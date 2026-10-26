@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agenticml-lite"
+version = "0.1.0.dev0"
+description = "Lean, local-first experiment tracker for AgenticML. Installs as `agenticml-lite`, imports as `agenticml`."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Gaurav Singh", email = "gaurav.singh@agenticml.xyz" }]
+requires-python = ">=3.9"
+keywords = ["mlops", "experiment-tracking", "machine-learning", "agentic"]
+dependencies = [
+  "requests>=2.31",
+]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+# System metrics sampler
+system = [
+  "psutil>=5.9",
+]
+# GPU metrics (NVIDIA only)
+gpu = [
+  "nvidia-ml-py>=12",
+]
+# Image media (numpy/PIL pathways)
+media = [
+  "Pillow>=10.0",
+]
+dev = [
+  "pytest>=7",
+  "build>=1.0",
+  "twine>=5.0",
+  "psutil>=5.9",
+  "Pillow>=10.0",
+  "responses>=0.24",
+]
+
+[project.scripts]
+agenticml = "agenticml.cli:main"
+
+[project.urls]
+Homepage = "https://agenticml.xyz"
+Source   = "https://github.com/agenticML/agenticml"
+Issues   = "https://github.com/agenticML/agenticml/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
