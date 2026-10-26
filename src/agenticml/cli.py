@@ -10,7 +10,7 @@ agenticml code in the script:
 
 `agenticml sync` replays offline journals against a live server.
 
-Offline runs land in AGENTICML_OFFLINE_DIR (default ~/.agenticml/offline/<run_id>/).
+Offline runs land in AGENTICML_DIR (default ~/.agenticml) under runs/<run_id>/.
 Each run dir holds a `journal.jsonl` plus optional `code/`, `artifacts/`,
 `media/` subtrees. Sync re-issues each entry against the real server and,
 on success, renames the run dir to `<run_id>.synced`.
@@ -29,7 +29,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .client import DEFAULT_OFFLINE_DIR, Client
+from .client import Client, resolve_dir
 from .launch import LaunchError, RunSettings, Target, parse_log_every, run_target
 
 
@@ -95,7 +95,6 @@ def _replay_run(client: Client, run_dir: Path) -> bool:
                     })
                 client.upload_code(
                     real_run_id,
-                    json.dumps(payload.get("manifest", {}), separators=(",", ":"), sort_keys=True),
                     files,
                 )
             elif kind == "log_artifact":
@@ -126,9 +125,9 @@ def _replay_run(client: Client, run_dir: Path) -> bool:
 
 
 def cmd_sync(args):
-    root = Path(args.dir).expanduser()
+    root = resolve_dir(args.dir) / "runs"
     if not root.exists():
-        print(f"no offline dir at {root}", file=sys.stderr)
+        print(f"no runs directory at {root}", file=sys.stderr)
         return 1
 
     client = Client(base_url=args.host, api_key=args.api_key)
@@ -171,8 +170,8 @@ options:
   --notes TEXT         run notes (env AGENTICML_NOTES)
   --group NAME         run group (env AGENTICML_GROUP)
   --job-type NAME      job type (env AGENTICML_JOB_TYPE)
-  --mode MODE          online, offline, or disabled (env AGENTICML_MODE)
-  --offline-dir DIR    offline journal root (env AGENTICML_OFFLINE_DIR)
+  --mode MODE          local (default), offline (alias), or disabled (env AGENTICML_MODE)
+  --dir DIR            local journal root (env AGENTICML_DIR)
   --no-auto-track      do not detect model/optimizer/loss/dataloader (env AGENTICML_AUTO_TRACK=0)
   --no-auto-metrics    do not log auto/loss, auto/lr, auto/epoch (env AGENTICML_AUTO_METRICS=0)
   --log-every N        log auto metrics every N optimizer steps (env AGENTICML_LOG_EVERY; default 1)
@@ -190,7 +189,7 @@ _RUN_VALUE_OPTIONS = {
     "--group": "group",
     "--job-type": "job_type",
     "--mode": "mode",
-    "--offline-dir": "offline_dir",
+    "--dir": "dir",
     "--log-every": "log_every",
 }
 _RUN_FLAG_OPTIONS = {
@@ -370,7 +369,7 @@ def main(argv=None):
     sub.add_parser("run", help="Run a script inside a tracked run (see `agenticml run -h`)")
 
     p_sync = sub.add_parser("sync", help="Replay offline journals against a live server")
-    p_sync.add_argument("--dir", default=str(DEFAULT_OFFLINE_DIR), help="Offline runs directory")
+    p_sync.add_argument("--dir", default=str(resolve_dir()), help="Local root (default: AGENTICML_DIR or ~/.agenticml)")
     p_sync.add_argument("--host", default=None, help="Server base URL (default: AGENTICML_HOST)")
     p_sync.add_argument("--api-key", default=None, help="API key (default: AGENTICML_API_KEY)")
     p_sync.set_defaults(func=cmd_sync)

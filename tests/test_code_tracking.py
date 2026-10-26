@@ -14,7 +14,6 @@ from agenticml.code_tracking import (
     DEFAULT_MAX_FILE_BYTES,
     DEFAULT_MAX_TOTAL_BYTES,
     RuntimeFileCollector,
-    collect_code_snapshot,
     compute_snapshot_hash,
     find_repo_root,
     manifest_to_json,
@@ -46,73 +45,15 @@ def test_find_repo_root_walks_up(fake_repo):
     assert find_repo_root(nested) == fake_repo
 
 
-def test_collect_respects_gitignore(fake_repo):
-    manifest, files = collect_code_snapshot(entrypoint=fake_repo / "src" / "main.py")
-    paths = {f.relative_path for f in files}
-
-    assert "src/main.py" in paths
-    assert "src/lib.py" in paths
-    assert "pyproject.toml" in paths
-    # gitignored
-    assert "noisy.log" not in paths
-    assert not any(p.startswith("data/") for p in paths)
-    # virtualenv hard-skip
-    assert not any(p.startswith(".venv") for p in paths)
-
-
-def test_collect_respects_agenticmlignore(fake_repo):
-    (fake_repo / "src" / "lib.py").write_text("# secret stuff\n")
-    (fake_repo / ".agenticmlignore").write_text("src/lib.py\n")
-
-    _manifest, files = collect_code_snapshot(entrypoint=fake_repo / "src" / "main.py")
-    paths = {f.relative_path for f in files}
-    assert "src/main.py" in paths
-    assert "src/lib.py" not in paths
-
-
-def test_repo_snapshot_excludes_packaging_and_build_artifacts(fake_repo):
-    generated_files = [
-        fake_repo / "build" / "lib" / "generated.py",
-        fake_repo / "dist" / "demo.whl",
-        fake_repo / ".eggs" / "dependency.egg" / "module.py",
-        fake_repo / "pip-wheel-metadata" / "metadata.json",
-        fake_repo / "src" / "demo.egg-info" / "PKG-INFO",
-        fake_repo / "src" / "demo.dist-info" / "METADATA",
-        fake_repo / "src" / "cached.pyc",
-        fake_repo / "demo.egg-link",
-        fake_repo / "demo.egg",
-    ]
-    for path in generated_files:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("generated\n")
-
-    # Similar names are legitimate source directories and must remain tracked.
-    (fake_repo / "builder").mkdir()
-    (fake_repo / "builder" / "source.py").write_text("VALUE = 1\n")
-    (fake_repo / "distribution").mkdir()
-    (fake_repo / "distribution" / "source.py").write_text("VALUE = 2\n")
-
-    _manifest, files = collect_code_snapshot(entrypoint=fake_repo / "src" / "main.py")
-    paths = {item.relative_path for item in files}
-
-    assert "builder/source.py" in paths
-    assert "distribution/source.py" in paths
-    assert not any("egg-info" in path or "dist-info" in path for path in paths)
-    assert not any(path.startswith(("build/", "dist/", ".eggs/")) for path in paths)
-    assert "pip-wheel-metadata/metadata.json" not in paths
-    assert "src/cached.pyc" not in paths
-    assert "demo.egg-link" not in paths
-    assert "demo.egg" not in paths
-
-
 def test_max_file_bytes_skips_oversized(fake_repo):
     big = fake_repo / "src" / "big.py"
     big.write_bytes(b"x" * 5000)
 
-    manifest, files = collect_code_snapshot(
+    manifest, files = RuntimeFileCollector(
         entrypoint=fake_repo / "src" / "main.py",
+        extra_files=[big],
         max_file_bytes=1000,
-    )
+    ).close()
     paths = {f.relative_path for f in files}
     assert "src/big.py" not in paths
     assert "src/big.py" in manifest["skipped"]["oversized"]
@@ -122,26 +63,39 @@ def test_max_total_bytes_caps_snapshot(fake_repo):
     for i in range(10):
         (fake_repo / "src" / f"f{i}.py").write_text("x = 1\n" * 200)
 
-    manifest, files = collect_code_snapshot(
+    manifest, files = RuntimeFileCollector(
         entrypoint=fake_repo / "src" / "main.py",
+        extra_files=list((fake_repo / "src").glob("f*.py")),
         max_total_bytes=2000,
-    )
+    ).close()
     total = sum(f.size for f in files)
     assert total <= 2000
     assert manifest["skipped"]["over_total"]
 
 
 def test_manifest_is_deterministic(fake_repo):
-    m1, _ = collect_code_snapshot(entrypoint=fake_repo / "src" / "main.py")
-    m2, _ = collect_code_snapshot(entrypoint=fake_repo / "src" / "main.py")
+    m1, _ = RuntimeFileCollector(
+        entrypoint=fake_repo / "src" / "main.py",
+        extra_files=[fake_repo / "src" / "lib.py"],
+    ).close()
+    m2, _ = RuntimeFileCollector(
+        entrypoint=fake_repo / "src" / "main.py",
+        extra_files=[fake_repo / "src" / "lib.py"],
+    ).close()
     assert manifest_to_json(m1) == manifest_to_json(m2)
     assert compute_snapshot_hash(m1) == compute_snapshot_hash(m2)
 
 
 def test_snapshot_hash_changes_on_content_change(fake_repo):
-    m1, _ = collect_code_snapshot(entrypoint=fake_repo / "src" / "main.py")
+    m1, _ = RuntimeFileCollector(
+        entrypoint=fake_repo / "src" / "main.py",
+        extra_files=[fake_repo / "src" / "lib.py"],
+    ).close()
     (fake_repo / "src" / "lib.py").write_text("def helper(): return 999\n")
-    m2, _ = collect_code_snapshot(entrypoint=fake_repo / "src" / "main.py")
+    m2, _ = RuntimeFileCollector(
+        entrypoint=fake_repo / "src" / "main.py",
+        extra_files=[fake_repo / "src" / "lib.py"],
+    ).close()
     assert compute_snapshot_hash(m1) != compute_snapshot_hash(m2)
 
 
@@ -152,10 +106,10 @@ def test_extra_files_outside_repo(tmp_path):
     outside = tmp_path.parent / "outside.py"
     outside.write_text("# external file\n")
     try:
-        _manifest, files = collect_code_snapshot(
+        _manifest, files = RuntimeFileCollector(
             entrypoint=tmp_path / "main.py",
             extra_files=[str(outside)],
-        )
+        ).close()
         # The outside file gets prefixed with "extra/"
         paths = {f.relative_path for f in files}
         assert any(p.startswith("extra/") and p.endswith("outside.py") for p in paths)
@@ -294,13 +248,3 @@ def test_runtime_collector_excludes_site_packages_and_custom_venv(fake_repo):
     paths = {item.relative_path for item in files}
     assert not any("site-packages" in path for path in paths)
     assert not any(path.startswith("python-runtime/") for path in paths)
-
-
-def test_repo_mode_prunes_custom_named_virtualenv(fake_repo):
-    custom_venv = fake_repo / "runtime-python"
-    custom_venv.mkdir()
-    (custom_venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
-    (custom_venv / "leaked.py").write_text("# must not be tracked\n")
-
-    _manifest, files = collect_code_snapshot(entrypoint=fake_repo / "src" / "main.py")
-    assert not any(item.relative_path.startswith("runtime-python/") for item in files)

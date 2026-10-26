@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import logging
 import mimetypes
 import os
@@ -15,12 +16,12 @@ from .code_tracking import (
     DEFAULT_MAX_FILE_BYTES,
     DEFAULT_MAX_TOTAL_BYTES,
     RuntimeFileCollector,
-    collect_code_snapshot,
     compute_snapshot_hash,
+    find_repo_root,
     manifest_to_json,
 )
 from .env import capture_environment
-from .lineage import get_git_metadata, write_local_lineage_state
+from .lineage import get_git_metadata
 from .media import _Media, is_media
 from ._source_inspect import stage_source_and_metadata
 from .auto_tracking import AutoTracker
@@ -38,14 +39,8 @@ from .system_metrics import SystemMetricsSampler
 
 logger = logging.getLogger("agenticml.run")
 
-DEFAULT_MAX_BUFFER = 10_000
-
 _VALID_RESUME = {"never", "allow", "must"}
-_VALID_RUN_MODES = {"online", "offline"}
-
-
-class _ResumeError(RuntimeError):
-    pass
+_VALID_RUN_MODES = {"local", "offline"}
 
 
 class Run:
@@ -54,20 +49,17 @@ class Run:
         project,
         name,
         config=None,
-        base_url=None,
-        api_key=None,
         flush_interval=2,
         track_source="runtime",
         source_roots=None,
         extra_files=None,
-        max_buffer=DEFAULT_MAX_BUFFER,
         # Phase 1 metadata
         tags=None,
         notes=None,
         group=None,
         job_type=None,
         capture_env=True,
-        # Phase 2: explicit parent for lineage when local state isn't reliable.
+        # Phase 2: explicit parent for lineage.
         parent_run_id=None,
         # Phase 2: code-snapshot size caps (passed through).
         max_file_bytes=None,
@@ -75,10 +67,10 @@ class Run:
         # Phase 3
         id=None,
         resume="never",
-        mode="online",
+        mode=None,
         system_metrics=True,
         system_metrics_interval=10.0,
-        offline_dir=None,
+        dir=None,
         verbose=False,
         auto_track=True,
         auto_metrics=False,
@@ -87,41 +79,33 @@ class Run:
     ):
         if resume not in _VALID_RESUME:
             raise ValueError(f"resume must be one of {_VALID_RESUME}")
+        mode = "local" if mode is None else mode.lower()
         if mode not in _VALID_RUN_MODES:
             raise ValueError(
                 f"mode must be one of {_VALID_RUN_MODES}, got {mode!r}. "
                 "('disabled' is handled by agenticml.init(), not Run directly.)"
             )
-        if offline_dir is not None and mode != "offline":
-            raise ValueError(
-                f"offline_dir is only valid when mode is 'offline', got mode={mode!r}"
-            )
+        if mode == "offline":
+            mode = "local"
+        if id is not None and resume == "never":
+            raise ValueError("Run.id passed with resume='never'; pass resume='allow' or 'must'")
 
         self.mode = mode
         self.verbose = bool(verbose)
-        self.client = make_client(
-            mode,
-            base_url=base_url,
-            api_key=api_key,
-            run_id_hint=id,
-            offline_dir=offline_dir,
-        )
+        self.client = make_client(mode, run_id_hint=id, dir=dir)
         self.project = project
         self.name = name
         self.flush_interval = flush_interval
         if track_source is True:
             track_source = "runtime"
-        if track_source not in {"runtime", "repo", False}:
-            raise ValueError("track_source must be 'runtime', 'repo', True, or False")
-        self.source_tracking_mode = track_source
+        if track_source not in {"runtime", False}:
+            raise ValueError("track_source must be 'runtime', True, or False")
         self.code_tracking_enabled = track_source is not False
         self.code_manifest = None
         self.tracked_files = []
         self._runtime_collector = None
         self._object_staging_dir = None
         self.lineage = {}
-        self.max_buffer = max_buffer
-        self._dropped = 0
         self._finished = False
         self._tracked: dict[tuple[str, int], str] = {}
         self._auto_finalizing = False
@@ -150,23 +134,6 @@ class Run:
         self._pending_metrics: dict = {}
         self._pending_step: int | None = None
 
-        # Resume handling: if id is given and resume!='never', try to attach.
-        self._resumed = False
-        if id is not None and resume != "never" and mode == "online":
-            existing = self.client.get_run(id)
-            if existing is None:
-                if resume == "must":
-                    raise _ResumeError(
-                        f"resume='must' but run id={id!r} not found on server"
-                    )
-                # resume='allow' and not found -> create fresh below
-            else:
-                self.run_id = id
-                self._resumed = True
-                logger.info("resumed run %s (status=%s)", id, existing.get("status"))
-        elif id is not None and resume == "never":
-            raise ValueError("Run.id passed with resume='never'; pass resume='allow' or 'must'")
-
         if self.code_tracking_enabled:
             resolved_max_file_bytes = (
                 DEFAULT_MAX_FILE_BYTES if max_file_bytes is None else max_file_bytes
@@ -174,26 +141,15 @@ class Run:
             resolved_max_total_bytes = (
                 DEFAULT_MAX_TOTAL_BYTES if max_total_bytes is None else max_total_bytes
             )
-            if self.source_tracking_mode == "runtime":
-                self._runtime_collector = RuntimeFileCollector(
-                    source_roots=source_roots or [],
-                    extra_files=extra_files or [],
-                    max_file_bytes=resolved_max_file_bytes,
-                    max_total_bytes=resolved_max_total_bytes,
-                )
-                repo_root = str(self._runtime_collector.repo_root)
-                snapshot_hash = None
-            else:
-                self.code_manifest, self.tracked_files = collect_code_snapshot(
-                    extra_files=extra_files or [],
-                    max_file_bytes=resolved_max_file_bytes,
-                    max_total_bytes=resolved_max_total_bytes,
-                )
-                self.code_manifest["tracking_mode"] = "repo"
-                repo_root = self.code_manifest["repo_root"]
-                snapshot_hash = compute_snapshot_hash(self.code_manifest)
+            self._runtime_collector = RuntimeFileCollector(
+                source_roots=source_roots or [],
+                extra_files=extra_files or [],
+                max_file_bytes=resolved_max_file_bytes,
+                max_total_bytes=resolved_max_total_bytes,
+            )
+            repo_root = str(self._runtime_collector.repo_root)
             self.lineage = {
-                "snapshot_hash": snapshot_hash,
+                "snapshot_hash": None,
                 "repo_root": repo_root,
                 "parent_run_id": parent_run_id,
                 "parent_inference": "explicit" if parent_run_id else None,
@@ -202,19 +158,19 @@ class Run:
 
         env_payload = capture_environment() if capture_env else {}
 
-        if not self._resumed:
-            init_payload = {
-                "project": project,
-                "name": name,
-                "config": self.config,
-                "tags": self.tags,
-                "notes": self.notes,
-                "group": self.group,
-                "job_type": self.job_type,
-                **env_payload,
-                **self.lineage,
-            }
-            self.run_id = self.client.init_run(init_payload)
+        init_payload = {
+            "project": project,
+            "name": name,
+            "config": self.config,
+            "tags": self.tags,
+            "notes": self.notes,
+            "group": self.group,
+            "job_type": self.job_type,
+            "parent_run_id": parent_run_id,
+            **env_payload,
+            **self.lineage,
+        }
+        self.run_id = self.client.init_run(init_payload)
 
         if self.verbose:
             self._print_init_info()
@@ -228,21 +184,6 @@ class Run:
         )
         self.thread.start()
 
-        # Code upload off the hot path. Skipped on resume (already uploaded).
-        self.code_upload_thread = None
-        if (
-            not self._resumed
-            and self.code_tracking_enabled
-            and self.source_tracking_mode == "repo"
-            and self.code_manifest is not None
-        ):
-            self.code_upload_thread = threading.Thread(
-                target=self._track_prepared_code,
-                name=f"agenticml-code-{self.run_id}",
-                daemon=True,
-            )
-            self.code_upload_thread.start()
-
         # System metrics sampler (Phase 3).
         self._system_sampler = None
         if system_metrics:
@@ -250,7 +191,7 @@ class Run:
             self._system_sampler.start()
 
         # Phase 4: fork-safety. After fork, the child cannot reuse the parent's
-        # network sockets or background thread. We disable logging in the child
+        # background thread. We disable logging in the child
         # (the user can re-init explicitly if they want per-process tracking).
         self._owner_pid = os.getpid()
         if hasattr(os, "register_at_fork"):
@@ -345,7 +286,7 @@ class Run:
                     else:
                         self._auto_step = max(self._auto_step, step + 1)
 
-        # Media uploads happen outside the lock — they hit the network and
+        # Media writes happen outside the lock — they access disk and
         # must not block other log() callers.
         for key, media in media_items:
             try:
@@ -357,9 +298,9 @@ class Run:
             self._enqueue(target_step, payload_metrics)
 
     def log_artifact(self, file_path, name=None, type="file", metadata=None):
-        """Upload a file as a versioned artifact attached to this run.
+        """Store a file as a versioned artifact attached to this run.
 
-        Returns the server's response (id, project, name, version, sha256, ...).
+        Returns the journal client's response.
         """
         if self._finished:
             raise RuntimeError("log_artifact() called after finish()")
@@ -431,11 +372,6 @@ class Run:
         self._flush()
         self.thread.join(timeout=self.flush_interval + 1)
 
-        if self.code_upload_thread is not None:
-            self.code_upload_thread.join(timeout=60)
-            if self.code_upload_thread.is_alive():
-                logger.warning("code upload still running at finish(); detaching")
-
         tracker = self._auto_tracker
         if tracker is not None:
             self._auto_finalizing = True
@@ -457,24 +393,6 @@ class Run:
                 snapshot_hash = None
                 logger.exception("failed to finalize runtime source snapshot")
 
-        if (
-            status == "finished"
-            and self.code_tracking_enabled
-            and self.lineage
-            and snapshot_hash
-            and self.mode == "online"
-        ):
-            try:
-                write_local_lineage_state(
-                    self.lineage["repo_root"],
-                    run_id=self.run_id,
-                    snapshot_hash=self.lineage["snapshot_hash"],
-                    project=self.project,
-                    name=self.name,
-                )
-            except Exception:
-                logger.exception("failed to write local lineage state")
-
         try:
             self.client.finalize(
                 self.run_id,
@@ -483,7 +401,7 @@ class Run:
                 snapshot_hash=snapshot_hash,
             )
         except Exception:
-            logger.exception("failed to finalize run on server")
+            logger.exception("failed to finalize run")
 
     def track_files(self, *paths):
         if not paths:
@@ -492,7 +410,7 @@ class Run:
             for path in paths:
                 self._runtime_collector.add_explicit(path)
             return
-        self._track_code(extra_files=list(paths), include_repo=False)
+        self._upload_explicit_files([(path, None) for path in paths], source="extra")
 
     def _accepting_tracks(self) -> bool:
         return not self._finished or self._auto_finalizing
@@ -612,12 +530,8 @@ class Run:
                     manifest_path=manifest_path,
                     source=source,
                 )
-            return
-        self._track_code(
-            extra_files=[(path, manifest_path) for path, manifest_path in staged],
-            include_repo=False,
-            extra_source=source,
-        )
+        else:
+            self._upload_explicit_files(staged, source=source)
 
     def _ensure_object_staging(self) -> Path:
         if self._object_staging_dir is None:
@@ -645,31 +559,54 @@ class Run:
 
     # ----- internals -----
 
+    def _upload_explicit_files(self, staged, source):
+        try:
+            repo_root = find_repo_root(Path.cwd())
+            manifest_files = []
+            payload_files = []
+            for path, manifest_path in staged:
+                path = Path(path).expanduser().resolve()
+                if not path.is_file():
+                    continue
+                if manifest_path is None:
+                    try:
+                        manifest_path = path.relative_to(repo_root).as_posix()
+                    except ValueError:
+                        manifest_path = f"extra/{path.name}"
+                content = path.read_bytes()
+                spec = {
+                    "path": manifest_path,
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "content_type": mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+                    "source": source,
+                }
+                manifest_files.append({**spec, "size": len(content)})
+                payload_files.append({**spec, "content": content})
+            if payload_files:
+                self.client.upload_code(
+                    self.run_id,
+                    manifest_to_json({"files": manifest_files}),
+                    payload_files,
+                )
+        except Exception:
+            logger.exception("failed to track explicit files")
+
     def _print_init_info(self):
-        """Print run id and asset/host paths to stdout (W&B-style)."""
+        """Print run id and local asset paths to stdout (W&B-style)."""
         lines = [
             f"agenticml: run_id={self.run_id}",
             f"  project={self.project} name={self.name} mode={self.mode}",
         ]
-        if self.mode == "offline":
-            root = getattr(self.client, "root", None)
-            if root is not None:
-                run_dir = Path(root) / self.run_id
-                lines.extend([
-                    f"  offline_dir={root}",
-                    f"  run_dir={run_dir}",
-                    f"  journal={run_dir / 'journal.jsonl'}",
-                    f"  code={run_dir / 'code'}",
-                    f"  artifacts={run_dir / 'artifacts'}",
-                    f"  media={run_dir / 'media'}",
-                ])
-        else:
-            host = getattr(self.client, "base_url", None) or os.environ.get(
-                "AGENTICML_HOST"
-            )
+        root = getattr(self.client, "root", None)
+        if root is not None:
+            run_dir = Path(root) / "runs" / self.run_id
             lines.extend([
-                f"  host={host}",
-                "  code and artifacts upload to the server (no local asset dir)",
+                f"  dir={root}",
+                f"  run_dir={run_dir}",
+                f"  journal={run_dir / 'journal.jsonl'}",
+                f"  code={run_dir / 'code'}",
+                f"  artifacts={run_dir / 'artifacts'}",
+                f"  media={run_dir / 'media'}",
             ])
         print("\n".join(lines))
 
@@ -703,16 +640,6 @@ class Run:
         }
         with self.lock:
             self.buffer.append(item)
-            overflow = len(self.buffer) - self.max_buffer
-            if overflow > 0:
-                del self.buffer[:overflow]
-                self._dropped += overflow
-                logger.warning(
-                    "metric buffer exceeded max_buffer=%d; dropped %d oldest entries (total dropped=%d)",
-                    self.max_buffer,
-                    overflow,
-                    self._dropped,
-                )
 
     def _flush_loop(self):
         while not self.stop_event.wait(self.flush_interval):
@@ -728,9 +655,7 @@ class Run:
         try:
             self.client.log_batch(batch)
         except Exception:
-            logger.exception("failed to flush metric batch (%d items); requeueing", len(batch))
-            with self.lock:
-                self.buffer = (batch + self.buffer)[-self.max_buffer:]
+            logger.exception("failed to flush metric batch (%d items); dropping batch", len(batch))
 
     def _upload_media(self, key, step, media: _Media):
         file_path, content_type, _suggested = media._to_upload()
@@ -745,33 +670,9 @@ class Run:
         )
 
     def _upload_tracked_files(self, manifest, tracked_files):
-        # Skip uploading bytes the server already holds, but register every
-        # file regardless.
-        #
-        # That distinction is the whole fix. Objects are addressed by content
-        # hash now, so a file uploaded by an earlier run is already at the key
-        # this run needs — registration finds it and the artifact row is
-        # created. Under the old run-scoped keys, skipping the upload left the
-        # run with no object and no row, and the file vanished from it.
         sha_by_path = {
             item["path"]: item["sha256"] for item in manifest.get("files", [])
         }
-
-        already_stored: set[str] = set()
-        try:
-            already_stored = set(
-                self.client.artifacts_exists(
-                    [sha_by_path[item.relative_path] for item in tracked_files]
-                )
-            )
-            if already_stored:
-                logger.info(
-                    "code dedup: %d/%d files already stored, sending metadata only",
-                    len(already_stored),
-                    len(tracked_files),
-                )
-        except Exception:
-            logger.exception("artifacts_exists failed; uploading every file")
 
         payload_files = []
         for item in tracked_files:
@@ -783,11 +684,7 @@ class Run:
                 "content_type": item.content_type,
                 "sha256": sha,
                 "source": "code",
-                # Read regardless of the dedup answer. The bytes are kilobytes,
-                # and keeping them means a registration that reports the content
-                # missing can be recovered rather than logged and dropped.
                 "content": content,
-                "stored": sha in already_stored,
             })
 
         self.client.upload_code(
@@ -795,22 +692,3 @@ class Run:
             manifest_to_json(manifest),
             payload_files,
         )
-
-    def _track_prepared_code(self):
-        try:
-            if self.code_manifest is None:
-                return
-            self._upload_tracked_files(self.code_manifest, self.tracked_files)
-        except Exception:
-            logger.exception("failed to track code")
-
-    def _track_code(self, extra_files=None, include_repo=True, extra_source=None):
-        try:
-            manifest, tracked_files = collect_code_snapshot(
-                extra_files=extra_files,
-                include_repo=include_repo,
-                extra_source=extra_source,
-            )
-            self._upload_tracked_files(manifest, tracked_files)
-        except Exception:
-            logger.exception("failed to track code")

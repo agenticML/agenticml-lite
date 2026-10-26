@@ -15,18 +15,14 @@ from urllib3.util.retry import Retry
 logger = logging.getLogger("agenticml.client")
 
 DEFAULT_BASE_URL = "https://api.agenticml.xyz"
-DEFAULT_OFFLINE_DIR = Path.home() / ".agenticml" / "offline"
-
-
-class _PresignUnsupported(Exception):
-    """Server predates the presign endpoints; use the multipart path."""
+DEFAULT_DIR = Path("~/.agenticml")
 
 
 class _OfflineClient:
     """Drop-in for `Client` that writes payloads to a local JSONL journal.
 
     The `agenticml sync` CLI replays the journal against a real server later.
-    Each run lives in its own directory so concurrent offline runs don't
+    Each run lives in its own directory so concurrent local runs don't
     interleave events.
     """
 
@@ -39,7 +35,7 @@ class _OfflineClient:
     def _ensure_run_dir(self) -> Path:
         if self._run_dir is None:
             assert self._run_id is not None, "init_run must run before journaling"
-            self._run_dir = self.root / self._run_id
+            self._run_dir = self.root / "runs" / self._run_id
             self._run_dir.mkdir(parents=True, exist_ok=True)
         return self._run_dir
 
@@ -97,9 +93,6 @@ class _OfflineClient:
         })
         return {"status": "offline", "files": len(stored)}
 
-    def artifacts_exists(self, sha256s):
-        return []
-
     def log_artifact(self, run_id, name, type, metadata, file_path, content_type):
         run_dir = self._ensure_run_dir()
         artifacts_dir = run_dir / "artifacts"
@@ -135,9 +128,6 @@ class _OfflineClient:
         })
         return {"status": "offline", "key": key, "step": step}
 
-    def get_run(self, run_id):
-        return None  # offline cannot resolve resume; caller must handle
-
 
 class Client:
     def __init__(self, base_url=None, timeout=5, max_retries=3, api_key=None):
@@ -158,7 +148,7 @@ class Client:
             read=max_retries,
             backoff_factor=0.5,
             status_forcelist=(500, 502, 503, 504),
-            allowed_methods=frozenset(["GET", "POST", "PATCH"]),
+            allowed_methods=frozenset(["POST"]),
             raise_on_status=False,
         )
         adapter = HTTPAdapter(max_retries=retry)
@@ -205,16 +195,6 @@ class Client:
         )
         res.raise_for_status()
 
-    def get_run(self, run_id):
-        res = self.session.get(
-            f"{self.base_url}/runs/{run_id}",
-            timeout=self.timeout,
-        )
-        if res.status_code == 404:
-            return None
-        res.raise_for_status()
-        return res.json()
-
     def artifacts_exists(self, sha256s):
         if not sha256s:
             return []
@@ -226,24 +206,27 @@ class Client:
         res.raise_for_status()
         return res.json().get("existing", [])
 
-    def upload_code(self, run_id, manifest_json, files):
-        """Upload the code snapshot straight to object storage.
-
-        The server signs one URL per file, the bytes go client-to-bucket, and a
-        second call records them. Nothing passes through the API process, which
-        previously buffered every file in memory before writing it out again.
-
-        Falls back to the legacy multipart endpoint when the server does not
-        expose presigning, so an older deployment keeps working.
-        """
+    def upload_code(self, run_id, files):
+        """Upload missing code bytes to object storage and register every file."""
         if not files:
             return {"status": "ok", "registered": []}
 
+        already_stored: set[str] = set()
         try:
-            return self._upload_code_presigned(run_id, files)
-        except _PresignUnsupported:
-            logger.info("server has no presign endpoint; using multipart upload")
-            return self._upload_code_multipart(run_id, manifest_json, files)
+            already_stored = set(self.artifacts_exists([item["sha256"] for item in files]))
+            if already_stored:
+                logger.info(
+                    "code dedup: %d/%d files already stored, sending metadata only",
+                    len(already_stored),
+                    len(files),
+                )
+        except Exception:
+            logger.exception("artifacts_exists failed; uploading every file")
+
+        files = [
+            {**item, "stored": item["sha256"] in already_stored} for item in files
+        ]
+        return self._upload_code_presigned(run_id, files)
 
     def _upload_code_presigned(self, run_id, files):
         descriptors = [
@@ -263,8 +246,6 @@ class Client:
             json={"files": to_upload},
             timeout=max(self.timeout, 30),
         )
-        if res.status_code == 404:
-            raise _PresignUnsupported()
         res.raise_for_status()
 
         urls = {u["path"]: u for u in res.json().get("uploads", [])}
@@ -325,39 +306,11 @@ class Client:
         res.raise_for_status()
         return res.json()
 
-    def _upload_code_multipart(self, run_id, manifest_json, files):
-        multipart_files = [
-            (
-                "files",
-                (item["path"], item["content"], item["content_type"]),
-            )
-            for item in files
-        ]
-        res = self.session.post(
-            f"{self.base_url}/runs/{run_id}/code",
-            data={"manifest": manifest_json},
-            files=multipart_files,
-            timeout=max(self.timeout, 60),
-        )
-        res.raise_for_status()
-        return res.json()
-
     def log_artifact(self, run_id, name, type, metadata, file_path, content_type):
-        """Upload a versioned artifact straight to object storage.
-
-        Falls back to the multipart endpoint on an older server, where the file
-        is read into the API process in full — fine for a plot, an OOM kill for
-        a checkpoint.
-        """
-        try:
-            return self._log_artifact_presigned(
-                run_id, name, type, metadata, file_path, content_type
-            )
-        except _PresignUnsupported:
-            logger.info("server has no presign endpoint; using multipart upload")
-            return self._log_artifact_multipart(
-                run_id, name, type, metadata, file_path, content_type
-            )
+        """Upload a versioned artifact straight to object storage."""
+        return self._log_artifact_presigned(
+            run_id, name, type, metadata, file_path, content_type
+        )
 
     @staticmethod
     def _hash_file(file_path):
@@ -386,8 +339,6 @@ class Client:
             }]},
             timeout=max(self.timeout, 30),
         )
-        if res.status_code == 404:
-            raise _PresignUnsupported()
         res.raise_for_status()
 
         uploads = res.json().get("uploads", [])
@@ -418,25 +369,6 @@ class Client:
             },
             timeout=max(self.timeout, 30),
         )
-        if res.status_code == 404:
-            raise _PresignUnsupported()
-        res.raise_for_status()
-        return res.json()
-
-    def _log_artifact_multipart(self, run_id, name, type, metadata, file_path, content_type):
-        with open(file_path, "rb") as fh:
-            files = {"file": (Path(file_path).name, fh, content_type)}
-            data = {
-                "name": name,
-                "type": type,
-                "metadata": json.dumps(metadata or {}),
-            }
-            res = self.session.post(
-                f"{self.base_url}/runs/{run_id}/log_artifact",
-                data=data,
-                files=files,
-                timeout=max(self.timeout, 60),
-            )
         res.raise_for_status()
         return res.json()
 
@@ -459,28 +391,18 @@ class Client:
         return res.json()
 
 
-def resolve_offline_dir(offline_dir=None) -> Path:
-    """Resolve the offline asset root.
+def resolve_dir(dir=None) -> Path:
+    """Resolve the local asset root.
 
-    Precedence: ``offline_dir=`` > ``AGENTICML_OFFLINE_DIR`` > ``~/.agenticml/offline``.
+    Precedence: ``dir=`` > ``AGENTICML_DIR`` > ``~/.agenticml``.
     The result is expanduser'd and resolved to an absolute path.
     """
-    if offline_dir is not None:
-        raw = offline_dir
-    else:
-        raw = os.environ.get("AGENTICML_OFFLINE_DIR", str(DEFAULT_OFFLINE_DIR))
+    raw = dir if dir is not None else os.environ.get("AGENTICML_DIR", str(DEFAULT_DIR))
     return Path(raw).expanduser().resolve()
 
 
-def make_client(
-    mode: str,
-    base_url=None,
-    api_key=None,
-    run_id_hint=None,
-    offline_dir=None,
-) -> object:
-    """Factory that returns a real or offline client based on mode."""
-    if mode == "offline":
-        root = resolve_offline_dir(offline_dir)
-        return _OfflineClient(root, run_id_hint=run_id_hint)
-    return Client(base_url=base_url, api_key=api_key)
+def make_client(mode="local", run_id_hint=None, dir=None) -> _OfflineClient:
+    """Return a journal client for local training."""
+    if mode not in {"local", "offline"}:
+        raise ValueError(f"unsupported journal mode: {mode!r}")
+    return _OfflineClient(resolve_dir(dir), run_id_hint=run_id_hint)

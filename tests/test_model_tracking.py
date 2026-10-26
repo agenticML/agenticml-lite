@@ -262,41 +262,6 @@ def test_track_model_runtime_run_uploads_staged_files(fake_repo: Path, monkeypat
     assert not any("site-packages" in path for path in paths)
 
 
-def test_track_model_repo_mode_attaches_staged_files(fake_repo: Path, monkeypatch):
-    from agenticml import run as run_mod
-
-    entrypoint = fake_repo / "src" / "train.py"
-    monkeypatch.setattr(sys, "argv", [str(entrypoint)])
-    fake = _FakeClient()
-    monkeypatch.setattr(run_mod, "make_client", lambda mode, **kwargs: fake)
-
-    site_root = fake_repo / "vendor" / "lib" / "site-packages"
-    _arch, model = _write_arch_module(site_root)
-    try:
-        run = Run(
-            "p",
-            "n",
-            track_source="repo",
-            capture_env=False,
-            system_metrics=False,
-            flush_interval=999,
-        )
-        run.track_model(model)
-        run.finish()
-    finally:
-        sys.modules.pop("fakesarch.modeling", None)
-
-    model_uploads = [
-        manifest
-        for manifest, _files in fake.uploads
-        if any(item["path"].startswith("model/") for item in manifest["files"])
-    ]
-    assert model_uploads
-    paths = {item["path"] for item in model_uploads[-1]["files"]}
-    assert "model/fakesarch/modeling.py" in paths
-    assert MODEL_METADATA_PATH in paths
-
-
 def test_stage_dir_removed_even_if_upload_fails(fake_repo: Path, monkeypatch):
     from agenticml import run as run_mod
 

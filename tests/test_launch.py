@@ -115,7 +115,7 @@ def _launch(project: Path, *args: str, script: str | None = None, name: str = "t
     env = {
         **os.environ,
         "AGENTICML_MODE": "offline",
-        "AGENTICML_OFFLINE_DIR": str(out),
+        "AGENTICML_DIR": str(out),
     }
     env.pop("AGENTICML_PROJECT", None)
     env.pop("AGENTICML_NAME", None)
@@ -132,6 +132,7 @@ def _launch(project: Path, *args: str, script: str | None = None, name: str = "t
 
 def _journals(out: Path) -> list[dict]:
     runs = []
+    out = out / "runs"
     if not out.exists():
         return runs
     for run_dir in sorted(out.iterdir(), key=lambda p: p.stat().st_mtime):

@@ -436,43 +436,6 @@ def test_track_optimizer_runtime_run_uploads(fake_repo: Path, monkeypatch):
     assert sources == {"optimizer"}
 
 
-def test_repo_mode_attaches_immediately(fake_repo: Path, monkeypatch):
-    from agenticml import run as run_mod
-
-    entrypoint = fake_repo / "src" / "train.py"
-    monkeypatch.setattr(sys, "argv", [str(entrypoint)])
-    fake = _FakeClient()
-    monkeypatch.setattr(run_mod, "make_client", lambda mode, **kwargs: fake)
-
-    site_root = fake_repo / "vendor" / "lib" / "site-packages"
-    _path, module = _write_custom_loss(site_root)
-    try:
-        run = Run(
-            "p",
-            "n",
-            track_source="repo",
-            capture_env=False,
-            system_metrics=False,
-            flush_interval=999,
-        )
-        run.track_loss(module.FocalLoss())
-        run.finish()
-    finally:
-        sys.modules.pop("fakeloss.losses", None)
-
-    loss_uploads = [
-        (manifest, files)
-        for manifest, files in fake.uploads
-        if any(item["path"].startswith("loss/") or item["path"] == "agenticml/loss.json" for item in manifest["files"])
-    ]
-    assert loss_uploads
-    manifest, _files = loss_uploads[-1]
-    paths = {item["path"] for item in manifest["files"]}
-    assert "agenticml/loss.json" in paths
-    sources = {item["source"] for item in manifest["files"] if item["path"] == "agenticml/loss.json"}
-    assert sources == {"loss"}
-
-
 def test_stage_dir_removed_even_if_upload_fails(fake_repo: Path, monkeypatch):
     from agenticml import run as run_mod
 

@@ -13,7 +13,7 @@ from .run import Run
 
 logger = logging.getLogger("agenticml")
 
-_VALID_MODES = {"online", "offline", "disabled"}
+_VALID_MODES = {"local", "offline", "disabled"}
 
 _lock = threading.Lock()
 _active_run = None  # may be a Run or _DisabledRun
@@ -70,11 +70,11 @@ class _DisabledRun:
 
 
 def _resolve_mode(explicit):
-    mode = (explicit or os.environ.get("AGENTICML_MODE") or "online").lower()
+    mode = (explicit or os.environ.get("AGENTICML_MODE") or "local").lower()
     if mode not in _VALID_MODES:
-        logger.warning("unknown AGENTICML_MODE=%r; falling back to 'online'", mode)
-        mode = "online"
-    return mode
+        logger.warning("unknown AGENTICML_MODE=%r; falling back to 'local'", mode)
+        mode = "local"
+    return "local" if mode == "offline" else mode
 
 
 def init(
@@ -82,7 +82,7 @@ def init(
     name,
     mode=None,
     only_main_process=True,
-    offline_dir=None,
+    dir=None,
     verbose=False,
     **kwargs,
 ):
@@ -92,10 +92,10 @@ def init(
     training get a `_DisabledRun` automatically, so user code keeps calling
     `agenticml.log(...)` without coordinating logging duties manually.
 
-    `mode` precedence: explicit arg > AGENTICML_MODE env > 'online'.
-    `offline_dir` is only valid when the resolved mode is `"offline"`
-    (explicit arg > AGENTICML_OFFLINE_DIR > ``~/.agenticml/offline``).
-    `verbose=True` prints the run id and asset paths (or host) to stdout.
+    `mode` precedence: explicit arg > AGENTICML_MODE env > 'local'.
+    `"offline"` is an alias for `"local"`.
+    `dir` selects the local root (explicit arg > AGENTICML_DIR > ``~/.agenticml``).
+    `verbose=True` prints the run id and local asset paths to stdout.
     """
     global _active_run
 
@@ -105,11 +105,6 @@ def init(
         return _active_run
 
     resolved_mode = _resolve_mode(mode)
-    if offline_dir is not None and resolved_mode != "offline":
-        raise ValueError(
-            f"offline_dir is only valid when mode is 'offline', got mode={resolved_mode!r}"
-        )
-
     with _lock:
         active = _active_run
         if (
@@ -135,7 +130,7 @@ def init(
             project=project,
             name=name,
             mode=resolved_mode,
-            offline_dir=offline_dir,
+            dir=dir,
             verbose=verbose,
             **kwargs,
         )

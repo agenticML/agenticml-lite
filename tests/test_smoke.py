@@ -108,7 +108,7 @@ def test_env_capture_returns_basics():
 def test_offline_run_writes_journal(monkeypatch):
     monkeypatch.delenv("AGENTICML_MODE", raising=False)
     with tempfile.TemporaryDirectory() as tmpdir:
-        monkeypatch.setenv("AGENTICML_OFFLINE_DIR", tmpdir)
+        monkeypatch.setenv("AGENTICML_DIR", tmpdir)
 
         run = agenticml.init(
             "demo",
@@ -132,7 +132,7 @@ def test_offline_run_writes_journal(monkeypatch):
         agenticml.finish()
 
         run_dirs = [
-            p for p in Path(tmpdir).iterdir() if p.is_dir() and p.name.startswith("offline-")
+            p for p in (Path(tmpdir) / "runs").iterdir() if p.is_dir() and p.name.startswith("offline-")
         ]
         assert len(run_dirs) == 1
         journal_lines = (run_dirs[0] / "journal.jsonl").read_text().splitlines()
@@ -160,9 +160,6 @@ def test_run_auto_step_and_commit_merging():
 
         def upload_code(self, *a, **kw):
             return {}
-
-        def get_run(self, run_id):
-            return None
 
         def artifacts_exists(self, x):
             return []
@@ -202,53 +199,7 @@ def test_run_auto_step_and_commit_merging():
     assert fake.finalized == ("fake-run-id", {"done": True}, "finished", None)
 
 
-def test_resume_must_missing_raises():
-    from agenticml import Run
-    from agenticml import run as run_mod
-
-    class StubMissing:
-        def __init__(self, *a, **kw):
-            pass
-
-        def get_run(self, run_id):
-            return None
-
-        def init_run(self, payload):
-            return "x"
-
-        def log_batch(self, items):
-            pass
-
-        def finalize(self, *a, **kw):
-            pass
-
-        def artifacts_exists(self, x):
-            return []
-
-    original = run_mod.make_client
-    run_mod.make_client = lambda mode, **kw: StubMissing()
-    try:
-        raised = False
-        try:
-            Run(
-                "p",
-                "n",
-                id="missing",
-                resume="must",
-                track_source=False,
-                capture_env=False,
-                system_metrics=False,
-            )
-        except RuntimeError as e:
-            raised = True
-            assert "resume='must'" in str(e)
-        assert raised, "expected RuntimeError"
-    finally:
-        run_mod.make_client = original
-
-
-def test_runtime_source_sends_bytes_when_server_has_nothing(tmp_path, monkeypatch):
-    """The complement of the dedup case: an empty server gets the content."""
+def test_runtime_source_sends_bytes_to_journal(tmp_path, monkeypatch):
     from agenticml import Run
     from agenticml import run as run_mod
 
@@ -284,11 +235,11 @@ def test_runtime_source_sends_bytes_when_server_has_nothing(tmp_path, monkeypatc
 
     assert fake.files
     for item in fake.files:
-        assert item["stored"] is False
+        assert "stored" not in item
         assert item["content"], f"{item['path']} should carry bytes"
 
 
-def test_runtime_source_uploads_content_even_when_server_knows_the_hashes(tmp_path, monkeypatch):
+def test_runtime_source_journals_all_content_without_dedup(tmp_path, monkeypatch):
     from agenticml import Run
     from agenticml import run as run_mod
 
@@ -312,7 +263,7 @@ def test_runtime_source_uploads_content_even_when_server_knows_the_hashes(tmp_pa
             pass
 
         def artifacts_exists(self, hashes):
-            return list(hashes)
+            raise AssertionError("training must not query server dedup")
 
         def upload_code(self, run_id, manifest_json, files):
             self.manifest = json.loads(manifest_json)
@@ -337,21 +288,11 @@ def test_runtime_source_uploads_content_even_when_server_knows_the_hashes(tmp_pa
     assert fake.manifest["tracking_mode"] == "runtime"
     assert {item["path"] for item in fake.manifest["files"]} >= {"train.py", "config.yaml"}
 
-    # Every file reaches upload_code even though the server reports holding
-    # every hash. Bytes are skipped; registration is not. Objects are addressed
-    # by content hash, so a file stored by an earlier run is already at the key
-    # this run needs, and registration attaches it.
-    #
-    # The earlier bug dropped these files entirely: run-scoped keys meant the
-    # content lived elsewhere, so skipping the upload left no object and no
-    # artifact row, and the file vanished from the run.
+    # The journal always receives bytes for every tracked file.
     registered = {item["path"] for item in fake.files}
     assert registered >= {"train.py", "config.yaml"}
     for item in fake.files:
         assert item["sha256"], f"{item['path']} needs a sha256 to presign"
-        # Marked as already stored, so the client will skip the PUT — but the
-        # bytes are still carried, so a server that turns out not to have the
-        # content can be recovered from rather than silently losing the file.
-        assert item["stored"] is True
+        assert "stored" not in item
         assert item["content"]
     assert fake.final_snapshot

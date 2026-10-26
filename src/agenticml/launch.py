@@ -52,7 +52,7 @@ class RunSettings:
     group: str | None = None
     job_type: str | None = None
     mode: str | None = None
-    offline_dir: str | None = None
+    dir: str | None = None
     auto_track: bool = True
     auto_metrics: bool = True
     log_every: int = 1
@@ -213,7 +213,7 @@ def _start_run(settings: RunSettings, resolved: _Resolved):
             project=project,
             name=name,
             mode=settings.mode,
-            offline_dir=settings.offline_dir,
+            dir=settings.dir,
             verbose=settings.verbose,
             tags=settings.tags or None,
             notes=settings.notes,
