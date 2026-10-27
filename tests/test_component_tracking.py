@@ -21,28 +21,7 @@ from agenticml.component_tracking import (
     stage_tracked_optimizer,
 )
 from agenticml.run import Run
-
-
-class _FakeClient:
-    def __init__(self):
-        self.uploads: list[tuple[dict, list]] = []
-        self.final_snapshot = None
-
-    def init_run(self, payload):
-        return "component-run"
-
-    def log_batch(self, items):
-        pass
-
-    def artifacts_exists(self, hashes):
-        return []
-
-    def upload_code(self, run_id, manifest_json, files):
-        self.uploads.append((json.loads(manifest_json), files))
-        return {"status": "ok"}
-
-    def finalize(self, run_id, summary, status="finished", snapshot_hash=None):
-        self.final_snapshot = snapshot_hash
+from agenticml.store import RunReader, RunWriter
 
 
 @pytest.fixture
@@ -400,12 +379,8 @@ def test_runtime_collector_records_component_source(fake_repo: Path, tmp_path: P
 
 
 def test_track_optimizer_runtime_run_uploads(fake_repo: Path, monkeypatch):
-    from agenticml import run as run_mod
-
     entrypoint = fake_repo / "src" / "train.py"
     monkeypatch.setattr(sys, "argv", [str(entrypoint)])
-    fake = _FakeClient()
-    monkeypatch.setattr(run_mod, "make_client", lambda mode, **kwargs: fake)
 
     site_root = fake_repo / "vendor" / "lib" / "site-packages"
     _path, cls = _write_custom_optimizer(site_root)
@@ -425,28 +400,22 @@ def test_track_optimizer_runtime_run_uploads(fake_repo: Path, monkeypatch):
     finally:
         sys.modules.pop("fakeopt.optim", None)
 
-    assert fake.uploads
-    manifest, payload_files = fake.uploads[-1]
-    paths = {item["path"] for item in manifest["files"]}
+    manifest = RunReader(run.root, run.run_id).code_manifest()
+    paths = {item["path"] for item in manifest}
     assert "agenticml/optimizer.gen.json" in paths
     assert any(path.startswith("optimizer/") for path in paths)
-    uploaded = {item["path"] for item in payload_files}
+    uploaded = {item["path"] for item in manifest}
     assert "agenticml/optimizer.gen.json" in uploaded
-    sources = {item["source"] for item in manifest["files"] if item["path"] == "agenticml/optimizer.gen.json"}
+    sources = {item["source"] for item in manifest if item["path"] == "agenticml/optimizer.gen.json"}
     assert sources == {"optimizer"}
 
 
 def test_stage_dir_removed_even_if_upload_fails(fake_repo: Path, monkeypatch):
-    from agenticml import run as run_mod
-
-    class BoomClient(_FakeClient):
-        def upload_code(self, run_id, manifest_json, files):
-            raise RuntimeError("upload failed")
-
+    def fail_code(self, manifest, files):
+        raise RuntimeError("store failed")
+    monkeypatch.setattr(RunWriter, "add_code", fail_code)
     entrypoint = fake_repo / "src" / "train.py"
     monkeypatch.setattr(sys, "argv", [str(entrypoint)])
-    fake = BoomClient()
-    monkeypatch.setattr(run_mod, "make_client", lambda mode, **kwargs: fake)
 
     site_root = fake_repo / "vendor" / "lib" / "site-packages"
     _path, cls = _write_custom_optimizer(site_root)
@@ -467,12 +436,8 @@ def test_stage_dir_removed_even_if_upload_fails(fake_repo: Path, monkeypatch):
 
 
 def test_ignored_after_finish(fake_repo: Path, monkeypatch):
-    from agenticml import run as run_mod
-
     entrypoint = fake_repo / "src" / "train.py"
     monkeypatch.setattr(sys, "argv", [str(entrypoint)])
-    fake = _FakeClient()
-    monkeypatch.setattr(run_mod, "make_client", lambda mode, **kwargs: fake)
     run = Run(
         "p",
         "n",

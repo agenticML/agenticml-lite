@@ -12,6 +12,7 @@ torch = pytest.importorskip("torch")
 
 from agenticml.auto_tracking import force_uninstall
 from agenticml.run import Run
+from agenticml.store import RunReader, path_for
 
 
 @pytest.fixture(autouse=True)
@@ -21,38 +22,14 @@ def _restore_torch_hooks():
     force_uninstall()
 
 
-class _FakeClient:
-    def __init__(self):
-        self.uploads: list[tuple[dict, list]] = []
-
-    def init_run(self, payload):
-        return "auto-run"
-
-    def log_batch(self, items):
-        pass
-
-    def artifacts_exists(self, hashes):
-        return []
-
-    def upload_code(self, run_id, manifest_json, files):
-        self.uploads.append((json.loads(manifest_json), files))
-        return {"status": "ok"}
-
-    def finalize(self, run_id, summary, status="finished", snapshot_hash=None):
-        pass
-
-
 @pytest.fixture
 def tracked_run(tmp_path: Path, monkeypatch):
-    from agenticml import run as run_mod
-
     (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n")
     source = tmp_path / "src"
     source.mkdir()
     (source / "train.py").write_text("print('train')\n")
     monkeypatch.setattr(sys, "argv", [str(source / "train.py")])
-    fake = _FakeClient()
-    monkeypatch.setattr(run_mod, "make_client", lambda mode, **kwargs: fake)
+    runs = []
 
     def make(**kwargs):
         defaults = dict(
@@ -61,22 +38,21 @@ def tracked_run(tmp_path: Path, monkeypatch):
             flush_interval=999,
         )
         defaults.update(kwargs)
-        return Run("p", "n", **defaults)
+        run = Run("p", "n", **defaults)
+        runs.append(run)
+        return run
 
-    return make, fake
+    return make, runs
 
 
-def _metadata(fake: _FakeClient) -> dict[str, dict]:
-    found: dict[str, dict] = {}
-    for _manifest, files in fake.uploads:
-        for item in files:
+def _metadata(runs) -> dict[str, dict]:
+    found = {}
+    for run in runs:
+        reader = RunReader(run.root, run.run_id)
+        for item in reader.code_manifest():
             path = item["path"]
-            if not (path.startswith("agenticml/") and path.endswith(".json")):
-                continue
-            content = item["content"]
-            if isinstance(content, bytes):
-                content = content.decode()
-            found[path] = json.loads(content)
+            if path.startswith("agenticml/") and path.endswith(".json"):
+                found[path] = json.loads(path_for(run.root, item["sha256"]).read_bytes())
     return found
 
 

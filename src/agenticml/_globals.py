@@ -39,7 +39,7 @@ class _DisabledRun:
     def log(self, metrics, step=None, commit=True):
         return
 
-    def log_artifact(self, file_path, name=None, type="file", metadata=None):
+    def log_artifact(self, file_path, name=None, type="file", metadata=None, copy=False):
         return None
 
     def finish(self, status="finished"):
@@ -190,9 +190,9 @@ def log(metrics, step=None, commit=True):
     _require_active("log").log(metrics, step=step, commit=commit)
 
 
-def log_artifact(file_path, name=None, type="file", metadata=None):
+def log_artifact(file_path, name=None, type="file", metadata=None, copy=False):
     return _require_active("log_artifact").log_artifact(
-        file_path, name=name, type=type, metadata=metadata
+        file_path, name=name, type=type, metadata=metadata, copy=copy
     )
 
 

@@ -233,6 +233,11 @@ class RuntimeFileCollector:
             return
         if not path.is_file() or _looks_like_virtualenv(path):
             return
+        # Editable installs put this package inside the project tree. Runtime
+        # imports and reads are not project code. track_files() uses
+        # explicit=True and is still recorded.
+        if not explicit and _is_under_agenticml_package(path):
+            return
         relative_path = _normalize_manifest_path(manifest_path) if manifest_path else None
         if relative_path is not None:
             if _should_skip(Path(relative_path)):
@@ -372,6 +377,34 @@ def _is_relative_to(path: Path, other: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+@lru_cache(maxsize=1)
+def _agenticml_package_dir() -> Path | None:
+    """Directory of the installed ``agenticml`` package, or None."""
+    try:
+        import agenticml
+        source = agenticml.__file__
+    except Exception:
+        return None
+    if not source:
+        return None
+    try:
+        return Path(source).resolve().parent
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _is_under_agenticml_package(path: Path) -> bool:
+    """True when resolved ``path`` is a file inside the agenticml package."""
+    package_dir = _agenticml_package_dir()
+    if package_dir is None:
+        return False
+    try:
+        path.relative_to(package_dir)
+    except ValueError:
+        return False
+    return True
 
 
 @lru_cache(maxsize=1)

@@ -1,6 +1,6 @@
 """agenticml — Python SDK for the AgenticML platform.
 
-Install as ``agenticml-py``, import as ``agenticml``.
+Install as ``agenticml-lite``, import as ``agenticml``.
 
 Quickstart::
 
@@ -29,7 +29,6 @@ from ._globals import (
     track_model,
     track_optimizer,
 )
-from .client import Client
 from .distributed import get_rank, is_main_process
 from .media import Image
 from .run import Run
@@ -37,7 +36,6 @@ from .run import Run
 __version__ = "0.1.0.dev0"
 
 __all__ = [
-    "Client",
     "Image",
     "Run",
     "__version__",
@@ -56,3 +54,10 @@ __all__ = [
     "track_model",
     "track_optimizer",
 ]
+
+
+def __getattr__(name):
+    if name == "Client":
+        from .client import Client
+        return Client
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

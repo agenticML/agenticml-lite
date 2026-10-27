@@ -13,6 +13,7 @@ import pytest
 
 from agenticml import cli
 from agenticml.launch import Target
+from agenticml.store import RunReader
 
 
 # ----- argument parsing -----
@@ -127,25 +128,15 @@ def _launch(project: Path, *args: str, script: str | None = None, name: str = "t
         text=True,
         timeout=120,
     )
-    return proc, _journals(out)
+    return proc, _read_runs(out)
 
 
-def _journals(out: Path) -> list[dict]:
-    runs = []
-    out = out / "runs"
-    if not out.exists():
-        return runs
-    for run_dir in sorted(out.iterdir(), key=lambda p: p.stat().st_mtime):
-        entries = [
-            json.loads(line)
-            for line in (run_dir / "journal.jsonl").read_text().splitlines()
-            if line.strip()
-        ]
-        by_kind: dict[str, list] = {}
-        for entry in entries:
-            by_kind.setdefault(entry["kind"], []).append(entry["payload"])
-        runs.append(by_kind)
-    return runs
+def _read_runs(out: Path) -> list[dict]:
+    if not (out / "runs").exists():
+        return []
+    return [RunReader(out, path.name) for path in sorted(
+        (out / "runs").iterdir(), key=lambda path: path.stat().st_mtime
+    )]
 
 
 def test_script_runs_as_main(project):
@@ -176,10 +167,10 @@ def test_script_runs_as_main(project):
     assert proc.returncode == 0, proc.stderr
     assert "ok 7" in proc.stdout
     (run,) = runs
-    assert run["init"][0]["project"] == "proj"
-    assert run["init"][0]["name"] == "train"
-    assert run["finalize"][0]["status"] == "finished"
-    code_paths = {f["path"] for f in run["upload_code"][0]["files"]}
+    assert run.meta()["project"] == "proj"
+    assert run.meta()["name"] == "train"
+    assert run.meta()["status"] == "finished"
+    code_paths = {f["path"] for f in run.code_manifest()}
     assert {"train.py", "helper.py"} <= code_paths, code_paths
 
 
@@ -187,7 +178,7 @@ def test_project_and_name_options(project):
     proc, runs = _launch(project, "--project", "demo", "--name", "exp", "--tags", "a,b", "t.py",
                          script="pass\n", name="t.py")
     assert proc.returncode == 0, proc.stderr
-    init = runs[0]["init"][0]
+    init = runs[0].meta()
     assert (init["project"], init["name"], init["tags"]) == ("demo", "exp", ["a", "b"])
 
 
@@ -196,7 +187,7 @@ def test_exception_marks_run_crashed(project):
     assert proc.returncode == 1
     assert "ValueError: boom" in proc.stderr
     assert "launch.py" not in proc.stderr
-    final = runs[0]["finalize"][0]
+    final = runs[0].meta()
     assert final["status"] == "crashed"
     assert final["summary"] == {"_exit_code": 1, "_exception": "ValueError"}
 
@@ -213,7 +204,7 @@ def test_exception_marks_run_crashed(project):
 def test_system_exit_codes(project, body, code):
     proc, runs = _launch(project, "train.py", script=body + "\n")
     assert proc.returncode == code
-    final = runs[0]["finalize"][0]
+    final = runs[0].meta()
     assert final["status"] == ("finished" if code == 0 else "crashed")
     if code:
         assert final["summary"]["_exit_code"] == code
@@ -222,7 +213,7 @@ def test_system_exit_codes(project, body, code):
 def test_keyboard_interrupt(project):
     proc, runs = _launch(project, "train.py", script="raise KeyboardInterrupt\n")
     assert proc.returncode == 130
-    assert runs[0]["finalize"][0]["status"] == "crashed"
+    assert runs[0].meta()["status"] == "crashed"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX signals")
@@ -237,7 +228,7 @@ def test_sigterm_finalizes_run(project):
         """,
     )
     assert proc.returncode == 143
-    final = runs[0]["finalize"][0]
+    final = runs[0].meta()
     assert final["status"] == "crashed"
     assert final["summary"]["_exception"] == "SIGTERM"
 
@@ -248,7 +239,7 @@ def test_script_init_and_finish_attach_to_launcher_run(project):
         "train.py",
         script="""
             import agenticml
-            run = agenticml.init(project="other", name="other", config={"lr": 0.1})
+            run = agenticml.init(project="other", name="other", config={"lr": 0.1}, tags=["script"], notes="attached")
             agenticml.log({"acc": 0.5})
             agenticml.finish()
             agenticml.log({"acc": 0.7})
@@ -258,10 +249,12 @@ def test_script_init_and_finish_attach_to_launcher_run(project):
     )
     assert proc.returncode == 0, proc.stderr
     (run,) = runs
-    assert run["init"][0]["name"] == "train"
-    assert len(run["finalize"]) == 1
-    logged = [item["metrics"] for batch in run["log_batch"] for item in batch["items"]]
-    assert logged == [{"acc": 0.5}, {"acc": 0.7}]
+    assert run.meta()["name"] == "train"
+    assert len([event for event in run.events() if event["kind"] == "finish"]) == 1
+    assert run.meta()["config"]["lr"] == 0.1
+    assert run.meta()["tags"] == ["script"]
+    assert run.meta()["notes"] == "attached"
+    assert run.series("acc")["points"] == [[0, 0.5], [1, pytest.approx(0.7)]]
 
 
 def test_script_requested_failure_status_is_kept(project):
@@ -271,7 +264,7 @@ def test_script_requested_failure_status_is_kept(project):
         script="import agenticml\nagenticml.init(project='p', name='n')\nagenticml.finish(status='crashed')\n",
     )
     assert proc.returncode == 0
-    assert runs[0]["finalize"][0]["status"] == "crashed"
+    assert runs[0].meta()["status"] == "crashed"
 
 
 def test_module_target_runs_package_main(project):
@@ -284,7 +277,7 @@ def test_module_target_runs_package_main(project):
     proc, runs = _launch(project, "-m", "pkg", "a", "b")
     assert proc.returncode == 0, proc.stderr
     assert "pkg pkg ['a', 'b']" in proc.stdout
-    assert runs[0]["init"][0]["name"] == "pkg"
+    assert runs[0].meta()["name"] == "pkg"
 
 
 def test_missing_script_exits_two(project):
@@ -299,7 +292,7 @@ def test_shorthand_with_current_interpreter(project):
     proc, runs = _launch(project, "--", sys.executable, "-u", "t.py")
     assert proc.returncode == 0, proc.stderr
     assert "hi" in proc.stdout
-    assert runs[0]["finalize"][0]["status"] == "finished"
+    assert runs[0].meta()["status"] == "finished"
 
 
 def test_auto_tracking_under_launcher(project):
@@ -324,7 +317,7 @@ def test_auto_tracking_under_launcher(project):
         """,
     )
     assert proc.returncode == 0, proc.stderr
-    files = {f["path"] for f in runs[0]["upload_code"][0]["files"]}
+    files = {f["path"] for f in runs[0].code_manifest()}
     assert {
         "agenticml/model.net.json",
         "agenticml/optimizer.optimizer.json",
@@ -336,9 +329,13 @@ def test_auto_tracking_under_launcher(project):
 def test_torchrun_creates_one_run(project):
     pytest.importorskip("torch.distributed.run")
     (project / "ddp.py").write_text(textwrap.dedent("""
+        import os
+        from pathlib import Path
+
         import torch, torch.distributed as dist
         from torch.nn.parallel import DistributedDataParallel as DDP
 
+        Path("rank-" + os.environ["RANK"]).write_text("ok\\n")
         dist.init_process_group("gloo")
         model = DDP(torch.nn.Linear(4, 2))
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
@@ -353,7 +350,7 @@ def test_torchrun_creates_one_run(project):
         [
             sys.executable, "-m", "torch.distributed.run",
             "--standalone", "--nproc_per_node", "2",
-            "-m", "agenticml", "run", "--mode", "offline", "--offline-dir", str(out),
+            "-m", "agenticml", "run", "--mode", "offline", "--dir", str(out),
             "ddp.py",
         ],
         cwd=project,
@@ -362,9 +359,13 @@ def test_torchrun_creates_one_run(project):
         timeout=300,
     )
     assert proc.returncode == 0, proc.stderr
-    runs = _journals(out)
+    assert (project / "rank-0").is_file()
+    assert (project / "rank-1").is_file()
+    run_dirs = [path for path in (out / "runs").iterdir() if (path / "meta.json").is_file()]
+    assert len(run_dirs) == 1
+    runs = _read_runs(out)
     assert len(runs) == 1
-    assert runs[0]["finalize"][0]["status"] == "finished"
+    assert runs[0].meta()["status"] == "finished"
 
 
 def test_integration_flags_parse(monkeypatch):
@@ -431,15 +432,15 @@ def test_launcher_logs_auto_metrics_tensorboard_and_args(project):
     assert proc.returncode == 0, proc.stderr
     (run,) = runs
     steps: dict[int, dict] = {}
-    for batch in run["log_batch"]:
-        for item in batch["items"]:
-            steps.setdefault(item["step"], {}).update(item["metrics"])
+    for key in run.keys():
+        for step, value in run.series(key)["points"]:
+            steps.setdefault(step, {})[key] = value
     assert sorted(steps) == [0, 1, 2]
     for metrics in steps.values():
         assert {"auto/loss", "auto/lr", "auto/epoch", "train/loss"} <= set(metrics)
         assert metrics["auto/loss"] == pytest.approx(metrics["train/loss"])
-        assert metrics["auto/lr"] == 0.05
-    assert run["finalize"][0]["summary"] == {"hparam/final": 1.5}
+        assert metrics["auto/lr"] == pytest.approx(0.05)
+    assert run.meta()["summary"] == {"hparam/final": 1.5}
 
 
 def test_launcher_integrations_can_be_disabled(project):
@@ -472,7 +473,7 @@ def test_launcher_integrations_can_be_disabled(project):
         """,
     )
     assert proc.returncode == 0, proc.stderr
-    assert "log_batch" not in runs[0]
+    assert runs[0].keys() == []
 
 
 def test_launcher_captures_hydra_config(project):

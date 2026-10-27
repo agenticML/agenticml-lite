@@ -1,11 +1,10 @@
 """Smoke tests covering the public surface of the agenticml SDK."""
 
-import json
+import subprocess
 import sys
-import tempfile
-from pathlib import Path
 
 import agenticml
+import pytest
 
 
 def test_version_set():
@@ -14,7 +13,6 @@ def test_version_set():
 
 def test_public_surface():
     expected = {
-        "Client",
         "Image",
         "Run",
         "config",
@@ -33,6 +31,21 @@ def test_public_surface():
         "track_dataloader",
     }
     assert expected.issubset(set(agenticml.__all__))
+    assert "Client" not in agenticml.__all__
+    assert agenticml.Client.__name__ == "Client"
+
+
+def test_star_import_does_not_import_requests():
+    code = """
+import sys
+ns = {}
+exec("from agenticml import *", ns)
+assert "Client" not in ns
+assert "requests" not in sys.modules
+assert "agenticml.client" not in sys.modules
+assert "Run" in ns and "log" in ns
+"""
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 def test_client_constructs(monkeypatch):
@@ -105,143 +118,53 @@ def test_env_capture_returns_basics():
     assert isinstance(env["packages"], dict)
 
 
-def test_offline_run_writes_journal(monkeypatch):
-    monkeypatch.delenv("AGENTICML_MODE", raising=False)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        monkeypatch.setenv("AGENTICML_DIR", tmpdir)
 
-        run = agenticml.init(
-            "demo",
-            "offline",
-            mode="offline",
-            track_source=False,
-            capture_env=False,
-            system_metrics=False,
-            only_main_process=False,
-        )
-        assert run.run_id.startswith("offline-")
+def test_local_run_persists_scalars_config_summary_and_artifact(tmp_path):
+    from agenticml.store import RunReader, valid_run_id
 
-        agenticml.log({"loss": 0.5})
-        agenticml.log({"acc": 0.9}, step=5)
-
-        artifact_file = Path(tmpdir) / "model.bin"
-        artifact_file.write_bytes(b"fake model weights")
-        agenticml.log_artifact(str(artifact_file), name="my_model", type="model")
-
-        agenticml.summary["final"] = 1.0
-        agenticml.finish()
-
-        run_dirs = [
-            p for p in (Path(tmpdir) / "runs").iterdir() if p.is_dir() and p.name.startswith("offline-")
-        ]
-        assert len(run_dirs) == 1
-        journal_lines = (run_dirs[0] / "journal.jsonl").read_text().splitlines()
-        kinds = {line.split('"kind":', 1)[1].split('"')[1] for line in journal_lines}
-        assert {"init", "log_artifact", "log_batch", "finalize"}.issubset(kinds)
+    run = agenticml.init("demo", "local", dir=tmp_path, track_source=False,
+                         capture_env=False, system_metrics=False, auto_track=False)
+    assert valid_run_id(run.run_id)
+    agenticml.log({"loss": 0.5})
+    agenticml.log({"acc": 0.9}, step=5)
+    artifact = tmp_path / "model.bin"
+    artifact.write_bytes(b"weights")
+    record = agenticml.log_artifact(artifact, name="model", type="model")
+    agenticml.config["lr"] = 0.01
+    agenticml.summary["final"] = 1
+    agenticml.finish()
+    reader = RunReader(tmp_path, run.run_id)
+    assert reader.series("loss")["points"] == [[0, 0.5]]
+    assert reader.series("acc")["points"][0][1] == pytest.approx(0.9)
+    assert reader.meta()["config"] == {"lr": 0.01}
+    assert reader.meta()["summary"] == {"final": 1}
+    assert reader.meta()["status"] == "finished"
+    assert reader.artifacts()[0]["path"] == str(artifact)
+    assert record["copy"] is False and record["sha256"] is None
 
 
-def test_run_auto_step_and_commit_merging():
+def test_run_auto_step_and_commit_merging(tmp_path):
     from agenticml import Run
-    from agenticml import run as run_mod
+    from agenticml.store import RunReader
 
-    class FakeClient:
-        def __init__(self, *a, **kw):
-            self.batches: list = []
-            self.finalized = None
-
-        def init_run(self, payload):
-            return "fake-run-id"
-
-        def log_batch(self, items):
-            self.batches.append(list(items))
-
-        def finalize(self, run_id, summary, status="finished", snapshot_hash=None):
-            self.finalized = (run_id, dict(summary), status, snapshot_hash)
-
-        def upload_code(self, *a, **kw):
-            return {}
-
-        def artifacts_exists(self, x):
-            return []
-
-        def log_artifact(self, *a, **kw):
-            return {}
-
-        def log_media(self, *a, **kw):
-            return {}
-
-    fake = FakeClient()
-    original = run_mod.make_client
-    run_mod.make_client = lambda mode, **kw: fake
-    try:
-        with Run(
-            "p",
-            "n",
-            track_source=False,
-            capture_env=False,
-            system_metrics=False,
-            flush_interval=999,
-        ) as r:
-            r.log({"a": 1})
-            r.log({"b": 2}, commit=False)
-            r.log({"c": 3})
-            r.log({"d": 4}, step=10)
-            r.summary["done"] = True
-            r._flush()
-    finally:
-        run_mod.make_client = original
-
-    flat = [item for batch in fake.batches for item in batch]
-    by_step = {item["step"]: item["metrics"] for item in flat}
-    assert by_step[0] == {"a": 1}
-    assert by_step[1] == {"b": 2, "c": 3}
-    assert by_step[10] == {"d": 4}
-    assert fake.finalized == ("fake-run-id", {"done": True}, "finished", None)
+    with Run("p", "n", dir=tmp_path, track_source=False, capture_env=False,
+             system_metrics=False, auto_track=False, flush_interval=999) as run:
+        run.log({"a": 1})
+        run.log({"b": 2}, commit=False)
+        run.log({"c": 3})
+        run.log({"d": 4}, step=10)
+        run.log({"e": 5}, step=12, commit=False)
+        run.summary["done"] = True
+    reader = RunReader(tmp_path, run.run_id)
+    assert {key: reader.series(key)["points"] for key in reader.keys()} == {
+        "a": [[0, 1]], "b": [[1, 2]], "c": [[1, 3]], "d": [[10, 4]], "e": [[12, 5]],
+    }
+    assert reader.meta()["summary"] == {"done": True}
 
 
-def test_runtime_source_sends_bytes_to_journal(tmp_path, monkeypatch):
+def test_runtime_source_persists_content_and_snapshot(tmp_path, monkeypatch):
     from agenticml import Run
-    from agenticml import run as run_mod
-
-    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'runtime-demo'\n")
-    entrypoint = tmp_path / "train.py"
-    entrypoint.write_text("print('train')\n")
-    monkeypatch.setattr(sys, "argv", [str(entrypoint)])
-
-    class FakeClient:
-        def __init__(self):
-            self.files = None
-
-        def init_run(self, payload):
-            return "runtime-run"
-
-        def log_batch(self, items):
-            pass
-
-        def artifacts_exists(self, hashes):
-            return []
-
-        def upload_code(self, run_id, manifest_json, files):
-            self.files = files
-            return {"status": "ok"}
-
-        def finalize(self, run_id, summary, status="finished", snapshot_hash=None):
-            pass
-
-    fake = FakeClient()
-    monkeypatch.setattr(run_mod, "make_client", lambda mode, **kwargs: fake)
-    run = Run("p", "n", capture_env=False, system_metrics=False, flush_interval=999)
-    run.finish()
-
-    assert fake.files
-    for item in fake.files:
-        assert "stored" not in item
-        assert item["content"], f"{item['path']} should carry bytes"
-
-
-def test_runtime_source_journals_all_content_without_dedup(tmp_path, monkeypatch):
-    from agenticml import Run
-    from agenticml import run as run_mod
+    from agenticml.store import RunReader, path_for
 
     (tmp_path / "pyproject.toml").write_text("[project]\nname = 'runtime-demo'\n")
     entrypoint = tmp_path / "train.py"
@@ -249,50 +172,12 @@ def test_runtime_source_journals_all_content_without_dedup(tmp_path, monkeypatch
     config = tmp_path / "config.yaml"
     config.write_text("epochs: 2\n")
     monkeypatch.setattr(sys, "argv", [str(entrypoint)])
-
-    class FakeClient:
-        def __init__(self):
-            self.manifest = None
-            self.files = None
-            self.final_snapshot = None
-
-        def init_run(self, payload):
-            return "runtime-run"
-
-        def log_batch(self, items):
-            pass
-
-        def artifacts_exists(self, hashes):
-            raise AssertionError("training must not query server dedup")
-
-        def upload_code(self, run_id, manifest_json, files):
-            self.manifest = json.loads(manifest_json)
-            self.files = files
-            return {"status": "ok"}
-
-        def finalize(self, run_id, summary, status="finished", snapshot_hash=None):
-            self.final_snapshot = snapshot_hash
-
-    fake = FakeClient()
-    monkeypatch.setattr(run_mod, "make_client", lambda mode, **kwargs: fake)
-    run = Run(
-        "p",
-        "n",
-        capture_env=False,
-        system_metrics=False,
-        flush_interval=999,
-    )
-    config.read_text()
-    run.finish()
-
-    assert fake.manifest["tracking_mode"] == "runtime"
-    assert {item["path"] for item in fake.manifest["files"]} >= {"train.py", "config.yaml"}
-
-    # The journal always receives bytes for every tracked file.
-    registered = {item["path"] for item in fake.files}
-    assert registered >= {"train.py", "config.yaml"}
-    for item in fake.files:
-        assert item["sha256"], f"{item['path']} needs a sha256 to presign"
-        assert "stored" not in item
-        assert item["content"]
-    assert fake.final_snapshot
+    with Run("p", "n", dir=tmp_path / "store", capture_env=False,
+             system_metrics=False, auto_track=False) as run:
+        config.read_text()
+    reader = RunReader(run.root, run.run_id)
+    manifest = {row["path"]: row for row in reader.code_manifest()}
+    assert manifest.keys() >= {"train.py", "config.yaml"}
+    for name in ("train.py", "config.yaml"):
+        assert path_for(run.root, manifest[name]["sha256"]).read_bytes() == (tmp_path / name).read_bytes()
+    assert reader.meta()["snapshot_hash"]

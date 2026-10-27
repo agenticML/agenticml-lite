@@ -11,6 +11,7 @@ torch = pytest.importorskip("torch")
 
 from agenticml.auto_tracking import force_uninstall
 from agenticml.run import Run
+from agenticml.store import RunReader
 
 
 @pytest.fixture(autouse=True)
@@ -20,35 +21,11 @@ def _restore_torch_hooks():
     force_uninstall()
 
 
-class _LoggingClient:
-    def __init__(self):
-        self.items: list[dict] = []
-
-    def init_run(self, payload):
-        return "metrics-run"
-
-    def log_batch(self, items):
-        self.items.extend(items)
-
-    def artifacts_exists(self, hashes):
-        return []
-
-    def upload_code(self, run_id, manifest_json, files):
-        return {"status": "ok"}
-
-    def finalize(self, run_id, summary, status="finished", snapshot_hash=None):
-        pass
-
-
 @pytest.fixture
 def make_run(tmp_path: Path, monkeypatch):
-    from agenticml import run as run_mod
-
     (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n")
     (tmp_path / "train.py").write_text("pass\n")
     monkeypatch.setattr(sys, "argv", [str(tmp_path / "train.py")])
-    client = _LoggingClient()
-    monkeypatch.setattr(run_mod, "make_client", lambda mode, **kwargs: client)
     runs = []
 
     def make(**kwargs):
@@ -64,16 +41,19 @@ def make_run(tmp_path: Path, monkeypatch):
         runs.append(run)
         return run
 
-    yield make, client
+    yield make, runs
     for run in runs:
         if not run._finished:
             run.finish()
 
 
-def _by_step(client) -> dict[int, dict]:
-    merged: dict[int, dict] = {}
-    for item in client.items:
-        merged.setdefault(item["step"], {}).update(item["metrics"])
+def _by_step(runs) -> dict[int, dict]:
+    merged = {}
+    for run in runs:
+        reader = RunReader(run.root, run.run_id)
+        for key in reader.keys():
+            for step, value in reader.series(key)["points"]:
+                merged.setdefault(step, {})[key] = value
     return merged
 
 
@@ -230,4 +210,4 @@ def test_no_metrics_when_disabled(make_run):
     run = make(auto_metrics=False)
     _loop(net, optimizer, [])
     run.finish()
-    assert client.items == []
+    assert _by_step(client) == {}

@@ -8,150 +8,214 @@ agenticml code in the script:
     python -m agenticml run train.py
     torchrun --nproc_per_node 4 -m agenticml run train.py
 
-`agenticml sync` replays offline journals against a live server.
-
-Offline runs land in AGENTICML_DIR (default ~/.agenticml) under runs/<run_id>/.
-Each run dir holds a `journal.jsonl` plus optional `code/`, `artifacts/`,
-`media/` subtrees. Sync re-issues each entry against the real server and,
-on success, renames the run dir to `<run_id>.synced`.
+`agenticml sync` incrementally uploads local runs to a server.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
 import logging
 import os
 import re
 import shutil
 import subprocess
 import sys
-from pathlib import Path
 
-from .client import Client, resolve_dir
 from .launch import LaunchError, RunSettings, Target, parse_log_every, run_target
 
 
 logger = logging.getLogger("agenticml.cli")
 
 
-def _replay_run(client: Client, run_dir: Path) -> bool:
-    journal = run_dir / "journal.jsonl"
-    if not journal.exists():
-        logger.warning("no journal in %s; skipping", run_dir)
-        return False
-
-    # The server assigns a real run_id at /init; we map the offline id to it
-    # so subsequent entries reference the correct row.
-    real_run_id: str | None = None
-
-    with journal.open("r", encoding="utf-8") as fh:
-        for raw in fh:
-            raw = raw.strip()
-            if not raw:
-                continue
-            entry = json.loads(raw)
-            kind = entry["kind"]
-            payload = entry["payload"]
-
-            if kind == "init":
-                real_run_id = client.init_run(payload)
-                continue
-
-            if real_run_id is None:
-                logger.error("entry %s before init in %s", kind, run_dir)
-                return False
-
-            if kind == "log":
-                payload = {**payload, "run_id": real_run_id}
-                client.log(payload)
-            elif kind == "log_batch":
-                items = [
-                    {**item, "run_id": real_run_id}
-                    for item in payload.get("items", [])
-                ]
-                client.log_batch(items)
-            elif kind == "finalize":
-                client.finalize(
-                    real_run_id,
-                    payload.get("summary") or {},
-                    status=payload.get("status", "finished"),
-                    snapshot_hash=payload.get("snapshot_hash"),
-                )
-            elif kind == "upload_code":
-                files = []
-                for spec in payload.get("files", []):
-                    target = run_dir / spec["stored_at"]
-                    content = target.read_bytes()
-                    files.append({
-                        "path": spec["path"],
-                        "content_type": spec["content_type"],
-                        # Journals written before sha256 was recorded still
-                        # replay: recompute it from the stored bytes.
-                        "sha256": spec.get("sha256") or hashlib.sha256(content).hexdigest(),
-                        "source": spec.get("source", "code"),
-                        "content": content,
-                    })
-                client.upload_code(
-                    real_run_id,
-                    files,
-                )
-            elif kind == "log_artifact":
-                target = run_dir / payload["stored_at"]
-                client.log_artifact(
-                    real_run_id,
-                    payload["name"],
-                    payload.get("type", "file"),
-                    payload.get("metadata") or {},
-                    str(target),
-                    payload.get("content_type") or "application/octet-stream",
-                )
-            elif kind == "log_media":
-                target = run_dir / payload["stored_at"]
-                client.log_media(
-                    real_run_id,
-                    payload["key"],
-                    int(payload["step"]),
-                    payload.get("kind", "image"),
-                    payload.get("caption") or "",
-                    str(target),
-                    payload.get("content_type") or "application/octet-stream",
-                )
-            else:
-                logger.warning("unknown journal entry kind=%r; skipping", kind)
-
-    return True
-
-
 def cmd_sync(args):
-    root = resolve_dir(args.dir) / "runs"
-    if not root.exists():
-        print(f"no runs directory at {root}", file=sys.stderr)
-        return 1
+    from .sync import cmd_sync as sync
+    return sync(args)
 
-    client = Client(base_url=args.host, api_key=args.api_key)
 
-    failed = 0
-    synced = 0
-    for run_dir in sorted(p for p in root.iterdir() if p.is_dir()):
-        if run_dir.name.endswith(".synced"):
-            continue
+def cmd_login(args):
+    from .auth import cmd_login as login
+    try:
+        return login(args)
+    except KeyboardInterrupt:
+        return 130
+
+
+def cmd_logout(args):
+    from .auth import cmd_logout as logout
+    try:
+        return logout(args)
+    except KeyboardInterrupt:
+        return 130
+
+
+def cmd_whoami(args):
+    from .auth import cmd_whoami as whoami
+    try:
+        return whoami(args)
+    except KeyboardInterrupt:
+        return 130
+
+
+def cmd_ls(args):
+    import json
+    from datetime import datetime
+    from .store import RunReader, list_runs
+    from .store.layout import resolve_root
+
+    root = resolve_root(args.dir)
+    runs = list_runs(root)
+    if args.project is not None:
+        runs = [run for run in runs if run.get("project") == args.project]
+    if args.json:
+        print(json.dumps(runs))
+        return 0
+
+    rows = [["RUN ID", "PROJECT", "NAME", "STATUS", "CREATED", "LAST STEP"]]
+    for run in runs:
+        created = run.get("created_at") or ""
         try:
-            if _replay_run(client, run_dir):
-                target = run_dir.with_name(run_dir.name + ".synced")
-                if target.exists():
-                    shutil.rmtree(target)
-                run_dir.rename(target)
-                synced += 1
-            else:
-                failed += 1
-        except Exception:
-            logger.exception("failed to sync %s", run_dir)
-            failed += 1
+            created = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+            created = created.astimezone().strftime("%Y-%m-%d %H:%M")
+        except (ValueError, TypeError):
+            created = "-"
+        try:
+            # One record per flush: never read scalar series for a listing.
+            times = RunReader(root, run["run_id"]).time_index()
+            last_step = max((step for step, _ in times), default=None)
+        except (OSError, ValueError):
+            last_step = None
+        rows.append([
+            str(run.get("run_id", "")), str(run.get("project", "")),
+            str(run.get("name", "")), str(run.get("effective_status", "")),
+            created, "-" if last_step is None else str(last_step),
+        ])
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    for row in rows:
+        print("  ".join(value.ljust(width) for value, width in zip(row, widths)).rstrip())
+    print(f"{len(runs)} run{'s' if len(runs) != 1 else ''}")
+    return 0
 
-    print(f"synced={synced} failed={failed}")
-    return 0 if failed == 0 else 2
+
+def cmd_ui(args):
+    from .store.layout import resolve_root
+    from .ui.server import serve
+
+    try:
+        serve(resolve_root(args.dir), args.host, args.port, args.open)
+    except KeyboardInterrupt:
+        print("stopped")
+        return 0
+    except (OSError, OverflowError) as exc:
+        text = str(exc).strip()
+        line = text.splitlines()[0] if text else type(exc).__name__
+        print(f"agenticml ui: {line}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_du(args):
+    import json
+    from .store.gc import _format_bytes, usage
+    from .store.layout import resolve_root
+
+    root = resolve_root(args.dir)
+    report = usage(root)
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return 0
+
+    rows = [["RUN ID", "PROJECT/NAME", "STATUS", "SYNCED?", "RAW", "OVERVIEW", "MEDIA", "TOTAL"]]
+    for run in report.get("runs", []):
+        proj = run.get("project") or ""
+        name = run.get("name") or ""
+        label = f"{proj}/{name}" if (proj or name) else "-"
+        synced_str = "yes" if run.get("synced") else "no"
+        rows.append([
+            str(run.get("run_id", "")),
+            label,
+            str(run.get("status", "")),
+            synced_str,
+            _format_bytes(run.get("raw", 0)),
+            _format_bytes(run.get("overview", 0)),
+            _format_bytes(run.get("media", 0)),
+            _format_bytes(run.get("total", 0)),
+        ])
+
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    for row in rows:
+        print("  ".join(value.ljust(width) for value, width in zip(row, widths)).rstrip())
+
+    print()
+    print(f"Runs dir total:        {_format_bytes(report.get('runs_total', 0))}")
+    print(
+        f"Objects dir total:     {_format_bytes(report.get('objects_total', 0))} "
+        f"({report.get('unreferenced_count', 0)} unreferenced: {_format_bytes(report.get('unreferenced_total', 0))})"
+    )
+    print(f"Total store usage:     {_format_bytes(report.get('total', 0))}")
+    return 0
+
+
+def cmd_gc(args):
+    from .store.gc import _format_bytes, collect
+    from .store.layout import resolve_root
+
+    root = resolve_root(args.dir)
+    dry_run = getattr(args, "dry_run", False)
+    yes = getattr(args, "yes", False)
+    older_than = getattr(args, "older_than", None)
+    keep_last = getattr(args, "keep_last", None)
+    include_unsynced = getattr(args, "include_unsynced", False)
+
+    if not dry_run and not yes:
+        if not sys.stdin.isatty():
+            print(
+                "agenticml gc: confirmation required on non-interactive terminal (use --yes)",
+                file=sys.stderr,
+            )
+            return 2
+        preview = collect(
+            root,
+            older_than_days=older_than,
+            keep_last=keep_last,
+            include_unsynced=include_unsynced,
+            dry_run=True,
+        )
+        runs_count = preview["runs_deleted"]
+        runs_bytes = preview["runs_bytes_freed"]
+        objs_count = preview["objects_deleted"]
+        objs_bytes = preview["objects_bytes_freed"]
+        total_bytes = preview["total_bytes_freed"]
+        if runs_count == 0 and objs_count == 0:
+            print("No runs or objects eligible for garbage collection.")
+            return 0
+        print(
+            f"Would delete {runs_count} run(s) ({_format_bytes(runs_bytes)}) and "
+            f"{objs_count} unreferenced object(s) ({_format_bytes(objs_bytes)})."
+        )
+        print(f"Total space to free: {_format_bytes(total_bytes)}")
+        try:
+            answer = input("Proceed with garbage collection? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            return 1
+        if answer not in ("y", "yes"):
+            print("Aborted.")
+            return 0
+
+    report = collect(
+        root,
+        older_than_days=older_than,
+        keep_last=keep_last,
+        include_unsynced=include_unsynced,
+        dry_run=dry_run,
+    )
+    prefix = "Would delete" if dry_run else "Deleted"
+    print(
+        f"{prefix} {report['runs_deleted']} run(s) ({_format_bytes(report['runs_bytes_freed'])}) and "
+        f"{report['objects_deleted']} object(s) ({_format_bytes(report['objects_bytes_freed'])}). "
+        f"Total space freed: {_format_bytes(report['total_bytes_freed'])}"
+    )
+    return 0
 
 
 RUN_USAGE = """\
@@ -171,7 +235,7 @@ options:
   --group NAME         run group (env AGENTICML_GROUP)
   --job-type NAME      job type (env AGENTICML_JOB_TYPE)
   --mode MODE          local (default), offline (alias), or disabled (env AGENTICML_MODE)
-  --dir DIR            local journal root (env AGENTICML_DIR)
+  --dir DIR            local store root (default: $AGENTICML_DIR or ~/.agenticml)
   --no-auto-track      do not detect model/optimizer/loss/dataloader (env AGENTICML_AUTO_TRACK=0)
   --no-auto-metrics    do not log auto/loss, auto/lr, auto/epoch (env AGENTICML_AUTO_METRICS=0)
   --log-every N        log auto metrics every N optimizer steps (env AGENTICML_LOG_EVERY; default 1)
@@ -311,7 +375,7 @@ def _exec_interpreter(python, flags, raw_options, target):
     if probe.returncode != 0:
         print(
             f"agenticml: {resolved} has no agenticml with `run` support; "
-            f"install it there with `{resolved} -m pip install -U agenticml-py`",
+            f"install it there with `{resolved} -m pip install -U agenticml-lite`",
             file=sys.stderr,
         )
         return 1
@@ -366,13 +430,64 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     parser = argparse.ArgumentParser(prog="agenticml")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("run", help="Run a script inside a tracked run (see `agenticml run -h`)")
+    sub.add_parser("run", help="Run a Python script inside a tracked run")
 
-    p_sync = sub.add_parser("sync", help="Replay offline journals against a live server")
-    p_sync.add_argument("--dir", default=str(resolve_dir()), help="Local root (default: AGENTICML_DIR or ~/.agenticml)")
-    p_sync.add_argument("--host", default=None, help="Server base URL (default: AGENTICML_HOST)")
-    p_sync.add_argument("--api-key", default=None, help="API key (default: AGENTICML_API_KEY)")
+    p_ls = sub.add_parser("ls", help="List local runs newest first")
+    p_ls.add_argument("--dir", default=None, help="Local root (default: AGENTICML_DIR or ~/.agenticml)")
+    p_ls.add_argument("--project", default=None, help="Filter by project")
+    p_ls.add_argument("--json", action="store_true", help="Print run metadata as JSON")
+    p_ls.set_defaults(func=cmd_ls)
+
+    p_du = sub.add_parser("du", help="Show local run and object storage usage")
+    p_du.add_argument("--dir", default=None, help="Local root (default: AGENTICML_DIR or ~/.agenticml)")
+    p_du.add_argument("--json", action="store_true", help="Print usage totals as JSON")
+    p_du.set_defaults(func=cmd_du)
+
+    p_gc = sub.add_parser("gc", help="Garbage collect runs and unreferenced objects")
+    p_gc.add_argument("--dir", default=None, help="Local root (default: AGENTICML_DIR or ~/.agenticml)")
+    p_gc.add_argument("--older-than", type=float, metavar="DAYS", help="Only delete runs older than DAYS")
+    p_gc.add_argument("--keep-last", type=int, metavar="N", help="Keep the N newest runs per project")
+    p_gc.add_argument("--include-unsynced", action="store_true", help="Include unsynced runs (default: synced only)")
+    p_gc.add_argument("--dry-run", action="store_true", help="Show what would be deleted without deleting")
+    p_gc.add_argument("-y", "--yes", action="store_true", help="Confirm deletion without prompting")
+    p_gc.set_defaults(func=cmd_gc)
+
+    p_ui = sub.add_parser("ui", help="Serve the local run dashboard")
+    p_ui.add_argument("--dir", default=None, help="Local root (default: AGENTICML_DIR or ~/.agenticml)")
+    p_ui.add_argument("--host", default="127.0.0.1")
+    p_ui.add_argument("--port", type=int, default=6006)
+    p_ui.add_argument("--open", action="store_true", help="Open the dashboard in a browser")
+    p_ui.set_defaults(func=cmd_ui)
+
+    p_sync = sub.add_parser("sync", help="Incrementally upload local runs to a server")
+    p_sync.add_argument("run_ids", nargs="*", metavar="RUN_ID")
+    p_sync.add_argument("--all", action="store_true", help="Sync every incomplete or changed run")
+    p_sync.add_argument("--dir", default=None, help="Local root (default: AGENTICML_DIR or ~/.agenticml)")
+    p_sync.add_argument("--host", default=None, help="Server base URL")
+    p_sync.add_argument("--api-key", default=None, help="API key")
+    p_sync.add_argument("--watch", type=float, metavar="SECONDS", help="Repeat until all selected runs complete")
+    p_sync.add_argument("--dry-run", action="store_true", help="Show counts without sending or saving")
+    p_sync.add_argument("--prune", action="store_true", help="Delete raw series (.bin) with valid overviews after sync")
+    p_sync.add_argument("--reset", action="store_true", help="Clear saved remote run state for the given runs on this host")
+    p_sync.add_argument("--insecure", action="store_true", help="Allow http:// to a non-local host")
     p_sync.set_defaults(func=cmd_sync)
+
+    p_login = sub.add_parser("login", help="Validate and save an API key")
+    p_login.add_argument("--host", default=None, help="Server base URL")
+    p_login.add_argument("--key", default=None, help="API key (default: prompt or stdin)")
+    p_login.add_argument("--no-verify", action="store_true", help="Save without checking the server")
+    p_login.add_argument("--insecure", action="store_true", help="Allow http:// to a non-local host")
+    p_login.set_defaults(func=cmd_login)
+
+    p_logout = sub.add_parser("logout", help="Remove saved credentials for a host")
+    p_logout.add_argument("--host", default=None, help="Server base URL (default: saved default host)")
+    p_logout.set_defaults(func=cmd_logout)
+
+    p_whoami = sub.add_parser("whoami", help="Show the current host, key prefix, and validity")
+    p_whoami.add_argument("--host", default=None, help="Server base URL")
+    p_whoami.add_argument("--offline", action="store_true", help="Skip server verification")
+    p_whoami.add_argument("--insecure", action="store_true", help="Allow http:// to a non-local host")
+    p_whoami.set_defaults(func=cmd_whoami)
 
     args = parser.parse_args(argv)
     if args.cmd == "run":

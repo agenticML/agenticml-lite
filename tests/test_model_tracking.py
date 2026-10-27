@@ -17,28 +17,7 @@ from agenticml.model_tracking import (
     unwrap_model,
 )
 from agenticml.run import Run
-
-
-class _FakeClient:
-    def __init__(self):
-        self.uploads: list[tuple[dict, list]] = []
-        self.final_snapshot = None
-
-    def init_run(self, payload):
-        return "model-run"
-
-    def log_batch(self, items):
-        pass
-
-    def artifacts_exists(self, hashes):
-        return []
-
-    def upload_code(self, run_id, manifest_json, files):
-        self.uploads.append((json.loads(manifest_json), files))
-        return {"status": "ok"}
-
-    def finalize(self, run_id, summary, status="finished", snapshot_hash=None):
-        self.final_snapshot = snapshot_hash
+from agenticml.store import RunReader, RunWriter
 
 
 @pytest.fixture
@@ -225,12 +204,8 @@ def test_collector_skips_env_import_but_records_staged_copy(fake_repo: Path, tmp
 
 
 def test_track_model_runtime_run_uploads_staged_files(fake_repo: Path, monkeypatch):
-    from agenticml import run as run_mod
-
     entrypoint = fake_repo / "src" / "train.py"
     monkeypatch.setattr(sys, "argv", [str(entrypoint)])
-    fake = _FakeClient()
-    monkeypatch.setattr(run_mod, "make_client", lambda mode, **kwargs: fake)
 
     site_root = fake_repo / "vendor" / "lib" / "site-packages"
     _arch, model = _write_arch_module(site_root)
@@ -251,28 +226,22 @@ def test_track_model_runtime_run_uploads_staged_files(fake_repo: Path, monkeypat
     finally:
         sys.modules.pop("fakesarch.modeling", None)
 
-    assert fake.uploads
-    manifest, payload_files = fake.uploads[-1]
-    paths = {item["path"] for item in manifest["files"]}
+    manifest = RunReader(run.root, run.run_id).code_manifest()
+    paths = {item["path"] for item in manifest}
     assert "model/fakesarch/modeling.py" in paths
     assert MODEL_METADATA_PATH in paths
-    uploaded = {item["path"] for item in payload_files}
+    uploaded = {item["path"] for item in manifest}
     assert "model/fakesarch/modeling.py" in uploaded
     assert MODEL_METADATA_PATH in uploaded
     assert not any("site-packages" in path for path in paths)
 
 
 def test_stage_dir_removed_even_if_upload_fails(fake_repo: Path, monkeypatch):
-    from agenticml import run as run_mod
-
-    class BoomClient(_FakeClient):
-        def upload_code(self, run_id, manifest_json, files):
-            raise RuntimeError("upload failed")
-
+    def fail_code(self, manifest, files):
+        raise RuntimeError("store failed")
+    monkeypatch.setattr(RunWriter, "add_code", fail_code)
     entrypoint = fake_repo / "src" / "train.py"
     monkeypatch.setattr(sys, "argv", [str(entrypoint)])
-    fake = BoomClient()
-    monkeypatch.setattr(run_mod, "make_client", lambda mode, **kwargs: fake)
 
     site_root = fake_repo / "vendor" / "lib" / "site-packages"
     _arch, model = _write_arch_module(site_root)

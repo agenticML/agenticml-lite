@@ -248,3 +248,49 @@ def test_runtime_collector_excludes_site_packages_and_custom_venv(fake_repo):
     paths = {item.relative_path for item in files}
     assert not any("site-packages" in path for path in paths)
     assert not any(path.startswith("python-runtime/") for path in paths)
+
+
+def test_runtime_collector_excludes_agenticml_package(tmp_path, monkeypatch):
+    """A fake project that contains the package directory must not snapshot it."""
+    import agenticml
+    from agenticml.code_tracking import _agenticml_package_dir
+
+    project = tmp_path / "project"
+    package = project / "src" / "agenticml"
+    package.mkdir(parents=True)
+    init_py = package / "__init__.py"
+    init_py.write_text("marker = 1\n")
+    module_py = package / "helper.py"
+    module_py.write_text("marker = 2\n")
+    (project / "pyproject.toml").write_text("[project]\nname = 'demo'\n")
+    train = project / "train.py"
+    train.write_text("print('train')\n")
+    user = project / "user_lib.py"
+    user.write_text("marker = 3\n")
+    notes = project / "agenticml_notes.txt"
+    notes.write_text("keep\n")
+
+    monkeypatch.setattr(agenticml, "__file__", str(init_py))
+    _agenticml_package_dir.cache_clear()
+    loaded = types.ModuleType("fake_agenticml_helper")
+    loaded.__file__ = str(module_py)
+    sys.modules[loaded.__name__] = loaded
+    try:
+        collector = RuntimeFileCollector(entrypoint=train)
+        module_py.read_text()
+        user.read_text()
+        notes.read_text()
+        _manifest, files = collector.close()
+        paths = {item.relative_path for item in files}
+        assert paths >= {"train.py", "user_lib.py", "agenticml_notes.txt"}
+        assert not any(
+            path == "src/agenticml" or path.startswith("src/agenticml/") for path in paths
+        )
+
+        explicit = RuntimeFileCollector(entrypoint=train)
+        explicit.add_explicit(module_py)
+        _manifest, explicit_files = explicit.close()
+        assert "src/agenticml/helper.py" in {item.relative_path for item in explicit_files}
+    finally:
+        sys.modules.pop(loaded.__name__, None)
+        _agenticml_package_dir.cache_clear()
