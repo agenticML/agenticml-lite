@@ -57,15 +57,6 @@ def _unique(values):
     return list(dict.fromkeys(values))
 
 
-def _list_runs(root):
-    """Store adapter: keep reader API dependencies here and in _new_reader."""
-    return reader.list_runs(root)
-
-
-def _new_reader(root, run_id):
-    return reader.RunReader(root, run_id)
-
-
 def _json_safe(value):
     # The store intentionally preserves NaN/Inf; JSON clients need null gaps.
     if isinstance(value, float) and not math.isfinite(value):
@@ -174,7 +165,7 @@ class DashboardServer(ThreadingHTTPServer):
         # RunReader is thread-safe. Lock only the LRU map, not the read.
         with self.reader_lock:
             if run_id not in self.readers:
-                self.readers[run_id] = _new_reader(self.root, run_id)
+                self.readers[run_id] = reader.RunReader(self.root, run_id)
             self.readers.move_to_end(run_id)
             while len(self.readers) > 64:
                 self.readers.popitem(last=False)
@@ -299,7 +290,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/runs":
             fields = ("run_id", "project", "name", "created_at", "finished_at", "tags", "group")
             runs = []
-            for meta in _list_runs(self.server.root):
+            for meta in reader.list_runs(self.server.root):
                 if not isinstance(meta, dict):
                     continue
                 row = {k: meta.get(k) for k in fields}
@@ -406,6 +397,13 @@ def make_server(root, host="127.0.0.1", port=6006) -> ThreadingHTTPServer:
 
 def serve(root, host="127.0.0.1", port=6006, open_browser=False) -> None:
     """Serve until Ctrl-C. No subprocesses, background services or writes."""
+    if host not in _LOOPBACK_HOSTS:
+        try:
+            loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            loopback = False
+        if not loopback:
+            print("Warning: the UI has no authentication and exposes configs, env and code to the network.", flush=True)
     with make_server(root, host, port) as server:
         address, bound_port = server.server_address[:2]
         url = f"http://{_browser_host(address)}:{bound_port}"

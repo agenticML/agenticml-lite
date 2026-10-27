@@ -503,3 +503,18 @@ def test_launcher_captures_hydra_config(project):
         """,
     )
     assert proc.returncode == 0, proc.stderr
+
+
+@pytest.mark.parametrize("verbose", [False, True])
+def test_store_failure_prints_reason_to_stderr_and_runs_script(tmp_path, monkeypatch, capsys, verbose):
+    from agenticml.store import RunWriter
+    script = tmp_path / "train.py"
+    script.write_text('print("trained")\n')
+    def fail(*args, **kwargs):
+        raise OSError("store unavailable")
+    monkeypatch.setattr(RunWriter, "create", fail)
+    options = ["--verbose"] if verbose else []
+    assert cli.main(["run", *options, "--dir", str(tmp_path / "store"), str(script)]) == 0
+    captured = capsys.readouterr()
+    assert "trained" in captured.out
+    assert "agenticml: tracking disabled: store unavailable\n" in captured.err

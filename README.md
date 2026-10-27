@@ -70,7 +70,7 @@ Loss is unscaled under `GradScaler` and averaged over gradient-accumulation step
 
 A script that calls `agenticml.init()` joins the launcher's run. Exit 0 finishes as `finished`; any other exit finishes as `crashed`, with `_exit_code` and `_exception` in the summary. The script's exit code is preserved. SIGTERM finishes the run and exits 143.
 
-`examples/train_toy.py --explicit` is the same loop calling the Python API itself. See [examples/README.md](examples/README.md).
+The zero-code toy example captures config, code and system information, but no training metrics: its pure-Python loop has no framework hooks. `examples/train_toy.py --explicit` is the same loop calling the Python API itself to log metrics. See [examples/README.md](examples/README.md).
 
 ## Viewing
 
@@ -81,7 +81,7 @@ agenticml ui --open --port 6006 --host 127.0.0.1
 agenticml ls --project demo --json
 ```
 
-`agenticml ui` binds to `127.0.0.1` and port 6006. On loopback it answers only loopback `Host` headers. `--dir` selects the store (else `AGENTICML_DIR`, else `~/.agenticml`). `ls` prints run id, project, name, status, created time, and last step. A run still marked `running` is listed as `stale` once `meta.json` and `scalars/_time.bin` are both older than 120 seconds.
+`agenticml ui` binds to `127.0.0.1` and port 6006. On loopback it answers only loopback `Host` headers. `--dir` selects the store (else `AGENTICML_DIR`, else `~/.agenticml`). `ls` prints run id, project, name, status, created time, and last step. A run stays `running` while its lifetime lock is held, even when it logs infrequently. If the lock is free, it is shown as `crashed`; sync finalizes it with `_exit_reason: "process died"`. On filesystems without locking, mtimes older than 120 seconds are the fallback for `stale` status.
 
 ## Where data lives
 
@@ -103,7 +103,7 @@ The store root is `init(dir=...)`, else `AGENTICML_DIR`, else `~/.agenticml`. La
 
 New run ids look like `20261027T021500-ab12cd34` (UTC). Each scalar point is 8 bytes in `<id>.bin`. An overview is written at finish only when a series has more than 65,536 points, and it is at most 40 + 36×2048 = 73,768 bytes. Worst-case overview overhead is about 14% of the raw series (the 73,768-byte cap next to a 65,537-point `<id>.bin`); the share falls as the series grows, to about 0.6 B/pt past ~120,000 points. At or below 65,536 points the reader builds the overview from `<id>.bin` on demand. TensorBoard tfevents are ~51 B/pt, and the old JSONL journal was ~57 B/pt.
 
-Code snapshots and media are stored once, keyed by SHA-256. The same bytes logged again share one object. Default snapshot caps are 10 MB per file and 100 MB total. Media rows are kept as logged (one row per call). Artifacts are a path, size, and mtime unless `copy=True`, which hashes the bytes into `objects/`.
+Code snapshots and media are stored once, keyed by SHA-256. The same bytes logged again share one object. Default snapshot caps are 10 MB per file and 100 MB total. Media indexes retain at most 64 rows per key by default, thinning older rows as new media arrives (`AGENTICML_MEDIA_MAX_PER_KEY` overrides the cap). Artifacts are a path, size, and mtime unless `copy=True`, which hashes the bytes into `objects/`.
 
 ## Disk
 
@@ -115,7 +115,7 @@ agenticml gc --include-unsynced
 agenticml sync --all --prune
 ```
 
-`agenticml du` reports how much space the local store uses. `agenticml gc` removes runs. Only synced runs are eligible unless you pass `--include-unsynced`. `--older-than` and `--keep-last` narrow the set. `--dry-run` prints the plan and deletes nothing. `agenticml sync --prune` drops raw `<id>.bin` files for series that already have an overview; series of 65,536 points or fewer keep their `.bin` (≤ 512 KB each). A pruned run cannot be resumed. Agenticml warns when the store exceeds `AGENTICML_MAX_BYTES` (default 5 GiB).
+`agenticml du` reports how much space the local store uses. `agenticml gc` removes runs. Only synced runs are eligible unless you pass `--include-unsynced`. `--older-than` and `--keep-last` narrow the set. `--dry-run` prints the plan and deletes nothing. `agenticml sync --prune` drops raw `<id>.bin` files for series that already have an overview; series of 65,536 points or fewer keep their `.bin` (≤ 512 KB each). A pruned run cannot be resumed or synced to another host, or uploaded again after `sync --reset`. Unreferenced objects have a one-hour grace period before gc removes them. Agenticml warns when the store exceeds `AGENTICML_MAX_BYTES` (default 5 GiB).
 
 ## Upload
 
@@ -129,9 +129,9 @@ agenticml sync --all --watch 30 --dry-run
 agenticml sync RUN_ID --reset
 ```
 
-`login` checks the key (skip with `--no-verify`) and writes `~/.config/agenticml/credentials.json` at mode `0600`. The directory is `AGENTICML_CONFIG_DIR`, else `$XDG_CONFIG_HOME/agenticml`, else `~/.config/agenticml`. The default host is `https://api.agenticml.xyz`. `login` prompts for the key (`--key`, or stdin). `sync` takes the key from `--api-key`, then `AGENTICML_API_KEY`, then the file. `whoami` uses `AGENTICML_API_KEY`, then the file. `whoami --offline` skips the server check. `logout` removes the saved key for one host. On `login`, `whoami`, and `sync`, `--insecure` allows `http://` to a non-local host; localhost does not need it.
+`login` checks the key (skip with `--no-verify`) and writes `~/.config/agenticml/credentials.json` at mode `0600`. The directory is `AGENTICML_CONFIG_DIR`, else `$XDG_CONFIG_HOME/agenticml`, else `~/.config/agenticml`. The default host is `https://api.agenticml.xyz`. Use the `agenticml login` prompt to enter the key, or `AGENTICML_API_KEY` for sync. Avoid command-line `--key` / `--api-key`: their values are visible in `ps`. `login` also accepts stdin. `sync` takes the key from `--api-key`, then `AGENTICML_API_KEY`, then the file. `whoami` uses `AGENTICML_API_KEY`, then the file. `whoami --offline` skips the server check. `logout` removes the saved key for one host. On `login`, `whoami`, and `sync`, `--insecure` allows `http://` to a non-local host; localhost does not need it.
 
-Sync is incremental and resumable. A cursor in `runs/<id>/sync.json` stores scalar byte offsets and which code, media, and artifacts were sent. An interrupted sync retries at most the in-flight round. `--all` selects runs that are incomplete or changed. `--watch N` repeats every N seconds until every selected run has synced, failed permanently, or gone stale. `--dry-run` prints counts without sending or saving state. `--reset` clears the saved remote id for explicit run ids on this host, and it rejects `--all`.
+Sync is incremental and resumable. A cursor in `runs/<id>/sync.json` stores scalar byte offsets and which code, media, and artifacts were sent. An interrupted sync retries at most the in-flight batch. `--all` selects runs that are incomplete or changed. `--watch N` repeats every N seconds until every selected run has synced, failed permanently, or gone stale. `--dry-run` prints counts without sending or saving state. `--reset` clears the saved remote id for explicit run ids on this host, and it rejects `--all`.
 
 Uploaded: project, name, config, tags, notes, group, job type, env, git, the parent's remote id, finite scalar points, code files, media, artifacts, and the summary plus status at finalize. `copy=True` artifacts come from the object store. By-reference artifacts are read from the logged path when it is still a regular file with the same size and mtime.
 

@@ -144,10 +144,6 @@ class Client:
         body = res.json()
         return body["run_id"]
 
-    def log(self, payload):
-        res = self._send(self.session, "POST", f"{self.base_url}/log", json=payload)
-        res.raise_for_status()
-
     def log_batch(self, items):
         if not items:
             return

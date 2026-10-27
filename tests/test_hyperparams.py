@@ -95,3 +95,57 @@ def test_uninstall_restores_argparse():
     assert argparse.ArgumentParser.parse_known_args is not original
     hyperparams.uninstall_hyperparam_capture(run)
     assert argparse.ArgumentParser.parse_known_args is original
+
+
+def test_exact_secret_segments_and_camel_case():
+    public = {key: "keep" for key in ("tokenizer", "max_tokens", "author", "auth_mode", "use-auth", "monkey")}
+    secrets = {key: "hide" for key in ("hfToken", "apiKey", "APIKey", "access_key", "privateKey",
+                                        "authToken", "client_secret", "pwd", "PAT", "credentials", "bearer")}
+    assert hyperparams.redact_config({**public, **secrets}) == {**public, **dict.fromkeys(secrets, "***")}
+
+
+@pytest.mark.parametrize("password", [["-p", "x"], ["-px"], ["-p=x"]])
+def test_parser_redacts_long_short_and_attached_values(capture, monkeypatch, password):
+    argv = ["--tokenizer", "vocab", "--max_tokens", "100", "--author", "me", "--auth_mode", "local",
+            "--api_key", "x", "--hf-token", "x", *password, "--db-password=x", "--use-auth", "positional"]
+    monkeypatch.setattr(sys, "argv", ["train.py", *argv])
+    parser = argparse.ArgumentParser()
+    for flag in ("tokenizer", "max_tokens", "author", "auth_mode", "api_key", "hf-token", "db-password"):
+        parser.add_argument("--" + flag)
+    parser.add_argument("-p", dest="password")
+    parser.add_argument("--use-auth", action="store_true")
+    parser.add_argument("position")
+    parser.parse_args()
+    assert capture.config["tokenizer"] == "vocab"
+    assert capture.config["max_tokens"] == "100"
+    assert capture.config["author"] == "me"
+    assert capture.config["auth_mode"] == "local"
+    assert capture.config["use_auth"] is True
+    assert capture.config["position"] == "positional"
+    for key in ("api_key", "hf_token", "password", "db_password"):
+        assert capture.config[key] == "***"
+    redacted_password = ["-p", "***"] if len(password) == 2 else ["-p=***"] if "=" in password[0] else ["-p***"]
+    assert capture.config["_argv"] == [*argv[:8], "--api_key", "***", "--hf-token", "***",
+                                       *redacted_password, "--db-password=***", "--use-auth", "positional"]
+
+
+def test_secret_boolean_flag_does_not_hide_position(capture, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["train.py", "--token", "position"])
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--token", action="store_true")
+    parser.add_argument("position")
+    parser.parse_args()
+    assert capture.config["_argv"] == ["--token", "position"]
+
+
+def test_no_parser_only_redacts_equals_values():
+    argv = ["--password", "position", "-psecret", "--token=x", "--max_tokens=10", "--auth_mode=local"]
+    assert hyperparams._redact_argv(argv) == [*argv[:3], "--token=***", *argv[4:]]
+
+
+def test_parser_redacts_all_values_of_multi_value_secret():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tokens", dest="credentials", nargs="+")
+    parser.add_argument("--epochs")
+    assert hyperparams._redact_argv(["--tokens", "a", "b", "--epochs", "2"], parser) == [
+        "--tokens", "***", "***", "--epochs", "2"]

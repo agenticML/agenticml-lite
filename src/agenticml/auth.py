@@ -69,10 +69,6 @@ def credentials_path() -> Path:
     return config_dir() / "credentials.json"
 
 
-def _legacy_credentials_path() -> Path:
-    return Path.home() / ".agenticml" / "credentials.json"
-
-
 def _posix() -> bool:
     return os.name != "nt" and hasattr(os, "getuid")
 
@@ -136,55 +132,9 @@ def _ignore_credentials(reason: str) -> dict:
     return {"hosts": {}}
 
 
-def _same_file(left: Path, right: Path) -> bool:
-    try:
-        return left.resolve() == right.resolve()
-    except OSError:
-        return False
-
-
-def _maybe_migrate(path: Path) -> dict | None:
-    """Copy ``~/.agenticml/credentials.json`` once. Leave the old file in place.
-
-    The legacy directory is also the data root and is often 0775 (umask 002).
-    The file itself must still be owned by the user and not group/world-writable.
-    """
-    legacy = _legacy_credentials_path()
-    if _same_file(legacy, path) or not legacy.is_file():
-        return None
-    if _posix():
-        try:
-            info = legacy.stat()
-            parent = legacy.parent.stat()
-        except OSError as exc:
-            return _ignore_credentials(f"{legacy} is not readable ({type(exc).__name__})")
-        if parent.st_uid != os.getuid():
-            return _ignore_credentials(
-                f"{legacy.parent} is not owned by you; chmod 700 {legacy.parent}"
-            )
-        if info.st_uid != os.getuid():
-            return _ignore_credentials(
-                f"{legacy} is not owned by you; chmod 700 {legacy.parent}"
-            )
-        if stat.S_IMODE(info.st_mode) & 0o022:
-            return _ignore_credentials(
-                f"{legacy} is group- or world-writable; chmod 700 {legacy.parent}"
-            )
-    data = _parse_credentials(legacy)
-    write_credentials(data)
-    print(
-        f"agenticml: copied credentials to {path}; you can delete {legacy}",
-        file=sys.stderr,
-    )
-    return data
-
-
 def read_credentials() -> dict:
     path = credentials_path()
     if not path.exists():
-        migrated = _maybe_migrate(path)
-        if migrated is not None:
-            return migrated
         return {"hosts": {}}
     if _posix():
         for candidate in (path.parent, path):

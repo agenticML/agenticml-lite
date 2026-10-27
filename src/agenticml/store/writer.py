@@ -66,28 +66,12 @@ MEDIA_MAX_PER_KEY = 64
 MEDIA_MAX_PX = 1024
 
 
-def _media_max_per_key() -> int:
-    env = os.environ.get("AGENTICML_MEDIA_MAX_PER_KEY")
-    if env is not None:
-        try:
-            val = int(env)
-            if val > 0:
-                return val
-        except (ValueError, TypeError):
-            pass
-    return MEDIA_MAX_PER_KEY
-
-
-def _media_max_px() -> int:
-    env = os.environ.get("AGENTICML_MEDIA_MAX_PX")
-    if env is not None:
-        try:
-            val = int(env)
-            if val > 0:
-                return val
-        except (ValueError, TypeError):
-            pass
-    return MEDIA_MAX_PX
+def _media_limit(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, default))
+        return value if value > 0 else default
+    except (ValueError, TypeError):
+        return default
 
 
 def _downscale_image(data: bytes, content_type: str) -> tuple[bytes, str]:
@@ -98,10 +82,7 @@ def _downscale_image(data: bytes, content_type: str) -> tuple[bytes, str]:
     except ImportError:
         return data, content_type
 
-    max_px = _media_max_px()
-    if max_px <= 0:
-        return data, content_type
-
+    max_px = _media_limit("AGENTICML_MEDIA_MAX_PX", MEDIA_MAX_PX)
     try:
         import io
 
@@ -118,19 +99,7 @@ def _downscale_image(data: bytes, content_type: str) -> tuple[bytes, str]:
 
         buf_png = io.BytesIO()
         resized.save(buf_png, format="PNG")
-        png_data = buf_png.getvalue()
-
-        webp_data = None
-        try:
-            buf_webp = io.BytesIO()
-            resized.save(buf_webp, format="WEBP")
-            webp_data = buf_webp.getvalue()
-        except Exception:
-            webp_data = None
-
-        if webp_data is not None and len(webp_data) < len(png_data):
-            return webp_data, "image/webp"
-        return png_data, "image/png"
+        return buf_png.getvalue(), "image/png"
     except Exception as exc:
         logger.warning("could not downscale image: %s", exc)
         return data, content_type
@@ -423,7 +392,8 @@ class RunWriter:
             # Indexes before meta, so a crash mid-create is invisible to list_runs.
             writer._persist_index()
             writer._persist_media()
-            atomic_write(writer._meta_path, _meta_bytes(built))
+            writer._meta_data = _meta_bytes(built)
+            atomic_write(writer._meta_path, writer._meta_data)
             writer._meta = built
         except BaseException:
             writer.close()
@@ -464,9 +434,25 @@ class RunWriter:
         return writer
 
     def _acquire_run_lock(self) -> None:
-        self._run_lock = try_lock_run(self.run_dir)
-        if self._run_lock is None:
-            raise ValueError(f"run {self.run_id} is open in another process")
+        # Short shared reader probes can briefly block an exclusive lock.
+        for attempt in range(11):
+            self._run_lock = try_lock_run(self.run_dir)
+            if self._run_lock is not None:
+                self.heartbeat()
+                return
+            if attempt < 10:
+                time.sleep(0.05)
+        raise ValueError(f"run {self.run_id} is open in another process")
+
+    def heartbeat(self) -> None:
+        """Refresh liveness even when the trainer has no metrics to flush."""
+        with self._lock:
+            handle = self._run_lock
+            if handle is not None and not handle.closed and handle.owner_pid == os.getpid():
+                if os.utime in os.supports_fd:
+                    os.utime(handle.fileno())
+                else:
+                    os.utime(self.run_dir / "run.lock", follow_symlinks=False)
 
     def _release_run_lock(self) -> None:
         handle, self._run_lock = self._run_lock, None
@@ -758,7 +744,7 @@ class RunWriter:
             old_rows = list(rows)
             entry["id"] = self._next_media_id
             rows.append(entry)
-            max_entries = _media_max_per_key()
+            max_entries = _media_limit("AGENTICML_MEDIA_MAX_PER_KEY", MEDIA_MAX_PER_KEY)
             if len(rows) > max_entries:
                 thinned = rows[::2]
                 if thinned[-1] is not rows[-1]:
@@ -853,6 +839,9 @@ class RunWriter:
             self._fsync_dir(self.run_dir, "run")
             self._finished = True
             self._release_run_lock()
+            from .gc import record_finished_usage
+
+            record_finished_usage(self.root, self.run_id)
 
     def _check_open(self) -> None:
         if self._finished:
@@ -869,10 +858,11 @@ class RunWriter:
         new = dict(self._meta)
         new.update(updates)
         data = _meta_bytes(new)
-        if data == _meta_bytes(self._meta):
+        if data == self._meta_data:
             return
         atomic_write(self._meta_path, data, fsync=fsync)
         self._meta = new
+        self._meta_data = data
 
     def _persist_index(self) -> None:
         series = {
@@ -1114,6 +1104,7 @@ class RunWriter:
         if not isinstance(created, str):
             raise ValueError(f"run {self.run_id} has no created_at")
         self._meta = raw
+        self._meta_data = _meta_bytes(raw)
         self._created_at_unix = parse_timestamp(created).timestamp()
         self._c(self._scalars).mkdir(parents=True, exist_ok=True)
         self._c(self.run_dir / MEDIA_DIRNAME).mkdir(parents=True, exist_ok=True)

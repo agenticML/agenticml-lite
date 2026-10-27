@@ -244,6 +244,8 @@ def test_collect_never_follows_symlinks(tmp_path):
 
 def test_check_budget(tmp_path, monkeypatch):
     # Empty store: usage is small
+    import agenticml.store.gc as gc
+    gc._refresh_usage(tmp_path)
     warn = check_budget(tmp_path)
     assert warn is None
 
@@ -263,6 +265,7 @@ def test_check_budget(tmp_path, monkeypatch):
     data["computed_at"] = time.time() - 90000  # older than 1 day
     usage_file.write_text(json.dumps(data))
 
+    gc._refresh_usage(tmp_path)
     warn = check_budget(tmp_path)
     assert warn is not None
     assert "exceeds budget" in warn
@@ -328,10 +331,11 @@ def test_collect_skips_locked_stale_run(tmp_path, caplog):
     assert report["in_use"] == [writer.run_id]
     assert "in use" in caplog.text
     writer.close()
+    os.utime(writer.run_dir / "run.lock", (1, 1))
     assert collect(tmp_path, include_unsynced=True)["runs_deleted"] == 1
 
 
-def test_collect_rechecks_status_after_lock(tmp_path, monkeypatch):
+def test_collect_rechecks_heartbeat_after_lock(tmp_path, monkeypatch):
     import agenticml.store.gc as gc_mod
     writer = RunWriter.create(tmp_path, run_id="resumed")
     writer.finish("finished")
@@ -345,8 +349,11 @@ def test_collect_rechecks_status_after_lock(tmp_path, monkeypatch):
         return handle
 
     monkeypatch.setattr(gc_mod, "try_lock_run", change_status)
-    assert collect(tmp_path, include_unsynced=True)["runs_deleted"] == 0
+    assert collect(tmp_path, include_unsynced=True, dry_run=False)["runs_deleted"] == 0
     assert writer.run_dir.exists()
+    os.utime(writer.run_dir / "run.lock", (1, 1))
+    assert collect(tmp_path, include_unsynced=True, dry_run=False)["runs_deleted"] == 1
+    assert not writer.run_dir.exists()
 
 
 @pytest.mark.parametrize("broken", ["meta.json", "events.jsonl", "media/index.json", "manifest", "missing", "oserror"])

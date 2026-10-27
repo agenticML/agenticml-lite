@@ -1,9 +1,8 @@
 """Local v1 run store.
 
-Training writes a directory under the asset root. A UI (later) and
-``agenticml sync`` (later) read it. Nothing in this package uploads, and
-WP2a does not wire it into ``Run`` — callers use ``RunWriter`` / ``RunReader``
-directly until WP2b.
+``Run`` writes through ``RunWriter`` under the asset root. The UI and
+``agenticml sync`` read those files through ``RunReader``. This package
+handles local storage; uploads live in the sync client.
 
 The byte layout is the contract in ``docs/FORMAT.md``.
 """

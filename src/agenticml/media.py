@@ -10,7 +10,6 @@ pattern (wrapper class with a `_to_upload` method) extends naturally.
 
 from __future__ import annotations
 
-import io
 import logging
 import mimetypes
 import os

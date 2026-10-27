@@ -459,7 +459,7 @@ must heal the remaining tail before writing, even within the same open writer.
 | Middle of an atomic replace | Dotfile temp; previous file intact | Reader opens the previous file. |
 | `finish` after `.ovw` files exist, before `meta.json` says finished | Status still `running` | Reader ignores `.ovw` and rebuilds from `.bin`. |
 | `finish` after meta is `finished` / `crashed`, before the `finish` event | Status is terminal; event may be absent | Trust `meta.json`. |
-| Exit without `finish` | `status` stays `running` | `list_runs` reports `stale` once meta and `_time.bin` are quiet (below). |
+| Exit without `finish` | `status` stays `running` | `list_runs` reports `crashed` when the lifetime lock is free and its heartbeat is at least 120 seconds old (below). |
 
 A `.bin` whose size is a multiple of 8 has no torn tail. Readers never
 repair files. Only the writer truncates, and only a torn tail, and only
@@ -471,14 +471,21 @@ Sync must persist `new_offset`, not the raw file size (the raw size includes
 a torn tail the cursor must not step into). `offset` itself must be a
 non-negative multiple of 8.
 
+Each sync pass snapshots every series' complete `.bin` length before its
+first request and reads only those prefixes. New keys and appended records
+wait for the next invocation (or `--watch` pass), so continuous training cannot
+keep a pass running forever. Each scalar round loads at most 200,000 records
+total across all keys.
+
 ## Who may write
 
 `RunWriter.create` and `resume` acquire an exclusive, non-blocking
 `fcntl.flock` on `<run_dir>/run.lock` before reading or changing run state.
 They hold the descriptor for the writer's lifetime, releasing it after a
 successful `finish`, on `close`, on failed create/resume, or at process exit.
-`close` releases ownership without marking the run finished. A locked resume
-raises `ValueError("run <id> is open in another process")`.
+`close` releases ownership without marking the run finished. A locked create or
+resume retries ten times over about 0.5 seconds (a reader's shared lock probe
+may be brief), then raises `ValueError("run <id> is open in another process")`.
 `layout.try_lock_run(run_dir)` uses the same file and returns a handle or
 `None` if held; `layout.unlock_run(handle)` releases it. GC and prune use
 these helpers to coordinate with resumed writers. Windows uses no-op locks
@@ -529,11 +536,21 @@ warning is logged and the directory name is used). Results are sorted
 by `created_at` descending, then `run_id` descending. Runs with a missing
 `created_at` sort last.
 
-`effective_status` is `stale` when `status == "running"` and the newest
-mtime of `meta.json` and `scalars/_time.bin` (if that file exists) is
-**strictly older than 120 seconds**. Otherwise it is the stored status.
-`finished` and `crashed` are never rewritten to `stale`. The comparison uses
-the wall clock, because mtime does.
+The writer refreshes the mtime of `run.lock` on create/resume and every flush
+interval, even without metrics or system sampling. For stored
+`status == "running"`, `effective_status` is `running` if the lock is held OR
+the heartbeat is less than 120 seconds old. A free lock alone does not prove
+death: NFS `local_lock=flock|all` can hide another client's lock. Only a free
+lock AND a heartbeat at least 120 seconds old yield `crashed`. If locking is
+unsupported (Windows, ENOLCK, ENOSYS, EOPNOTSUPP) or a probe fails, an old
+heartbeat yields `stale`; a fresh heartbeat still yields `running`. Missing
+heartbeats count as old; an unreadable heartbeat is treated conservatively as
+running. Bad lock files are logged once per run and probes never break listing.
+Readers probe without creating files or rewriting metadata. Sync takes the run
+lock and rechecks metadata and liveness before finalizing, retaining the lock
+through the request. It finalizes dead runs as `crashed`, preserving summary
+and adding `_exit_reason: "process died"`. Stale runs are never finalized.
+Stored `finished` and `crashed` statuses remain terminal.
 
 `series(key, max_points=1000, start=None, end=None)`:
 
@@ -572,7 +589,9 @@ the wall clock, because mtime does.
   .bin size)`. Any change drops the entry, so resume, a rewritten `.ovw`,
   or a pruned `.bin` is not served from the previous cache. A running
   series still extends its incremental overview by byte offset while the
-  file only grows.
+  file only grows. Each reader keeps at most 32 cached series in LRU order;
+  a terminal series retains only its parsed `.ovw`, replacing any incremental
+  overview built while it was running.
 
 Unknown series keys raise `KeyError` from `series` and `read_records`.
 `media(key)` returns `[]` when the key has no rows. `media()` with no key
@@ -596,9 +615,12 @@ The store maintains a cached `<root>/usage.json` file:
 ```
 
 - `check_budget(root)` reads `<root>/usage.json`. If missing or older than 1 day
-  (86,400 seconds), it recomputes total store size cheaply by walking directory
-  trees with `os.scandir` (summing `st_size` with no hashing) and updates `usage.json`
-  atomically.
+  (86,400 seconds), it starts a daemon to walk directory trees with `os.scandir`
+  (summing `st_size` without hashing), update the cache atomically, and return
+  immediately. A subsequent check can warn from the refreshed cache.
+- `finish` adds the run directory's size delta to the cached total. The cache
+  also stores per-run sizes in `runs` to avoid counting resumed runs twice;
+  this update preserves `computed_at` so a full refresh still runs daily.
 - If total usage exceeds `AGENTICML_MAX_BYTES` (default 5 GiB, 5,368,709,120 bytes),
   it returns a warning string suggesting `agenticml du`, `agenticml gc`, or
   `agenticml sync --prune`.
@@ -616,7 +638,8 @@ The store maintains a cached `<root>/usage.json` file:
     it in the report's `in_use` field, including a locked stale run.
   - By default, only fully-synced runs (where a host in `sync.json` has
     `complete: true` and `source_hash` equal to `store.gc.run_fingerprint(root, run_id)`)
-    are selected. `--include-unsynced` allows selecting unsynced runs.
+    are selected. `--include-unsynced` allows selecting unsynced runs and is
+    required for stale runs, whose heartbeat must be at least 120 seconds old.
   - `--keep-last N`: Protects the N newest runs per project from deletion.
   - `--older-than DAYS`: Protects runs newer than the specified age.
   - Symlinks are never followed during run directory traversal or deletion.

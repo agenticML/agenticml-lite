@@ -26,7 +26,7 @@ result built from it.
 
 from __future__ import annotations
 
-import errno
+from collections import OrderedDict
 import json
 import logging
 import math
@@ -48,6 +48,7 @@ from .layout import (
     TIME_BIN_NAME,
     contained,
     is_symlink_error,
+    is_run_locked,
     load_events,
     open_nofollow,
     read_file_nofollow,
@@ -59,9 +60,7 @@ from .overview import Overview
 
 logger = logging.getLogger("agenticml.store.reader")
 
-# A run still marked running whose meta and _time.bin have not been touched
-# for this long is treated as abandoned. Wall clock, because that is what
-# mtime is.
+# A free lock alone cannot establish death across NFS clients.
 STALE_AFTER_SECONDS = 120
 
 _DONE = frozenset({"finished", "crashed"})
@@ -98,9 +97,7 @@ def run_references(root, run_id: str) -> dict[str, set[str]]:
                 raise ValueError(f"invalid {kind} digest in run {run_id}")
             refs[kind].add(sha)
 
-    for key, rows in media.items():
-        if key == "_next_id" and type(rows) is int:
-            continue  # Accept indexes that persist their counter explicitly.
+    for rows in media.values():
         if not isinstance(rows, list):
             raise ValueError(f"invalid media rows in run {run_id}")
         for row in rows:
@@ -127,10 +124,9 @@ def list_runs(root) -> list[dict]:
 
     Only ``meta.json`` is parsed. Directories whose names are not run ids,
     and runs whose meta is missing, corrupt, or symlinked, are skipped.
-    ``run_id`` is set to the directory name; if meta.json differs, a warning
-    is logged once. ``effective_status`` is ``stale`` when ``status`` is
-    ``running`` and the newest mtime of ``meta.json`` and ``scalars/_time.bin``
-    is older than :data:`STALE_AFTER_SECONDS`; otherwise it is the stored status.
+    ``run_id`` is set to the directory name; mismatches are logged once.
+    Running runs need both a free lock and an old heartbeat to be crashed.
+    An unknown lock with an old heartbeat indicates a stale run.
     """
     root_path = Path(root).expanduser().resolve()
     runs_root = str(root_path / "runs")
@@ -187,27 +183,25 @@ def _run_sort_key(meta: dict) -> tuple:
     return (created, run_id)
 
 
-def _effective_status(meta: dict, meta_path: str, run_path: str, now: float) -> str:
+def _effective_status(meta: dict, meta_path: str, run_path: str, now: float, *, lock=None) -> str:
     status = meta.get("status")
     if not isinstance(status, str):
         status = ""
     if status != "running":
         return status
+    locked = (False if lock.locking_supported else None) if lock is not None else is_run_locked(Path(run_path))
+    if locked:
+        return "running"
     try:
-        st_meta = os.lstat(meta_path)
-        newest = 0 if stat.S_ISLNK(st_meta.st_mode) else st_meta.st_mtime
+        heartbeat = os.lstat(f"{run_path}/run.lock")
+        age = now - heartbeat.st_mtime
+    except FileNotFoundError:
+        age = STALE_AFTER_SECONDS
     except OSError:
-        newest = 0
-    time_bin = f"{run_path}/{SCALARS_DIRNAME}/{TIME_BIN_NAME}"
-    try:
-        st_time = os.lstat(time_bin)
-        if not stat.S_ISLNK(st_time.st_mode):
-            newest = max(newest, st_time.st_mtime)
-    except OSError:
-        pass
-    if now - newest > STALE_AFTER_SECONDS:
-        return "stale"
-    return "running"
+        return "running"
+    if age < STALE_AFTER_SECONDS:
+        return "running"
+    return "crashed" if locked is False else "stale"
 
 
 def _bound(value):
@@ -378,8 +372,10 @@ class RunReader:
             raise FileNotFoundError(self._meta_path)
         if not self._meta_path.is_file():
             raise FileNotFoundError(self._meta_path)
-        # key -> ("ovw"|"inc", Overview, offset or point_count)
+        # key -> ("inc", Overview, byte offset); shares the 32-series LRU
+        # with parsed terminal overviews in _ovw_decision.
         self._cache: dict = {}
+        self._series_lru = OrderedDict()
         # key -> (token, overview or None). token is
         # (status, ovw size, ovw mtime_ns, bin size).
         self._ovw_decision: dict[str, tuple] = {}
@@ -430,6 +426,14 @@ class RunReader:
             ranked.append((series_id, key))
         ranked.sort()
         return [key for _series_id, key in ranked]
+
+    def record_sizes(self) -> dict:
+        """Snapshot complete scalar byte lengths for one bounded sync pass."""
+        sizes = {}
+        for key in self.keys():
+            size = _file_size(self._bin_path(_series_id(self._series_info(key))))
+            sizes[key] = size - size % RECORD_SIZE
+        return sizes
 
     def events(self) -> list:
         """Event objects. A torn last line is omitted; a bad earlier line is skipped."""
@@ -506,6 +510,21 @@ class RunReader:
             return []
         return list(RECORD_STRUCT.iter_unpack(data[:usable]))
 
+    def last_step(self) -> int | None:
+        """Last complete time record, without loading the time index."""
+        path = self._c(self.run_dir / SCALARS_DIRNAME / TIME_BIN_NAME)
+        try:
+            with open_nofollow(path) as handle:
+                size = os.fstat(handle.fileno()).st_size
+                complete = size - size % RECORD_SIZE
+                if complete < RECORD_SIZE:
+                    return None
+                handle.seek(complete - RECORD_SIZE)
+                data = handle.read(RECORD_SIZE)
+                return RECORD_STRUCT.unpack(data)[0] if len(data) == RECORD_SIZE else None
+        except FileNotFoundError:
+            return None
+
     def read_records(self, key: str, offset: int = 0, limit: int | None = None) -> tuple:
         """Raw records from a byte offset, for a sync cursor.
 
@@ -575,6 +594,12 @@ class RunReader:
         if start is not None and end is not None and start > end:
             return _empty(key)
         series_id = self._cached_series_id(key)
+        self._series_lru[key] = None
+        self._series_lru.move_to_end(key)
+        while len(self._series_lru) > 32:
+            evicted, _ = self._series_lru.popitem(last=False)
+            self._cache.pop(evicted, None)
+            self._ovw_decision.pop(evicted, None)
         path = self._bin_path(series_id)
         # Stat the prefix before reading monotonic. The writer clears the
         # flag before it appends an out-of-order record, so a flag that is
@@ -726,6 +751,7 @@ class RunReader:
             self._ovw_decision[key] = (token, None)
             return None
         if bin_count is None or overview.point_count == bin_count:
+            self._cache.pop(key, None)
             self._ovw_decision[key] = (token, overview)
             return overview
         if key not in self._mismatch_warned:

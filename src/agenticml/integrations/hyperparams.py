@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import functools
 import logging
+import re
 import sys
 import threading
 import weakref
@@ -70,14 +71,87 @@ def _active_run() -> Any:
     return run
 
 
-def merge_captured(values: dict[str, Any], *, argv: list[str] | None = None) -> None:
+_SECRET_SEGMENTS = {"token", "secret", "password", "passwd", "pwd", "credential", "credentials", "apikey", "bearer", "pat"}
+_SECRET_PAIRS = {("api", "key"), ("access", "key"), ("secret", "key"),
+                 ("private", "key"), ("auth", "token"), ("client", "secret")}
+
+
+def _secret_key(key):
+    name = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", str(key))
+    name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
+    segments = re.findall(r"[a-z0-9]+", name.lower())
+    return bool(_SECRET_SEGMENTS.intersection(segments) or
+                _SECRET_PAIRS.intersection(zip(segments, segments[1:])))
+
+
+def redact_config(value):
+    """Copy config, masking secret keys and command-line flag values."""
+    if isinstance(value, dict):
+        return {key: "***" if _secret_key(key) else
+                _redact_argv(child) if key == "_argv" and isinstance(child, (list, tuple)) else
+                redact_config(child) for key, child in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_config(child) for child in value]
+    return value
+
+
+def _redact_argv(argv, parser=None):
+    options = {}
+    def add_actions(parser):
+        for action in parser._actions:
+            for option in action.option_strings:
+                options[option] = action
+            if isinstance(action, argparse._SubParsersAction):
+                for child in action.choices.values():
+                    add_actions(child)
+    if parser is not None:
+        add_actions(parser)
+    clean = []
+    remaining = 0
+    for arg in argv:
+        if not isinstance(arg, str):
+            clean.append(arg)
+            continue
+        if arg == "--":
+            clean.append(arg)
+            remaining = 0
+            break
+        name, sep, value = arg.partition("=")
+        action = options.get(name)
+        attached = False
+        if action is None and arg.startswith("-") and not arg.startswith("--") and len(arg) > 2:
+            name = arg[:2]
+            action = options.get(name)
+            attached = action is not None and action.nargs != 0
+        if action is not None:
+            remaining = 0
+            secret = action.nargs != 0 and any(_secret_key(key) for key in [action.dest, *action.option_strings])
+            if secret:
+                if attached or sep:
+                    clean.append(name + ("=" if sep and not attached else "") + "***")
+                    continue
+                remaining = action.nargs if isinstance(action.nargs, int) else 1 if action.nargs in (None, "?") else float("inf")
+        elif remaining and (not arg.startswith("-") or re.match(r"^-\d", arg)):
+            clean.append("***")
+            remaining -= 1
+            continue
+        else:
+            remaining = 0
+        if parser is None and arg.startswith("--") and sep and _secret_key(name):
+            arg = name + "=***"
+        clean.append(arg)
+    clean.extend(argv[len(clean):])
+    return clean
+
+
+def merge_captured(values: dict[str, Any], *, argv: list[str] | None = None, parser=None) -> None:
     """Merge captured hyperparameters into the active run's config."""
     run = _active_run()
     if run is None:
         return
     explicit = getattr(run, "_explicit_config_keys", set())
     with _LOCK:
-        for key, value in values.items():
+        for key, value in redact_config(values).items():
             if not isinstance(key, str) or key in explicit:
                 continue
             if key in run.config and key not in _CAPTURED:
@@ -85,7 +159,7 @@ def merge_captured(values: dict[str, Any], *, argv: list[str] | None = None) -> 
             run.config[key] = _config_value(value)
             _CAPTURED.add(key)
         if argv is not None:
-            run.config["_argv"] = list(argv)
+            run.config["_argv"] = _redact_argv(argv, parser)
 
 
 def _config_value(value: Any) -> Any:
@@ -107,7 +181,7 @@ def _wrap_parse(original):
         # explicit lists are someone else's business.
         if args is None and not _called_from_skipped_library():
             try:
-                merge_captured(vars(result[0]), argv=sys.argv[1:])
+                merge_captured(vars(result[0]), argv=sys.argv[1:], parser=self)
             except Exception:
                 logger.debug("argparse capture failed", exc_info=True)
         return result

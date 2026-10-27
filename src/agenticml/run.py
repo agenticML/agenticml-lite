@@ -15,12 +15,7 @@ import weakref
 from datetime import date, datetime
 from pathlib import Path
 
-from .store import RunReader, RunWriter, check_budget
-
-try:
-    from .store import RunFinishedError
-except ImportError:  # export lands with all-or-nothing scalar writes
-    RunFinishedError = RuntimeError  # type: ignore[misc, assignment]
+from .store import RunReader, RunWriter, RunFinishedError, check_budget
 from .store.layout import resolve_root, valid_run_id
 from .code_tracking import (
     DEFAULT_MAX_FILE_BYTES,
@@ -65,8 +60,7 @@ _budget_warned = False
 def _warn_store_budget(root) -> None:
     """Warn once per process when a newly created run's store is over budget.
 
-    ``check_budget`` reads cached ``usage.json`` and walks the store only when
-    that cache is missing or older than a day.
+    ``check_budget`` reads cached usage and refreshes stale data in a daemon.
     """
     global _budget_warned
     message = check_budget(root)
@@ -233,7 +227,26 @@ class _RunLock:
         return getattr(self._local, "depth", 0) > 0
 
 
-class Run:
+class _StoreError(Exception):
+    pass
+
+
+class _RunType(type):
+    def __call__(cls, *args, **kwargs):
+        try:
+            return super().__call__(*args, **kwargs)
+        except _StoreError as exc:
+            from ._globals import _DisabledRun
+
+            logger.exception("could not create tracking store; tracking disabled")
+            run = _DisabledRun()
+            run._disabled_reason = (str(exc.__cause__ or exc).splitlines() or ["store unavailable"])[0]
+            if kwargs.get("verbose"):
+                print(f"agenticml: tracking disabled: {run._disabled_reason}")
+            return run
+
+
+class Run(metaclass=_RunType):
     def __init__(
         self,
         project,
@@ -282,7 +295,10 @@ class Run:
 
         self.mode = mode
         self.verbose = bool(verbose)
-        self.root = resolve_root(dir)
+        try:
+            self.root = resolve_root(dir)
+        except Exception as exc:
+            raise _StoreError() from exc
         if id is not None and not valid_run_id(id):
             raise ValueError(f"invalid run id: {id!r}")
         self.project = project
@@ -395,7 +411,10 @@ class Run:
         if id is not None:
             self.writer = RunWriter.resume(self.root, id, must=(resume == "must"))
         if self.writer is None:
-            self.writer = RunWriter.create(self.root, run_id=id, meta=meta)
+            try:
+                self.writer = RunWriter.create(self.root, run_id=id, meta=meta)
+            except Exception as exc:
+                raise _StoreError() from exc
             _warn_store_budget(self.root)
         else:
             previous = RunReader(self.root, id).meta()
@@ -1027,6 +1046,10 @@ class Run:
     def _flush_loop(self):
         try:
             while not self.stop_event.wait(self._flush_wait):
+                try:
+                    self.writer.heartbeat()
+                except Exception:
+                    logger.exception("failed to refresh run heartbeat")
                 self._flush()
             self._flush()
         except Exception:

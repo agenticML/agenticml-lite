@@ -1,6 +1,6 @@
 """On-disk locations and names for the v1 run store.
 
-Training writes only under a local root. A later UI and ``agenticml sync``
+Training writes only under a local root. The UI and ``agenticml sync``
 read those bytes back, so every path and id is checked before it is joined
 onto the root: a run id or content hash that came from a request must not be
 able to escape ``runs/`` or ``objects/``.
@@ -27,6 +27,9 @@ from pathlib import Path
 logger = logging.getLogger("agenticml.store.layout")
 
 _run_lock_handles = weakref.WeakSet()
+_lock_warning_emitted = False
+_probe_warned: set[str] = set()
+_LOCK_UNSUPPORTED = {errno.ENOLCK, errno.ENOSYS, errno.EOPNOTSUPP}
 
 
 def _close_inherited_run_locks() -> None:
@@ -223,6 +226,7 @@ def try_lock_run(run_dir: Path):
     """Take the run's non-blocking exclusive lifetime lock, or return None."""
     handle = open_nofollow(Path(run_dir) / "run.lock", "ab", buffering=0)
     handle.owner_pid = os.getpid()
+    handle.locking_supported = os.name != "nt"
     _run_lock_handles.add(handle)
     if os.name == "nt":
         # Windows: no-op locks; fcntl.flock is unavailable.
@@ -232,18 +236,59 @@ def try_lock_run(run_dir: Path):
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as exc:
-        handle.close()
-        if exc.errno in (errno.EACCES, errno.EAGAIN):
-            return None
-        raise
+        if exc.errno in _LOCK_UNSUPPORTED:
+            handle.locking_supported = False
+            _warn_lock_unsupported()
+        else:
+            handle.close()
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                return None
+            raise
     return handle
+
+
+def _warn_lock_unsupported() -> None:
+    global _lock_warning_emitted
+    if not _lock_warning_emitted:
+        _lock_warning_emitted = True
+        logger.warning("run locking is unsupported on this filesystem; continuing unlocked")
+
+
+def is_run_locked(run_dir: Path) -> bool | None:
+    """Probe without creating files; None if unsupported or unreadable."""
+    if os.name == "nt":
+        return None
+    import fcntl
+
+    try:
+        with open_nofollow(Path(run_dir) / "run.lock") as handle:
+            try:
+                # A shared probe conflicts with the writer's exclusive lock
+                # and works with a read-only descriptor on NFS.
+                fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EAGAIN):
+                    return True
+                if exc.errno in _LOCK_UNSUPPORTED:
+                    _warn_lock_unsupported()
+                    return None
+                raise
+            return False  # Closing releases this probe's lock.
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        path = str(run_dir)
+        if path not in _probe_warned:
+            _probe_warned.add(path)
+            logger.warning("could not probe run.lock in %s: %s", path, exc)
+        return None
 
 
 def unlock_run(handle) -> None:
     """Release a handle returned by try_lock_run (also safe for None)."""
     if handle is not None:
         try:
-            if not handle.closed and os.name != "nt" and os.getpid() == handle.owner_pid:
+            if not handle.closed and handle.locking_supported and os.getpid() == handle.owner_pid:
                 import fcntl
 
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)

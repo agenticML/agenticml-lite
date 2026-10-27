@@ -1,8 +1,10 @@
 """Incremental upload of the v1 local store, with a cursor per destination host."""
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
+import logging
 import math
 import mimetypes
 import os
@@ -17,13 +19,14 @@ from pathlib import Path
 import requests
 
 from .auth import resolve
+from .integrations.hyperparams import redact_config
 from .store.gc import prunable_series, prune_run, run_fingerprint
 from .store.layout import (
-    RECORD_SIZE, open_object, read_file_nofollow, resolve_root, try_lock_run, unlock_run,
+    RECORD_SIZE, _LOCK_UNSUPPORTED, open_object, read_file_nofollow, resolve_root, try_lock_run, unlock_run,
 )
 from .store.reader import RunReader, _effective_status, list_runs
 
-ROUND_RECORDS = 20_000
+ROUND_RECORDS = 200_000
 BATCH_ITEMS = 2_000
 CODE_FILES = 200
 CONFIG_FIELDS = ("config", "tags", "notes", "group", "job_type")
@@ -32,6 +35,7 @@ _MEDIA_STEP_MIN = -2**31
 _MEDIA_STEP_MAX = 2**31 - 1
 _TRANSIENT_STATUS = frozenset({408, 429})
 _ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\].*?(?:\x07|\x1b\\)|[@-Z\\-_])")
+_lock_warning_emitted = False
 
 
 def _hash(value) -> str:
@@ -106,7 +110,7 @@ def _config(meta):
     job_type = meta.get("job_type")
     if not isinstance(job_type, str):
         job_type = None
-    return {"config": cfg, "tags": tags, "notes": notes, "group": group, "job_type": job_type}
+    return {"config": redact_config(cfg), "tags": tags, "notes": notes, "group": group, "job_type": job_type}
 
 
 def _init_payload(meta):
@@ -246,6 +250,7 @@ def _clear_host_state(reader, host):
 
 
 def _acquire_lock(run_dir):
+    global _lock_warning_emitted
     if os.name == "nt":
         # Windows has no fcntl.flock; skip locking. Concurrent sync of one run
         # is not guarded there.
@@ -254,9 +259,16 @@ def _acquire_lock(run_dir):
     fd = os.open(run_dir / "sync.lock", os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except OSError as exc:
         os.close(fd)
-        return False
+        if exc.errno in _LOCK_UNSUPPORTED:
+            if not _lock_warning_emitted:
+                _lock_warning_emitted = True
+                logging.getLogger(__name__).warning("sync locking is unsupported on this filesystem; continuing unlocked")
+            return None
+        if exc.errno in (errno.EAGAIN, errno.EACCES):
+            return False
+        raise
     return fd
 
 
@@ -270,32 +282,12 @@ def _release_lock(lock):
         os.close(lock)
 
 
-def _current(reader, state):
-    return bool(state["complete"] and state.get("source_hash") == _source_hash(reader))
-
-
 def _code_token(item):
     return f"{item['path']}|{item['sha256']}"
 
 
-def _sent_code(state):
-    # Older sync state stored the sha alone. Ignore those entries: two paths
-    # with the same bytes must both be registered, and repeating a registration
-    # is harmless.
-    return {entry for entry in state.get("code") or []
-            if isinstance(entry, str) and "|" in entry}
-
-
 def _skipped_ids(state):
-    found = set()
-    for entry in state.get("skipped") or []:
-        if isinstance(entry, dict):
-            ident = entry.get("id")
-        else:
-            ident = entry
-        if isinstance(ident, str):
-            found.add(ident)
-    return found
+    return {entry["id"] for entry in state.get("skipped") or []}
 
 
 def _remember_skip(state, kind, ident, reason):
@@ -325,44 +317,21 @@ def _permanent_object_reason(exc):
 
 
 def _code_pending(manifest, state):
-    sent = _sent_code(state)
+    sent = set(state.get("code") or [])
     skipped = _skipped_ids(state)
     return [item for item in manifest
             if _code_token(item) not in sent and _code_token(item) not in skipped]
 
 
-def _media_identity(key, row, index):
-    """Stable checkpoint for one media row.
-
-    Entries written with an integer ``id`` use ``m:<id>`` so thinning the
-    index does not change identity. Older rows without ``id`` keep
-    ``key|step|sha|index``. Both retain legacy checkpoint compatibility.
-    """
-    media_id = row.get("id") if isinstance(row, dict) else None
-    legacy = f"{key}|{row.get('step')}|{row.get('sha256')}"
-    if type(media_id) is int and media_id >= 0:
-        return f"m:{media_id}", legacy
-    return f"{legacy}|{index}", legacy
-
-
 def _media_rows(reader):
     for key, rows in reader.media().items():
-        for index, row in enumerate(rows):
-            if not isinstance(row, dict):
-                continue
-            token, legacy = _media_identity(key, row, index)
-            yield token, legacy, index, key, row
+        for row in rows:
+            if isinstance(row, dict):
+                yield f"m:{row['id']}", key, row
 
 
-def _media_done(state, token, legacy, index):
-    media = state.get("media") or []
-    if token in media or token in _skipped_ids(state):
-        return True
-    if legacy and f"{legacy}|{index}" in media:
-        return True
-    # ID-bearing rows also accept the oldest unindexed checkpoint. Keep the
-    # first-row rule for rows that still rely on positional identities.
-    return bool(legacy and (token.startswith("m:") or index == 0) and legacy in media)
+def _media_done(state, token):
+    return token in (state.get("media") or []) or token in _skipped_ids(state)
 
 
 def _artifacts(reader):
@@ -473,7 +442,7 @@ def _prune_markers(reader):
     return hosts, flagged
 
 
-def _pruned_upload_block(reader, state):
+def _pruned_upload_block(reader, state, source_hash):
     """Refuse a fresh upload once raw scalar history is gone.
 
     The host that already stored the post-prune snapshot is left to the
@@ -485,7 +454,7 @@ def _pruned_upload_block(reader, state):
     if not flagged and not missing:
         return None
     if (state.get("remote_run_id") and state.get("complete")
-            and state.get("source_hash") == _source_hash(reader)):
+            and state.get("source_hash") == source_hash):
         return None
     if hosts:
         host = hosts[0]
@@ -502,8 +471,8 @@ def _pruned_upload_block(reader, state):
 
 
 def _media_pending(reader, state):
-    for token, legacy, index, _key, _row in _media_rows(reader):
-        if not _media_done(state, token, legacy, index):
+    for token, _key, _row in _media_rows(reader):
+        if not _media_done(state, token):
             return True
     return False
 
@@ -532,19 +501,12 @@ def _upload_pending(reader, state):
     )
 
 
-def _sync_idle(reader, state):
-    return _current(reader, state) and not _upload_pending(reader, state) \
-        and not _byref_restored(reader, state)
-
-
-def _read_window(reader, key, offset):
-    try:
-        records, end = reader.read_records(key, offset, limit=ROUND_RECORDS)
-    except TypeError:
-        records, end = reader.read_records(key, offset)
-        records = list(records[:ROUND_RECORDS])
-        end = min(end, offset + len(records) * RECORD_SIZE)
-    return list(records), end
+def _sync_idle(reader, state, source_hash):
+    return (state["complete"] and state.get("source_hash") == source_hash
+            and _effective_status(
+                reader.meta(), str(reader.run_dir / "meta.json"), str(reader.run_dir), time.time())
+                in ("finished", "crashed")
+            and not _upload_pending(reader, state) and not _byref_restored(reader, state))
 
 
 def _skip_nonfinite_heads(keys, loaded, indexes):
@@ -570,7 +532,7 @@ def _skip_nonfinite_heads(keys, loaded, indexes):
     return skipped
 
 
-def _scalar_batches(reader, remote_id, start_offsets):
+def _scalar_batches(reader, remote_id, start_offsets, sizes=None):
     """Yield ``(items, offsets, skipped_nonfinite)`` one server batch at a time.
 
     Each key is walked in file order. Same-step values are grouped only when
@@ -583,6 +545,8 @@ def _scalar_batches(reader, remote_id, start_offsets):
     ``(run, key, step)`` points, so the replay skews the aggregate. Saving
     after every accepted batch keeps the replay to that single batch.
     """
+    sizes = reader.record_sizes() if sizes is None else sizes
+    keys = list(sizes)
     offsets = {}
     for key, value in (start_offsets or {}).items():
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -590,13 +554,16 @@ def _scalar_batches(reader, remote_id, start_offsets):
         else:
             offsets[key] = value
     while True:
-        keys = list(reader.keys())
         for key in keys:
             offsets.setdefault(key, 0)
+        window = max(1, ROUND_RECORDS // max(1, len(keys)))
         loaded = {}
         progressed = False
+        remaining = ROUND_RECORDS
         for key in keys:
-            records, _end = _read_window(reader, key, offsets[key])
+            limit = min(window, remaining, max(0, (sizes[key] - offsets[key]) // RECORD_SIZE))
+            records, _end = reader.read_records(key, offsets[key], limit=limit) if limit else ([], offsets[key])
+            remaining -= len(records)
             loaded[key] = records
             progressed = progressed or bool(records)
         if not progressed:
@@ -633,8 +600,6 @@ def _scalar_batches(reader, remote_id, start_offsets):
             yield batch, offsets_now(), skipped_since_yield
         for key in keys:
             offsets[key] = offsets[key] + indexes[key] * RECORD_SIZE
-        if all(len(loaded[key]) < ROUND_RECORDS for key in keys):
-            return
 
 
 def _prune_synced_run(reader, state, save, result):
@@ -686,6 +651,7 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False):
     # State is read again under the lock so a peer cannot init between the
     # check and the POST.
     source_hash = _source_hash(reader)
+    sizes = reader.record_sizes()
     meta = reader.meta()
     result.label = f"{meta.get('project', '')}/{meta.get('name', '')}"
     state = _host_state(reader, host)
@@ -693,26 +659,14 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False):
         if not dry_run:
             _save_state(reader, host, state)
 
-    block = _pruned_upload_block(reader, state)
+    block = _pruned_upload_block(reader, state, source_hash)
     if block:
         result.failed = True
         result.permanent = True
         result.status = f"failed: {block}"
         return
 
-    # Upgrade legacy checkpoints even on the up-to-date path. Once a row has
-    # an ID, later thinning must not make it depend on its current index.
-    upgraded_media = False
-    skipped = _skipped_ids(state)
-    for token, legacy, index, _key, _row in _media_rows(reader):
-        if (token.startswith("m:") and token not in state["media"] and token not in skipped
-                and _media_done(state, token, legacy, index)):
-            state["media"].append(token)
-            upgraded_media = True
-    if upgraded_media:
-        save()
-
-    if _sync_idle(reader, state):
+    if _sync_idle(reader, state, source_hash):
         result.status = "up to date"
         result.complete = True
         if prune and not dry_run and not state.get("pruned"):
@@ -750,7 +704,7 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False):
     # See _scalar_batches: offsets move forward only for batches the server
     # accepted. A crash between that commit and the save below can still
     # duplicate the one unsaved batch.
-    for items, new_offsets, skipped in _scalar_batches(reader, remote_id, state["offsets"]):
+    for items, new_offsets, skipped in _scalar_batches(reader, remote_id, state["offsets"], sizes):
         if items and not dry_run:
             try:
                 client.log_batch(items)
@@ -803,17 +757,17 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False):
                 except requests.HTTPError as exc:
                     _note_missing_remote(exc, first_remote_request, host, reader.run_id)
                     raise
-            state["code"] = sorted(_sent_code(state) | {_code_token(item) for item in valid_items})
+            state["code"] = sorted(set(state.get("code") or []) | {_code_token(item) for item in valid_items})
             result.files += len(valid_items)
             save()
         else:
-            state["code"] = sorted(_sent_code(state) | {_code_token(item) for item in batch})
+            state["code"] = sorted(set(state.get("code") or []) | {_code_token(item) for item in batch})
             result.files += len(batch)
 
     # server: log_media and artifacts/register-version need an idempotency key.
     # A lost response is retried as a new upload and can duplicate the row.
-    for token, legacy, index, key, row in _media_rows(reader):
-        if _media_done(state, token, legacy, index):
+    for token, key, row in _media_rows(reader):
+        if _media_done(state, token):
             continue
         step = row.get("step")
         # media_events.step is a signed 32-bit integer.
@@ -895,57 +849,59 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False):
         result.artifacts += 1
         save()
 
-    current_meta = reader.meta()
-    effective = _effective_status(
-        current_meta, str(reader.run_dir / "meta.json"), str(reader.run_dir), time.time()
-    )
-    if effective == "stale":
-        result.stale = True
-        print("stale — not finalizing; resume or finish the run")
+    handle = try_lock_run(reader.run_dir)
+    try:
+        current_meta = reader.meta()
+        effective = "running" if handle is None else _effective_status(
+            current_meta, str(reader.run_dir / "meta.json"), str(reader.run_dir), time.time(), lock=handle
+        )
+        if effective == "running":
+            result.warnings.append("run is active")
+        if effective == "stale":
+            result.stale = True
+            print("stale — not finalizing; resume or finish the run")
 
-    terminal = current_meta.get("status") in ("finished", "crashed")
-    unchanged = source_hash == _source_hash(reader)
-    snapshot_hash = meta.get("snapshot_hash")
-    if not snapshot_hash:
-        lines = sorted(f"{item['path']}:{item['sha256']}" for item in manifest)
-        snapshot_hash = hashlib.sha256("\n".join(lines).encode()).hexdigest()
-    summary, summary_replacements = _json_safe(meta.get("summary") or {})
-    finalize_hash = _hash([meta.get("status"), meta.get("finished_at"), summary, snapshot_hash])
+        terminal = effective in ("finished", "crashed")
+        unchanged = source_hash == _source_hash(reader)
+        snapshot_hash = current_meta.get("snapshot_hash")
+        if not snapshot_hash:
+            lines = sorted(f"{item['path']}:{item['sha256']}" for item in manifest)
+            snapshot_hash = hashlib.sha256("\n".join(lines).encode()).hexdigest()
+        summary, summary_replacements = _json_safe(current_meta.get("summary") or {})
+        if effective == "crashed" and current_meta.get("status") == "running":
+            summary = {**summary, "_exit_reason": "process died"}
+        finalize_hash = _hash([effective, current_meta.get("finished_at"), summary, snapshot_hash])
 
-    def commit_finalize():
-        nonlocal first_remote_request
-        if not dry_run:
-            try:
-                client.finalize(remote_id, summary, status=meta["status"])
-                first_remote_request = False
-            except requests.HTTPError as exc:
-                _note_missing_remote(exc, first_remote_request, host, reader.run_id)
-                raise
-        result.replaced += summary_replacements
-        state["finalized"] = True
-        state["finalize_hash"] = finalize_hash
+        def commit_finalize():
+            nonlocal first_remote_request
+            if not dry_run:
+                try:
+                    client.finalize(remote_id, summary, status=effective)
+                    first_remote_request = False
+                except requests.HTTPError as exc:
+                    _note_missing_remote(exc, first_remote_request, host, reader.run_id)
+                    raise
+            result.replaced += summary_replacements
+            state["finalized"] = True
+            state["finalize_hash"] = finalize_hash
+            save()
+
+        if not terminal:
+            state["finalized"] = False
+        elif unchanged and (not state["finalized"] or state.get("finalize_hash") != finalize_hash):
+            commit_finalize()
+        # By-reference mismatches are listed in artifact_skips and do not block
+        # completion. Unreadable or missing objects stay pending and are retried.
+        # Permanent skips (range, sha mismatch, planted link) are listed in
+        # state["skipped"] so a later sync and du can show them without retrying.
+        state["source_hash"] = source_hash
+        pending = _upload_pending(reader, state)
+        state["complete"] = bool(terminal and state["finalized"] and unchanged and not pending)
         save()
-
-    if not terminal:
-        state["finalized"] = False
-    elif unchanged and (not state["finalized"] or (
-            "finalize_hash" in state and state["finalize_hash"] != finalize_hash)):
-        commit_finalize()
-    elif unchanged and state["finalized"] and "finalize_hash" not in state:
-        # No stored fingerprint: record the current one. Re-finalizing would
-        # only restamp finished_at, and nothing on disk has this shape outside tests.
-        state["finalize_hash"] = finalize_hash
-        save()
-    # By-reference mismatches are listed in artifact_skips and do not block
-    # completion. Unreadable or missing objects stay pending and are retried.
-    # Permanent skips (range, sha mismatch, planted link) are listed in
-    # state["skipped"] so a later sync and du can show them without retrying.
-    state["source_hash"] = source_hash
-    pending = _upload_pending(reader, state)
-    state["complete"] = bool(terminal and state["finalized"] and unchanged and not pending)
-    save()
-    result.complete = state["complete"]
-    result.status = "synced" if result.complete else "partial" if terminal else "partial (running)"
+        result.complete = state["complete"]
+        result.status = "synced" if result.complete else "partial" if terminal else "partial (running)"
+    finally:
+        unlock_run(handle)
     if prune and result.complete and not dry_run:
         _prune_synced_run(reader, state, save, result)
     if dry_run:
@@ -1048,7 +1004,7 @@ def _selected_ids(root, host, explicit, include_all, prune=False):
             try:
                 reader = RunReader(root, run_id)
                 state = _host_state(reader, host)
-                if _sync_idle(reader, state):
+                if _sync_idle(reader, state, _source_hash(reader)):
                     if not (prune and not state.get("pruned")):
                         continue
             except Exception:

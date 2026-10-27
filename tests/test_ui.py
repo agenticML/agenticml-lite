@@ -73,7 +73,7 @@ def load(dashboard,path):
 def test_routes(dashboard):
     runs = load(dashboard,'/api/runs')
     assert len(runs) == 1
-    assert runs[0]['status'] == 'running'
+    assert runs[0]['status'] == 'crashed'
     assert runs[0]['summary'] == {'loss':.5,'label':'ok'}
     assert set(runs[0]) == {'run_id','project','name','status','created_at','finished_at','tags','group','summary'}
     run = load(dashboard,'/api/runs/run-1')
@@ -195,12 +195,12 @@ def test_gzip_and_nonfinite(dashboard):
 
 def test_reader_reuse_and_incremental_updates(dashboard,monkeypatch):
     request, httpd, _, _ = dashboard
-    original=server._new_reader
+    original=reader.RunReader
     calls=[]
     def factory(root,run_id):
         calls.append(run_id)
         return original(root,run_id)
-    monkeypatch.setattr(server,'_new_reader',factory)
+    monkeypatch.setattr(reader,'RunReader',factory)
     load(dashboard,'/api/runs/run-1/scalars?max_points=10')
     with (httpd.root/'runs/run-1/scalars/0.bin').open('ab') as file:
         file.write(struct.pack('<If',120,.25))
@@ -232,7 +232,7 @@ def test_symlink_run_and_effective_status(dashboard, tmp_path):
     run=tmp_path/'runs'/'run-1'
     os.utime(run/'meta.json',(0,0))
     os.utime(run/'scalars'/'_time.bin',(0,0))
-    assert load(dashboard,'/api/runs')[0]['status'] == 'stale'
+    assert load(dashboard,'/api/runs')[0]['status'] == 'crashed'
 
 
 def test_accept_encoding_negotiation(dashboard):
@@ -478,3 +478,22 @@ def test_accepted_connection_has_timeout(tmp_path):
         httpd.shutdown()
         thread.join(timeout=5)
         httpd.server_close()
+
+
+@pytest.mark.parametrize('host,warn', [('0.0.0.0', True), ('::', True),
+                                      ('127.0.0.1', False), ('127.0.0.2', False),
+                                      ('localhost', False), ('::1', False)])
+def test_network_bind_warning(tmp_path, monkeypatch, capsys, host, warn):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    @contextmanager
+    def fake_server(*args):
+        yield SimpleNamespace(server_address=(host, 6006), serve_forever=lambda: None)
+
+    monkeypatch.setattr(server, 'make_server', fake_server)
+    server.serve(tmp_path, host)
+    output = capsys.readouterr().out
+    assert ('no authentication' in output) == warn
+    if warn:
+        assert 'configs, env and code' in output

@@ -456,10 +456,10 @@ def test_scalar_step_above_uint32_is_rejected(tmp_path, server, capsys, monkeypa
     writer = make_run(tmp_path, "bad", points=1)
     original = RunReader.read_records
 
-    def fake(self, key, offset=0):
+    def fake(self, key, offset=0, limit=None):
         if self.run_id == writer.run_id and offset == 0:
             return [(2**32, 1.0)], 8
-        return original(self, key, offset)
+        return original(self, key, offset, limit=limit)
 
     monkeypatch.setattr(RunReader, "read_records", fake)
     assert sync(tmp_path, writer.run_id) == 1
@@ -524,26 +524,6 @@ def test_run_changed_during_upload_is_not_finalized(tmp_path, server):
     assert state(writer)["complete"]
 
 
-def test_missing_finalize_hash_is_stored_without_refinalize(tmp_path, server):
-    writer = make_run(tmp_path)
-    assert sync(tmp_path, writer.run_id) == 0
-    meta_path = writer.run_dir / "meta.json"
-    meta = json.loads(meta_path.read_text())
-    meta["summary"] = {"best": 9}
-    meta_path.write_text(json.dumps(meta))
-    path = writer.run_dir / "sync.json"
-    saved = json.loads(path.read_text())
-    saved["hosts"][BASE].pop("finalize_hash")
-    path.write_text(json.dumps(saved))
-    before = len(server.calls)
-    assert sync(tmp_path, writer.run_id) == 0
-    assert len(server.calls) == before
-    assert state(writer)["complete"]
-    assert state(writer)["finalize_hash"]
-    meta["summary"] = {"best": 10}
-    meta_path.write_text(json.dumps(meta))
-    assert sync(tmp_path, writer.run_id) == 0
-    assert len(server.matching("/finalize")) == 2
 
 
 def _same_bytes_code(writer):
@@ -579,21 +559,6 @@ def test_same_bytes_at_two_paths_survive_a_batch_failure(tmp_path, server, monke
     assert server.init_count == 1
 
 
-def test_sha_only_code_entries_are_registered_again(tmp_path, server):
-    writer = make_run(tmp_path, finished=False, points=0)
-    blob = _same_bytes_code(writer)
-    digest = hashlib.sha256(blob).hexdigest()
-    writer.finish("finished")
-    assert sync(tmp_path, writer.run_id) == 0
-    path = writer.run_dir / "sync.json"
-    saved = json.loads(path.read_text())
-    saved["hosts"][BASE]["code"] = [digest]
-    path.write_text(json.dumps(saved))
-    before = len(server.bodies("/artifacts/register"))
-    assert sync(tmp_path, writer.run_id) == 0
-    paths = [item["path"] for body in server.bodies("/artifacts/register")[before:] for item in body["files"]]
-    assert set(paths) == {"a.py", "b.py"}
-    assert state(writer)["code"] == [f"a.py|{digest}", f"b.py|{digest}"]
 
 
 def test_duplicate_media_and_out_of_range_steps(tmp_path, server, capsys):
@@ -957,20 +922,43 @@ def test_lineage_ordering_parents_first(tmp_path, server):
     assert init_calls3[5]["parent_run_id"] == "remote-5"
 
 
-def test_stale_run_not_finalized_and_watch_stops(tmp_path, server, capsys, monkeypatch):
+def test_quiet_live_run_watch_waits_for_finish(tmp_path, server, capsys, monkeypatch):
     import agenticml.sync as sync_module
     writer = make_run(tmp_path, finished=False, points=1)
     old = time.time() - 200
     os.utime(writer.run_dir / "meta.json", (old, old))
     os.utime(writer.run_dir / "scalars" / "_time.bin", (old, old))
-
     slept = []
-    monkeypatch.setattr(sync_module.time, "sleep", lambda s: slept.append(s))
+
+    def sleep(seconds):
+        slept.append(seconds)
+        writer.finish("finished")
+
+    monkeypatch.setattr(sync_module.time, "sleep", sleep)
     assert sync(tmp_path, writer.run_id, extra=("--watch", "0.2")) == 0
-    output = capsys.readouterr().out
-    assert "stale — not finalizing; resume or finish the run" in output
-    assert not server.matching("/finalize")
-    assert slept == []  # Watch did not sleep; stopped waiting for stale run
+    assert slept == [0.2]
+    assert server.bodies("/finalize")[0]["status"] == "finished"
+
+
+def test_dead_run_finalizes_crashed_and_can_resume(tmp_path, server, monkeypatch):
+    import agenticml.sync as sync_module
+    writer = make_run(tmp_path, finished=False, points=1)
+    writer.set_summary({"best": 3})
+    writer.close()  # Same on-disk state and unlocked lifetime lock as SIGKILL.
+    os.utime(writer.run_dir / "run.lock", (0, 0))
+    before = (writer.run_dir / "meta.json").read_bytes()
+    monkeypatch.setattr(sync_module.time, "sleep", lambda _: pytest.fail("watch waited on dead run"))
+    assert sync(tmp_path, writer.run_id, extra=("--watch", "0.2")) == 0
+    assert server.bodies("/finalize") == [{"summary": {"best": 3, "_exit_reason": "process died"},
+                                           "status": "crashed"}]
+    assert state(writer)["complete"]
+    assert (writer.run_dir / "meta.json").read_bytes() == before
+    resumed = RunWriter.resume(tmp_path, writer.run_id, must=True)
+    assert sync(tmp_path, writer.run_id) == 0
+    assert not state(writer)["complete"]
+    resumed.finish("finished")
+    assert sync(tmp_path, writer.run_id) == 0
+    assert server.bodies("/finalize")[-1]["status"] == "finished"
 
 
 def test_watch_401_403_permanent_failure(tmp_path, server, capsys, monkeypatch):
@@ -1299,59 +1287,8 @@ def test_media_id_is_stable_across_thinning(tmp_path, server, monkeypatch):
     assert state(writer)["media"].count("m:0") == 1
 
 
-@pytest.mark.parametrize("unindexed", [False, True])
-@pytest.mark.parametrize("complete", [False, True])
-def test_media_with_id_accepts_and_upgrades_legacy_state(tmp_path, server, unindexed, complete):
-    writer = make_run(tmp_path, finished=False, points=0)
-    writer.add_media("preview", 1, b"a", "image/png", None)
-    writer.add_media("preview", 2, b"b", "image/png", None)
-    writer.finish("finished")
-    assert sync(tmp_path, writer.run_id) == 0
-    rows = RunReader(tmp_path, writer.run_id).media()["preview"]
-    legacy = [f"preview|{row['step']}|{row['sha256']}|{index}" for index, row in enumerate(rows)]
-    if unindexed:
-        legacy = [token.rsplit("|", 1)[0] for token in legacy]
-    path = writer.run_dir / "sync.json"
-    data = json.loads(path.read_text())
-    data["hosts"][BASE]["media"] = legacy
-    data["hosts"][BASE]["complete"] = complete
-    path.write_text(json.dumps(data))
-    before = len(server.calls)
-    assert sync(tmp_path, writer.run_id) == 0
-    assert len(server.calls) == before
-    assert set(state(writer)["media"]) == set(legacy) | {"m:0", "m:1"}
-    assert state(writer)["complete"] is True
-    assert sync(tmp_path, writer.run_id) == 0
-    assert len(server.calls) == before
-    assert state(writer)["media"].count("m:0") == 1
-    assert state(writer)["media"].count("m:1") == 1
 
 
-def test_media_without_id_keeps_the_legacy_checkpoint(tmp_path, server):
-    writer = make_run(tmp_path, finished=False, points=0)
-    writer.add_media("preview", 1, b"a", "image/png", None)
-    writer.add_media("preview", 2, b"b", "image/png", None)
-    path = writer.run_dir / "media" / "index.json"
-    data = json.loads(path.read_text())
-    for row in data["preview"]:
-        row.pop("id", None)
-    path.write_text(json.dumps(data))
-    writer.finish("finished")
-    assert sync(tmp_path, writer.run_id) == 0
-    tokens = state(writer)["media"]
-    assert any(token.endswith("|0") for token in tokens)
-    assert any(token.endswith("|1") for token in tokens)
-    legacy = next(token[:-2] for token in tokens if token.endswith("|0"))
-    saved = json.loads((writer.run_dir / "sync.json").read_text())
-    saved["hosts"][BASE]["media"] = [legacy]
-    (writer.run_dir / "sync.json").write_text(json.dumps(saved))
-    before = len(server.matching("/log_media"))
-    assert sync(tmp_path, writer.run_id) == 0
-    assert len(server.matching("/log_media")) == before + 1
-    again = state(writer)["media"]
-    assert legacy in again
-    assert any(token.endswith("|1") for token in again)
-    assert not any(token.endswith("|0") for token in again)
 
 
 def test_missing_media_object_stays_incomplete(tmp_path, server):
@@ -1398,3 +1335,102 @@ def test_acknowledged_scalar_prefix_is_not_resent(tmp_path, server, monkeypatch)
     ]
 
 
+
+
+def test_sync_redacts_config_and_argv_from_existing_store(tmp_path, server):
+    writer = make_run(tmp_path, finished=False, points=0)
+    writer.set_config({"api_key": "local-secret", "nested": {"authToken": "hidden", "lr": 0.1},
+                       "_argv": ["--password=abc", "--credential", "def", "--epochs", "5"]})
+    writer.finish("finished")
+    assert sync(tmp_path, writer.run_id) == 0
+    config = server.bodies("/init")[0]["config"]
+    assert config == {"api_key": "***", "nested": {"authToken": "***", "lr": 0.1},
+                      "_argv": ["--password=***", "--credential", "def", "--epochs", "5"]}
+    resumed = RunWriter.resume(tmp_path, writer.run_id, must=True)
+    resumed.set_config({"secret": "new-secret", "lr": 0.2})
+    resumed.finish("finished")
+    assert sync(tmp_path, writer.run_id) == 0
+    assert server.bodies("/config", "PATCH")[-1]["config"] == {"secret": "***", "lr": 0.2}
+
+
+def test_sync_reuses_fingerprint_within_unchanged_step(tmp_path, server, monkeypatch):
+    import agenticml.sync as sync_module
+    writer = make_run(tmp_path)
+    original = sync_module.run_fingerprint
+    calls = []
+
+    def fingerprint(*args):
+        calls.append(args)
+        return original(*args)
+
+    monkeypatch.setattr(sync_module, "run_fingerprint", fingerprint)
+    assert sync(tmp_path, writer.run_id) == 0
+    assert len(calls) == 2  # Start snapshot and the check after upload.
+    calls.clear()
+    assert sync(tmp_path, writer.run_id) == 0
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_finalize_holds_run_lock(tmp_path, server, terminal):
+    from agenticml.store.layout import is_run_locked
+    writer = make_run(tmp_path, finished=terminal, points=1)
+    if not terminal:
+        writer.close()
+        os.utime(writer.run_dir / "run.lock", (0, 0))
+    checked = []
+    def finalize(request):
+        assert is_run_locked(writer.run_dir) is True
+        checked.append(True)
+        return 200, {}, "{}"
+    server.mock.remove(responses.POST, re.compile(re.escape(BASE) + r"/runs/[^/]+/finalize$"))
+    server.mock.add_callback(responses.POST, re.compile(re.escape(BASE) + r"/runs/[^/]+/finalize$"), callback=finalize)
+    assert sync(tmp_path, writer.run_id) == 0
+    assert checked == [True]
+    assert is_run_locked(writer.run_dir) is False
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_resume_before_finalize_lock_skips_active_run(tmp_path, server, monkeypatch, capsys, terminal):
+    import agenticml.sync as sync_module
+    writer = make_run(tmp_path, finished=terminal, points=1)
+    if not terminal:
+        writer.close()
+        os.utime(writer.run_dir / "run.lock", (0, 0))
+    original = sync_module.try_lock_run
+    resumed = []
+    def acquire(directory):
+        resumed.append(RunWriter.resume(tmp_path, writer.run_id, must=True))
+        return original(directory)
+    monkeypatch.setattr(sync_module, "try_lock_run", acquire)
+    try:
+        assert sync(tmp_path, writer.run_id) == 0
+        assert "run is active" in capsys.readouterr().out
+        assert not server.matching("/finalize")
+        assert not state(writer)["complete"]
+    finally:
+        for run in resumed:
+            run.close()
+
+
+def test_sync_snapshots_scalar_sizes_before_requests(tmp_path, server, monkeypatch):
+    import agenticml.sync as sync_module
+    monkeypatch.setattr(sync_module, "ROUND_RECORDS", 4)
+    writer = make_run(tmp_path, finished=False, points=4)
+    # Every upload adds a full round for every key. Reading a moving EOF would
+    # never terminate. The assertion bounds failures without hanging pytest.
+    calls = []
+    def append(request):
+        calls.append(True)
+        assert len(calls) <= 2
+        writer.write_scalars([(step, {"loss": float(step), "acc": 0.5}) for step in range(4, 8)])
+        return 200, {}, "{}"
+    server.mock.remove(responses.POST, BASE + "/log/batch")
+    server.mock.add_callback(responses.POST, BASE + "/log/batch", callback=append)
+    try:
+        assert sync(tmp_path, writer.run_id) == 0
+        assert len(calls) == 2
+        assert state(writer)["offsets"] == {"loss": 32, "acc": 32}
+        assert not state(writer)["complete"]
+    finally:
+        writer.close()

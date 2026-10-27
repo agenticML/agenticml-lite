@@ -704,7 +704,7 @@ def test_incremental_overview_cache_reads_new_bytes(tmp_path):
     assert fresh["points"] == second["points"]
 
 
-def test_list_runs_order_skip_and_stale(tmp_path):
+def test_list_runs_order_skip_and_liveness(tmp_path):
     older = RunWriter.create(tmp_path, run_id="older-run", meta={"project": "p"})
     newer = RunWriter.create(tmp_path, run_id="newer-run", meta={"project": "p"})
     older.set_meta_fields(created_at="2020-01-01T00:00:00.000000Z")
@@ -729,7 +729,7 @@ def test_list_runs_order_skip_and_stale(tmp_path):
     os.utime(meta_path, (old, old))
     os.utime(time_bin, (old, old))
     by_id = {item["run_id"]: item for item in list_runs(tmp_path)}
-    assert by_id["older-run"]["effective_status"] == "stale"
+    assert by_id["older-run"]["effective_status"] == "running"
     os.utime(time_bin, None)
     by_id = {item["run_id"]: item for item in list_runs(tmp_path)}
     assert by_id["older-run"]["effective_status"] == "running"
@@ -744,7 +744,7 @@ def test_list_runs_order_skip_and_stale(tmp_path):
     quiet = RunWriter.create(tmp_path, run_id="quiet-run", meta={})
     os.utime(quiet.run_dir / "meta.json", (old, old))
     by_id = {item["run_id"]: item for item in list_runs(tmp_path)}
-    assert by_id["quiet-run"]["effective_status"] == "stale"
+    assert by_id["quiet-run"]["effective_status"] == "running"
     assert list_runs(tmp_path / "does-not-exist") == []
 
 
@@ -1756,7 +1756,7 @@ def test_media_downscale_pillow(tmp_path, monkeypatch):
     rows = writer._media["preview"]
     assert len(rows) == 1
     stored_entry = rows[0]
-    assert stored_entry["content_type"] in ("image/png", "image/webp")
+    assert stored_entry["content_type"] == "image/png"
 
     # Read back the stored object
     from agenticml.store import open_object
@@ -2187,3 +2187,24 @@ def test_shared_reference_extraction_includes_superseded_code(tmp_path):
         reader.referenced_shas()
     with pytest.raises(ValueError):
         run_usage(tmp_path, writer.run_id)
+
+
+def test_meta_update_serializes_once_and_skips_unchanged_write(tmp_path, monkeypatch):
+    import agenticml.store.writer as writer_module
+    writer = RunWriter.create(tmp_path)
+    original = writer_module._meta_bytes
+    calls = []
+
+    def serialize(meta):
+        calls.append(meta)
+        return original(meta)
+
+    monkeypatch.setattr(writer_module, '_meta_bytes', serialize)
+    writer.set_summary({'best': 0.2})
+    assert len(calls) == 1
+    path = writer.run_dir / 'meta.json'
+    before = path.stat().st_mtime_ns
+    writer.set_summary({'best': 0.2})
+    assert len(calls) == 2
+    assert path.stat().st_mtime_ns == before
+    writer.close()

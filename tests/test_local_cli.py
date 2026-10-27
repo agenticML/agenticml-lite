@@ -18,8 +18,8 @@ def test_ls_lists_newest_first_filters_and_handles_empty_runs(tmp_path, capsys):
     os.utime(second.run_dir / "meta.json", (stale, stale))
     assert cli.main(["ls", "--dir", str(tmp_path)]) == 0
     lines = capsys.readouterr().out.splitlines()
-    assert lines[1].startswith("second") and "stale" in lines[1] and lines[1].endswith("-")
-    assert lines[2].startswith("first") and "finished" in lines[2] and lines[2].endswith("10")
+    assert lines[1].startswith("second") and "running" in lines[1] and lines[1].endswith("-")
+    assert lines[2].startswith("first") and "finished" in lines[2] and lines[2].endswith("2")
     assert lines[-1] == "2 runs"
     cli.main(["ls", "--dir", str(tmp_path), "--project", "p"])
     filtered = capsys.readouterr().out

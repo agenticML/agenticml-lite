@@ -1142,9 +1142,11 @@ def test_budget_warning_on_create_not_resume_or_disabled(tmp_path, monkeypatch, 
     caplog.set_level(logging.WARNING, logger="agenticml.run")
     walks = {"n": 0}
     real_walk = gc._cheap_total_bytes
+    (tmp_path / "usage.json").write_text(json.dumps({"bytes": 100, "computed_at": time.time()}))
 
     def counting(path):
-        walks["n"] += 1
+        if path == tmp_path:
+            walks["n"] += 1
         return real_walk(path)
 
     monkeypatch.setattr(gc, "_cheap_total_bytes", counting)
@@ -1164,7 +1166,7 @@ def test_budget_warning_on_create_not_resume_or_disabled(tmp_path, monkeypatch, 
 
     first = open_run("create")
     try:
-        assert walks["n"] == 1
+        assert walks["n"] == 0
         assert sum("exceeds budget" in rec.getMessage() for rec in caplog.records) == 1
         assert (first.root / "usage.json").is_file()
     finally:
@@ -1174,7 +1176,7 @@ def test_budget_warning_on_create_not_resume_or_disabled(tmp_path, monkeypatch, 
     second = open_run("again")
     try:
         # Fresh usage.json: check_budget must not walk the store again.
-        assert walks["n"] == 1
+        assert walks["n"] == 0
         assert not any("exceeds budget" in rec.getMessage() for rec in caplog.records)
     finally:
         second.finish()

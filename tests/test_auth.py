@@ -22,8 +22,6 @@ def credentials(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTICML_DIR", str(tmp_path / "project-data"))
     monkeypatch.delenv("AGENTICML_HOST", raising=False)
     monkeypatch.delenv("AGENTICML_API_KEY", raising=False)
-    # Keep migration from reading a real ~/.agenticml/credentials.json.
-    monkeypatch.setattr(auth.Path, "home", lambda: tmp_path / "home")
     return auth.credentials_path()
 
 
@@ -320,47 +318,10 @@ def test_read_ignores_credentials_owned_by_someone_else(credentials, monkeypatch
     assert "not logged in" in capsys.readouterr().err
 
 
-def test_migrates_legacy_credentials_and_leaves_the_old_file(tmp_path, monkeypatch, capsys):
-    home = tmp_path / "home"
-    legacy_dir = home / ".agenticml"
-    legacy_dir.mkdir(parents=True)
-    os.chmod(legacy_dir, 0o775)
-    legacy = legacy_dir / "credentials.json"
-    payload = {"default_host": HOST, "hosts": {HOST: {"api_key": KEY}}}
-    legacy.write_text(json.dumps(payload) + "\n")
-    os.chmod(legacy, 0o600)
-    monkeypatch.setattr(auth.Path, "home", lambda: home)
-    assert main(["whoami", "--offline"]) == 0
-    captured = capsys.readouterr()
-    assert captured.err.count("\n") == 1
-    assert "you can delete" in captured.err
-    assert str(legacy) in captured.err
-    assert KEY not in captured.out + captured.err
-    assert "source=file" in captured.out
-    assert json.loads(legacy.read_text())["hosts"][HOST]["api_key"] == KEY
-    assert json.loads(credentials_text())["hosts"][HOST]["api_key"] == KEY
-    assert main(["whoami", "--offline"]) == 0
-    assert "delete" not in capsys.readouterr().err
 
 
-def credentials_text():
-    return auth.credentials_path().read_text()
 
 
-def test_migration_skips_group_writable_legacy_file(tmp_path, monkeypatch, capsys):
-    home = tmp_path / "home"
-    legacy_dir = home / ".agenticml"
-    legacy_dir.mkdir(mode=0o700, parents=True)
-    legacy = legacy_dir / "credentials.json"
-    legacy.write_text(json.dumps({"default_host": HOST, "hosts": {HOST: {"api_key": KEY}}}))
-    os.chmod(legacy, 0o664)
-    monkeypatch.setattr(auth.Path, "home", lambda: home)
-    assert auth.read_credentials() == {"hosts": {}}
-    assert not auth.credentials_path().exists()
-    err = capsys.readouterr().err
-    assert "writable" in err
-    assert KEY not in err
-    assert legacy.is_file()
 
 
 @pytest.mark.parametrize("bad", ["abc\r\nSECRET-value", "bad key", "a\x00b", "a\x7fb"])

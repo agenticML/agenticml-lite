@@ -126,14 +126,18 @@ def init(
             _active_run = _DisabledRun(verbose=verbose)
             return _active_run
 
-        _active_run = Run(
-            project=project,
-            name=name,
-            mode=resolved_mode,
-            dir=dir,
-            verbose=verbose,
-            **kwargs,
-        )
+        try:
+            _active_run = Run(
+                project=project,
+                name=name,
+                mode=resolved_mode,
+                dir=dir,
+                verbose=verbose,
+                **kwargs,
+            )
+        except Exception:
+            logger.exception("could not initialize tracking; tracking disabled")
+            _active_run = _DisabledRun()
         return _active_run
 
 

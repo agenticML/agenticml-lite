@@ -228,6 +228,8 @@ def _start_run(settings: RunSettings, resolved: _Resolved):
         logger.exception("agenticml: failed to start a run; running the script untracked")
         return None
     run._launcher_owned = True
+    if getattr(run, "_disabled_reason", None):
+        print(f"agenticml: tracking disabled: {run._disabled_reason}", file=sys.stderr)
     if settings.capture_args and getattr(run, "run_id", None) is not None:
         install_hyperparam_capture(run)
     return run

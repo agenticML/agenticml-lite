@@ -79,9 +79,7 @@ def cmd_ls(args):
         except (ValueError, TypeError):
             created = "-"
         try:
-            # One record per flush: never read scalar series for a listing.
-            times = RunReader(root, run["run_id"]).time_index()
-            last_step = max((step for step, _ in times), default=None)
+            last_step = RunReader(root, run["run_id"]).last_step()
         except (OSError, ValueError):
             last_step = None
         rows.append([

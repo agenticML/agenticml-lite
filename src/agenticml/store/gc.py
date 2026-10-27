@@ -9,6 +9,7 @@ import logging
 import os
 import stat
 import struct
+import threading
 import time
 from pathlib import Path
 
@@ -436,10 +437,10 @@ def collect(
         try:
             # Resume may have changed status after list_runs took its snapshot.
             meta = RunReader(root_path, run_id).meta()
-            eff = _effective_status(meta, str(r_dir / META_NAME), str(r_dir), time.time())
+            eff = _effective_status(meta, str(r_dir / META_NAME), str(r_dir), time.time(), lock=handle)
             if eff not in ("finished", "crashed", "stale") or run_id in protected_keep_last:
                 continue
-            if not include_unsynced and not _is_run_synced(r_dir):
+            if not include_unsynced and (eff == "stale" or not _is_run_synced(r_dir)):
                 continue
             if older_than_days is not None:
                 try:
@@ -559,48 +560,66 @@ def collect(
     }
 
 
+_usage_lock = threading.Lock()
+_usage_refreshing = set()
+
+
+def _write_usage(root, data):
+    atomic_write(root / "usage.json", json.dumps(data).encode("utf-8") + b"\n")
+
+
+def _refresh_usage(root):
+    try:
+        # Serialize refresh and finish adjustments so neither overwrites the other.
+        with _usage_lock:
+            sizes = {meta["run_id"]: _cheap_total_bytes(run_dir(root, meta["run_id"]))
+                     for meta in list_runs(root)}
+            _write_usage(root, {"bytes": _cheap_total_bytes(root), "computed_at": time.time(),
+                                "runs": sizes})
+    except Exception:
+        logger.debug("could not refresh store usage", exc_info=True)
+    finally:
+        _usage_refreshing.discard(root)
+
+
+def record_finished_usage(root, run_id):
+    """Add this run's size delta to the cache, without walking the store."""
+    try:
+        with _usage_lock:
+            try:
+                data = json.loads(read_file_nofollow(root / "usage.json"))
+            except FileNotFoundError:
+                data = {"bytes": 0, "computed_at": 0, "runs": {}}
+            sizes = data.setdefault("runs", {})
+            size = _cheap_total_bytes(run_dir(root, run_id))
+            data["bytes"] += size - sizes.get(run_id, 0)
+            sizes[run_id] = size
+            _write_usage(root, data)
+    except Exception:
+        logger.debug("could not update store usage", exc_info=True)
+
+
 def check_budget(root) -> str | None:
-    """Check whether local store usage exceeds AGENTICML_MAX_BYTES.
-
-    Reads cached <root>/usage.json (bytes total, computed_at). If missing or older than 1 day,
-    recomputes cheaply via os.scandir without hashing.
-    Returns a warning string suggesting 'agenticml du', 'agenticml gc', or 'agenticml sync --prune'
-    if over budget, else None.
-    """
+    """Read cached usage; refresh missing/stale data in a daemon, warn next time."""
     root_path = resolve_root(root)
-    usage_file = root_path / "usage.json"
-    now = time.time()
-    total_bytes = None
-
-    if usage_file.is_file() and not usage_file.is_symlink():
-        try:
-            raw = read_file_nofollow(usage_file)
-            data = json.loads(raw.decode("utf-8"))
-            if isinstance(data, dict):
-                computed_at = float(data.get("computed_at", 0))
-                if (now - computed_at) <= ONE_DAY_SECONDS and "bytes" in data:
-                    total_bytes = int(data["bytes"])
-        except Exception:
-            total_bytes = None
-
-    if total_bytes is None:
-        total_bytes = _cheap_total_bytes(root_path)
-        try:
-            atomic_write(
-                usage_file,
-                json.dumps({"bytes": total_bytes, "computed_at": now}, indent=2).encode("utf-8") + b"\n",
-            )
-        except Exception:
-            pass
+    try:
+        data = json.loads(read_file_nofollow(root_path / "usage.json"))
+        total_bytes = int(data["bytes"])
+        fresh = time.time() - float(data["computed_at"]) <= ONE_DAY_SECONDS
+    except Exception:
+        total_bytes, fresh = 0, False
+    if not fresh:
+        if root_path not in _usage_refreshing:
+            _usage_refreshing.add(root_path)
+            threading.Thread(target=_refresh_usage, args=(root_path,),
+                             name="agenticml-usage", daemon=True).start()
+        return None
 
     max_bytes = DEFAULT_MAX_BYTES
-    env_val = os.environ.get("AGENTICML_MAX_BYTES")
-    if env_val is not None:
-        try:
-            max_bytes = int(env_val)
-        except (ValueError, TypeError):
-            pass
-
+    try:
+        max_bytes = int(os.environ.get("AGENTICML_MAX_BYTES", max_bytes))
+    except (ValueError, TypeError):
+        pass
     if total_bytes > max_bytes:
         return (
             f"AgenticML local store usage ({_format_bytes(total_bytes)}) exceeds budget "

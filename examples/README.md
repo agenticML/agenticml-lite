@@ -4,7 +4,9 @@
 is optional and only used to log a small image).
 
 Zero-code tracking: the script never imports agenticml, and `agenticml run`
-captures its argparse hyperparameters, code and system metrics for you.
+captures its argparse config, code and system information for you. It captures
+no training metrics: this pure-Python loop has no framework hooks. Use explicit
+logging below to record the loop's loss and other metrics.
 
     agenticml run -- python examples/train_toy.py --lr 0.05 --epochs 5
 
