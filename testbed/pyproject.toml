@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agenticml-testbed"
+version = "0.1.0"
+description = "A tiny user's ML project exercising agenticml-lite"
+requires-python = ">=3.10"
+dependencies = ["agenticml-lite"]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "Pillow>=10", "psutil>=5.9", "playwright==1.62.0"]
+
+[tool.setuptools.packages.find]
+include = ["dummytrain*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "cli: console and launcher integration",
+  "ui: dashboard HTTP API",
+  "browser: browser dashboard tests (provided separately)",
+  "slow: optional longer-running checks",
+]
