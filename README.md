@@ -55,6 +55,27 @@ agenticml run -m mypkg.train --epochs 3
 agenticml run -- python examples/train_toy.py --lr 0.05 --epochs 5
 ```
 
+### Command forms
+
+There are several ways to write the same launch. All of them run the target in-process as `__main__` inside one tracked run. The `run` forms take agenticml options; the bare `agenticml python` form does not, so set `AGENTICML_*` environment variables there. They differ in how you name the interpreter and the target, so pick the one that matches how you already start training.
+
+| Form | Use it when | Equivalent to |
+| --- | --- | --- |
+| `agenticml run train.py [args]` | You just want to track a script with the current interpreter. Shortest form. | `agenticml run -- python train.py [args]` |
+| `agenticml run -m pkg.train [args]` | Your entry point is a module (`python -m pkg.train`), so relative imports and package layout keep working. | `agenticml run -- python -m pkg.train [args]` |
+| `agenticml run -- python train.py [args]` | You are wrapping an existing command line, for example from a Makefile, a shell script or a README. Swap `python` for `agenticml run --` and nothing else changes. | `agenticml python train.py [args]` |
+| `agenticml python train.py [args]` | You want the least typing and no `run` or `--`. It reads as "python, but tracked". Options come from `AGENTICML_*` variables. | `agenticml run -- python train.py [args]` |
+| `agenticml run --project demo -- python -u train.py` | You need Python flags (`-u`, `-X`, `-W`, ...) or a specific interpreter such as `python3.11` or a venv's `python`. Agenticml re-launches itself under that interpreter, so `agenticml-lite` must be installed there. | `agenticml python -u train.py` (options via env vars) |
+| `python -m agenticml run train.py` | `agenticml` is not on `PATH` (for example inside `torchrun`, `accelerate launch`, or a scheduler that takes a Python command). | `agenticml run train.py` |
+
+Rules that apply to every form:
+
+- Agenticml options (`--project`, `--name`, ...) must come before the script or module. Everything after the target is the script's own argv, passed through untouched.
+- With `run`, the `--` separator is optional when the target is a bare script or `-m` module. It is needed in front of `python ...` so that the options before it are not read as Python flags.
+- `python -c "..."` and reading the script from stdin are not supported. Put the code in a file.
+- Only Python targets are supported. To track a shell script, call `agenticml run -- python ...` from inside it.
+- Multi-GPU: launch as `torchrun ... -m agenticml run -- train.py`. Only rank 0 logs.
+
 Options go before the script; everything after it is the script's own argv. See `agenticml run -h`. `--project`, `--name`, `--tags`, `--notes`, `--group`, `--job-type`, `--mode`, `--dir`, and `--log-every` read `AGENTICML_PROJECT`, `AGENTICML_NAME`, `AGENTICML_TAGS`, `AGENTICML_NOTES`, `AGENTICML_GROUP`, `AGENTICML_JOB_TYPE`, `AGENTICML_MODE`, `AGENTICML_DIR`, and `AGENTICML_LOG_EVERY`. The off switches are in the table. `--verbose` has no variable.
 
 | What | Where it comes from | Turn off |
