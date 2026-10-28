@@ -60,8 +60,8 @@ def private_api(private_ui):
 
 @pytest.mark.parametrize("path,content_type", [
     ("/", "text/html"), ("/static/app.js", "text/javascript"),
-    ("/static/app.css", "text/css"), ("/static/uPlot.iife.min.js", "text/javascript"),
-    ("/static/uPlot.min.css", "text/css"), ("/static/uPlot.LICENSE", "text/plain"),
+    ("/static/app.css", "text/css"), ("/static/charts.js", "text/javascript"),
+    ("/static/code.js", "text/javascript"),
 ])
 def test_static_files_and_etags(api, path, content_type):
     response = api(path)
@@ -172,6 +172,8 @@ def test_image_object(api, ui_server):
     ("/api/runs/.hidden", 400), ("/api/runs/bad%5Cid", 400),
     ("/api/runs/unknown-valid-id", 404), ("/api/runs/unknown-valid-id/scalars", 404),
     ("/unknown", 404), ("/static/missing.js", 404),
+    ("/static/uPlot.iife.min.js", 404), ("/static/uPlot.min.css", 404),
+    ("/static/uPlot.LICENSE", 404),
     ("/api/objects/bad", 400), ("/api/objects/" + "a" * 64, 404),
 ])
 def test_errors(api, path, status):

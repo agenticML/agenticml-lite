@@ -355,6 +355,46 @@ def _empty(key: str) -> dict:
     return {"key": key, "total": 0, "nonfinite": 0, "mode": "raw", "points": []}
 
 
+def _ensure_contained(root, path: Path) -> None:
+    """Raise if ``path`` leaves ``root``. A symlink at the file itself is not resolved."""
+    contained(root, path.parent)
+    if not path.is_symlink():
+        contained(root, path)
+
+
+def _last_complete_step(path: Path) -> int | None:
+    """Step in the last complete record of a scalar file, or None.
+
+    Missing and short files are None. A torn tail is left unread. Symlinks
+    raise from ``open_nofollow``.
+    """
+    try:
+        with open_nofollow(path) as handle:
+            size = os.fstat(handle.fileno()).st_size
+            complete = size - size % RECORD_SIZE
+            if complete < RECORD_SIZE:
+                return None
+            handle.seek(complete - RECORD_SIZE)
+            data = handle.read(RECORD_SIZE)
+            return RECORD_STRUCT.unpack(data)[0] if len(data) == RECORD_SIZE else None
+    except FileNotFoundError:
+        return None
+
+
+def read_last_step(root, run_id: str) -> int | None:
+    """Last complete ``_time.bin`` step without constructing a ``RunReader``.
+
+    Same record rules as ``RunReader.last_step``: one seek to the last 8-byte
+    record, no series scan, and no reader lock. A missing or short file is
+    ``None``. A bad id, an escaping path, or a symlink raises.
+    """
+    root_path = Path(root).expanduser().resolve()
+    directory = run_dir(root_path, run_id)
+    path = directory / SCALARS_DIRNAME / TIME_BIN_NAME
+    _ensure_contained(root_path, path)
+    return _last_complete_step(path)
+
+
 class RunReader:
     """Read one run. Thread-safe. Raises ``ValueError`` for a bad id and ``FileNotFoundError`` if it is missing."""
 
@@ -392,9 +432,7 @@ class RunReader:
             cached = self._path_cache.get(key)
             if cached is not None:
                 return cached
-            contained(self.root, path.parent)
-            if not path.is_symlink():
-                contained(self.root, path)
+            _ensure_contained(self.root, path)
             self._path_cache[key] = path
             return path
 
@@ -513,17 +551,7 @@ class RunReader:
     def last_step(self) -> int | None:
         """Last complete time record, without loading the time index."""
         path = self._c(self.run_dir / SCALARS_DIRNAME / TIME_BIN_NAME)
-        try:
-            with open_nofollow(path) as handle:
-                size = os.fstat(handle.fileno()).st_size
-                complete = size - size % RECORD_SIZE
-                if complete < RECORD_SIZE:
-                    return None
-                handle.seek(complete - RECORD_SIZE)
-                data = handle.read(RECORD_SIZE)
-                return RECORD_STRUCT.unpack(data)[0] if len(data) == RECORD_SIZE else None
-        except FileNotFoundError:
-            return None
+        return _last_complete_step(path)
 
     def read_records(self, key: str, offset: int = 0, limit: int | None = None) -> tuple:
         """Raw records from a byte offset, for a sync cursor.

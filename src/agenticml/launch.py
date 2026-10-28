@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import _globals
-from .code_tracking import find_repo_root
+from .code_tracking import default_project
 from .integrations.hyperparams import install_hyperparam_capture, uninstall_hyperparam_capture
 
 logger = logging.getLogger("agenticml.launch")
@@ -206,7 +206,7 @@ def _make_main_module(resolved: _Resolved) -> types.ModuleType:
 def _start_run(settings: RunSettings, resolved: _Resolved):
     project = settings.project
     if not project:
-        project = find_repo_root(Path(resolved.path0)).name or "default"
+        project = default_project(Path(resolved.path0))
     name = settings.name or resolved.default_name
     try:
         run = _globals.init(

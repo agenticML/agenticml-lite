@@ -7,9 +7,14 @@ import os
 from pathlib import Path
 import socket
 import struct
+import sys
 import threading
 
 import pytest
+
+import agenticml
+from agenticml import Run
+from agenticml.code_tracking import default_project
 
 pytest.importorskip("agenticml.store")
 from agenticml.store import reader
@@ -75,7 +80,12 @@ def test_routes(dashboard):
     assert len(runs) == 1
     assert runs[0]['status'] == 'crashed'
     assert runs[0]['summary'] == {'loss':.5,'label':'ok'}
-    assert set(runs[0]) == {'run_id','project','name','status','created_at','finished_at','tags','group','summary'}
+    assert set(runs[0]) == {
+        'run_id','project','name','status','created_at','finished_at','tags','group',
+        'summary','config','last_step',
+    }
+    assert runs[0]['config'] == {'lr': .01}
+    assert runs[0]['last_step'] == 119
     run = load(dashboard,'/api/runs/run-1')
     assert run['keys'] == ['loss']
     assert run['code_manifest_length'] == 1
@@ -169,13 +179,28 @@ def test_get_only(dashboard,method):
         assert json.loads(body) == {'error':'method not allowed'}
 
 
-@pytest.mark.parametrize('name',['index.html','app.js','app.css','uPlot.iife.min.js','uPlot.min.css','uPlot.LICENSE'])
+@pytest.mark.parametrize('name',['index.html','app.js','app.css','charts.js','code.js'])
 def test_static(dashboard,name):
     path = '/' if name == 'index.html' else '/static/'+name
     status, headers, body = dashboard[0](path)
     assert status == 200 and body
+    assert headers['Content-Type'] == server._FILES[name]
     assert headers['ETag']
     assert dashboard[0](path,headers={'If-None-Match':headers['ETag']})[0] == 304
+
+
+def test_static_allowlist():
+    assert list(server._FILES) == ['index.html','app.js','app.css','charts.js','code.js']
+    assert server._FILES['charts.js'] == 'text/javascript; charset=utf-8'
+    assert server._FILES['code.js'] == 'text/javascript; charset=utf-8'
+
+
+@pytest.mark.parametrize('name',['uPlot.iife.min.js','uPlot.min.css','uPlot.LICENSE'])
+def test_uplot_static_removed(dashboard,name):
+    status, _, body = dashboard[0]('/static/'+name)
+    assert status == 404
+    assert json.loads(body) == {'error':'not found'}
+    assert name not in server._FILES
 
 
 def test_gzip_and_nonfinite(dashboard):
@@ -497,3 +522,323 @@ def test_network_bind_warning(tmp_path, monkeypatch, capsys, host, warn):
     assert ('no authentication' in output) == warn
     if warn:
         assert 'configs, env and code' in output
+
+
+def test_summary_keeps_scalar_string_keys_in_order():
+    value = {1: 'no', 'a': 1, 'b': {'n': 1}, 'c': True, 'd': None, 'e': 'x', 'f': 1.5}
+    assert server._summary(value) == {'a': 1, 'c': True, 'd': None, 'e': 'x', 'f': 1.5}
+    limited = server._summary(value, limit=3)
+    assert list(limited) == ['a', 'c', 'd']
+    assert limited['c'] is True
+    assert server._summary(['nope']) == {}
+    assert server._summary(None) == {}
+
+
+def test_runs_list_config_scalars_and_nonfinite(dashboard):
+    request, httpd, _, _ = dashboard
+    meta_path = httpd.root / 'runs' / 'run-1' / 'meta.json'
+    meta = json.loads(meta_path.read_text())
+    config = {'nested': {'x': 1}, 'items': [1, 2, 3]}
+    config['lr'] = 0.01
+    config['label'] = 'ok' * 500
+    config['epochs'] = 3
+    config['flag'] = True
+    config['optional'] = None
+    config['nan'] = float('nan')
+    config['posinf'] = float('inf')
+    config['neginf'] = float('-inf')
+    for i in range(50):
+        config[f'k{i:02d}'] = i
+    config['late'] = 'dropped'
+    meta['config'] = config
+    summary = {f's{i:02d}': i for i in range(51)}
+    summary['nested'] = {'a': 1}
+    meta['summary'] = summary
+    meta_path.write_text(json.dumps(meta))
+    status, headers, body = request('/api/runs', headers={'Accept-Encoding': 'gzip'})
+    assert status == 200
+    assert headers['Content-Encoding'] == 'gzip'
+    runs = json.loads(gzip.decompress(body))
+    row = runs[0]
+    kept = ['lr', 'label', 'epochs', 'flag', 'optional', 'nan', 'posinf', 'neginf']
+    kept += [f'k{i:02d}' for i in range(42)]
+    assert list(row['config']) == kept
+    assert len(row['config']) == 50
+    assert row['config']['flag'] is True
+    assert row['config']['epochs'] == 3
+    assert row['config']['optional'] is None
+    assert row['config']['lr'] == 0.01
+    assert row['config']['nan'] is None
+    assert row['config']['posinf'] is None
+    assert row['config']['neginf'] is None
+    assert 'nested' not in row['config']
+    assert 'items' not in row['config']
+    assert 'k42' not in row['config']
+    assert 'late' not in row['config']
+    assert len(row['summary']) == 51
+    assert 'nested' not in row['summary']
+    assert row['summary']['s50'] == 50
+    assert row['last_step'] == 119
+    assert row['tags'] == ['test']
+    assert row['name'] == '<script>run</script>'
+
+
+def _put_run(root, run_id, *, step, config, time_bytes=None):
+    run = root / 'runs' / run_id
+    scalars = run / 'scalars'
+    scalars.mkdir(parents=True)
+    meta = {
+        'format_version': 1,
+        'run_id': run_id,
+        'project': 'demo',
+        'name': run_id,
+        'config': config,
+        'tags': ['t'],
+        'notes': '',
+        'group': None,
+        'status': 'finished',
+        'summary': {'loss': 1.0, 'nested': {'a': 1}},
+        'created_at': '2026-10-27T00:00:00Z',
+        'finished_at': '2026-10-27T00:01:00Z',
+    }
+    (run / 'meta.json').write_text(json.dumps(meta))
+    if time_bytes is not None:
+        (scalars / '_time.bin').write_bytes(time_bytes)
+    elif step is not None:
+        (scalars / '_time.bin').write_bytes(struct.pack('<If', step, 1.0))
+
+
+def test_list_last_step_for_many_runs(tmp_path, monkeypatch):
+    def refuse(self, *args, **kwargs):
+        raise AssertionError('list scanned series records')
+
+    monkeypatch.setattr(reader.RunReader, 'series', refuse)
+    monkeypatch.setattr(reader.RunReader, 'read_records', refuse)
+    monkeypatch.setattr(reader.RunReader, 'time_index', refuse)
+    monkeypatch.setattr(reader.RunReader, 'keys', refuse)
+    expected = {}
+    for i in range(100):
+        run_id = f'm{i:03d}'
+        time_bytes = None
+        if i == 1:
+            step = 0
+        elif i == 3:
+            step = 4
+            time_bytes = struct.pack('<If', 9, 1.0) + struct.pack('<If', 4, 1.0)
+        elif i % 11 == 0:
+            step = None
+        else:
+            step = i
+        _put_run(
+            tmp_path, run_id, step=step, config={'i': i, 'skip': {'a': 1}}, time_bytes=time_bytes,
+        )
+        expected[run_id] = step
+    broken = tmp_path / 'runs' / 'm002' / 'scalars' / '_time.bin'
+    broken.unlink()
+    broken.symlink_to(tmp_path / 'runs' / 'm002' / 'meta.json')
+    expected['m002'] = None
+    httpd = server.make_server(tmp_path, '127.0.0.1', 0)
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True)
+    thread.start()
+    try:
+        conn = http.client.HTTPConnection(*httpd.server_address[:2], timeout=10)
+        conn.request('GET', '/api/runs')
+        response = conn.getresponse()
+        body = response.read()
+        status = response.status
+        conn.close()
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()
+    assert status == 200
+    runs = json.loads(body)
+    assert len(runs) == 100
+    assert {row['run_id']: row['last_step'] for row in runs} == expected
+    by_id = {row['run_id']: row for row in runs}
+    assert by_id['m001']['last_step'] == 0
+    assert by_id['m003']['last_step'] == 4
+    assert by_id['m003']['config'] == {'i': 3}
+    assert by_id['m003']['summary'] == {'loss': 1.0}
+    assert by_id['m002']['last_step'] is None
+    assert by_id['m000']['last_step'] is None
+
+
+def test_list_last_step_does_not_evict_chart_reader(tmp_path, monkeypatch):
+    n = 20
+    records = b''.join(struct.pack('<If', i, float(i)) for i in range(n))
+    _put_run(tmp_path, 'charted', step=None, config={'lr': 0.1}, time_bytes=records)
+    scalars = tmp_path / 'runs' / 'charted' / 'scalars'
+    (scalars / 'index.json').write_text(json.dumps({
+        'version': 1, 'series': {'loss': {'id': 0, 'monotonic': True}},
+    }))
+    (scalars / '0.bin').write_bytes(records)
+    httpd = server.make_server(tmp_path, '127.0.0.1', 0)
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True)
+    thread.start()
+
+    def request(path):
+        conn = http.client.HTTPConnection(*httpd.server_address[:2], timeout=10)
+        conn.request('GET', path)
+        response = conn.getresponse()
+        status, body = response.status, response.read()
+        conn.close()
+        return status, body
+
+    try:
+        status, body = request('/api/runs/charted/scalars?key=loss&max_points=10')
+        assert status == 200
+        series = json.loads(body)['series']['loss']
+        assert series['mode'] == 'overview'
+        assert series['total'] == n
+        cached = httpd.readers['charted']
+        incremental = cached._cache['loss']
+        assert incremental[0] == 'inc'
+        assert incremental[2] == n * reader.RECORD_SIZE
+        others = 65
+        for i in range(others):
+            run_id = f'o{i:03d}'
+            if i == 4:
+                _put_run(
+                    tmp_path, run_id, step=4, config={'i': i},
+                    time_bytes=struct.pack('<If', 9, 1.0) + struct.pack('<If', 4, 1.0),
+                )
+            else:
+                _put_run(tmp_path, run_id, step=i, config={'i': i})
+        reads = []
+        real_open = reader.open_nofollow
+
+        class _Handle:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.handle.close()
+
+            def __getattr__(self, key):
+                return getattr(self.handle, key)
+
+            def read(self, size=-1):
+                reads.append(size)
+                return self.handle.read(size)
+
+        def tracking_open(path, mode='rb', buffering=-1):
+            return _Handle(real_open(path, mode, buffering))
+
+        monkeypatch.setattr(reader, 'open_nofollow', tracking_open)
+        status, body = request('/api/runs')
+        assert status == 200
+        runs = json.loads(body)
+        by_id = {row['run_id']: row for row in runs}
+        assert len(runs) == others + 1
+        assert by_id['charted']['last_step'] == n - 1
+        assert by_id['o004']['last_step'] == 4
+        assert by_id['o000']['last_step'] == 0
+        assert by_id['o010']['last_step'] == 10
+        with httpd.reader_lock:
+            assert httpd.readers.get('charted') is cached
+            assert set(httpd.readers) == {'charted'}
+        assert cached._cache['loss'] is incremental
+        assert reads == [reader.RECORD_SIZE] * (others + 1)
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()
+
+
+def _init_run(directory, **kwargs):
+    options = dict(
+        dir=directory, track_source=False, capture_env=False,
+        system_metrics=False, auto_track=False,
+    )
+    options.update(kwargs)
+    return agenticml.init(**options)
+
+
+def test_init_project_defaults_to_repo_directory(tmp_path, monkeypatch):
+    repo = tmp_path / 'widgetlab'
+    nested = repo / 'pkg'
+    nested.mkdir(parents=True)
+    (repo / 'pyproject.toml').write_text("[project]\nname = 'widgetlab'\n")
+    script = nested / 'train.py'
+    script.write_text('pass\n')
+    monkeypatch.delenv('AGENTICML_PROJECT', raising=False)
+    monkeypatch.setattr(sys.modules['__main__'], '__file__', str(script), raising=False)
+    store = tmp_path / 'store'
+    run = _init_run(store, name='exp')
+    try:
+        assert run.project == 'widgetlab'
+        assert run.name == 'exp'
+    finally:
+        agenticml.finish()
+
+    monkeypatch.setenv('AGENTICML_PROJECT', '')
+    run = _init_run(store, name='exp')
+    try:
+        assert run.project == 'widgetlab'
+    finally:
+        agenticml.finish()
+
+    monkeypatch.setenv('AGENTICML_PROJECT', 'from-env')
+    run = _init_run(store)
+    try:
+        assert run.project == 'from-env'
+        assert run.name is None
+    finally:
+        agenticml.finish()
+
+    run = _init_run(store, project='explicit', name='named')
+    try:
+        assert run.project == 'explicit'
+        assert run.name == 'named'
+    finally:
+        agenticml.finish()
+
+
+def test_init_project_uses_cwd_without_main_file(tmp_path, monkeypatch):
+    repo = tmp_path / 'cwdproj'
+    repo.mkdir()
+    (repo / 'pyproject.toml').write_text("[project]\nname = 'cwdproj'\n")
+    monkeypatch.delenv('AGENTICML_PROJECT', raising=False)
+    monkeypatch.delattr(sys.modules['__main__'], '__file__', raising=False)
+    monkeypatch.chdir(repo)
+    run = _init_run(tmp_path / 'store')
+    try:
+        assert run.project == 'cwdproj'
+    finally:
+        agenticml.finish()
+
+
+def test_resume_keeps_stored_project(tmp_path, monkeypatch):
+    repo = tmp_path / 'widgetlab'
+    repo.mkdir()
+    (repo / 'pyproject.toml').write_text("[project]\nname = 'widgetlab'\n")
+    script = repo / 'train.py'
+    script.write_text('pass\n')
+    monkeypatch.delenv('AGENTICML_PROJECT', raising=False)
+    monkeypatch.setattr(sys.modules['__main__'], '__file__', str(script), raising=False)
+    store = tmp_path / 'store'
+    options = dict(
+        dir=store, track_source=False, capture_env=False,
+        system_metrics=False, auto_track=False,
+    )
+    with Run(None, 'kept', id='resume-me', resume='allow', **options) as run:
+        assert run.project == 'widgetlab'
+        assert run.name == 'kept'
+    monkeypatch.setenv('AGENTICML_PROJECT', 'changed')
+    with Run('explicit', 'other', id='resume-me', resume='allow', **options) as resumed:
+        assert resumed.project == 'widgetlab'
+        assert resumed.name == 'kept'
+    assert reader.RunReader(store, 'resume-me').meta()['project'] == 'widgetlab'
+    assert reader.RunReader(store, 'resume-me').meta()['name'] == 'kept'
+
+
+def test_default_project_empty_directory_name(monkeypatch):
+    monkeypatch.delenv('AGENTICML_PROJECT', raising=False)
+    monkeypatch.setattr('agenticml.code_tracking.find_repo_root', lambda start: Path('/'))
+    assert default_project(Path('/tmp')) == 'default'
+    monkeypatch.setenv('AGENTICML_PROJECT', 'from-env')
+    assert default_project(Path('/tmp')) == 'from-env'

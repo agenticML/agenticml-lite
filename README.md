@@ -31,7 +31,7 @@ agenticml.summary["best_loss"] = 0.1
 agenticml.finish()
 ```
 
-`init(project, name, ...)` starts the one active run. `log` advances the step when `step` is omitted; `commit=False` merges later metrics into the same step. `config` and `summary` are dicts on the active run. `init(verbose=True)` prints the run id, the run directory, and the `agenticml ui` command.
+`init(project, name, ...)` starts the one active run. Omit `project` and it defaults to the repository or directory name (`AGENTICML_PROJECT` overrides that; an explicit project wins). `log` advances the step when `step` is omitted; `commit=False` merges later metrics into the same step. `config` and `summary` are dicts on the active run. `init(verbose=True)` prints the run id, the run directory, and the `agenticml ui` command.
 
 `init` also turns on runtime code snapshots and PyTorch component detection (`auto_track=True`). Automatic loss / learning-rate / epoch metrics and TensorBoard mirroring stay off until you pass `auto_metrics=True` and `sync_tensorboard=True`. System metrics are on (every 10 seconds) when `psutil` is installed; `system_metrics=False` disables them.
 
