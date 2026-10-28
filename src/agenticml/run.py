@@ -26,7 +26,7 @@ from .code_tracking import (
     find_repo_root,
 )
 from .env import capture_environment
-from .lineage import get_git_metadata
+from .lineage import get_git_metadata, snapshot as snapshot_lineage
 from .media import _Media, is_media
 from ._source_inspect import stage_source_and_metadata
 from .auto_tracking import AutoTracker
@@ -280,6 +280,7 @@ class Run(metaclass=_RunType):
         auto_metrics=False,
         log_every=1,
         sync_tensorboard=False,
+        lineage=True,
     ):
         if resume not in _VALID_RESUME:
             raise ValueError(f"resume must be one of {_VALID_RESUME}")
@@ -302,6 +303,8 @@ class Run(metaclass=_RunType):
             raise _StoreError() from exc
         if id is not None and not valid_run_id(id):
             raise ValueError(f"invalid run id: {id!r}")
+        if id is not None and parent_run_id == id:
+            parent_run_id = None
         if not project:
             project = default_project()
         self.project = project
@@ -321,6 +324,9 @@ class Run(metaclass=_RunType):
         self._runtime_collector = None
         self._object_staging_dir = None
         self.lineage = {}
+        self._lineage_enabled = bool(lineage) and os.environ.get(
+            "AGENTICML_LINEAGE", "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
         self._finished = False
         self._finishing = False
         self._finish_done = threading.Event()
@@ -395,7 +401,11 @@ class Run(metaclass=_RunType):
 
         # Sync maps these nested fields to the server's /init payload.
         repo_root = self.lineage.get("repo_root") or str(find_repo_root(Path.cwd()))
-        git_payload = {**get_git_metadata(repo_root), "repo_root": repo_root}
+        try:
+            git_payload = {**get_git_metadata(repo_root), "repo_root": repo_root}
+        except Exception:
+            logger.warning("failed to read project Git metadata", exc_info=True)
+            git_payload = {"repo_root": repo_root}
         if self.code_tracking_enabled:
             self.lineage.update(git_payload)
         meta = {
@@ -418,6 +428,19 @@ class Run(metaclass=_RunType):
                 self.writer = RunWriter.create(self.root, run_id=id, meta=meta)
             except Exception as exc:
                 raise _StoreError() from exc
+            if self._lineage_enabled:
+                try:
+                    result = snapshot_lineage(
+                        self.root, project, repo_root, self.writer.run_id,
+                        parent_run_id=parent_run_id,
+                        created_at=self.writer._meta["created_at"],
+                        max_file_bytes=DEFAULT_MAX_FILE_BYTES if max_file_bytes is None else max_file_bytes,
+                        max_total_bytes=DEFAULT_MAX_TOTAL_BYTES if max_total_bytes is None else max_total_bytes,
+                    )
+                    self.writer.set_meta_fields(lineage=result)
+                    self.lineage.update(result)
+                except Exception:
+                    logger.exception("failed to capture run lineage")
             _warn_store_budget(self.root)
         else:
             previous = RunReader(self.root, id).meta()

@@ -988,3 +988,177 @@ def test_code_content_length_is_rejected_before_reading(page, tmp_path, ui_serve
         page.goto(f"{server.url}#/run/{run_id}")
         expect(page.locator(".code-lines")).to_contain_text("limited to 1 MB")
         assert page.evaluate("!bodyRead && downloadAborted")
+
+
+def test_lineage_graph_selects_and_opens_run(page, tmp_path, ui_server_factory):
+    root = tmp_path / "lineage-ui"
+    names = ("root-run", "child-run", "leaf-run")
+    writers = []
+    for name in names:
+        writer = RunWriter.create(root, meta={"name": name, "project": "demo", "tags": ["graph"]})
+        writer.finish("finished")
+        writers.append(writer)
+    ids = [writer.run_id for writer in writers]
+    stamps = (
+        "2026-10-27T00:00:00.000000Z",
+        "2026-10-27T00:01:00.000000Z",
+        "2026-10-27T00:02:00.000000Z",
+    )
+    parents = (None, ids[0], ids[1])
+    inferences = (None, "explicit", "repo_root")
+    shared_tree = "ab" * 20
+    for index, run_id in enumerate(ids):
+        path = root / "runs" / run_id / "meta.json"
+        meta = json.loads(path.read_text())
+        meta["created_at"] = stamps[index]
+        meta["parent_run_id"] = parents[index]
+        meta["lineage"] = {
+            "version": 1,
+            "commit": f"{index + 1:040x}",
+            "tree": shared_tree if index else "cd" * 20,
+            "parent_commit": None if index == 0 else f"{index:040x}",
+            "parent_run_id": parents[index],
+            "parent_inference": inferences[index],
+            "project_key": "demo-0123abcd",
+            "repo_root": "/tmp/demo",
+            "base_commit": "abc1234",
+            "base_branch": "main",
+            "base_dirty": index == 2,
+            "error": None,
+        }
+        path.write_text(json.dumps(meta))
+    with ui_server_factory(root) as server:
+        page.set_viewport_size({"width": 375, "height": 812})
+        home(page, server)
+        expect(page.locator(".run-row")).to_have_count(3)
+        page.get_by_role("tab", name="Lineage", exact=True).click()
+        expect(page.locator(".lineage-node")).to_have_count(3)
+        expect(page.locator(".lineage-edge")).to_have_count(2)
+        expect(page.locator(".lineage-edge.is-inferred")).to_have_count(1)
+        suffix = ids[1].rsplit("-", 1)[-1]
+        node_label = page.locator(".lineage-node", has_text="child-run")
+        visible_id = node_label.locator(".lineage-meta").evaluate(
+            "el => el.childNodes[0] ? el.childNodes[0].nodeValue : el.textContent"
+        )
+        assert visible_id.split(" · ", 1)[0] == suffix
+        assert ids[1] in node_label.get_attribute("aria-label")
+        assert ids[1] in node_label.locator("title").first.text_content()
+        overflow = page.evaluate(
+            "Math.max(document.documentElement.scrollWidth - document.documentElement.clientWidth, document.body.scrollWidth - document.body.clientWidth)"
+        )
+        assert overflow <= 0, f"lineage view scrolls horizontally by {overflow}px"
+        page.reload()
+        expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+        expect(page.locator(".lineage-node")).to_have_count(3)
+        node = page.locator(".lineage-node", has_text="child-run")
+        node.click()
+        expect(page.get_by_test_id("selection-bar")).to_contain_text("1 run selected")
+        expect(node).to_have_attribute("data-picked", "true")
+        expect(page.locator(".lineage-detail")).to_contain_text("agenticml lineage checkout")
+        overflow = page.evaluate(
+            "Math.max(document.documentElement.scrollWidth - document.documentElement.clientWidth, document.body.scrollWidth - document.body.clientWidth)"
+        )
+        assert overflow <= 0, f"lineage detail scrolls horizontally by {overflow}px"
+        node.press("Enter")
+        expect(page.get_by_role("heading", name="child-run", exact=True)).to_be_visible()
+
+
+def _lineage_project(root, names=("root-run", "child-run", "leaf-run")):
+    writers = []
+    for name in names:
+        writer = RunWriter.create(root, meta={"name": name, "project": "demo", "tags": ["graph"]})
+        writer.finish("finished")
+        writers.append(writer)
+    ids = [writer.run_id for writer in writers]
+    stamps = (
+        "2026-10-27T00:00:00.000000Z",
+        "2026-10-27T00:01:00.000000Z",
+        "2026-10-27T00:02:00.000000Z",
+    )
+    parents = (None, ids[0], ids[1])
+    inferences = (None, "explicit", "repo_root")
+    shared_tree = "ab" * 20
+    for index, run_id in enumerate(ids):
+        path = root / "runs" / run_id / "meta.json"
+        meta = json.loads(path.read_text())
+        meta["created_at"] = stamps[index]
+        meta["parent_run_id"] = parents[index]
+        meta["lineage"] = {
+            "version": 1,
+            "commit": f"{index + 1:040x}",
+            "tree": shared_tree if index else "cd" * 20,
+            "parent_commit": None if index == 0 else f"{index:040x}",
+            "parent_run_id": parents[index],
+            "parent_inference": inferences[index],
+            "project_key": "demo-0123abcd",
+            "repo_root": "/tmp/demo",
+            "base_commit": "abc1234",
+            "base_branch": "main",
+            "base_dirty": index == 2,
+            "error": None,
+        }
+        path.write_text(json.dumps(meta))
+    return ids
+
+
+def test_lineage_view_opens_when_storage_throws(page, tmp_path, ui_server_factory):
+    page.add_init_script("""
+      const getItem = Storage.prototype.getItem;
+      const setItem = Storage.prototype.setItem;
+      Storage.prototype.getItem = function (key) {
+        if (String(key).startsWith("agenticml.view.")) throw new Error("denied");
+        return getItem.call(this, key);
+      };
+      Storage.prototype.setItem = function (key, value) {
+        if (String(key).startsWith("agenticml.view.")) throw new Error("denied");
+        return setItem.call(this, key, value);
+      };
+    """)
+    root = tmp_path / "lineage-storage"
+    writer = RunWriter.create(root, meta={"name": "solo", "project": "demo", "tags": []})
+    writer.finish("finished")
+    with ui_server_factory(root) as server:
+        home(page, server)
+        page.get_by_role("tab", name="Lineage", exact=True).click()
+        expect(page.locator(".lineage-graph")).to_be_visible()
+        expect(page.locator(".lineage-node")).to_have_count(1)
+        page.get_by_role("tab", name="List", exact=True).click()
+        expect(page.locator(".run-row")).to_have_count(1)
+        page.get_by_role("tab", name="Lineage", exact=True).click()
+        expect(page.locator(".lineage-node")).to_have_count(1)
+
+
+def test_lineage_rebuild_keeps_focus_scroll_and_detail(page, tmp_path, ui_server_factory):
+    root = tmp_path / "lineage-focus"
+    ids = _lineage_project(root)
+    root_meta = root / "runs" / ids[0] / "meta.json"
+    meta = json.loads(root_meta.read_text())
+    meta["status"] = "running"
+    root_meta.write_text(json.dumps(meta))
+    (root / "runs" / ids[0] / "run.lock").write_bytes(b"")
+    child = ids[1]
+    with ui_server_factory(root) as server:
+        page.set_viewport_size({"width": 375, "height": 812})
+        home(page, server)
+        expect(page.locator(".poll-status")).to_contain_text("refreshes every 5 s")
+        page.get_by_role("tab", name="Lineage", exact=True).click()
+        node = page.locator(f'.lineage-node[data-run-id="{child}"]')
+        expect(node).to_be_visible()
+        expect(page.locator(".lineage-detail")).to_contain_text("Select a run")
+        node.focus()
+        left = page.locator(".lineage-scroll").evaluate(
+            "el => { el.scrollLeft = Math.min(180, el.scrollWidth); return el.scrollLeft; }"
+        )
+        assert left > 0, "lineage graph did not overflow its scroller"
+        path = root / "runs" / child / "meta.json"
+        updated = json.loads(path.read_text())
+        updated["name"] = "child-renamed"
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(updated))
+        temporary.replace(path)
+        expect(node).to_contain_text("child-renamed", timeout=12000)
+        expect(page.locator(".lineage-node:focus")).to_have_attribute("data-run-id", child)
+        assert page.locator(".lineage-scroll").evaluate("el => el.scrollLeft") == left
+        page.locator(".lineage-node:focus").click()
+        expect(page.locator(".lineage-detail")).to_contain_text("agenticml lineage checkout")
+        expect(page.locator(".lineage-detail")).to_contain_text(child)

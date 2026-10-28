@@ -16,6 +16,10 @@ Nothing here is uploaded. Paths below are relative to a root resolved by
   usage.json                     cached total store bytes and computation timestamp
   objects/<hh>/<sha256>          content-addressed bytes, shared by every run
   objects/<hh>/.trash-<sha256>-<pid>  GC candidate awaiting its final mtime check
+  lineage/<project-key>.git/     bare shadow Git repository per project
+    refs/runs/<run_id>          snapshot commit refs (loose or packed)
+    agenticml.lock              init / ref-update flock
+  worktrees/<project-key>/<run_id>/  created only by lineage checkout
   runs/<run_id>/
     meta.json
     run.lock                     writer/GC/prune lifetime flock
@@ -89,6 +93,7 @@ atomically (see below). Fields:
 | `notes` | String. Default `""`. |
 | `group`, `job_type`, `parent_run_id` | String or `null`. |
 | `env`, `git` | JSON objects. Default `{}`. |
+| `lineage` | Optional startup shadow snapshot; fields below. |
 | `status` | `running`, `finished`, or `crashed`. |
 | `summary` | JSON object. Default `{}`. |
 | `created_at` | UTC timestamp, set once at create. |
@@ -99,6 +104,44 @@ atomically (see below). Fields:
 Extra keys from the caller are preserved. Create always forces
 `format_version`, `run_id`, `status=running`, `created_at`, `finished_at=null`,
 `pid`, and `hostname`, even if the caller passed them.
+
+### `lineage`
+
+New runs capture code synchronously at init; resume keeps the existing snapshot.
+The user's project and Git index, HEAD, and refs are read-only. A project key is
+its lowercase filesystem-safe slug (up to 48 characters, fallback `project`),
+then `-` and the first eight hex digits of SHA-256 of the exact project string.
+All store paths are containment-checked.
+
+| Field | Meaning |
+| --- | --- |
+| `version` | `1`. |
+| `commit`, `tree` | Shadow Git object ids. |
+| `parent_commit`, `parent_run_id` | Parent snapshot commit and run id, or null. |
+| `parent_inference` | `explicit`, `repo_root`, `project`, or null. |
+| `project_key`, `repo_root` | Shadow repository key and absolute source directory. |
+| `base_commit`, `base_branch`, `base_dirty` | User Git state, or null outside Git. |
+| `files`, `bytes` | Kept file count and total lstat size. |
+| `skipped` | `oversized`, `over_total`, and `path_errors` path lists; `over_count` is the number of candidate paths beyond the file-count cap. |
+| `error` | Null on success; short diagnostic on failure. |
+
+On failure only `version`, `error`, `parent_run_id`, `parent_inference`,
+`project_key`, and `repo_root` are required. Tracking continues without Git.
+Parents are explicit (except self-parents), else the latest eligible run in the
+same project and source directory, else the latest eligible project run. Eligibility
+requires `(created_at, run_id)` strictly before the current run, allowing equal
+timestamps with a smaller run id. Invalid source paths are skipped. The top-level
+`parent_run_id` remains explicit-only. Git ignores, `.agenticmlignore`, hard
+skip directories/suffixes, nested Git repositories, and escaping symlinks are
+excluded. File/total caps are checked before hashing (defaults 10/100 MiB).
+Only the first 20,000 candidate paths are inspected; excess paths are counted
+without sorting or stat calls. Individual path errors are skipped and recorded.
+The entire snapshot shares a 30-second deadline, including lock waits and Git
+commands. `.agenticmlignore` is not applied when larger than 1 MiB.
+The parent ref is resolved inside the repository lock immediately before
+`commit-tree` and `update-ref`. If the parent is still unpublished, the child has
+no Git parent and `parent_commit` is null; diff resolves `parent_run_id` live on
+later calls. Existing commits and metadata are not rewritten.
 
 Timestamps are `YYYY-MM-DDTHH:MM:SS.ffffffZ` (UTC, 6-digit microseconds,
 `Z` suffix). The width is fixed so `created_at` sorts lexicographically.
@@ -643,6 +686,17 @@ The store maintains a cached `<root>/usage.json` file:
   - `--keep-last N`: Protects the N newest runs per project from deletion.
   - `--older-than DAYS`: Protects runs newer than the specified age.
   - Symlinks are never followed during run directory traversal or deletion.
+- Deleting a run also removes its shadow `refs/runs/<id>` and default checkout
+  at `<root>/worktrees/<project-key>/<run_id>`. Custom `--path` directories are
+  user-owned: GC never deletes them and reports their paths in `worktrees_kept`
+  and CLI output, even if the checkout has new commits or edits. Each checkout
+  records its run id in `<repo>/worktrees/<name>/agenticml-run`, independently of
+  HEAD. Existing checkout destinations are accepted only when registered at
+  the requested run's commit. Dry-run previews removals and kept paths.
+  Non-dry-run GC also retries cleanup of orphan `refs/runs/<id>` whose run
+  directories no longer exist, and logs cleanup failures for later retry.
+  Shadow object storage is retained; parent commits may still be reachable.
+  `usage()` includes `lineage_total` and `worktrees_total` bytes in `total`.
 - **Mark-and-sweep object sweep**:
   - Referenced objects are determined by taking the union of digests across all
     surviving runs: `media/index.json` sha256s, code manifest sha256s, and copied
