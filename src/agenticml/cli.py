@@ -56,6 +56,13 @@ def cmd_whoami(args):
         return 130
 
 
+def _table_cell(value, *, missing=""):
+    """Text for one table cell. ``None`` must not render as the word None."""
+    if value is None or value == "":
+        return missing
+    return str(value)
+
+
 def cmd_ls(args):
     import json
     from datetime import datetime
@@ -83,8 +90,10 @@ def cmd_ls(args):
         except (OSError, ValueError):
             last_step = None
         rows.append([
-            str(run.get("run_id", "")), str(run.get("project", "")),
-            str(run.get("name", "")), str(run.get("effective_status", "")),
+            _table_cell(run.get("run_id")),
+            _table_cell(run.get("project")),
+            _table_cell(run.get("name"), missing="-"),
+            _table_cell(run.get("effective_status")),
             created, "-" if last_step is None else str(last_step),
         ])
     widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
@@ -226,7 +235,7 @@ Run a Python script or module as __main__ inside an agenticml run.
 Options must come before the target; everything after it goes to the script.
 
 options:
-  --project NAME       project (env AGENTICML_PROJECT; default: repo directory name)
+  --project NAME       project (env AGENTICML_PROJECT; default: repo or directory name)
   --name NAME          run name (env AGENTICML_NAME; default: script or module name)
   --tags A,B           comma-separated tags (env AGENTICML_TAGS)
   --notes TEXT         run notes (env AGENTICML_NOTES)

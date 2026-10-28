@@ -1,219 +1,45 @@
-"""End-to-end dashboard tests using Playwright's sync API.
+"""Browser coverage for the local workspace, metrics, and code snapshots.
 
-Every test gets a fresh browser context. Console errors, page errors, and HTTP
-responses >= 400 from the dashboard fail the test at teardown. The missing-run
-route opts out of the 4xx check because that response is the page's error state.
+Canvas instrumentation observes real draw calls without adding test APIs to the
+application. Every browser console/page/network error fails fixture teardown.
 """
-import os
-from pathlib import Path
-import queue
+import json
 import re
-import subprocess
-import sys
-import threading
-from urllib.parse import parse_qs, urlsplit
 
 import pytest
+from agenticml.store import RunWriter
 from agenticml.store.reader import RunReader
 
 pytest.importorskip("playwright.sync_api")
 from playwright.sync_api import expect, sync_playwright
 
 pytestmark = [pytest.mark.browser, pytest.mark.ui]
-
-TESTBED = Path(__file__).resolve().parents[1]
-CONSOLE = Path(sys.executable).parent / "agenticml"
-UI_URL = re.compile(r"AgenticML UI: (http://127\.0\.0\.1:\d+)")
-RUNS = (
-    ("explicit-baseline", "testbed", "finished", "final_loss"),
-    ("explicit-highlr", "testbed", "finished", "final_loss"),
-    ("zero-code", "testbed", "finished", ""),
-    ("crashed", "testbed", "crashed", "_exception"),
-    ("other-project", "other-project", "finished", "final_loss"),
-)
+LIVE_TIMEOUT = 16000
 COMPARE_RUNS = ("explicit-baseline", "explicit-highlr")
-# app.js emits raw, low, high, and mean for every compared run. EMA weight 0
-# keeps the raw series hidden, so three series per visible run are shown.
-SERIES_PER_RUN = 4
-SHOWN_PER_RUN = 3
-LIVE_TIMEOUT = 12000
-# `var uPlot` installs a non-configurable global, so the wrapper has to replace
-# the constructor after that script runs and before app.js does `new uPlot`.
-UPLOT_HOOK = r"""
+
+CANVAS_HOOK = """
 (() => {
-  if (window.__chartState) return;
-  const plots = [];
-  window.__plots = plots;
-  const wrap = () => {
-    const Ctor = window.uPlot;
-    if (typeof Ctor !== 'function' || Ctor.__tracksPlots) return false;
-    function Tracked(...args) {
-      const plot = new Ctor(...args);
-      plots.push(plot);
-      const destroy = plot.destroy.bind(plot);
-      plot.destroy = (...destroyArgs) => {
-        const index = plots.indexOf(plot);
-        if (index >= 0) plots.splice(index, 1);
-        return destroy(...destroyArgs);
-      };
-      return plot;
-    }
-    Tracked.__tracksPlots = true;
-    Tracked.prototype = Ctor.prototype;
-    Object.setPrototypeOf(Tracked, Ctor);
-    window.uPlot = Tracked;
-    return true;
+  const p = CanvasRenderingContext2D.prototype;
+  const clear = p.clearRect, begin = p.beginPath, move = p.moveTo;
+  const line = p.lineTo, stroke = p.stroke, text = p.fillText;
+  p.clearRect = function(...args) {
+    this.canvas.__draw = {strokes: [], labels: []};
+    return clear.apply(this, args);
   };
-  const timer = setInterval(() => {
-    if (typeof window.uPlot !== 'function') return;
-    if (!window.uPlot.__tracksPlots) wrap();
-    clearInterval(timer);
-  }, 0);
-  const plotFor = key => {
-    const card = [...document.querySelectorAll('article.chart-card')].find(node => node.dataset.key === key);
-    if (!card) return null;
-    const plot = plots.find(item => item.root && item.root.isConnected && card.contains(item.root));
-    return plot ? {card, plot} : {card, plot: null};
+  p.beginPath = function(...args) { this.__path = []; this.__moves = 0; return begin.apply(this, args); };
+  p.moveTo = function(x, y) { this.__path?.push([x, y]); this.__moves++; return move.call(this, x, y); };
+  p.lineTo = function(x, y) { this.__path?.push([x, y]); return line.call(this, x, y); };
+  p.stroke = function(...args) {
+    this.canvas.__draw?.strokes.push({path: this.__path, moves: this.__moves, color: this.strokeStyle,
+      alpha: this.globalAlpha, width: this.lineWidth, dash: this.getLineDash()});
+    return stroke.apply(this, args);
   };
-  window.__chartState = key => [...document.querySelectorAll('article.chart-card')]
-    .filter(card => !key || card.dataset.key === key)
-    .map(card => {
-      const plot = plots.find(item => item.root && item.root.isConnected && card.contains(item.root));
-      const data = plot && plot.data ? plot.data : [];
-      const xs = (data[0] || []).filter(value => Number.isFinite(value));
-      const scaleX = plot && plot.scales ? plot.scales.x : null;
-      const scaleY = plot && plot.scales ? plot.scales.y : null;
-      return {
-        key: card.dataset.key,
-        hidden: !!card.hidden,
-        open: !!card.closest('details')?.open,
-        n: xs.length,
-        xs,
-        xMin: scaleX && Number.isFinite(scaleX.min) ? scaleX.min : null,
-        xMax: scaleX && Number.isFinite(scaleX.max) ? scaleX.max : null,
-        yDistr: scaleY ? scaleY.distr : null,
-        series: plot ? plot.series.slice(1).map((series, index) => {
-          const values = data[index + 1] || [];
-          return {
-            label: series.label || '',
-            show: !!series.show,
-            finite: values.filter(value => Number.isFinite(value)).length,
-          };
-        }) : [],
-      };
-    });
-  window.__emaDelta = key => {
-    const found = plotFor(key);
-    if (!found || !found.plot || !found.plot.data) return null;
-    const plot = found.plot;
-    const groups = new Map();
-    for (let index = 1; index < plot.series.length; index += 1) {
-      const label = plot.series[index].label || '';
-      const split = label.lastIndexOf(' ');
-      if (split <= 0) continue;
-      const name = label.slice(0, split);
-      const field = label.slice(split + 1);
-      if (!groups.has(name)) groups.set(name, {});
-      groups.get(name)[field] = {show: !!plot.series[index].show, values: plot.data[index] || []};
-    }
-    let differ = 0;
-    let compared = 0;
-    let rawShown = false;
-    for (const group of groups.values()) {
-      if (!group.raw || !group.mean) continue;
-      rawShown = rawShown || group.raw.show;
-      const raw = group.raw.values;
-      const mean = group.mean.values;
-      for (let index = 0; index < raw.length; index += 1) {
-        if (Number.isFinite(raw[index]) && Number.isFinite(mean[index])) {
-          compared += 1;
-          if (raw[index] !== mean[index]) differ += 1;
-        }
-      }
-    }
-    return {differ, compared, rawShown};
+  p.fillText = function(value, ...args) {
+    this.canvas.__draw?.labels.push(String(value));
+    return text.call(this, value, ...args);
   };
 })();
 """
-LOSS_READY = r"""
-({steps, visible, total}) => {
-  const state = (window.__chartState('train/loss') || [])[0];
-  if (!state || state.xs.length !== steps.length) return false;
-  if (!state.xs.every((value, index) => value === steps[index])) return false;
-  if (state.series.length !== total * 4) return false;
-  const shown = state.series.filter(series => series.show);
-  if (shown.length !== visible.length * 3) return false;
-  if (shown.some(series => series.label.endsWith(' raw'))) return false;
-  const names = new Set(shown.map(series => series.label.slice(0, series.label.lastIndexOf(' '))));
-  if (names.size !== visible.length || visible.some(name => !names.has(name))) return false;
-  return visible.every(name => shown.some(series =>
-    series.label === `${name} mean` && series.finite === steps.length));
-}
-"""
-
-
-def _ignored_browser_noise(text):
-    lowered = text.lower()
-    return "favicon" in lowered or "err_aborted" in lowered
-
-
-def _stop_process(proc):
-    if proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
-    if proc.stdout:
-        proc.stdout.close()
-
-
-class _UIServer:
-    def __init__(self, root):
-        self.proc = subprocess.Popen(
-            [str(CONSOLE), "ui", "--dir", str(root), "--port", "0"],
-            cwd=TESTBED,
-            env=os.environ.copy(),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-        self.lines = queue.Queue()
-        self.thread = threading.Thread(target=self._read, daemon=True)
-        self.thread.start()
-
-    def _read(self):
-        for line in self.proc.stdout:
-            self.lines.put(line)
-        self.lines.put(None)
-
-    def url(self):
-        try:
-            line = self.lines.get(timeout=15)
-        except queue.Empty:
-            raise AssertionError("UI did not announce a URL within 15s") from None
-        if line is None:
-            raise AssertionError("UI exited before announcing its URL")
-        match = UI_URL.search(line)
-        if not match:
-            raise AssertionError(f"unexpected UI output: {line!r}")
-        return match.group(1)
-
-    def stop(self):
-        _stop_process(self.proc)
-        self.thread.join(timeout=2)
-
-    def __enter__(self):
-        try:
-            self.address = self.url()
-        except Exception:
-            self.stop()
-            raise
-        return self.address
-
-    def __exit__(self, *exc):
-        self.stop()
 
 
 @pytest.fixture(scope="module")
@@ -233,833 +59,932 @@ def browser():
 
 @pytest.fixture
 def context(browser):
-    ctx = browser.new_context(
-        viewport={"width": 1400, "height": 1000},
-        locale="en-US",
-        color_scheme="light",
-    )
+    ctx = browser.new_context(viewport={"width": 1400, "height": 1000}, locale="en-US", color_scheme="light")
     ctx.route("**/favicon.ico", lambda route: route.fulfill(status=204, body=""))
-    try:
-        yield ctx
-    finally:
-        ctx.close()
+    yield ctx
+    ctx.close()
 
 
 @pytest.fixture
 def page(context):
     tab = context.new_page()
-    tab.add_init_script(UPLOT_HOOK)
-    state = {"problems": [], "allow_http_errors": False}
-
-    def on_console(msg):
-        if msg.type != "error" or _ignored_browser_noise(msg.text):
-            return
-        state["problems"].append(f"console: {msg.text}")
-
-    def on_pageerror(exc):
-        state["problems"].append(f"pageerror: {exc}")
-
-    def on_response(response):
-        if response.status < 400 or _ignored_browser_noise(response.url):
-            return
-        state["problems"].append(f"HTTP {response.status} {response.url}")
-
-    def on_request_failed(request):
-        failure = request.failure or ""
-        if _ignored_browser_noise(failure) or _ignored_browser_noise(request.url):
-            return
-        state["problems"].append(f"failed: {request.url} {failure}")
-
-    tab.on("console", on_console)
-    tab.on("pageerror", on_pageerror)
-    tab.on("response", on_response)
-    tab.on("requestfailed", on_request_failed)
-    tab.allow_http_errors = lambda: state.__setitem__("allow_http_errors", True)
+    tab.add_init_script(CANVAS_HOOK)
+    problems = []
+    tab.on("pageerror", lambda error: problems.append(f"pageerror: {error}"))
+    tab.on("console", lambda message: problems.append(f"console: {message.text}") if message.type == "error" else None)
+    tab.on("response", lambda response: problems.append(f"HTTP {response.status}: {response.url}") if response.status >= 400 else None)
+    tab.on("requestfailed", lambda request: problems.append(f"failed: {request.url}: {request.failure}") if "ERR_ABORTED" not in (request.failure or "") else None)
+    tab.allow_http_errors = False
     yield tab
-    problems = list(state["problems"])
-    if state["allow_http_errors"]:
-        def allowed(item):
-            # Chromium logs the same 4xx responses the page turns into an error.
-            return item.startswith("HTTP 4") or item.startswith("console: Failed to load resource:")
-
-        other = [item for item in problems if not allowed(item)]
-        assert not other, "unexpected browser errors:\n" + "\n".join(other)
-        assert any(item.startswith("HTTP 4") for item in problems), (
-            "expected the missing run route to receive an HTTP 4xx"
-        )
-    else:
-        assert not problems, "browser errors:\n" + "\n".join(problems)
+    if tab.allow_http_errors:
+        problems = [problem for problem in problems if not problem.startswith(("HTTP 4", "HTTP 503", "console: Failed to load resource:"))]
+    assert not problems, "browser errors:\n" + "\n".join(problems)
     tab.close()
 
 
-def open_home(page, url):
-    page.goto(url)
-    expect(page.get_by_role("heading", name="Experiments", exact=True)).to_be_visible()
+def home(page, server):
+    page.goto(server.url)
+    expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+    expect(page.locator(".poll-status")).not_to_be_empty()
 
 
-def run_row(page, name):
-    return page.locator("tbody tr").filter(
-        has=page.get_by_role("link", name=name, exact=True)
-    )
+def row(page, name):
+    return page.locator(".run-row").filter(has=page.get_by_role("link", name=name, exact=True))
 
 
-def loss_steps(ui_server, name):
-    series = RunReader(ui_server.root, ui_server.runs[name]).series("train/loss")
-    assert series["mode"] == "raw", series["mode"]
-    steps = [point[0] for point in series["points"]]
-    assert steps and steps == sorted(set(steps))
-    return steps
+def open_run(page, server, name="explicit-baseline"):
+    page.goto(f"{server.url}#/run/{server.runs[name]}")
+    expect(page.get_by_role("heading", name=name, exact=True)).to_be_visible()
 
 
-def chart_state(page, key="train/loss"):
-    return page.evaluate("(key) => (window.__chartState(key) || [])[0] || null", key)
+def compare(page, server):
+    home(page, server)
+    for name in COMPARE_RUNS:
+        page.get_by_role("checkbox", name=f"Select {name}", exact=True).check()
+    page.get_by_role("button", name="Compare runs", exact=True).click()
+    expect(page.get_by_role("heading", name="Compare runs", exact=True)).to_be_visible()
+    expect(page.locator('.chart-card[data-key="train/loss"]')).to_be_visible()
 
 
-def response_matches(response, *, kind, run_id=None, key=None, bounds=None):
-    if not response.ok:
-        return False
-    parts = urlsplit(response.url)
-    tail = parts.path.rsplit("/", 1)[-1]
-    if tail != kind:
-        return False
-    if run_id is not None and f"/{run_id}/" not in parts.path:
-        return False
-    if kind != "scalars":
-        return True
-    query = parse_qs(parts.query)
-    if key is not None and key not in query.get("key", []):
-        return False
-    has_bounds = "start" in query and "end" in query
-    if bounds is not None and has_bounds != bounds:
-        return False
-    return True
+def loss(page):
+    return page.locator('.chart-card[data-key="train/loss"]')
 
 
-def expect_api(page, action, timeout=15000, **match):
-    with page.expect_response(lambda response: response_matches(response, **match), timeout=timeout) as caught:
-        action()
-    return caught.value
-
-
-def quiet(page):
-    page.wait_for_load_state("networkidle", timeout=15000)
-
-
-def require_plot_hook(page):
-    page.wait_for_function(
-        "() => typeof window.uPlot === 'function' && window.uPlot.__tracksPlots === true",
-        timeout=15000,
-    )
-
-
-def wait_for_loss_plot(page, steps, visible, total=None):
-    page.locator('article.chart-card[data-key="train/loss"]').scroll_into_view_if_needed()
-    require_plot_hook(page)
-    page.wait_for_function(
-        LOSS_READY,
-        arg={"steps": steps, "visible": list(visible), "total": total or len(visible)},
-        timeout=15000,
-    )
-    expect(page.locator(".poll-status")).to_have_text("Up to date")
-    quiet(page)
-
-
-def open_compare(page, url):
-    open_home(page, url)
-    expect(page.get_by_role("button", name="Compare selected (0)")).to_be_disabled()
-    page.get_by_role("checkbox", name="Select explicit-baseline", exact=True).check()
-    page.get_by_role("checkbox", name="Select explicit-highlr", exact=True).check()
-    button = page.get_by_role("button", name="Compare selected (2)")
-    expect(button).to_be_enabled()
-    button.click()
-    expect(page.get_by_role("heading", name="Compare 2 runs", exact=True)).to_be_visible()
-
-
-def open_loss_plot(page, ui_server):
-    open_compare(page, ui_server.url)
-    steps = loss_steps(ui_server, "explicit-baseline")
-    assert steps == loss_steps(ui_server, "explicit-highlr")
-    wait_for_loss_plot(page, steps, COMPARE_RUNS)
-    return steps
-
-
-def run_checkbox(page, name):
-    return page.locator(".run-list label").filter(
-        has=page.get_by_role("link", name=name, exact=True)
-    ).locator("input[type=checkbox]")
-
-
-def loss_card(page):
-    return page.locator('article.chart-card[data-key="train/loss"]')
-
-
-def drag_plot(page, start=0.18, end=0.62):
-    overlay = loss_card(page).locator(".u-over")
-    overlay.scroll_into_view_if_needed()
-    expect(overlay).to_be_visible()
-    box = overlay.bounding_box()
-    assert box is not None and box["width"] > 100 and box["height"] > 40, box
-    y = box["y"] + box["height"] / 2
-    page.mouse.move(box["x"] + box["width"] * start, y)
-    page.mouse.down()
-    page.mouse.move(box["x"] + box["width"] * end, y, steps=24)
-    page.mouse.up()
-
-
-def assert_narrow_bounds(url, steps):
-    query = parse_qs(urlsplit(url).query)
-    assert "train/loss" in query.get("key", []), query
-    start = int(query["start"][0])
-    end = int(query["end"][0])
-    assert steps[0] <= start <= end <= steps[-1], (start, end, steps[0], steps[-1])
-    assert end - start < steps[-1] - steps[0], (start, end, steps)
-    return start, end
-
-
-def x_span(state):
-    assert state["xMin"] is not None and state["xMax"] is not None, state
-    span = state["xMax"] - state["xMin"]
-    assert span > 0, state
-    return span
-
-
-def metric_keys(page, visible_only):
-    return page.locator("article.chart-card").evaluate_all(
-        """(nodes, visibleOnly) => nodes
-            .filter(node => !visibleOnly || !node.hidden)
-            .map(node => node.dataset.key)
-            .sort()""",
-        visible_only,
-    )
-
-
-def train_section(page):
-    return page.locator("details.section").filter(
-        has=page.locator("summary", has_text=re.compile(r"^train$"))
-    )
+def painted(canvas):
+    expect(canvas).to_be_visible()
+    page = canvas.page
+    page.wait_for_function("el => el.width > 0 && !!el.__draw && el.__draw.strokes.some(s => s.width === 2 && s.path.length > 1)", arg=canvas.element_handle())
+    return canvas.evaluate("el => el.__draw")
 
 
 def test_home_lists_every_run(page, ui_server):
-    open_home(page, ui_server.url)
+    home(page, ui_server)
+    expect(page.locator(".run-row")).to_have_count(5)
     expect(page.locator(".poll-status")).to_have_text("5 runs")
-    expect(page.locator("tbody tr")).to_have_count(len(RUNS))
-    for name, project, status, summary_text in RUNS:
-        row = run_row(page, name)
-        expect(row).to_be_visible()
-        expect(row.get_by_role("link", name=name, exact=True)).to_be_visible()
-        expect(row.locator("td").nth(2)).to_have_text(project)
-        badge = row.locator(".badge")
-        expect(badge).to_have_text(status)
-        expect(badge).to_have_class(re.compile(rf"\b{status}\b"))
-        summary = row.locator(".summary")
-        expect(summary).to_have_count(1)
-        if summary_text:
-            expect(summary).to_contain_text(summary_text)
+    expect(page.get_by_text("5 runs · grouped by project", exact=True)).to_be_visible()
+    for name, status, project in (("explicit-baseline", "finished", "testbed"), ("explicit-highlr", "finished", "testbed"), ("zero-code", "finished", "testbed"), ("crashed", "crashed", "testbed"), ("other-project", "finished", "other-project")):
+        run = row(page, name)
+        expect(run).to_be_visible()
+        expect(run.locator(".chip")).to_have_text(status)
+        assert run.evaluate("el => el.closest('[data-project]').dataset.project") == project
+    data = page.request.get(f"{ui_server.url}/api/runs").json()
+    for project in {run["project"] for run in data}:
+        siblings = sorted((run for run in data if run["project"] == project), key=lambda run: run["created_at"], reverse=True)
+        key = None
+        for run in siblings:
+            numeric = [key for key, value in run["summary"].items() if isinstance(value, (int, float)) and not isinstance(value, bool)]
+            if numeric:
+                key = next((key for key in numeric if re.search("loss|acc", key, re.I)), numeric[0])
+                break
+        if key:
+            for run in siblings:
+                expect(row(page, run["name"]).locator(".run-number").first).to_have_attribute("title", key)
 
 
-def test_project_filter_limits_rows(page, ui_server):
-    open_home(page, ui_server.url)
-    select = page.get_by_label("Project filter")
-    expect(select.locator("option")).to_have_text(["All projects", "other-project", "testbed"])
-
-    select.select_option(label="testbed")
-    expect(page.locator("tbody tr")).to_have_count(4)
-    expect(page.get_by_role("link", name="other-project", exact=True)).to_have_count(0)
-    expect(page.get_by_role("link", name="explicit-baseline", exact=True)).to_be_visible()
-
-    select.select_option(label="other-project")
-    expect(page.locator("tbody tr")).to_have_count(1)
-    expect(page.get_by_role("link", name="other-project", exact=True)).to_be_visible()
-    expect(page.get_by_role("link", name="crashed", exact=True)).to_have_count(0)
-
-    select.select_option(label="All projects")
-    expect(page.locator("tbody tr")).to_have_count(5)
-
-
-def test_search_filters_by_name_and_tag(page, ui_server):
-    open_home(page, ui_server.url)
+def test_project_filter_and_search(page, ui_server):
+    home(page, ui_server)
+    page.get_by_role("tab", name="testbed", exact=True).click()
+    expect(page.locator(".run-row")).to_have_count(4)
+    page.get_by_role("tab", name="other-project", exact=True).click()
+    expect(page.locator(".run-row")).to_have_count(1)
+    page.get_by_role("tab", name="All", exact=True).click()
     search = page.get_by_label("Filter runs")
-
-    search.fill("Zero-Code")
-    expect(page.locator("tbody tr")).to_have_count(1)
-    expect(page.get_by_role("link", name="zero-code", exact=True)).to_be_visible()
-
-    # "fixture" is a tag, not part of any run name. zero-code is launched
-    # without --explicit, so the script's tags are not stored on that run.
-    search.fill("FIXTURE")
-    expect(page.get_by_role("link", name="zero-code", exact=True)).to_have_count(0)
-    for name in ("explicit-baseline", "explicit-highlr", "crashed", "other-project"):
-        expect(page.get_by_role("link", name=name, exact=True)).to_be_visible()
-    expect(page.locator("tbody tr")).to_have_count(4)
-
-    # "baseline" matches crashed and other-project only through their tags.
-    search.fill("baseline")
-    expect(page.get_by_role("link", name="crashed", exact=True)).to_be_visible()
-    expect(page.get_by_role("link", name="other-project", exact=True)).to_be_visible()
-    expect(page.get_by_role("link", name="explicit-baseline", exact=True)).to_be_visible()
-    expect(page.get_by_role("link", name="explicit-highlr", exact=True)).to_have_count(0)
-    expect(page.get_by_role("link", name="zero-code", exact=True)).to_have_count(0)
-
-    search.fill("highlr")
-    expect(page.locator("tbody tr")).to_have_count(1)
-    expect(page.get_by_role("link", name="explicit-highlr", exact=True)).to_be_visible()
-
+    for query, names in (("Zero-Code", ["zero-code"]), ("FIXTURE", ["explicit-baseline", "explicit-highlr", "crashed", "other-project"]), ("baseline", ["explicit-baseline", "crashed", "other-project"]), ("highlr", ["explicit-highlr"])):
+        search.fill(query)
+        expect(page.locator(".run-row")).to_have_count(len(names))
+        for name in names:
+            expect(row(page, name)).to_be_visible()
+    search.fill(ui_server.runs["zero-code"])
+    expect(page.locator(".run-row")).to_have_count(1)
     search.fill("")
-    expect(page.locator("tbody tr")).to_have_count(5)
+    expect(page.locator(".run-row")).to_have_count(5)
 
 
-def test_compare_selected_updates_and_navigates(page, ui_server):
-    open_compare(page, ui_server.url)
-    url = page.url
-    baseline = ui_server.runs["explicit-baseline"]
-    highlr = ui_server.runs["explicit-highlr"]
-    assert "#/compare?" in url
-    assert url.index(baseline) < url.index(highlr)
+@pytest.mark.parametrize("width", [375, 1400])
+def test_selection_bar_and_compare_navigation(page, ui_server, width):
+    page.set_viewport_size({"width": width, "height": 1000})
+    home(page, ui_server)
+    bar = page.get_by_test_id("selection-bar")
+    expect(bar).to_be_visible()
+    expect(bar).to_have_text("Select runs to compare", use_inner_text=True)
+    expect(bar.get_by_role("button", name="Compare runs")).to_be_hidden()
+    placeholder_box = bar.bounding_box()
+    checkbox = page.get_by_role("checkbox", name="Select explicit-baseline", exact=True)
+    original = checkbox.element_handle()
+    second = page.get_by_role("checkbox", name="Select explicit-highlr", exact=True)
+    position = second.bounding_box()
+    checkbox.check()
+    assert original.evaluate("el => el.isConnected && el === document.activeElement")
+    assert second.bounding_box() == position
+    expect(bar).to_contain_text("1 run selected")
+    assert bar.bounding_box() == placeholder_box
+    expect(bar.get_by_role("button", name="Compare runs")).to_be_disabled()
+    expect(page).not_to_have_url(re.compile(r"#/run/"))
+    page.get_by_role("checkbox", name="Select explicit-highlr", exact=True).check()
+    expect(bar).to_contain_text("2 runs selected")
+    expect(bar.get_by_role("button", name="Compare runs")).to_be_enabled()
+    bar.get_by_role("button", name="Clear").click()
+    expect(bar).to_have_text("Select runs to compare", use_inner_text=True)
+    expect(bar.get_by_role("button", name="Compare runs")).to_be_hidden()
+    assert bar.bounding_box() == placeholder_box
+    assert second.bounding_box() == position
+    expect(page.get_by_role("checkbox", checked=True)).to_have_count(0)
+    compare(page, ui_server)
+    assert page.url.index(ui_server.runs["explicit-baseline"]) < page.url.index(ui_server.runs["explicit-highlr"])
+    expect(page.get_by_test_id("selected-runs")).to_contain_text("explicit-baseline")
+    expect(page.get_by_role("heading", name="Params & metrics comparison")).to_be_visible()
+    expect(page.get_by_text(re.compile(r"Params that differ \(\d+\)"))).to_be_visible()
+    expect(page.locator(".compare-focus pre")).to_contain_text('"explicit-highlr"')
+    page.get_by_role("button", name="Exit focus").click()
+    expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
 
 
-def test_run_page_shows_facts_config_code_media_and_artifacts(page, ui_server):
-    open_home(page, ui_server.url)
-    page.get_by_role("link", name="explicit-baseline", exact=True).click()
-    expect(page.get_by_role("heading", name="explicit-baseline", exact=True)).to_be_visible()
-    expect(page).to_have_url(re.compile(r"#/run/"))
-    expect(page.locator("#app > .badge")).to_have_text("finished")
-
-    facts = page.locator(".run-facts")
-    expect(facts).to_be_visible()
-    text = facts.inner_text()
-    assert "testbed" in text and "finished" in text
-    assert re.search(r"Created .*\d", text)
-    assert re.search(r"Finished .*\d", text)
-    assert re.search(r"Duration .+ s", text)
-    assert "Host —" not in text and "Created —" not in text and "Finished —" not in text
-    assert re.search(r"Git (?:[0-9a-f]{8}|—)", text)
-
-    config = page.locator("section.card").filter(
-        has=page.get_by_role("heading", name="Config", exact=True)
-    )
-    expect(config.get_by_role("cell", name="lr", exact=True)).to_be_visible()
-    expect(config.get_by_role("cell", name="epochs", exact=True)).to_be_visible()
-    config.get_by_label("Search Config").fill("batch_size")
-    expect(config.get_by_role("cell", name="batch_size", exact=True)).to_be_visible()
-    expect(config.get_by_role("cell", name="lr", exact=True)).to_be_hidden()
-    expect(config.get_by_role("cell", name="epochs", exact=True)).to_be_hidden()
-    config.get_by_label("Search Config").fill("")
-    expect(config.get_by_role("cell", name="lr", exact=True)).to_be_visible()
-
-    environment = page.locator("section.card").filter(
-        has=page.get_by_role("heading", name="Environment", exact=True)
-    )
-    expect(environment.get_by_role("cell", name="python_version", exact=True)).to_be_visible()
-    expect(environment.get_by_role("cell", name="hostname", exact=True)).to_be_visible()
-    expect(environment.get_by_text("Packages", exact=True)).to_be_visible()
-
-    heading = page.get_by_role("heading", name=re.compile(r"^Code · \d+ files?$"))
-    expect(heading).to_be_visible()
-    file_count = int(re.search(r"(\d+)", heading.inner_text()).group(1))
-    tree = page.get_by_role("navigation", name="Code files")
-    for _ in range(8):
-        closed = tree.locator("details:not([open]) > summary")
-        if closed.count() == 0:
-            break
-        closed.first.click()
-    else:
-        raise AssertionError("code tree did not fully expand")
-    expect(tree.get_by_role("button")).to_have_count(file_count)
-    for filename in ("model.py", "train.py", "data.py"):
-        expect(tree.get_by_role("button", name=filename, exact=True)).to_be_visible()
-    tree.get_by_role("button", name="model.py", exact=True).click()
-    expect(page.locator(".code-view")).to_contain_text("class LogisticRegression")
-
+def test_run_facts_parameters_environment_artifacts_and_media(page, ui_server):
+    open_run(page, ui_server)
+    expect(page.locator(".detail > .inline .chip").first).to_have_text("finished")
+    identity = page.get_by_test_id("identity")
+    for label in ("Run id", "Project", "Created", "Finished", "Duration", "Host", "Git commit"):
+        expect(identity.locator("dt").filter(has_text=re.compile(f"^{label}$"))).to_be_visible()
+    expect(identity).to_contain_text(ui_server.runs["explicit-baseline"])
+    expect(identity).to_contain_text("testbed")
+    assert all(value != "—" for value in identity.locator("dd").all_text_contents()[:6])
+    params = page.locator('[data-card="Parameters"]')
+    expect(params.locator("dt")).to_contain_text(["batch_size", "epochs", "lr"])
+    params.get_by_label("Search Parameters").fill("batch_size")
+    expect(params.locator("dt").filter(has_text=re.compile("^lr$"))).to_be_hidden()
+    expect(params.locator("dt").filter(has_text=re.compile("^batch_size$"))).to_be_visible()
+    params.get_by_label("Search Parameters").fill("")
+    environment = page.locator('[data-card="Environment"]')
+    expect(environment).to_contain_text("python_version")
+    expect(environment).to_contain_text("hostname")
+    environment.get_by_text("Packages", exact=True).click()
+    expect(environment.locator("details")).to_have_js_property("open", True)
+    artifacts = page.locator('[data-card="Artifacts"]')
+    expect(artifacts.locator("[data-artifact]")).to_have_count(2)
+    expect(artifacts).to_contain_text("checkpoint")
+    expect(artifacts).to_contain_text("model")
     image = page.locator(".media-strip img")
     expect(image).to_have_count(1)
     expect(image).to_have_attribute("alt", "decision boundary")
     image.scroll_into_view_if_needed()
-    page.wait_for_function(
-        """() => {
-          const img = document.querySelector('.media-strip img');
-          return !!img && img.naturalWidth > 0;
-        }""",
-        timeout=10000,
-    )
-    assert image.evaluate("node => node.naturalWidth") > 0
-    image.click()
-    dialog = page.get_by_role("dialog")
+    page.wait_for_function("() => document.querySelector('.media-strip img')?.naturalWidth > 0")
+    image.focus()
+    image.press("Enter")
+    dialog = page.locator("#lightbox")
     expect(dialog).to_be_visible()
-    page.wait_for_function(
-        """() => {
-          const img = document.querySelector('#lightbox img');
-          return !!img && img.naturalWidth > 0;
-        }""",
-        timeout=10000,
-    )
-    assert dialog.locator("img").evaluate("node => node.naturalWidth") > 0
-    dialog.get_by_role("button", name="Close").click()
+    page.wait_for_function("() => document.querySelector('#lightbox img')?.naturalWidth > 0")
+    dialog.get_by_role("button", name="Close", exact=True).click()
+    expect(dialog).to_be_hidden()
+    image.click()
+    expect(dialog).to_be_visible()
+    page.keyboard.press("Escape")
     expect(dialog).to_be_hidden()
 
-    artifacts = page.locator("section.card").filter(
-        has=page.get_by_role("heading", name="Artifacts", exact=True)
-    )
-    expect(artifacts.locator("tbody tr")).to_have_count(2)
-    expect(artifacts.get_by_role("cell", name="checkpoint", exact=True)).to_have_count(2)
-    expect(artifacts.get_by_role("cell", name="model", exact=True)).to_have_count(2)
+
+def test_code_tabs_find_wrap_and_full_window(page, ui_server):
+    open_run(page, ui_server)
+    viewer = page.get_by_test_id("code-inline-view")
+    model = viewer.locator('.code-file[data-path$="model.py"]')
+    expect(model).to_be_visible()
+    expect(viewer.locator('.code-file[data-path$="train.py"]')).to_be_visible()
+    expect(viewer.locator('.code-file[data-path$="data.py"]')).to_be_visible()
+    expect(viewer.get_by_role("tab", name="train.py", exact=True)).to_be_visible()
+    model.click()
+    expect(viewer.locator(".code-lines")).to_contain_text("class LogisticRegression")
+    search = viewer.get_by_label("Find in file", exact=True)
+    search.fill("self")
+    expect(viewer.locator(".find-count")).to_have_text(re.compile(r"1 of [1-9]\d*"))
+    search.press("Enter")
+    expect(viewer.locator(".find-count")).to_have_text(re.compile(r"2 of \d+"))
+    search.press("Shift+Enter")
+    expect(viewer.locator(".find-count")).to_have_text(re.compile(r"1 of \d+"))
+    viewer.get_by_role("button", name="Next match", exact=True).click()
+    expect(viewer.locator(".find-count")).to_have_text(re.compile(r"2 of \d+"))
+    viewer.get_by_role("button", name="Previous match", exact=True).click()
+    viewer.get_by_role("button", name="Wrap", exact=True).click()
+    expect(viewer.locator(".code-lines")).to_have_class(re.compile(r"wrap"))
+    viewer.locator('.code-file[data-path$="train.py"]').click()
+    expect(viewer.get_by_role("tab", name="train.py", exact=True)).to_be_visible()
+    expect(viewer.get_by_role("tab", name="model.py", exact=True)).to_be_visible()
+    viewer.get_by_role("button", name=re.compile(r"^Close .*train.py$")).click()
+    expect(viewer.get_by_role("tab", name="train.py", exact=True)).to_have_count(0)
+    page.get_by_role("button", name="Open full window ⤢").click()
+    full = page.locator(".code-full")
+    expect(full).to_be_visible()
+    expect(full.get_by_label("Code outline")).to_be_visible()
+    expect(full.locator(".code-crumb")).to_contain_text("model.py")
+    page.keyboard.press("Escape")
+    expect(full).to_have_count(0)
+    viewer.locator(".code-lines").click()
+    expect(full).to_be_visible()
+    full.get_by_role("button", name="Close · Esc").click()
 
 
-def test_compare_charts_render_and_stay_healthy(page, ui_server):
-    open_compare(page, ui_server.url)
-    expect(page.locator("details.section > summary").filter(has_text=re.compile(r"^train$"))).to_be_visible()
-    expect(page.locator("details.section > summary").filter(has_text=re.compile(r"^val$"))).to_be_visible()
-    legend = page.locator(".run-list")
-    swatches = legend.locator(".swatch")
-    expect(swatches).to_have_count(2)
-    expect(legend.get_by_role("link", name="explicit-baseline", exact=True)).to_be_visible()
-    expect(legend.get_by_role("link", name="explicit-highlr", exact=True)).to_be_visible()
-    colors = swatches.evaluate_all(
-        "nodes => nodes.map(node => getComputedStyle(node).backgroundColor)"
-    )
-    assert all(color not in ("", "transparent", "rgba(0, 0, 0, 0)") for color in colors)
-
-    steps = loss_steps(ui_server, "explicit-baseline")
-    assert steps == loss_steps(ui_server, "explicit-highlr")
-    wait_for_loss_plot(page, steps, COMPARE_RUNS)
-    state = chart_state(page)
-    assert state["xs"] == steps
-    assert len(state["series"]) == SERIES_PER_RUN * len(COMPARE_RUNS)
-    assert sum(series["show"] for series in state["series"]) == SHOWN_PER_RUN * len(COMPARE_RUNS)
-
-    expect_api(
-        page,
-        lambda: run_checkbox(page, "explicit-highlr").uncheck(),
-        kind="scalars",
-        run_id=ui_server.runs["explicit-baseline"],
-        key="train/loss",
-        bounds=False,
-    )
-    wait_for_loss_plot(page, steps, ["explicit-baseline"], total=len(COMPARE_RUNS))
-    hidden = chart_state(page)
-    assert hidden["xs"] == steps
-    assert len(hidden["series"]) == SERIES_PER_RUN * len(COMPARE_RUNS)
-    assert sum(series["show"] for series in hidden["series"]) == SHOWN_PER_RUN
-    assert not any(
-        series["show"] and series["label"].startswith("explicit-highlr ")
-        for series in hidden["series"]
-    )
-
-    expect_api(
-        page,
-        lambda: page.get_by_role("combobox", name="X axis").select_option("time"),
-        kind="time",
-        run_id=ui_server.runs["explicit-baseline"],
-    )
-    page.wait_for_function(
-        r"""
-        (previous) => {
-          const state = (window.__chartState('train/loss') || [])[0];
-          if (!state || !state.n) return false;
-          const shown = state.series.filter(series => series.show);
-          const names = new Set(shown.map(series => series.label.slice(0, series.label.lastIndexOf(' '))));
-          if (names.size !== 1 || !names.has('explicit-baseline')) return false;
-          if (!shown.some(series => series.label === 'explicit-baseline mean' && series.finite > 0)) return false;
-          if (state.xs.length !== previous.length) return true;
-          return state.xs.some((value, index) => value !== previous[index]);
-        }
-        """,
-        arg=steps,
-        timeout=15000,
-    )
-    expect(page.locator(".poll-status")).to_have_text("Up to date")
-    assert chart_state(page)["xs"] != steps
-
-
-def test_zoom_drag_narrows_range_and_reset_clears_bounds(page, ui_server):
-    steps = open_loss_plot(page, ui_server)
-    before = chart_state(page)
-    full_span = x_span(before)
-
-    response = expect_api(page, lambda: drag_plot(page), kind="scalars", key="train/loss", bounds=True)
-    start, end = assert_narrow_bounds(response.url, steps)
-    page.wait_for_function(
-        r"""
-        ({count, start, end, span}) => {
-          const state = (window.__chartState('train/loss') || [])[0];
-          if (!state || !state.n || state.xMin == null || state.xMax == null) return false;
-          const width = state.xMax - state.xMin;
-          const last = state.xs[state.xs.length - 1];
-          return state.n < count && state.n > 0 && width > 0 && width < span * 0.85
-            && state.xs[0] >= start && last <= end;
-        }
-        """,
-        arg={"count": len(steps), "start": start, "end": end, "span": full_span},
-        timeout=15000,
-    )
-    zoomed = chart_state(page)
-    assert zoomed["n"] < len(steps)
-    assert x_span(zoomed) < full_span * 0.85
-    quiet(page)
-
-    expect_api(
-        page,
-        lambda: loss_card(page).locator(".chart-host").dblclick(),
-        kind="scalars",
-        key="train/loss",
-        bounds=False,
-    )
-    page.wait_for_function(
-        r"""
-        (steps) => {
-          const state = (window.__chartState('train/loss') || [])[0];
-          if (!state || state.xMin == null || state.xMax == null) return false;
-          return state.xs.length === steps.length
-            && state.xs.every((value, index) => value === steps[index]);
-        }
-        """,
-        arg=steps,
-        timeout=15000,
-    )
-    restored = chart_state(page)
-    assert restored["xs"] == steps
-    assert x_span(restored) > x_span(zoomed)
-    quiet(page)
-
-    time_before_xs = restored["xs"]
-    expect_api(
-        page,
-        lambda: page.get_by_role("combobox", name="X axis").select_option("time"),
-        kind="time",
-    )
-    page.wait_for_function(
-        r"""
-        (previous) => {
-          const state = (window.__chartState('train/loss') || [])[0];
-          if (!state || !state.n || state.xMin == null || state.xMax == null) return false;
-          if (!state.series.some(series => series.show && series.finite > 0)) return false;
-          if (state.xs.length !== previous.length) return true;
-          return state.xs.some((value, index) => value !== previous[index]);
-        }
-        """,
-        arg=time_before_xs,
-        timeout=15000,
-    )
-    timed = chart_state(page)
-    assert timed["xs"] != steps
-    time_span = x_span(timed)
-    quiet(page)
-
-    response = expect_api(page, lambda: drag_plot(page), kind="scalars", key="train/loss", bounds=True)
-    assert_narrow_bounds(response.url, steps)
-    page.wait_for_function(
-        r"""
-        (span) => {
-          const state = (window.__chartState('train/loss') || [])[0];
-          if (!state || !state.n || state.xMin == null || state.xMax == null) return false;
-          return state.xMax - state.xMin < span * 0.85;
-        }
-        """,
-        arg=time_span,
-        timeout=15000,
-    )
-    time_zoomed = chart_state(page)
-    assert x_span(time_zoomed) < time_span * 0.85
-    quiet(page)
-
-    expect_api(
-        page,
-        lambda: page.get_by_role("button", name="Reset zoom").click(),
-        kind="scalars",
-        key="train/loss",
-        bounds=False,
-    )
-    page.wait_for_function(
-        r"""
-        (span) => {
-          const state = (window.__chartState('train/loss') || [])[0];
-          if (!state || !state.n || state.xMin == null || state.xMax == null) return false;
-          return state.xMax - state.xMin > span * 0.9;
-        }
-        """,
-        arg=time_span,
-        timeout=15000,
-    )
-    assert x_span(chart_state(page)) > x_span(time_zoomed)
-
-
-def test_ema_smoothing_changes_plotted_values(page, ui_server):
-    steps = open_loss_plot(page, ui_server)
-    series = RunReader(ui_server.root, ui_server.runs["explicit-baseline"]).series("train/loss")
-    assert len({point[1] for point in series["points"]}) > 1
-    initial = page.evaluate("() => window.__emaDelta('train/loss')")
-    assert initial["compared"] == len(steps) * len(COMPARE_RUNS)
-    assert initial["differ"] == 0
-    assert initial["rawShown"] is False
-
-    slider = page.get_by_label("EMA smoothing")
-    slider.fill("0.9")
-    expect(page.locator("label").filter(has=slider)).to_contain_text("0.90")
-    page.wait_for_function(
-        r"""
-        (count) => {
-          const delta = window.__emaDelta('train/loss');
-          return !!delta && delta.compared === count && delta.differ > 0 && delta.rawShown === true;
-        }
-        """,
-        arg=len(steps) * len(COMPARE_RUNS),
-        timeout=15000,
-    )
-
-
-def test_log_y_scale_changes_distribution(page, ui_server):
-    open_loss_plot(page, ui_server)
-    assert chart_state(page)["yDistr"] == 1
-    toggle = page.get_by_label("Logarithmic y axis")
-    toggle.check()
-    page.wait_for_function(
-        r"""
-        () => {
-          const state = (window.__chartState('train/loss') || [])[0];
-          return !!state && state.yDistr === 3 && state.n > 0
-            && state.series.some(series => series.show && series.finite > 0);
-        }
-        """,
-        timeout=15000,
-    )
-    toggle.uncheck()
-    page.wait_for_function(
-        r"""
-        (steps) => {
-          const state = (window.__chartState('train/loss') || [])[0];
-          return !!state && state.yDistr === 1 && state.xs.length === steps.length
-            && state.xs.every((value, index) => value === steps[index]);
-        }
-        """,
-        arg=loss_steps(ui_server, "explicit-baseline"),
-        timeout=15000,
-    )
-
-
-def test_metric_filter_shows_exact_cards(page, ui_server):
-    open_compare(page, ui_server.url)
-    expect(loss_card(page)).to_be_visible()
-    all_keys = metric_keys(page, False)
+def test_canvas_charts_compare_smoothing_filter_and_focus(page, ui_server):
+    compare(page, ui_server)
+    legend = page.locator(".legend")
+    expect(legend).to_contain_text("explicit-baseline")
+    expect(legend).to_contain_text("explicit-highlr")
+    colors = legend.locator(".dot").evaluate_all("nodes => nodes.map(el => getComputedStyle(el).backgroundColor)")
+    assert len(set(colors)) == 2
+    canvas = loss(page).locator("canvas")
+    before = painted(canvas)
+    paths = [stroke for stroke in before["strokes"] if stroke["width"] == 2 and len(stroke["path"]) > 2]
+    assert len(paths) == 4 and sum(stroke["alpha"] == .22 for stroke in paths) == 2
+    expect(page.get_by_label("Smoothing", exact=True)).to_have_value("0.6")
+    page.get_by_label("Smoothing", exact=True).fill("0")
+    after = painted(canvas)
+    assert len([s for s in after["strokes"] if s["width"] == 2 and len(s["path"]) > 2]) == 2
+    assert [s["path"] for s in paths if s["alpha"] == 1] != [s["path"] for s in after["strokes"] if s["width"] == 2 and len(s["path"]) > 2]
+    page.get_by_label("Ignore outliers", exact=True).uncheck()
+    page.get_by_label("Ignore outliers", exact=True).check()
+    all_keys = page.locator(".chart-card").evaluate_all("nodes => nodes.map(el => el.dataset.key)")
     assert {"train/loss", "train/lr", "val/loss", "val/acc"} <= set(all_keys)
-    search = page.get_by_label("Filter metric keys")
-
-    def expect_exact(query):
-        search.fill(query)
+    for query in ("train/loss", "VAL/", "loss"):
+        page.get_by_label("Filter tags", exact=True).fill(query)
         expected = sorted(key for key in all_keys if query.lower() in key.lower())
-        assert metric_keys(page, True) == expected
-        for key in all_keys:
-            card = page.locator(f'article.chart-card[data-key="{key}"]')
-            if key in expected:
-                expect(card).to_be_visible()
-            else:
-                expect(card).to_be_hidden()
-
-    expect_exact("train/loss")
-    expect_exact("VAL/")
-    expect_exact("loss")
-    search.fill("")
-    assert metric_keys(page, True) == sorted(all_keys)
-    expect(loss_card(page)).to_be_visible()
-
-
-def test_reopening_section_reloads_plots(page, ui_server):
-    steps = open_loss_plot(page, ui_server)
-    section = train_section(page)
-    expect(section).to_have_count(1)
-    expect(section).to_have_js_property("open", True)
-    summary = section.locator("> summary")
-    summary.click()
-    expect(section).to_have_js_property("open", False)
-    expect(loss_card(page)).to_be_hidden()
-    quiet(page)
-
-    response = expect_api(page, lambda: summary.click(), kind="scalars", key="train/loss", bounds=False)
-    assert response.ok
-    expect(section).to_have_js_property("open", True)
-    wait_for_loss_plot(page, steps, COMPARE_RUNS)
-    assert chart_state(page)["xs"] == steps
+        assert sorted(page.locator(".chart-card").evaluate_all("nodes => nodes.map(el => el.dataset.key)")) == expected
+    page.get_by_label("Filter tags", exact=True).fill("")
+    loss(page).click()
+    overlay = page.locator(".chart-focus")
+    expect(overlay).to_be_visible()
+    expect(overlay.get_by_role("heading", name="train/loss", exact=True)).to_be_visible()
+    full_canvas = overlay.locator("canvas")
+    painted(full_canvas)
+    box = full_canvas.bounding_box()
+    page.mouse.move(box["x"] + box["width"] * .5, box["y"] + 100)
+    expect(overlay.get_by_test_id("hover-table")).to_contain_text("Step · hover")
+    assert any(s["dash"] == [3, 3] for s in full_canvas.evaluate("el => el.__draw.strokes"))
+    page.keyboard.press("Escape")
+    expect(overlay).to_have_count(0)
+    expect(page.locator(".compare-focus")).to_be_visible()
+    page.keyboard.press("Escape")
+    expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
 
 
-def test_theme_cycles_and_persists(page, ui_server):
-    open_home(page, ui_server.url)
+def test_ema_matches_hosted_bias_correction(page, ui_server):
+    home(page, ui_server)
+    result = page.evaluate("async () => (await import('/static/charts.js')).emaSmooth([1, 2, 4], .6)")
+    assert result == pytest.approx([1, 1.625, 2.836734693877551])
+
+
+def test_theme_cycles_persists_and_repaints_chart(page, ui_server):
+    open_run(page, ui_server)
+    canvas = loss(page).locator("canvas")
+    before = painted(canvas)
     theme = page.get_by_role("button", name="Change color theme")
     expect(theme).to_have_text("Theme: system")
-
-    def applied():
-        return page.evaluate(
-            """() => ({
-              stored: localStorage.getItem('agenticml-theme'),
-              theme: document.documentElement.dataset.theme,
-              bg: getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()
-            })"""
-        )
-
-    initial = applied()
-    assert initial["stored"] is None
-    assert initial["theme"] == "light"
-    assert initial["bg"] == "#f7f8f8"
-
     theme.click()
     expect(theme).to_have_text("Theme: light")
-    assert applied() == {"stored": "light", "theme": "light", "bg": "#f7f8f8"}
-
     theme.click()
     expect(theme).to_have_text("Theme: dark")
-    assert applied() == {"stored": "dark", "theme": "dark", "bg": "#0b0e0f"}
-
+    expect(page.locator("html")).to_have_attribute("data-theme", "dark")
+    assert painted(canvas)["strokes"][0]["color"] != before["strokes"][0]["color"]
+    assert page.evaluate("localStorage.getItem('agenticml-theme')") == "dark"
     page.reload()
     expect(theme).to_have_text("Theme: dark")
-    assert applied()["stored"] == "dark"
-    assert applied()["theme"] == "dark"
-    assert applied()["bg"] == "#0b0e0f"
+    theme.click()
+    expect(theme).to_have_text("Theme: system")
 
 
-def test_back_and_forward_between_routes(page, ui_server):
-    open_home(page, ui_server.url)
+def test_back_and_forward_and_route_cancellation(page, ui_server):
+    home(page, ui_server)
     page.get_by_role("link", name="explicit-baseline", exact=True).click()
     expect(page.get_by_role("heading", name="explicit-baseline", exact=True)).to_be_visible()
-    expect(page).to_have_url(re.compile(r"#/run/"))
-
     page.go_back()
-    expect(page.get_by_role("heading", name="Experiments", exact=True)).to_be_visible()
-    expect(page).not_to_have_url(re.compile(r"#/run/"))
-
+    expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
     page.go_forward()
     expect(page.get_by_role("heading", name="explicit-baseline", exact=True)).to_be_visible()
-    expect(page.get_by_role("heading", name="Config", exact=True)).to_be_visible()
-
-    page.get_by_role("link", name="Charts").click()
-    expect(page.get_by_role("button", name="Reset zoom")).to_be_visible()
-    expect(page).to_have_url(re.compile(r"#/compare\?"))
-    expect(page.locator(".poll-status")).to_have_text("Up to date")
-
-    page.go_back()
-    expect(page.get_by_role("heading", name="Config", exact=True)).to_be_visible()
-    expect(page.get_by_role("button", name="Reset zoom")).to_have_count(0)
-
-    page.go_forward()
-    expect(page.get_by_role("button", name="Reset zoom")).to_be_visible()
-    expect(page.locator(".poll-status")).to_have_text("Up to date")
+    page.get_by_role("link", name="← All runs").click()
+    expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+    page.evaluate("id => { location.hash = '#/run/' + id; setTimeout(() => { location.hash = '#/'; }, 5); }", ui_server.runs["explicit-highlr"])
+    expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+    expect(page.locator(".code-full, .chart-focus")).to_have_count(0)
 
 
-@pytest.mark.parametrize(("run_id", "status_code"), [
-    ("unknown-valid-id", 404),
-    (".hidden", 400),
-])
-def test_bad_run_route_shows_error(page, ui_server, run_id, status_code):
-    page.allow_http_errors()
+@pytest.mark.parametrize(("run_id", "status"), [("unknown-valid-id", 404), (".hidden", 400)])
+def test_bad_run_route_shows_error(page, ui_server, run_id, status):
+    page.allow_http_errors = True
     page.goto(f"{ui_server.url}#/run/{run_id}")
-    error = page.locator("#app .error")
-    expect(error).to_be_visible()
-    expect(error).to_contain_text(str(status_code))
-    expect(page.get_by_role("heading", name="Experiments")).to_have_count(0)
+    expect(page.locator("#app .error")).to_contain_text(str(status))
     expect(page.locator("#app .error")).to_have_count(1)
 
 
-def test_empty_store_shows_no_runs(page, tmp_path):
-    root = tmp_path / "empty-store"
+def test_empty_store_and_friendly_compare(page, tmp_path, ui_server_factory):
+    root = tmp_path / "empty"
     root.mkdir()
-    with _UIServer(root) as url:
-        open_home(page, url)
-        expect(page.get_by_text(
-            "No runs found. Start a local experiment to see it here.",
-            exact=True,
-        )).to_be_visible()
+    with ui_server_factory(root) as server:
+        home(page, server)
+        expect(page.get_by_text("No runs found. Start a local experiment to see it here.", exact=True)).to_be_visible()
         expect(page.locator(".poll-status")).to_have_text("0 runs")
+        page.goto(f"{server.url}#/compare")
+        expect(page.get_by_text("Select two or more runs from Runs to compare.", exact=True)).to_be_visible()
 
 
-def _open_live_run(root):
+def test_single_run_compare_is_friendly(page, ui_server):
+    page.goto(f"{ui_server.url}#/compare?runs={ui_server.runs['explicit-baseline']}")
+    expect(page.get_by_text("Select two or more runs from Runs to compare.", exact=True)).to_be_visible()
+
+
+def test_no_project_group_is_first_and_escaped(page, tmp_path, ui_server_factory):
+    root = tmp_path / "groups"
+    malicious = '<img src=x onerror="window.__xss=1">'
+    for name, project in ((malicious, ""), ("missing-project", None), ("assigned", "z-project")):
+        meta = {"name": name, "tags": [malicious], "config": {"literal": malicious}}
+        if project is not None:
+            meta["project"] = project
+        writer = RunWriter.create(root, meta=meta)
+        writer.finish("finished")
+    with ui_server_factory(root) as server:
+        home(page, server)
+        expect(page.locator(".project-card")).to_have_count(2)
+        expect(page.locator(".project-card").first.locator(".project-head")).to_contain_text("No project")
+        expect(page.locator('.project-card[data-project=""] .run-row')).to_have_count(2)
+        expect(page.get_by_text("no project — pass project= or run inside a repo", exact=True)).to_be_visible()
+        page.get_by_role("tab", name="No project", exact=True).click()
+        expect(page.locator(".run-row")).to_have_count(2)
+        page.get_by_role("link", name=malicious, exact=True).click()
+        expect(page.get_by_role("heading", name=malicious, exact=True)).to_be_visible()
+        expect(page.locator('[data-card="Parameters"]')).to_contain_text(malicious)
+        assert page.locator("#app img").count() == 0
+        assert page.evaluate("window.__xss") is None
+
+
+def live_run(root):
     import agenticml
-
-    return agenticml, agenticml.init(
-        "live-project",
-        "live-run",
-        dir=root,
-        flush_interval=0.01,
-        system_metrics=False,
-        auto_track=False,
-        track_source=False,
-        capture_env=False,
-    )
+    run = agenticml.init("live-project", "live-run", dir=root, flush_interval=.01, system_metrics=False, auto_track=False, track_source=False, capture_env=False)
+    return agenticml, run
 
 
-def test_live_run_finishes_without_reload(page, tmp_path):
-    root = tmp_path / "live-store"
-    root.mkdir()
-    agenticml, _run = _open_live_run(root)
+def test_live_run_finishes_without_reload(page, tmp_path, ui_server_factory):
+    root = tmp_path / "live"
+    agenticml, run = live_run(root)
     try:
-        with _UIServer(root) as url:
-            open_home(page, url)
-            badge = run_row(page, "live-run").locator(".badge")
-            expect(badge).to_have_text("running")
+        with ui_server_factory(root) as server:
+            home(page, server)
+            expect(row(page, "live-run").locator(".chip")).to_have_text("running")
             expect(page.locator(".poll-status")).to_have_text("Live · refreshes every 5 s")
-            page.evaluate("() => { window.__stayed = true; }")
+            page.evaluate("window.__stayed = true")
             agenticml.finish()
-            expect(badge).to_have_text("finished", timeout=LIVE_TIMEOUT)
+            expect(row(page, "live-run").locator(".chip")).to_have_text("finished", timeout=LIVE_TIMEOUT)
             expect(page.locator(".poll-status")).to_have_text("1 runs")
-            assert page.evaluate("() => window.__stayed === true")
+            assert page.evaluate("window.__stayed")
     finally:
         agenticml.finish()
 
 
-def test_live_chart_shows_new_points_and_metric(page, tmp_path):
+def test_live_chart_retains_controls_and_open_focus(page, tmp_path, ui_server_factory):
     root = tmp_path / "live-chart"
-    root.mkdir()
-    agenticml, run = _open_live_run(root)
+    agenticml, run = live_run(root)
     try:
-        for step, loss in enumerate((0.9, 0.6, 0.4)):
-            agenticml.log({"train/loss": loss}, step=step)
+        for step, value in enumerate((.9, .6, .4)):
+            agenticml.log({"train/loss": value}, step=step)
         run._flush()
-        with _UIServer(root) as url:
-            page.set_viewport_size({"width": 1400, "height": 1400})
-            page.goto(f"{url}#/compare?runs={run.run_id}")
-            expect(page.get_by_role("heading", name="live-run", exact=True)).to_be_visible()
-            expect(page.locator(".poll-status")).to_have_text("Live · refreshes every 5 s", timeout=15000)
-            require_plot_hook(page)
-            loss_card(page).scroll_into_view_if_needed()
-            page.wait_for_function(
-                r"""
-                () => {
-                  const state = (window.__chartState('train/loss') || [])[0];
-                  return !!state && state.n === 3
-                    && state.series.some(series => series.label.endsWith(' mean') && series.show && series.finite === 3);
-                }
-                """,
-                timeout=15000,
-            )
-            page.evaluate("() => { window.__stayed = true; }")
-            agenticml.log({"train/loss": 0.2, "train/extra": 1.25}, step=3)
-            agenticml.log({"train/loss": 0.1}, step=4)
+        with ui_server_factory(root) as server:
+            page.goto(f"{server.url}#/run/{run.run_id}")
+            expect(loss(page).locator("[data-points]")).to_have_attribute("data-points", "3")
+            page.get_by_label("Smoothing", exact=True).fill("0.9")
+            page.get_by_label("Filter tags", exact=True).fill("train/")
+            original_canvas = loss(page).locator("canvas").element_handle()
+            loss(page).click()
+            agenticml.log({"train/loss": .2, "train/extra": 1.25}, step=3)
+            agenticml.log({"train/loss": .1}, step=4)
             run._flush()
-            page.wait_for_function(
-                r"""
-                () => {
-                  const loss = (window.__chartState('train/loss') || [])[0];
-                  const extra = (window.__chartState('train/extra') || [])[0];
-                  return !!loss && loss.n === 5
-                    && loss.series.some(series => series.show && series.label.endsWith(' mean') && series.finite === 5)
-                    && !!extra && extra.n === 1 && !extra.hidden
-                    && extra.series.some(series => series.show && series.label.endsWith(' mean') && series.finite === 1);
-                }
-                """,
-                timeout=LIVE_TIMEOUT,
-            )
-            extra = chart_state(page, "train/extra")
-            assert extra["n"] == 1
-            assert chart_state(page)["n"] == 5
-            assert page.evaluate("() => window.__stayed === true")
+            expect(loss(page).locator("[data-points]")).to_have_attribute("data-points", "5", timeout=LIVE_TIMEOUT)
+            assert original_canvas.evaluate("el => el.isConnected")
+            expect(page.locator('.chart-card[data-key="train/extra"] [data-points]')).to_have_attribute("data-points", "1")
+            expect(page.locator(".chart-focus")).to_be_visible()
+            expect(page.locator(".chart-focus [data-testid=hover-table]")).to_contain_text("0.1")
+            page.keyboard.press("Escape")
+            expect(page.get_by_label("Smoothing", exact=True)).to_have_value("0.9")
+            expect(page.get_by_label("Filter tags", exact=True)).to_have_value("train/")
+            agenticml.finish()
+            expect(page.locator(".detail > .inline .chip").first).to_have_text("finished", timeout=LIVE_TIMEOUT)
+            expect(page.locator(".poll-status")).to_have_text("Up to date")
     finally:
         agenticml.finish()
 
 
-def test_mobile_home_has_no_horizontal_scroll(page, ui_server):
-    page.set_viewport_size({"width": 375, "height": 812})
-    open_home(page, ui_server.url)
-    expect(page.locator("tbody tr")).to_have_count(5)
-    expect(page.get_by_label("Filter runs")).to_be_visible()
-    overflow = page.evaluate(
-        """() => {
-          const nodes = [document.documentElement, document.body];
-          return Math.max(...nodes.map(node => node.scrollWidth - node.clientWidth));
-        }"""
-    )
-    assert overflow <= 0, f"home page scrolls horizontally by {overflow}px"
+def write_snapshot(root, name, project, source, created):
+    """Use the store contract directly so baseline order and bytes are deterministic."""
+    writer = RunWriter.create(root, meta={"name": name, "project": project})
+    writer.set_meta_fields(created_at=created)
+    writer.add_code([{"path": path} for path in source], [(path, text.encode()) for path, text in source.items()])
+    writer.finish("finished")
+    return writer.run_id
+
+
+def test_code_baseline_modified_marker_lazy_fetch_and_diff(page, tmp_path, ui_server_factory):
+    root = tmp_path / "baseline"
+    common = "unchanged = True\n"
+    old = write_snapshot(root, "baseline", "project", {"main.py": "def train():\n    return 1\n", "same.py": common}, "2024-01-01T00:00:00Z")
+    # A newer same-project run without code and another project must be skipped.
+    write_snapshot(root, "empty", "project", {}, "2024-01-02T00:00:00Z")
+    write_snapshot(root, "foreign", "elsewhere", {"main.py": "foreign\n"}, "2024-01-03T00:00:00Z")
+    current = write_snapshot(root, "current", "project", {"main.py": "def train():\n    return 2\n", "same.py": common}, "2024-01-04T00:00:00Z")
+    objects = []
+    page.on("request", lambda request: objects.append(request.url) if "/api/objects/" in request.url else None)
+    with ui_server_factory(root) as server:
+        page.goto(f"{server.url}#/run/{current}")
+        viewer = page.get_by_test_id("code-inline-view")
+        expect(viewer.locator('[data-path="main.py"] [data-modified=true]')).to_have_text("M")
+        expect(viewer.locator('[data-path="same.py"] [data-modified=false]')).not_to_have_text("M")
+        expect(viewer.locator(".code-line.changed")).to_contain_text("return 2")
+        assert len(objects) == 2  # Current and baseline main.py; same.py stays lazy.
+        viewer.locator('[data-path="same.py"]').click()
+        expect(viewer.locator(".code-lines")).to_contain_text(common.strip())
+        assert len(objects) == 3  # The identical baseline blob is never fetched.
+        page.get_by_role("button", name="View diff", exact=True).click()
+        full = page.locator(".code-full")
+        expect(full.get_by_text("Differs from baseline", exact=True)).to_be_visible()
+        expect(full.locator(".code-crumb")).to_have_text("same.py")
+        full.locator('[data-path="main.py"]').click()
+        expect(full.locator(".code-outline")).to_contain_text("was return 1")
+        page.keyboard.press("Escape")
+        expect(full).to_have_count(0)
+
+
+@pytest.mark.parametrize("width", [360, 375])
+def test_mobile_pages_have_no_horizontal_scroll(page, ui_server, width):
+    page.set_viewport_size({"width": width, "height": 812})
+    home(page, ui_server)
+    expect(page.locator(".run-row")).to_have_count(5)
+    for route in ("", f"#/run/{ui_server.runs['explicit-baseline']}", f"#/compare?runs={','.join(ui_server.runs[name] for name in COMPARE_RUNS)}"):
+        page.goto(ui_server.url + route)
+        page.wait_for_load_state("networkidle")
+        overflow = page.evaluate("Math.max(document.documentElement.scrollWidth-document.documentElement.clientWidth, document.body.scrollWidth-document.body.clientWidth)")
+        assert overflow <= 0, f"{route} scrolls horizontally by {overflow}px"
+
+
+def test_metrics_chunk_keys_and_overview_points(page, tmp_path, ui_server_factory):
+    root = tmp_path / "many-metrics"
+    writer = RunWriter.create(root, meta={"name": "many", "project": "stress"})
+    writer.write_scalars([(step, {"dense/loss": float(step)}) for step in range(5105)])
+    writer.write_scalars([(0, {f"tags/{index:03}": index / 10 for index in range(201)})])
+    writer.finish("finished")
+    from urllib.parse import parse_qs, urlsplit
+    queries = []
+    page.on("request", lambda request: queries.append(parse_qs(urlsplit(request.url).query)) if "/scalars?" in request.url else None)
+    with ui_server_factory(root) as server:
+        page.goto(f"{server.url}#/run/{writer.run_id}")
+        expect(page.locator(".chart-card")).to_have_count(202)
+        expect(page.get_by_text("202 / 202 tags", exact=True)).to_be_visible()
+        assert len(queries) == 2
+        assert all(len(query["key"]) <= 200 for query in queries)
+        assert len({key for query in queries for key in query["key"]}) == 202
+        dense = page.locator('.chart-card[data-key="dense/loss"]')
+        points = int(dense.locator("[data-points]").get_attribute("data-points"))
+        assert 1 < points <= 1000
+        values = RunReader(root, writer.run_id).series("dense/loss", max_points=1000)
+        assert values["mode"] == "overview" and points == len(values["points"])
+        last_mean = values["points"][-1][4]
+        assert dense.locator(".chart-values").inner_text().strip() == f"{last_mean:,.4f}".rstrip("0").rstrip(".")
+        painted(dense.locator("canvas"))
+
+
+def test_canvas_resizes_for_device_pixels_and_viewport(page, context, ui_server):
+    open_run(page, ui_server)
+    canvas = loss(page).locator("canvas")
+    painted(canvas)
+    old = canvas.evaluate("el => ({width: el.width, css: el.getBoundingClientRect().width})")
+    page.set_viewport_size({"width": 700, "height": 900})
+    page.wait_for_function("({canvas, width}) => canvas.width !== width", arg={"canvas": canvas.element_handle(), "width": old["width"]})
+    size = canvas.evaluate("el => ({width: el.width, css: el.getBoundingClientRect().width, dpr: devicePixelRatio})")
+    assert size["width"] == int(size["css"] * size["dpr"])
+    assert painted(canvas)["labels"]
+
+
+def test_code_preview_limits_and_escaping(page, tmp_path, ui_server_factory):
+    root = tmp_path / "preview-limits"
+    text = '<script>window.__xss=1</script>\n'
+    run_id = write_snapshot(root, "limits", "preview", {"main.py": text, "large.py": "x" * (1024 * 1024 + 1)}, "2024-01-01T00:00:00Z")
+    with ui_server_factory(root) as server:
+        objects = []
+        page.on("request", lambda request: objects.append(request.url) if "/api/objects/" in request.url else None)
+        page.goto(f"{server.url}#/run/{run_id}")
+        viewer = page.get_by_test_id("code-inline-view")
+        viewer.locator('[data-path="main.py"]').click()
+        expect(viewer.locator(".code-lines")).to_contain_text(text.strip())
+        assert page.evaluate("window.__xss") is None
+        assert viewer.locator("script").count() == 0
+        count = len(objects)
+        viewer.locator('[data-path="large.py"]').click()
+        expect(viewer.locator(".code-lines")).to_contain_text("Too large: code previews are limited to 1 MB.")
+        assert len(objects) == count
+
+
+def test_code_checks_actual_blob_size_and_sixty_file_cap(page, tmp_path, ui_server_factory):
+    root = tmp_path / "blob-limit"
+    source = {f"file{index:02}.py": "x = 1\n" for index in range(65)}
+    source["file00.py"] = "x" * (1024 * 1024 + 1)
+    run_id = write_snapshot(root, "limits", "preview", source, "2024-01-01T00:00:00Z")
+    # Simulate a stale size in the manifest without changing the object bytes.
+    events_path = root / "runs" / run_id / "events.jsonl"
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    for event in events:
+        if event.get("kind") == "code":
+            for file in event["manifest"]:
+                file["size"] = 1
+    events_path.write_text("".join(json.dumps(event) + "\n" for event in events))
+    with ui_server_factory(root) as server:
+        page.goto(f"{server.url}#/run/{run_id}")
+        viewer = page.get_by_test_id("code-inline-view")
+        expect(viewer.locator(".code-file")).to_have_count(60)
+        expect(viewer.locator(".code-file-limit")).to_have_text("Showing 60 of 65 files")
+        expect(viewer.locator(".code-lines")).to_contain_text("Too large: code previews are limited to 1 MB.")
+
+
+def test_chart_errors_and_truncation_are_visible(page, ui_server):
+    page.route("**/scalars?*", lambda route: route.fulfill(status=200, content_type="application/json", body=json.dumps({"series": {"loss": {"mode": "raw", "points": [[0, 1], [1, .5]]}}, "truncated": True})))
+    open_run(page, ui_server)
+    expect(page.get_by_text("Some metric keys were truncated by the server.", exact=True)).to_be_visible()
+    expect(page.locator('.chart-card[data-key="loss"]')).to_be_visible()
+    page.unroute("**/scalars?*")
+    page.route("**/scalars?*", lambda route: route.fulfill(status=503, content_type="application/json", body='{"error":"test failure"}'))
+    page.allow_http_errors = True
+    page.reload()
+    expect(page.locator(".metrics-panel .error")).to_contain_text("503")
+    expect(page.get_by_role("heading", name="explicit-baseline", exact=True)).to_be_visible()
+
+
+def test_varied_progress_headline_delta_and_best_metric(page, tmp_path, ui_server_factory):
+    root = tmp_path / "table-facts"
+    ids = []
+    for index, (name, summary) in enumerate((("older", {"train/loss": .8, "quality": .5}), ("different-key", {"quality": .7}), ("newer", {"train/loss": .4, "quality": .9}))):
+        writer = RunWriter.create(root, meta={"name": name, "project": "project", "config": {"lr": index + 1, "epochs": 5}})
+        writer.set_meta_fields(created_at=f"2024-01-0{index + 1}T00:00:00Z")
+        writer.write_scalars([(1500, {"loss": .4})])
+        writer.finish("finished", summary=summary)
+        ids.append(writer.run_id)
+    with ui_server_factory(root) as server:
+        home(page, server)
+        expect(row(page, "newer").locator(".run-varied")).to_have_text("lr=3")
+        expect(row(page, "newer").locator(".run-progress")).to_have_text("1.5k")
+        expect(row(page, "newer").locator('.run-number[title="train/loss"]')).to_have_text("0.4")
+        expect(row(page, "newer").locator(".run-delta")).to_have_text("-0.4")
+        expect(row(page, "newer").locator(".run-delta")).to_have_class(re.compile(r"\bok\b"))
+        # Skip the intervening run with a different headline key.
+        expect(page.locator(".run-columns")).to_contain_text("train/loss")
+        page.goto(f"{server.url}#/compare?runs={ids[0]},{ids[2]}")
+        table = page.locator(".compare-focus table").last
+        loss_row = table.locator("tr").filter(has=page.get_by_role("cell", name="train/loss", exact=True))
+        expect(loss_row.locator(".ok")).to_have_text("0.4")
+        quality_row = table.locator("tr").filter(has=page.get_by_role("cell", name="quality", exact=True))
+        expect(quality_row.locator(".ok")).to_have_text("0.9")
+        expect(table).to_contain_text("Params that differ (1)")
+        assert "epochs" not in table.inner_text()
+
+
+def test_theme_storage_denied_and_system_change(page, context, ui_server):
+    page.add_init_script("Object.defineProperty(window, 'localStorage', {get() { throw new Error('storage denied'); }});")
+    home(page, ui_server)
+    expect(page.get_by_role("button", name="Change color theme")).to_have_text("Theme: system")
+    page.emulate_media(color_scheme="dark")
+    expect(page.locator("html")).to_have_attribute("data-theme", "dark")
+    page.get_by_role("button", name="Change color theme").click()
+    expect(page.locator("html")).to_have_attribute("data-theme", "light")
+
+
+def test_abandoned_run_detail_uses_effective_status(page, tmp_path, ui_server_factory):
+    import os
+    root = tmp_path / "abandoned"
+    writer = RunWriter.create(root, meta={"name": "abandoned", "project": "project"})
+    writer.close()
+    os.utime(root / "runs" / writer.run_id / "run.lock", (0, 0))
+    with ui_server_factory(root) as server:
+        status = page.request.get(f"{server.url}/api/runs").json()[0]["status"]
+        assert status in ("crashed", "stale")
+        page.goto(f"{server.url}#/run/{writer.run_id}")
+        expect(page.locator(".detail > .inline .chip").first).to_have_text(status)
+        expect(page.locator(".poll-status")).to_have_text("Up to date")
+
+
+def mock_dashboard(page, runs):
+    """Mock only store data; exercise the actual modules, routes, and DOM."""
+    from urllib.parse import unquote, urlsplit
+
+    def respond(route):
+        path = urlsplit(route.request.url).path
+        if path == "/api/runs":
+            body = runs
+        else:
+            parts = path[len("/api/runs/"):].split("/")
+            run_id = unquote(parts[0])
+            run = next(run for run in runs if run["run_id"] == run_id)
+            suffix = parts[1] if len(parts) > 1 else ""
+            body = {"scalars": {"series": {}}, "media": {}, "code": []}.get(suffix, run)
+        route.fulfill(content_type="application/json", body=json.dumps(body))
+
+    page.route("**/api/**", respond)
+
+
+@pytest.mark.parametrize("branch", ["claude/experiments-view-redesign", "branch/" + "long-name" * 80])
+def test_git_dirty_chip_wraps_only_when_needed(page, ui_server, branch):
+    mock_dashboard(page, [{"run_id": "git-run", "name": "git run", "status": "finished", "keys": [],
+                           "git": {"git_commit": "51c5eb5f12345678", "git_branch": branch, "is_dirty": True}}])
+    page.goto(f"{ui_server.url}#/run/git-run")
+    value = page.get_by_test_id("identity").locator("dd").filter(has_text="51c5eb5f")
+    expect(value).to_contain_text(branch)
+    dirty = value.get_by_text("dirty", exact=True)
+    expect(dirty).to_be_visible()
+    branch_box = value.locator(".git-identity > span").nth(1).bounding_box()
+    chip_box = dirty.bounding_box()
+    if branch.startswith("claude/"):
+        assert chip_box["x"] > branch_box["x"]
+        assert chip_box["y"] < branch_box["y"] + branch_box["height"]
+    else:
+        assert chip_box["y"] >= branch_box["y"] + branch_box["height"]
+    assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+
+
+@pytest.mark.parametrize("run_id", ["literal%", "a%2Fb", "a&b?c,d"])
+def test_run_route_decodes_exactly_once(page, ui_server, run_id):
+    from urllib.parse import quote
+    run = {"run_id": run_id, "name": "encoded run", "status": "finished", "keys": []}
+    mock_dashboard(page, [run])
+    page.goto(f"{ui_server.url}#/run/{quote(run_id, safe='')}")
+    expect(page.get_by_role("heading", name="encoded run", exact=True)).to_be_visible()
+    expect(page.get_by_test_id("identity")).to_contain_text(run_id)
+
+
+def test_compare_round_trips_punctuation_in_repeated_parameters(page, ui_server):
+    from urllib.parse import parse_qs, urlsplit
+    ids = ["literal%", "a%2Fb", "a&b?c,d"]
+    runs = [{"run_id": run_id, "name": f"run {index}", "status": "finished", "keys": []} for index, run_id in enumerate(ids)]
+    mock_dashboard(page, runs)
+    home(page, ui_server)
+    for index in range(3):
+        page.get_by_role("checkbox", name=f"Select run {index}", exact=True).check()
+    page.get_by_role("button", name="Compare runs", exact=True).click()
+    expect(page.get_by_test_id("selected-runs")).to_contain_text("run 2")
+    assert parse_qs(urlsplit(page.url).fragment.split("?", 1)[1])["runs"] == ids
+    page.reload()
+    expect(page.get_by_test_id("selected-runs")).to_contain_text("run 2")
+
+
+def test_project_headline_uses_chronology_and_skips_missing_values(page, ui_server):
+    runs = [
+        {"run_id": "middle", "created_at": "2024-01-02", "summary": {"quality": .7}},
+        {"run_id": "old", "created_at": "2024-01-01", "summary": {"loss": .8}},
+        {"run_id": "new", "created_at": "2024-01-03", "summary": {"loss": .4}},
+        {"run_id": "same-date", "created_at": "2024-01-03", "summary": {"loss": .6}},
+        {"run_id": "invalid", "created_at": "invalid", "summary": {}},
+    ]
+    for run in runs:
+        run.update(name=run["run_id"], project="test", status="finished", keys=[])
+    mock_dashboard(page, runs)
+    home(page, ui_server)
+    assert page.locator(".run-row").evaluate_all("nodes => nodes.map(el => el.dataset.runId)") == ["new", "same-date", "middle", "old", "invalid"]
+    expect(row(page, "middle").locator(".run-number").first).to_have_text("—")
+    expect(row(page, "middle").locator(".run-delta")).to_have_text("—")
+    expect(row(page, "new").locator(".run-delta")).to_have_text("-0.4")
+    expect(row(page, "same-date").locator(".run-delta")).to_have_text("-0.2")
+    expect(row(page, "invalid").locator(".run-duration")).to_have_text("—")
+
+
+@pytest.mark.parametrize("width", [375, 1400])
+def test_long_values_are_contained_and_short_subtitles_have_titles(page, ui_server, width):
+    page.set_viewport_size({"width": width, "height": 1000})
+    long = "/outputs/" + "nested-directory/" * 80
+    project = "project" * 80
+    runs = [{"run_id": str(index), "name": f"run {index}", "status": "finished", "keys": [], "project": project,
+             "config": {"output": long + str(index), **{f"parameter{i}": f"short-{index}" for i in range(10)}},
+             "summary": {"best_val_accuracy_metric_with_a_long_name": index}, "env": {"packages": long}, "tags": [long]}
+            for index in range(2)]
+    mock_dashboard(page, runs)
+    home(page, ui_server)
+    subtitle = row(page, "run 0").locator(".run-varied")
+    assert long not in subtitle.inner_text()
+    assert subtitle.get_attribute("title") == subtitle.inner_text()
+    assert subtitle.evaluate("el => el.scrollWidth > el.clientWidth && getComputedStyle(el).whiteSpace === 'nowrap'")
+    header = page.locator(".run-columns .run-number").first
+    expect(header).to_have_attribute("title", "best_val_accuracy_metric_with_a_long_name")
+    for route in ("", "#/run/0", "#/compare?runs=0&runs=1"):
+        page.goto(ui_server.url + route)
+        if "run/0" in route:
+            expect(page.locator(".subline")).to_have_attribute("title", re.compile("parameter"))
+            assert long not in page.locator(".subline").inner_text()
+            expect(page.locator('[data-card="Parameters"]')).to_contain_text(long)
+            page.get_by_text("Packages", exact=True).click()
+        page.wait_for_load_state("networkidle")
+        assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth"), page.evaluate("[...document.querySelectorAll('body *')].filter(el => el.getBoundingClientRect().right > innerWidth).map(el => [el.tagName, el.className, Math.round(el.getBoundingClientRect().width)]).slice(0, 20)")
+
+
+def test_live_poll_skips_unchanged_scalars_and_refreshes_media(page, tmp_path, ui_server_factory):
+    root = tmp_path / "live-media"
+    agenticml, run = live_run(root)
+    try:
+        agenticml.log({"train/loss": .5}, step=0)
+        agenticml.log({"train/loss": .4}, step=1)
+        run._flush()
+        requests = []
+        page.on("request", lambda request: requests.append(request.url))
+        with ui_server_factory(root) as server:
+            page.goto(f"{server.url}#/run/{run.run_id}")
+            painted(loss(page).locator("canvas"))
+            canvas = loss(page).locator("canvas").element_handle()
+            # Inject a new media response after initial render; no scalar step/key changes.
+            media = {"live image": [{"step": 1, "sha256": "a" * 64, "content_type": "image/png", "caption": "new image"}]}
+            page.route("**/media", lambda route: route.fulfill(content_type="application/json", body=json.dumps(media)))
+            page.route("**/api/objects/**", lambda route: route.fulfill(content_type="image/png", body=bytes.fromhex("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000b49444154789c636000020000050001a5f645400000000049454e44ae426082")))
+            expect(page.locator(".media-strip img")).to_have_attribute("alt", "new image", timeout=LIVE_TIMEOUT)
+            assert sum("/scalars?" in url for url in requests) == 1
+            assert sum(url.endswith("/media") for url in requests) >= 2
+            assert canvas.evaluate("el => el.isConnected")
+    finally:
+        agenticml.finish()
+
+
+def test_code_failed_load_can_retry(page, tmp_path, ui_server_factory):
+    root = tmp_path / "retry-code"
+    run_id = write_snapshot(root, "retry", "p", {"main.py": "print('retried')"}, "2024-01-01")
+    attempts = []
+    page.allow_http_errors = True
+    with ui_server_factory(root) as server:
+        def respond(route):
+            attempts.append(route.request.url)
+            if len(attempts) == 1:
+                route.fulfill(status=503, body="unavailable")
+            else:
+                route.continue_()
+        page.route("**/api/objects/**", respond)
+        page.goto(f"{server.url}#/run/{run_id}")
+        viewer = page.get_by_test_id("code-inline-view")
+        expect(viewer.locator(".code-lines")).to_contain_text("503")
+        viewer.locator('[data-path="main.py"]').click()
+        expect(viewer.locator(".code-lines")).to_contain_text("retried")
+        assert len(attempts) == 2
+
+
+def test_code_stream_limit_cancels_without_content_length(page, tmp_path, ui_server_factory):
+    root = tmp_path / "stream-code"
+    run_id = write_snapshot(root, "stream", "p", {"main.py": "small"}, "2024-01-01")
+    page.add_init_script("""(() => {
+      const original = window.fetch;
+      window.fetch = (url, options) => {
+        if (!String(url).startsWith('/api/objects/')) return original(url, options);
+        window.streamChunks = 0; window.streamCancelled = false;
+        return Promise.resolve(new Response(new ReadableStream({
+          pull(controller) { window.streamChunks++; controller.enqueue(new Uint8Array(65536)); },
+          cancel() { window.streamCancelled = true; }
+        })));
+      };
+    })();""")
+    with ui_server_factory(root) as server:
+        page.goto(f"{server.url}#/run/{run_id}")
+        expect(page.get_by_test_id("code-inline-view").locator(".code-lines")).to_contain_text("limited to 1 MB")
+        assert page.evaluate("streamCancelled && streamChunks <= 18")
+
+
+def test_oversized_baseline_keeps_current_source_visible(page, tmp_path, ui_server_factory):
+    root = tmp_path / "large-baseline"
+    write_snapshot(root, "large baseline", "p", {"main.py": "x" * (1024 * 1024 + 1)}, "2024-01-01")
+    run_id = write_snapshot(root, "current", "p", {"main.py": "print('current file')"}, "2024-01-02")
+    with ui_server_factory(root) as server:
+        page.goto(f"{server.url}#/run/{run_id}")
+        viewer = page.get_by_test_id("code-inline-view")
+        expect(viewer.locator(".code-lines")).to_contain_text("current file")
+        expect(viewer.locator(".code-status")).to_contain_text("Diff skipped: baseline unavailable.")
+        expect(viewer.locator(".code-status")).to_contain_text("1 MB")
+        expect(viewer.locator(".code-line.changed")).to_have_count(0)
+
+
+def test_file_cap_sorts_and_retains_config_and_entry(page, tmp_path, ui_server_factory):
+    root = tmp_path / "file-order"
+    source = {"z/train.py": "print('entry')", "z/config.yaml": "lr: 1", **{f"a/{i:03}.py": "pass" for i in reversed(range(65))}}
+    run_id = write_snapshot(root, "order", "p", source, "2024-01-01")
+    with ui_server_factory(root) as server:
+        page.goto(f"{server.url}#/run/{run_id}")
+        viewer = page.get_by_test_id("code-inline-view")
+        expect(viewer.locator(".code-file")).to_have_count(60)
+        expect(viewer.locator(".code-file-limit")).to_have_text("Showing 60 of 67 files")
+        paths = viewer.locator(".code-file").evaluate_all("nodes => nodes.map(el => el.dataset.path)")
+        assert paths == sorted(paths)
+        assert paths[:58] == [f"a/{i:03}.py" for i in range(58)]
+        assert paths[-2:] == ["z/config.yaml", "z/train.py"]
+        expect(viewer.get_by_role("tab")).to_have_text(["config.yaml", "train.py"])
+        expect(viewer.locator(".code-lines")).to_contain_text("lr: 1")
+
+
+def test_full_code_preserves_file_and_line_and_caps_change_list(page, tmp_path, ui_server_factory):
+    root = tmp_path / "code-position"
+    write_snapshot(root, "named baseline", "p", {"config.yaml": "a: 1", "train.py": "\n".join(f"old_{i}" for i in range(500))}, "2024-01-01")
+    run_id = write_snapshot(root, "current", "p", {"config.yaml": "a: 1", "train.py": "\n".join(f"new_{i}" for i in range(500))}, "2024-01-02")
+    with ui_server_factory(root) as server:
+        page.goto(f"{server.url}#/run/{run_id}")
+        viewer = page.get_by_test_id("code-inline-view")
+        expect(viewer.locator(".code-status")).to_contain_text("Click code to open full window")
+        viewer.get_by_role("tab", name="train.py", exact=True).click()
+        viewer.get_by_label("Find in file", exact=True).fill("new_300")
+        expect(viewer.locator(".find-count")).to_have_text("1 of 1")
+        page.get_by_role("button", name="Open full window ⤢").click()
+        full = page.get_by_test_id("code-full-view")
+        expect(full.locator(".code-crumb")).to_have_text("train.py")
+        expect(full.locator(".code-outline")).to_contain_text("Differs from named baseline")
+        expect(full.locator(".change-item")).to_have_count(200)
+        expect(full.locator(".code-more")).to_have_text("and 301 more")
+        expect(full.get_by_text("Nothing to outline", exact=True)).to_have_css("padding-left", "14px")
+        page.wait_for_function("() => document.querySelector('[data-testid=code-full-view] .code-lines').scrollTop > 0")
+        assert full.locator('.code-line[data-line="301"]').evaluate("el => { const a=el.getBoundingClientRect(), b=el.parentElement.getBoundingClientRect(); return a.top >= b.top && a.bottom <= b.bottom; }")
+        page.keyboard.press("Escape")
+        viewer.locator('.code-line[data-line="301"]').click()
+        expect(full.locator(".code-crumb")).to_have_text("train.py")
+        expect(full.locator('.code-line[data-line="301"]')).to_be_in_viewport()
+
+
+def test_identical_code_has_no_diff_heading_and_baseline_suffix(page, tmp_path, ui_server_factory):
+    root = tmp_path / "same-code"
+    old = write_snapshot(root, "", "p", {"main.py": "pass"}, "2024-01-01")
+    same = write_snapshot(root, "same", "p", {"main.py": "pass"}, "2024-01-02")
+    current = write_snapshot(root, "different", "p", {"main.py": "changed"}, "2024-01-03")
+    with ui_server_factory(root) as server:
+        page.goto(f"{server.url}#/run/{same}")
+        expect(page.locator(".code-status")).to_contain_text("Click code to open full window")
+        page.get_by_role("button", name="Open full window ⤢").click()
+        expect(page.locator(".code-outline")).not_to_contain_text("Differs from")
+        page.keyboard.press("Escape")
+        # Remove the intermediate run from baseline candidates to exercise fallback naming.
+        page.route("**/api/runs", lambda route: route.fulfill(content_type="application/json", body=json.dumps([
+            {"run_id": old, "created_at": "2024-01-01", "project": "p", "name": ""},
+            {"run_id": current, "created_at": "2024-01-03", "project": "p", "name": "different"},
+        ])))
+        page.goto(f"{server.url}#/run/{current}")
+        page.get_by_role("button", name="View diff", exact=True).click()
+        expect(page.locator(".code-outline")).to_contain_text(f"Differs from {old.rsplit('-', 1)[-1]}")
+
+
+def test_large_chart_null_gaps_and_cached_hover(page, ui_server):
+    home(page, ui_server)
+    result = page.evaluate("""async () => {
+      const {MetricChart} = await import('/static/charts.js');
+      const canvas = document.createElement('canvas');
+      canvas.style.cssText = 'width:600px;height:300px';
+      document.body.append(canvas);
+      const points = Array.from({length:150000}, (_, i) => ({step:i, value:i === 75000 ? null : i % 100}));
+      const chart = new MetricChart(canvas, {runs:[{id:'large'}], metrics:{large:{loss:points}}, activeMetric:'loss', smoothing:.6});
+      const layout = {...chart.layout};
+      const before = canvas.__draw.labels.length;
+      let sorts = 0;
+      const sort = Array.prototype.sort;
+      Array.prototype.sort = function(...args) { sorts++; return sort.apply(this,args); };
+      try { chart.move({clientX:canvas.getBoundingClientRect().left+300}); }
+      finally { Array.prototype.sort = sort; }
+      const after = canvas.__draw.labels.length;
+      chart.destroy(); canvas.remove();
+      return {layout, sorts, before, after};
+    }""")
+    assert result["layout"]["minStep"] == 0 and result["layout"]["maxStep"] == 149999
+    assert result["sorts"] == 0 and result["before"] == result["after"]
+    # A small gapped series should have two independent stroke segments.
+    points = [[0, .8], [1, .6], [2, None], [3, .4], [4, .2]]
+    page.route("**/scalars?*", lambda route: route.fulfill(content_type="application/json", body=json.dumps({"series": {"train/loss": {"mode": "raw", "points": points}}})))
+    open_run(page, ui_server)
+    expect(loss(page).locator("[data-points]")).to_have_attribute("data-points", "5")
+    draw = painted(loss(page).locator("canvas"))
+    assert all(stroke["moves"] == 2 for stroke in draw["strokes"] if stroke["width"] == 2 and len(stroke["path"]) == 4)
+    assert len([stroke for stroke in draw["strokes"] if stroke["width"] == 2 and len(stroke["path"]) == 4]) == 2
+
+
+def test_baseline_discovery_is_bounded_parallel_and_chooses_nearest(page, tmp_path, ui_server_factory):
+    root = tmp_path / "parallel-baseline"
+    for day in range(1, 7):
+        write_snapshot(root, f"baseline {day}", "p", {"main.py": "old"} if day <= 4 else {}, f"2024-01-0{day}")
+    run_id = write_snapshot(root, "current", "p", {"main.py": "new"}, "2024-01-07")
+    page.add_init_script("""(() => {
+      const original = window.fetch;
+      window.manifestActive = 0; window.manifestPeak = 0;
+      window.fetch = async (url, options) => {
+        if (!String(url).endsWith('/code')) return original(url, options);
+        window.manifestActive++;
+        window.manifestPeak = Math.max(window.manifestPeak, window.manifestActive);
+        try {
+          const response = await original(url, options);
+          await new Promise(resolve => setTimeout(resolve, 50));
+          return response;
+        } finally { window.manifestActive--; }
+      };
+    })();""")
+    with ui_server_factory(root) as server:
+        page.goto(f"{server.url}#/run/{run_id}")
+        page.get_by_role("button", name="View diff", exact=True).click()
+        expect(page.locator(".code-outline")).to_contain_text("Differs from baseline 4")
+        assert page.evaluate("manifestPeak") == 4
+
+
+def test_code_content_length_is_rejected_before_reading(page, tmp_path, ui_server_factory):
+    root = tmp_path / "length-limit"
+    run_id = write_snapshot(root, "length", "p", {"main.py": "small"}, "2024-01-01")
+    page.add_init_script("""(() => {
+      const original = window.fetch;
+      window.bodyRead = false; window.downloadAborted = false;
+      window.fetch = (url, options) => {
+        if (!String(url).startsWith('/api/objects/')) return original(url, options);
+        options.signal.addEventListener('abort', () => { window.downloadAborted = true; });
+        return Promise.resolve({ok:true, headers:new Headers({'Content-Length':'2000000'}),
+          get body() { window.bodyRead = true; throw new Error('body must not be read'); }});
+      };
+    })();""")
+    with ui_server_factory(root) as server:
+        page.goto(f"{server.url}#/run/{run_id}")
+        expect(page.locator(".code-lines")).to_contain_text("limited to 1 MB")
+        assert page.evaluate("!bodyRead && downloadAborted")

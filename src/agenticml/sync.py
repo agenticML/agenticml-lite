@@ -631,9 +631,23 @@ def _prune_synced_run(reader, state, save, result):
     save()
 
 
+def _label_part(value, *, missing=""):
+    """One side of a ``project/name`` sync label. ``None`` is not the word None."""
+    if value is None or value == "":
+        return missing
+    return str(value)
+
+
+def _run_label(meta):
+    data = meta if isinstance(meta, dict) else {}
+    project = _label_part(data.get("project"))
+    name = _label_part(data.get("name"), missing="-")
+    return f"{project}/{name}"
+
+
 def sync_run(reader, host, client, result, *, dry_run=False, prune=False):
     meta = reader.meta()
-    result.label = f"{meta.get('project', '')}/{meta.get('name', '')}"
+    result.label = _run_label(meta)
     lock = None
     if not dry_run:
         lock = _acquire_lock(reader.run_dir)
@@ -653,7 +667,7 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False):
     source_hash = _source_hash(reader)
     sizes = reader.record_sizes()
     meta = reader.meta()
-    result.label = f"{meta.get('project', '')}/{meta.get('name', '')}"
+    result.label = _run_label(meta)
     state = _host_state(reader, host)
     def save():
         if not dry_run:

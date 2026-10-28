@@ -22,6 +22,7 @@ from .code_tracking import (
     DEFAULT_MAX_TOTAL_BYTES,
     RuntimeFileCollector,
     compute_snapshot_hash,
+    default_project,
     find_repo_root,
 )
 from .env import capture_environment
@@ -301,6 +302,8 @@ class Run(metaclass=_RunType):
             raise _StoreError() from exc
         if id is not None and not valid_run_id(id):
             raise ValueError(f"invalid run id: {id!r}")
+        if not project:
+            project = default_project()
         self.project = project
         self.name = name
         self.flush_interval = flush_interval
@@ -979,9 +982,11 @@ class Run(metaclass=_RunType):
 
     def _print_init_info(self):
         """Print the run identity and how to open its local UI."""
+        project = "-" if self.project is None or self.project == "" else self.project
+        name = "-" if self.name is None or self.name == "" else self.name
         print("\n".join([
             f"agenticml: run_id={self.run_id}",
-            f"  project={self.project} name={self.name} mode={self.mode}",
+            f"  project={project} name={name} mode={self.mode}",
             f"  run_dir={self.writer.run_dir}",
             f"  agenticml ui --dir {shlex.quote(str(self.root))}",
         ]))

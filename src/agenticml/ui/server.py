@@ -21,14 +21,19 @@ import webbrowser
 from agenticml.store import layout, reader
 
 _STATIC = Path(__file__).with_name("static")
-_FILES = {"index.html": "text/html; charset=utf-8", "app.js": "text/javascript; charset=utf-8",
-          "app.css": "text/css; charset=utf-8", "uPlot.iife.min.js": "text/javascript; charset=utf-8",
-          "uPlot.min.css": "text/css; charset=utf-8", "uPlot.LICENSE": "text/plain; charset=utf-8"}
+_FILES = {
+    "index.html": "text/html; charset=utf-8",
+    "app.js": "text/javascript; charset=utf-8",
+    "app.css": "text/css; charset=utf-8",
+    "charts.js": "text/javascript; charset=utf-8",
+    "code.js": "text/javascript; charset=utf-8",
+}
 _OBJECT_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp", "image/avif",
                  "image/bmp", "image/x-icon", "text/plain", "application/json"}
 _CSP = "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _SERIES_LIMIT = 200
+_CONFIG_LIMIT = 50
 _CHUNK = 64 * 1024
 _CONNECTION_TIMEOUT = 60
 _DISCONNECT = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
@@ -44,13 +49,17 @@ def _tags(value):
     return [item for item in value if isinstance(item, str)]
 
 
-def _summary(value):
+def _summary(value, limit=None):
+    """String-keyed scalars, in insertion order. ``limit`` caps how many are kept."""
     if not isinstance(value, dict):
         return {}
-    return {
-        key: item for key, item in value.items()
-        if isinstance(key, str) and (item is None or isinstance(item, (str, int, float, bool)))
-    }
+    kept = {}
+    for key, item in value.items():
+        if isinstance(key, str) and (item is None or isinstance(item, (str, int, float, bool))):
+            kept[key] = item
+            if limit is not None and len(kept) >= limit:
+                break
+    return kept
 
 
 def _unique(values):
@@ -172,6 +181,15 @@ class DashboardServer(ThreadingHTTPServer):
             current = self.readers[run_id]
         yield current
 
+    def cached_reader(self, run_id):
+        """The LRU entry for ``run_id``, or None.
+
+        Does not insert, reorder, or evict. List polling uses this so a run
+        that is not already open for charts cannot push chart readers out.
+        """
+        with self.reader_lock:
+            return self.readers.get(run_id)
+
 
 class IPv6DashboardServer(DashboardServer):
     address_family = socket.AF_INET6
@@ -282,6 +300,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 traceback.print_exc()
             self._error({"error": "internal error"}, 500)
 
+    def _list_last_step(self, run_id):
+        """Latest scalar step, or None when the run has none or cannot be read.
+
+        One failed run must not drop the rest of the list. A reader already
+        in the chart LRU is reused; every other run is a short uncached read.
+        This never inserts or evicts, so a list poll cannot drop incremental
+        overview state from readers the charts are still using.
+        """
+        if not isinstance(run_id, str) or not run_id:
+            return None
+        try:
+            current = self.server.cached_reader(run_id)
+            if current is not None:
+                step = current.last_step()
+            else:
+                step = reader.read_last_step(self.server.root, run_id)
+        except Exception:
+            return None
+        if isinstance(step, bool) or not isinstance(step, int):
+            return None
+        return step
+
     def _get(self):
         url = urlsplit(self.path)
         path = unquote(url.path, errors="strict")
@@ -299,6 +339,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 row["tags"] = _tags(meta.get("tags"))
                 row["status"] = meta.get("effective_status", meta.get("status"))
                 row["summary"] = _summary(meta.get("summary"))
+                row["config"] = _summary(meta.get("config"), limit=_CONFIG_LIMIT)
+                # meta.json and the scalars index do not record a step. The last
+                # _time.bin record is one seek, not a scan of the series files.
+                # Do not route this through run_reader: inserting every row
+                # evicts chart readers from the 64-entry LRU.
+                row["last_step"] = self._list_last_step(meta.get("run_id"))
                 runs.append(row)
             return self._json(runs)
         if path.startswith("/api/runs/"):

@@ -133,6 +133,100 @@ def test_du_table_and_json(tmp_path, capsys):
     assert data["runs"][0]["run_id"] == "du-run"
 
 
+def _ls_cells(header, line):
+    titles = ("RUN ID", "PROJECT", "NAME", "STATUS", "CREATED", "LAST STEP")
+    starts = [header.index(title) for title in titles]
+    padded = line.ljust(len(header))
+    cells = {}
+    for index, title in enumerate(titles):
+        end = starts[index + 1] if index + 1 < len(starts) else len(padded)
+        cells[title] = padded[starts[index]:end].strip()
+    return cells
+
+
+def test_ls_missing_name_prints_dash_not_none(tmp_path, capsys):
+    none_name = RunWriter.create(tmp_path, run_id="none-name", meta={"project": "p", "name": None})
+    none_name.finish("finished")
+    blank = RunWriter.create(tmp_path, run_id="blank-name", meta={"project": "p", "name": ""})
+    blank.finish("finished")
+    omitted = RunWriter.create(tmp_path, run_id="omitted-name", meta={"project": "q"})
+    omitted.finish("finished")
+    named = RunWriter.create(tmp_path, run_id="named", meta={"project": "p", "name": "kept"})
+    named.finish("finished")
+    literal = RunWriter.create(tmp_path, run_id="literal-none", meta={"project": None, "name": "None"})
+    literal.finish("finished")
+
+    assert cli.main(["ls", "--dir", str(tmp_path)]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    header, *body = lines
+    assert body[-1] == "5 runs"
+    rows = {_ls_cells(header, line)["RUN ID"]: _ls_cells(header, line) for line in body[:-1]}
+    for run_id in ("none-name", "blank-name", "omitted-name"):
+        assert rows[run_id]["NAME"] == "-"
+        assert rows[run_id]["NAME"] != "None"
+    assert rows["named"]["NAME"] == "kept"
+    assert rows["none-name"]["PROJECT"] == "p"
+    assert rows["literal-none"]["NAME"] == "None"
+    assert rows["literal-none"]["PROJECT"] == ""
+
+    assert cli.main(["ls", "--dir", str(tmp_path), "--json"]) == 0
+    payload = {row["run_id"]: row for row in json.loads(capsys.readouterr().out)}
+    assert payload["none-name"]["name"] is None
+    assert payload["named"]["name"] == "kept"
+    assert payload["literal-none"]["name"] == "None"
+
+    assert cli.main(["du", "--dir", str(tmp_path)]) == 0
+    usage = capsys.readouterr().out
+    assert "p/kept" in usage
+    assert "None/None" not in usage and "p/None" not in usage
+
+
+def test_verbose_init_and_sync_label_omit_literal_none(tmp_path, monkeypatch, capsys):
+    import agenticml
+    from agenticml.store import RunReader
+    from agenticml.sync import SyncResult, _run_label, sync_run
+
+    assert _run_label({"project": "demo", "name": "train"}) == "demo/train"
+    assert _run_label({"project": 67890, "name": 12345}) == "67890/12345"
+    assert _run_label({"project": "p", "name": None}) == "p/-"
+    assert _run_label({"project": "p", "name": ""}) == "p/-"
+    assert _run_label({"project": "p"}) == "p/-"
+    assert _run_label({"project": None, "name": "n"}) == "/n"
+    assert "None" not in _run_label({"project": None, "name": None})
+
+    writer = RunWriter.create(tmp_path, run_id="sync-none", meta={"project": "p", "name": None})
+    writer.finish("finished")
+    result = SyncResult(writer.run_id)
+    sync_run(RunReader(tmp_path, writer.run_id), "http://127.0.0.1", None, result, dry_run=True)
+    assert result.label == "p/-"
+    assert "None" not in result.line()
+
+    monkeypatch.delenv("AGENTICML_MODE", raising=False)
+    monkeypatch.delenv("AGENTICML_DIR", raising=False)
+    monkeypatch.delenv("AGENTICML_PROJECT", raising=False)
+    monkeypatch.delenv("AGENTICML_NAME", raising=False)
+    run = agenticml.init(
+        project="p",
+        name=None,
+        mode="local",
+        dir=tmp_path,
+        verbose=True,
+        track_source=False,
+        capture_env=False,
+        system_metrics=False,
+        only_main_process=False,
+        auto_track=False,
+    )
+    try:
+        out = capsys.readouterr().out
+        assert "project=p" in out
+        assert "name=-" in out
+        assert "name=None" not in out
+        assert run.name is None
+    finally:
+        agenticml.finish()
+
+
 def test_gc_cli(tmp_path, monkeypatch, capsys):
     writer = RunWriter.create(tmp_path, run_id="gc-run", meta={"project": "p", "name": "n"})
     writer.write_scalars([(0, {"x": 1.0})])

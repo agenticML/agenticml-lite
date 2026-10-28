@@ -78,8 +78,8 @@ def _resolve_mode(explicit):
 
 
 def init(
-    project,
-    name,
+    project=None,
+    name=None,
     mode=None,
     only_main_process=True,
     dir=None,
@@ -92,6 +92,8 @@ def init(
     training get a `_DisabledRun` automatically, so user code keeps calling
     `agenticml.log(...)` without coordinating logging duties manually.
 
+    `project` defaults to `AGENTICML_PROJECT`, then the repository or
+    directory name. An explicit project wins. `name` may be omitted.
     `mode` precedence: explicit arg > AGENTICML_MODE env > 'local'.
     `"offline"` is an alias for `"local"`.
     `dir` selects the local root (explicit arg > AGENTICML_DIR > ``~/.agenticml``).
@@ -142,13 +144,25 @@ def init(
 
 
 def _attach(run, project, name, kwargs):
-    """Merge a script's own init() into the run `agenticml run` started."""
-    if (project, name) != (getattr(run, "project", project), getattr(run, "name", name)):
+    """Merge a script's own init() into the run `agenticml run` started.
+
+    ``None`` means that argument was omitted, so it is not a conflict with
+    the run the launcher already started. A run with no project or name
+    attribute is not a conflict either.
+    """
+    missing = object()
+    current_project = getattr(run, "project", missing)
+    current_name = getattr(run, "name", missing)
+    project_differs = (
+        project is not None and current_project is not missing and project != current_project
+    )
+    name_differs = name is not None and current_name is not missing and name != current_name
+    if project_differs or name_differs:
         logger.warning(
             "agenticml run already started run %r in project %r; "
             "keeping it instead of project=%r name=%r",
-            getattr(run, "name", None),
-            getattr(run, "project", None),
+            None if current_name is missing else current_name,
+            None if current_project is missing else current_project,
             project,
             name,
         )

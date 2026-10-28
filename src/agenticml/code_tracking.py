@@ -466,6 +466,34 @@ def find_repo_root(start: Path) -> Path:
     return start
 
 
+def _main_directory() -> Path:
+    """Directory of ``__main__.__file__`` when that file exists, else the cwd."""
+    main = sys.modules.get("__main__")
+    main_file = getattr(main, "__file__", None) if main is not None else None
+    if isinstance(main_file, Path):
+        main_file = os.fspath(main_file)
+    if isinstance(main_file, str) and main_file:
+        return Path(main_file).resolve().parent
+    return Path.cwd()
+
+
+def default_project(start: Path | None = None) -> str:
+    """Project name when the caller did not pass one.
+
+    ``AGENTICML_PROJECT`` wins when it is non-empty. Otherwise this is the
+    directory name of the repo that contains ``start`` (or the main file's
+    directory, else the working directory). A path whose name is empty
+    (``/``) becomes ``"default"``.
+    """
+    configured = os.environ.get("AGENTICML_PROJECT")
+    if configured:
+        return configured
+    if start is None:
+        start = _main_directory()
+    name = find_repo_root(Path(start)).name
+    return name or "default"
+
+
 def _should_skip(path: Path) -> bool:
     lowered_parts = [part.lower() for part in path.parts]
     if any(part in SKIP_DIR_NAMES for part in lowered_parts):
