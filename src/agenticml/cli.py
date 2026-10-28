@@ -158,7 +158,70 @@ def cmd_du(args):
         f"Objects dir total:     {_format_bytes(report.get('objects_total', 0))} "
         f"({report.get('unreferenced_count', 0)} unreferenced: {_format_bytes(report.get('unreferenced_total', 0))})"
     )
+    print(f"Lineage repos total:   {_format_bytes(report.get('lineage_total', 0))}")
+    print(f"Worktrees total:       {_format_bytes(report.get('worktrees_total', 0))}")
     print(f"Total store usage:     {_format_bytes(report.get('total', 0))}")
+    return 0
+
+
+def cmd_lineage(args):
+    from . import lineage
+    from .store.layout import resolve_root
+    from .store.reader import list_runs
+
+    root = resolve_root(args.dir)
+    try:
+        if args.lineage_cmd == "checkout":
+            print(lineage.checkout(root, args.run_id, args.path))
+        elif args.lineage_cmd == "diff":
+            print("ADDED  DELETED  STATUS  PATH")
+            for entry in lineage.diff(root, args.run_id, args.other_run_id):
+                added = "-" if entry["added"] is None else entry["added"]
+                deleted = "-" if entry["deleted"] is None else entry["deleted"]
+                print(f"{added}  {deleted}  {entry['status']}  {entry['path']}")
+        else:
+            runs = list_runs(root)
+            inferred = lineage.infer_parents(runs)
+            projects = {}
+            for meta in runs:
+                try:
+                    project, rid = meta.get("project", ""), meta["run_id"]
+                    if not isinstance(project, str) or not isinstance(rid, str):
+                        continue
+                    projects.setdefault(project, {})[rid] = meta
+                except (KeyError, TypeError, AttributeError):
+                    continue
+            for project, members in projects.items():
+                if args.project is not None and project != args.project:
+                    continue
+                print(project)
+                children = {}
+                for rid, meta in members.items():
+                    try:
+                        info = meta.get("lineage") or {}
+                        parent = info.get("parent_run_id") or meta.get("parent_run_id")
+                        if not parent or parent == rid:
+                            parent, _ = inferred.get(rid, (None, None))
+                        if not isinstance(parent, str):
+                            parent = None
+                    except (RuntimeError, TypeError, OSError, ValueError, AttributeError):
+                        parent = None
+                    children.setdefault(parent if parent in members else None, []).append(rid)
+                seen = set()
+                # One iterative traversal, including roots of explicit cycles.
+                for first in [*children.get(None, []), *members]:
+                    stack = [(first, 1)]
+                    while stack:
+                        rid, depth = stack.pop()
+                        if rid in seen:
+                            continue
+                        seen.add(rid)
+                        meta = members[rid]
+                        print(f"{'  ' * depth}{rid}  {meta.get('name') or ''}".rstrip())
+                        stack.extend((child, depth + 1) for child in reversed(children.get(rid, [])))
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        print(f"agenticml lineage: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -222,6 +285,8 @@ def cmd_gc(args):
         f"{report['objects_deleted']} object(s) ({_format_bytes(report['objects_bytes_freed'])}). "
         f"Total space freed: {_format_bytes(report['total_bytes_freed'])}"
     )
+    for path in report.get("worktrees_kept", []):
+        print(f"Kept user-owned checkout: {path}")
     return 0
 
 
@@ -444,6 +509,22 @@ def main(argv=None):
     p_ls.add_argument("--project", default=None, help="Filter by project")
     p_ls.add_argument("--json", action="store_true", help="Print run metadata as JSON")
     p_ls.set_defaults(func=cmd_ls)
+
+    p_lineage = sub.add_parser("lineage", help="Inspect run code snapshots")
+    p_lineage.add_argument("--dir", default=None, help="Local store root")
+    lineage_sub = p_lineage.add_subparsers(dest="lineage_cmd", required=True)
+    for command in ("checkout", "diff", "ls"):
+        child = lineage_sub.add_parser(command)
+        child.add_argument("--dir", default=argparse.SUPPRESS, help="Local store root")
+        child.set_defaults(func=cmd_lineage)
+        if command == "ls":
+            child.add_argument("--project", default=None)
+        else:
+            child.add_argument("run_id")
+            if command == "checkout":
+                child.add_argument("--path", default=None)
+            else:
+                child.add_argument("other_run_id", nargs="?", default=None)
 
     p_du = sub.add_parser("du", help="Show local run and object storage usage")
     p_du.add_argument("--dir", default=None, help="Local root (default: AGENTICML_DIR or ~/.agenticml)")

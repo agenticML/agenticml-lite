@@ -84,6 +84,7 @@ def init(
     only_main_process=True,
     dir=None,
     verbose=False,
+    lineage=True,
     **kwargs,
 ):
     """Start a run and register it as the module-level active run.
@@ -135,6 +136,7 @@ def init(
                 mode=resolved_mode,
                 dir=dir,
                 verbose=verbose,
+                lineage=lineage,
                 **kwargs,
             )
         except Exception:

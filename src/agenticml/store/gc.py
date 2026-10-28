@@ -355,12 +355,16 @@ def usage(root) -> dict:
                             unreferenced_total += size
                             unreferenced_count += 1
 
+    lineage_total = _cheap_total_bytes(contained(root_path, root_path / "lineage"))
+    worktrees_total = _cheap_total_bytes(contained(root_path, root_path / "worktrees"))
     return {
+        "lineage_total": lineage_total,
+        "worktrees_total": worktrees_total,
         "runs_total": runs_total,
         "objects_total": objects_total,
         "unreferenced_total": unreferenced_total,
         "unreferenced_count": unreferenced_count,
-        "total": runs_total + objects_total,
+        "total": runs_total + objects_total + lineage_total + worktrees_total,
         "runs": runs_list,
     }
 
@@ -423,6 +427,8 @@ def collect(
     selected_ids = set()
     runs_bytes_freed = 0
     in_use = []
+    lineage_refs_removed = worktrees_removed = 0
+    worktrees_kept = set()
     for original in all_metas:
         run_id = original["run_id"]
         r_dir = run_dir(root_path, run_id)
@@ -452,12 +458,23 @@ def collect(
             runs_bytes_freed += _cheap_total_bytes(r_dir) if dry_run else _safe_rmtree(r_dir)
             if dry_run or not r_dir.exists():
                 selected_ids.add(run_id)
+                from ..lineage import remove_run
+                removed = remove_run(root_path, meta, dry_run=dry_run)
+                lineage_refs_removed += len(removed["refs"])
+                worktrees_removed += len(removed["worktrees"])
+                worktrees_kept.update(removed["worktrees_kept"])
         except (OSError, ValueError, RecursionError) as exc:
             logger.warning("skipping run %s: %s", run_id, exc)
         finally:
             unlock_run(handle)
 
     runs_deleted = len(selected_ids)
+    if not dry_run:
+        from ..lineage import sweep_orphans
+        removed = sweep_orphans(root_path)
+        lineage_refs_removed += len(removed["refs"])
+        worktrees_removed += len(removed["worktrees"])
+        worktrees_kept.update(removed["worktrees_kept"])
     referenced_shas = set()
     sweep_error = None
     # Include directories list_runs omitted because their metadata was corrupt.
@@ -549,6 +566,9 @@ def collect(
                 pass
 
     return {
+        "lineage_refs_removed": lineage_refs_removed,
+        "worktrees_removed": worktrees_removed,
+        "worktrees_kept": sorted(worktrees_kept),
         "runs_deleted": runs_deleted,
         "runs_bytes_freed": runs_bytes_freed,
         "objects_deleted": objects_deleted,

@@ -68,7 +68,26 @@ A run is also a context manager: `with agenticml.Run("proj", "name") as run: run
 
 ### Useful `init` options
 
-`config`, `tags`, `notes`, `group`, `job_type`, `id` + `resume` (`"never"`, `"allow"`, `"must"`), `mode` (`"local"`, `"offline"`, `"disabled"`), `dir` (store root), `system_metrics` (`True`/`False`), `auto_track`, `auto_metrics`, `sync_tensorboard`, `verbose`.
+`config`, `tags`, `notes`, `group`, `job_type`, `id` + `resume` (`"never"`, `"allow"`, `"must"`), `mode` (`"local"`, `"offline"`, `"disabled"`), `dir` (store root), `system_metrics` (`True`/`False`), `auto_track`, `auto_metrics`, `sync_tensorboard`, `lineage` (default `True`), `verbose`.
+
+`lineage=True` captures the project code at init in a shadow Git repository
+under the store root, including for projects without Git. The project is never
+written to. Disable with `lineage=False` or `AGENTICML_LINEAGE=0` (`false`, `no`,
+`off` also work). Resume preserves the original snapshot. `parent_run_id=`
+selects an explicit parent; a self-parent is ignored. Otherwise the latest eligible
+source-directory run or project run is used, ordered by `(created_at, run_id)`
+strictly before the current run. `max_file_bytes` / `max_total_bytes` also cap lineage
+(default 10/100 MiB); ignored and oversized files are skipped before hashing.
+Capture has one 30-second deadline, including waiting for the repository lock,
+and inspects at most 20,000 candidate paths. Excess paths and individual path
+errors are recorded in `lineage.skipped`; these produce a partial snapshot.
+`.agenticmlignore` is applied only when at most 1 MiB. Git failures and deadline
+expiry are recorded in `meta.json` and do not interrupt the run.
+
+Overlapping runs resolve the parent's ref under the repository lock before
+creating the child commit. If the parent has not published its snapshot yet,
+the child commit has no Git parent; `lineage diff` resolves the parent run's ref
+live once it becomes available. The stored snapshot is never rewritten.
 
 ## 4. Things to try
 
@@ -110,17 +129,28 @@ agenticml run --no-auto-track --no-capture-args -- python try_sdk.py   # switch 
 ```bash
 agenticml ls [--project P] [--json]       # list runs, newest first
 agenticml ui [--port 6006] [--open]       # local dashboard
+agenticml lineage checkout RUN_ID [--path DIR]  # detached shadow worktree
+agenticml lineage diff RUN_ID [OTHER_RUN_ID]   # numstat vs other or parent
+agenticml lineage ls [--project P]            # run parent tree
 agenticml du                              # store disk usage
 agenticml gc --dry-run                    # preview cleanup; nothing is deleted
 agenticml login / whoami / logout         # credentials for upload
 agenticml sync RUN_ID [--dry-run]         # upload (needs login)
 ```
 
+All lineage commands accept `--dir ROOT`; otherwise they use `AGENTICML_DIR`
+or `~/.agenticml`. `gc` removes deleted runs' refs and default checkouts. Custom
+`--path` checkouts are user-owned and always kept, including edits and new
+commits; GC lists them in `worktrees_kept` and CLI output. Later collections
+retry orphan-ref cleanup after earlier failures.
+
 ## 6. Where the data is
 
 ```
 $AGENTICML_DIR/                 (default ~/.agenticml)
   objects/                      shared, content-addressed files
+  lineage/<project-key>.git/     shadow snapshots
+  worktrees/<project-key>/<run_id>/  on-demand checkouts
   runs/<run_id>/
     meta.json                   config, status, summary, env, git
     events.jsonl                config updates, code, artifacts, finish

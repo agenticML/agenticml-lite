@@ -5,8 +5,10 @@ import http.client
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import struct
+import subprocess
 import sys
 import threading
 
@@ -842,3 +844,710 @@ def test_default_project_empty_directory_name(monkeypatch):
     assert default_project(Path('/tmp')) == 'default'
     monkeypatch.setenv('AGENTICML_PROJECT', 'from-env')
     assert default_project(Path('/tmp')) == 'from-env'
+
+
+_NODE_KEYS = {
+    'run_id', 'name', 'project', 'status', 'created_at', 'commit', 'tree',
+    'base_commit', 'base_branch', 'base_dirty', 'parent_run_id', 'parent_inference',
+    'same_tree_as_parent', 'error',
+}
+_EDGE_KEYS = {'from', 'to', 'inferred'}
+_DIFF_KEYS = {
+    'run_id', 'commit', 'parent_run_id', 'parent_commit', 'files', 'truncated',
+    'checkout', 'error',
+}
+_TREE = 'ab' * 20
+_COMMIT = {
+    'a': 'a' * 40,
+    'b': 'b' * 40,
+    'c': 'c' * 40,
+    'd': 'd' * 40,
+}
+
+
+def _stamp(second):
+    return f'2026-10-27T00:00:{second:02d}Z'
+
+
+def _seed_run(root, run_id, *, project, name, second, lineage=None, parent_run_id=None, git=None):
+    run = root / 'runs' / run_id
+    run.mkdir(parents=True)
+    meta = {
+        'format_version': 1,
+        'run_id': run_id,
+        'project': project,
+        'name': name,
+        'status': 'finished',
+        'created_at': _stamp(second),
+        'parent_run_id': parent_run_id,
+        'git': git or {},
+    }
+    if lineage is not None:
+        meta['lineage'] = lineage
+    (run / 'meta.json').write_text(json.dumps(meta))
+
+
+def _lineage_meta(**overrides):
+    payload = {
+        'version': 1,
+        'commit': None,
+        'tree': None,
+        'parent_commit': None,
+        'parent_run_id': None,
+        'parent_inference': None,
+        'project_key': 'alpha-0123abcd',
+        'repo_root': '/src/alpha',
+        'base_commit': '1234abcd' * 5,
+        'base_branch': 'main',
+        'base_dirty': False,
+        'error': None,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _serve(root):
+    httpd = server.make_server(root, '127.0.0.1', 0)
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True)
+    thread.start()
+    return httpd, thread
+
+
+def _stop(httpd, thread):
+    httpd.shutdown()
+    thread.join(timeout=5)
+    httpd.server_close()
+
+
+def _get(httpd, path):
+    conn = http.client.HTTPConnection(*httpd.server_address[:2], timeout=5)
+    conn.request('GET', path)
+    response = conn.getresponse()
+    result = response.status, dict(response.getheaders()), response.read()
+    conn.close()
+    return result
+
+
+def _body(httpd, path, status=200):
+    code, headers, raw = _get(httpd, path)
+    assert code == status, raw
+    if status == 200:
+        assert headers['Content-Type'] == 'application/json'
+    return json.loads(raw)
+
+
+def _seed_lineage_store(root):
+    _seed_run(root, 'run-a', project='alpha', name='root', second=0, git={'repo_root': '/src/alpha'})
+    _seed_run(
+        root, 'run-b', project='alpha', name='explicit-child', second=2, parent_run_id='run-a',
+        lineage=_lineage_meta(
+            commit=_COMMIT['b'], tree=_TREE, parent_commit=_COMMIT['a'],
+            parent_run_id='run-a', parent_inference='explicit',
+        ),
+    )
+    _seed_run(
+        root, 'run-c', project='alpha', name='inferred-child', second=3,
+        lineage=_lineage_meta(
+            commit=_COMMIT['c'], tree=_TREE, parent_commit=_COMMIT['b'],
+            parent_run_id='run-b', parent_inference='repo_root', base_dirty=True,
+        ),
+    )
+    _seed_run(root, 'run-d', project='alpha', name='read-time-repo', second=4, git={'repo_root': '/src/alpha'})
+    _seed_run(root, 'run-e', project='alpha', name='read-time-project', second=5, git={'repo_root': '/src/other'})
+    _seed_run(
+        root, 'run-f', project='alpha', name='no-parent', second=6,
+        lineage=_lineage_meta(parent_run_id=None, parent_inference=None, commit=_COMMIT['d'], tree=_TREE),
+    )
+    _seed_run(
+        root, 'run-z', project='alpha', name='failed', second=7,
+        lineage=_lineage_meta(commit=None, tree=None, parent_run_id=None, error='snapshot failed'),
+    )
+    _seed_run(root, 'run-h', project='', name='blank-root', second=1)
+    _seed_run(root, 'run-i', project='', name='blank-child', second=2)
+    _seed_run(
+        root, 'run-g', project='other', name='cross', second=1,
+        lineage=_lineage_meta(parent_run_id='run-a', parent_inference='explicit', repo_root='/src/other'),
+    )
+    _seed_run(
+        root, 'run-j', project='cycle', name='cycle-old', second=1,
+        lineage=_lineage_meta(parent_run_id='run-k', parent_inference='explicit', project_key='cycle-0123abcd'),
+    )
+    _seed_run(
+        root, 'run-k', project='cycle', name='cycle-new', second=2,
+        lineage=_lineage_meta(parent_run_id='run-j', parent_inference='explicit', project_key='cycle-0123abcd'),
+    )
+    _seed_run(
+        root, 'run-s', project='loop', name='self', second=1,
+        lineage=_lineage_meta(parent_run_id='run-s', parent_inference='explicit', project_key='loop-0123abcd'),
+    )
+
+
+def _index(payload):
+    return {node['run_id']: node for node in payload['nodes']}
+
+
+def _edges(payload):
+    return {(edge['from'], edge['to']): edge for edge in payload['edges']}
+
+
+def _assert_acyclic(edges):
+    children = {}
+    for edge in edges:
+        children.setdefault(edge['from'], []).append(edge['to'])
+    seen = set()
+
+    def walk(node, stack):
+        assert node not in stack
+        if node in seen:
+            return
+        stack.add(node)
+        for child in children.get(node, []):
+            walk(child, stack)
+        stack.remove(node)
+        seen.add(node)
+
+    for node in list(children):
+        walk(node, set())
+
+
+def test_lineage_legacy_run_and_filters(dashboard):
+    data = load(dashboard, '/api/lineage')
+    assert data['edges'] == []
+    assert set(data['nodes'][0]) == _NODE_KEYS
+    assert data['nodes'][0]['run_id'] == 'run-1'
+    assert data['nodes'][0]['parent_run_id'] is None
+    assert data['nodes'][0]['parent_inference'] is None
+    assert data['nodes'][0]['same_tree_as_parent'] is False
+    assert data['nodes'][0]['commit'] is None
+    demo = load(dashboard, '/api/lineage?project=demo')
+    assert [node['run_id'] for node in demo['nodes']] == ['run-1']
+    assert load(dashboard, '/api/lineage?project=') == {'nodes': [], 'edges': []}
+    assert load(dashboard, '/api/lineage?project=missing') == {'nodes': [], 'edges': []}
+    diff = load(dashboard, '/api/runs/run-1/lineage')
+    assert set(diff) == _DIFF_KEYS
+    assert diff['error'] == 'no lineage for this run'
+    assert diff['files'] == []
+    assert diff['truncated'] is False
+    assert diff['checkout'] == 'agenticml lineage checkout run-1'
+    assert diff['commit'] is None
+
+
+def test_lineage_invalid_run_id(dashboard):
+    for path in ('/api/runs/../lineage', '/api/runs/%2e%2e/lineage', '/api/runs/%00/lineage'):
+        status, headers, body = dashboard[0](path)
+        assert status == 400
+        assert headers['Content-Type'] == 'application/json'
+        assert isinstance(json.loads(body)['error'], str)
+    status, _, body = dashboard[0]('/api/runs/missing-run/lineage')
+    assert status == 404
+    assert json.loads(body) == {'error': 'not found'}
+
+
+def test_lineage_graph_inference_filter_and_cycles(tmp_path):
+    _seed_lineage_store(tmp_path)
+    httpd, thread = _serve(tmp_path)
+    try:
+        whole = _body(httpd, '/api/lineage')
+        alpha = _body(httpd, '/api/lineage?project=alpha')
+        blank = _body(httpd, '/api/lineage?project=')
+        other = _body(httpd, '/api/lineage?project=other')
+        cycle = _body(httpd, '/api/lineage?project=cycle')
+        loop = _body(httpd, '/api/lineage?project=loop')
+    finally:
+        _stop(httpd, thread)
+    for payload in (whole, alpha, blank, other, cycle, loop):
+        assert set(payload) == {'nodes', 'edges'}
+        ids = {node['run_id'] for node in payload['nodes']}
+        for node in payload['nodes']:
+            assert set(node) == _NODE_KEYS
+        for edge in payload['edges']:
+            assert set(edge) == _EDGE_KEYS
+            assert isinstance(edge['inferred'], bool)
+            assert edge['from'] in ids and edge['to'] in ids
+            assert edge['from'] != edge['to']
+        _assert_acyclic(payload['edges'])
+    assert {node['run_id'] for node in whole['nodes']} == {
+        'run-a', 'run-b', 'run-c', 'run-d', 'run-e', 'run-f', 'run-z',
+        'run-h', 'run-i', 'run-g', 'run-j', 'run-k', 'run-s',
+    }
+    nodes = _index(alpha)
+    edges = _edges(alpha)
+    assert set(nodes) == {'run-a', 'run-b', 'run-c', 'run-d', 'run-e', 'run-f', 'run-z'}
+    assert nodes['run-a']['parent_run_id'] is None
+    assert nodes['run-a']['commit'] is None
+    assert nodes['run-a']['base_dirty'] is None
+    assert nodes['run-b']['parent_run_id'] == 'run-a'
+    assert nodes['run-b']['parent_inference'] == 'explicit'
+    assert nodes['run-b']['same_tree_as_parent'] is False
+    assert nodes['run-b']['base_dirty'] is False
+    assert nodes['run-b']['commit'] == _COMMIT['b']
+    assert nodes['run-c']['parent_run_id'] == 'run-b'
+    assert nodes['run-c']['parent_inference'] == 'repo_root'
+    assert nodes['run-c']['same_tree_as_parent'] is True
+    assert nodes['run-c']['base_dirty'] is True
+    assert nodes['run-c']['base_branch'] == 'main'
+    assert nodes['run-d']['parent_run_id'] == 'run-c'
+    assert nodes['run-d']['parent_inference'] == 'repo_root'
+    assert nodes['run-e']['parent_run_id'] == 'run-d'
+    assert nodes['run-e']['parent_inference'] == 'project'
+    assert nodes['run-f']['parent_run_id'] is None
+    assert nodes['run-f']['parent_inference'] is None
+    assert nodes['run-z']['error'] == 'snapshot failed'
+    assert nodes['run-z']['commit'] is None
+    assert edges[('run-a', 'run-b')]['inferred'] is False
+    assert edges[('run-b', 'run-c')]['inferred'] is True
+    assert edges[('run-c', 'run-d')]['inferred'] is True
+    assert edges[('run-d', 'run-e')]['inferred'] is True
+    assert ('run-a', 'run-g') not in edges
+    assert all(node['status'] == 'finished' for node in nodes.values())
+    blank_nodes = _index(blank)
+    assert set(blank_nodes) == {'run-h', 'run-i'}
+    assert blank_nodes['run-i']['parent_run_id'] == 'run-h'
+    assert blank_nodes['run-i']['parent_inference'] == 'project'
+    assert _edges(blank)[('run-h', 'run-i')]['inferred'] is True
+    assert _index(other)['run-g']['parent_run_id'] == 'run-a'
+    assert other['edges'] == []
+    assert ('run-a', 'run-g') in _edges(whole)
+    assert _edges(whole)[('run-a', 'run-g')]['inferred'] is False
+    assert len(cycle['edges']) == 1
+    assert {edge['from'], edge['to']} == {'run-j', 'run-k'}
+    assert _index(cycle)['run-j']['parent_run_id'] == 'run-k'
+    assert _index(cycle)['run-k']['parent_run_id'] == 'run-j'
+    assert loop['edges'] == []
+    assert _index(loop)['run-s']['parent_run_id'] == 'run-s'
+
+
+def test_lineage_diff_missing_repo_and_git_failures(tmp_path, monkeypatch):
+    _seed_lineage_store(tmp_path)
+    outside = tmp_path / 'outside-repo'
+    outside.mkdir()
+    key = 'alpha-0123abcd'
+    link_parent = tmp_path / 'lineage'
+    link_parent.mkdir()
+    # run-b uses this key and a real commit, but the repo is absent until the symlink test.
+    httpd, thread = _serve(tmp_path)
+    try:
+        missing = _body(httpd, '/api/runs/run-b/lineage')
+        assert missing['error'] == 'lineage repository not found'
+        assert missing['files'] == []
+        assert missing['truncated'] is False
+        assert missing['commit'] == _COMMIT['b']
+        assert missing['parent_commit'] == _COMMIT['a']
+        assert missing['parent_run_id'] == 'run-a'
+        assert missing['checkout'] == 'agenticml lineage checkout run-b'
+        failed = _body(httpd, '/api/runs/run-z/lineage')
+        assert failed['error'] == 'snapshot failed'
+        assert failed['files'] == []
+        none = _body(httpd, '/api/runs/run-a/lineage')
+        assert none['error'] == 'no lineage for this run'
+        assert none['files'] == []
+    finally:
+        _stop(httpd, thread)
+
+    escaped = tmp_path / 'escape-store'
+    _seed_run(
+        escaped, 'run-x', project='alpha', name='escape', second=1,
+        lineage=_lineage_meta(commit=_COMMIT['a'], project_key=key),
+    )
+    repo_link = escaped / 'lineage' / f'{key}.git'
+    repo_link.parent.mkdir(parents=True)
+    repo_link.symlink_to(outside)
+    httpd, thread = _serve(escaped)
+    try:
+        payload = _body(httpd, '/api/runs/run-x/lineage')
+        raw = json.dumps(payload).encode()
+    finally:
+        _stop(httpd, thread)
+    assert payload['error'] == 'invalid lineage repository'
+    assert payload['files'] == []
+    assert str(outside).encode() not in raw
+
+    bad = tmp_path / 'bad-key'
+    _seed_run(
+        bad, 'run-y', project='alpha', name='bad-key', second=1,
+        lineage=_lineage_meta(commit=_COMMIT['a'], project_key='../evil'),
+    )
+    httpd, thread = _serve(bad)
+    try:
+        payload = _body(httpd, '/api/runs/run-y/lineage')
+    finally:
+        _stop(httpd, thread)
+    assert payload['error'] == 'invalid lineage project key'
+    assert payload['files'] == []
+
+    empty = tmp_path / 'empty-git'
+    _seed_run(
+        empty, 'run-q', project='alpha', name='empty', second=1,
+        lineage=_lineage_meta(commit=_COMMIT['a'], parent_commit=_COMMIT['b'], project_key=key),
+    )
+    (empty / 'lineage' / f'{key}.git').mkdir(parents=True)
+
+    def missing_git(*args, **kwargs):
+        raise FileNotFoundError('git')
+
+    monkeypatch.setattr(server.subprocess, 'Popen', missing_git)
+    httpd, thread = _serve(empty)
+    try:
+        payload = _body(httpd, '/api/runs/run-q/lineage')
+    finally:
+        _stop(httpd, thread)
+    assert payload['error'] == 'git is not available'
+    assert payload['files'] == []
+
+    class _TimeoutProc:
+        def __init__(self, *args, **kwargs):
+            self.stdout = None
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+    def timed_out(proc, timeout):
+        raise subprocess.TimeoutExpired(cmd='git', timeout=timeout)
+
+    monkeypatch.setattr(server.subprocess, 'Popen', lambda *args, **kwargs: _TimeoutProc())
+    monkeypatch.setattr(server, '_iter_stdout', timed_out)
+    httpd, thread = _serve(empty)
+    try:
+        payload = _body(httpd, '/api/runs/run-q/lineage')
+    finally:
+        _stop(httpd, thread)
+    assert payload['error'] == 'git diff timed out'
+
+    def failed_git(*args, **kwargs):
+        assert kwargs.get('stderr') is subprocess.DEVNULL
+        proc = _TimeoutProc()
+        proc.returncode = 1
+        proc.stderr_bytes = b'fatal: secret /tmp/private'
+        return proc
+
+    def empty_stdout(proc, timeout):
+        if False:
+            yield b''
+
+    monkeypatch.setattr(server.subprocess, 'Popen', failed_git)
+    monkeypatch.setattr(server, '_iter_stdout', empty_stdout)
+    httpd, thread = _serve(empty)
+    try:
+        code, _, raw = _get(httpd, '/api/runs/run-q/lineage')
+    finally:
+        _stop(httpd, thread)
+    assert code == 200
+    assert b'secret' not in raw
+    assert b'/tmp/private' not in raw
+    assert json.loads(raw)['error'] == 'git diff failed'
+    assert json.loads(raw)['files'] == []
+
+
+def _git(repo, *args, input=None):
+    env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    env.update(
+        GIT_AUTHOR_NAME='Tester', GIT_AUTHOR_EMAIL='t@example.com',
+        GIT_COMMITTER_NAME='Tester', GIT_COMMITTER_EMAIL='t@example.com',
+    )
+    command = ['git', '--git-dir', str(repo), *args] if repo is not None else ['git', *args]
+    completed = subprocess.run(command, input=input, capture_output=True, check=True, env=env, timeout=30)
+    return completed.stdout
+
+
+def test_lineage_diff_numstat_binary_and_truncated(tmp_path):
+    if shutil.which('git') is None:
+        pytest.skip('git is not available')
+    root = tmp_path / 'store'
+    key = 'demo-abcdef12'
+    repo = root / 'lineage' / f'{key}.git'
+    repo.parent.mkdir(parents=True)
+    _git(None, 'init', '--bare', str(repo))
+    hello = _git(repo, 'hash-object', '-w', '--stdin', input=b'hello\n').decode().strip()
+    edited = _git(repo, 'hash-object', '-w', '--stdin', input=b'hello\nworld\n').decode().strip()
+    added = _git(repo, 'hash-object', '-w', '--stdin', input=b'n\n').decode().strip()
+    binary = _git(repo, 'hash-object', '-w', '--stdin', input=b'a\0b').decode().strip()
+    tree_root = _git(
+        repo, 'mktree',
+        input=f'100644 blob {hello}\thello.txt\n100644 blob {binary}\tbin.dat\n'.encode(),
+    ).decode().strip()
+    tree_child = _git(
+        repo, 'mktree',
+        input=(
+            f'100644 blob {edited}\thello.txt\n'
+            f'100644 blob {binary}\tbin.dat\n'
+            f'100644 blob {added}\tnew.txt\n'
+        ).encode(),
+    ).decode().strip()
+    parent_commit = _git(repo, 'commit-tree', tree_root, '-m', 'root').decode().strip()
+    child_commit = _git(repo, 'commit-tree', tree_child, '-p', parent_commit, '-m', 'child').decode().strip()
+    blob = _git(repo, 'hash-object', '-w', '--stdin', input=b'x\n').decode().strip()
+    wide = ''.join(f'100644 blob {blob}\tf{index:04d}.txt\n' for index in range(501))
+    wide_tree = _git(repo, 'mktree', input=wide.encode()).decode().strip()
+    wide_commit = _git(repo, 'commit-tree', wide_tree, '-m', 'wide').decode().strip()
+    _git(repo, 'update-ref', 'refs/runs/diff-root', parent_commit)
+    _git(repo, 'update-ref', 'refs/runs/diff-child', child_commit)
+    _git(repo, 'update-ref', 'refs/runs/diff-wide', wide_commit)
+    _seed_run(
+        root, 'diff-root', project='demo', name='root', second=1,
+        lineage=_lineage_meta(commit=parent_commit, tree=tree_root, parent_commit=None, project_key=key),
+    )
+    _seed_run(
+        root, 'diff-child', project='demo', name='child', second=2, parent_run_id='diff-root',
+        lineage=_lineage_meta(
+            commit=child_commit, tree=tree_child, parent_commit=parent_commit,
+            parent_run_id='diff-root', parent_inference='explicit', project_key=key,
+        ),
+    )
+    _seed_run(
+        root, 'diff-wide', project='demo', name='wide', second=3,
+        lineage=_lineage_meta(commit=wide_commit, tree=wide_tree, parent_commit=None, project_key=key),
+    )
+    httpd, thread = _serve(root)
+    try:
+        root_diff = _body(httpd, '/api/runs/diff-root/lineage')
+        child_diff = _body(httpd, '/api/runs/diff-child/lineage')
+        wide_diff = _body(httpd, '/api/runs/diff-wide/lineage')
+    finally:
+        _stop(httpd, thread)
+    assert root_diff['error'] is None and root_diff['truncated'] is False
+    assert root_diff['parent_commit'] is None
+    assert {row['path']: (row['added'], row['deleted']) for row in root_diff['files']} == {
+        'hello.txt': (1, 0),
+        'bin.dat': (None, None),
+    }
+    assert child_diff['error'] is None
+    assert child_diff['parent_run_id'] == 'diff-root'
+    assert child_diff['parent_commit'] == parent_commit
+    assert {row['path']: (row['added'], row['deleted']) for row in child_diff['files']} == {
+        'hello.txt': (1, 0),
+        'new.txt': (1, 0),
+    }
+    assert wide_diff['error'] is None
+    assert wide_diff['truncated'] is True
+    assert len(wide_diff['files']) == 500
+    assert {row['path'] for row in wide_diff['files']} <= {f'f{index:04d}.txt' for index in range(501)}
+    assert all(row['added'] == 1 and row['deleted'] == 0 for row in wide_diff['files'])
+
+
+class _GitProc:
+    def __init__(self, returncode=0):
+        self.stdout = None
+        self.returncode = returncode
+        self.terminated = False
+        self.waited = False
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        if self.returncode is None:
+            self.returncode = -15
+
+    def kill(self):
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        self.waited = True
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+
+def _patch_diff_git(monkeypatch, chunks, *, returncode=0):
+    box = {'proc': None, 'pulled': 0, 'blobs': []}
+
+    def popen(*args, **kwargs):
+        assert kwargs.get('stderr') is subprocess.DEVNULL
+        box['proc'] = _GitProc(returncode)
+        return box['proc']
+
+    def iterate(proc, timeout):
+        for chunk in chunks:
+            box['pulled'] += 1
+            yield chunk
+
+    real_parse = server._parse_numstat
+
+    def counting(blob):
+        box['blobs'].append(bytes(blob))
+        return real_parse(blob)
+
+    monkeypatch.setattr(server.subprocess, 'Popen', popen)
+    monkeypatch.setattr(server, '_iter_stdout', iterate)
+    monkeypatch.setattr(server, '_parse_numstat', counting)
+    return box
+
+
+def _seed_diff_target(root):
+    key = 'demo-abcdef12'
+    (root / 'lineage' / f'{key}.git').mkdir(parents=True)
+    _seed_run(
+        root, 'cap-run', project='demo', name='cap', second=1,
+        lineage=_lineage_meta(commit=_COMMIT['a'], parent_commit=None, project_key=key),
+    )
+
+
+def test_lineage_diff_stream_caps_and_exact_paths(tmp_path, monkeypatch):
+    assert server._LINEAGE_FILES == 500
+    assert server._GIT_MAX_BYTES == 2 * 1024 * 1024
+    root = tmp_path / 'stream'
+    _seed_diff_target(root)
+    record = b'1\t0\ta.txt\0'
+    paths = _patch_diff_git(monkeypatch, [
+        b'4\t1\tweird\r\nname\0',
+        b'1\t0\tbad\xffname\0',
+    ])
+    httpd, thread = _serve(root)
+    try:
+        exact = _body(httpd, '/api/runs/cap-run/lineage')
+        assert exact['error'] is None and exact['truncated'] is False
+        assert [row['path'] for row in exact['files']] == ['weird\r\nname', 'bad\ufffdname']
+        assert paths['pulled'] == 2
+        assert len(paths['blobs']) == 1
+        assert paths['proc'].waited and not paths['proc'].terminated
+
+        monkeypatch.setattr(server, '_LINEAGE_FILES', 3)
+        capped = _patch_diff_git(
+            monkeypatch, [record] * 30, returncode=None,
+        )
+        overflow = _body(httpd, '/api/runs/cap-run/lineage')
+        assert overflow['truncated'] is True
+        assert overflow['error'] is None
+        assert len(overflow['files']) <= 3
+        assert capped['blobs'][-1].count(b'\0') <= 3
+        assert capped['pulled'] < 30
+        assert capped['proc'].terminated and capped['proc'].waited
+
+        monkeypatch.setattr(server, '_LINEAGE_FILES', 50)
+        monkeypatch.setattr(server, '_GIT_MAX_BYTES', 20)
+        bounded = _patch_diff_git(
+            monkeypatch, [record] * 10, returncode=None,
+        )
+        limited = _body(httpd, '/api/runs/cap-run/lineage')
+        assert limited['truncated'] is True
+        assert len(bounded['blobs'][-1]) <= 20
+        assert bounded['blobs'][-1].count(b'\0') <= 50
+        assert bounded['pulled'] < 10
+        assert bounded['proc'].terminated and bounded['proc'].waited
+
+        fitted = _patch_diff_git(monkeypatch, [record, record])
+        complete = _body(httpd, '/api/runs/cap-run/lineage')
+    finally:
+        _stop(httpd, thread)
+    assert complete['truncated'] is False
+    assert len(complete['files']) == 2
+    assert fitted['pulled'] == 2
+    assert fitted['blobs'][-1].count(b'\0') == 2
+    assert not fitted['proc'].terminated
+
+
+def test_lineage_parent_precedence_ties_and_malformed_meta(tmp_path):
+    root = tmp_path / 'parents'
+    _seed_run(root, 'run-early', project='alpha', name='early', second=1, git={'repo_root': '/src/alpha'})
+    _seed_run(
+        root, 'run-top', project='alpha', name='top-wins', second=2, parent_run_id='run-early',
+        lineage=_lineage_meta(
+            parent_run_id='run-missing', parent_inference='repo_root', commit=_COMMIT['b'],
+        ),
+    )
+    _seed_run(
+        root, 'run-bad', project='alpha', name='bad-root', second=3, lineage=['not-a-dict'],
+        git={'repo_root': '~__nonexistent_user__/repo'},
+    )
+    weird = root / 'runs' / 'run-weird'
+    weird.mkdir(parents=True)
+    (weird / 'meta.json').write_text(json.dumps({
+        'format_version': 1,
+        'run_id': 'run-weird',
+        'project': 'alpha',
+        'name': {'not': 'a string'},
+        'status': 5,
+        'created_at': {'bad': True},
+        'parent_run_id': 12,
+        'git': 'not-a-dict',
+        'lineage': 'not-a-dict',
+    }))
+    _seed_run(
+        root, 'run-agree', project='alpha', name='agree', second=4, parent_run_id='run-early',
+        lineage=_lineage_meta(parent_run_id='run-early', parent_inference='repo_root'),
+    )
+    for run_id in ('m-2', 'm-1', 'm-3'):
+        _seed_run(root, run_id, project='ties', name=run_id, second=8, git={'repo_root': '/src/ties'})
+    _seed_run(root, 's-b', project='cross', name='bee', second=9, git={'repo_root': '/src/bee'})
+    _seed_run(root, 's-a', project='cross', name='ay', second=9, git={'repo_root': '/src/ay'})
+    httpd, thread = _serve(root)
+    try:
+        alpha = _body(httpd, '/api/lineage?project=alpha')
+        ties = _body(httpd, '/api/lineage?project=ties')
+        cross = _body(httpd, '/api/lineage?project=cross')
+        diff = _body(httpd, '/api/runs/run-top/lineage')
+    finally:
+        _stop(httpd, thread)
+    nodes = _index(alpha)
+    assert set(nodes) == {'run-early', 'run-top', 'run-bad', 'run-weird', 'run-agree'}
+    assert nodes['run-early']['parent_run_id'] is None
+    assert nodes['run-top']['parent_run_id'] == 'run-early'
+    assert nodes['run-top']['parent_inference'] == 'explicit'
+    assert nodes['run-bad']['parent_run_id'] == 'run-top'
+    assert nodes['run-bad']['parent_inference'] == 'project'
+    assert nodes['run-weird']['parent_run_id'] is None
+    assert nodes['run-weird']['name'] == ''
+    assert nodes['run-weird']['status'] == ''
+    assert nodes['run-agree']['parent_run_id'] == 'run-early'
+    assert nodes['run-agree']['parent_inference'] == 'repo_root'
+    edges = _edges(alpha)
+    assert edges[('run-early', 'run-top')]['inferred'] is False
+    assert edges[('run-top', 'run-bad')]['inferred'] is True
+    assert ('run-missing', 'run-top') not in edges
+    assert edges[('run-early', 'run-agree')]['inferred'] is True
+    assert diff['parent_run_id'] == 'run-early'
+    assert diff['error'] == 'lineage repository not found'
+    tied = _index(ties)
+    assert tied['m-1']['parent_run_id'] is None
+    assert tied['m-2']['parent_run_id'] == 'm-1'
+    assert tied['m-2']['parent_inference'] == 'repo_root'
+    assert tied['m-3']['parent_run_id'] == 'm-2'
+    assert tied['m-3']['parent_inference'] == 'repo_root'
+    assert tied['m-1']['parent_run_id'] != 'm-1'
+    crossed = _index(cross)
+    assert crossed['s-a']['parent_run_id'] is None
+    assert crossed['s-b']['parent_run_id'] == 's-a'
+    assert crossed['s-b']['parent_inference'] == 'project'
+    assert crossed['s-b']['parent_run_id'] != 's-b'
+
+
+def test_lineage_inference_resolves_each_root_once(tmp_path, monkeypatch):
+    root = tmp_path / 'once'
+    ids = [f'n{index:02d}' for index in range(40)]
+    for run_id in ids:
+        _seed_run(root, run_id, project='bulk', name=run_id, second=1, git={'repo_root': '/src/bulk-root'})
+    calls = {'n': 0}
+    real_resolve = Path.resolve
+
+    def counting(self, *args, **kwargs):
+        if 'bulk-root' in str(self):
+            calls['n'] += 1
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'resolve', counting)
+    httpd, thread = _serve(root)
+    try:
+        calls['n'] = 0
+        payload = _body(httpd, '/api/lineage?project=bulk')
+    finally:
+        _stop(httpd, thread)
+    nodes = _index(payload)
+    assert calls['n'] == 40
+    assert nodes['n00']['parent_run_id'] is None
+    for index in range(1, 40):
+        assert nodes[ids[index]]['parent_run_id'] == ids[index - 1]
+        assert nodes[ids[index]]['parent_inference'] == 'repo_root'
+        assert nodes[ids[index]]['parent_run_id'] != ids[index]

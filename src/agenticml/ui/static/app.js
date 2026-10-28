@@ -239,6 +239,296 @@ const headline = (run) => {
   );
   return keys.find((key) => /loss|acc/i.test(key)) || keys[0];
 };
+const LINEAGE_W = 200;
+const LINEAGE_H = 64;
+const LINEAGE_GAP_X = 56;
+const LINEAGE_GAP_Y = 16;
+const LINEAGE_PAD = 16;
+let lineageMarker = 0;
+function svgEl(tag, attrs = {}, ...children) {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [key, value] of Object.entries(attrs)) {
+    if (value == null) continue;
+    if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+    else if (key === "text") node.textContent = value;
+    else node.setAttribute(key, value);
+  }
+  node.append(...children.filter((child) => child != null));
+  return node;
+}
+const cssEscape = (value) =>
+  window.CSS?.escape ? CSS.escape(String(value)) : String(value).replace(/"/g, '\\"');
+const shorten = (value, max) => {
+  const text = value || "";
+  return text.length > max ? `${text.slice(0, Math.max(1, max - 1))}…` : text;
+};
+const RUN_ID_SUFFIX = /^(\d{8}T\d{6})-([0-9a-fA-F]{8})$/;
+function shortRunId(id) {
+  const text = String(id || "");
+  const matched = RUN_ID_SUFFIX.exec(text);
+  return matched ? matched[2] : text.slice(0, 8);
+}
+const lineageTime = (value) => {
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? time : Number.POSITIVE_INFINITY;
+};
+const LINEAGE_REFRESH_MS = 15000;
+const projectViews = new Map();
+function viewFor(project) {
+  if (projectViews.has(project)) return projectViews.get(project);
+  let mode = "list";
+  try {
+    if (localStorage.getItem(`agenticml.view.${project}`) === "lineage")
+      mode = "lineage";
+  } catch {}
+  projectViews.set(project, mode);
+  return mode;
+}
+function storeView(project, mode) {
+  projectViews.set(project, mode);
+  try {
+    localStorage.setItem(`agenticml.view.${project}`, mode);
+  } catch {}
+}
+function lineageSignature(runs) {
+  return runs
+    .map((run) =>
+      [run.run_id, run.status || "", run.name || "", run.created_at || ""].join(
+        "\t",
+      ),
+    )
+    .sort()
+    .join("\n");
+}
+// Layer is the longest path from a root. A barycenter sweep then pulls
+// related nodes into the same band; ties stay in created_at order.
+function layoutLineage(nodes, edges) {
+  const byId = new Map(nodes.map((node) => [node.run_id, node]));
+  const parents = new Map();
+  const children = new Map();
+  for (const edge of edges) {
+    if (!byId.has(edge.from) || !byId.has(edge.to) || edge.from === edge.to)
+      continue;
+    if (!parents.has(edge.to)) parents.set(edge.to, []);
+    parents.get(edge.to).push(edge.from);
+    if (!children.has(edge.from)) children.set(edge.from, []);
+    children.get(edge.from).push(edge.to);
+  }
+  const layerOf = new Map();
+  const visiting = new Set();
+  const layer = (id) => {
+    if (layerOf.has(id)) return layerOf.get(id);
+    if (visiting.has(id)) return 0;
+    visiting.add(id);
+    let value = 0;
+    for (const parent of parents.get(id) || [])
+      value = Math.max(value, layer(parent) + 1);
+    visiting.delete(id);
+    layerOf.set(id, value);
+    return value;
+  };
+  for (const node of nodes) layer(node.run_id);
+  const depth = Math.max(0, ...[...layerOf.values(), 0]);
+  const layers = Array.from({ length: depth + 1 }, () => []);
+  const ordered = [...nodes].sort(
+    (a, b) =>
+      lineageTime(a.created_at) - lineageTime(b.created_at) ||
+      String(a.run_id).localeCompare(String(b.run_id)),
+  );
+  for (const node of ordered) layers[layerOf.get(node.run_id) || 0].push(node);
+  const index = new Map();
+  const reindex = () => {
+    index.clear();
+    layers.forEach((row) =>
+      row.forEach((node, position) => index.set(node.run_id, position)),
+    );
+  };
+  const barycenter = (row, neighborOf) => {
+    const ranked = row.map((node, position) => {
+      const neighbors = (neighborOf(node.run_id) || []).filter((id) =>
+        index.has(id),
+      );
+      const center = neighbors.length
+        ? neighbors.reduce((sum, id) => sum + index.get(id), 0) /
+          neighbors.length
+        : position;
+      return { node, center, position };
+    });
+    ranked.sort(
+      (a, b) =>
+        a.center - b.center ||
+        lineageTime(a.node.created_at) - lineageTime(b.node.created_at) ||
+        String(a.node.run_id).localeCompare(String(b.node.run_id)) ||
+        a.position - b.position,
+    );
+    return ranked.map((item) => item.node);
+  };
+  reindex();
+  for (let pass = 0; pass < 2; pass++) {
+    for (let i = 1; i < layers.length; i++) {
+      layers[i] = barycenter(layers[i], (id) => parents.get(id));
+      reindex();
+    }
+    for (let i = layers.length - 2; i >= 0; i--) {
+      layers[i] = barycenter(layers[i], (id) => children.get(id));
+      reindex();
+    }
+  }
+  const pos = new Map();
+  let height = 0;
+  layers.forEach((row, column) => {
+    row.forEach((node, position) => {
+      pos.set(node.run_id, {
+        x: LINEAGE_PAD + column * (LINEAGE_W + LINEAGE_GAP_X),
+        y: LINEAGE_PAD + position * (LINEAGE_H + LINEAGE_GAP_Y),
+      });
+    });
+    height = Math.max(height, row.length);
+  });
+  return {
+    pos,
+    width:
+      LINEAGE_PAD * 2 +
+      Math.max(layers.length, 1) * LINEAGE_W +
+      Math.max(layers.length - 1, 0) * LINEAGE_GAP_X,
+    height:
+      LINEAGE_PAD * 2 +
+      Math.max(height, 1) * LINEAGE_H +
+      Math.max(height - 1, 0) * LINEAGE_GAP_Y,
+  };
+}
+function renderLineageSvg(data, options) {
+  const nodes = data.nodes || [];
+  const edges = (data.edges || []).filter(
+    (edge) => edge && edge.from && edge.to && edge.from !== edge.to,
+  );
+  const { pos, width, height } = layoutLineage(nodes, edges);
+  const markerId = `lineage-arrow-${++lineageMarker}`;
+  const filtering = options.filtering;
+  const matching = options.matching || new Set();
+  const dimmed = (id) => filtering && !matching.has(id);
+  const paths = edges.map((edge) => {
+    const from = pos.get(edge.from);
+    const to = pos.get(edge.to);
+    if (!from || !to) return null;
+    const x1 = from.x + LINEAGE_W;
+    const y1 = from.y + LINEAGE_H / 2;
+    const x2 = to.x;
+    const y2 = to.y + LINEAGE_H / 2;
+    const bend = Math.max(24, (x2 - x1) / 2);
+    const faded = dimmed(edge.from) || dimmed(edge.to);
+    return svgEl("path", {
+      class: `lineage-edge${edge.inferred ? " is-inferred" : ""}${faded ? " is-dim" : ""}`,
+      "data-from": edge.from,
+      "data-to": edge.to,
+      d: `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`,
+      "marker-end": `url(#${markerId})`,
+    });
+  });
+  const glyphs = nodes.map((node) => {
+    const at = pos.get(node.run_id) || { x: LINEAGE_PAD, y: LINEAGE_PAD };
+    const name = node.name || node.run_id || "run";
+    const status = node.status || "unknown";
+    const tone = ["running", "finished", "crashed", "stale"].includes(status)
+      ? status
+      : "unknown";
+    const badges = [];
+    if (node.base_dirty) badges.push(["dirty", "lineage-dirty", "Base tree was dirty"]);
+    if (node.same_tree_as_parent)
+      badges.push(["same code", "lineage-same", "Same tree as parent"]);
+    if (node.error) badges.push(["error", "lineage-error", String(node.error)]);
+    let badgeX = at.x + 28;
+    const badgeNodes = badges.map(([label, className, tip]) => {
+      const item = svgEl(
+        "text",
+        { class: className, x: badgeX, y: at.y + 54, text: label },
+        svgEl("title", { text: tip }),
+      );
+      badgeX += label.length * 5.6 + 10;
+      return item;
+    });
+    const commit = node.commit ? String(node.commit).slice(0, 7) : "—";
+    const picked = options.selected?.has(node.run_id);
+    const runId = node.run_id || "";
+    return svgEl(
+      "g",
+      {
+        class: `lineage-node${dimmed(node.run_id) ? " is-dim" : ""}`,
+        role: "button",
+        tabindex: "0",
+        "data-run-id": node.run_id,
+        "data-picked": picked ? "true" : "false",
+        "aria-pressed": picked ? "true" : "false",
+        "aria-label": `${name}, ${status}, ${runId}`,
+      },
+      svgEl("title", { text: `${name}\n${runId}` }),
+      svgEl("rect", {
+        class: "lineage-shape",
+        x: at.x,
+        y: at.y,
+        width: LINEAGE_W,
+        height: LINEAGE_H,
+        rx: "8",
+      }),
+      svgEl("circle", {
+        class: `lineage-dot ${tone}`,
+        cx: at.x + 16,
+        cy: at.y + 20,
+        r: "4",
+      }),
+      svgEl(
+        "text",
+        { class: "lineage-name", x: at.x + 28, y: at.y + 24, text: shorten(name, 22) },
+        svgEl("title", { text: name }),
+      ),
+      svgEl(
+        "text",
+        {
+          class: "lineage-meta",
+          x: at.x + 28,
+          y: at.y + 40,
+          text: `${shortRunId(runId)} · ${commit}`,
+        },
+        svgEl("title", { text: runId }),
+      ),
+      ...badgeNodes,
+    );
+  });
+  return svgEl(
+    "svg",
+    {
+      class: "lineage-graph",
+      width: width,
+      height: height,
+      viewBox: `0 0 ${width} ${height}`,
+      role: "group",
+      "aria-label": "Run lineage",
+    },
+    svgEl(
+      "defs",
+      {},
+      svgEl(
+        "marker",
+        {
+          id: markerId,
+          viewBox: "0 0 8 8",
+          refX: "8",
+          refY: "4",
+          markerWidth: "7",
+          markerHeight: "7",
+          orient: "auto",
+        },
+        svgEl("path", {
+          class: "lineage-arrow",
+          d: "M0,0 L8,4 L0,8 Z",
+          style: "fill: var(--text-3)",
+        }),
+      ),
+    ),
+    ...paths,
+    ...glyphs,
+  );
+}
 async function home(version) {
   const selected = new Set();
   const search = el("input", {
@@ -310,8 +600,382 @@ async function home(version) {
       row.dataset.picked = picked;
       row.querySelector(".check").checked = picked;
     }
+    for (const node of content.querySelectorAll(".lineage-node")) {
+      const picked = selected.has(node.dataset.runId);
+      node.dataset.picked = picked;
+      node.setAttribute("aria-pressed", picked ? "true" : "false");
+    }
+  }
+  const haystack = (run) =>
+    `${run.name} ${run.run_id} ${(run.tags || []).join(" ")}`.toLowerCase();
+  const lineageCache = new Map();
+  let lineageToken = 0;
+  let detailToken = 0;
+  let pendingFocus = { runId: "", project: "" };
+  function projectHead(key, mode) {
+    const choose = (next) => {
+      storeView(key, next);
+      draw();
+    };
+    return el(
+      "header",
+      { class: "project-head inline" },
+      el("h2", { text: key || "No project" }),
+      !key
+        ? el("span", {
+            class: "project-note",
+            text: "no project — pass project= or run inside a repo",
+          })
+        : null,
+      el(
+        "div",
+        {
+          class: "segmented",
+          role: "tablist",
+          "aria-label": `View for ${key || "no project"}`,
+        },
+        button("List", () => choose("list"), "ghost", {
+          role: "tab",
+          "aria-selected": mode !== "lineage",
+        }),
+        button("Lineage", () => choose("lineage"), "ghost", {
+          role: "tab",
+          "aria-selected": mode === "lineage",
+        }),
+      ),
+    );
+  }
+  function renderDetail(host, node, detail) {
+    const parentId = node.parent_run_id;
+    const parentRun = runs.find((run) => run.run_id === parentId);
+    const parent = parentId
+      ? el("a", {
+          href: routeRun(parentId),
+          text: parentRun?.name || parentId,
+        })
+      : el("span", { text: "—" });
+    const inferred =
+      node.parent_inference && node.parent_inference !== "explicit"
+        ? el("span", { class: "muted", text: node.parent_inference })
+        : null;
+    const base = [
+      node.base_commit ? String(node.base_commit).slice(0, 7) : "",
+      node.base_branch || "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    const files = Array.isArray(detail.files) ? detail.files : [];
+    const shown = files.slice(0, 8);
+    const extra = files.length - shown.length;
+    const checkout =
+      detail.checkout || `agenticml lineage checkout ${node.run_id}`;
+    const copy = button("Copy", () => {
+      try {
+        const pending = navigator.clipboard.writeText(checkout);
+        Promise.resolve(pending).then(
+          () => {
+            copy.textContent = "Copied";
+          },
+          () => {
+            copy.textContent = "Copy failed";
+          },
+        );
+      } catch {
+        copy.textContent = "Copy failed";
+      }
+    });
+    host.replaceChildren(
+      ...[
+      el(
+        "div",
+        { class: "lineage-facts" },
+        el("div", {}, el("div", { class: "eyebrow", text: "Parent" }), el("div", { class: "inline" }, parent, inferred)),
+        el(
+          "div",
+          {},
+          el("div", { class: "eyebrow", text: "Commit" }),
+          el("span", {
+            class: "mono",
+            text: detail.commit || node.commit || "—",
+            title: detail.commit || node.commit || "",
+          }),
+        ),
+        el(
+          "div",
+          {},
+          el("div", { class: "eyebrow", text: "Base" }),
+          el("span", {
+            class: "mono",
+            text: `${base || "—"}${node.base_dirty ? " · dirty" : ""}`,
+          }),
+        ),
+      ),
+      detail.error ? el("p", { class: "error", text: detail.error }) : null,
+      el("div", { class: "eyebrow", text: "Files changed vs parent" }),
+      shown.length
+        ? el(
+            "div",
+            { class: "lineage-files" },
+            ...shown.map((file) =>
+              el(
+                "div",
+                { class: "lineage-file" },
+                el("span", {
+                  class: "path",
+                  text: file.path || "—",
+                  title: file.path || "",
+                }),
+                el("span", {
+                  class: "added",
+                  text: file.added == null ? "—" : `+${file.added}`,
+                }),
+                el("span", {
+                  class: "deleted",
+                  text: file.deleted == null ? "—" : `-${file.deleted}`,
+                }),
+              ),
+            ),
+          )
+        : el("p", { class: "muted", text: detail.error ? "—" : "No file changes." }),
+      extra > 0
+        ? el("p", {
+            class: "muted",
+            text: `and ${extra} more${detail.truncated ? " (list truncated)" : ""}`,
+          })
+        : detail.truncated
+          ? el("p", { class: "muted", text: "list truncated" })
+          : null,
+      el(
+        "div",
+        { class: "lineage-checkout" },
+        el("code", { text: checkout }),
+        copy,
+      ),
+    ].filter((child) => child != null));
+  }
+  function showLineageDetail(card, node) {
+    const token = String(++detailToken);
+    card.dataset.detailToken = token;
+    card.dataset.detailFor = node.run_id;
+    card.dataset.focus = node.run_id;
+    const host = card.querySelector(".lineage-detail");
+    host.replaceChildren(el("p", { class: "muted", text: "Loading changes…" }));
+    get(`${apiRun(node.run_id)}/lineage`)
+      .then((detail) => {
+        if (epoch !== version || !card.isConnected || card.dataset.detailToken !== token)
+          return;
+        renderDetail(host, node, detail);
+      })
+      .catch((error) => {
+        if (epoch !== version || error.name === "AbortError") return;
+        if (!card.isConnected || card.dataset.detailToken !== token) return;
+        showError(host, error);
+      });
+  }
+  function toggleLineage(card, node) {
+    if (selected.has(node.run_id)) selected.delete(node.run_id);
+    else selected.add(node.run_id);
+    card.dataset.focus = node.run_id;
+    updateSelection();
+    showLineageDetail(card, node);
+  }
+  function lineageNodeFrom(card, event) {
+    const target = event.target;
+    if (!target || !target.closest) return null;
+    const glyph = target.closest(".lineage-node");
+    if (!glyph || !card.contains(glyph)) return null;
+    const runId = glyph.getAttribute("data-run-id");
+    if (!runId) return null;
+    const data = lineageCache.get(card.dataset.project || "")?.data;
+    return (
+      (data?.nodes || []).find((node) => node.run_id === runId) || {
+        run_id: runId,
+      }
+    );
+  }
+  function bindLineageCard(card) {
+    if (card.dataset.lineageBound === "1") return;
+    card.dataset.lineageBound = "1";
+    card.addEventListener("click", (event) => {
+      if (event.detail > 1) return;
+      const node = lineageNodeFrom(card, event);
+      if (!node) return;
+      toggleLineage(card, node);
+    });
+    card.addEventListener("dblclick", (event) => {
+      const node = lineageNodeFrom(card, event);
+      if (!node) return;
+      event.preventDefault();
+      location.hash = routeRun(node.run_id);
+    });
+    card.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      const node = lineageNodeFrom(card, event);
+      if (!node) return;
+      event.preventDefault();
+      if (event.key === "Enter") location.hash = routeRun(node.run_id);
+      else toggleLineage(card, node);
+    });
+  }
+  function paintLineage(card, data) {
+    const scroll = card.querySelector(".lineage-scroll");
+    if (!scroll) return;
+    if (!data || !Array.isArray(data.nodes) || !Array.isArray(data.edges)) {
+      showError(scroll, new Error("Invalid lineage response"));
+      return;
+    }
+    const active = document.activeElement;
+    const focusedNode = active?.closest?.(".lineage-node");
+    const typing =
+      active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA");
+    const inThisGraph = Boolean(focusedNode && scroll.contains(focusedNode));
+    const projectKey = card.dataset.project ?? "";
+    const blurredHere =
+      !typing &&
+      !inThisGraph &&
+      pendingFocus.runId &&
+      pendingFocus.project === projectKey &&
+      (!active ||
+        active === document.body ||
+        active === document.documentElement);
+    const restoreId = inThisGraph
+      ? focusedNode.getAttribute("data-run-id") || ""
+      : blurredHere
+        ? pendingFocus.runId
+        : "";
+    const left = scroll.scrollLeft;
+    if (!data.nodes.length) {
+      scroll.replaceChildren(
+        el("p", { class: "muted", text: "No runs to graph." }),
+      );
+      return;
+    }
+    const query = search.value.trim().toLowerCase();
+    const siblings = runs.filter((run) => (run.project || "") === projectKey);
+    const matching = new Set(
+      siblings
+        .filter((run) => haystack(run).includes(query))
+        .map((run) => run.run_id),
+    );
+    scroll.replaceChildren(
+      renderLineageSvg(data, {
+        filtering: Boolean(query),
+        matching,
+        selected,
+      }),
+    );
+    scroll.scrollLeft = left;
+    if (restoreId && !typing) {
+      const live = scroll.querySelector(
+        `.lineage-node[data-run-id="${cssEscape(restoreId)}"]`,
+      );
+      if (live) {
+        try {
+          live.focus({ preventScroll: true });
+        } catch {
+          live.focus();
+        }
+        scroll.scrollLeft = left;
+      }
+    }
+    updateSelection();
+    const focusId = card.dataset.focus;
+    if (!focusId) return;
+    const node = data.nodes.find((item) => item.run_id === focusId);
+    if (node && card.dataset.detailFor !== focusId) showLineageDetail(card, node);
+  }
+  function dimLineage(card, siblings, query) {
+    const matching = new Set(
+      siblings.filter((run) => haystack(run).includes(query)).map((run) => run.run_id),
+    );
+    const filtering = Boolean(query);
+    for (const node of card.querySelectorAll(".lineage-node"))
+      node.classList.toggle("is-dim", filtering && !matching.has(node.dataset.runId));
+    for (const edge of card.querySelectorAll(".lineage-edge")) {
+      const faded =
+        filtering &&
+        (!matching.has(edge.dataset.from) || !matching.has(edge.dataset.to));
+      edge.classList.toggle("is-dim", faded);
+    }
+  }
+  function ensureLineage(key, signature, card, running) {
+    const now = Date.now();
+    let entry = lineageCache.get(key);
+    const same = entry && entry.signature === signature;
+    const due =
+      Boolean(running) &&
+      same &&
+      !entry.pending &&
+      now - (entry.fetchedAt || 0) >= LINEAGE_REFRESH_MS;
+    if (same && !due) {
+      entry.card = card;
+      if (entry.data) paintLineage(card, entry.data);
+      else if (entry.error)
+        showError(card.querySelector(".lineage-scroll"), entry.error);
+      else if (!card.querySelector(".lineage-graph"))
+        card
+          .querySelector(".lineage-scroll")
+          .replaceChildren(el("p", { class: "muted", text: "Loading lineage…" }));
+      return;
+    }
+    const token = ++lineageToken;
+    const kept = entry?.data || null;
+    entry = {
+      signature,
+      token,
+      data: kept,
+      error: null,
+      pending: true,
+      card,
+      fetchedAt: now,
+    };
+    lineageCache.set(key, entry);
+    const scroll = card.querySelector(".lineage-scroll");
+    if (scroll && !scroll.querySelector(".lineage-graph")) {
+      if (kept) paintLineage(card, kept);
+      else
+        scroll.replaceChildren(
+          el("p", { class: "muted", text: "Loading lineage…" }),
+        );
+    }
+    get(`/api/lineage?${new URLSearchParams({ project: key })}`)
+      .then((data) => {
+        if (epoch !== version) return;
+        const current = lineageCache.get(key);
+        if (!current || current.token !== token) return;
+        current.data = data;
+        current.pending = false;
+        current.error = null;
+        const target = current.card;
+        if (target?.isConnected && target.dataset.signature === signature)
+          paintLineage(target, data);
+      })
+      .catch((error) => {
+        if (epoch !== version || error.name === "AbortError") return;
+        const current = lineageCache.get(key);
+        if (!current || current.token !== token) return;
+        current.pending = false;
+        current.error = error;
+        const target = current.card;
+        if (
+          target?.isConnected &&
+          target.dataset.signature === signature &&
+          !current.data
+        )
+          showError(target.querySelector(".lineage-scroll"), error);
+      });
   }
   function draw() {
+    const active = document.activeElement;
+    const focusedNode = active?.closest?.(".lineage-node");
+    pendingFocus =
+      focusedNode && content.contains(focusedNode)
+        ? {
+            runId: focusedNode.getAttribute("data-run-id") || "",
+            project:
+              focusedNode.closest("[data-project]")?.dataset.project ?? "",
+          }
+        : { runId: "", project: "" };
     const groups = new Map();
     for (const run of runs) {
       const key = run.project || "";
@@ -354,6 +1018,57 @@ async function home(version) {
               ? Date.parse(a.created_at)
               : -Infinity),
         );
+      if (viewFor(key) === "lineage") {
+        const signature = lineageSignature(siblings);
+        const running = siblings.some((run) => run.status === "running");
+        let card = [...content.children].find(
+          (node) =>
+            node.dataset?.project === key && node.dataset.view === "lineage",
+        );
+        if (card && card.dataset.signature === signature) {
+          dimLineage(card, siblings, query);
+          const entry = lineageCache.get(key);
+          if (
+            running &&
+            entry &&
+            !entry.pending &&
+            Date.now() - (entry.fetchedAt || 0) >= LINEAGE_REFRESH_MS
+          )
+            ensureLineage(key, signature, card, true);
+          cards.push(card);
+          continue;
+        }
+        if (!card) {
+          const scroll = el(
+            "div",
+            { class: "lineage-scroll" },
+            el("p", { class: "muted", text: "Loading lineage…" }),
+          );
+          const detail = el(
+            "div",
+            { class: "lineage-detail" },
+            el("p", {
+              class: "muted",
+              text: "Select a run to see its parent, commit, and files changed.",
+            }),
+          );
+          card = el(
+            "section",
+            {
+              class: "card project-card",
+              "data-project": key,
+              "data-view": "lineage",
+              "data-signature": signature,
+            },
+            projectHead(key, "lineage"),
+            el("div", { class: "lineage-body" }, scroll, detail),
+          );
+          bindLineageCard(card);
+        } else card.dataset.signature = signature;
+        ensureLineage(key, signature, card, running);
+        cards.push(card);
+        continue;
+      }
       const visible = siblings.filter((run) =>
         `${run.name} ${run.run_id} ${(run.tags || []).join(" ")}`
           .toLowerCase()
@@ -483,35 +1198,36 @@ async function home(version) {
       cards.push(
         el(
           "section",
-          { class: "card project-card", "data-project": key },
-          el(
-            "header",
-            { class: "project-head inline" },
-            el("h2", { text: key || "No project" }),
-            !key
-              ? el("span", {
-                  class: "project-note",
-                  text: "no project — pass project= or run inside a repo",
-                })
-              : null,
-          ),
+          { class: "card project-card", "data-project": key, "data-view": "list" },
+          projectHead(key, "list"),
           columns,
           ...rows,
         ),
       );
     }
-    content.replaceChildren(
-      ...(cards.length
-        ? cards
-        : [
-            el("p", {
-              class: "empty",
-              text: runs.length
-                ? "No runs match this filter."
-                : "No runs found. Start a local experiment to see it here.",
-            }),
-          ]),
-    );
+    if (!cards.length) {
+      content.replaceChildren(
+        el("p", {
+          class: "empty",
+          text: runs.length
+            ? "No runs match this filter."
+            : "No runs found. Start a local experiment to see it here.",
+        }),
+      );
+    } else {
+      const wanted = new Set(cards);
+      for (const child of [...content.children])
+        if (!wanted.has(child)) child.remove();
+      let cursor = content.firstChild;
+      for (const card of cards) {
+        if (cursor === card) {
+          cursor = cursor.nextSibling;
+          continue;
+        }
+        content.insertBefore(card, cursor);
+      }
+    }
+    updateSelection();
   }
   search.oninput = draw;
   async function refresh() {
