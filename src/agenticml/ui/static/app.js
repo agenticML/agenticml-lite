@@ -273,23 +273,6 @@ const lineageTime = (value) => {
   return Number.isFinite(time) ? time : Number.POSITIVE_INFINITY;
 };
 const LINEAGE_REFRESH_MS = 15000;
-const projectViews = new Map();
-function viewFor(project) {
-  if (projectViews.has(project)) return projectViews.get(project);
-  let mode = "list";
-  try {
-    if (localStorage.getItem(`agenticml.view.${project}`) === "lineage")
-      mode = "lineage";
-  } catch {}
-  projectViews.set(project, mode);
-  return mode;
-}
-function storeView(project, mode) {
-  projectViews.set(project, mode);
-  try {
-    localStorage.setItem(`agenticml.view.${project}`, mode);
-  } catch {}
-}
 function lineageSignature(runs) {
   return runs
     .map((run) =>
@@ -552,7 +535,7 @@ async function home(version) {
   app.replaceChildren(
     el(
       "div",
-      { class: "workspace stack" },
+      { class: "workspace runs-workspace stack" },
       el(
         "div",
         { class: "heading" },
@@ -612,11 +595,7 @@ async function home(version) {
   let lineageToken = 0;
   let detailToken = 0;
   let pendingFocus = { runId: "", project: "" };
-  function projectHead(key, mode) {
-    const choose = (next) => {
-      storeView(key, next);
-      draw();
-    };
+  function projectHead(key) {
     return el(
       "header",
       { class: "project-head inline" },
@@ -627,22 +606,6 @@ async function home(version) {
             text: "no project — pass project= or run inside a repo",
           })
         : null,
-      el(
-        "div",
-        {
-          class: "segmented",
-          role: "tablist",
-          "aria-label": `View for ${key || "no project"}`,
-        },
-        button("List", () => choose("list"), "ghost", {
-          role: "tab",
-          "aria-selected": mode !== "lineage",
-        }),
-        button("Lineage", () => choose("lineage"), "ghost", {
-          role: "tab",
-          "aria-selected": mode === "lineage",
-        }),
-      ),
     );
   }
   function renderDetail(host, node, detail) {
@@ -796,6 +759,15 @@ async function home(version) {
   function bindLineageCard(card) {
     if (card.dataset.lineageBound === "1") return;
     card.dataset.lineageBound = "1";
+    for (const type of ["mouseover", "mouseout"])
+      card.addEventListener(type, (event) => {
+        const source = event.target.closest?.(".run-row, .lineage-node");
+        if (!source?.isConnected || source.contains(event.relatedTarget)) return;
+        for (const peer of card.querySelectorAll(
+          `[data-run-id="${cssEscape(source.dataset.runId)}"]`,
+        ))
+          peer.classList.toggle("is-linked", type === "mouseover");
+      });
     card.addEventListener("click", (event) => {
       if (event.detail > 1) return;
       const node = lineageNodeFrom(card, event);
@@ -816,6 +788,14 @@ async function home(version) {
       if (event.key === "Enter") location.hash = routeRun(node.run_id);
       else toggleLineage(card, node);
     });
+  }
+  function restoreLineageHover(card) {
+    const source = card.querySelector(".run-row:hover, .lineage-node:hover");
+    if (!source) return;
+    for (const peer of card.querySelectorAll(
+      `[data-run-id="${cssEscape(source.dataset.runId)}"]`,
+    ))
+      peer.classList.add("is-linked");
   }
   function paintLineage(card, data) {
     const scroll = card.querySelector(".lineage-scroll");
@@ -865,6 +845,7 @@ async function home(version) {
       }),
     );
     scroll.scrollLeft = left;
+    restoreLineageHover(card);
     if (restoreId && !typing) {
       const live = scroll.querySelector(
         `.lineage-node[data-run-id="${cssEscape(restoreId)}"]`,
@@ -907,11 +888,9 @@ async function home(version) {
       same &&
       !entry.pending &&
       now - (entry.fetchedAt || 0) >= LINEAGE_REFRESH_MS;
-    if (same && !due) {
+    if (same && !due && !entry.error) {
       entry.card = card;
       if (entry.data) paintLineage(card, entry.data);
-      else if (entry.error)
-        showError(card.querySelector(".lineage-scroll"), entry.error);
       else if (!card.querySelector(".lineage-graph"))
         card
           .querySelector(".lineage-scroll")
@@ -956,13 +935,13 @@ async function home(version) {
         if (!current || current.token !== token) return;
         current.pending = false;
         current.error = error;
+        current.signature = null;
         const target = current.card;
-        if (
-          target?.isConnected &&
-          target.dataset.signature === signature &&
-          !current.data
-        )
-          showError(target.querySelector(".lineage-scroll"), error);
+        if (target?.dataset.signature === signature) {
+          delete target.dataset.signature;
+          if (target.isConnected && !current.data)
+            showError(target.querySelector(".lineage-scroll"), error);
+        }
       });
   }
   function draw() {
@@ -1018,63 +997,55 @@ async function home(version) {
               ? Date.parse(a.created_at)
               : -Infinity),
         );
-      if (viewFor(key) === "lineage") {
-        const signature = lineageSignature(siblings);
-        const running = siblings.some((run) => run.status === "running");
-        let card = [...content.children].find(
-          (node) =>
-            node.dataset?.project === key && node.dataset.view === "lineage",
-        );
-        if (card && card.dataset.signature === signature) {
-          dimLineage(card, siblings, query);
-          const entry = lineageCache.get(key);
-          if (
-            running &&
-            entry &&
-            !entry.pending &&
-            Date.now() - (entry.fetchedAt || 0) >= LINEAGE_REFRESH_MS
-          )
-            ensureLineage(key, signature, card, true);
-          cards.push(card);
-          continue;
-        }
-        if (!card) {
-          const scroll = el(
-            "div",
-            { class: "lineage-scroll" },
-            el("p", { class: "muted", text: "Loading lineage…" }),
-          );
-          const detail = el(
-            "div",
-            { class: "lineage-detail" },
-            el("p", {
-              class: "muted",
-              text: "Select a run to see its parent, commit, and files changed.",
-            }),
-          );
-          card = el(
-            "section",
-            {
-              class: "card project-card",
-              "data-project": key,
-              "data-view": "lineage",
-              "data-signature": signature,
-            },
-            projectHead(key, "lineage"),
-            el("div", { class: "lineage-body" }, scroll, detail),
-          );
-          bindLineageCard(card);
-        } else card.dataset.signature = signature;
-        ensureLineage(key, signature, card, running);
-        cards.push(card);
-        continue;
-      }
-      const visible = siblings.filter((run) =>
-        `${run.name} ${run.run_id} ${(run.tags || []).join(" ")}`
-          .toLowerCase()
-          .includes(query),
+      const signature = lineageSignature(siblings);
+      const running = siblings.some((run) => run.status === "running");
+      let card = [...content.children].find(
+        (node) =>
+          node.classList.contains("project-card") && node.dataset.project === key,
       );
-      if (!visible.length) continue;
+      const unchanged = card && card.dataset.signature === signature;
+      if (!card) {
+        const scroll = el(
+          "div",
+          { class: "lineage-scroll" },
+          el("p", { class: "muted", text: "Loading lineage…" }),
+        );
+        const detail = el(
+          "div",
+          { class: "lineage-detail" },
+          el("p", {
+            class: "muted",
+            text: "Select a run to see its parent, commit, and files changed.",
+          }),
+        );
+        card = el(
+          "section",
+          { class: "card project-card", "data-project": key },
+          projectHead(key),
+          el(
+            "div",
+            { class: "project-body" },
+            el("div", { class: "runs-pane" }),
+            el("div", { class: "lineage-body" }, scroll, detail),
+          ),
+        );
+        bindLineageCard(card);
+      }
+      card.dataset.signature = signature;
+      // Keep the graph DOM, scroller, focus and detail strip on ordinary polls.
+      // Only changed signatures or the running-project refresh fetch/repaint it.
+      if (unchanged) {
+        dimLineage(card, siblings, query);
+        const entry = lineageCache.get(key);
+        if (
+          running &&
+          entry &&
+          !entry.pending &&
+          Date.now() - (entry.fetchedAt || 0) >= LINEAGE_REFRESH_MS
+        )
+          ensureLineage(key, signature, card, true);
+      } else ensureLineage(key, signature, card, running);
+      const visible = siblings.filter((run) => haystack(run).includes(query));
       const keys = variedKeys(siblings);
       const headlineKey = siblings.map(headline).find(Boolean) || "Metric";
       // Walk oldest first, batching equal timestamps so only strictly earlier
@@ -1195,16 +1166,23 @@ async function home(version) {
           el("span", { class: "muted", text: "›" }),
         );
       });
-      cards.push(
-        el(
-          "section",
-          { class: "card project-card", "data-project": key, "data-view": "list" },
-          projectHead(key, "list"),
-          columns,
-          ...rows,
-        ),
+      for (const peer of card.querySelectorAll(".is-linked"))
+        peer.classList.remove("is-linked");
+      card.querySelector(".runs-pane").replaceChildren(
+        ...(visible.length
+          ? [columns, ...rows]
+          : [
+              el("p", {
+                class: "runs-empty muted",
+                text: "No runs match this filter.",
+              }),
+            ]),
       );
+      restoreLineageHover(card);
+      cards.push(card);
     }
+    if (cards.length && !cards.some((card) => card.querySelector(".run-row")))
+      cards.unshift(el("p", { class: "empty", text: "No runs match this filter." }));
     if (!cards.length) {
       content.replaceChildren(
         el("p", {

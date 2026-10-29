@@ -661,12 +661,15 @@ def test_abandoned_run_detail_uses_effective_status(page, tmp_path, ui_server_fa
 
 def mock_dashboard(page, runs):
     """Mock only store data; exercise the actual modules, routes, and DOM."""
-    from urllib.parse import unquote, urlsplit
+    from urllib.parse import parse_qs, unquote, urlsplit
 
     def respond(route):
         path = urlsplit(route.request.url).path
         if path == "/api/runs":
             body = runs
+        elif path == "/api/lineage":
+            project = parse_qs(urlsplit(route.request.url).query, keep_blank_values=True)["project"][0]
+            body = {"nodes": [run for run in runs if (run.get("project") or "") == project], "edges": []}
         else:
             parts = path[len("/api/runs/"):].split("/")
             run_id = unquote(parts[0])
@@ -1031,7 +1034,6 @@ def test_lineage_graph_selects_and_opens_run(page, tmp_path, ui_server_factory):
         page.set_viewport_size({"width": 375, "height": 812})
         home(page, server)
         expect(page.locator(".run-row")).to_have_count(3)
-        page.get_by_role("tab", name="Lineage", exact=True).click()
         expect(page.locator(".lineage-node")).to_have_count(3)
         expect(page.locator(".lineage-edge")).to_have_count(2)
         expect(page.locator(".lineage-edge.is-inferred")).to_have_count(1)
@@ -1101,31 +1103,164 @@ def _lineage_project(root, names=("root-run", "child-run", "leaf-run")):
     return ids
 
 
-def test_lineage_view_opens_when_storage_throws(page, tmp_path, ui_server_factory):
+def test_split_runs_page_works_when_storage_throws(page, tmp_path, ui_server_factory):
     page.add_init_script("""
-      const getItem = Storage.prototype.getItem;
-      const setItem = Storage.prototype.setItem;
-      Storage.prototype.getItem = function (key) {
-        if (String(key).startsWith("agenticml.view.")) throw new Error("denied");
-        return getItem.call(this, key);
-      };
-      Storage.prototype.setItem = function (key, value) {
-        if (String(key).startsWith("agenticml.view.")) throw new Error("denied");
-        return setItem.call(this, key, value);
-      };
+      Storage.prototype.getItem = function () { throw new Error("denied"); };
+      Storage.prototype.setItem = function () { throw new Error("denied"); };
     """)
     root = tmp_path / "lineage-storage"
     writer = RunWriter.create(root, meta={"name": "solo", "project": "demo", "tags": []})
     writer.finish("finished")
     with ui_server_factory(root) as server:
         home(page, server)
-        page.get_by_role("tab", name="Lineage", exact=True).click()
         expect(page.locator(".lineage-graph")).to_be_visible()
         expect(page.locator(".lineage-node")).to_have_count(1)
-        page.get_by_role("tab", name="List", exact=True).click()
         expect(page.locator(".run-row")).to_have_count(1)
-        page.get_by_role("tab", name="Lineage", exact=True).click()
+        page.reload()
         expect(page.locator(".lineage-node")).to_have_count(1)
+        expect(page.locator(".run-row")).to_have_count(1)
+
+
+@pytest.mark.parametrize("width", [375, 650, 900, 1001, 1440])
+def test_split_runs_layout_and_shared_selection(page, tmp_path, ui_server_factory, width):
+    root = tmp_path / "lineage-split"
+    ids = _lineage_project(root)
+    with ui_server_factory(root) as server:
+        page.set_viewport_size({"width": width, "height": 900})
+        home(page, server)
+        left = page.locator(".runs-pane")
+        right = page.locator(".lineage-body")
+        expect(left).to_be_visible()
+        expect(right.locator(".lineage-graph")).to_be_visible()
+        expect(page.get_by_role("tab", name="Lineage", exact=True)).to_have_count(0)
+        expect(page.get_by_role("tab", name="List", exact=True)).to_have_count(0)
+        a, b = left.bounding_box(), right.bounding_box()
+        assert abs(a["width"] - b["width"]) <= 1
+        if width > 1000:
+            assert a["x"] < b["x"]
+            assert abs(a["y"] - b["y"]) <= 1
+        else:
+            assert abs(a["x"] - b["x"]) <= 1
+            assert a["y"] + a["height"] <= b["y"]
+        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+        assert left.evaluate("el => el.scrollWidth <= el.clientWidth")
+        node = page.locator(f'.lineage-node[data-run-id="{ids[0]}"]')
+        check = page.get_by_role("checkbox", name="Select root-run", exact=True)
+        check.check()
+        expect(node).to_have_attribute("data-picked", "true")
+        node.press("Space")
+        expect(check).not_to_be_checked()
+        expect(node).to_have_attribute("data-picked", "false")
+        expect(page.locator(".lineage-detail")).to_contain_text(ids[0])
+        if width == 1440:
+            run_row = row(page, "root-run")
+            run_row.hover()
+            expect(node).to_have_class(re.compile(r"\bis-linked\b"))
+            node.hover()
+            expect(run_row).to_have_class(re.compile(r"\bis-linked\b"))
+            page.get_by_role("heading", name="Runs", exact=True).hover()
+            expect(run_row).not_to_have_class(re.compile(r"\bis-linked\b"))
+
+
+def test_split_runs_search_keeps_unmatched_project_graphs(page, ui_server):
+    home(page, ui_server)
+    expect(page.locator(".lineage-node")).to_have_count(5)
+    page.evaluate("window.keptGraphs = [...document.querySelectorAll('.lineage-graph')]")
+    page.get_by_label("Filter runs").fill("explicit-highlr")
+    expect(page.locator(".run-row")).to_have_count(1)
+    expect(page.locator(".project-card")).to_have_count(2)
+    expect(page.locator('.project-card[data-project="other-project"] .runs-empty')).to_have_text("No runs match this filter.")
+    expect(page.locator(".lineage-node.is-dim")).to_have_count(4)
+    assert page.evaluate("keptGraphs.every(graph => graph.isConnected)")
+    page.get_by_label("Filter runs").fill("no-such-run")
+    expect(page.locator(".run-row")).to_have_count(0)
+    expect(page.locator(".project-card")).to_have_count(2)
+    expect(page.locator(".runs-empty")).to_have_count(2)
+    expect(page.locator(".empty")).to_have_text("No runs match this filter.")
+    expect(page.locator(".lineage-node.is-dim")).to_have_count(5)
+    page.get_by_role("tab", name="testbed", exact=True).click()
+    expect(page.locator(".project-card")).to_have_count(1)
+    expect(page.locator(".lineage-node")).to_have_count(4)
+    page.get_by_label("Filter runs").fill("")
+    expect(page.locator(".run-row")).to_have_count(4)
+    expect(page.locator(".lineage-node.is-dim")).to_have_count(0)
+
+
+@pytest.mark.parametrize("retry", ["poll", "reenter"])
+def test_failed_lineage_refresh_retries_idle_project(page, ui_server, retry):
+    runs = [
+        {"run_id": "idle", "name": "old run", "project": "demo", "status": "finished", "keys": []},
+        {"run_id": "live", "name": "live run", "project": "other", "status": "running", "keys": []},
+    ]
+    mock_dashboard(page, runs)
+    attempts = []
+
+    def lineage(route):
+        attempts.append(route.request.url)
+        if len(attempts) == 2:
+            route.fulfill(status=503, body="unavailable")
+        else:
+            route.fulfill(content_type="application/json", body=json.dumps({"nodes": [runs[0]], "edges": []}))
+
+    page.route("**/api/lineage?project=demo", lineage)
+    page.allow_http_errors = True
+    page.clock.install()
+    home(page, ui_server)
+    page.get_by_role("tab", name="demo", exact=True).click()
+    node = page.locator('.lineage-node[data-run-id="idle"]')
+    expect(node).to_contain_text("old run")
+    page.evaluate("window.keptGraph = document.querySelector('.lineage-graph')")
+    runs[0]["name"] = "updated run"
+    page.clock.fast_forward(5000)
+    expect(row(page, "updated run")).to_be_visible()
+    page.wait_for_function("() => !document.querySelector('.project-card').dataset.signature")
+    assert len(attempts) == 2
+    assert page.evaluate("keptGraph === document.querySelector('.lineage-graph')")
+    expect(node).to_contain_text("old run")
+    if retry == "poll":
+        page.clock.fast_forward(5000)
+    else:
+        page.get_by_role("tab", name="other", exact=True).click()
+        page.get_by_role("tab", name="demo", exact=True).click()
+    expect(node).to_contain_text("updated run")
+    assert len(attempts) == 3
+
+
+@pytest.mark.parametrize("source", ["run-row", "lineage-node"])
+def test_hover_link_survives_poll_filter_and_detached_mouseout(page, ui_server, source):
+    mock_dashboard(page, [{"run_id": "hover", "name": "hover run", "project": "demo", "status": "running", "keys": []}])
+    page.clock.install()
+    home(page, ui_server)
+    node = page.locator(".lineage-node")
+    run_row = page.locator(".run-row")
+    expect(node).to_be_visible()
+    page.locator(f".{source}").hover()
+    linked = re.compile(r"\bis-linked\b")
+    expect(node).to_have_class(linked)
+    expect(run_row).to_have_class(linked)
+    page.evaluate("window.oldRow = document.querySelector('.run-row')")
+    page.clock.fast_forward(5000)
+    page.wait_for_function("() => !oldRow.isConnected")
+    expect(node).to_have_class(linked)
+    expect(run_row).to_have_class(linked)
+    page.get_by_label("Filter runs").fill("run")
+    expect(node).to_have_class(linked)
+    expect(run_row).to_have_class(linked)
+    # Remove the event source during dispatch, then link its replacement before
+    # the old mouseout reaches the card's delegated handler.
+    run_row.evaluate("""old => {
+      old.addEventListener('mouseout', () => {
+        const fresh = old.cloneNode(true);
+        old.replaceWith(fresh);
+        fresh.dispatchEvent(new MouseEvent('mouseover', {bubbles: true}));
+      }, {once: true});
+      old.dispatchEvent(new MouseEvent('mouseout', {bubbles: true}));
+    }""")
+    expect(node).to_have_class(linked)
+    expect(run_row).to_have_class(linked)
+    page.get_by_role("heading", name="Runs", exact=True).hover()
+    expect(node).not_to_have_class(linked)
+    expect(run_row).not_to_have_class(linked)
 
 
 def test_lineage_rebuild_keeps_focus_scroll_and_detail(page, tmp_path, ui_server_factory):
@@ -1141,7 +1276,6 @@ def test_lineage_rebuild_keeps_focus_scroll_and_detail(page, tmp_path, ui_server
         page.set_viewport_size({"width": 375, "height": 812})
         home(page, server)
         expect(page.locator(".poll-status")).to_contain_text("refreshes every 5 s")
-        page.get_by_role("tab", name="Lineage", exact=True).click()
         node = page.locator(f'.lineage-node[data-run-id="{child}"]')
         expect(node).to_be_visible()
         expect(page.locator(".lineage-detail")).to_contain_text("Select a run")
@@ -1162,3 +1296,59 @@ def test_lineage_rebuild_keeps_focus_scroll_and_detail(page, tmp_path, ui_server
         page.locator(".lineage-node:focus").click()
         expect(page.locator(".lineage-detail")).to_contain_text("agenticml lineage checkout")
         expect(page.locator(".lineage-detail")).to_contain_text(child)
+
+
+def test_split_runs_poll_updates_list_and_preserves_lineage(page, tmp_path, ui_server_factory):
+    root = tmp_path / "lineage-poll"
+    ids = _lineage_project(root)
+    path = root / "runs" / ids[0] / "meta.json"
+    meta = json.loads(path.read_text())
+    meta.update(status="running", summary={"loss": .5})
+    path.write_text(json.dumps(meta))
+    (path.parent / "run.lock").write_bytes(b"")
+    requests = []
+    page.on("request", lambda request: requests.append(request.url) if "/api/lineage?" in request.url else None)
+    page.clock.install()
+    with ui_server_factory(root) as server:
+        page.set_viewport_size({"width": 375, "height": 812})
+        home(page, server)
+        node = page.locator(f'.lineage-node[data-run-id="{ids[1]}"]')
+        node.press("Space")
+        detail = page.locator(".lineage-detail")
+        expect(detail).to_contain_text(ids[1])
+        left = page.locator(".lineage-scroll").evaluate(
+            "el => { el.scrollLeft = 180; return el.scrollLeft; }"
+        )
+        assert left > 0
+        page.evaluate("""() => {
+          window.keptCard = document.querySelector('.project-card');
+          window.keptPane = document.querySelector('.lineage-body');
+          window.keptGraph = document.querySelector('.lineage-graph');
+          window.keptNode = document.activeElement;
+          window.keptDetail = document.querySelector('.lineage-detail').firstElementChild;
+          window.oldRow = document.querySelector('.run-row');
+        }""")
+        assert len(requests) == 1
+        meta["summary"]["loss"] = .25
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(meta))
+        temporary.replace(path)
+        page.clock.fast_forward(5000)
+        expect(row(page, "root-run").locator('.run-number[title="loss"]')).to_have_text("0.25")
+        assert page.evaluate("""keptCard === document.querySelector('.project-card') &&
+          keptPane === document.querySelector('.lineage-body') &&
+          keptGraph === document.querySelector('.lineage-graph') &&
+          keptNode === document.activeElement && keptNode.isConnected &&
+          keptDetail === document.querySelector('.lineage-detail').firstElementChild &&
+          !oldRow.isConnected""")
+        assert len(requests) == 1
+        assert page.locator(".lineage-scroll").evaluate("el => el.scrollLeft") == left
+        expect(detail).to_contain_text(ids[1])
+        # Running projects still refresh their lineage at the longer interval.
+        page.clock.fast_forward(10000)
+        page.wait_for_function("() => keptGraph !== document.querySelector('.lineage-graph')")
+        assert len(requests) == 2
+        expect(page.locator(".lineage-node:focus")).to_have_attribute("data-run-id", ids[1])
+        assert page.locator(".lineage-scroll").evaluate("el => el.scrollLeft") == left
+        assert page.evaluate("keptDetail === document.querySelector('.lineage-detail').firstElementChild")
+        expect(detail).to_contain_text(ids[1])
