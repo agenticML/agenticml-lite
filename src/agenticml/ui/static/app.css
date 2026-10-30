@@ -1098,6 +1098,23 @@ th {
   flex: 1 1 140px;
   min-width: 0;
 }
+.code-diff-view {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface-3);
+}
+.code-diff-view .btn {
+  border-color: transparent;
+  color: var(--text-3);
+}
+.code-diff-view .btn[aria-pressed="true"]:not(:disabled),
+.code-diff-view .btn[aria-pressed="true"]:not(:disabled):hover {
+  background: var(--surface);
+  color: var(--text);
+}
 .code-diff-label,
 .code-diff-summary,
 .code-diff-counts,
@@ -1239,6 +1256,46 @@ th {
   padding: 4px 12px;
   color: var(--text-3);
   background: var(--surface-3);
+}
+.code-diff-split {
+  table-layout: fixed;
+  width: 100%;
+  min-width: 640px;
+}
+.code-diff-split .code-diff-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.code-diff-split .code-diff-base-line,
+.code-diff-split .code-diff-target-line {
+  position: static;
+  width: 56px;
+}
+.code-diff-split .code-diff-target-line {
+  border-left: 1px solid var(--border);
+}
+.code-diff-split .code-diff-marker {
+  width: 20px;
+  min-width: 20px;
+}
+.code-diff-split td.diff-added {
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
+}
+.code-diff-split td.diff-removed {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+.code-diff-split td.code-diff-base-line,
+.code-diff-split td.code-diff-target-line {
+  background: var(--surface-3);
+}
+.code-diff-split td.code-diff-filler {
+  background: var(--surface-3);
+}
+.code-diff-split .code-diff-marker.diff-added {
+  color: var(--ok-text);
+}
+.code-diff-split .code-diff-marker.diff-removed {
+  color: var(--danger-text);
 }
 .diff-token-kw { color: var(--syn-kw); }
 .diff-token-str { color: var(--syn-str); }

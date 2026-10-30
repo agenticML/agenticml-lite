@@ -513,6 +513,131 @@ def test_compare_code_statuses_summary_and_line_numbers(page, tmp_path, ui_serve
         expect(unchanged.get_by_text("same.py", exact=True)).to_be_visible()
 
 
+def test_compare_code_split_view_pairs_lines_and_persists(page, tmp_path, ui_server_factory):
+    root = tmp_path / "compare-split"
+    base = write_snapshot(root, "base", "p", {
+        "main.py": "a\nb\nc\nd\n", "removed.py": "old\n", "same.py": "pass\n",
+    }, "2024-01-01")
+    target = write_snapshot(root, "target", "p", {
+        "main.py": "a\nB\nX\nY\nc\nd\n", "added.py": "new\n", "same.py": "pass\n",
+    }, "2024-01-02")
+    requests = []
+    page.on("request", lambda request: requests.append(request.url) if "/api/compare/code?" in request.url else None)
+    with ui_server_factory(root) as server:
+        section = open_code_compare(page, server, base, target)
+        merged = section.get_by_test_id("code-diff-view-merged")
+        split = section.get_by_test_id("code-diff-view-split")
+        expect(merged).to_have_attribute("aria-pressed", "true")
+        expect(split).to_have_attribute("aria-pressed", "false")
+        expect(section).to_have_attribute("data-view", "merged")
+        unchanged = section.locator(".code-diff-unchanged")
+        unchanged.locator("summary").click()
+        split.click()
+        expect(section).to_have_attribute("data-view", "split")
+        expect(split).to_have_attribute("aria-pressed", "true")
+        expect(merged).to_have_attribute("aria-pressed", "false")
+        main = section.locator('[data-path="main.py"]')
+        expect(main.locator(".code-diff-split")).to_have_count(1)
+        paired = main.locator('[data-base-type="removed"][data-target-type="added"]')
+        assert paired.locator("td").all_text_contents() == ["2", "−", "b", "2", "+", "B"]
+        fillers = main.locator('[data-base-type="empty"]')
+        expect(fillers).to_have_count(2)
+        for index, text in enumerate(("X", "Y")):
+            expect(fillers.nth(index).locator(".code-diff-filler")).to_have_count(3)
+            assert fillers.nth(index).locator("td").all_text_contents() == ["", "", "", str(index + 3), "+", text]
+        context = main.locator('[data-base-type="context"]').first
+        assert context.locator("td").all_text_contents() == ["1", "", "a", "1", "", "a"]
+        for path, base_type, target_type, cells in (
+            ("removed.py", "removed", "empty", ["1", "−", "old", "", "", ""]),
+            ("added.py", "empty", "added", ["", "", "", "1", "+", "new"]),
+        ):
+            row = section.locator(f'[data-path="{path}"] .code-diff-split-row')
+            expect(row).to_have_attribute("data-base-type", base_type)
+            expect(row).to_have_attribute("data-target-type", target_type)
+            assert row.locator("td").all_text_contents() == cells
+        main.locator("summary").click()
+        merged.click()
+        assert not main.evaluate("el => el.open")
+        expect(main.locator(".code-diff-table")).to_have_count(0)
+        assert unchanged.evaluate("el => el.open")
+        split.click()
+        assert not main.evaluate("el => el.open")
+        assert unchanged.evaluate("el => el.open")
+        main.locator("summary").click()
+        expect(main.locator(".code-diff-split")).to_have_count(1)
+        split.click()
+        assert len(requests) == 1
+        page.reload()
+        expect(section).to_have_attribute("aria-busy", "false")
+        expect(section).to_have_attribute("data-view", "split")
+        expect(split).to_have_attribute("aria-pressed", "true")
+        expect(main.locator(".code-diff-split")).to_have_count(1)
+        assert len(requests) == 2
+        merged.click()
+        assert main.locator(".diff-removed td").all_text_contents() == ["2", "", "−", "b"]
+        assert main.locator(".diff-added .code-diff-text").all_text_contents() == ["B", "X", "Y"]
+        assert len(requests) == 2
+
+
+@pytest.mark.parametrize("theme", ["light", "dark"])
+@pytest.mark.parametrize("width", [375, 1440])
+def test_compare_code_split_view_fits_mobile(page, tmp_path, ui_server_factory, theme, width):
+    root = tmp_path / "compare-split-mobile"
+    path = "nested/" * 30 + "main.py"
+    base = write_snapshot(root, "base", "p", {path: "value = 1\n"}, "2024-01-01")
+    target = write_snapshot(root, "target", "p", {path: "value = '" + "long-line" * 250 + "'\n"}, "2024-01-02")
+    page.set_viewport_size({"width": width, "height": 812})
+    with ui_server_factory(root) as server:
+        section = open_code_compare(page, server, base, target)
+        page.evaluate("theme => document.documentElement.dataset.theme = theme", theme)
+        section.get_by_test_id("code-diff-view-split").click()
+        expect(section.locator(".code-diff-split")).to_be_visible()
+        assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+        assert page.locator(".compare-focus .focus-body").evaluate("el => el.scrollWidth <= el.clientWidth")
+        for name in ("merged", "split"):
+            control = section.get_by_test_id(f"code-diff-view-{name}")
+            expect(control).to_be_in_viewport()
+            bounds = control.bounding_box()
+            assert 0 <= bounds["x"] and bounds["x"] + bounds["width"] <= width
+        colors = section.locator(".code-diff-split td.code-diff-text.diff-added, .code-diff-split td.code-diff-text.diff-removed").evaluate_all(
+            "nodes => nodes.map(el => getComputedStyle(el).backgroundColor)")
+        assert len(set(colors)) == 2
+        assert all(color not in ("transparent", "rgba(0, 0, 0, 0)") for color in colors)
+        assert section.locator(".code-diff-split td.code-diff-base-line").first.evaluate("""el => {
+            const color = getComputedStyle(el).backgroundColor;
+            const alpha = color.includes('/') ? color.split('/')[1].replace(')', '').trim()
+                : color.startsWith('rgba(') ? color.slice(5, -1).split(',')[3].trim() : '1';
+            return color !== 'transparent' && (alpha.endsWith('%') ? parseFloat(alpha) / 100 : Number(alpha)) === 1;
+        }""")
+        text = section.locator(".code-diff-text.diff-added")
+        assert text.evaluate("el => el.scrollWidth <= el.clientWidth && getComputedStyle(el).whiteSpace === 'pre-wrap'")
+        assert section.locator(".code-diff-target-line").evaluate("el => getComputedStyle(el).position === 'static'")
+
+
+def test_compare_code_poll_keeps_split_view(page, tmp_path, ui_server_factory):
+    root = tmp_path / "compare-split-poll"
+    base = write_snapshot(root, "base", "p", {"main.py": "value = 0\n", "other.py": "old\n"}, "2024-01-01")
+    writer = RunWriter.create(root, meta={"name": "running", "project": "p"})
+    writer.add_code([], [("main.py", b"value = 1\n"), ("other.py", b"new\n")])
+    try:
+        with ui_server_factory(root) as server:
+            section = open_code_compare(page, server, base, writer.run_id)
+            section.get_by_test_id("code-diff-view-split").click()
+            other = section.locator('[data-path="other.py"]')
+            other.locator("summary").click()
+            writer.add_code([], [("main.py", b"value = 2\n"), ("other.py", b"newer\n")])
+            expect(section.locator('[data-path="main.py"] .code-diff-text.diff-added')).to_have_text("value = 2", timeout=LIVE_TIMEOUT)
+            expect(section).to_have_attribute("data-view", "split")
+            expect(section.get_by_test_id("code-diff-view-split")).to_have_attribute("aria-pressed", "true")
+            expect(section.locator(".code-diff-table:not(.code-diff-split)")).to_have_count(0)
+            assert not other.evaluate("el => el.open")
+            expect(other.locator(".code-diff-table")).to_have_count(0)
+            other.locator("summary").click()
+            expect(other.locator(".code-diff-split .code-diff-text.diff-added")).to_have_text("newer")
+    finally:
+        writer.finish("finished")
+
+
 def test_compare_code_swap_and_pickers_refetch(page, tmp_path, ui_server_factory):
     from urllib.parse import parse_qs, urlsplit
     root = tmp_path / "compare-pickers"
@@ -680,7 +805,8 @@ def test_compare_code_short_columns_lazy_files_and_keyboard(page, tmp_path, ui_s
         # Include mounted-but-closed regions, which have layout rects in Chromium.
         files.nth(2).locator("summary").click()
         base_select.focus()
-        forward = [compare_select, swap, files.nth(0).locator("summary"),
+        forward = [compare_select, swap, section.get_by_test_id("code-diff-view-merged"),
+                   section.get_by_test_id("code-diff-view-split"), files.nth(0).locator("summary"),
                    files.nth(0).locator(".code-diff-scroll"), files.nth(1).locator("summary"),
                    files.nth(1).locator(".code-diff-scroll"), files.nth(2).locator("summary"),
                    files.nth(3).locator("summary"), files.nth(4).locator("summary"), unchanged,

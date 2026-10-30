@@ -1,4 +1,4 @@
-/* Unified snapshot diffs. Store strings enter the DOM only as text. */
+/* Snapshot diffs. Store strings enter the DOM only as text. */
 import { tokenize, langFor } from "./code.js";
 
 /**
@@ -24,7 +24,13 @@ export function createCodeDiff({
     requestPair = null,
     trailingRefresh = false,
     pickerSignature = null,
-    unchangedOpen = false;
+    unchangedOpen = false,
+    view = "merged",
+    lastData = null;
+  try {
+    const stored = localStorage.getItem("agenticml-code-diff-view");
+    if (["merged", "split"].includes(stored)) view = stored;
+  } catch {}
   const openPaths = new Map(),
     scrollPaths = new Map();
   let fileNodes = new Map(), unchangedNode = null, unchangedSignature = null;
@@ -54,6 +60,15 @@ export function createCodeDiff({
     refresh(true);
   }, "ghost", { "aria-label": "Swap base and compare runs" });
   swap.classList.add("code-diff-swap");
+  const merged = button("Merged", () => setView("merged"), "ghost", {
+    "data-testid": "code-diff-view-merged",
+    title: "Merged diff: both runs in one column",
+  });
+  const split = button("Split", () => setView("split"), "ghost", {
+    "data-testid": "code-diff-view-split",
+    title: "Split diff: base left, compare right",
+  });
+  syncView();
   node.append(
     el("h2", { class: "eyebrow", text: "Code diff" }),
     el(
@@ -64,11 +79,31 @@ export function createCodeDiff({
       baseSelect.label,
       targetSelect.label,
       swap,
+      el("div", { class: "code-diff-view", role: "group", "aria-label": "Diff view" }, merged, split),
     ),
     summary,
     errors,
     content,
   );
+
+  function syncView() {
+    node.dataset.view = view;
+    merged.setAttribute("aria-pressed", String(view === "merged"));
+    split.setAttribute("aria-pressed", String(view === "split"));
+  }
+
+  function setView(next) {
+    if (next === view) return;
+    view = next;
+    try {
+      localStorage.setItem("agenticml-code-diff-view", view);
+    } catch {}
+    syncView();
+    remember();
+    scrollPaths.clear();
+    fileNodes.clear();
+    if (lastData) draw(lastData, false);
+  }
 
   function picker(label, testid, change) {
     const select = el("select", {
@@ -117,6 +152,20 @@ export function createCodeDiff({
     if (unchanged) unchangedOpen = unchanged.open;
   }
 
+  function textCell(line, lang, className = "") {
+    const text = el("td", { class: `code-diff-text ${className}`.trim() });
+    for (const token of tokenize(line.text, lang))
+      text.append(el("span", {
+        class: `diff-token-${token.k}`,
+        text: token.t,
+      }));
+    if (line.clipped) {
+      text.title = "This line was shortened to fit the diff preview.";
+      text.append(el("span", { class: "code-diff-clipped", text: "…" }));
+    }
+    return text;
+  }
+
   function patch(file) {
     const body = el("tbody");
     const lang = langFor(file.path);
@@ -127,18 +176,6 @@ export function createCodeDiff({
       })));
       for (const line of hunk.lines) {
         const type = ["added", "removed"].includes(line.type) ? line.type : "context";
-        const text = el("td", {
-          class: "code-diff-text",
-        });
-        for (const token of tokenize(line.text, lang))
-          text.append(el("span", {
-            class: `diff-token-${token.k}`,
-            text: token.t,
-          }));
-        if (line.clipped) {
-          text.title = "This line was shortened to fit the diff preview.";
-          text.append(el("span", { class: "code-diff-clipped", text: "…" }));
-        }
         body.append(el("tr", { class: `code-diff-line diff-${type}` },
           el("td", {
             class: "code-diff-base-line",
@@ -152,7 +189,7 @@ export function createCodeDiff({
             class: "code-diff-marker",
             text: type === "added" ? "+" : type === "removed" ? "−" : " ",
           }),
-          text,
+          textCell(line, lang),
         ));
       }
     }
@@ -165,6 +202,62 @@ export function createCodeDiff({
       class: "code-diff-table",
       "aria-label": "Base line, compare line, change, source",
     }, body));
+  }
+
+  function splitPatch(file) {
+    const body = el("tbody");
+    const lang = langFor(file.path);
+    const side = (line, name, type) => {
+      const change = line ? `diff-${type}` : "code-diff-filler";
+      const classes = `code-diff-side-${name} ${change}`;
+      return [
+        el("td", {
+          class: `code-diff-${name === "base" ? "base" : "target"}-line ${change}`,
+          text: line?.[name === "base" ? "base_line" : "target_line"] ?? "",
+        }),
+        el("td", {
+          class: `code-diff-marker ${classes}`,
+          text: !line || type === "context" ? "" : type === "removed" ? "−" : "+",
+        }),
+        line ? textCell(line, lang, classes) : el("td", { class: `code-diff-text ${classes}` }),
+      ];
+    };
+    const row = (baseLine, targetLine, baseType, targetType) => body.append(el("tr", {
+      class: "code-diff-line code-diff-split-row",
+      "data-base-type": baseLine ? baseType : "empty",
+      "data-target-type": targetLine ? targetType : "empty",
+    }, ...side(baseLine, "base", baseType), ...side(targetLine, "target", targetType)));
+    for (const hunk of file.hunks) {
+      body.append(el("tr", { class: "code-diff-hunk" }, el("td", {
+        colSpan: 6,
+        text: `@@ -${hunk.base_start},${hunk.base_count} +${hunk.target_start},${hunk.target_count} @@`,
+      })));
+      let index = 0;
+      while (index < hunk.lines.length) {
+        const line = hunk.lines[index];
+        if (!["removed", "added"].includes(line.type)) {
+          row(line, line, "context", "context");
+          index++;
+          continue;
+        }
+        const removed = [], added = [];
+        while (hunk.lines[index]?.type === "removed") removed.push(hunk.lines[index++]);
+        while (hunk.lines[index]?.type === "added") added.push(hunk.lines[index++]);
+        for (let i = 0; i < Math.max(removed.length, added.length); i++)
+          row(removed[i], added[i], "removed", "added");
+      }
+    }
+    return el("div", {
+      class: "code-diff-scroll",
+      tabIndex: 0,
+      role: "region",
+      "aria-label": `Diff for ${file.path}`,
+    }, el("table", {
+      class: "code-diff-table code-diff-split",
+      "aria-label": "Base line, base source, compare line, compare source",
+    }, el("colgroup", {},
+      ...[56, 20, null, 56, 20, null].map((width) => el("col", width ? { style: `width: ${width}px` } : {})),
+    ), body));
   }
 
   function fileDetails(file, initiallyOpen) {
@@ -193,7 +286,7 @@ export function createCodeDiff({
     let scroll = null;
     const mount = () => {
       if (!scroll && file.hunks.length) {
-        scroll = patch(file);
+        scroll = view === "split" ? splitPatch(file) : patch(file);
         details.append(scroll);
         scroll.addEventListener("scroll", () => {
           if (details.open && content.contains(details))
@@ -225,8 +318,9 @@ export function createCodeDiff({
     return details;
   }
 
-  function draw(data) {
-    remember();
+  function draw(data, rememberState = true) {
+    lastData = data;
+    if (rememberState) remember();
     // Replacement can briefly shrink the page and clamp ancestor scrolling.
     const ancestors = [];
     for (let parent = node.parentElement; parent; parent = parent.parentElement)
@@ -248,7 +342,7 @@ export function createCodeDiff({
     const nextFiles = new Map();
     for (const file of data.files.filter((file) => file.status !== "unchanged")) {
       const initiallyOpen = file.hunks.length > 0 && withHunks++ < 3;
-      const signature = JSON.stringify(file);
+      const signature = JSON.stringify([view, file]);
       const previous = fileNodes.get(file.path);
       const details = previous?.signature === signature ? previous.node : fileDetails(file, initiallyOpen);
       nextFiles.set(file.path, { signature, node: details });
@@ -304,6 +398,7 @@ export function createCodeDiff({
     errors.replaceChildren();
     if (reset) {
       remember();
+      lastData = null;
       fileNodes.clear();
       unchangedNode = null;
       unchangedSignature = null;
