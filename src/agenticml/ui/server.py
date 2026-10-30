@@ -1,4 +1,7 @@
-"""Read-only HTTP dashboard over the local v1 store (stdlib only)."""
+"""HTTP dashboard over the local v1 store (stdlib only).
+
+The dashboard is read-only except for run notes.
+"""
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -23,7 +26,7 @@ import traceback
 from urllib.parse import parse_qs, unquote, urlsplit
 import webbrowser
 
-from agenticml.store import layout, reader
+from agenticml.store import layout, notes, reader
 
 _STATIC = Path(__file__).with_name("static")
 _FILES = {
@@ -33,6 +36,7 @@ _FILES = {
     "charts.js": "text/javascript; charset=utf-8",
     "code.js": "text/javascript; charset=utf-8",
     "codediff.js": "text/javascript; charset=utf-8",
+    "notes.js": "text/javascript; charset=utf-8",
 }
 _OBJECT_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp", "image/avif",
                  "image/bmp", "image/x-icon", "text/plain", "application/json"}
@@ -61,6 +65,12 @@ _GIT_READ = 64 * 1024
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _PROJECT_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,80}$")
 _INFERENCE_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+# Larger than a note so a normal JSON body fits, small enough to bound a PUT.
+_NOTE_PUT_MAX = 512 * 1024
+# Absolute cap for receiving a note body. The socket timeout is per-read
+# inactivity, so a client that keeps the stream moving would otherwise hold
+# the handler forever. Past this deadline the PUT is 408 and is not written.
+_NOTE_PUT_DEADLINE = 15
 
 
 def _text(value):
@@ -898,10 +908,11 @@ class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, root, host, port):
+    def __init__(self, root, host, port, read_only=False):
         self.root = layout.resolve_root(root)
         self.verbose = False
         self.bind_host = host
+        self.read_only = read_only
         self.readers = OrderedDict()
         self.reader_lock = threading.Lock()
         self.code_diffs = OrderedDict()
@@ -964,6 +975,47 @@ class DashboardServer(ThreadingHTTPServer):
 
 class IPv6DashboardServer(DashboardServer):
     address_family = socket.AF_INET6
+
+
+def _reject_nonfinite(value):
+    raise ValueError(f"non-finite JSON number: {value}")
+
+
+def _media_type(value):
+    if not isinstance(value, str):
+        return ""
+    return value.split(";", 1)[0].strip().lower()
+
+
+def _note_run_id(raw_path):
+    """Run id when ``raw_path`` is exactly ``/api/runs/<id>/notes``."""
+    try:
+        path = unquote(urlsplit(raw_path).path, errors="strict")
+    except (UnicodeDecodeError, ValueError, LookupError):
+        return None
+    prefix = "/api/runs/"
+    suffix = "/notes"
+    if not path.startswith(prefix) or not path.endswith(suffix):
+        return None
+    run_id = path[len(prefix):-len(suffix)]
+    if not layout.valid_run_id(run_id):
+        return None
+    return run_id
+
+
+def _parse_note_body(data: bytes):
+    try:
+        text = data.decode("utf-8")
+        body = json.loads(text, parse_constant=_reject_nonfinite)
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise ValueError("invalid note body") from exc
+    if not isinstance(body, dict) or set(body) != {"text", "revision"}:
+        raise ValueError("invalid note body")
+    note_text = body["text"]
+    revision = body["revision"]
+    if not isinstance(note_text, str) or not (revision is None or isinstance(revision, str)):
+        raise ValueError("invalid note body")
+    return note_text, revision
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -1042,11 +1094,171 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._error({"error": "forbidden host"}, 403)
                 return
             self.close_connection = True
-            self._json({"error": "method not allowed"}, 405, {"Allow": "GET"})
+            allow = "GET, PUT" if _note_run_id(self.path) else "GET"
+            self._json({"error": "method not allowed"}, 405, {"Allow": allow})
         except _DISCONNECT:
             self.close_connection = True
 
-    do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = do_TRACE = do_CONNECT = _method_not_allowed
+    do_POST = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = do_TRACE = do_CONNECT = _method_not_allowed
+
+    def do_PUT(self):
+        self._started = False
+        try:
+            if not self._host_allowed():
+                self.close_connection = True
+                self._error({"error": "forbidden host"}, 403)
+                return
+            self._put()
+        except notes.NoteConflict as exc:
+            note = dict(exc.note)
+            note["writable"] = True
+            self._error({"error": "conflict", "note": note}, 409)
+        except notes.NoteTooLarge:
+            self._error({"error": "note too large"}, 413)
+        except _DISCONNECT:
+            self.close_connection = True
+        except (TimeoutError, socket.timeout):
+            # socket.timeout is TimeoutError on 3.10+ and a distinct OSError on 3.9.
+            # A stalled body read must not fall through to a 500.
+            self.close_connection = True
+            if not getattr(self, "_started", False):
+                try:
+                    self._error({"error": "request timeout"}, 408)
+                except OSError:
+                    self.close_connection = True
+        except ValueError:
+            self._error({"error": "invalid request or store data"}, 400)
+        except (FileNotFoundError, NotADirectoryError):
+            self._error({"error": "not found"}, 404)
+        except Exception:
+            if self.server.verbose:
+                traceback.print_exc()
+            self._error({"error": "internal error"}, 500)
+
+    def _csrf_ok(self) -> bool:
+        token = self.headers.get_all("X-AgenticML-Request")
+        if token is None or len(token) != 1 or token[0].strip() != "1":
+            return False
+        origins = self.headers.get_all("Origin")
+        if origins:
+            if len(origins) != 1:
+                return False
+            host = self.headers.get("Host")
+            if host is None or origins[0].strip().lower() != ("http://" + host.strip()).lower():
+                return False
+        sites = self.headers.get_all("Sec-Fetch-Site")
+        if sites:
+            if len(sites) != 1 or sites[0].strip() not in ("same-origin", "none"):
+                return False
+        return True
+
+    def _put_length(self):
+        """Declared body length, or None when an error response was sent.
+
+        ``Transfer-Encoding`` and a missing or non-digit ``Content-Length``
+        are 411. Only ASCII digits count: ``str.isdigit`` is true for ``²``,
+        and ``int`` of that would otherwise surface as 400. A length above
+        512 KiB is 413 and the body is not read. The connection is closed so
+        the unread bytes cannot desync keep-alive.
+        """
+        if self.headers.get("Transfer-Encoding") is not None:
+            self.close_connection = True
+            self._error({"error": "length required"}, 411)
+            return None
+        values = self.headers.get_all("Content-Length")
+        if values is None or len(values) != 1 or not isinstance(values[0], str):
+            self.close_connection = True
+            self._error({"error": "length required"}, 411)
+            return None
+        v = values[0].strip()
+        if re.fullmatch(r"[0-9]{1,9}", v) is None:
+            self.close_connection = True
+            self._error({"error": "length required"}, 411)
+            return None
+        length = int(v)
+        if length > _NOTE_PUT_MAX:
+            self.close_connection = True
+            self._error({"error": "payload too large"}, 413)
+            return None
+        return length
+
+    def _read_put_body(self, length: int) -> bytes:
+        """Read ``length`` body bytes, or raise ``TimeoutError`` at the deadline.
+
+        ``rfile.read(length)`` waits until that many bytes arrive. Its socket
+        timeout resets after every successful ``recv``, so a trickle never
+        trips it. Each ``read1`` returns after one socket read. The deadline
+        is checked between those reads, and the socket timeout for each read
+        is the time still left, so one stalled ``recv`` cannot outlive it.
+        """
+        if length <= 0:
+            return b""
+        deadline = time.monotonic() + _NOTE_PUT_DEADLINE
+        try:
+            previous = self.connection.gettimeout()
+        except OSError:
+            previous = _CONNECTION_TIMEOUT
+        reader = self.rfile.read1 if hasattr(self.rfile, "read1") else self.rfile.read
+        chunks = []
+        remaining = length
+        try:
+            while remaining > 0:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    self.close_connection = True
+                    raise TimeoutError("note put deadline exceeded")
+                wait = left if previous is None else min(previous, left)
+                try:
+                    self.connection.settimeout(wait)
+                except OSError as exc:
+                    self.close_connection = True
+                    raise TimeoutError("note put deadline exceeded") from exc
+                try:
+                    chunk = reader(min(_CHUNK, remaining))
+                except (TimeoutError, socket.timeout, BlockingIOError) as exc:
+                    self.close_connection = True
+                    raise TimeoutError("note put deadline exceeded") from exc
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+        finally:
+            try:
+                self.connection.settimeout(previous)
+            except OSError:
+                pass
+        return b"".join(chunks)
+
+    def _put(self):
+        run_id = _note_run_id(self.path)
+        if run_id is None:
+            self._method_not_allowed()
+            return
+        # Reject before reading the body. Close so the unread body cannot be
+        # parsed as the next keep-alive request.
+        if self.server.read_only:
+            self.close_connection = True
+            self._error({"error": "read-only"}, 403)
+            return
+        if not self._csrf_ok():
+            self.close_connection = True
+            self._error({"error": "cross-site request refused"}, 403)
+            return
+        if _media_type(self.headers.get("Content-Type")) != "application/json":
+            self.close_connection = True
+            self._error({"error": "unsupported media type"}, 415)
+            return
+        length = self._put_length()
+        if length is None:
+            return
+        body = self._read_put_body(length)
+        if len(body) != length:
+            self.close_connection = True
+            raise ValueError("short body")
+        text, revision = _parse_note_body(body)
+        saved = notes.write_note(self.server.root, run_id, text, revision)
+        saved["writable"] = True
+        self._json(saved)
 
     def __getattr__(self, name):
         if name.startswith("do_"):
@@ -1123,6 +1335,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             else:
                 project = None
             return self._json(_lineage_graph(self.server.root, project))
+        if path == "/api/notes":
+            if "project" in query:
+                project = (query.get("project") or [""])[0]
+                if not isinstance(project, str) or "\x00" in project:
+                    raise ValueError("invalid project")
+            else:
+                project = None
+            listed = notes.list_notes(self.server.root, project)
+            listed["writable"] = not self.server.read_only
+            return self._json(listed)
         if path == "/api/runs":
             fields = ("run_id", "project", "name", "created_at", "finished_at", "tags", "group")
             runs = []
@@ -1154,6 +1376,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             run_path = self.server.root / "runs" / run_id
             if not run_path.resolve().is_relative_to(self.server.root / "runs"):
                 raise FileNotFoundError()
+            if route == "notes":
+                note = notes.read_note(self.server.root, run_id)
+                note["writable"] = not self.server.read_only
+                return self._json(note)
             with self.server.run_reader(run_id) as run:
                 if route == "":
                     result = dict(run.meta())
@@ -1233,22 +1459,29 @@ def _browser_host(address) -> str:
     return text
 
 
-def make_server(root, host="127.0.0.1", port=6006) -> ThreadingHTTPServer:
+def make_server(root, host="127.0.0.1", port=6006, read_only=False) -> ThreadingHTTPServer:
     """Construct a server; port=0 chooses a free port, server.verbose enables logs."""
     cls = IPv6DashboardServer if ":" in str(host) else DashboardServer
-    return cls(root, host, port)
+    return cls(root, host, port, read_only)
 
 
-def serve(root, host="127.0.0.1", port=6006, open_browser=False) -> None:
-    """Serve until Ctrl-C. No subprocesses, background services or writes."""
+def serve(root, host="127.0.0.1", port=6006, open_browser=False, read_only=False) -> None:
+    """Serve until Ctrl-C. No subprocesses or background services.
+
+    The dashboard is read-only except for run notes. ``read_only`` disables
+    note editing.
+    """
     if host not in _LOOPBACK_HOSTS:
         try:
             loopback = ipaddress.ip_address(host).is_loopback
         except ValueError:
             loopback = False
         if not loopback:
-            print("Warning: the UI has no authentication and exposes configs, env and code to the network.", flush=True)
-    with make_server(root, host, port) as server:
+            message = "Warning: the UI has no authentication and exposes configs, env and code to the network."
+            if not read_only:
+                message += " Anyone who can reach it can edit run notes; pass --read-only to disable editing."
+            print(message, flush=True)
+    with make_server(root, host, port, read_only) as server:
         address, bound_port = server.server_address[:2]
         url = f"http://{_browser_host(address)}:{bound_port}"
         print(f"AgenticML UI: {url}", flush=True)

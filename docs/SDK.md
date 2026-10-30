@@ -128,7 +128,7 @@ agenticml run --no-auto-track --no-capture-args -- python try_sdk.py   # switch 
 
 ```bash
 agenticml ls [--project P] [--json]       # list runs, newest first
-agenticml ui [--port 6006] [--open]       # local dashboard
+agenticml ui [--port 6006] [--open] [--read-only]  # local dashboard
 agenticml lineage checkout RUN_ID [--path DIR]  # detached shadow worktree
 agenticml lineage diff RUN_ID [OTHER_RUN_ID]   # numstat vs other or parent
 agenticml lineage ls [--project P]            # run parent tree

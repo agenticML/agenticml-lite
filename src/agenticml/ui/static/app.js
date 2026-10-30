@@ -2,6 +2,7 @@
 import { MetricChart, emaSmooth, colorForId, formatNumber } from "./charts.js";
 import { createCodeViewer } from "./code.js";
 import { createCodeDiff } from "./codediff.js";
+import { createNotepad, createNotebook } from "./notes.js";
 
 const app = document.querySelector("#app");
 const fmt = (value) =>
@@ -548,6 +549,7 @@ async function home(version) {
     role: "tablist",
     "aria-label": "Projects",
   });
+  const notebook = createNotebook({ el, button, get, routeRun });
   const selection = el("div", {
     class: "selection-bar is-empty",
     "data-testid": "selection-bar",
@@ -566,6 +568,7 @@ async function home(version) {
         count,
       ),
       tabs,
+      notebook.node,
       el("div", { class: "selection-slot" }, selection),
       content,
       status,
@@ -1182,6 +1185,7 @@ async function home(version) {
     count.textContent = `${runs.length} runs · grouped by project`;
     updateSelection();
     const query = search.value.trim().toLowerCase();
+    notebook.update({ project, query });
     const cards = [];
     for (const key of projects) {
       if (project !== null && key !== project) continue;
@@ -1408,6 +1412,7 @@ async function home(version) {
   }
   search.oninput = draw;
   async function refresh() {
+    notebook.refresh();
     try {
       const result = await get("/api/runs");
       if (epoch !== version) return;
@@ -1430,6 +1435,7 @@ async function home(version) {
   cleanup = () => {
     clearTimeout(timer);
     for (const key of [...lineageRetry.keys()]) clearLineageRetry(key);
+    notebook.destroy();
   };
   await refresh();
 }
@@ -1962,6 +1968,7 @@ async function runPage(id, version) {
   let code = null,
     timer;
   const panel = metricsPanel([run], false, signal);
+  const notepad = createNotepad({ runId: id, el, button, signal });
   function drawFacts() {
     title.replaceChildren(
       el("h1", { class: "mono", text: run.name || id }),
@@ -2049,6 +2056,7 @@ async function runPage(id, version) {
       title,
       subline,
       facts,
+      notepad.node,
       el(
         "div",
         { class: "stack" },
@@ -2074,6 +2082,8 @@ async function runPage(id, version) {
   drawFacts();
   cleanup = () => {
     clearTimeout(timer);
+    notepad.flush();
+    notepad.destroy();
     panel.destroy();
     code?.destroy();
   };

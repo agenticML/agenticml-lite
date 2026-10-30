@@ -108,9 +108,9 @@ def trained_store(tmp_path_factory):
 
 
 @contextmanager
-def serve_ui(root, config, runs=None):
+def serve_ui(root, config, runs=None, extra_args=()):
     env = clean_env(root, config)
-    proc = subprocess.Popen([str(CONSOLE), "ui", "--dir", str(root), "--port", "0"],
+    proc = subprocess.Popen([str(CONSOLE), "ui", "--dir", str(root), "--port", "0", *extra_args],
                             cwd=TESTBED, env=env, text=True, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT)
     lines = queue.Queue()
@@ -142,6 +142,6 @@ def ui_server(trained_store, tmp_path_factory):
 @pytest.fixture
 def ui_server_factory(tmp_path):
     """Mutation tests own their stores and servers; the session store is read-only."""
-    def factory(root):
-        return serve_ui(root, tmp_path / "ui-config")
+    def factory(root, extra_args=()):
+        return serve_ui(root, tmp_path / "ui-config", extra_args=extra_args)
     return factory

@@ -20,7 +20,7 @@ from agenticml import Run
 from agenticml.code_tracking import default_project
 
 pytest.importorskip("agenticml.store")
-from agenticml.store import reader
+from agenticml.store import notes, reader
 from agenticml.ui import server
 
 
@@ -58,9 +58,9 @@ def dashboard(tmp_path):
     httpd = server.make_server(tmp_path,'127.0.0.1',0)
     thread = threading.Thread(target=httpd.serve_forever,kwargs={"poll_interval":.01},daemon=True)
     thread.start()
-    def request(path, method='GET', headers=None):
+    def request(path, method='GET', headers=None, body=None):
         conn = http.client.HTTPConnection(*httpd.server_address[:2],timeout=5)
-        conn.request(method,path,headers=headers or {})
+        conn.request(method,path,body=body,headers=headers or {})
         response = conn.getresponse()
         result = response.status, dict(response.getheaders()), response.read()
         conn.close()
@@ -180,9 +180,16 @@ def test_get_only(dashboard,method):
     assert headers['Allow'] == 'GET'
     if method != 'HEAD':
         assert json.loads(body) == {'error':'method not allowed'}
+    # PUT is the only extra method, and only on a run's notes path.
+    if method != 'PUT':
+        status, headers, body = dashboard[0]('/api/runs/run-1/notes', method)
+        assert status == 405
+        assert headers['Allow'] == 'GET, PUT'
+        if method != 'HEAD':
+            assert json.loads(body) == {'error':'method not allowed'}
 
 
-@pytest.mark.parametrize('name',['index.html','app.js','app.css','charts.js','code.js','codediff.js'])
+@pytest.mark.parametrize('name',['index.html','app.js','app.css','charts.js','code.js','codediff.js','notes.js'])
 def test_static(dashboard,name):
     path = '/' if name == 'index.html' else '/static/'+name
     status, headers, body = dashboard[0](path)
@@ -193,10 +200,11 @@ def test_static(dashboard,name):
 
 
 def test_static_allowlist():
-    assert list(server._FILES) == ['index.html','app.js','app.css','charts.js','code.js','codediff.js']
+    assert list(server._FILES) == ['index.html','app.js','app.css','charts.js','code.js','codediff.js','notes.js']
     assert server._FILES['charts.js'] == 'text/javascript; charset=utf-8'
     assert server._FILES['code.js'] == 'text/javascript; charset=utf-8'
     assert server._FILES['codediff.js'] == 'text/javascript; charset=utf-8'
+    assert server._FILES['notes.js'] == 'text/javascript; charset=utf-8'
 
 
 @pytest.mark.parametrize('name',['uPlot.iife.min.js','uPlot.min.css','uPlot.LICENSE'])
@@ -526,6 +534,45 @@ def test_network_bind_warning(tmp_path, monkeypatch, capsys, host, warn):
     assert ('no authentication' in output) == warn
     if warn:
         assert 'configs, env and code' in output
+        assert 'edit run notes' in output
+        assert '--read-only' in output
+        assert output.count('Warning:') == 1
+    else:
+        assert 'edit run notes' not in output
+
+
+def test_network_bind_warning_read_only_keeps_the_original_sentence(tmp_path, monkeypatch, capsys):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    @contextmanager
+    def fake_server(*args):
+        yield SimpleNamespace(server_address=('0.0.0.0', 6006), serve_forever=lambda: None)
+
+    monkeypatch.setattr(server, 'make_server', fake_server)
+    server.serve(tmp_path, '0.0.0.0', read_only=True)
+    output = capsys.readouterr().out
+    assert 'no authentication' in output
+    assert 'configs, env and code' in output
+    assert 'edit run notes' not in output
+    assert '--read-only' not in output
+    assert output.count('Warning:') == 1
+
+
+def test_serve_passes_read_only(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    seen = {}
+
+    @contextmanager
+    def fake_server(*args):
+        seen['args'] = args
+        yield SimpleNamespace(server_address=('127.0.0.1', 9), serve_forever=lambda: None)
+
+    monkeypatch.setattr(server, 'make_server', fake_server)
+    server.serve(tmp_path, '127.0.0.1', 0, False, True)
+    assert seen['args'][-1] is True
 
 
 def test_summary_keeps_scalar_string_keys_in_order():
@@ -908,8 +955,8 @@ def _lineage_meta(**overrides):
     return payload
 
 
-def _serve(root):
-    httpd = server.make_server(root, '127.0.0.1', 0)
+def _serve(root, read_only=False):
+    httpd = server.make_server(root, '127.0.0.1', 0, read_only=read_only)
     thread = threading.Thread(target=httpd.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True)
     thread.start()
     return httpd, thread
@@ -922,8 +969,12 @@ def _stop(httpd, thread):
 
 
 def _get(httpd, path):
+    return _exchange(httpd, 'GET', path)
+
+
+def _exchange(httpd, method, path, body=None, headers=None):
     conn = http.client.HTTPConnection(*httpd.server_address[:2], timeout=5)
-    conn.request('GET', path)
+    conn.request(method, path, body=body, headers=headers or {})
     response = conn.getresponse()
     result = response.status, dict(response.getheaders()), response.read()
     conn.close()
@@ -2145,3 +2196,565 @@ def test_compare_code_only_lf_separates_lines(dashboard, tmp_path):
         dict(type='added', text='new', base_line=None, target_line=2),
         dict(type='context', text='end', base_line=3, target_line=3),
     ]
+
+
+def _note_headers(httpd, **overrides):
+    host = f'127.0.0.1:{httpd.server_address[1]}'
+    headers = {
+        'Content-Type': 'application/json; charset=utf-8',
+        'X-AgenticML-Request': '1',
+        'Origin': 'http://' + host,
+        'Sec-Fetch-Site': 'same-origin',
+    }
+    headers.update(overrides)
+    return headers
+
+
+def _put_note(dashboard, text, revision, path='/api/runs/run-1/notes', headers=None):
+    request, httpd, _, _ = dashboard
+    raw = json.dumps({'text': text, 'revision': revision}).encode()
+    merged = _note_headers(httpd)
+    if headers:
+        merged.update(headers)
+    return request(path, 'PUT', merged, raw)
+
+
+def _add_run(root, run_id, project, name, status='finished', created_at='2026-10-28T00:00:00.000000Z'):
+    directory = root / 'runs' / run_id
+    directory.mkdir()
+    meta = {
+        'format_version': 1, 'run_id': run_id, 'project': project, 'name': name,
+        'status': status, 'created_at': created_at,
+    }
+    (directory / 'meta.json').write_text(json.dumps(meta))
+    return directory
+
+
+def test_put_and_get_notes(dashboard):
+    request, httpd, _, _ = dashboard
+    assert load(dashboard, '/api/runs/run-1/notes') == {
+        'text': '', 'updated_at': None, 'revision': None, 'writable': True,
+    }
+    status, headers, body = _put_note(dashboard, 'hello\r\n<script>', None)
+    assert status == 200
+    assert headers['Content-Type'] == 'application/json'
+    saved = json.loads(body)
+    assert saved['text'] == 'hello\n<script>'
+    assert saved['writable'] is True
+    assert saved['revision'] == hashlib.sha256(b'hello\n<script>').hexdigest()
+    assert saved['updated_at']
+    disk = (httpd.root / 'runs' / 'run-1' / 'notes.md').read_bytes()
+    assert disk == b'hello\n<script>'
+    assert load(dashboard, '/api/runs/run-1/notes') == saved
+
+    port = httpd.server_address[1]
+    cased = _note_headers(httpd)
+    cased['Host'] = f'LocalHost:{port}'
+    cased['Origin'] = f'HTTP://localhost:{port}'
+    cased['Sec-Fetch-Site'] = 'none'
+    status, _, body = request(
+        '/api/runs/run-1/notes', 'PUT', cased,
+        json.dumps({'text': 'cased', 'revision': saved['revision']}).encode(),
+    )
+    assert status == 200
+    assert json.loads(body)['text'] == 'cased'
+
+    token_only = {
+        'Content-Type': 'application/json',
+        'X-AgenticML-Request': '1',
+    }
+    status, _, body = request(
+        '/api/runs/run-1/notes', 'PUT', token_only,
+        json.dumps({'text': '  \n\t', 'revision': json.loads(body)['revision']}).encode(),
+    )
+    assert status == 200
+    assert json.loads(body) == {
+        'text': '', 'updated_at': None, 'revision': None, 'writable': True,
+    }
+    assert not (httpd.root / 'runs' / 'run-1' / 'notes.md').exists()
+
+
+def test_put_notes_conflict(dashboard):
+    first = json.loads(_put_note(dashboard, 'one', None)[2])
+    second = json.loads(_put_note(dashboard, 'two', first['revision'])[2])
+    status, _, body = _put_note(dashboard, 'three', first['revision'])
+    assert status == 409
+    payload = json.loads(body)
+    assert set(payload) == {'error', 'note'}
+    assert payload['error'] == 'conflict'
+    assert payload['note']['text'] == 'two'
+    assert payload['note']['revision'] == second['revision']
+    assert payload['note']['writable'] is True
+    assert payload['note']['updated_at'] == second['updated_at']
+    assert load(dashboard, '/api/runs/run-1/notes')['text'] == 'two'
+    status, _, body = _put_note(dashboard, 'nope', None)
+    assert status == 409
+    assert json.loads(body)['note']['text'] == 'two'
+
+
+def test_put_notes_rejects_cross_site(dashboard):
+    request, httpd, _, _ = dashboard
+    raw = json.dumps({'text': 'x', 'revision': None}).encode()
+    path = '/api/runs/run-1/notes'
+
+    def send(headers):
+        return request(path, 'PUT', headers, raw)
+
+    missing = _note_headers(httpd)
+    del missing['X-AgenticML-Request']
+    status, _, body = send(missing)
+    assert status == 403
+    assert json.loads(body) == {'error': 'cross-site request refused'}
+
+    foreign = _note_headers(httpd)
+    foreign['Origin'] = 'http://evil.example'
+    status, _, body = send(foreign)
+    assert status == 403
+    assert json.loads(body) == {'error': 'cross-site request refused'}
+
+    opaque = _note_headers(httpd)
+    opaque['Origin'] = 'null'
+    status, _, body = send(opaque)
+    assert status == 403
+    assert json.loads(body) == {'error': 'cross-site request refused'}
+
+    for site in ('cross-site', 'same-site'):
+        headers = _note_headers(httpd)
+        headers['Sec-Fetch-Site'] = site
+        status, _, body = send(headers)
+        assert status == 403
+        assert json.loads(body) == {'error': 'cross-site request refused'}
+
+    wrong_token = _note_headers(httpd)
+    wrong_token['X-AgenticML-Request'] = '2'
+    status, _, body = send(wrong_token)
+    assert status == 403
+    assert json.loads(body) == {'error': 'cross-site request refused'}
+    assert not (httpd.root / 'runs' / 'run-1' / 'notes.md').exists()
+
+
+def test_put_notes_rejects_bad_type_length_and_body(dashboard):
+    request, httpd, _, _ = dashboard
+    path = '/api/runs/run-1/notes'
+    raw = json.dumps({'text': 'x', 'revision': None}).encode()
+
+    plain = _note_headers(httpd, **{'Content-Type': 'text/plain; charset=utf-8'})
+    status, _, body = request(path, 'PUT', plain, raw)
+    assert status == 415
+    assert json.loads(body) == {'error': 'unsupported media type'}
+
+    missing_type = _note_headers(httpd)
+    del missing_type['Content-Type']
+    status, _, body = request(path, 'PUT', missing_type, raw)
+    assert status == 415
+    assert json.loads(body) == {'error': 'unsupported media type'}
+
+    chunked = _note_headers(httpd)
+    chunked['Transfer-Encoding'] = 'chunked'
+    status, _, body = request(path, 'PUT', chunked, None)
+    assert status == 411
+    assert json.loads(body) == {'error': 'length required'}
+
+    invalid_length = _note_headers(httpd)
+    invalid_length['Content-Length'] = 'nope'
+    status, _, body = request(path, 'PUT', invalid_length, b'{}')
+    assert status == 411
+    assert json.loads(body) == {'error': 'length required'}
+
+    # "²".isdigit() is true; the length must still be 411, not a 400 from int().
+    superscript = _note_headers(httpd)
+    superscript['Content-Length'] = '²'
+    status, _, body = request(path, 'PUT', superscript, b'{}')
+    assert status == 411
+    assert json.loads(body) == {'error': 'length required'}
+
+    negative_length = _note_headers(httpd)
+    negative_length['Content-Length'] = '-1'
+    status, _, body = request(path, 'PUT', negative_length, b'{}')
+    assert status == 411
+    assert json.loads(body) == {'error': 'length required'}
+
+    oversize = _note_headers(httpd)
+    oversize['Content-Length'] = str(512 * 1024 + 1)
+    status, _, body = request(path, 'PUT', oversize, b'{}')
+    assert status == 413
+    assert json.loads(body) == {'error': 'payload too large'}
+
+    at_cap = request(path, 'PUT', _note_headers(httpd), b' ' * (512 * 1024))
+    assert at_cap[0] == 400
+    assert json.loads(at_cap[2]) == {'error': 'invalid request or store data'}
+
+    port = httpd.server_address[1]
+    missing_length = (
+        f'PUT /api/runs/run-1/notes HTTP/1.1\r\n'
+        f'Host: 127.0.0.1:{port}\r\n'
+        f'Content-Type: application/json\r\n'
+        f'X-AgenticML-Request: 1\r\n'
+        f'Connection: close\r\n'
+        f'\r\n'
+    ).encode()
+    with socket.create_connection(httpd.server_address[:2], timeout=5) as sock:
+        sock.sendall(missing_length)
+        received = b''
+        while True:
+            piece = sock.recv(65536)
+            if not piece:
+                break
+            received += piece
+    head, _, received_body = received.partition(b'\r\n\r\n')
+    assert head.split(b'\r\n', 1)[0].split()[1] == b'411'
+    assert json.loads(received_body) == {'error': 'length required'}
+
+    bad_bodies = [
+        b'{',
+        b'null',
+        b'[]',
+        b'{"text": "a"}',
+        b'{"text": "a", "revision": null, "extra": 1}',
+        b'{"text": 1, "revision": null}',
+        b'{"text": "a", "revision": 1}',
+        b'{"text": "a", "revision": true}',
+        b'{"text": null, "revision": null}',
+        b'{"text": "a", "revision": NaN}',
+        b'{"text": "a", "revision": Infinity}',
+    ]
+    for payload in bad_bodies:
+        status, _, body = request(path, 'PUT', _note_headers(httpd), payload)
+        assert status == 400, payload
+        assert json.loads(body) == {'error': 'invalid request or store data'}
+
+    status, _, body = _put_note(dashboard, 'bad\x00note', None)
+    assert status == 400
+    assert json.loads(body) == {'error': 'invalid request or store data'}
+    status, _, body = _put_note(dashboard, 'x' * (notes.MAX_NOTE_BYTES + 1), None)
+    assert status == 413
+    assert json.loads(body) == {'error': 'note too large'}
+    assert not (httpd.root / 'runs' / 'run-1' / 'notes.md').exists()
+
+
+def test_notes_unknown_run_and_put_elsewhere(dashboard):
+    status, _, body = dashboard[0]('/api/runs/missing-run/notes')
+    assert status == 404
+    assert json.loads(body) == {'error': 'not found'}
+    status, _, body = _put_note(dashboard, 'x', None, path='/api/runs/missing-run/notes')
+    assert status == 404
+    assert json.loads(body) == {'error': 'not found'}
+    assert not (dashboard[1].root / 'runs' / 'missing-run').exists()
+
+    target = dashboard[1].root / 'runs' / 'file-run'
+    target.write_bytes(b'not-a-directory')
+    status, _, body = dashboard[0]('/api/runs/file-run/notes')
+    assert status == 404
+    assert json.loads(body) == {'error': 'not found'}
+    status, _, body = _put_note(dashboard, 'x', None, path='/api/runs/file-run/notes')
+    assert status == 404
+    assert json.loads(body) == {'error': 'not found'}
+    assert target.read_bytes() == b'not-a-directory'
+
+    for path in (
+        '/api/runs', '/api/notes', '/api/runs/run-1', '/api/runs/run-1/scalars',
+        '/api/runs/run-1/notes/extra', '/api/runs/run-1/notes/', '/api/runs/.hidden/notes',
+        '/static/app.js',
+    ):
+        status, headers, body = _put_note(dashboard, 'x', None, path=path)
+        assert status == 405, path
+        assert headers['Allow'] == 'GET'
+        assert json.loads(body) == {'error': 'method not allowed'}
+
+
+def test_api_notes_list_and_project_filter(dashboard):
+    request, httpd, _, _ = dashboard
+    empty = load(dashboard, '/api/notes')
+    assert empty == {'notes': [], 'truncated': False, 'writable': True}
+    notes.write_note(httpd.root, 'run-1', 'alpha note', None)
+    _add_run(httpd.root, 'run-2', 'other', 'Second')
+    notes.write_note(httpd.root, 'run-2', 'beta note', None)
+    os.utime(httpd.root / 'runs' / 'run-1' / 'notes.md', (1000, 1000))
+    os.utime(httpd.root / 'runs' / 'run-2' / 'notes.md', (2000, 2000))
+
+    status, _, body = request('/api/notes')
+    assert status == 200
+    payload = json.loads(body)
+    assert payload['writable'] is True
+    assert payload['truncated'] is False
+    assert [row['run_id'] for row in payload['notes']] == ['run-2', 'run-1']
+    assert payload['notes'][0]['name'] == 'Second'
+    assert payload['notes'][0]['project'] == 'other'
+    assert payload['notes'][0]['text'] == 'beta note'
+    assert payload['notes'][0]['status'] == 'finished'
+    assert payload['notes'][1]['name'] == '<script>run</script>'
+    assert payload['notes'][1]['project'] == 'demo'
+    assert payload['notes'][1]['text'] == 'alpha note'
+    assert payload['notes'][1]['status'] == 'crashed'
+
+    demo = json.loads(request('/api/notes?project=demo')[2])
+    assert [row['run_id'] for row in demo['notes']] == ['run-1']
+    other = json.loads(request('/api/notes?project=other')[2])
+    assert [row['run_id'] for row in other['notes']] == ['run-2']
+    assert json.loads(request('/api/notes?project=missing')[2])['notes'] == []
+    status, _, body = request('/api/notes?project=%00')
+    assert status == 400
+    assert json.loads(body) == {'error': 'invalid request or store data'}
+
+
+def test_read_only_server_rejects_note_writes(tmp_path):
+    write_store(tmp_path)
+    notes.write_note(tmp_path, 'run-1', 'keep', None)
+    httpd, thread = _serve(tmp_path, read_only=True)
+    try:
+        assert httpd.read_only is True
+        status, _, body = _get(httpd, '/api/runs/run-1/notes')
+        assert status == 200
+        payload = json.loads(body)
+        assert payload['text'] == 'keep'
+        assert payload['writable'] is False
+        listed = json.loads(_get(httpd, '/api/notes')[2])
+        assert listed['writable'] is False
+        assert [row['text'] for row in listed['notes']] == ['keep']
+        raw = json.dumps({'text': 'changed', 'revision': payload['revision']}).encode()
+        status, _, body = _exchange(httpd, 'PUT', '/api/runs/run-1/notes', raw, {
+            'Content-Type': 'application/json',
+        })
+        assert status == 403
+        assert json.loads(body) == {'error': 'read-only'}
+        status, _, body = _exchange(
+            httpd, 'PUT', '/api/runs/run-1/notes', raw, _note_headers(httpd),
+        )
+        assert status == 403
+        assert json.loads(body) == {'error': 'read-only'}
+        assert (httpd.root / 'runs' / 'run-1' / 'notes.md').read_text(encoding='utf-8') == 'keep'
+    finally:
+        _stop(httpd, thread)
+
+
+def _raw_exchange(address, payload, timeout=5, shutdown_write=False):
+    with socket.create_connection(address, timeout=timeout) as sock:
+        sock.sendall(payload)
+        if shutdown_write:
+            sock.shutdown(socket.SHUT_WR)
+        sock.settimeout(timeout)
+        received = b''
+        while True:
+            try:
+                piece = sock.recv(65536)
+            except socket.timeout:
+                pytest.fail(f'handler hung after {timeout}s')
+            if not piece:
+                break
+            received += piece
+    head, _, received_body = received.partition(b'\r\n\r\n')
+    status = int(head.split(b'\r\n', 1)[0].split()[1])
+    return status, head, received_body
+
+
+def _raw_put(httpd, header_lines, body, **kwargs):
+    blob = (''.join(f'{line}\r\n' for line in header_lines) + '\r\n').encode('latin-1') + body
+    return _raw_exchange(httpd.server_address[:2], blob, **kwargs)
+
+
+def test_put_forbidden_host_writes_nothing(dashboard):
+    _, httpd, _, _ = dashboard
+    status, _, body = _put_note(dashboard, 'pwned', None, headers={'Host': 'evil.example'})
+    assert status == 403
+    assert json.loads(body) == {'error': 'forbidden host'}
+    assert not (httpd.root / 'runs' / 'run-1' / 'notes.md').exists()
+
+
+def test_put_notes_rejects_duplicate_headers(dashboard):
+    _, httpd, _, _ = dashboard
+    port = httpd.server_address[1]
+    body = json.dumps({'text': 'nope', 'revision': None}).encode()
+    host = f'Host: 127.0.0.1:{port}'
+    origin = f'Origin: http://127.0.0.1:{port}'
+    length = f'Content-Length: {len(body)}'
+    common = [
+        'PUT /api/runs/run-1/notes HTTP/1.1',
+        host,
+        'Content-Type: application/json',
+        'Connection: close',
+    ]
+
+    def refused(extra_lines, status_code, error):
+        lines = common[:3] + extra_lines + common[3:]
+        status, _, received = _raw_put(httpd, lines, body)
+        assert status == status_code
+        assert json.loads(received) == {'error': error}
+        assert not (httpd.root / 'runs' / 'run-1' / 'notes.md').exists()
+
+    refused(
+        ['X-AgenticML-Request: 1', 'X-AgenticML-Request: 1', origin, length],
+        403, 'cross-site request refused',
+    )
+    refused(
+        ['X-AgenticML-Request: 1', origin, origin, length],
+        403, 'cross-site request refused',
+    )
+    refused(
+        ['X-AgenticML-Request: 1', origin, length, length],
+        411, 'length required',
+    )
+
+
+def test_options_notes_sends_no_cors_headers(dashboard):
+    status, headers, body = dashboard[0]('/api/runs/run-1/notes', 'OPTIONS')
+    assert status == 405
+    assert headers['Allow'] == 'GET, PUT'
+    assert json.loads(body) == {'error': 'method not allowed'}
+    assert not any(name.lower().startswith('access-control-') for name in headers)
+
+
+def test_put_notes_short_body_does_not_hang_or_write(dashboard):
+    _, httpd, _, _ = dashboard
+    port = httpd.server_address[1]
+    raw = json.dumps({'text': 'should-not-stick', 'revision': None}).encode()
+    lines = [
+        'PUT /api/runs/run-1/notes HTTP/1.1',
+        f'Host: 127.0.0.1:{port}',
+        'Content-Type: application/json',
+        f'Content-Length: {len(raw) + 64}',
+        'X-AgenticML-Request: 1',
+        'Connection: close',
+    ]
+    started = time.monotonic()
+    status, _, received = _raw_put(httpd, lines, raw, timeout=3, shutdown_write=True)
+    assert time.monotonic() - started < 3
+    assert status == 400
+    assert json.loads(received) == {'error': 'invalid request or store data'}
+    assert not (httpd.root / 'runs' / 'run-1' / 'notes.md').exists()
+
+
+def test_put_notes_body_timeout_returns_408(dashboard, monkeypatch):
+    _, httpd, _, _ = dashboard
+    monkeypatch.setattr(server, '_CONNECTION_TIMEOUT', 0.5)
+    port = httpd.server_address[1]
+    raw = b'{"text":"should-not-stick","revision":null}'
+    lines = [
+        'PUT /api/runs/run-1/notes HTTP/1.1',
+        f'Host: 127.0.0.1:{port}',
+        'Content-Type: application/json',
+        f'Content-Length: {len(raw) + 32}',
+        'X-AgenticML-Request: 1',
+        'Connection: close',
+    ]
+    status, _, received = _raw_put(httpd, lines, raw, timeout=3)
+    assert status == 408
+    assert json.loads(received) == {'error': 'request timeout'}
+    assert not (httpd.root / 'runs' / 'run-1' / 'notes.md').exists()
+
+
+def test_put_notes_rejects_null_origin(dashboard):
+    request, httpd, _, _ = dashboard
+    headers = _note_headers(httpd)
+    headers['Origin'] = 'null'
+    raw = json.dumps({'text': 'nope', 'revision': None}).encode()
+    status, _, body = request('/api/runs/run-1/notes', 'PUT', headers, raw)
+    assert status == 403
+    assert json.loads(body) == {'error': 'cross-site request refused'}
+    assert not (httpd.root / 'runs' / 'run-1' / 'notes.md').exists()
+
+
+def test_fifo_note_get_is_empty_and_put_is_rejected(dashboard):
+    if not hasattr(os, 'mkfifo'):
+        pytest.skip('fifo unavailable')
+    _, httpd, _, _ = dashboard
+    path = httpd.root / 'runs' / 'run-1' / 'notes.md'
+    os.mkfifo(path)
+    port = httpd.server_address[1]
+    started = time.monotonic()
+    status, _, received = _raw_exchange(httpd.server_address[:2], (
+        f'GET /api/runs/run-1/notes HTTP/1.1\r\n'
+        f'Host: 127.0.0.1:{port}\r\n'
+        f'Connection: close\r\n'
+        f'\r\n'
+    ).encode(), timeout=2)
+    assert time.monotonic() - started < 2
+    assert status == 200
+    assert json.loads(received) == {
+        'text': '', 'updated_at': None, 'revision': None, 'writable': True,
+    }
+    raw = json.dumps({'text': 'nope', 'revision': None}).encode()
+    lines = [
+        'PUT /api/runs/run-1/notes HTTP/1.1',
+        f'Host: 127.0.0.1:{port}',
+        'Content-Type: application/json',
+        f'Content-Length: {len(raw)}',
+        'X-AgenticML-Request: 1',
+        'Connection: close',
+    ]
+    started = time.monotonic()
+    status, _, received = _raw_put(httpd, lines, raw, timeout=2)
+    assert time.monotonic() - started < 2
+    assert status == 400
+    assert json.loads(received) == {'error': 'invalid request or store data'}
+    assert path.is_fifo()
+
+
+def test_put_notes_trickled_body_hits_absolute_deadline(dashboard, monkeypatch):
+    monkeypatch.setattr(server, '_NOTE_PUT_DEADLINE', 0.35)
+    _, httpd, _, _ = dashboard
+    port = httpd.server_address[1]
+    body = b'{"text":"should-not-stick","revision":null}'
+    head = (
+        f'PUT /api/runs/run-1/notes HTTP/1.1\r\n'
+        f'Host: 127.0.0.1:{port}\r\n'
+        f'Content-Type: application/json\r\n'
+        f'Content-Length: {len(body)}\r\n'
+        f'X-AgenticML-Request: 1\r\n'
+        f'Connection: close\r\n'
+        f'\r\n'
+    ).encode()
+    started = time.monotonic()
+    with socket.create_connection(httpd.server_address[:2], timeout=3) as sock:
+        sock.settimeout(3)
+        try:
+            sock.sendall(head)
+            for byte in body:
+                time.sleep(0.03)
+                sock.sendall(bytes([byte]))
+        except OSError:
+            pass
+        received = b''
+        while True:
+            try:
+                piece = sock.recv(65536)
+            except socket.timeout:
+                pytest.fail('handler hung past the note body deadline')
+            if not piece:
+                break
+            received += piece
+    assert time.monotonic() - started < 2.5
+    status = int(received.split(b'\r\n', 1)[0].split()[1])
+    _, _, received_body = received.partition(b'\r\n\r\n')
+    assert status == 408
+    assert json.loads(received_body) == {'error': 'request timeout'}
+    assert not (httpd.root / 'runs' / 'run-1' / 'notes.md').exists()
+
+
+def test_oversized_note_get_is_truncated_and_put_uses_prefix_revision(dashboard):
+    _, httpd, _, _ = dashboard
+    path = httpd.root / 'runs' / 'run-1' / 'notes.md'
+    path.write_bytes(b'A' * (notes.MAX_NOTE_BYTES + 10))
+    payload = load(dashboard, '/api/runs/run-1/notes')
+    assert payload['too_large'] is True
+    assert payload['writable'] is True
+    assert len(payload['text'].encode()) == notes.MAX_NOTE_BYTES
+    assert payload['text'] == 'A' * notes.MAX_NOTE_BYTES
+    prefix = b'A' * notes.MAX_NOTE_BYTES
+    bare = hashlib.sha256(prefix).hexdigest()
+    assert payload['revision'] == hashlib.sha256(prefix + b'\0too_large').hexdigest()
+    assert payload['revision'] != bare
+    status, _, body = _put_note(dashboard, 'nope', None)
+    assert status == 409
+    conflict = json.loads(body)
+    assert conflict['error'] == 'conflict'
+    assert conflict['note']['too_large'] is True
+    assert conflict['note']['revision'] == payload['revision']
+    assert path.stat().st_size == notes.MAX_NOTE_BYTES + 10
+    status, _, body = _put_note(dashboard, 'trimmed', bare)
+    assert status == 409
+    assert json.loads(body)['note']['revision'] == payload['revision']
+    assert path.stat().st_size == notes.MAX_NOTE_BYTES + 10
+    status, _, body = _put_note(dashboard, 'trimmed', payload['revision'])
+    assert status == 200
+    assert json.loads(body)['text'] == 'trimmed'
+    assert path.read_text(encoding='utf-8') == 'trimmed'
