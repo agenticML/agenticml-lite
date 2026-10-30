@@ -134,6 +134,7 @@ export function createCodeDiff({
           })),
         );
       picker.select.value = value;
+      picker.select.title = currentRuns.find((run) => run.run_id === value)?.name || value;
       picker.select.disabled = !currentRuns.length;
       picker.select.style.borderInlineStartColor = colors[value] || "";
     }

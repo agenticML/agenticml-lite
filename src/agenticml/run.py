@@ -23,7 +23,9 @@ from .code_tracking import (
     RuntimeFileCollector,
     compute_snapshot_hash,
     default_project,
+    default_run_name,
     find_repo_root,
+    main_file,
 )
 from .env import capture_environment
 from .lineage import get_git_metadata, snapshot as snapshot_lineage
@@ -307,6 +309,8 @@ class Run(metaclass=_RunType):
             parent_run_id = None
         if not project:
             project = default_project()
+        if name is None:
+            name = default_run_name(main_file())
         self.project = project
         self.name = name
         self.flush_interval = flush_interval

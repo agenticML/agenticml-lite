@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import _globals
-from .code_tracking import default_project
+from .code_tracking import default_project, default_run_name
 from .integrations.hyperparams import install_hyperparam_capture, uninstall_hyperparam_capture
 
 logger = logging.getLogger("agenticml.launch")
@@ -151,7 +151,7 @@ def _resolve(target: Target) -> _Resolved:
             filename=str(path),
             argv0=str(path),
             path0=str(path.parent),
-            default_name=path.stem,
+            default_name=default_run_name(path) or path.name,
             spec=None,
         )
     if target.kind == "module":
@@ -181,7 +181,7 @@ def _resolve(target: Target) -> _Resolved:
             filename=origin,
             argv0=origin,
             path0=cwd,
-            default_name=target.value,
+            default_name=default_run_name(spec.origin) or target.value,
             spec=spec,
         )
     raise LaunchError(f"unknown target kind {target.kind!r}")
