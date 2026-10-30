@@ -201,9 +201,12 @@ later; the record is a reference. `copy=true` snapshots the bytes into
 ## `notes.md`
 
 Optional UTF-8 Markdown text with `\n` line endings, capped at 256 KiB.
-One note per run, stored at `<root>/runs/<run_id>/notes.md`. Clearing the
-note deletes the file. Notes stay local: `agenticml sync` does not upload
-them, and `agenticml gc` deletes them together with the run.
+One note per run, stored at `<root>/runs/<run_id>/notes.md`. A missing
+`notes.md` falls back to the `notes` string in `meta.json` in the dashboard.
+An empty `notes.md` means the note was cleared, so that launch note stays
+hidden. Clearing the note deletes the file when the run has no launch note.
+Notes stay local: `agenticml sync` does not upload them, and `agenticml gc`
+deletes them together with the run.
 
 The dashboard is read-only except for notes. Writes use
 `PUT /api/runs/<run_id>/notes`, which requires a same-origin request and the

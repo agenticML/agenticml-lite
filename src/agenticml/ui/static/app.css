@@ -1682,6 +1682,14 @@ pre,
   font-size: 17px;
   margin: 0;
 }
+.note-card > .note-launch {
+  margin: 0;
+  padding: 12px 20px 0;
+}
+.note-launch {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 .note-save {
   font-size: 12px;
   overflow-wrap: anywhere;
@@ -1966,6 +1974,10 @@ pre,
 @media (max-width: 480px) {
   .note-header {
     padding: 12px 16px;
+  }
+  .note-card > .note-launch {
+    padding-left: 16px;
+    padding-right: 16px;
   }
   .note-controls {
     width: 100%;

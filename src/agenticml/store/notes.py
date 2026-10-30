@@ -2,9 +2,14 @@
 
 Notes stay on this machine: sync does not read the run directory, and
 removing a run removes the note with it. Writes compare-and-swap on the
-SHA-256 of the stored bytes.
+SHA-256 of the stored bytes. When ``notes.md`` is missing, a non-empty
+``notes`` string in ``meta.json`` is that run's launch note. An empty
+``notes.md`` stays empty, so clearing the notepad does not bring the launch
+note back. Every note dict includes ``source``: ``file``, ``launch``, or
+``none``.
 
-A FIFO or other special ``notes.md`` is not a note. Opening it goes through
+A FIFO or other special ``notes.md`` is not a note, and it does not fall
+back to the launch note. Opening it goes through
 ``O_NONBLOCK`` (where the flag exists) and then ``fstat`` on that descriptor,
 so a planted FIFO cannot block ``open`` — including while the process lock
 is held. Reads keep at most ``MAX_NOTE_BYTES + 1`` bytes. On POSIX, after
@@ -22,6 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import errno
 import hashlib
+import json
 import logging
 import os
 import stat
@@ -36,6 +42,9 @@ MAX_NOTE_BYTES = 256 * 1024
 # One extra byte distinguishes "exactly at the cap" from "larger than the cap"
 # without reading the rest of a sparse or multi-gigabyte file.
 _PROBE_BYTES = MAX_NOTE_BYTES + 1
+# meta.json holds config and env as well as the launch note. Past this cap
+# it is not parsed, and the run has no launch note.
+_META_CAP = 16 * 1024 * 1024
 # Mixed into an oversized revision so it cannot match SHA-256(prefix) for a
 # note whose stored bytes are exactly that prefix. NUL cannot occur in a
 # note written through write_note.
@@ -44,6 +53,11 @@ _TOO_LARGE_MARK = b"\0too_large"
 # One lock for every run. The check and the replace must not interleave.
 # Serializes within one process only (two dashboard processes on one store can lose an update).
 _LOCK = threading.Lock()
+
+# ``_note_stat`` returns this when ``notes.md`` exists but is not a regular
+# file. ``None`` means the file is absent, which is the only stat result that
+# may become a launch row.
+_NOTE_SPECIAL = object()
 
 # Linux reports ENOTDIR (not ELOOP) for O_DIRECTORY|O_NOFOLLOW on a symlink.
 # A regular file at the same path fails with ENOTDIR too, so the errno alone
@@ -70,7 +84,7 @@ class _SpecialNote(Exception):
 
 
 def _empty() -> dict:
-    return {"text": "", "updated_at": None, "revision": None}
+    return {"text": "", "updated_at": None, "revision": None, "source": "none"}
 
 
 def _text(value):
@@ -184,23 +198,29 @@ def _entry_is_special(directory: Path, dir_fd, name: str) -> bool:
     return stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)
 
 
-def _open_note(directory: Path, dir_fd) -> int:
-    """Open ``notes.md`` without blocking on a FIFO and without following a symlink.
+def _open_entry(directory: Path, dir_fd, name: str) -> int:
+    """Open ``name`` without blocking on a FIFO and without following a symlink.
 
     ``lstat`` then ``open`` still races: the inode can become a FIFO in
     between, and ``open`` waits forever. ``O_NONBLOCK`` makes that ``open``
     return so ``fstat`` can reject the descriptor we actually hold.
+    ``notes.md`` and ``meta.json`` both use this open.
     """
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     if hasattr(os, "O_NONBLOCK"):
         flags |= os.O_NONBLOCK
-    elif _entry_is_special(directory, dir_fd, NOTE_NAME):
+    elif _entry_is_special(directory, dir_fd, name):
         raise _SpecialNote()
     if dir_fd is not None:
-        return os.open(NOTE_NAME, flags, dir_fd=dir_fd)
-    return os.open(directory / NOTE_NAME, flags)
+        return os.open(name, flags, dir_fd=dir_fd)
+    return os.open(directory / name, flags)
+
+
+def _open_note(directory: Path, dir_fd) -> int:
+    """Open ``notes.md`` through :func:`_open_entry`."""
+    return _open_entry(directory, dir_fd, NOTE_NAME)
 
 
 def _read_bounded(fd: int, limit: int) -> bytes:
@@ -213,6 +233,123 @@ def _read_bounded(fd: int, limit: int) -> bytes:
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
+
+
+def _regular_stat(fd: int):
+    """``fstat`` of a regular file, ready for a blocking read.
+
+    ``O_NONBLOCK`` was only there so ``open`` could not wait on a FIFO.
+    A regular file is switched back to blocking before its bytes are read.
+    """
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise _SpecialNote()
+    if hasattr(os, "set_blocking"):
+        try:
+            os.set_blocking(fd, True)
+        except OSError:
+            pass
+    return info
+
+
+def _normalize_newlines(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _clip_utf8(text: str, limit: int) -> str:
+    """``text`` cut to at most ``limit`` UTF-8 bytes on a character boundary."""
+    raw = text.encode("utf-8")
+    if len(raw) <= limit:
+        return text
+    clipped = raw[:limit]
+    while clipped:
+        try:
+            return clipped.decode("utf-8")
+        except UnicodeDecodeError:
+            clipped = clipped[:-1]
+    return ""
+
+
+def _launch_text(value):
+    """Normalized launch note, or None when ``value`` is not usable text.
+
+    A lone surrogate is not UTF-8. JSON round-trips ``\\udcff``, and
+    ``--notes`` read with ``surrogateescape`` can store one. ``None`` keeps
+    that run out of the notebook instead of failing ``list_notes`` for every
+    run.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        text = _clip_utf8(_normalize_newlines(value), MAX_NOTE_BYTES)
+    except UnicodeEncodeError:
+        return None
+    if not text.strip():
+        return None
+    return text
+
+
+def _read_meta_bytes(directory: Path, dir_fd):
+    """``meta.json`` bytes, or None when it cannot supply a launch note.
+
+    A missing ``meta.json`` is a missing run (``FileNotFoundError``).
+    :func:`_require_run` is what turns that into a 404. A symlink, FIFO, or
+    other non-regular file is not followed. Any other error opening the file,
+    including permission denied, is not a launch note. A file larger than
+    ``_META_CAP`` is not parsed.
+    """
+    try:
+        fd = _open_entry(directory, dir_fd, layout.META_NAME)
+    except _SpecialNote:
+        return None
+    except FileNotFoundError:
+        raise FileNotFoundError(directory.name) from None
+    except OSError:
+        return None
+    try:
+        try:
+            info = _regular_stat(fd)
+        except _SpecialNote:
+            return None
+        # st_size rejects a sparse file before its hole is read.
+        if info.st_size > _META_CAP:
+            return None
+        raw = _read_bounded(fd, _META_CAP + 1)
+    finally:
+        os.close(fd)
+    if len(raw) > _META_CAP:
+        return None
+    return raw
+
+
+def _launch_note(directory: Path, dir_fd):
+    """Launch note dict, or None when this run has no usable launch note."""
+    raw = _read_meta_bytes(directory, dir_fd)
+    if raw is None:
+        return None
+    try:
+        meta = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+    text = _launch_text(meta.get("notes"))
+    if text is None:
+        return None
+    return {
+        "text": text,
+        "updated_at": None,
+        "revision": None,
+        "source": "launch",
+    }
+
+
+def _created_sort_time(value) -> float:
+    """POSIX time for ``created_at``, or the oldest key when it will not parse."""
+    try:
+        return layout.parse_timestamp(value).timestamp()
+    except (TypeError, ValueError):
+        return float("-inf")
 
 
 def _revision(data: bytes, too_large: bool) -> str:
@@ -228,14 +365,7 @@ def _revision(data: bytes, too_large: bool) -> str:
 
 
 def _note_from_fd(fd: int) -> dict:
-    info = os.fstat(fd)
-    if not stat.S_ISREG(info.st_mode):
-        raise _SpecialNote()
-    if hasattr(os, "set_blocking"):
-        try:
-            os.set_blocking(fd, True)
-        except OSError:
-            pass
+    info = _regular_stat(fd)
     raw = _read_bounded(fd, _PROBE_BYTES)
     # st_size catches a sparse file whose logical size is past the cap.
     # The probe byte catches a file that grew after that fstat.
@@ -246,6 +376,7 @@ def _note_from_fd(fd: int) -> dict:
         "text": data.decode("utf-8", errors="replace"),
         "updated_at": layout.format_timestamp(when),
         "revision": _revision(data, too_large),
+        "source": "file",
     }
     if too_large:
         note["too_large"] = True
@@ -343,54 +474,76 @@ def _publish(directory: Path, dir_fd, data: bytes) -> None:
 
 
 def _note_stat(directory: Path, dir_fd=None):
-    """``(mtime, size)`` when ``notes.md`` is a regular file, else None.
+    """``(mtime, size)`` for a regular ``notes.md``.
 
-    A missing file, symlink, or other non-regular file is not a note.
-    ``lstat`` does not open the inode, so a FIFO does not block the list.
-    Other ``OSError``s propagate so the caller can skip that run.
+    ``None`` means the file is missing. ``_NOTE_SPECIAL`` means a
+    symlink, FIFO, directory, or other non-regular file: not a note, and not
+    a launch row. ``lstat`` does not open the inode, so a FIFO does not block
+    the list. Other ``OSError``s propagate so the caller can skip that run.
     """
     try:
         info = _stat_entry(directory, dir_fd, NOTE_NAME)
     except FileNotFoundError:
         return None
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-        return None
+        return _NOTE_SPECIAL
     return info.st_mtime, info.st_size
 
 
 def read_note(root, run_id: str) -> dict:
     """The run's note.
 
-    A missing ``notes.md`` is ``{"text": "", "updated_at": None, "revision": None}``.
-    A symlink, FIFO, directory, or other non-regular ``notes.md`` is treated
-    the same way and is not followed. ``meta.json`` must be a regular file;
-    otherwise ``FileNotFoundError``. A bad ``run_id`` raises ``ValueError``.
+    A regular ``notes.md``, including an empty or whitespace-only file, is
+    ``source`` ``file``. A missing ``notes.md`` whose ``meta.json`` ``notes``
+    string has non-whitespace UTF-8 text is ``source`` ``launch``: line endings are
+    normalized to ``\\n``, the text is cut to ``MAX_NOTE_BYTES`` of UTF-8 on
+    a character boundary, and ``revision`` and ``updated_at`` are None.
+    Otherwise the result is empty with ``source`` ``none``. A symlink, FIFO,
+    directory, or other non-regular ``notes.md`` is not followed and is not a
+    launch note. ``meta.json`` must be a regular file; otherwise
+    ``FileNotFoundError``. A bad ``run_id`` raises ``ValueError``. The launch
+    note is read through the same pinned directory and non-blocking
+    regular-file open as ``notes.md``. A ``meta.json`` over ``_META_CAP``, one
+    that is not JSON, one whose ``notes`` text is not UTF-8, or one that
+    cannot be opened (for example permission denied) is not a launch note.
 
-    At most ``MAX_NOTE_BYTES + 1`` bytes are read. When the file is larger
-    than ``MAX_NOTE_BYTES`` (by ``st_size`` or by that probe), the result
-    adds ``too_large: True``. ``text`` is the first ``MAX_NOTE_BYTES`` of the
-    bytes read, decoded with ``errors="replace"``. ``revision`` is the
-    SHA-256 of the stored bytes when the note fits. When it does not,
-    ``revision`` is the SHA-256 of the retained prefix plus
+    At most ``MAX_NOTE_BYTES + 1`` bytes of ``notes.md`` are read. When the
+    file is larger than ``MAX_NOTE_BYTES`` (by ``st_size`` or by that probe),
+    the result adds ``too_large: True``. ``text`` is the first
+    ``MAX_NOTE_BYTES`` of the bytes read, decoded with ``errors="replace"``.
+    ``revision`` is the SHA-256 of the stored bytes when the note fits. When
+    it does not, ``revision`` is the SHA-256 of the retained prefix plus
     ``b"\\0too_large"``, so it cannot match a note whose bytes are exactly
     that prefix. The probe byte and the unread tail are not hashed. A note
-    that fits omits ``too_large``. ``updated_at`` is the file mtime.
+    that fits omits ``too_large``. ``too_large`` applies only to file notes.
+    ``updated_at`` is the file mtime.
     """
     directory = layout.run_dir(root, run_id)
     with _pinned_run(directory) as dir_fd:
         _require_run(directory, dir_fd)
-        return _load(directory, dir_fd)
+        kind, note = _read_stored(directory, dir_fd)
+        if kind == "ok":
+            return note
+        if kind == "missing":
+            launch = _launch_note(directory, dir_fd)
+            if launch is not None:
+                return launch
+        return note
 
 
 def write_note(root, run_id: str, text, base_revision) -> dict:
     """Replace the note when ``base_revision`` is still current.
 
-    ``None`` means the note must be absent. Line endings are normalized to
-    ``\\n``. NUL is rejected. Empty or whitespace-only text deletes the file.
-    ``NoteConflict`` carries the note currently on disk. ``NoteTooLarge`` is a
-    ``ValueError``. A symlink, FIFO, or other non-regular ``notes.md`` raises
-    ``ValueError`` and is left in place. That check happens after the
-    revision compare, so a stale ``base_revision`` is still ``NoteConflict``.
+    ``None`` means the note must be absent (a launch note's revision is
+    None, so the first save creates ``notes.md``). Line endings are
+    normalized to ``\\n``. NUL is rejected. Empty or whitespace-only text
+    deletes the file, unless the run has a launch note: then an empty
+    ``notes.md`` is written so the launch note does not come back.
+    ``NoteConflict`` carries the note currently visible, including ``source``.
+    ``NoteTooLarge`` is a ``ValueError``. A symlink, FIFO, or other
+    non-regular ``notes.md`` raises ``ValueError`` and is left in place. That
+    check happens after the revision compare, so a stale ``base_revision``
+    is still ``NoteConflict``.
 
     An oversized file uses the revision described on :func:`read_note`.
     ``write_note`` leaves it unchanged unless ``base_revision`` equals that
@@ -399,7 +552,7 @@ def write_note(root, run_id: str, text, base_revision) -> dict:
     """
     if not isinstance(text, str):
         raise ValueError("note text must be a string")
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = _normalize_newlines(text)
     if "\x00" in text:
         raise ValueError("note text contains NUL")
     data = text.encode("utf-8")
@@ -411,12 +564,23 @@ def write_note(root, run_id: str, text, base_revision) -> dict:
             _require_run(directory, dir_fd)
             _ensure_attached(directory, dir_fd)
             kind, current = _read_stored(directory, dir_fd)
+            if kind == "missing":
+                launch = _launch_note(directory, dir_fd)
+                if launch is not None:
+                    current = launch
             if base_revision != current["revision"]:
                 raise NoteConflict(current)
             if kind == "special":
                 raise ValueError("refusing to replace a non-regular notes.md")
             _ensure_attached(directory, dir_fd)
             if not text.strip():
+                if kind == "missing":
+                    has_launch = current.get("source") == "launch"
+                else:
+                    has_launch = _launch_note(directory, dir_fd) is not None
+                if has_launch:
+                    _publish(directory, dir_fd, b"")
+                    return _load(directory, dir_fd)
                 _unlink_note(directory, dir_fd)
                 return _empty()
             _publish(directory, dir_fd, data)
@@ -424,16 +588,25 @@ def write_note(root, run_id: str, text, base_revision) -> dict:
 
 
 def list_notes(root, project=None, limit_bytes=4 * 1024 * 1024) -> dict:
-    """Non-empty notes, newest ``notes.md`` mtime first.
+    """Non-empty notes, newest first.
 
-    ``project`` keeps rows whose project string matches exactly. Each
-    candidate is stat'd before its body is read. Whitespace-only text is
-    skipped. A file larger than ``MAX_NOTE_BYTES`` is omitted without
-    being read (``truncated``). A file that grows past the cap between
-    that stat and the read is still bounded to ``MAX_NOTE_BYTES + 1``
-    bytes, omitted, and counted as ``truncated``. Once the next file
-    would pass ``limit_bytes``, the scan stops and older bodies are not
-    read. One unreadable run is skipped. Rows do not include ``too_large``.
+    File rows sort by ``notes.md`` mtime. A missing ``notes.md`` whose
+    ``meta["notes"]`` (already loaded by :func:`reader.list_runs`) is
+    non-whitespace UTF-8 is a launch row, sorted by ``created_at``. Text that
+    cannot be encoded as UTF-8 is skipped, and that run does not drop the
+    rest of the list. A symlink, FIFO, directory, or other non-regular
+    ``notes.md`` is not a launch row. An unparseable ``created_at`` is the
+    oldest. ``project`` keeps rows whose project string matches exactly. Each
+    file is stat'd before its body is read. Whitespace-only files are skipped,
+    including a cleared note that left an empty ``notes.md``.
+    A file larger than ``MAX_NOTE_BYTES`` is omitted without being read
+    (``truncated``). A file that grows past the cap between that stat and the
+    read is still bounded to ``MAX_NOTE_BYTES + 1`` bytes, omitted, and
+    counted as ``truncated``. Launch text is normalized and capped the same
+    way as :func:`read_note`, and those bytes count toward ``limit_bytes``.
+    ``too_large`` applies only to file notes and is not a row field. Once the
+    next note would pass ``limit_bytes``, the scan stops and older bodies are
+    not read. One unreadable run is skipped.
     """
     candidates = []
     for meta in reader.list_runs(root):
@@ -452,39 +625,59 @@ def list_notes(root, project=None, limit_bytes=4 * 1024 * 1024) -> dict:
         except (OSError, ValueError) as exc:
             logger.warning("skipping unreadable note for run %s: %s", run_id, exc)
             continue
+        if found is _NOTE_SPECIAL:
+            continue
         if found is None:
+            # list_runs already parsed meta.json. Do not open it again.
+            # Only a truly missing file can fall back to the launch note.
+            launch_text = _launch_text(meta.get("notes"))
+            if launch_text is None:
+                continue
+            when = _created_sort_time(meta.get("created_at"))
+            size = len(launch_text.encode("utf-8"))
+            candidates.append((when, size, None, meta, row_project, launch_text))
             continue
         mtime, size = found
-        candidates.append((mtime, size, directory, meta, row_project))
-    # st_mtime, not the formatted timestamp: the body is read only after this order is known.
+        candidates.append((mtime, size, directory, meta, row_project, None))
+    # The sort key is a POSIX timestamp. The body is read only after this order is known.
     candidates.sort(key=lambda item: item[0], reverse=True)
     kept = []
     used = 0
     truncated = False
-    for _mtime, size, directory, meta, row_project in candidates:
-        if size == 0:
+    for _when, size, directory, meta, row_project, launch_text in candidates:
+        if launch_text is None and size == 0:
             continue
-        # A file that does not fit ends the scan so older bodies stay unread.
-        # Over the per-note cap but still inside the budget: omit it and keep going.
+        # A note that does not fit ends the scan so older bodies stay unread.
+        # Over the per-note cap but still inside the budget: omit the file and keep going.
         if used + size > limit_bytes:
             truncated = True
             break
-        if size > MAX_NOTE_BYTES:
+        if launch_text is None and size > MAX_NOTE_BYTES:
             truncated = True
             continue
         run_id = meta.get("run_id")
-        try:
-            with _pinned_run(directory) as dir_fd:
-                note = _load(directory, dir_fd)
-        except (OSError, ValueError) as exc:
-            logger.warning("skipping unreadable note for run %s: %s", run_id, exc)
-            continue
-        if note.get("too_large"):
-            truncated = True
-            continue
-        if not note["text"].strip():
-            continue
-        text_size = len(note["text"].encode("utf-8"))
+        if launch_text is None:
+            try:
+                with _pinned_run(directory) as dir_fd:
+                    note = _load(directory, dir_fd)
+            except (OSError, ValueError) as exc:
+                logger.warning("skipping unreadable note for run %s: %s", run_id, exc)
+                continue
+            if note.get("too_large"):
+                truncated = True
+                continue
+            if not note["text"].strip():
+                continue
+            text = note["text"]
+            updated_at = note["updated_at"]
+            revision = note["revision"]
+            source = "file"
+        else:
+            text = launch_text
+            updated_at = None
+            revision = None
+            source = "launch"
+        text_size = len(text.encode("utf-8"))
         if used + text_size > limit_bytes:
             truncated = True
             break
@@ -498,9 +691,10 @@ def list_notes(root, project=None, limit_bytes=4 * 1024 * 1024) -> dict:
             "project": row_project,
             "status": status,
             "created_at": meta.get("created_at"),
-            "text": note["text"],
-            "updated_at": note["updated_at"],
-            "revision": note["revision"],
+            "text": text,
+            "updated_at": updated_at,
+            "revision": revision,
+            "source": source,
         })
         used += text_size
     return {"notes": kept, "truncated": truncated}

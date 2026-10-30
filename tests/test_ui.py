@@ -2251,7 +2251,7 @@ def _add_run(root, run_id, project, name, status='finished', created_at='2026-10
 def test_put_and_get_notes(dashboard):
     request, httpd, _, _ = dashboard
     assert load(dashboard, '/api/runs/run-1/notes') == {
-        'text': '', 'updated_at': None, 'revision': None, 'writable': True,
+        'text': '', 'updated_at': None, 'revision': None, 'source': 'none', 'writable': True,
     }
     status, headers, body = _put_note(dashboard, 'hello\r\n<script>', None)
     assert status == 200
@@ -2287,8 +2287,46 @@ def test_put_and_get_notes(dashboard):
     )
     assert status == 200
     assert json.loads(body) == {
-        'text': '', 'updated_at': None, 'revision': None, 'writable': True,
+        'text': '', 'updated_at': None, 'revision': None, 'source': 'none', 'writable': True,
     }
+    assert not (httpd.root / 'runs' / 'run-1' / 'notes.md').exists()
+
+
+def test_launch_note_get_put_and_list(dashboard):
+    _, httpd, _, _ = dashboard
+    meta_path = httpd.root / 'runs' / 'run-1' / 'meta.json'
+    meta = json.loads(meta_path.read_text())
+    meta['notes'] = 'Launch\r\nidea'
+    meta_path.write_text(json.dumps(meta))
+    payload = load(dashboard, '/api/runs/run-1/notes')
+    assert payload['source'] == 'launch'
+    assert payload['text'] == 'Launch\nidea'
+    assert payload['revision'] is None
+    assert payload['updated_at'] is None
+    assert payload['writable'] is True
+    listed = load(dashboard, '/api/notes')
+    assert listed['truncated'] is False
+    assert [row['run_id'] for row in listed['notes']] == ['run-1']
+    assert listed['notes'][0]['source'] == 'launch'
+    assert listed['notes'][0]['text'] == 'Launch\nidea'
+    assert listed['notes'][0]['revision'] is None
+    status, _, body = _put_note(dashboard, 'Launch\nidea', None)
+    assert status == 200
+    saved = json.loads(body)
+    assert saved['source'] == 'file'
+    assert saved['text'] == 'Launch\nidea'
+    assert saved['writable'] is True
+    assert (httpd.root / 'runs' / 'run-1' / 'notes.md').read_text(encoding='utf-8') == 'Launch\nidea'
+    assert load(dashboard, '/api/runs/run-1/notes')['source'] == 'file'
+    (httpd.root / 'runs' / 'run-1' / 'notes.md').unlink()
+    status, _, body = _put_note(dashboard, 'other', 'not-the-revision')
+    assert status == 409
+    conflict = json.loads(body)
+    assert conflict['error'] == 'conflict'
+    assert conflict['note']['source'] == 'launch'
+    assert conflict['note']['text'] == 'Launch\nidea'
+    assert conflict['note']['revision'] is None
+    assert conflict['note']['writable'] is True
     assert not (httpd.root / 'runs' / 'run-1' / 'notes.md').exists()
 
 
@@ -2688,7 +2726,7 @@ def test_fifo_note_get_is_empty_and_put_is_rejected(dashboard):
     assert time.monotonic() - started < 2
     assert status == 200
     assert json.loads(received) == {
-        'text': '', 'updated_at': None, 'revision': None, 'writable': True,
+        'text': '', 'updated_at': None, 'revision': None, 'source': 'none', 'writable': True,
     }
     raw = json.dumps({'text': 'nope', 'revision': None}).encode()
     lines = [

@@ -106,7 +106,7 @@ agenticml ls --project demo --json
 
 `agenticml ui` binds to `127.0.0.1` and port 6006. On loopback it answers only loopback `Host` headers. `--dir` selects the store (else `AGENTICML_DIR`, else `~/.agenticml`). `ls` prints run id, project, name, status, created time, and last step. A run stays `running` while its lifetime lock is held, even when it logs infrequently. If the lock is free, it is shown as `crashed`; sync finalizes it with `_exit_reason: "process died"`. On filesystems without locking, mtimes older than 120 seconds are the fallback for `stale` status.
 
-Every run page has an autosaving Markdown notepad, and view mode allows ticking checklist items directly. The home page includes a collapsible Notes notebook that shows each run's note grouped under the run name, following the project tab and filter box. The dashboard is read-only except for notes; `--read-only` disables note editing (recommended when exposing a non-loopback `--host`).
+Every run page has an autosaving Markdown notepad, and view mode allows ticking checklist items directly. The home page includes a collapsible Notes notebook that shows each run's note grouped under the run name, following the project tab and filter box. The dashboard is read-only except for notes; `--read-only` disables note editing (recommended when exposing a non-loopback `--host`). A run's launch note (`--notes` / `init(notes=)`) is shown until the notepad is edited.
 
 ## Where data lives
 

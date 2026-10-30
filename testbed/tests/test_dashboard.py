@@ -207,8 +207,10 @@ def test_project_filter_and_search(page, ui_server):
 def test_selection_bar_and_compare_navigation(page, ui_server, width):
     # Keep the notebook, selection bar, and both target rows in view so these
     # geometry assertions measure layout changes rather than automatic scrolling.
+    page.add_init_script("localStorage.setItem('agenticml-notebook-open','false')")
     page.set_viewport_size({"width": width, "height": 1400})
     home(page, ui_server)
+    expect(page.locator(".notebook summary")).not_to_contain_text("loading")
     bar = page.get_by_test_id("selection-bar")
     expect(bar).to_be_visible()
     expect(bar).to_have_text("Select runs to compare", use_inner_text=True)
@@ -394,7 +396,8 @@ def test_theme_cycles_persists_and_repaints_chart(page, ui_server):
 
 def test_back_and_forward_and_route_cancellation(page, ui_server):
     home(page, ui_server)
-    page.get_by_role("link", name="explicit-baseline", exact=True).click()
+    # The notebook lists the same run, so the row link is the one that navigates from the list.
+    row(page, "explicit-baseline").locator(".run-name").click()
     expect(page.get_by_role("heading", name="explicit-baseline", exact=True)).to_be_visible()
     page.go_back()
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
@@ -3366,3 +3369,83 @@ def test_truncated_note_warns_until_save_anyway(page, tmp_path, ui_server_factor
         expect(server_box).not_to_be_checked()
         assert puts() == 2
         assert _stored_note(page, server, run_id)["text"] == "- [x] Confirmed task"
+
+
+def test_launch_note_shows_until_the_notepad_is_edited(page, tmp_path, ui_server_factory):
+    root = tmp_path / "launch-notes"
+    launch_title = "Set with --notes / init(notes=...). Saving here creates this run's notepad."
+
+    def start(name, project, notes):
+        writer = RunWriter.create(root, meta={"name": name, "project": project, "notes": notes})
+        writer.finish("finished")
+        return writer.run_id
+
+    run_id = start("launch run", "alpha", "Launch idea\n- [ ] check lr")
+    listed_id = start("listed launch", "beta", "Listed idea\n- [ ] keep")
+    frozen_id = start("frozen launch", "alpha", "Frozen idea\n- [ ] look")
+    page.set_viewport_size({"width": 375, "height": 812})
+    with ui_server_factory(root) as server:
+        page.goto(f"{server.url}#/run/{run_id}")
+        pad = page.locator(".notepad")
+        label = pad.locator(".note-launch")
+        expect(label).to_be_visible()
+        expect(label).to_have_text("From launch notes")
+        expect(label).to_have_attribute("title", launch_title)
+        expect(pad).to_contain_text("Launch idea")
+        expect(pad.locator(".note-save")).to_have_text("Not saved yet")
+        expect(pad.get_by_role("checkbox", name="check lr", exact=True)).to_be_enabled()
+        _assert_notes_no_overflow(page)
+        pad.get_by_role("button", name="Edit", exact=True).click()
+        area = pad.get_by_label("Note Markdown")
+        expect(area).to_have_value("Launch idea\n- [ ] check lr")
+        _assert_notes_no_overflow(page)
+        pad.get_by_role("button", name="View", exact=True).click()
+        with page.expect_response(lambda response: response.request.method == "PUT" and response.ok) as saved:
+            pad.get_by_role("checkbox", name="check lr", exact=True).check()
+        assert saved.value.json()["source"] == "file"
+        expect(pad.locator(".note-save")).to_contain_text("Saved")
+        expect(label).to_be_hidden()
+        note_path = root / "runs" / run_id / "notes.md"
+        assert "- [x] check lr" in note_path.read_text(encoding="utf-8")
+        page.reload()
+        expect(pad.locator(".note-launch")).to_be_hidden()
+        expect(pad.get_by_role("checkbox", name="check lr", exact=True)).to_be_checked()
+        expect(pad).to_contain_text("Launch idea")
+        pad.get_by_role("button", name="Edit", exact=True).click()
+        area = pad.get_by_label("Note Markdown")
+        with page.expect_response(lambda response: response.request.method == "PUT" and response.ok):
+            area.fill("")
+        expect(pad.locator(".note-save")).to_contain_text("Saved")
+        page.reload()
+        expect(pad.get_by_role("button", name="Add a note…", exact=True)).to_be_visible()
+        expect(pad.get_by_text("Launch idea")).to_have_count(0)
+        expect(pad.locator(".note-launch")).to_be_hidden()
+        assert note_path.read_bytes() == b""
+        _assert_notes_no_overflow(page)
+
+        home(page, server)
+        book = page.locator(".notebook")
+        expect(book).to_have_attribute("open", "")
+        frozen = book.locator(".notebook-entry").filter(has_text="frozen launch")
+        listed = book.locator(".notebook-entry").filter(has_text="listed launch")
+        expect(frozen.locator(".note-launch")).to_be_visible()
+        expect(frozen.locator(".note-launch")).to_have_attribute("title", launch_title)
+        expect(frozen).to_contain_text("Frozen idea")
+        expect(listed.locator(".note-launch")).to_be_visible()
+        expect(book.locator(".notebook-entry").filter(has_text="launch run")).to_have_count(0)
+        _assert_notes_no_overflow(page)
+        with page.expect_response(lambda response: response.request.method == "PUT" and response.ok) as ticked:
+            listed.get_by_role("checkbox", name="keep", exact=True).check()
+        assert ticked.value.json()["source"] == "file"
+        expect(listed.locator(".note-launch")).to_be_hidden()
+        assert "- [x] keep" in (root / "runs" / listed_id / "notes.md").read_text(encoding="utf-8")
+        expect(frozen.locator(".note-launch")).to_be_visible()
+
+    with ui_server_factory(root, extra_args=("--read-only",)) as server:
+        page.goto(f"{server.url}#/run/{frozen_id}")
+        pad = page.locator(".notepad")
+        expect(pad.locator(".note-launch")).to_be_visible()
+        expect(pad.locator(".note-launch")).to_have_text("From launch notes")
+        expect(pad).to_contain_text("Frozen idea")
+        expect(pad.get_by_role("checkbox", name="look", exact=True)).to_be_disabled()
+        _assert_notes_no_overflow(page)

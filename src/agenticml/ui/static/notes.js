@@ -222,6 +222,8 @@ export function renderMarkdown(text, { el, onToggle, interactive = false }) {
   return root;
 }
 
+const launchNoteTitle =
+  "Set with --notes / init(notes=...). Saving here creates this run's notepad.";
 function relativeTime(value) {
   if (!value) return "";
   const elapsed = Math.max(0, Date.now() - Date.parse(value));
@@ -353,6 +355,7 @@ export function createNotepad({ runId, el, button, signal }) {
   let text = "",
     saved = "",
     revision = null,
+    source = "none",
     writable = false,
     loaded = false;
   let editing = false,
@@ -392,6 +395,12 @@ export function createNotepad({ runId, el, button, signal }) {
     "aria-pressed": false,
   });
   const modes = el("div", { class: "note-modes", hidden: true }, view, edit);
+  const launchLabel = el("p", {
+    class: "note-launch muted",
+    text: "From launch notes",
+    title: launchNoteTitle,
+    hidden: true,
+  });
   const banner = el("div", {
     class: "note-conflict",
     role: "alert",
@@ -460,6 +469,7 @@ export function createNotepad({ runId, el, button, signal }) {
         ),
         el("div", { class: "note-controls" }, status, retry, modes),
       ),
+      launchLabel,
       banner,
       truncateBanner,
       body,
@@ -498,6 +508,7 @@ export function createNotepad({ runId, el, button, signal }) {
     paintStatus();
   }
   function paintStatus() {
+    launchLabel.hidden = source !== "launch";
     const counts = taskCounts(text);
     progress.hidden = !counts.total;
     progress.textContent = `${counts.done}/${counts.total} done`;
@@ -585,6 +596,7 @@ export function createNotepad({ runId, el, button, signal }) {
         text = saved = conflict.text;
         revision = conflict.revision;
         updatedAt = conflict.updated_at;
+        source = typeof conflict.source === "string" ? conflict.source : source;
         tooLarge = !!conflict.too_large;
         truncateArmed = false;
         conflict = null;
@@ -597,6 +609,7 @@ export function createNotepad({ runId, el, button, signal }) {
       button("Keep mine", () => {
         revision = conflict.revision;
         saved = conflict.text;
+        source = typeof conflict.source === "string" ? conflict.source : source;
         tooLarge = !!conflict.too_large;
         truncateArmed = false;
         conflict = null;
@@ -671,6 +684,7 @@ export function createNotepad({ runId, el, button, signal }) {
         revision = note.revision;
         updatedAt = note.updated_at;
         saved = note.text;
+        if (typeof note.source === "string") source = note.source;
         if (text === snapshot) text = saved;
         failed = "";
         tooLarge = !!note.too_large;
@@ -701,6 +715,7 @@ export function createNotepad({ runId, el, button, signal }) {
       if (disposed || signal?.aborted) return;
       text = saved = note.text;
       revision = note.revision;
+      source = typeof note.source === "string" ? note.source : "none";
       writable = note.writable;
       updatedAt = note.updated_at;
       tooLarge = !!note.too_large;
@@ -825,8 +840,8 @@ export function createNotebook({ el, button, get, routeRun }) {
   function draw(force = false) {
     if (!initialized) return;
     const key = JSON.stringify([
-      notes.map(({ run_id, revision, name, project, status, updated_at, too_large }) => [
-        run_id, revision, name, project, status, updated_at, !!too_large,
+      notes.map(({ run_id, revision, name, project, status, updated_at, too_large, source: noteSource }) => [
+        run_id, revision, name, project, status, updated_at, !!too_large, noteSource,
       ]),
       writable, truncated, project, query, [...expanded],
     ]);
@@ -877,6 +892,13 @@ export function createNotebook({ el, button, get, routeRun }) {
           text: note.name || note.run_id,
           title: note.name || note.run_id,
         }),
+        note.source === "launch"
+          ? el("span", {
+              class: "note-launch muted",
+              text: "From launch notes",
+              title: launchNoteTitle,
+            })
+          : null,
         el("span", {
           class: `chip ${{ running: "accent", finished: "ok", crashed: "danger", stale: "warn" }[status] || ""}`,
           text: status,

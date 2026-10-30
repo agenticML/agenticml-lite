@@ -23,7 +23,7 @@ from agenticml.store.notes import (
 
 
 def _make_run(root, run_id="run-1", *, project="demo", name="Run", status="finished",
-              created_at="2026-10-27T00:00:00.000000Z"):
+              created_at="2026-10-27T00:00:00.000000Z", notes=None):
     directory = root / "runs" / run_id
     directory.mkdir(parents=True)
     meta = {
@@ -34,12 +34,14 @@ def _make_run(root, run_id="run-1", *, project="demo", name="Run", status="finis
         "status": status,
         "created_at": created_at,
     }
+    if notes is not None:
+        meta["notes"] = notes
     (directory / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
     return directory
 
 
 def _empty():
-    return {"text": "", "updated_at": None, "revision": None}
+    return {"text": "", "updated_at": None, "revision": None, "source": "none"}
 
 
 def test_missing_note_is_empty_and_round_trip_changes_revision(tmp_path):
@@ -292,8 +294,10 @@ def test_list_notes_skips_empty_sorts_filters_and_truncates(tmp_path):
     assert newest["text"] == "bbbb"
     assert newest["created_at"] == "2026-10-01T00:00:00.000000Z"
     assert set(newest) == {
-        "run_id", "name", "project", "status", "created_at", "text", "updated_at", "revision",
+        "run_id", "name", "project", "status", "created_at", "text",
+        "updated_at", "revision", "source",
     }
+    assert newest["source"] == "file"
     live = found["notes"][1]
     assert live["status"] == "crashed"
     assert live["status"] != "running"
@@ -651,3 +655,333 @@ def test_swapped_run_directory_symlink_is_not_followed(tmp_path, monkeypatch):
     found = list_notes(root)
     assert all("outside-note" not in row["text"] for row in found["notes"])
     unchanged(before)
+
+
+def test_missing_file_reads_launch_note_normalized_and_capped(tmp_path):
+    directory = _make_run(tmp_path, notes="a\r\nb\rc")
+    loaded = read_note(tmp_path, "run-1")
+    assert loaded == {
+        "text": "a\nb\nc",
+        "updated_at": None,
+        "revision": None,
+        "source": "launch",
+    }
+    assert not (directory / NOTE_NAME).exists()
+
+    filler = "é" * (MAX_NOTE_BYTES // 2 + 4)
+    raw = "é\r\n" + filler
+    meta = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
+    meta["notes"] = raw
+    (directory / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    normalized = "é\n" + filler
+    encoded = normalized.encode("utf-8")
+    assert len(encoded) > MAX_NOTE_BYTES
+    clipped = encoded[:MAX_NOTE_BYTES]
+    while clipped:
+        try:
+            expected = clipped.decode("utf-8")
+            break
+        except UnicodeDecodeError:
+            clipped = clipped[:-1]
+    else:
+        expected = ""
+    # The prefix is an odd number of bytes, so the cap falls inside "é".
+    assert len(expected.encode("utf-8")) == MAX_NOTE_BYTES - 1
+    capped = read_note(tmp_path, "run-1")
+    assert capped["source"] == "launch"
+    assert capped["revision"] is None
+    assert capped["updated_at"] is None
+    assert "too_large" not in capped
+    assert capped["text"] == expected
+    assert capped["text"].startswith("é\n")
+    assert "\r" not in capped["text"]
+
+
+@pytest.mark.parametrize("notes", ["", " ", "\t", "\n", "\r\n", " \r\n\t"])
+def test_whitespace_meta_notes_are_not_a_launch_note(tmp_path, notes):
+    _make_run(tmp_path, notes=notes)
+    assert read_note(tmp_path, "run-1") == _empty()
+
+
+def test_empty_file_hides_the_launch_note(tmp_path):
+    directory = _make_run(tmp_path, notes="Launch idea")
+    (directory / NOTE_NAME).write_bytes(b"")
+    loaded = read_note(tmp_path, "run-1")
+    assert loaded["source"] == "file"
+    assert loaded["text"] == ""
+    assert loaded["revision"] == hashlib.sha256(b"").hexdigest()
+    assert loaded["updated_at"]
+    (directory / NOTE_NAME).write_text(" \n", encoding="utf-8")
+    whitespace = read_note(tmp_path, "run-1")
+    assert whitespace["source"] == "file"
+    assert whitespace["text"] == " \n"
+    assert "Launch" not in whitespace["text"]
+
+
+def test_writing_over_a_launch_note_creates_the_file(tmp_path):
+    directory = _make_run(tmp_path, notes="Launch idea")
+    saved = write_note(tmp_path, "run-1", "Launch idea\n- [x] done", None)
+    assert saved["source"] == "file"
+    assert saved["text"] == "Launch idea\n- [x] done"
+    assert (directory / NOTE_NAME).read_text(encoding="utf-8") == saved["text"]
+    assert read_note(tmp_path, "run-1") == saved
+
+
+def test_clearing_with_a_launch_note_writes_an_empty_file(tmp_path):
+    directory = _make_run(tmp_path, notes="Launch idea")
+    cleared = write_note(tmp_path, "run-1", " \n", None)
+    assert (directory / NOTE_NAME).read_bytes() == b""
+    assert cleared["source"] == "file"
+    assert cleared["text"] == ""
+    assert cleared["revision"] == hashlib.sha256(b"").hexdigest()
+    again = read_note(tmp_path, "run-1")
+    assert again["source"] == "file"
+    assert again["text"] == ""
+    current = write_note(tmp_path, "run-1", "kept", cleared["revision"])
+    removed = write_note(tmp_path, "run-1", "", current["revision"])
+    assert (directory / NOTE_NAME).read_bytes() == b""
+    assert removed["source"] == "file"
+    assert removed["text"] == ""
+    assert read_note(tmp_path, "run-1")["text"] == ""
+
+
+def test_clearing_without_a_launch_note_deletes_the_file(tmp_path):
+    directory = _make_run(tmp_path, notes="")
+    current = write_note(tmp_path, "run-1", "keep", None)
+    deleted = write_note(tmp_path, "run-1", " \t", current["revision"])
+    assert deleted == _empty()
+    assert not (directory / NOTE_NAME).exists()
+    assert read_note(tmp_path, "run-1") == _empty()
+
+
+def test_symlink_or_fifo_meta_gives_no_launch_note(tmp_path, monkeypatch):
+    if not hasattr(os, "mkfifo") or not hasattr(os, "O_NONBLOCK"):
+        pytest.skip("nonblocking fifo open is unavailable")
+    directory = _make_run(tmp_path)
+    secret = directory / "secret.json"
+    secret.write_text(json.dumps({"notes": "hidden launch"}), encoding="utf-8")
+    meta = directory / "meta.json"
+    meta.unlink()
+    meta.symlink_to(secret.name)
+
+    with pytest.raises(FileNotFoundError):
+        _finish(lambda: read_note(tmp_path, "run-1"), 2)
+    with pytest.raises(FileNotFoundError):
+        _finish(lambda: write_note(tmp_path, "run-1", "x", None), 2)
+    assert not (directory / NOTE_NAME).exists()
+    assert secret.read_text(encoding="utf-8").count("hidden launch") == 1
+
+    # The existence check 404s a symlink. The launch read itself must also
+    # refuse it, without following the target, if that check has passed.
+    real_require = note_store._require_run
+    monkeypatch.setattr(note_store, "_require_run", lambda *_args, **_kwargs: None)
+    loaded = _finish(lambda: read_note(tmp_path, "run-1"), 2)
+    assert loaded == _empty()
+    assert "hidden" not in loaded["text"]
+    monkeypatch.setattr(note_store, "_require_run", real_require)
+
+    meta.unlink()
+    os.mkfifo(meta)
+    with pytest.raises(FileNotFoundError):
+        _finish(lambda: read_note(tmp_path, "run-1"), 2)
+    with pytest.raises(FileNotFoundError):
+        _finish(lambda: write_note(tmp_path, "run-1", " \n", None), 2)
+    assert meta.is_fifo()
+    assert not (directory / NOTE_NAME).exists()
+
+    monkeypatch.setattr(note_store, "_require_run", lambda *_args, **_kwargs: None)
+    loaded = _finish(lambda: read_note(tmp_path, "run-1"), 2)
+    assert loaded["source"] == "none"
+    assert loaded["text"] == ""
+
+
+def test_invalid_or_oversize_meta_has_no_launch_note(tmp_path, monkeypatch):
+    directory = _make_run(tmp_path, notes="hello")
+    meta = directory / "meta.json"
+    meta.write_text("{", encoding="utf-8")
+    assert read_note(tmp_path, "run-1") == _empty()
+    meta.write_text(json.dumps(["notes"]), encoding="utf-8")
+    assert read_note(tmp_path, "run-1") == _empty()
+    meta.write_text(json.dumps({"notes": 1}), encoding="utf-8")
+    assert read_note(tmp_path, "run-1") == _empty()
+
+    meta.write_bytes(b'{"notes": "hello"}')
+    fd = os.open(meta, os.O_RDWR)
+    try:
+        os.ftruncate(fd, note_store._META_CAP + 1)
+    finally:
+        os.close(fd)
+    requested = []
+    real_read = os.read
+
+    def counting(handle, size):
+        requested.append(size)
+        if sum(requested) > note_store._META_CAP + 1:
+            raise AssertionError(f"meta read asked for {sum(requested)} bytes")
+        return real_read(handle, size)
+
+    monkeypatch.setattr(os, "read", counting)
+    assert read_note(tmp_path, "run-1") == _empty()
+    # st_size is past the cap, so the body (and its sparse hole) is not read.
+    assert sum(requested) == 0
+
+
+def test_list_notes_includes_launch_rows_in_created_at_order(tmp_path):
+    file_mtime = 1_700_000_000
+    newer_at = "2024-06-01T00:00:00.000000Z"
+    older_at = "2020-01-01T00:00:00.000000Z"
+    assert layout.parse_timestamp(newer_at).timestamp() > file_mtime
+    assert file_mtime > layout.parse_timestamp(older_at).timestamp()
+
+    filed = _make_run(tmp_path, "filed", name="Filed", created_at="2023-01-01T00:00:00.000000Z")
+    write_note(tmp_path, "filed", "abcd", None)
+    os.utime(filed / NOTE_NAME, (file_mtime, file_mtime))
+    _make_run(tmp_path, "newer", name="Newer", created_at=newer_at, notes="newer\r\nlaunch")
+    _make_run(tmp_path, "older", name="Older", created_at=older_at, notes="older launch")
+    _make_run(tmp_path, "bad-time", name="Bad", created_at="not-a-timestamp", notes="bad clock")
+    _make_run(tmp_path, "blank-meta", name="Blank", notes="  \n")
+    cleared = _make_run(
+        tmp_path, "cleared", name="Cleared",
+        created_at="2030-01-01T00:00:00.000000Z", notes="should stay hidden",
+    )
+    (cleared / NOTE_NAME).write_bytes(b"")
+    spaces = _make_run(
+        tmp_path, "spaces", name="Spaces",
+        created_at="2030-06-01T00:00:00.000000Z", notes="also hidden",
+    )
+    (spaces / NOTE_NAME).write_text(" \n\t", encoding="utf-8")
+
+    found = list_notes(tmp_path)
+    assert [row["run_id"] for row in found["notes"]] == ["newer", "filed", "older", "bad-time"]
+    assert found["truncated"] is False
+    launch = found["notes"][0]
+    assert launch["source"] == "launch"
+    assert launch["text"] == "newer\nlaunch"
+    assert launch["revision"] is None
+    assert launch["updated_at"] is None
+    assert launch["name"] == "Newer"
+    assert "too_large" not in launch
+    assert found["notes"][1]["source"] == "file"
+    assert found["notes"][1]["text"] == "abcd"
+    assert found["notes"][3]["source"] == "launch"
+    assert found["notes"][3]["text"] == "bad clock"
+
+    launch_bytes = len("newer\nlaunch".encode("utf-8"))
+    capped = list_notes(tmp_path, limit_bytes=launch_bytes)
+    assert [row["run_id"] for row in capped["notes"]] == ["newer"]
+    assert capped["truncated"] is True
+    assert list_notes(tmp_path, limit_bytes=launch_bytes - 1) == {"notes": [], "truncated": True}
+
+
+def test_lone_surrogate_launch_note_is_absent_and_list_continues(tmp_path):
+    bad = _make_run(
+        tmp_path, "bad", name="Bad",
+        created_at="2030-01-01T00:00:00.000000Z", notes="bad\udcff",
+    )
+    _make_run(
+        tmp_path, "good", name="Good",
+        created_at="2020-01-01T00:00:00.000000Z", notes="visible launch",
+    )
+    stored = json.loads((bad / "meta.json").read_text(encoding="utf-8"))["notes"]
+    assert "\udcff" in stored
+    with pytest.raises(UnicodeEncodeError):
+        stored.encode("utf-8")
+
+    assert read_note(tmp_path, "bad") == _empty()
+    found = list_notes(tmp_path)
+    assert [row["run_id"] for row in found["notes"]] == ["good"]
+    assert found["notes"][0]["source"] == "launch"
+    assert found["notes"][0]["text"] == "visible launch"
+    assert found["truncated"] is False
+
+    assert write_note(tmp_path, "bad", " \n", None) == _empty()
+    assert not (bad / NOTE_NAME).exists()
+    saved = write_note(tmp_path, "bad", "kept", None)
+    removed = write_note(tmp_path, "bad", "", saved["revision"])
+    assert removed == _empty()
+    assert not (bad / NOTE_NAME).exists()
+    assert read_note(tmp_path, "bad")["source"] == "none"
+    again = list_notes(tmp_path)
+    assert [row["run_id"] for row in again["notes"]] == ["good"]
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo", "directory"])
+def test_special_notes_md_with_a_launch_note_is_not_listed(tmp_path, kind):
+    if kind == "fifo" and (not hasattr(os, "mkfifo") or not hasattr(os, "O_NONBLOCK")):
+        pytest.skip("nonblocking fifo open is unavailable")
+    special = _make_run(
+        tmp_path, "special", name="Special",
+        created_at="2030-01-01T00:00:00.000000Z", notes="Launch idea",
+    )
+    _make_run(
+        tmp_path, "plain", name="Plain",
+        created_at="2020-01-01T00:00:00.000000Z", notes="plain launch",
+    )
+    note = special / NOTE_NAME
+    if kind == "symlink":
+        secret = special / "secret.md"
+        secret.write_text("secret body", encoding="utf-8")
+        note.symlink_to(secret.name)
+    elif kind == "fifo":
+        os.mkfifo(note)
+    else:
+        note.mkdir()
+
+    found = _finish(lambda: list_notes(tmp_path), 2)
+    assert [row["run_id"] for row in found["notes"]] == ["plain"]
+    assert found["notes"][0]["text"] == "plain launch"
+    joined = " ".join(row["text"] for row in found["notes"])
+    assert "Launch idea" not in joined
+    assert "secret" not in joined
+    loaded = _finish(lambda: read_note(tmp_path, "special"), 2)
+    assert loaded["source"] == "none"
+    assert loaded["text"] == ""
+    if kind == "symlink":
+        assert note.is_symlink()
+        assert secret.read_text(encoding="utf-8") == "secret body"
+    elif kind == "fifo":
+        assert note.is_fifo()
+    else:
+        assert note.is_dir()
+
+
+def _opening_meta(path, flags) -> bool:
+    if isinstance(path, bytes):
+        text = os.fsdecode(path)
+    else:
+        text = str(path)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    return Path(text).name == layout.META_NAME and not (flags & directory_flag)
+
+
+def test_unreadable_meta_open_is_not_a_launch_note(tmp_path, monkeypatch):
+    directory = _make_run(tmp_path, notes="hidden launch")
+    real_open = os.open
+
+    def deny_meta(path, flags, *args, **kwargs):
+        if _opening_meta(path, flags):
+            raise PermissionError(errno.EACCES, "Permission denied", layout.META_NAME)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", deny_meta)
+    assert read_note(tmp_path, "run-1") == _empty()
+    assert write_note(tmp_path, "run-1", " \n", None) == _empty()
+    assert not (directory / NOTE_NAME).exists()
+    assert {path.name for path in directory.iterdir()} == {"meta.json"}
+
+
+def test_meta_missing_at_launch_open_stays_not_found(tmp_path, monkeypatch):
+    directory = _make_run(tmp_path, notes="hello")
+    real_open = os.open
+
+    def vanish(path, flags, *args, **kwargs):
+        if _opening_meta(path, flags):
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", layout.META_NAME)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", vanish)
+    with pytest.raises(FileNotFoundError):
+        read_note(tmp_path, "run-1")
+    with pytest.raises(FileNotFoundError):
+        write_note(tmp_path, "run-1", " \n", None)
+    assert not (directory / NOTE_NAME).exists()
