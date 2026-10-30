@@ -595,3 +595,212 @@ def test_checkout_existing_destination_requires_matching_registration(project, t
         pass
     with pytest.raises(ValueError, match="not a worktree"):
         lineage.checkout(root, second.run_id, registered)
+
+
+def test_task_resolution_precedence(project, monkeypatch, caplog):
+    from agenticml.code_tracking import resolve_task
+
+    entry = project / "asr" / "train.py"
+    entry.parent.mkdir()
+    entry.write_text("pass\n")
+    marker = project / "agenticml.toml"
+    marker.write_text('task = "marker"\n')
+    monkeypatch.setenv("AGENTICML_TASK", " env ")
+    assert resolve_task(" explicit ", project, entry) == ("explicit", "explicit")
+    assert resolve_task("\x00bad", project, entry) == ("env", "env")
+    assert "invalid explicit task" in caplog.text
+    assert resolve_task(None, project, entry) == ("env", "env")
+    monkeypatch.setenv("AGENTICML_TASK", "x" * 129)
+    assert resolve_task(None, project, entry) == ("marker", "marker")
+    assert "invalid env task" in caplog.text
+    monkeypatch.delenv("AGENTICML_TASK")
+    nearest = entry.parent / "agenticml.toml"
+    nearest.write_text("task = 'nearest'\n")
+    assert resolve_task(None, project, entry) == ("nearest", "marker")
+    nearest.write_text("task = [invalid\n")
+    assert resolve_task(None, project, entry) == ("marker", "marker")
+    marker.unlink()
+    assert resolve_task(None, project, entry) == ("asr", "entry")
+    assert resolve_task(None, project, project / "train.py") == (None, None)
+    assert resolve_task(None, project, None) == (None, None)
+    marker.write_text('task = "cwd-marker"\n')
+    assert resolve_task(None, project, None) == ("cwd-marker", "marker")
+    assert resolve_task(None, project, project.parent / "outside.py") == (None, None)
+
+
+@pytest.mark.parametrize("value", ["", "  ", "x" * 129, "a\nb", "a\x7fb", "a\x85b", [], 42])
+def test_invalid_task_falls_through(project, monkeypatch, value):
+    from agenticml.code_tracking import resolve_task
+
+    monkeypatch.setenv("AGENTICML_TASK", "valid")
+    assert resolve_task(value, project) == ("valid", "env")
+
+
+@pytest.mark.parametrize("char", [
+    "\x00", "\t", "\x85", "\u202e", "\ud800", "\ue000", "\u0378", "\u2028", "\u2029",
+])
+@pytest.mark.parametrize("template", ["{}asr", "as{}r", "asr{}"])
+def test_task_rejects_unicode_controls_and_separators(char, template):
+    from agenticml.code_tracking import _normalize_task
+
+    value = template.format(char)
+    assert _normalize_task(value) is None
+    assert lineage.run_task({"task": value, "task_source": "explicit"}) == ("", None)
+    assert lineage.run_task({"name": f"{value}/train.py"}) == ("", None)
+    assert lineage.run_task({"name": f"asr/train{char}.py"}) == ("", None)
+
+
+@pytest.mark.parametrize("kind", ["symlink", "large", "directory", "unreadable", "invalid", "nested"])
+def test_task_marker_guards(project, monkeypatch, kind):
+    from agenticml.code_tracking import resolve_task
+
+    monkeypatch.delenv("AGENTICML_TASK", raising=False)
+    entry = project / "src" / "tts" / "train.py"
+    entry.parent.mkdir(parents=True)
+    marker = entry.parent / "agenticml.toml"
+    if kind == "symlink":
+        target = project / "config.toml"
+        target.write_text('task = "wrong"\n')
+        marker.symlink_to(target)
+    elif kind == "directory":
+        marker.mkdir()
+    elif kind == "large":
+        marker.write_text('task = "wrong"\n' + "#" * (64 * 1024))
+    elif kind == "unreadable":
+        marker.write_text('task = "wrong"\n')
+        original = os.open
+        def denied(path, *args, **kwargs):
+            if path == marker:
+                raise PermissionError("denied")
+            return original(path, *args, **kwargs)
+        monkeypatch.setattr(os, "open", denied)
+    elif kind == "nested":
+        marker.write_text('[section]\ntask = "wrong"\n')
+    else:
+        marker.write_bytes(b'task = "\xff"\n')
+    assert resolve_task(None, project, entry) == ("src/tts", "entry")
+
+
+def test_task_marker_python39_fallback(project, monkeypatch):
+    import builtins
+    from agenticml.code_tracking import resolve_task
+
+    original = builtins.__import__
+    def no_tomllib(name, *args, **kwargs):
+        if name == "tomllib":
+            raise ImportError(name)
+        return original(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", no_tomllib)
+    monkeypatch.delenv("AGENTICML_TASK", raising=False)
+    marker = project / "agenticml.toml"
+    for content, expected in [('task = " asr " # comment\n', "asr"),
+                              ("task = 'tts'\n", "tts"),
+                              ('[other]\ntask = "nested"\n', None),
+                              ('task = [invalid\n', None)]:
+        marker.write_text(content)
+        assert resolve_task(None, project) == ((expected, "marker") if expected else (None, None))
+
+
+@pytest.mark.parametrize("meta, expected", [
+    ({"name": "asr/train.py"}, ("asr", "legacy")),
+    ({"name": "src/tts/train.py"}, ("src/tts", "legacy")),
+    ({"name": "asr/train.py", "task": None}, ("", None)),
+    ({"name": "asr/train.py", "task": "tts", "task_source": "explicit"}, ("tts", "explicit")),
+    ({"task": "", "task_source": "explicit"}, ("", "explicit")),
+    ({"task": ["bad"]}, ("", None)),
+    ({"task": "asr", "task_source": {}}, ("asr", None)),
+    ({"name": "/asr/train.py"}, ("", None)),
+    ({"name": "../asr/train.py"}, ("", None)),
+    ({"name": "asr\\train.py"}, ("", None)),
+    ({"name": "asr/train\x00.py"}, ("", None)),
+    ({"name": "train.py"}, ("", None)),
+    ({"name": {"bad": True}}, ("", None)),
+    (None, ("", None)),
+])
+def test_run_task_legacy_and_malformed(meta, expected):
+    assert lineage.run_task(meta) == expected
+
+
+def test_entry_tasks_isolate_parents_and_cli(project, tmp_path, monkeypatch, capsys):
+    root = tmp_path / "store"
+    runs = []
+    for task in ("asr", "imagegen", "asr"):
+        entry = project / task / "train.py"
+        entry.parent.mkdir(exist_ok=True)
+        entry.write_text("pass\n")
+        monkeypatch.setattr(sys.modules["__main__"], "__file__", str(entry))
+        monkeypatch.setattr(sys, "argv", [str(entry)])
+        with start(root) as run:
+            meta = RunReader(root, run.run_id).meta()
+            assert run.task == meta["task"] == task
+            assert meta["task_source"] == "entry"
+            assert info(run)["task"] == task
+        runs.append(run)
+    first, image, second = runs
+    assert info(first)["parent_run_id"] is None
+    assert info(image)["parent_run_id"] is None
+    assert info(second)["parent_run_id"] == first.run_id
+    assert info(second)["parent_inference"] == "repo_root"
+    inferred = lineage.infer_parents(lineage.list_runs(root))
+    assert inferred[first.run_id] == inferred[image.run_id] == (None, None)
+    assert inferred[second.run_id] == (first.run_id, "repo_root")
+    repo = root / "lineage" / f"{info(second)['project_key']}.git"
+    assert b"task: asr\n" in git(repo, "show", "-s", "--format=%B", info(second)["commit"])
+    assert main(["lineage", "ls", "--dir", str(root)]) == 0
+    output = capsys.readouterr().out
+    assert "test\n  [asr]\n" in output
+    assert f"    {first.run_id}" in output and f"      {second.run_id}" in output
+    assert f"  [imagegen]\n    {image.run_id}" in output
+    assert main(["lineage", "ls", "--task", "asr", "--dir", str(root)]) == 0
+    output = capsys.readouterr().out
+    assert image.run_id not in output and "[imagegen]" not in output
+    assert first.run_id in output and second.run_id in output
+    with start(root, task="imagegen", parent_run_id=second.run_id) as cross:
+        assert info(cross)["parent_run_id"] == second.run_id
+        assert info(cross)["parent_inference"] == "explicit"
+        assert info(cross)["parent_commit"] == info(second)["commit"]
+
+
+def test_inference_task_fallback_and_legacy(project, tmp_path):
+    root = tmp_path / "store"
+    for rid, name in (("asr-first", "asr/train.py"), ("image", "imagegen/train.py"),
+                      ("asr-second", "asr/train.py")):
+        writer = RunWriter.create(root, run_id=rid, meta={"project": "p", "name": name,
+                                                        "git": {"repo_root": str(project)}})
+        writer.finish("finished")
+    before = "2099-01-01T00:00:00.000000Z"
+    assert lineage.infer_parent(root, "p", "/other", before, task="asr") == ("asr-second", "task")
+    assert lineage.infer_parent(root, "p", "/other", before) == (None, None)
+    assert lineage.infer_parents(lineage.list_runs(root)) == {
+        "asr-first": (None, None), "image": (None, None), "asr-second": ("asr-first", "repo_root"),
+    }
+
+
+def test_no_task_keeps_project_stream_and_resume(project, tmp_path, monkeypatch, capsys):
+    root = tmp_path / "store"
+    monkeypatch.delenv("AGENTICML_TASK", raising=False)
+    monkeypatch.delattr(sys.modules["__main__"], "__file__", raising=False)
+    with start(root) as first:
+        assert first.task is None
+        assert RunReader(root, first.run_id).meta()["task"] is None
+    other = tmp_path / "other"
+    other.mkdir()
+    monkeypatch.chdir(other)
+    with start(root, track_source=False) as second:
+        assert second.task is None
+        assert info(second)["parent_run_id"] == first.run_id
+        assert info(second)["parent_inference"] == "project"
+    with start(root, id=first.run_id, resume="allow", task="new-task") as resumed:
+        assert resumed.task is None
+        assert RunReader(root, resumed.run_id).meta()["task"] is None
+    assert main(["lineage", "ls", "--task", "", "--dir", str(root)]) == 0
+    assert "  [no task]" in capsys.readouterr().out
+
+
+def test_resume_keeps_stored_task(project, tmp_path):
+    root = tmp_path / "store"
+    with start(root, task="asr") as first:
+        pass
+    with start(root, id=first.run_id, resume="allow", task="imagegen") as resumed:
+        assert resumed.task == "asr"
+        assert RunReader(root, resumed.run_id).meta()["task_source"] == "explicit"

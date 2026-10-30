@@ -10,6 +10,7 @@ import difflib
 import gzip
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import ipaddress
 import json
 import math
@@ -46,6 +47,8 @@ _SERIES_LIMIT = 200
 _CONFIG_LIMIT = 50
 _CHUNK = 64 * 1024
 _CONNECTION_TIMEOUT = 60
+_MAX_CONNECTIONS = 64
+_HEADER_DEADLINE = 10.0
 _DISCONNECT = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
 _LINEAGE_FILES = 500
 _CODE_DIFF_MAX_BYTES = 1024 * 1024
@@ -493,16 +496,16 @@ def _stored_parent(meta):
 
 
 def _infer_missing_parents(items):
-    """Fill inferred parents in one forward pass per project.
+    """Fill inferred parents in one forward pass per project/task.
 
     Items are ordered by ``(created_at, run_id)``. The parent is the latest
     strictly earlier run with the same normalized repo root, else the latest
-    strictly earlier run in the project. Equal timestamps tie-break on
+    strictly earlier run in the same task. Equal timestamps tie-break on
     ``run_id``, and the strict comparison never selects the run itself.
     """
     grouped = {}
     for item in items:
-        grouped.setdefault(item["project"], []).append(item)
+        grouped.setdefault((item["project"], item["task"]), []).append(item)
     for group in grouped.values():
         ordered = sorted(
             (item for item in group if item["order"] is not None),
@@ -519,7 +522,7 @@ def _infer_missing_parents(items):
                     item["inference"] = "repo_root"
                 elif latest is not None and latest < order:
                     item["parent"] = latest[1]
-                    item["inference"] = "project"
+                    item["inference"] = "task" if item["task"] else "project"
                 else:
                     item["parent"] = None
                     item["inference"] = None
@@ -553,6 +556,8 @@ def _stamp_key(item):
 
 def _lineage_item(meta):
     """One graph row. Malformed fields become empty values instead of a 500."""
+    from ..lineage import run_task
+
     run_id = meta.get("run_id")
     if not isinstance(run_id, str):
         return None
@@ -563,10 +568,13 @@ def _lineage_item(meta):
         project = _text(meta.get("project"))
     except Exception:
         created, repo, parent, inference, needs, project = None, None, None, None, False, ""
+    task, task_source = run_task(meta)
     return {
         "meta": meta,
         "run_id": run_id,
         "project": project,
+        "task": task,
+        "task_source": task_source,
         "repo": repo,
         "created": created,
         "order": (created, run_id) if created is not None else None,
@@ -574,6 +582,20 @@ def _lineage_item(meta):
         "inference": inference,
         "needs": needs,
     }
+
+
+def _lineage_arch(meta):
+    raw = meta.get("arch")
+    if not isinstance(raw, dict):
+        return None
+    arch = {key: _safe_token(raw.get(key), 256)
+            for key in ("model_class", "model_type", "loss_class")}
+    architectures = raw.get("architectures")
+    arch["architectures"] = ([_safe_token(item, 256) for item in architectures]
+                             if isinstance(architectures, list) else None)
+    if arch["architectures"] is not None and any(item is None for item in arch["architectures"]):
+        arch["architectures"] = None
+    return arch
 
 
 def _lineage_graph(root, project_filter):
@@ -593,6 +615,8 @@ def _lineage_graph(root, project_filter):
             items.append(item)
     _infer_missing_parents(items)
     resolved = {item["run_id"]: (item["parent"], item["inference"]) for item in items}
+    tasks = {item["run_id"]: item["task"] for item in items}
+    architectures = {item["run_id"]: _lineage_arch(item["meta"]) for item in items}
     trees = {}
     for item in items:
         lineage = _lineage_block(item["meta"]) or {}
@@ -608,7 +632,8 @@ def _lineage_graph(root, project_filter):
             continue
         accepted[run_id] = parent
     nodes = []
-    node_ids = set()
+    node_ids = {item["run_id"] for item in order
+                if project_filter is None or item["project"] == project_filter}
     for item in order:
         project = item["project"]
         if project_filter is not None and project != project_filter:
@@ -619,6 +644,9 @@ def _lineage_graph(root, project_filter):
         parent, inference = resolved[run_id]
         own_tree = trees.get(run_id)
         parent_tree = trees.get(parent) if parent else None
+        arch = architectures[run_id]
+        own_class = (arch or {}).get("model_class")
+        parent_class = (architectures.get(parent) or {}).get("model_class")
         status = meta.get("effective_status", meta.get("status"))
         if not isinstance(status, str):
             status = ""
@@ -626,6 +654,12 @@ def _lineage_graph(root, project_filter):
             "run_id": run_id,
             "name": _text(meta.get("name")),
             "project": project,
+            "task": item["task"],
+            "task_source": item["task_source"],
+            "arch": arch,
+            "arch_changed": bool(own_class and parent_class and own_class != parent_class),
+            "cross_task": (parent in node_ids and accepted.get(run_id) == parent
+                           and tasks[parent] != item["task"]),
             "status": status,
             "created_at": _text(meta.get("created_at")),
             "commit": _safe_token(lineage.get("commit")),
@@ -638,7 +672,6 @@ def _lineage_graph(root, project_filter):
             "same_tree_as_parent": bool(own_tree and parent_tree and own_tree == parent_tree),
             "error": _opt_text(lineage.get("error")),
         })
-        node_ids.add(run_id)
     edges = []
     for item in order:
         run_id = item["run_id"]
@@ -650,6 +683,7 @@ def _lineage_graph(root, project_filter):
             "from": parent,
             "to": run_id,
             "inferred": inference not in (None, "explicit"),
+            "cross_task": tasks[parent] != item["task"],
         })
     return {"nodes": nodes, "edges": edges}
 
@@ -917,6 +951,8 @@ class DashboardServer(ThreadingHTTPServer):
         self.reader_lock = threading.Lock()
         self.code_diffs = OrderedDict()
         self.code_diff_lock = threading.Lock()
+        self.connections = OrderedDict()
+        self.connection_lock = threading.Lock()
         super().__init__((host, port), DashboardHandler)
 
     def handle_error(self, request, client_address):
@@ -930,6 +966,61 @@ class DashboardServer(ThreadingHTTPServer):
         except OSError:
             pass
         return request, client_address
+
+    def process_request(self, request, client_address):
+        with self.connection_lock:
+            if len(self.connections) >= _MAX_CONNECTIONS:
+                oldest = next((conn for conn, state in self.connections.items()
+                               if state == "headers"), None)
+                if oldest is not None:
+                    # Wake its reader without waiting for the handler to exit.
+                    self.connections.pop(oldest)
+                    try:
+                        oldest.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+            admitted = len(self.connections) < _MAX_CONNECTIONS
+            if admitted:
+                self.connections[request] = "headers"
+        if not admitted:
+            try:
+                # One nonblocking send: a client that does not read must never
+                # stall the accept loop, even while all handlers are busy.
+                request.setblocking(False)
+                request.send(b"HTTP/1.1 503 Service Unavailable\r\n"
+                             b"Connection: close\r\nContent-Length: 0\r\n\r\n")
+            except OSError:
+                pass
+            finally:
+                try:
+                    request.recv(65536)
+                except OSError:
+                    pass
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            with self.connection_lock:
+                self.connections.pop(request, None)
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            # The superclass has already called shutdown_request.
+            with self.connection_lock:
+                self.connections.pop(request, None)
+
+    def _set_connection_state(self, request, state):
+        with self.connection_lock:
+            if request not in self.connections:
+                return False  # Evicted while finishing its headers.
+            self.connections[request] = state
+            if state == "headers":
+                self.connections.move_to_end(request)
+            return True
 
     @contextmanager
     def run_reader(self, run_id):
@@ -1020,6 +1111,63 @@ def _parse_note_body(data: bytes):
 
 class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "AgenticML"
+
+    class _HeaderReader(io.RawIOBase):
+        """Apply the remaining header budget before every socket read."""
+
+        def __init__(self, handler, raw):
+            self.handler = handler
+            self.raw = raw
+
+        def readable(self):
+            return True
+
+        def readinto(self, buffer):
+            deadline = self.handler._header_deadline
+            if deadline is not None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError("request header deadline exceeded")
+                self.handler.connection.settimeout(min(left, _CONNECTION_TIMEOUT))
+            return self.raw.readinto(buffer)
+
+        def close(self):
+            try:
+                self.raw.close()
+            finally:
+                super().close()
+
+    def setup(self):
+        super().setup()
+        self._header_deadline = None
+        self.rfile = io.BufferedReader(self._HeaderReader(self, self.rfile.detach()))
+
+    def handle_one_request(self):
+        if not self.server._set_connection_state(self.connection, "headers"):
+            self.close_connection = True
+            return
+        self._header_deadline = time.monotonic() + _HEADER_DEADLINE
+        try:
+            super().handle_one_request()
+        except (TimeoutError, socket.timeout):
+            self.close_connection = True
+        finally:
+            self._header_deadline = None
+            self.connection.settimeout(_CONNECTION_TIMEOUT)
+
+    def parse_request(self):
+        try:
+            parsed = super().parse_request()
+            if (self._header_deadline is not None
+                    and time.monotonic() >= self._header_deadline):
+                raise TimeoutError("request header deadline exceeded")
+        finally:
+            self._header_deadline = None
+            self.connection.settimeout(_CONNECTION_TIMEOUT)
+        if not self.server._set_connection_state(self.connection, "busy"):
+            self.close_connection = True
+            return False
+        return parsed
 
     def log_message(self, fmt, *args):
         if self.server.verbose:
@@ -1346,6 +1494,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             listed["writable"] = not self.server.read_only
             return self._json(listed)
         if path == "/api/runs":
+            from ..lineage import run_task
+
             fields = ("run_id", "project", "name", "created_at", "finished_at", "tags", "group")
             runs = []
             for meta in reader.list_runs(self.server.root):
@@ -1358,6 +1508,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 row["status"] = meta.get("effective_status", meta.get("status"))
                 row["summary"] = _summary(meta.get("summary"))
                 row["config"] = _summary(meta.get("config"), limit=_CONFIG_LIMIT)
+                row["task"], row["task_source"] = run_task(meta)
+                row["arch"] = _lineage_arch(meta)
                 # meta.json and the scalars index do not record a step. The last
                 # _time.bin record is one seek, not a scan of the series files.
                 # Do not route this through run_reader: inserting every row

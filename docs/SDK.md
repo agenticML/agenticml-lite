@@ -68,21 +68,50 @@ A run is also a context manager: `with agenticml.Run("proj", "name") as run: run
 
 ### Useful `init` options
 
-`config`, `tags`, `notes`, `group`, `job_type`, `id` + `resume` (`"never"`, `"allow"`, `"must"`), `mode` (`"local"`, `"offline"`, `"disabled"`), `dir` (store root), `system_metrics` (`True`/`False`), `auto_track`, `auto_metrics`, `sync_tensorboard`, `lineage` (default `True`), `verbose`.
+`config`, `tags`, `notes`, `group`, `job_type`, `task`, `id` + `resume` (`"never"`, `"allow"`, `"must"`), `mode` (`"local"`, `"offline"`, `"disabled"`), `dir` (store root), `system_metrics` (`True`/`False`), `auto_track`, `auto_metrics`, `sync_tensorboard`, `lineage` (default `True`), `verbose`.
+
+A run belongs to a task (e.g. `"asr"`, `"imagegen"`). Lineage graphs and parent
+inference are per `(project, task)` instead of per project. Parent inference
+never crosses tasks; an explicit `parent_run_id` may cross tasks. The shadow Git
+repository is still one per project.
+
+Task resolution at init checks, in order (first match wins, recorded as `task_source`):
+- `explicit`: `agenticml.init(task="asr")` / `Run(task=...)`
+- `env`: `AGENTICML_TASK`
+- `marker`: nearest `agenticml.toml` with a top-level `task = "..."`, searched from
+  the entry script's directory (cwd if none) up to and including the project repo root.
+  Must be a regular, non-symlink file of at most 64 KiB; unreadable/invalid files are skipped.
+- `entry`: the entry script's directory relative to the repo root, POSIX form
+  (e.g. `asr/train.py` -> `asr`, `src/tts/train.py` -> `src/tts`). Not used when
+  the script is at the repo root or outside it.
+- none: `task` is null and the whole project is one stream (previous behaviour).
+
+Values are stripped; empty, longer than 128 characters, or containing control,
+format, or separator characters (Unicode categories C*, Zl, Zp) are ignored
+(a warning for explicit/env) and resolution falls through to the next signal.
+Resume keeps the stored task. Under `agenticml run`, an `init(task=...)` that
+differs from the launcher run's task logs a warning and the launcher's run is kept.
+Older runs without a `task` field: if their `name` is a relative `.py` path with
+a directory part (the default run name, e.g. `asr/train.py`), the task is read as
+that directory with source `legacy` (read-time only, nothing is rewritten);
+otherwise they count as no task.
 
 `lineage=True` captures the project code at init in a shadow Git repository
 under the store root, including for projects without Git. The project is never
 written to. Disable with `lineage=False` or `AGENTICML_LINEAGE=0` (`false`, `no`,
 `off` also work). Resume preserves the original snapshot. `parent_run_id=`
-selects an explicit parent; a self-parent is ignored. Otherwise the latest eligible
-source-directory run or project run is used, ordered by `(created_at, run_id)`
-strictly before the current run. `max_file_bytes` / `max_total_bytes` also cap lineage
-(default 10/100 MiB); ignored and oversized files are skipped before hashing.
-Capture has one 30-second deadline, including waiting for the repository lock,
-and inspects at most 20,000 candidate paths. Excess paths and individual path
-errors are recorded in `lineage.skipped`; these produce a partial snapshot.
-`.agenticmlignore` is applied only when at most 1 MiB. Git failures and deadline
-expiry are recorded in `meta.json` and do not interrupt the run.
+selects an explicit parent; a self-parent is ignored. Otherwise parent inference
+selects the latest strictly earlier run with the same project, same task, and
+same repo root; else the latest strictly earlier run with the same project and
+task; else no parent (ordered by `(created_at, run_id)` strictly before the
+current run). Parent inference never crosses tasks. `max_file_bytes` /
+`max_total_bytes` also cap lineage (default 10/100 MiB); ignored and oversized
+files are skipped before hashing. Capture has one 30-second deadline, including
+waiting for the repository lock, and inspects at most 20,000 candidate paths.
+Excess paths and individual path errors are recorded in `lineage.skipped`; these
+produce a partial snapshot. `.agenticmlignore` is applied only when at most 1 MiB.
+Git failures and deadline expiry are recorded in `meta.json` and do not interrupt
+the run.
 
 Overlapping runs resolve the parent's ref under the repository lock before
 creating the child commit. If the parent has not published its snapshot yet,
@@ -131,13 +160,14 @@ agenticml ls [--project P] [--json]       # list runs, newest first
 agenticml ui [--port 6006] [--open] [--read-only]  # local dashboard
 agenticml lineage checkout RUN_ID [--path DIR]  # detached shadow worktree
 agenticml lineage diff RUN_ID [OTHER_RUN_ID]   # numstat vs other or parent
-agenticml lineage ls [--project P]            # run parent tree
+agenticml lineage ls [--project P] [--task T]  # run parent tree
 agenticml du                              # store disk usage
 agenticml gc --dry-run                    # preview cleanup; nothing is deleted
 agenticml login / whoami / logout         # credentials for upload
 agenticml sync RUN_ID [--dry-run]         # upload (needs login)
 ```
 
+`lineage ls` groups output by project, then `[task]` (`[no task]` for none).
 All lineage commands accept `--dir ROOT`; otherwise they use `AGENTICML_DIR`
 or `~/.agenticml`. `gc` removes deleted runs' refs and default checkouts. Custom
 `--path` checkouts are user-owned and always kept, including edits and new

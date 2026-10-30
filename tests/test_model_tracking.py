@@ -259,3 +259,57 @@ def test_stage_dir_removed_even_if_upload_fails(fake_repo: Path, monkeypatch):
         assert staging is not None and not staging.exists()
     finally:
         sys.modules.pop("fakesarch.modeling", None)
+
+
+def test_run_arch_first_model_and_loss_merge(fake_repo, tmp_path, monkeypatch):
+    monkeypatch.chdir(fake_repo)
+    entry = fake_repo / "src" / "train.py"
+    monkeypatch.setattr(sys, "argv", [str(entry)])
+    model_path = fake_repo / "architecture.py"
+    model_path.write_text('''
+class Config:
+    def to_dict(self):
+        return {"model_type": "fake", "architectures": ["First"]}
+class First:
+    config = Config()
+class Second:
+    pass
+class Loss:
+    pass
+''')
+    module = _load_module("task_architecture", model_path)
+    try:
+        with Run("p", "n", dir=tmp_path / "store", capture_env=False, system_metrics=False,
+                 auto_track=False, track_source=False, lineage=False) as run:
+            run.track_loss(module.Loss(), name="criterion")
+            assert RunReader(run.root, run.run_id).meta()["arch"] == {"loss_class": "task_architecture.Loss"}
+            run.track_model(module.First(), name="encoder")
+            expected = {"model_class": "task_architecture.First", "model_type": "fake",
+                        "architectures": ["First"], "loss_class": "task_architecture.Loss"}
+            assert RunReader(run.root, run.run_id).meta()["arch"] == expected
+            run.track_model(module.Second())
+            run.track_loss(module.Second())
+            assert RunReader(run.root, run.run_id).meta()["arch"] == expected
+        with Run("p", "n", dir=run.root, id=run.run_id, resume="allow", capture_env=False,
+                 system_metrics=False, auto_track=False, track_source=False) as resumed:
+            resumed.track_model(module.Second())
+            assert RunReader(run.root, run.run_id).meta()["arch"] == expected
+    finally:
+        sys.modules.pop("task_architecture", None)
+
+
+def test_arch_without_hf_config_and_metadata_failure(fake_repo, tmp_path, monkeypatch):
+    monkeypatch.chdir(fake_repo)
+    with Run("p", "n", dir=tmp_path / "store", capture_env=False, system_metrics=False,
+             auto_track=False, track_source=False, lineage=False) as run:
+        run.track_model(None)
+        assert "arch" not in RunReader(run.root, run.run_id).meta()
+        run.track_model(object())
+        assert RunReader(run.root, run.run_id).meta()["arch"] == {
+            "model_class": "builtins.object", "model_type": None, "architectures": None,
+        }
+        def broken(**kwargs):
+            raise OSError("unavailable")
+        with monkeypatch.context() as patch:
+            patch.setattr(run.writer, "set_meta_fields", broken)
+            run.track_loss(object())  # Failed fingerprint persistence must not raise.

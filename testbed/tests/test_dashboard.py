@@ -3162,13 +3162,19 @@ def test_truncated_note_warns_until_save_anyway(page, tmp_path, ui_server_factor
     root = tmp_path / "truncated-notes"
     ids = _notes_runs(root)
     run_id = ids["first notes run"]
-    mode = {"conflict": False}
+    mode = {"conflict": False, "fail": False, "read_only": False}
     warning_text = (
         "This note is larger than 256 KiB and is shown truncated. "
         "Saving will drop the rest of the file."
     )
+    readonly_text = "This note is larger than 256 KiB and is shown truncated."
+    save_hint = "Use Save anyway to replace the file."
 
     def run_notes(route):
+        if route.request.method == "PUT" and mode["fail"]:
+            mode["fail"] = False
+            route.fulfill(status=503, json={"error": "Try again later"})
+            return
         if route.request.method == "PUT" and mode["conflict"]:
             mode["conflict"] = False
             route.fulfill(status=409, json={
@@ -3186,6 +3192,8 @@ def test_truncated_note_warns_until_save_anyway(page, tmp_path, ui_server_factor
             upstream = route.fetch()
             payload = upstream.json()
             payload["too_large"] = True
+            if mode["read_only"]:
+                payload["writable"] = False
             route.fulfill(status=upstream.status, json=payload)
             return
         route.continue_()
@@ -3255,7 +3263,7 @@ def test_truncated_note_warns_until_save_anyway(page, tmp_path, ui_server_factor
         expect(page.get_by_role("heading", name="first notes run", exact=True)).to_be_visible()
         pad = page.locator(".notepad")
         warning = pad.locator(".note-truncate")
-        expect(warning.locator("p")).to_have_text(warning_text)
+        expect(warning.locator(".note-truncate-copy")).to_have_text(warning_text)
         expect(warning.get_by_role("button", name="Save anyway", exact=True)).to_be_visible()
         expect(pad.get_by_role("status")).to_have_text("Unsaved")
         expect(pad.get_by_role("status")).not_to_contain_text("256 KiB")
@@ -3263,7 +3271,9 @@ def test_truncated_note_warns_until_save_anyway(page, tmp_path, ui_server_factor
             "el => !el.closest('.notepad [aria-live], .notepad [role=status], .notepad [role=alert]')"
         )
         assert warning.evaluate("el => el.getAttribute('role') === 'alert' && !el.closest('[role=status]')")
-        expect(pad.get_by_role("checkbox", name="Keep the tail", exact=True)).to_be_enabled()
+        kept = pad.get_by_role("checkbox", name="Keep the tail", exact=True)
+        expect(kept).to_be_disabled()
+        expect(kept).not_to_be_checked()
         page.set_viewport_size({"width": 375, "height": 812})
         _assert_notes_no_overflow(page)
         page.set_viewport_size({"width": 1400, "height": 1000})
@@ -3276,26 +3286,81 @@ def test_truncated_note_warns_until_save_anyway(page, tmp_path, ui_server_factor
             }).observe(el, {subtree: true, childList: true, characterData: true, attributes: true});
         }""")
 
-        pad.get_by_role("checkbox", name="Keep the tail", exact=True).check()
-        expect(pad.get_by_role("checkbox", name="Keep the tail", exact=True)).to_be_checked()
-        page.clock.fast_forward(800)
-        expect(pad.get_by_role("status")).to_have_text("Unsaved")
-        assert puts() == 0
-        assert _stored_note(page, server, run_id)["text"] == "- [ ] Keep the tail"
         pad.get_by_role("button", name="Edit", exact=True).click()
         area = pad.get_by_label("Note Markdown")
-        expect(area).to_have_value("- [x] Keep the tail")
+        expect(area).to_have_value("- [ ] Keep the tail")
         area.fill("Still truncated")
         page.clock.fast_forward(800)
         expect(pad.get_by_role("status")).to_have_text("Unsaved")
         assert puts() == 0
         assert _stored_note(page, server, run_id)["text"] == original["text"]
         page.clock.fast_forward(60000)
-        expect(warning.locator("p")).to_have_text(warning_text)
+        expect(warning.locator(".note-truncate-copy")).to_have_text(warning_text)
         expect(pad.get_by_role("status")).to_have_text("Unsaved")
         assert page.evaluate("window.truncateMutations") == []
         assert warning.evaluate("el => el === window.truncateWarning")
         assert puts() == 0
+
+        # Closed gate: lifecycle events must not PUT. beforeunload still warns.
+        page.evaluate("() => window.dispatchEvent(new Event('pagehide'))")
+        assert puts() == 0
+        seen = page.evaluate("""() => {
+            const proto = Document.prototype;
+            const previous = Object.getOwnPropertyDescriptor(proto, 'visibilityState');
+            Object.defineProperty(proto, 'visibilityState', {configurable: true, get: () => 'hidden'});
+            try {
+                const state = document.visibilityState;
+                document.dispatchEvent(new Event('visibilitychange'));
+                return state;
+            } finally {
+                Object.defineProperty(proto, 'visibilityState', previous);
+            }
+        }""")
+        assert seen == "hidden"
+        assert puts() == 0
+        unload = page.evaluate("""() => {
+            const event = new Event('beforeunload', {cancelable: true});
+            window.dispatchEvent(event);
+            return {defaultPrevented: event.defaultPrevented, returnValue: event.returnValue};
+        }""")
+        assert unload["defaultPrevented"] is True
+        # Chromium cannot construct BeforeUnloadEvent. On a synthetic Event,
+        # returnValue is the legacy boolean and false means the unload was cancelled.
+        # The handler still assigns "" for a real BeforeUnloadEvent.
+        assert unload["returnValue"] is False
+        assert puts() == 0
+        page.evaluate("() => { location.hash = '#/' }")
+        expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+        assert puts() == 0
+        assert _stored_note(page, server, run_id)["text"] == original["text"]
+
+        page.locator(".notebook").get_by_role("link", name="first notes run", exact=True).click()
+        expect(page.get_by_role("heading", name="first notes run", exact=True)).to_be_visible()
+        pad = page.locator(".notepad")
+        warning = pad.locator(".note-truncate")
+        expect(warning.locator(".note-truncate-copy")).to_have_text(warning_text)
+        expect(pad.get_by_role("checkbox", name="Keep the tail", exact=True)).to_be_disabled()
+        pad.get_by_role("button", name="Edit", exact=True).click()
+        area = pad.get_by_label("Note Markdown")
+        area.fill("Still truncated")
+        page.clock.fast_forward(800)
+        expect(pad.get_by_role("status")).to_have_text("Unsaved")
+        assert puts() == 0
+        area.focus()
+        expect(area).to_be_focused()
+        area.evaluate("el => el.blur()")
+        expect(area).not_to_be_focused()
+        assert puts() == 0
+        page.set_viewport_size({"width": 375, "height": 812})
+        area.press("Control+s")
+        assert puts() == 0
+        expect(warning.get_by_role("button", name="Save anyway", exact=True)).to_be_focused()
+        expect(warning.locator(".note-truncate-hint")).to_have_text(save_hint)
+        _assert_notes_no_overflow(page)
+        page.set_viewport_size({"width": 1400, "height": 1000})
+        pad.locator("button", has_text="Retry").evaluate("el => el.click()")
+        assert puts() == 0
+        assert _stored_note(page, server, run_id)["text"] == original["text"]
 
         with page.expect_response(note_write) as saved:
             warning.get_by_role("button", name="Save anyway", exact=True).click()
@@ -3329,6 +3394,13 @@ def test_truncated_note_warns_until_save_anyway(page, tmp_path, ui_server_factor
             page.reload()
         expect(warning).to_be_visible()
         assert puts() == 0
+        # Reveal the hint, then replace the file. A later truncated conflict
+        # must not show that hint until Ctrl+S or Retry asks for it again.
+        pad.get_by_role("button", name="Edit", exact=True).click()
+        area = pad.get_by_label("Note Markdown")
+        area.press("Control+s")
+        expect(warning.locator(".note-truncate-hint")).to_be_visible()
+        expect(warning.locator(".note-truncate-hint")).to_have_text(save_hint)
         with page.expect_response(note_write) as forced:
             warning.get_by_role("button", name="Save anyway", exact=True).click()
         assert forced.value.ok
@@ -3344,7 +3416,8 @@ def test_truncated_note_warns_until_save_anyway(page, tmp_path, ui_server_factor
         area.fill("- [ ] Local task")
         with page.expect_response(lambda response: response.status == 409 and response.url.endswith("/notes")):
             page.clock.fast_forward(800)
-        expect(warning.locator("p")).to_have_text(warning_text)
+        expect(warning.locator(".note-truncate-copy")).to_have_text(warning_text)
+        expect(warning.locator(".note-truncate-hint")).to_be_hidden()
         expect(pad.locator(".note-conflict")).to_contain_text("This note was changed elsewhere.")
         assert puts() == 2
         area.fill("- [ ] Local task revised")
@@ -3362,13 +3435,32 @@ def test_truncated_note_warns_until_save_anyway(page, tmp_path, ui_server_factor
         assert puts() == 2
         pad.get_by_role("button", name="View", exact=True).click()
         server_box = pad.get_by_role("checkbox", name="Server task", exact=True)
-        server_box.check()
-        expect(server_box).to_be_checked()
+        expect(server_box).to_be_disabled()
         page.clock.fast_forward(800)
-        server_box.uncheck()
-        expect(server_box).not_to_be_checked()
         assert puts() == 2
         assert _stored_note(page, server, run_id)["text"] == "- [x] Confirmed task"
+
+        # A failed Save anyway leaves the gate closed, so Retry must not PUT.
+        mode["fail"] = True
+        with page.expect_response(lambda response: response.status == 503 and response.url.endswith("/notes")):
+            warning.get_by_role("button", name="Save anyway", exact=True).click()
+        assert puts() == 3
+        expect(pad.get_by_role("status")).to_have_text("Save failed")
+        pad.get_by_role("button", name="Retry", exact=True).click()
+        assert puts() == 3
+        expect(pad.get_by_role("status")).to_have_text("Save failed")
+        expect(warning.get_by_role("button", name="Save anyway", exact=True)).to_be_focused()
+        expect(warning.locator(".note-truncate-hint")).to_have_text(save_hint)
+        assert _stored_note(page, server, run_id)["text"] == "- [x] Confirmed task"
+
+        mode["read_only"] = True
+        with page.expect_response(lambda response: response.request.method == "GET" and response.url.endswith("/notes")):
+            page.reload()
+        expect(warning.locator(".note-truncate-copy")).to_have_text(readonly_text)
+        expect(warning).not_to_contain_text("Saving will drop")
+        expect(warning.locator("button", has_text="Save anyway")).to_be_hidden()
+        expect(pad.get_by_role("status")).to_have_text("Read-only dashboard")
+        expect(pad.get_by_role("checkbox", name="Confirmed task", exact=True)).to_be_disabled()
 
 
 def test_launch_note_shows_until_the_notepad_is_edited(page, tmp_path, ui_server_factory):
@@ -3449,3 +3541,108 @@ def test_launch_note_shows_until_the_notepad_is_edited(page, tmp_path, ui_server
         expect(pad).to_contain_text("Frozen idea")
         expect(pad.get_by_role("checkbox", name="look", exact=True)).to_be_disabled()
         _assert_notes_no_overflow(page)
+
+
+def _in_dedicated_live(locator):
+    assert locator.evaluate("""el => {
+      const live = el.closest('[role=status], [role=alert], [aria-live]');
+      return !!live && live !== document.getElementById('app');
+    }""")
+
+
+def _outside_live(locator):
+    # Ancestors only: the relative-time node itself is not a live region either.
+    assert locator.evaluate("""el => {
+      if (el.matches('[aria-live], [role=status], [role=alert]')) return false;
+      for (let node = el.parentElement; node; node = node.parentElement) {
+        const role = node.getAttribute('role');
+        if (node.hasAttribute('aria-live') || role === 'status' || role === 'alert') return false;
+      }
+      return true;
+    }""")
+
+
+def test_page_live_regions_are_dedicated(page, tmp_path, ui_server_factory):
+    """main is quiet; loading, route errors, poll status, and save state each speak for themselves."""
+    root = tmp_path / "live-regions"
+    run_id = _notes_runs(root)["first notes run"]
+    held = []
+
+    def stall_runs(route):
+        held.append(route)
+
+    with ui_server_factory(root) as server:
+        _seed_note(page, server, run_id, "A saved note")
+        page.route("**/api/runs", stall_runs)
+        try:
+            page.goto(f"{server.url}#/run/{run_id}")
+            loading = page.locator("#app").get_by_text("Loading runs…", exact=True)
+            expect(loading).to_be_visible()
+            assert page.locator("main#app").evaluate("el => !el.hasAttribute('aria-live')")
+            expect(loading).to_have_attribute("role", "status")
+            _in_dedicated_live(loading)
+        finally:
+            for route in held:
+                route.continue_()
+            page.unroute("**/api/runs", stall_runs)
+        expect(page.get_by_role("heading", name="first notes run", exact=True)).to_be_visible()
+        assert page.locator("main#app").evaluate("el => !el.hasAttribute('aria-live')")
+        status = page.locator(".poll-status")
+        expect(status).to_have_text("Up to date")
+        expect(status).to_have_attribute("role", "status")
+        expect(status).to_have_attribute("aria-live", "polite")
+        _in_dedicated_live(status)
+        pad = page.locator(".notepad")
+        expect(pad.get_by_role("status")).to_have_text("Saved")
+        _in_dedicated_live(pad.get_by_role("status"))
+        age = pad.locator(".note-save-time")
+        expect(age).to_contain_text(re.compile(r"just now|\d+[mhd] ago"))
+        _outside_live(age)
+
+        page.allow_http_errors = True
+        page.goto(f"{server.url}#/run/unknown-valid-id")
+        error = page.locator("#app .error")
+        expect(error).to_contain_text("404")
+        expect(error).to_have_attribute("role", "alert")
+        _in_dedicated_live(error)
+        assert page.locator("main#app").evaluate("el => !el.hasAttribute('aria-live')")
+
+        home(page, server)
+        expect(page.locator(".runs-workspace > .poll-status")).to_have_attribute("role", "status")
+        edited = page.locator(".notebook .note-time").filter(has_text=re.compile(r"edited "))
+        expect(edited).not_to_have_count(0)
+        _outside_live(edited.first)
+
+        # Two identical /api/runs failures must keep the same alert node.
+        page.allow_http_errors = True
+        page.clock.install()
+        hits = {"count": 0}
+
+        def fail_runs(route):
+            hits["count"] += 1
+            route.fulfill(status=503, body="unavailable")
+
+        page.route("**/api/runs", fail_runs)
+        try:
+            with page.expect_response(lambda response: response.url.endswith("/api/runs") and response.status == 503):
+                page.reload()
+            error = page.locator(".runs-workspace > .stack > .error")
+            expect(error).to_have_count(1)
+            expect(error).to_contain_text("503")
+            error.evaluate("el => { el.__marker = true }")
+            assert hits["count"] == 1
+            with page.expect_response(lambda response: response.url.endswith("/api/runs") and response.status == 503):
+                page.clock.fast_forward(5000)
+            assert hits["count"] == 2
+            # The fetch continuation that paints the alert runs after the response event.
+            page.evaluate("""async () => {
+              const tick = () => new Promise((resolve) => {
+                const channel = new MessageChannel();
+                channel.port1.onmessage = () => resolve();
+                channel.port2.postMessage(0);
+              });
+              for (let i = 0; i < 10; i++) await tick();
+            }""")
+            assert error.evaluate("el => el.isConnected && el.__marker === true")
+        finally:
+            page.unroute("**/api/runs", fail_runs)
