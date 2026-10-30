@@ -15,6 +15,7 @@ from agenticml.code_tracking import (
     DEFAULT_MAX_TOTAL_BYTES,
     RuntimeFileCollector,
     compute_snapshot_hash,
+    default_run_name,
     find_repo_root,
     manifest_to_json,
 )
@@ -43,6 +44,46 @@ def fake_repo(tmp_path: Path) -> Path:
 def test_find_repo_root_walks_up(fake_repo):
     nested = fake_repo / "src"
     assert find_repo_root(nested) == fake_repo
+
+
+@pytest.mark.parametrize("marker", ["pyproject.toml", "setup.py", ".git"])
+def test_default_run_name_relative_to_nearest_repo(tmp_path, marker):
+    (tmp_path / "pyproject.toml").touch()
+    repo = tmp_path / "nested"
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True)
+    (repo / marker).touch()
+    script = scripts / "train.py"
+    script.write_text("pass\n")
+    assert default_run_name(script) == "scripts/train.py"
+    assert default_run_name(str(script)) == "scripts/train.py"
+
+
+def test_default_run_name_without_repo(tmp_path, monkeypatch):
+    monkeypatch.setattr("agenticml.code_tracking.PROJECT_MARKERS", (".missing-marker",))
+    script = tmp_path / "train.py"
+    script.write_text("pass\n")
+    assert default_run_name(script) == script.resolve().as_posix()
+    assert find_repo_root(tmp_path) == tmp_path.resolve()
+
+
+@pytest.mark.parametrize("path", [None, "", "missing.py", "."])
+def test_default_run_name_without_file(path):
+    assert default_run_name(path) is None
+
+
+def test_default_run_name_resolves_symlinks(fake_repo, tmp_path):
+    link = tmp_path / "train.py"
+    link.symlink_to(fake_repo / "src" / "main.py")
+    assert default_run_name(link) == "src/main.py"
+
+
+def test_default_run_name_ignores_os_errors(tmp_path, monkeypatch):
+    def fail(path):
+        raise OSError("unreadable")
+
+    monkeypatch.setattr(Path, "resolve", fail)
+    assert default_run_name(tmp_path / "train.py") is None
 
 
 def test_max_file_bytes_skips_oversized(fake_repo):

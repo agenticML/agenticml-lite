@@ -460,20 +460,28 @@ def _looks_like_virtualenv(path: Path) -> bool:
 
 def find_repo_root(start: Path) -> Path:
     start = start.resolve()
+    return _project_root(start) or start
+
+
+def _project_root(start: Path) -> Path | None:
     for candidate in (start, *start.parents):
         if any((candidate / marker).exists() for marker in PROJECT_MARKERS):
             return candidate
-    return start
+    return None
+
+
+def main_file() -> str | Path | None:
+    """Return ``__main__.__file__`` when it is a string or path."""
+    main = sys.modules.get("__main__")
+    main_file = getattr(main, "__file__", None) if main is not None else None
+    return main_file if isinstance(main_file, (str, Path)) else None
 
 
 def _main_directory() -> Path:
     """Directory of ``__main__.__file__`` when that file exists, else the cwd."""
-    main = sys.modules.get("__main__")
-    main_file = getattr(main, "__file__", None) if main is not None else None
-    if isinstance(main_file, Path):
-        main_file = os.fspath(main_file)
-    if isinstance(main_file, str) and main_file:
-        return Path(main_file).resolve().parent
+    entry_file = main_file()
+    if entry_file:
+        return Path(entry_file).resolve().parent
     return Path.cwd()
 
 
@@ -492,6 +500,25 @@ def default_project(start: Path | None = None) -> str:
         start = _main_directory()
     name = find_repo_root(Path(start)).name
     return name or "default"
+
+
+def default_run_name(path: str | Path | None) -> str | None:
+    """Run name when the caller did not pass one.
+
+    This is the file's POSIX path relative to its nearest project root, or
+    its absolute resolved path when no project marker exists. Missing or
+    unreadable files have no default name.
+    """
+    if not path:
+        return None
+    try:
+        p = Path(path).resolve()
+        if not p.is_file():
+            return None
+        root = _project_root(p.parent)
+        return p.relative_to(root).as_posix() if root is not None else p.as_posix()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
 
 
 def _should_skip(path: Path) -> bool:

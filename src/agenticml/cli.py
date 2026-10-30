@@ -301,7 +301,7 @@ Options must come before the target; everything after it goes to the script.
 
 options:
   --project NAME       project (env AGENTICML_PROJECT; default: repo or directory name)
-  --name NAME          run name (env AGENTICML_NAME; default: script or module name)
+  --name NAME          run name (env AGENTICML_NAME; default: entry file path relative to the repo root (absolute outside a repo), or the module name)
   --tags A,B           comma-separated tags (env AGENTICML_TAGS)
   --notes TEXT         run notes (env AGENTICML_NOTES)
   --group NAME         run group (env AGENTICML_GROUP)

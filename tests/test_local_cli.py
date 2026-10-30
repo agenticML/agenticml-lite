@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 import time
 
 from agenticml import cli
@@ -205,6 +206,7 @@ def test_verbose_init_and_sync_label_omit_literal_none(tmp_path, monkeypatch, ca
     monkeypatch.delenv("AGENTICML_DIR", raising=False)
     monkeypatch.delenv("AGENTICML_PROJECT", raising=False)
     monkeypatch.delenv("AGENTICML_NAME", raising=False)
+    monkeypatch.delattr(sys.modules["__main__"], "__file__", raising=False)
     run = agenticml.init(
         project="p",
         name=None,

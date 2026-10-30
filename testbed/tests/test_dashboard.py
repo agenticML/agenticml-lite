@@ -141,6 +141,47 @@ def test_home_lists_every_run(page, ui_server):
                 expect(row(page, run["name"]).locator(".run-number").first).to_have_attribute("title", key)
 
 
+def test_long_path_run_names_fit_mobile(page, tmp_path, ui_server_factory):
+    root = tmp_path / "long-names"
+    names = [f"experiments/vision/{'resnet_' * 30}/train_{index}.py" for index in range(2)]
+    ids = _lineage_project(root, names)
+    for run_id in ids:
+        writer = RunWriter.resume(root, run_id, must=True)
+        writer.write_scalars([(0, {"loss": 1.0}), (1, {"loss": 0.5})])
+        writer.finish("finished")
+
+    def assert_no_overflow():
+        overflow = page.evaluate(
+            "Math.max(document.documentElement.scrollWidth - document.documentElement.clientWidth, document.body.scrollWidth - document.body.clientWidth)"
+        )
+        assert overflow <= 0, f"long run names overflow horizontally by {overflow}px"
+
+    with ui_server_factory(root) as server:
+        page.set_viewport_size({"width": 375, "height": 812})
+        home(page, server)
+        for name in names:
+            expect(row(page, name).locator(".run-name")).to_have_attribute("title", name)
+        node = page.locator(f'.lineage-node[data-run-id="{ids[1]}"]')
+        expect(node).to_be_visible()
+        expect(node.locator(":scope > title")).to_contain_text(names[1])
+        node.click()
+        expect(page.locator(".lineage-detail")).to_contain_text(names[0])
+        assert_no_overflow()
+        for name in names:
+            page.get_by_role("checkbox", name=f"Select {name}", exact=True).check()
+        page.get_by_role("button", name="Compare runs", exact=True).click()
+        expect(page.get_by_role("heading", name="Compare runs", exact=True)).to_be_visible()
+        selected = page.get_by_test_id("selected-runs")
+        for name in names:
+            expect(selected.get_by_text(name, exact=True)).to_have_attribute("title", name)
+        expect(page.locator(".legend")).to_contain_text(names[0])
+        assert_no_overflow()
+        assert page.locator(".focus-body").evaluate("el => el.scrollWidth <= el.clientWidth")
+        page.goto(f"{server.url}#/run/{ids[0]}")
+        expect(page.get_by_role("heading", name=names[0], exact=True)).to_be_visible()
+        assert_no_overflow()
+
+
 def test_project_filter_and_search(page, ui_server):
     home(page, ui_server)
     page.get_by_role("tab", name="testbed", exact=True).click()
