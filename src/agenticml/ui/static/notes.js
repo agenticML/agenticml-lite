@@ -875,6 +875,7 @@ export function createNotebook({ el, button, get, routeRun }) {
           class: "mono notebook-run",
           href: routeRun(note.run_id),
           text: note.name || note.run_id,
+          title: note.name || note.run_id,
         }),
         el("span", {
           class: `chip ${{ running: "accent", finished: "ok", crashed: "danger", stale: "warn" }[status] || ""}`,

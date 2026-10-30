@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 
 import pytest
 from agenticml.store import RunWriter
+from agenticml.store.notes import write_note
 from agenticml.store.reader import RunReader
 
 pytest.importorskip("playwright.sync_api")
@@ -2568,6 +2569,24 @@ def test_notes_mobile_overflow_and_toolbar(page, tmp_path, ui_server_factory, wi
 def _assert_notes_no_overflow(page):
     overflow = page.evaluate("Math.max(document.documentElement.scrollWidth-document.documentElement.clientWidth, document.body.scrollWidth-document.body.clientWidth)")
     assert overflow <= 0, f"notes overflow horizontally by {overflow}px"
+
+
+@pytest.mark.parametrize("width", [375, 360])
+def test_notebook_long_path_run_name_has_title_and_fits(page, tmp_path, ui_server_factory, width):
+    root = tmp_path / "notebook-long-name"
+    name = "experiments/very/long/nested/directory/structure/for/tests/train_with_a_really_long_script_name.py"
+    writer = RunWriter.create(root, meta={"name": name, "project": "demo"})
+    writer.finish("finished")
+    write_note(root, writer.run_id, "- [ ] todo", None)
+    page.set_viewport_size({"width": width, "height": 812})
+    with ui_server_factory(root) as server:
+        home(page, server)
+        link = page.locator(".notebook .notebook-run")
+        expect(link).to_be_visible()
+        expect(link).to_have_attribute("title", name)
+        assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+        bounds = link.bounding_box()
+        assert 0 <= bounds["x"] and bounds["x"] + bounds["width"] <= width
 
 
 def test_notes_rendering_safety_and_markdown(page, tmp_path, ui_server_factory):
