@@ -11,6 +11,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 
 import pytest
 
@@ -181,7 +182,7 @@ def test_get_only(dashboard,method):
         assert json.loads(body) == {'error':'method not allowed'}
 
 
-@pytest.mark.parametrize('name',['index.html','app.js','app.css','charts.js','code.js'])
+@pytest.mark.parametrize('name',['index.html','app.js','app.css','charts.js','code.js','codediff.js'])
 def test_static(dashboard,name):
     path = '/' if name == 'index.html' else '/static/'+name
     status, headers, body = dashboard[0](path)
@@ -192,9 +193,10 @@ def test_static(dashboard,name):
 
 
 def test_static_allowlist():
-    assert list(server._FILES) == ['index.html','app.js','app.css','charts.js','code.js']
+    assert list(server._FILES) == ['index.html','app.js','app.css','charts.js','code.js','codediff.js']
     assert server._FILES['charts.js'] == 'text/javascript; charset=utf-8'
     assert server._FILES['code.js'] == 'text/javascript; charset=utf-8'
+    assert server._FILES['codediff.js'] == 'text/javascript; charset=utf-8'
 
 
 @pytest.mark.parametrize('name',['uPlot.iife.min.js','uPlot.min.css','uPlot.LICENSE'])
@@ -1551,3 +1553,595 @@ def test_lineage_inference_resolves_each_root_once(tmp_path, monkeypatch):
         assert nodes[ids[index]]['parent_run_id'] == ids[index - 1]
         assert nodes[ids[index]]['parent_inference'] == 'repo_root'
         assert nodes[ids[index]]['parent_run_id'] != ids[index]
+
+
+def _write_code_run(root, run_id, files):
+    _seed_run(root, run_id, project='compare', name=run_id, second=0)
+    manifest = []
+    for path, blob in files.items():
+        sha = hashlib.sha256(blob).hexdigest()
+        obj = root / 'objects' / sha[:2] / sha
+        obj.parent.mkdir(parents=True, exist_ok=True)
+        obj.write_bytes(blob)
+        manifest.append(dict(path=path, sha256=sha, size=len(blob),
+                             content_type='text/plain', source='code'))
+    (root / 'runs' / run_id / 'events.jsonl').write_text(
+        json.dumps({'kind': 'code', 'manifest': manifest}) + '\n')
+    return {entry['path']: entry for entry in manifest}
+
+
+def _compare_code(dashboard, base='base', target='target'):
+    return load(dashboard, f'/api/compare/code?base={base}&target={target}')
+
+
+def test_compare_code_statuses_and_summary(dashboard, tmp_path):
+    base = _write_code_run(tmp_path, 'base', {
+        'z-unchanged': b'same\n', 'c-removed': b'gone\nforever\n',
+        'b-modified': b'one\nold\nthree\n', 'a-unchanged': b'also same\n',
+    })
+    target = _write_code_run(tmp_path, 'target', {
+        'a-unchanged': b'also same\n', 'b-modified': b'one\nnew\nextra\nthree\n',
+        'd-added': b'hello\n', 'z-unchanged': b'same\n',
+    })
+    result = _compare_code(dashboard)
+    assert result['base'] == 'base' and result['target'] == 'target'
+    assert result['truncated'] is False
+    assert result['files_total'] == 5
+    assert result['summary'] == dict(added=1, removed=1, modified=1, unchanged=2,
+                                     lines_added=3, lines_deleted=3)
+    assert [(row['path'], row['status']) for row in result['files']] == [
+        ('b-modified', 'modified'), ('c-removed', 'removed'), ('d-added', 'added'),
+        ('a-unchanged', 'unchanged'), ('z-unchanged', 'unchanged'),
+    ]
+    for row in result['files']:
+        assert row['binary'] is False and row['too_large'] is False
+        assert row['approximate'] is False
+        assert row['patch_truncated'] is False
+        for side, manifest in (('base', base), ('target', target)):
+            entry = manifest.get(row['path'], {})
+            assert row[side + '_sha256'] == entry.get('sha256')
+            assert row[side + '_size'] == entry.get('size')
+        if row['status'] == 'unchanged':
+            assert row['hunks'] == [] and row['added'] == row['deleted'] == 0
+    removed, added = result['files'][1:3]
+    assert (removed['added'], removed['deleted']) == (0, 2)
+    assert removed['hunks'][0] == dict(base_start=1, base_count=2, target_start=1, target_count=0,
+                                     lines=[dict(type='removed', text=text, base_line=i, target_line=None)
+                                            for i, text in enumerate(('gone', 'forever'), 1)])
+    assert (added['added'], added['deleted']) == (1, 0)
+    assert added['hunks'][0] == dict(base_start=1, base_count=0, target_start=1, target_count=1,
+                                   lines=[dict(type='added', text='hello', base_line=None, target_line=1)])
+
+
+def test_compare_code_hunk_line_numbers(dashboard, tmp_path):
+    _write_code_run(tmp_path, 'base', {'edit': b'one\nold\nthree\n'})
+    _write_code_run(tmp_path, 'target', {'edit': b'one\nnew\nextra\nthree\n'})
+    row = _compare_code(dashboard)['files'][0]
+    assert (row['added'], row['deleted']) == (2, 1)
+    assert row['hunks'] == [dict(base_start=1, base_count=3, target_start=1, target_count=4, lines=[
+        dict(type='context', text='one', base_line=1, target_line=1),
+        dict(type='removed', text='old', base_line=2, target_line=None),
+        dict(type='added', text='new', base_line=None, target_line=2),
+        dict(type='added', text='extra', base_line=None, target_line=3),
+        dict(type='context', text='three', base_line=3, target_line=4),
+    ])]
+
+
+def test_compare_code_separated_hunks(dashboard, tmp_path):
+    lines = [f'line {i}\n' for i in range(1, 21)]
+    changed = list(lines)
+    changed[4] = 'replacement\n'
+    changed[15] = 'another replacement\n'
+    _write_code_run(tmp_path, 'base', {'edit': ''.join(lines).encode()})
+    _write_code_run(tmp_path, 'target', {'edit': ''.join(changed).encode()})
+    row = _compare_code(dashboard)['files'][0]
+    assert (row['added'], row['deleted']) == (2, 2)
+    assert [(h['base_start'], h['target_start'], h['base_count'], h['target_count'])
+            for h in row['hunks']] == [(2, 2, 7, 7), (13, 13, 7, 7)]
+    assert row['hunks'][1]['lines'][-1] == dict(type='context', text='line 19',
+                                              base_line=19, target_line=19)
+
+
+@pytest.mark.parametrize('blob', [b'contains\x00nul', b'bad utf8\xff'])
+@pytest.mark.parametrize('side', ['base', 'target'])
+def test_compare_code_binary(dashboard, tmp_path, blob, side):
+    _write_code_run(tmp_path, 'base', {'file': blob if side == 'base' else b'text'})
+    _write_code_run(tmp_path, 'target', {'file': blob if side == 'target' else b'text'})
+    result = _compare_code(dashboard)
+    row = result['files'][0]
+    assert row['binary'] is True and row['too_large'] is False
+    assert row['added'] is row['deleted'] is None
+    assert row['hunks'] == [] and row['patch_truncated'] is False
+    assert result['summary']['lines_added'] == result['summary']['lines_deleted'] == 0
+
+
+def test_compare_code_large_snapshot_bounded_read(dashboard, tmp_path, monkeypatch):
+    cap = server._CODE_DIFF_MAX_BYTES
+    _write_code_run(tmp_path, 'base', {})
+    _write_code_run(tmp_path, 'target', {'large': b'x' * (cap + 100)})
+    original = server._open_regular_object
+    reads = []
+
+    class BoundedRead:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.stream.close()
+
+        def read(self, size=-1):
+            assert size == cap + 1
+            reads.append(size)
+            return self.stream.read(size)
+
+    monkeypatch.setattr(server, '_open_regular_object', lambda *args: BoundedRead(original(*args)))
+    row = _compare_code(dashboard)['files'][0]
+    assert reads == [cap + 1]
+    assert row['too_large'] is True and row['binary'] is False
+    assert row['added'] is row['deleted'] is None
+    assert row['hunks'] == [] and row['patch_truncated'] is False
+
+
+def test_compare_code_exact_byte_cap(dashboard, tmp_path, monkeypatch):
+    monkeypatch.setattr(server, '_CODE_DIFF_MAX_BYTES', 4)
+    _write_code_run(tmp_path, 'base', {})
+    _write_code_run(tmp_path, 'target', {'exact': b'abcd'})
+    row = _compare_code(dashboard)['files'][0]
+    assert row['too_large'] is False and row['added'] == 1
+    assert row['hunks'][0]['lines'][0]['text'] == 'abcd'
+
+
+@pytest.mark.parametrize('failure', ['missing', 'unreadable', 'symlink'])
+def test_compare_code_snapshot_unavailable(dashboard, tmp_path, monkeypatch, failure):
+    _write_code_run(tmp_path, 'base', {})
+    manifest = _write_code_run(tmp_path, 'target', {'bad': b'snapshot', 'good': b'available\n'})
+    sha = manifest['bad']['sha256']
+    obj = tmp_path / 'objects' / sha[:2] / sha
+    if failure == 'unreadable':
+        original = server._open_regular_object
+
+        def unavailable(root, digest):
+            if digest == sha:
+                raise PermissionError(str(obj))
+            return original(root, digest)
+
+        monkeypatch.setattr(server, '_open_regular_object', unavailable)
+    else:
+        obj.unlink()
+        if failure == 'symlink':
+            obj.symlink_to(Path(__file__))
+    result = _compare_code(dashboard)
+    row, good = result['files']
+    assert row['error'] == 'snapshot unavailable' and row['too_large'] is True
+    assert row['binary'] is False and row['hunks'] == []
+    assert row['added'] is row['deleted'] is None
+    assert good['added'] == 1
+    assert str(tmp_path) not in json.dumps(result)
+    # A missing object may arrive later; failures must not poison the pair cache.
+    if failure == 'missing':
+        obj.write_bytes(b'snapshot')
+        recovered = _compare_code(dashboard)['files'][0]
+        assert 'error' not in recovered and recovered['added'] == 1
+
+
+@pytest.mark.parametrize('query,status', [
+    ('', 400), ('?base=run-1', 400), ('?target=run-1', 400),
+    ('?base=&target=run-1', 400), ('?base=run-1&target=', 400),
+    ('?base=..%2Fx&target=run-1', 400), ('?base=run-1&target=%00', 400),
+    ('?base=.hidden&target=run-1', 400), ('?base=run-1&target=bad%5Cid', 400),
+    ('?base=missing&target=run-1', 404), ('?base=run-1&target=missing', 404),
+])
+def test_compare_code_errors(dashboard, tmp_path, query, status):
+    code, headers, raw = dashboard[0]('/api/compare/code' + query)
+    assert code == status and headers['Content-Type'] == 'application/json'
+    assert json.loads(raw)['error']
+    assert str(tmp_path).encode() not in raw
+
+
+@pytest.mark.parametrize('side', ['base', 'target'])
+def test_compare_code_run_containment(dashboard, tmp_path, side):
+    # Even a valid run elsewhere inside the store must stay under runs/.
+    _write_code_run(tmp_path, 'linked', {})
+    (tmp_path / 'runs' / 'linked').rename(tmp_path / 'elsewhere')
+    (tmp_path / 'runs' / 'linked').symlink_to(tmp_path / 'elsewhere', target_is_directory=True)
+    base, target = ('linked', 'run-1') if side == 'base' else ('run-1', 'linked')
+    code, _, raw = dashboard[0](f'/api/compare/code?base={base}&target={target}')
+    assert code == 404
+    assert str(tmp_path).encode() not in raw
+
+
+def test_compare_code_same_run_no_object_reads(dashboard, tmp_path, monkeypatch):
+    _write_code_run(tmp_path, 'base', {'z': b'\x00binary', 'a': b'text\n'})
+    original_manifest = server.reader.RunReader.code_manifest
+    manifests = []
+
+    def tracked_manifest(run):
+        manifests.append(run.run_dir)
+        return original_manifest(run)
+
+    def unexpected_read(*args):
+        pytest.fail('unchanged snapshots must not be read')
+
+    monkeypatch.setattr(server, '_open_regular_object', unexpected_read)
+    monkeypatch.setattr(server.reader.RunReader, 'code_manifest', tracked_manifest)
+    result = _compare_code(dashboard, 'base', 'base')
+    assert manifests == [tmp_path / 'runs' / 'base']
+    assert result['base'] == result['target'] == 'base'
+    assert result['summary'] == dict(added=0, removed=0, modified=0, unchanged=2,
+                                     lines_added=0, lines_deleted=0)
+    assert [row['path'] for row in result['files']] == ['a', 'z']
+    for row in result['files']:
+        assert row['status'] == 'unchanged' and row['hunks'] == []
+        assert row['added'] == row['deleted'] == 0
+
+
+def test_compare_code_line_caps_and_cache(dashboard, tmp_path, monkeypatch):
+    monkeypatch.setattr(server, '_CODE_DIFF_FILE_LINES', 4)
+    monkeypatch.setattr(server, '_CODE_DIFF_TOTAL_LINES', 6)
+    _write_code_run(tmp_path, 'base', {'unchanged': b'same'})
+    _write_code_run(tmp_path, 'target', {
+        'a': b'1\n2\n3\n4\n5\n6\n', 'b': b'x\ny\nz\n',
+        'c': b'skipped\n', 'unchanged': b'same',
+    })
+    original = server._open_regular_object
+    reads = []
+
+    def tracked(root, sha):
+        reads.append(sha)
+        return original(root, sha)
+
+    monkeypatch.setattr(server, '_open_regular_object', tracked)
+    result = _compare_code(dashboard)
+    a, b, c, unchanged = result['files']
+    assert [len(row['hunks'][0]['lines']) for row in (a, b)] == [4, 2]
+    assert a['added'] == 6 and b['added'] == 3
+    assert all(row['patch_truncated'] for row in (a, b, c))
+    assert c['hunks'] == [] and c['added'] is c['deleted'] is None
+    assert unchanged['patch_truncated'] is False and unchanged['added'] == 0
+    assert result['summary']['lines_added'] == 9
+    assert len(reads) == 2
+    assert _compare_code(dashboard) == result and len(reads) == 2
+    # More response budget recovers the cached, untrimmed second patch.
+    monkeypatch.setattr(server, '_CODE_DIFF_TOTAL_LINES', 20)
+    expanded = _compare_code(dashboard)
+    assert len(expanded['files'][1]['hunks'][0]['lines']) == 3
+    assert expanded['files'][1]['patch_truncated'] is False
+    assert expanded['files'][2]['added'] == 1 and len(reads) == 3
+    # Pair cache keys include the file and byte caps.
+    monkeypatch.setattr(server, '_CODE_DIFF_FILE_LINES', 8)
+    expanded = _compare_code(dashboard)
+    assert len(expanded['files'][0]['hunks'][0]['lines']) == 6
+    assert expanded['files'][0]['patch_truncated'] is False
+    assert len(reads) == 6
+    monkeypatch.setattr(server, '_CODE_DIFF_MAX_BYTES', 1)
+    capped = _compare_code(dashboard)
+    assert all(row['too_large'] for row in capped['files'][:3]) and len(reads) == 9
+
+
+def test_compare_code_patch_cap_exact_and_multiple_hunks(dashboard, tmp_path, monkeypatch):
+    monkeypatch.setattr(server, '_CODE_DIFF_FILE_LINES', 2)
+    _write_code_run(tmp_path, 'base', {})
+    _write_code_run(tmp_path, 'target', {'exact': b'one\ntwo\n'})
+    row = _compare_code(dashboard)['files'][0]
+    assert row['patch_truncated'] is False
+    assert len(row['hunks'][0]['lines']) == 2
+    # Spending a cap exactly at a hunk boundary still marks later hunks omitted.
+    lines = [f'{i}\n' for i in range(20)]
+    changed = ['first\n', *lines[1:-1], 'last\n']
+    _write_code_run(tmp_path, 'before', {'edit': ''.join(lines).encode()})
+    _write_code_run(tmp_path, 'after', {'edit': ''.join(changed).encode()})
+    monkeypatch.setattr(server, '_CODE_DIFF_FILE_LINES', 5)
+    row = _compare_code(dashboard, 'before', 'after')['files'][0]
+    assert row['patch_truncated'] is True and len(row['hunks']) == 1
+    assert len(row['hunks'][0]['lines']) == 5
+    assert row['added'] == row['deleted'] == 2
+
+
+def test_compare_code_file_truncation(dashboard, tmp_path, monkeypatch):
+    monkeypatch.setattr(server, '_CODE_DIFF_FILES', 2)
+    _write_code_run(tmp_path, 'base', {'a-unchanged': b'same', 'b-removed': b'old\n'})
+    _write_code_run(tmp_path, 'target', {'a-unchanged': b'same', 'c-added': b'new\n', 'd-added': b'more\n'})
+    result = _compare_code(dashboard)
+    assert result['truncated'] is True
+    assert result['files_total'] == 4
+    assert [(row['path'], row['status']) for row in result['files']] == [
+        ('b-removed', 'removed'), ('c-added', 'added')]
+    assert result['summary'] == dict(added=2, removed=1, modified=0, unchanged=1,
+                                     lines_added=1, lines_deleted=1)
+    monkeypatch.setattr(server, '_CODE_DIFF_FILES', 4)
+    expanded = _compare_code(dashboard)
+    assert expanded['truncated'] is False
+    assert expanded['files_total'] == len(expanded['files']) == 4
+
+
+def test_compare_code_cache_bounded_and_store_scoped(dashboard, tmp_path, monkeypatch):
+    monkeypatch.setattr(server, '_CODE_DIFF_CACHE_SIZE', 2)
+    _write_code_run(tmp_path, 'base', {})
+    _write_code_run(tmp_path, 'target', {'a': b'1\n', 'b': b'2\n', 'c': b'3\n'})
+    _compare_code(dashboard)
+    assert len(dashboard[1].code_diffs) == 2
+    other = tmp_path / 'another-store'
+    _write_code_run(other, 'base', {})
+    manifest = _write_code_run(other, 'target', {'a': b'1\n', 'b': b'2\n', 'c': b'3\n'})
+    sha = manifest['c']['sha256']
+    (other / 'objects' / sha[:2] / sha).unlink()
+    httpd, thread = _serve(other)
+    try:
+        result = _body(httpd, '/api/compare/code?base=base&target=target')
+    finally:
+        _stop(httpd, thread)
+    assert result['files'][2]['error'] == 'snapshot unavailable'
+
+
+@pytest.mark.parametrize('threshold', [0, 25_000_000])
+def test_compare_code_repeated_lines_small_edit(dashboard, tmp_path, monkeypatch, threshold):
+    monkeypatch.setattr(server, '_CODE_DIFF_AUTOJUNK_THRESHOLD', threshold)
+    before = ['}\n'] * 220 + ['old\n'] + ['}\n'] * 220
+    after = before.copy()
+    after[220] = 'new\n'
+    _write_code_run(tmp_path, 'base', {'edit': ''.join(before).encode()})
+    _write_code_run(tmp_path, 'target', {'edit': ''.join(after).encode()})
+    row = _compare_code(dashboard)['files'][0]
+    assert row['added'] == row['deleted'] == 1
+    assert row['approximate'] is (threshold == 0)
+    assert len(row['hunks']) == 1
+    hunk = row['hunks'][0]
+    assert (hunk['base_start'], hunk['target_start']) == (218, 218)
+    assert hunk['base_count'] == hunk['target_count'] == 7
+    assert hunk['lines'][0] == dict(type='context', text='}', base_line=218, target_line=218)
+    assert hunk['lines'][-1] == dict(type='context', text='}', base_line=224, target_line=224)
+    assert [line['text'] for line in row['hunks'][0]['lines']
+            if line['type'] != 'context'] == ['old', 'new']
+
+
+@pytest.mark.parametrize('rewrite', [False, True])
+def test_compare_code_large_repetitive_file_fast(dashboard, tmp_path, rewrite):
+    repeated = ['', '    return x', '}']
+    before = [repeated[i % 3] if i % 5 < 3 else f'value = {i}' for i in range(20000)]
+    after = [f'rewritten = {i}' for i in range(20000)] if rewrite else before.copy()
+    if not rewrite:
+        for i in range(100, 20000, 400):
+            after[i] = f'edited = {i}'
+    _write_code_run(tmp_path, 'base', {'edit': ('\n'.join(before) + '\n').encode()})
+    _write_code_run(tmp_path, 'target', {'edit': ('\n'.join(after) + '\n').encode()})
+    started = time.monotonic()
+    row = _compare_code(dashboard)['files'][0]
+    elapsed = time.monotonic() - started
+    assert elapsed < 2, f'large repetitive diff took {elapsed:.3f}s'
+    assert row['approximate'] is True
+    assert not row['too_large'] and row['hunks']
+    assert row['added'] > 0 and row['deleted'] > 0
+
+
+def test_compare_code_approximate_cache_key(dashboard, tmp_path, monkeypatch):
+    _write_code_run(tmp_path, 'base', {'edit': b'context\nold\ncontext\n'})
+    _write_code_run(tmp_path, 'target', {'edit': b'context\nnew\ncontext\n'})
+    monkeypatch.setattr(server, '_CODE_DIFF_AUTOJUNK_THRESHOLD', 0)
+    approximate = _compare_code(dashboard)['files'][0]
+    assert approximate['approximate'] is True
+    # The middle is one line per side; equal edges must not count toward the threshold.
+    monkeypatch.setattr(server, '_CODE_DIFF_AUTOJUNK_THRESHOLD', 1)
+    exact = _compare_code(dashboard)['files'][0]
+    assert exact == dict(approximate, approximate=False)
+    assert len(dashboard[1].code_diffs) == 2
+
+
+@pytest.mark.parametrize('side', ['base', 'target'])
+def test_compare_code_input_line_ceiling(dashboard, tmp_path, monkeypatch, side):
+    monkeypatch.setattr(server, '_CODE_DIFF_MAX_LINES', 3)
+    for run_id in ('base', 'target'):
+        _write_code_run(tmp_path, run_id, {'many': b'line\n' * 4 if run_id == side else b'few\n'})
+
+    def unexpected_match(*args, **kwargs):
+        pytest.fail('snapshots above the line ceiling must not reach SequenceMatcher')
+
+    monkeypatch.setattr(server.difflib, 'SequenceMatcher', unexpected_match)
+    row = _compare_code(dashboard)['files'][0]
+    assert row['too_large'] is True and row['hunks'] == []
+    assert row['added'] is row['deleted'] is None
+
+
+def test_compare_code_exact_input_line_ceiling(dashboard, tmp_path, monkeypatch):
+    monkeypatch.setattr(server, '_CODE_DIFF_MAX_LINES', 3)
+    _write_code_run(tmp_path, 'base', {})
+    _write_code_run(tmp_path, 'target', {'exact': b'one\ntwo\nthree\n'})
+    row = _compare_code(dashboard)['files'][0]
+    assert row['too_large'] is False and row['added'] == 3
+
+
+def test_compare_code_oversized_files_share_read_budget(dashboard, tmp_path, monkeypatch):
+    monkeypatch.setattr(server, '_CODE_DIFF_MAX_BYTES', 64)
+    monkeypatch.setattr(server, '_CODE_DIFF_TOTAL_BYTES', 3 * 65 + 7)
+    for run_id in ('base', 'target'):
+        _write_code_run(tmp_path, run_id, {
+            f'{i:03d}': f'{run_id}-{i:03d}'.encode().ljust(80, b'x') for i in range(500)
+        })
+    original = server._open_regular_object
+    reads = []
+
+    class TrackedRead:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.stream.close()
+
+        def read(self, size):
+            blob = self.stream.read(size)
+            reads.append(len(blob))
+            return blob
+
+    monkeypatch.setattr(server, '_open_regular_object', lambda *args: TrackedRead(original(*args)))
+    result = _compare_code(dashboard)
+    assert reads == [65, 65, 65, 7]  # Never read the second side of an oversized pair.
+    assert sum(reads) == server._CODE_DIFF_TOTAL_BYTES
+    assert len(result['files']) == 500
+    assert all(row['too_large'] and not row['patch_truncated'] for row in result['files'][:3])
+    for row in result['files'][3:]:
+        assert row['patch_truncated'] is True and row['hunks'] == []
+        assert row['added'] is row['deleted'] is None
+
+
+@pytest.mark.parametrize('first', [b'alpha\n', b'\x00alpha'])
+def test_compare_code_read_budget_cache_hits_are_free(dashboard, tmp_path, monkeypatch, first):
+    monkeypatch.setattr(server, '_CODE_DIFF_TOTAL_BYTES', 7)
+    _write_code_run(tmp_path, 'base', {})
+    _write_code_run(tmp_path, 'target', {'a': first, 'b': b'bravo\n', 'c': b'charlie\n'})
+    result = _compare_code(dashboard)
+    assert result['files'][0]['binary'] == (b'\x00' in first)
+    for row in result['files'][1:]:
+        assert row['patch_truncated'] is True and row['hunks'] == []
+        assert row['added'] is row['deleted'] is None
+    assert len(dashboard[1].code_diffs) == 1
+    # The first result is cached, while the incomplete second read must retry.
+    result = _compare_code(dashboard)
+    assert result['files'][1]['added'] == 1
+    assert result['files'][1]['patch_truncated'] is False
+    assert result['files'][2]['patch_truncated'] is True
+    assert len(dashboard[1].code_diffs) == 2
+
+
+@pytest.mark.parametrize('size', [1024 * 1024, 3 * 1024 * 1024])
+def test_compare_code_single_long_line_clipped(dashboard, tmp_path, monkeypatch, size):
+    monkeypatch.setattr(server, '_CODE_DIFF_MAX_BYTES', size)
+    _write_code_run(tmp_path, 'base', {})
+    _write_code_run(tmp_path, 'target', {'long': b'x' * size})
+    result = _compare_code(dashboard)
+    row = result['files'][0]
+    assert row['added'] == 1 and row['deleted'] == 0 and row['too_large'] is False
+    assert row['patch_truncated'] is True
+    assert row['hunks'][0]['lines'] == [dict(
+        type='added', text='x' * server._CODE_DIFF_LINE_CHARS, clipped=True,
+        base_line=None, target_line=1,
+    )]
+    assert len(json.dumps(result)) < 10000
+    cached = next(iter(dashboard[1].code_diffs.values()))
+    assert cached['hunks'][0]['lines'][0]['text'] == 'x' * server._CODE_DIFF_LINE_CHARS
+    assert _compare_code(dashboard) == result
+    # Changing the display limit must invalidate the pair cache.
+    monkeypatch.setattr(server, '_CODE_DIFF_LINE_CHARS', 10)
+    assert len(_compare_code(dashboard)['files'][0]['hunks'][0]['lines'][0]['text']) == 10
+
+
+@pytest.mark.parametrize('text_budget', [6, 8])
+def test_compare_code_emitted_text_budget(dashboard, tmp_path, monkeypatch, text_budget):
+    monkeypatch.setattr(server, '_CODE_DIFF_TEXT_BYTES', text_budget)
+    _write_code_run(tmp_path, 'base', {})
+    _write_code_run(tmp_path, 'target', {'a': 'ééé\n'.encode(), 'b': b'next\n', 'c': b'last\n'})
+    reads = []
+    original = server._open_regular_object
+
+    def tracked(*args):
+        reads.append(args[1])
+        return original(*args)
+
+    monkeypatch.setattr(server, '_open_regular_object', tracked)
+    result = _compare_code(dashboard)
+    a, b, c = result['files']
+    assert a['hunks'][0]['lines'][0]['text'] == 'ééé'
+    assert a['patch_truncated'] is False
+    assert b['hunks'] == [] and b['patch_truncated'] is True
+    assert c['hunks'] == [] and c['patch_truncated'] is True
+    assert c['added'] is c['deleted'] is None
+    assert len(reads) == (1 if text_budget == 6 else 2)
+    assert sum(len(line['text'].encode()) for row in result['files']
+               for hunk in row['hunks'] for line in hunk['lines']) <= text_budget
+    # Response trimming must leave the cached b patch available in a later request.
+    if text_budget == 8:
+        cached = [diff for diff in dashboard[1].code_diffs.values() if diff['added'] == 1]
+        assert any(diff['hunks'][0]['lines'][0]['text'] == 'next' for diff in cached)
+    monkeypatch.setattr(server, '_CODE_DIFF_TEXT_BYTES', 100)
+    assert all(not row['patch_truncated'] for row in _compare_code(dashboard)['files'])
+
+
+def test_compare_code_deadline_between_files(dashboard, tmp_path, monkeypatch):
+    _write_code_run(tmp_path, 'base', {})
+    _write_code_run(tmp_path, 'target', {'a': b'first\n', 'b': b'second\n'})
+    original = server.DashboardServer.code_pair_diff
+    calls = []
+
+    def expire_after_first(httpd, base, target, budget):
+        calls.append(target)
+        result = original(httpd, base, target, budget)
+        budget.deadline = server.time.monotonic() - 1
+        return result
+
+    monkeypatch.setattr(server.DashboardServer, 'code_pair_diff', expire_after_first)
+    a, b = _compare_code(dashboard)['files']
+    assert a['added'] == 1 and a['patch_truncated'] is False
+    assert b['added'] is b['deleted'] is None
+    assert b['hunks'] == [] and b['patch_truncated'] is True
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('digest', [None, 'not-hex', ['a' * 64]])
+@pytest.mark.parametrize('side', ['base', 'target', 'both'])
+def test_compare_code_invalid_manifest_digest(dashboard, tmp_path, monkeypatch, digest, side):
+    _write_code_run(tmp_path, 'base', {'bad': b'original\n', 'good': b'same\n'})
+    _write_code_run(tmp_path, 'target', {'bad': b'changed\n', 'good': b'same\n'})
+    for run_id in ('base', 'target'):
+        if side not in (run_id, 'both'):
+            continue
+        events = tmp_path / 'runs' / run_id / 'events.jsonl'
+        event = json.loads(events.read_text())
+        bad = event['manifest'][0]
+        if digest is None:
+            bad.pop('sha256')
+        else:
+            bad['sha256'] = digest
+        events.write_text(json.dumps(event) + '\n')
+
+    def unexpected_read(*args):
+        pytest.fail('invalid digests must be rejected before object/cache access')
+
+    monkeypatch.setattr(server, '_open_regular_object', unexpected_read)
+    result = _compare_code(dashboard)
+    row, good = result['files']
+    assert row['status'] == 'modified' and row['error'] == 'snapshot unavailable'
+    assert row['hunks'] == [] and row['added'] is row['deleted'] is None
+    assert good['status'] == 'unchanged'
+    assert result['summary']['modified'] == result['summary']['unchanged'] == 1
+    assert not dashboard[1].code_diffs
+    assert str(tmp_path) not in json.dumps(result)
+
+
+@pytest.mark.parametrize('before,after,newline_change', [
+    (b'one\ntwo\n', b'one\r\ntwo\r\n', False),
+    (b'one\n', b'one', True),
+    (b'one', b'one\n', True),
+    (b'\n', b'', True),
+])
+def test_compare_code_newline_differences(dashboard, tmp_path, before, after, newline_change):
+    _write_code_run(tmp_path, 'base', {'edit': before})
+    _write_code_run(tmp_path, 'target', {'edit': after})
+    row = _compare_code(dashboard)['files'][0]
+    assert row['status'] == 'modified' and row['hunks']
+    assert row['newline_change'] is newline_change
+    assert row['added'] + row['deleted'] > 0
+    if b'\r' in after:
+        assert row['added'] == row['deleted'] == 2
+        assert [line['text'] for line in row['hunks'][0]['lines'] if line['type'] == 'added'] == [
+            'one\r', 'two\r']
+    elif before and after:
+        assert row['added'] == row['deleted'] == 1
+        assert [line['type'] for line in row['hunks'][0]['lines']] == ['removed', 'added']
+
+
+def test_compare_code_only_lf_separates_lines(dashboard, tmp_path):
+    _write_code_run(tmp_path, 'base', {'edit': 'one\finside\u2028line\nold\nend\n'.encode()})
+    _write_code_run(tmp_path, 'target', {'edit': 'one\finside\u2028line\nnew\nend\n'.encode()})
+    row = _compare_code(dashboard)['files'][0]
+    assert row['added'] == row['deleted'] == 1
+    assert row['hunks'][0]['base_count'] == row['hunks'][0]['target_count'] == 3
+    assert row['hunks'][0]['lines'] == [
+        dict(type='context', text='one\finside\u2028line', base_line=1, target_line=1),
+        dict(type='removed', text='old', base_line=2, target_line=None),
+        dict(type='added', text='new', base_line=None, target_line=2),
+        dict(type='context', text='end', base_line=3, target_line=3),
+    ]

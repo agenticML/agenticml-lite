@@ -524,6 +524,10 @@ pre {
   container-type: inline-size;
 }
 .lineage-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
   border-left: 1px solid var(--hairline);
 }
 .runs-empty {
@@ -1072,6 +1076,178 @@ th {
   font: 10.5px var(--font-mono-stack);
   color: var(--text-3);
 }
+/* Compare snapshot diffs keep long source lines inside their own scroller. */
+.code-diff-section,
+.code-diff-files,
+.code-diff-file,
+.code-diff-unchanged {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+.code-diff-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 8px;
+  min-width: 0;
+}
+.code-diff-picker {
+  display: grid;
+  gap: 4px;
+  flex: 1 1 140px;
+  min-width: 0;
+}
+.code-diff-label,
+.code-diff-summary,
+.code-diff-counts,
+.code-diff-note,
+.code-diff-empty,
+.code-diff-loading {
+  color: var(--text-3);
+  font-size: 12px;
+}
+.code-diff-select {
+  min-width: 0;
+  max-width: 100%;
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-inline-start-width: 3px;
+  border-radius: var(--r);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+}
+.code-diff-files {
+  display: grid;
+  gap: 8px;
+}
+.code-diff-file,
+.code-diff-unchanged {
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface);
+}
+.code-diff-file-summary,
+.code-diff-unchanged > summary {
+  padding: 10px 12px;
+  cursor: pointer;
+}
+.code-diff-path,
+.code-diff-counts {
+  font: 11.5px var(--font-mono-stack);
+}
+.code-diff-status,
+.code-diff-badge {
+  display: inline-block;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font: 10.5px var(--font-mono-stack);
+}
+.code-diff-badge {
+  margin-inline-start: 6px;
+  color: var(--text-3);
+}
+.diff-status-added {
+  color: var(--ok-text);
+  background: var(--ok-soft);
+  border-color: var(--ok-border);
+}
+.diff-status-removed {
+  color: var(--danger-text);
+  background: var(--danger-soft);
+  border-color: var(--danger-border);
+}
+.diff-status-modified {
+  color: var(--warn-text);
+  background: var(--warn-soft);
+  border-color: var(--warn-border);
+}
+.code-diff-note,
+.code-diff-unchanged-list {
+  padding: 8px 12px;
+}
+.code-diff-unchanged-list {
+  margin: 0 0 8px 20px;
+}
+.code-diff-scroll {
+  overflow: auto;
+  min-width: 0;
+  max-width: 100%;
+  max-height: 480px;
+  border-top: 1px solid var(--hairline);
+  border-radius: 0 0 var(--r) var(--r);
+  background: var(--surface-2);
+}
+.code-diff-table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font: 13px/20px var(--font-mono-stack);
+}
+.code-diff-table td {
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  vertical-align: top;
+}
+.code-diff-table .code-diff-text {
+  padding-right: 24px;
+  white-space: pre;
+}
+.code-diff-table .code-diff-base-line,
+.code-diff-table .code-diff-target-line {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  width: 1%;
+  min-width: 48px;
+  white-space: nowrap;
+  padding-right: 8px;
+  text-align: right;
+  color: var(--text-4);
+  background: var(--surface-3);
+  border-right: 1px solid var(--hairline);
+  user-select: none;
+}
+.code-diff-table .code-diff-target-line {
+  left: 48px;
+}
+.code-diff-table .code-diff-marker {
+  width: 1%;
+  min-width: 24px;
+  text-align: center;
+  white-space: nowrap;
+  user-select: none;
+}
+.diff-added {
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
+}
+.diff-removed {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+.diff-added .code-diff-marker {
+  color: var(--ok-text);
+}
+.diff-removed .code-diff-marker {
+  color: var(--danger-text);
+}
+.code-diff-hunk td {
+  padding: 4px 12px;
+  color: var(--text-3);
+  background: var(--surface-3);
+}
+.diff-token-kw { color: var(--syn-kw); }
+.diff-token-str { color: var(--syn-str); }
+.diff-token-num { color: var(--syn-num); }
+.diff-token-fn { color: var(--syn-fn); }
+.diff-token-com { color: var(--syn-com); font-style: italic; }
+.diff-token-dec { color: var(--syn-dec); }
+.diff-token-key { color: var(--syn-key); }
+.diff-token-bi { color: var(--syn-bi); }
 .code-full {
   z-index: 70;
 }
@@ -1233,9 +1409,11 @@ pre,
   max-width: 100%;
 }
 .lineage-scroll {
-  overflow-x: auto;
-  overflow-y: hidden;
-  overscroll-behavior-x: contain;
+  flex: 1 1 auto;
+  /* One node is 96px tall. Keep that slice even when the strip is maxed. */
+  min-height: 120px;
+  overflow: auto;
+  overscroll-behavior: contain;
 }
 .lineage-scroll > .muted,
 .lineage-scroll > .error {
@@ -1326,6 +1504,13 @@ pre,
 }
 .lineage-detail {
   display: grid;
+  flex: 0 0 auto;
+  min-height: 0;
+  /* 45% of the pane is cyclic (the strip helps size the pane), so the cap
+     is the viewport. 280px leaves the graph a share of the 720px pane. */
+  max-height: min(280px, 45vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   gap: 8px;
   padding: 12px 16px 14px;
   border-top: 1px solid var(--hairline);
@@ -1334,6 +1519,11 @@ pre,
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: 10px;
+  min-width: 0;
+}
+.lineage-facts a {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .lineage-facts .mono,
 .lineage-checkout code {

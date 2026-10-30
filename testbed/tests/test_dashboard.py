@@ -474,6 +474,359 @@ def write_snapshot(root, name, project, source, created):
     return writer.run_id
 
 
+def open_code_compare(page, server, *run_ids):
+    from urllib.parse import urlencode
+    page.goto(f"{server.url}#/compare?{urlencode([('runs', run_id) for run_id in run_ids])}")
+    section = page.get_by_test_id("code-diff")
+    expect(section).to_have_attribute("aria-busy", "false")
+    return section
+
+
+def test_compare_code_statuses_summary_and_line_numbers(page, tmp_path, ui_server_factory):
+    root = tmp_path / "compare-code"
+    base = write_snapshot(root, "base", "p", {
+        "main.py": "def train():\n    return 1\n", "removed.py": "old = True\n", "same.py": "pass\n",
+    }, "2024-01-01")
+    target = write_snapshot(root, "target", "p", {
+        "main.py": "def train():\n    return 2\n", "added.py": "new = True\n", "same.py": "pass\n",
+    }, "2024-01-02")
+    with ui_server_factory(root) as server:
+        section = open_code_compare(page, server, base, target)
+        expect(section.get_by_test_id("code-diff-summary")).to_have_text("3 files changed · +2 −2 · 1 unchanged file")
+        expect(page.get_by_role("heading", name="Code diff", exact=True)).to_have_count(1)
+        assert page.locator(".compare-focus h2.eyebrow").all_text_contents()[-3:] == [
+            "Params & metrics comparison", "Code diff", "Config",
+        ]
+        for path, status in (("added.py", "Added"), ("removed.py", "Removed"), ("main.py", "Modified")):
+            expect(section.locator(f'[data-path="{path}"] [data-testid="code-diff-status"]')).to_have_text(status)
+        modified = section.locator('[data-path="main.py"]')
+        assert modified.evaluate("el => el.open")
+        for row_type, cells in (("context", ["1", "1", "", "def train():"]),
+                                ("removed", ["2", "", "−", "return 1"]),
+                                ("added", ["", "2", "+", "return 2"])):
+            assert [text.strip() for text in modified.locator(f".diff-{row_type} td").all_text_contents()] == cells
+        unchanged = section.locator(".code-diff-unchanged")
+        expect(unchanged.locator("summary")).to_have_text("1 unchanged file")
+        assert not unchanged.evaluate("el => el.open")
+        expect(unchanged.get_by_text("same.py", exact=True)).to_be_hidden()
+        unchanged.locator("summary").click()
+        expect(unchanged.get_by_text("same.py", exact=True)).to_be_visible()
+
+
+def test_compare_code_swap_and_pickers_refetch(page, tmp_path, ui_server_factory):
+    from urllib.parse import parse_qs, urlsplit
+    root = tmp_path / "compare-pickers"
+    ids = [write_snapshot(root, f"run {value}", "p", {"main.py": f"value = {value}\n"}, f"2024-01-0{value}")
+           for value in (1, 2, 3)]
+    requests = []
+    held = []
+    def hold_first(route):
+        if not held:
+            held.append((route, route.fetch()))
+        else:
+            route.continue_()
+    page.route("**/api/compare/code?*", hold_first)
+    page.on("request", lambda request: requests.append(parse_qs(urlsplit(request.url).query))
+            if "/api/compare/code?" in request.url else None)
+    with ui_server_factory(root) as server:
+        from urllib.parse import urlencode
+        page.goto(f"{server.url}#/compare?{urlencode([('runs', run_id) for run_id in ids])}")
+        section = page.get_by_test_id("code-diff")
+        expect(section.locator(".code-diff-loading")).to_be_visible()
+        section.get_by_role("button", name="Swap base and compare runs").click()
+        expect(section.locator(".diff-added")).to_contain_text("value = 1")
+        assert held
+        held[0][0].fulfill(response=held[0][1])
+        # Process the released response before checking that the swapped body survived.
+        page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
+        expect(section.locator(".diff-added")).to_contain_text("value = 1")
+        expect(section.locator(".diff-removed")).to_contain_text("value = 2")
+        expect(section.get_by_label("Base", exact=True)).to_have_value(ids[1])
+        expect(section.get_by_label("Compare", exact=True)).to_have_value(ids[0])
+        section.get_by_label("Compare", exact=True).select_option(ids[2])
+        expect(section.locator(".diff-added")).to_contain_text("value = 3")
+        section.get_by_label("Base", exact=True).select_option(ids[0])
+        expect(section.locator(".diff-removed")).to_contain_text("value = 1")
+        assert requests == [{"base": [ids[a]], "target": [ids[b]]} for a, b in ((0, 1), (1, 0), (1, 2), (0, 2))]
+
+
+@pytest.mark.parametrize("source, message", [
+    ({"main.py": "pass\n"}, "Code is identical."),
+    ({}, "No code snapshots recorded for these runs."),
+])
+def test_compare_code_empty_states(page, tmp_path, ui_server_factory, source, message):
+    root = tmp_path / "compare-empty"
+    ids = [write_snapshot(root, name, "p", source, f"2024-01-0{index}")
+           for index, name in enumerate(("base", "target"), 1)]
+    with ui_server_factory(root) as server:
+        section = open_code_compare(page, server, *ids)
+        expect(section.locator(".code-diff-empty")).to_have_text(message)
+        expect(section.get_by_test_id("code-diff-file")).to_have_count(0)
+        if not source:
+            expect(section.get_by_test_id("code-diff-summary")).to_have_text(message)
+
+
+def test_compare_code_snapshots_are_text_only(page, tmp_path, ui_server_factory):
+    root = tmp_path / "compare-xss"
+    payload = '<script>window.__diffXss = true</script><img src=x onerror="window.__diffXss = true">'
+    base = write_snapshot(root, "base", "p", {"main.py": "pass\n"}, "2024-01-01")
+    target = write_snapshot(root, payload, "p", {"main.py": payload + "\n", payload: payload}, "2024-01-02")
+    with ui_server_factory(root) as server:
+        section = open_code_compare(page, server, base, target)
+        expect(section.locator('[data-path="main.py"] .diff-added .code-diff-text')).to_have_text(payload)
+        expect(section.locator(".code-diff-path").filter(has_text=payload)).to_have_text(payload)
+        expect(section.locator("script, img")).to_have_count(0)
+        for picker in ("code-diff-base", "code-diff-compare"):
+            expect(section.get_by_test_id(picker).locator("option").filter(has_text=payload)).to_have_text(payload)
+        assert page.evaluate("window.__diffXss") is None
+
+
+@pytest.mark.parametrize("theme", ["light", "dark"])
+@pytest.mark.parametrize("width", [375, 1440])
+def test_compare_code_long_lines_scroll_inside_diff(page, tmp_path, ui_server_factory, theme, width):
+    root = tmp_path / "compare-mobile"
+    path = "nested/" * 30 + "main.py"
+    base = write_snapshot(root, "base", "p", {path: "value = 1\n"}, "2024-01-01")
+    target = write_snapshot(root, "target", "p", {path: "value = '" + "long-line" * 250 + "'\n"}, "2024-01-02")
+    page.set_viewport_size({"width": width, "height": 812})
+    with ui_server_factory(root) as server:
+        section = open_code_compare(page, server, base, target)
+        page.evaluate("theme => document.documentElement.dataset.theme = theme", theme)
+        scroll = section.locator(".code-diff-scroll")
+        scroll.scroll_into_view_if_needed()
+        assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+        assert page.locator(".compare-focus .focus-body").evaluate("el => el.scrollWidth <= el.clientWidth")
+        assert scroll.evaluate("el => el.scrollWidth > el.clientWidth && getComputedStyle(el).overflowX === 'auto'")
+        gutters = section.locator(".diff-added .code-diff-target-line")
+        before = gutters.bounding_box()["x"]
+        scroll.evaluate("el => el.scrollLeft = 200")
+        assert scroll.evaluate("el => el.scrollLeft") == 200
+        assert gutters.bounding_box()["x"] == pytest.approx(before)
+        colors = section.locator(".diff-added, .diff-removed").evaluate_all("nodes => nodes.map(el => getComputedStyle(el).backgroundColor)")
+        assert len(set(colors)) == 2
+        assert all(color not in ("transparent", "rgba(0, 0, 0, 0)") for color in colors)
+
+
+def test_compare_code_poll_updates_and_preserves_collapsed_files(page, tmp_path, ui_server_factory):
+    root = tmp_path / "compare-poll"
+    wide = "value = '" + "long" * 250 + "'\n"
+    stable = "".join(wide for _ in range(50))
+    base = write_snapshot(root, "base", "p", {"main.py": "value = 0\n", "other.py": "pass\n", "stable.py": "old\n"}, "2024-01-01")
+    writer = RunWriter.create(root, meta={"name": "running", "project": "p"})
+    writer.add_code([], [("main.py", b"value = 1\n"), ("other.py", b"value = 1\n"), ("stable.py", stable.encode())])
+    try:
+        with ui_server_factory(root) as server:
+            section = open_code_compare(page, server, base, writer.run_id)
+            main = section.locator('[data-path="main.py"]')
+            steady = section.locator('[data-path="stable.py"]')
+            scroller = steady.locator(".code-diff-scroll")
+            scroller.evaluate("el => { window.__steadyDiff = el; el.scrollLeft = 200; el.scrollTop = 100; el.focus(); }")
+            expect(scroller).to_be_focused()
+            main.locator("summary").click()
+            assert not main.evaluate("el => el.open")
+            scroller.focus()
+            writer.add_code([], [("main.py", b"value = 2\n"), ("other.py", b"value = 2\nextra = True\n")])
+            expect(section.locator('[data-path="other.py"] .diff-added').first).to_contain_text("value = 2", timeout=LIVE_TIMEOUT)
+            expect(section.get_by_test_id("code-diff-summary")).to_have_text("3 files changed · +53 −3 · 0 unchanged files")
+            assert steady.evaluate("el => el.open")
+            expect(scroller).to_be_focused()
+            assert scroller.evaluate("el => el === window.__steadyDiff && el.scrollLeft === 200 && el.scrollTop === 100")
+            assert not main.evaluate("el => el.open")
+            main.locator("summary").click()
+            expect(main.locator(".diff-added")).to_contain_text("value = 2")
+            steady.locator("summary").click()
+            assert not steady.evaluate("el => el.open")
+            main.locator("summary").click()
+            writer.add_code([], [("main.py", b"value = 3\n"), ("other.py", b"value = 3\n"),
+                                 ("stable.py", (stable + "tail = True\n").encode())])
+            writer.finish("finished")
+            expect(page.locator(".poll-status")).to_have_text("Up to date", timeout=LIVE_TIMEOUT)
+            expect(section.locator('[data-path="other.py"] .diff-added').first).to_contain_text("value = 3")
+            assert not main.evaluate("el => el.open")
+            assert not steady.evaluate("el => el.open")
+            expect(steady.locator(".code-diff-line")).to_have_count(0)
+            steady.locator("summary").click()
+            assert steady.evaluate("el => el.open")
+            assert scroller.evaluate("el => el.scrollLeft === 200 && el.scrollTop === 100")
+            main.locator("summary").click()
+            expect(main.locator(".diff-added")).to_contain_text("value = 3")
+    finally:
+        writer.finish("finished")
+
+
+def test_compare_code_short_columns_lazy_files_and_keyboard(page, tmp_path, ui_server_factory):
+    root = tmp_path / "compare-lazy"
+    sources = {f"{index}.yaml": "lr: 0.1\n" for index in range(5)}
+    sources["same.py"] = "pass\n"
+    base = write_snapshot(root, "base", "p", sources, "2024-01-01")
+    target = write_snapshot(root, "target", "p", {
+        path: text.replace("0.1", "0.2") for path, text in sources.items()
+    }, "2024-01-02")
+    with ui_server_factory(root) as server:
+        section = open_code_compare(page, server, base, target)
+        files = section.get_by_test_id("code-diff-file")
+        assert files.evaluate_all("nodes => nodes.map(el => el.open)") == [True, True, True, False, False]
+        for index in (3, 4):
+            expect(files.nth(index).locator(".code-diff-line")).to_have_count(0)
+        row = files.first.locator(".diff-added")
+        gap = row.evaluate("el => el.querySelector('.code-diff-text').getBoundingClientRect().left - el.querySelector('.code-diff-marker').getBoundingClientRect().right")
+        marker_width = row.locator(".code-diff-marker").bounding_box()["width"]
+        assert 0 <= gap <= 3
+        assert marker_width <= 30
+        base_select = section.get_by_label("Base", exact=True)
+        compare_select = section.get_by_label("Compare", exact=True)
+        swap = section.get_by_role("button", name="Swap base and compare runs")
+        unchanged = section.locator(".code-diff-unchanged > summary")
+        # Include mounted-but-closed regions, which have layout rects in Chromium.
+        files.nth(2).locator("summary").click()
+        base_select.focus()
+        forward = [compare_select, swap, files.nth(0).locator("summary"),
+                   files.nth(0).locator(".code-diff-scroll"), files.nth(1).locator("summary"),
+                   files.nth(1).locator(".code-diff-scroll"), files.nth(2).locator("summary"),
+                   files.nth(3).locator("summary"), files.nth(4).locator("summary"), unchanged,
+                   page.get_by_role("button", name="Exit focus", exact=True)]
+        for control in forward:
+            page.keyboard.press("Tab")
+            expect(control).to_be_focused()
+        for control in reversed([base_select, *forward[:-1]]):
+            page.keyboard.press("Shift+Tab")
+            expect(control).to_be_focused()
+        page.get_by_role("button", name="Exit focus", exact=True).focus()
+        page.keyboard.press("Shift+Tab")
+        expect(unchanged).to_be_focused()
+        files.nth(3).locator("summary").click()
+        expect(files.nth(3).locator(".code-diff-line")).to_have_count(2)
+        assert files.nth(3).evaluate("el => el.open")
+
+
+def test_compare_code_special_states_and_returned_unchanged_paths(page, tmp_path, ui_server_factory):
+    root = tmp_path / "compare-flags"
+    ids = [write_snapshot(root, name, "p", {}, f"2024-01-0{index}")
+           for index, name in enumerate(("base", "target"), 1)]
+    def file(path, **flags):
+        return dict(path=path, status="modified", added=None, deleted=None,
+                    hunks=[], **flags)
+    payload = dict(
+        files=[file("binary", binary=True), file("large", too_large=True),
+               file("error", error="snapshot unavailable"),
+               file("budget", patch_truncated=True),
+               dict(path="preview.py", status="modified", added=1, deleted=0,
+                    patch_truncated=True, approximate=True, newline_change=True,
+                    hunks=[dict(base_start=1, base_count=0, target_start=1, target_count=1,
+                                lines=[dict(type="added", text="clipped", base_line=None,
+                                            target_line=1, clipped=True)])]),
+               dict(path="returned.py", status="unchanged", hunks=[])],
+        summary=dict(added=0, removed=0, modified=5, unchanged=9, lines_added=1, lines_deleted=0),
+        truncated=True, files_total=14,
+    )
+    page.route("**/api/compare/code?*", lambda route: route.fulfill(json=payload))
+    with ui_server_factory(root) as server:
+        section = open_code_compare(page, server, *ids)
+        for path, label in (("binary", "binary"), ("large", "too large"),
+                            ("error", "unavailable"), ("budget", "not diffed")):
+            detail = section.locator(f'[data-path="{path}"]')
+            assert not detail.evaluate("el => el.open")
+            expect(detail.locator(".code-diff-counts")).to_have_text(label)
+        for path, message in (("binary", "Binary file — not shown"), ("large", "Too large to diff")):
+            detail = section.locator(f'[data-path="{path}"]')
+            detail.locator("summary").click()
+            expect(detail.locator(".code-diff-note")).to_have_text(message)
+        expect(section.locator('[data-path="error"] summary .code-diff-badge')).to_have_text("Snapshot unavailable")
+        expect(section.locator('[data-path="budget"] summary .code-diff-badge')).to_have_text("Diff truncated")
+        preview = section.locator('[data-path="preview.py"]')
+        for label in ("Diff truncated", "Approximate diff (large file)", "Newline at end of file changed"):
+            expect(preview.locator("summary").get_by_text(label, exact=True)).to_be_visible()
+        expect(preview.locator(".code-diff-clipped")).to_have_text("…")
+        expect(preview.locator(".code-diff-text")).to_have_attribute("title", "This line was shortened to fit the diff preview.")
+        preview.locator("summary").click()
+        expect(preview.locator("summary .code-diff-badge")).to_have_count(3)
+        expect(preview.locator("summary .code-diff-badge").first).to_be_visible()
+        unchanged = section.locator(".code-diff-unchanged")
+        expect(unchanged.locator("summary")).to_have_text("1 unchanged file")
+        unchanged.locator("summary").click()
+        expect(unchanged.locator("li")).to_have_text(["returned.py"])
+        expect(section.get_by_text("Showing 6 of 14 files · 8 omitted", exact=True)).to_be_visible()
+        # When the cap returns no unchanged paths, do not announce an empty disclosure.
+        payload["files"].pop()
+        page.reload()
+        expect(section).to_have_attribute("aria-busy", "false")
+        expect(section.locator(".code-diff-unchanged")).to_have_count(0)
+        expect(section.get_by_text("Showing 5 of 14 files · 9 omitted", exact=True)).to_be_visible()
+
+
+def test_compare_code_inflight_poll_coalesces_and_destroy_aborts(page, tmp_path, ui_server_factory):
+    root = tmp_path / "compare-coalesce"
+    ids = [write_snapshot(root, name, "p", {}, f"2024-01-0{index}")
+           for index, name in enumerate(("base", "target"), 1)]
+    with ui_server_factory(root) as server:
+        open_code_compare(page, server, *ids)
+        # Exercise overlapping update calls deterministically, with an intentionally
+        # non-cancellable transport so generation guards are tested as well.
+        page.evaluate("""async ids => {
+          const { createCodeDiff } = await import('/static/codediff.js');
+          const el = (tag, attrs = {}, ...children) => {
+            const node = document.createElement(tag);
+            for (const [key, value] of Object.entries(attrs)) {
+              if (key.startsWith('on')) node.addEventListener(key.slice(2), value);
+              else if (key === 'text') node.textContent = value;
+              else if (key === 'class') node.className = value;
+              else if (key in node) node[key] = value;
+              else node.setAttribute(key, value);
+            }
+            node.append(...children);
+            return node;
+          };
+          window.__diffRequests = [];
+          const runs = ids.map(run_id => ({run_id, status: 'running'}));
+          window.__diffRuns = runs;
+          window.__diffHarness = createCodeDiff({runs, el,
+            button: (text, onclick, kind, attrs) => el('button', {text, onclick, ...attrs}),
+            get: (url, signal) => new Promise(resolve => window.__diffRequests.push({url, signal, resolve})),
+          });
+          document.body.append(window.__diffHarness.node);
+          window.__diffHarness.node.id = 'diff-harness';
+          window.__diffHarness.update(runs);
+          window.__diffHarness.update(runs);
+        }""", ids)
+        assert page.evaluate("__diffRequests.length") == 1
+        assert not page.evaluate("__diffRequests[0].signal.aborted")
+        payload = dict(files=[], files_total=0, truncated=False,
+                       summary=dict(added=0, removed=0, modified=0, unchanged=0, lines_added=0, lines_deleted=0))
+        page.evaluate("data => __diffRequests[0].resolve(data)", payload)
+        assert page.evaluate("__diffRequests.length") == 2
+        page.evaluate("data => __diffRequests[1].resolve(data)", payload)
+        expect(page.locator("#diff-harness")).to_have_attribute("aria-busy", "false")
+        assert page.evaluate("__diffRequests.length") == 2
+        page.evaluate("void __diffHarness.update(__diffRuns)")
+        page.locator("#diff-harness .code-diff-swap").evaluate("el => el.click()")
+        assert page.evaluate("__diffRequests[2].signal.aborted")
+        assert page.evaluate("__diffRequests.length") == 4
+        page.evaluate("data => __diffRequests[3].resolve(data)", payload)
+        stale = dict(payload, summary=dict(payload["summary"], modified=99))
+        page.evaluate("data => __diffRequests[2].resolve(data)", stale)
+        expect(page.locator("#diff-harness .code-diff-summary")).to_have_text("No code snapshots recorded for these runs.")
+        page.evaluate("__diffHarness.update(__diffRuns); __diffHarness.destroy()")
+        assert page.evaluate("__diffRequests[4].signal.aborted")
+        page.evaluate("data => __diffRequests[4].resolve(data)", stale)
+        expect(page.locator("#diff-harness .code-diff-summary")).to_have_text("No code snapshots recorded for these runs.")
+
+
+def test_compare_code_error_is_local_to_section(page, tmp_path, ui_server_factory):
+    root = tmp_path / "compare-error"
+    ids = [write_snapshot(root, name, "p", {"main.py": name}, f"2024-01-0{index}")
+           for index, name in enumerate(("base", "target"), 1)]
+    page.allow_http_errors = True
+    page.route("**/api/compare/code?*", lambda route: route.fulfill(
+        status=503, content_type="application/json", body=json.dumps({"error": "Diff temporarily unavailable"})))
+    with ui_server_factory(root) as server:
+        section = open_code_compare(page, server, *ids)
+        expect(section.get_by_role("alert")).to_contain_text("Diff temporarily unavailable")
+        expect(page.get_by_role("heading", name="Params & metrics comparison", exact=True)).to_be_visible()
+        expect(page.get_by_role("heading", name="Config", exact=True)).to_be_visible()
+        expect(page.get_by_test_id("selected-runs")).to_contain_text("target")
+        expect(page.locator(".poll-status")).to_have_text("Up to date")
+
+
 def test_code_baseline_modified_marker_lazy_fetch_and_diff(page, tmp_path, ui_server_factory):
     root = tmp_path / "baseline"
     common = "unchanged = True\n"
@@ -667,6 +1020,9 @@ def mock_dashboard(page, runs):
         path = urlsplit(route.request.url).path
         if path == "/api/runs":
             body = runs
+        elif path == "/api/compare/code":
+            body = {"files": [], "summary": dict(added=0, removed=0, modified=0, unchanged=0,
+                                                lines_added=0, lines_deleted=0), "truncated": False}
         elif path == "/api/lineage":
             project = parse_qs(urlsplit(route.request.url).query, keep_blank_values=True)["project"][0]
             body = {"nodes": [run for run in runs if (run.get("project") or "") == project], "edges": []}
@@ -1065,33 +1421,39 @@ def test_lineage_graph_selects_and_opens_run(page, tmp_path, ui_server_factory):
         expect(page.get_by_role("heading", name="child-run", exact=True)).to_be_visible()
 
 
-def _lineage_project(root, names=("root-run", "child-run", "leaf-run")):
+def _lineage_project(root, names=None, *, count=None, parents=None):
+    if names is None:
+        total = 3 if count is None else count
+        names = ("root-run", "child-run", "leaf-run") + tuple(
+            f"gen-{index}" for index in range(3, total)
+        )
+        names = names[:total]
     writers = []
     for name in names:
         writer = RunWriter.create(root, meta={"name": name, "project": "demo", "tags": ["graph"]})
         writer.finish("finished")
         writers.append(writer)
     ids = [writer.run_id for writer in writers]
-    stamps = (
-        "2026-10-27T00:00:00.000000Z",
-        "2026-10-27T00:01:00.000000Z",
-        "2026-10-27T00:02:00.000000Z",
-    )
-    parents = (None, ids[0], ids[1])
-    inferences = (None, "explicit", "repo_root")
     shared_tree = "ab" * 20
     for index, run_id in enumerate(ids):
         path = root / "runs" / run_id / "meta.json"
         meta = json.loads(path.read_text())
-        meta["created_at"] = stamps[index]
-        meta["parent_run_id"] = parents[index]
+        meta["created_at"] = f"2026-10-27T00:{index:02d}:00.000000Z"
+        if parents is None:
+            parent_index = None if index == 0 else index - 1
+            inference = None if index == 0 else ("repo_root" if index == 2 else "explicit")
+        else:
+            parent_index = parents[index]
+            inference = None if parent_index is None else "explicit"
+        parent = None if parent_index is None else ids[parent_index]
+        meta["parent_run_id"] = parent
         meta["lineage"] = {
             "version": 1,
             "commit": f"{index + 1:040x}",
             "tree": shared_tree if index else "cd" * 20,
             "parent_commit": None if index == 0 else f"{index:040x}",
-            "parent_run_id": parents[index],
-            "parent_inference": inferences[index],
+            "parent_run_id": parent,
+            "parent_inference": inference,
             "project_key": "demo-0123abcd",
             "repo_root": "/tmp/demo",
             "base_commit": "abc1234",
@@ -1160,6 +1522,160 @@ def test_split_runs_layout_and_shared_selection(page, tmp_path, ui_server_factor
             expect(run_row).to_have_class(re.compile(r"\bis-linked\b"))
             page.get_by_role("heading", name="Runs", exact=True).hover()
             expect(run_row).not_to_have_class(re.compile(r"\bis-linked\b"))
+
+
+def test_lineage_chain_fits_split_pane_top_to_bottom(page, tmp_path, ui_server_factory):
+    root = tmp_path / "lineage-vertical"
+    ids = _lineage_project(root, count=8)
+    with ui_server_factory(root) as server:
+        page.set_viewport_size({"width": 1440, "height": 900})
+        home(page, server)
+        expect(page.locator(".lineage-node")).to_have_count(8)
+        scroll = page.locator(".lineage-scroll")
+        assert scroll.evaluate("el => el.scrollWidth <= el.clientWidth")
+        geometry = scroll.evaluate(
+            """(el, ids) => {
+              const box = (id) => {
+                const shape = el.querySelector(`.lineage-node[data-run-id="${id}"] .lineage-shape`);
+                return {
+                  x: Number(shape.getAttribute("x")),
+                  y: Number(shape.getAttribute("y")),
+                  w: Number(shape.getAttribute("width")),
+                  h: Number(shape.getAttribute("height")),
+                };
+              };
+              const boxes = ids.map(box);
+              const edge = el.querySelector(
+                `.lineage-edge[data-from="${ids[0]}"][data-to="${ids[1]}"]`,
+              );
+              const nums = edge.getAttribute("d").split(/[^0-9.-]+/).filter(Boolean).map(Number);
+              return {boxes, x1: nums[0], y1: nums[1], x2: nums.at(-2), y2: nums.at(-1)};
+            }""",
+            ids,
+        )
+        xs = [box["x"] for box in geometry["boxes"]]
+        ys = [box["y"] for box in geometry["boxes"]]
+        assert xs == [xs[0]] * len(xs)
+        assert all(later > earlier for earlier, later in zip(ys, ys[1:]))
+        parent, child = geometry["boxes"][0], geometry["boxes"][1]
+        assert geometry["y1"] == parent["y"] + parent["h"]
+        assert geometry["x1"] == parent["x"] + parent["w"] / 2
+        assert geometry["y2"] == child["y"]
+        assert geometry["x2"] == child["x"] + child["w"] / 2
+        page.set_viewport_size({"width": 375, "height": 812})
+        overflow = page.evaluate(
+            "Math.max(document.documentElement.scrollWidth - document.documentElement.clientWidth, document.body.scrollWidth - document.body.clientWidth)"
+        )
+        assert overflow <= 0, f"lineage chain scrolls horizontally by {overflow}px"
+
+
+@pytest.mark.parametrize("width, height", [(375, 812), (1440, 900)])
+def test_oversized_lineage_detail_keeps_graph_and_strip_reachable(
+    page, tmp_path, ui_server_factory, width, height
+):
+    """A long parent name and base branch must not collapse the graph or clip the strip."""
+    root = tmp_path / "lineage-detail-overflow"
+    token = "wrapped-parent-" * 24
+    parent_name = " ".join([token] * 4)
+    branch = "release/" + "x" * (256 - len("release/"))
+    ids = _lineage_project(root, (parent_name, "child-run"))
+    meta_path = root / "runs" / ids[1] / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta["lineage"]["base_branch"] = branch
+    meta_path.write_text(json.dumps(meta))
+    with ui_server_factory(root) as server:
+        page.set_viewport_size({"width": width, "height": height})
+        home(page, server)
+        node = page.locator(f'.lineage-node[data-run-id="{ids[1]}"]')
+        expect(node).to_be_visible()
+        node.click()
+        detail = page.locator(".lineage-detail")
+        expect(detail).to_contain_text(token)
+        expect(detail).to_contain_text(branch)
+        metrics = detail.evaluate(
+            """(strip) => {
+              const scroll = strip.parentElement.querySelector(".lineage-scroll");
+              const pane = strip.closest(".lineage-body");
+              const code = strip.querySelector(".lineage-checkout code");
+              const overlap = (a, b) => Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
+              const paneBox = pane.getBoundingClientRect();
+              const graphVisible = overlap(scroll.getBoundingClientRect(), paneBox);
+              strip.scrollTop = strip.scrollHeight;
+              const codeBox = code.getBoundingClientRect();
+              const stripBox = strip.getBoundingClientRect();
+              return {
+                scrollClient: scroll.clientHeight,
+                graphVisible,
+                stripClient: strip.clientHeight,
+                stripScroll: strip.scrollHeight,
+                overflowY: getComputedStyle(strip).overflowY,
+                codeVisible: Math.min(overlap(codeBox, stripBox), overlap(codeBox, paneBox)),
+              };
+            }"""
+        )
+        assert metrics["scrollClient"] > 0, "lineage graph scroller collapsed"
+        assert metrics["graphVisible"] > 0, "lineage graph is clipped by the pane"
+        assert metrics["stripScroll"] > metrics["stripClient"], "oversized detail did not overflow the strip"
+        if metrics["stripScroll"] > metrics["stripClient"]:
+            assert metrics["overflowY"] in ("auto", "scroll")
+        assert metrics["codeVisible"] > 0, "lineage detail bottom is not reachable"
+        if width == 375:
+            overflow = page.evaluate(
+                "Math.max(document.documentElement.scrollWidth - document.documentElement.clientWidth, document.body.scrollWidth - document.body.clientWidth)"
+            )
+            assert overflow <= 0, f"lineage detail scrolls horizontally by {overflow}px"
+
+
+def test_lineage_arrow_keys_move_between_generations_and_siblings(page, tmp_path, ui_server_factory):
+    root = tmp_path / "lineage-keys"
+    ids = _lineage_project(
+        root,
+        ("root-run", "left-run", "right-run", "grand-run"),
+        parents=(None, 0, 0, 1),
+    )
+    root_id, left_id, right_id, grand_id = ids
+    with ui_server_factory(root) as server:
+        page.set_viewport_size({"width": 1440, "height": 900})
+        home(page, server)
+        places = page.evaluate(
+            """(ids) => Object.fromEntries(ids.map((id) => {
+              const shape = document.querySelector(`.lineage-node[data-run-id="${id}"] .lineage-shape`);
+              return [id, {x: Number(shape.getAttribute("x")), y: Number(shape.getAttribute("y"))}];
+            }))""",
+            ids,
+        )
+        assert places[root_id]["y"] < places[left_id]["y"] < places[grand_id]["y"]
+        assert places[left_id]["y"] == places[right_id]["y"]
+        assert places[left_id]["x"] < places[right_id]["x"]
+        assert places[grand_id]["x"] == places[left_id]["x"]
+        node = lambda run_id: page.locator(f'.lineage-node[data-run-id="{run_id}"]')
+        focused = page.locator(".lineage-node:focus")
+        node(root_id).focus()
+        node(root_id).press("ArrowDown")
+        expect(focused).to_have_attribute("data-run-id", left_id)
+        focused.press("ArrowRight")
+        expect(focused).to_have_attribute("data-run-id", right_id)
+        focused.press("ArrowLeft")
+        expect(focused).to_have_attribute("data-run-id", left_id)
+        focused.press("ArrowDown")
+        expect(focused).to_have_attribute("data-run-id", grand_id)
+        focused.press("ArrowDown")
+        expect(focused).to_have_attribute("data-run-id", grand_id)
+        focused.press("ArrowUp")
+        expect(focused).to_have_attribute("data-run-id", left_id)
+        focused.press("ArrowUp")
+        expect(focused).to_have_attribute("data-run-id", root_id)
+        focused.press("ArrowLeft")
+        expect(focused).to_have_attribute("data-run-id", root_id)
+        expect(page.locator(".lineage-detail")).to_contain_text("Select a run")
+        focused.press("ArrowDown")
+        focused.press("ArrowRight")
+        expect(focused).to_have_attribute("data-run-id", right_id)
+        focused.press("ArrowUp")
+        expect(focused).to_have_attribute("data-run-id", root_id)
+        focused.press("Space")
+        expect(node(root_id)).to_have_attribute("data-picked", "true")
+        expect(page.locator(".lineage-detail")).to_contain_text(root_id)
 
 
 def test_split_runs_search_keeps_unmatched_project_graphs(page, ui_server):
@@ -1265,7 +1781,7 @@ def test_hover_link_survives_poll_filter_and_detached_mouseout(page, ui_server, 
 
 def test_lineage_rebuild_keeps_focus_scroll_and_detail(page, tmp_path, ui_server_factory):
     root = tmp_path / "lineage-focus"
-    ids = _lineage_project(root)
+    ids = _lineage_project(root, count=8)
     root_meta = root / "runs" / ids[0] / "meta.json"
     meta = json.loads(root_meta.read_text())
     meta["status"] = "running"
@@ -1280,10 +1796,10 @@ def test_lineage_rebuild_keeps_focus_scroll_and_detail(page, tmp_path, ui_server
         expect(node).to_be_visible()
         expect(page.locator(".lineage-detail")).to_contain_text("Select a run")
         node.focus()
-        left = page.locator(".lineage-scroll").evaluate(
-            "el => { el.scrollLeft = Math.min(180, el.scrollWidth); return el.scrollLeft; }"
+        top = page.locator(".lineage-scroll").evaluate(
+            "el => { el.scrollTop = Math.min(180, el.scrollHeight); return el.scrollTop; }"
         )
-        assert left > 0, "lineage graph did not overflow its scroller"
+        assert top > 0, "lineage graph did not overflow its scroller"
         path = root / "runs" / child / "meta.json"
         updated = json.loads(path.read_text())
         updated["name"] = "child-renamed"
@@ -1292,7 +1808,7 @@ def test_lineage_rebuild_keeps_focus_scroll_and_detail(page, tmp_path, ui_server
         temporary.replace(path)
         expect(node).to_contain_text("child-renamed", timeout=12000)
         expect(page.locator(".lineage-node:focus")).to_have_attribute("data-run-id", child)
-        assert page.locator(".lineage-scroll").evaluate("el => el.scrollLeft") == left
+        assert page.locator(".lineage-scroll").evaluate("el => el.scrollTop") == top
         page.locator(".lineage-node:focus").click()
         expect(page.locator(".lineage-detail")).to_contain_text("agenticml lineage checkout")
         expect(page.locator(".lineage-detail")).to_contain_text(child)
@@ -1300,7 +1816,7 @@ def test_lineage_rebuild_keeps_focus_scroll_and_detail(page, tmp_path, ui_server
 
 def test_split_runs_poll_updates_list_and_preserves_lineage(page, tmp_path, ui_server_factory):
     root = tmp_path / "lineage-poll"
-    ids = _lineage_project(root)
+    ids = _lineage_project(root, count=8)
     path = root / "runs" / ids[0] / "meta.json"
     meta = json.loads(path.read_text())
     meta.update(status="running", summary={"loss": .5})
@@ -1316,10 +1832,10 @@ def test_split_runs_poll_updates_list_and_preserves_lineage(page, tmp_path, ui_s
         node.press("Space")
         detail = page.locator(".lineage-detail")
         expect(detail).to_contain_text(ids[1])
-        left = page.locator(".lineage-scroll").evaluate(
-            "el => { el.scrollLeft = 180; return el.scrollLeft; }"
+        top = page.locator(".lineage-scroll").evaluate(
+            "el => { el.scrollTop = 180; return el.scrollTop; }"
         )
-        assert left > 0
+        assert top > 0
         page.evaluate("""() => {
           window.keptCard = document.querySelector('.project-card');
           window.keptPane = document.querySelector('.lineage-body');
@@ -1342,13 +1858,321 @@ def test_split_runs_poll_updates_list_and_preserves_lineage(page, tmp_path, ui_s
           keptDetail === document.querySelector('.lineage-detail').firstElementChild &&
           !oldRow.isConnected""")
         assert len(requests) == 1
-        assert page.locator(".lineage-scroll").evaluate("el => el.scrollLeft") == left
+        assert page.locator(".lineage-scroll").evaluate("el => el.scrollTop") == top
         expect(detail).to_contain_text(ids[1])
         # Running projects still refresh their lineage at the longer interval.
         page.clock.fast_forward(10000)
         page.wait_for_function("() => keptGraph !== document.querySelector('.lineage-graph')")
         assert len(requests) == 2
         expect(page.locator(".lineage-node:focus")).to_have_attribute("data-run-id", ids[1])
-        assert page.locator(".lineage-scroll").evaluate("el => el.scrollLeft") == left
+        assert page.locator(".lineage-scroll").evaluate("el => el.scrollTop") == top
         assert page.evaluate("keptDetail === document.querySelector('.lineage-detail').firstElementChild")
         expect(detail).to_contain_text(ids[1])
+
+
+def test_lineage_detail_updates_parent_commit_and_dirty_flag(page, ui_server):
+    """A focused node's parent, commit, and dirty flag refresh when the graph repaints."""
+    root = {
+        "run_id": "root", "name": "root run", "project": "demo", "status": "finished", "keys": [],
+        "created_at": "2024-01-01T00:00:00Z", "commit": "1111111aaaaaaa",
+        "base_commit": "abc1234", "base_branch": "main", "base_dirty": False,
+    }
+    child = {
+        "run_id": "child", "name": "child run", "project": "demo", "status": "running", "keys": [],
+        "created_at": "2024-01-02T00:00:00Z", "parent_run_id": "root", "parent_inference": "explicit",
+        "commit": "aaaaaaa1111111", "base_commit": "abc1234", "base_branch": "main", "base_dirty": True,
+        "summary": {"loss": 0.5},
+    }
+    other = {
+        "run_id": "other", "name": "other run", "project": "demo", "status": "finished", "keys": [],
+        "created_at": "2024-01-03T00:00:00Z",
+    }
+    mock_dashboard(page, [root, child, other])
+    page.clock.install()
+    home(page, ui_server)
+    page.locator('.lineage-node[data-run-id="child"]').click()
+    detail = page.locator(".lineage-detail")
+    expect(detail).to_contain_text("root run")
+    expect(detail).to_contain_text("aaaaaaa1111111")
+    expect(detail).to_contain_text("dirty")
+    expect(detail.locator("a")).to_have_attribute("href", "#/run/root")
+    page.evaluate("""() => {
+      const host = document.querySelector('.lineage-detail');
+      window.detailSawLoading = false;
+      new MutationObserver(() => {
+        if (host.textContent.includes('Loading changes')) window.detailSawLoading = true;
+      }).observe(host, {childList: true, subtree: true, characterData: true});
+    }""")
+    child.update(parent_run_id="other", parent_inference="repo_root", commit="bbbbbbb2222222", base_dirty=False)
+    child["summary"]["loss"] = 0.25
+    page.clock.fast_forward(5000)
+    expect(row(page, "child run").locator('.run-number[title="loss"]')).to_have_text("0.25")
+    # The runs poll alone does not repaint lineage, so the strip stays put.
+    expect(detail).to_contain_text("root run")
+    expect(detail).to_contain_text("aaaaaaa1111111")
+    expect(detail).to_contain_text("dirty")
+    child["summary"]["loss"] = 0.75
+    page.clock.fast_forward(10000)
+    expect(row(page, "child run").locator('.run-number[title="loss"]')).to_have_text("0.75")
+    expect(detail).to_contain_text("other run")
+    expect(detail).to_contain_text("repo_root")
+    expect(detail).to_contain_text("bbbbbbb2222222")
+    expect(detail).not_to_contain_text("dirty")
+    expect(detail).not_to_contain_text("aaaaaaa1111111")
+    expect(detail).not_to_contain_text("root run")
+    expect(detail.locator("a")).to_have_attribute("href", "#/run/other")
+    expect(detail).to_contain_text("agenticml lineage checkout child")
+    assert page.evaluate("detailSawLoading === false")
+
+
+_DETAIL_SETTLED = """
+(() => {
+  const json = Response.prototype.json;
+  const text = Response.prototype.text;
+  const note = (url) => {
+    if (!url.includes("/api/runs/") || !url.endsWith("/lineage")) return;
+    const count = Number(document.documentElement.dataset.detailSettled || 0) + 1;
+    document.documentElement.dataset.detailSettled = String(count);
+  };
+  Response.prototype.json = function (...args) {
+    const url = this.url || "";
+    return json.apply(this, args).finally(() => note(url));
+  };
+  Response.prototype.text = function (...args) {
+    const url = this.url || "";
+    return text.apply(this, args).finally(() => note(url));
+  };
+})();
+"""
+
+
+def _fulfill_lineage_detail(route, path, commit):
+    route.fulfill(
+        content_type="application/json",
+        body=json.dumps({
+            "commit": commit,
+            "files": [{"path": path, "added": 1, "deleted": 0}],
+            "checkout": "agenticml lineage checkout child",
+        }),
+    )
+
+
+def _open_focused_child(page, ui_server, on_detail):
+    """Runs page with a focused child whose graph payload can switch A/B."""
+    root = {
+        "run_id": "root", "name": "root run", "project": "demo", "status": "finished", "keys": [],
+        "created_at": "2024-01-01T00:00:00Z", "commit": "1111111aaaaaaa",
+    }
+    child = {
+        "run_id": "child", "name": "child run", "project": "demo", "status": "running", "keys": [],
+        "created_at": "2024-01-02T00:00:00Z", "parent_run_id": "root", "parent_inference": "explicit",
+        "commit": "aaaaaaa1111111", "base_commit": "abc1234", "base_branch": "main", "base_dirty": True,
+        "summary": {"loss": 0.5},
+    }
+    other = {
+        "run_id": "other", "name": "other run", "project": "demo", "status": "finished", "keys": [],
+        "created_at": "2024-01-03T00:00:00Z",
+    }
+    state = {"mode": "A", "calls": []}
+
+    def lineage(route):
+        fresh = state["mode"] == "A"
+        node = {
+            "run_id": "child", "name": "child run", "project": "demo", "status": "running",
+            "created_at": child["created_at"],
+            "parent_run_id": "root" if fresh else "other",
+            "parent_inference": "explicit" if fresh else "repo_root",
+            "commit": "aaaaaaa1111111" if fresh else "bbbbbbb2222222",
+            "base_commit": "abc1234", "base_branch": "main", "base_dirty": fresh,
+        }
+        route.fulfill(
+            content_type="application/json",
+            body=json.dumps({"nodes": [root, node, other], "edges": []}),
+        )
+
+    def detail(route):
+        state["calls"].append(route.request.url)
+        on_detail(route, len(state["calls"]))
+
+    mock_dashboard(page, [root, child, other])
+    page.route("**/api/lineage?project=demo", lineage)
+    page.route("**/api/runs/child/lineage", detail)
+    page.add_init_script(_DETAIL_SETTLED)
+    page.clock.install()
+    home(page, ui_server)
+    page.locator('.lineage-node[data-run-id="child"]').click()
+    strip = page.locator(".lineage-detail")
+    expect(strip).to_contain_text("from-a.py")
+    expect(strip).to_contain_text("root run")
+    expect(strip).to_contain_text("aaaaaaa1111111")
+    expect(strip).to_contain_text("dirty")
+    assert len(state["calls"]) == 1
+    return state, strip, child
+
+
+def test_superseded_lineage_detail_keeps_rendered_payload(page, ui_server):
+    """A late detail response must not paint over a graph that has moved back."""
+    page.allow_http_errors = True
+    held = []
+
+    def on_detail(route, index):
+        if index == 2:
+            held.append(route)
+            return
+        _fulfill_lineage_detail(route, "from-a.py", "aaaaaaa1111111")
+
+    state, strip, _child = _open_focused_child(page, ui_server, on_detail)
+    meta = page.locator('.lineage-node[data-run-id="child"] .lineage-meta')
+    try:
+        state["mode"] = "B"
+        page.clock.fast_forward(15000)
+        expect(meta).to_contain_text("bbbbbbb")
+        assert len(held) == 1
+        assert len(state["calls"]) == 2
+        # Same node: the previous strip stays up while B is in flight.
+        expect(strip).to_contain_text("from-a.py")
+        expect(strip).to_contain_text("root run")
+        expect(strip).not_to_contain_text("other run")
+        state["mode"] = "A"
+        page.clock.fast_forward(15000)
+        expect(meta).to_contain_text("aaaaaaa")
+        # A mistaken refetch would hit the route as soon as the graph paints.
+        page.wait_for_timeout(200)
+        assert len(state["calls"]) == 2
+        expect(page.locator("html")).to_have_attribute("data-detail-settled", "1")
+        expect(strip).to_contain_text("from-a.py")
+        expect(strip).to_contain_text("dirty")
+        _fulfill_lineage_detail(held.pop(), "from-b.py", "bbbbbbb2222222")
+        expect(page.locator("html")).to_have_attribute("data-detail-settled", "2")
+        expect(strip).to_contain_text("from-a.py")
+        expect(strip).to_contain_text("aaaaaaa1111111")
+        expect(strip).to_contain_text("root run")
+        expect(strip).to_contain_text("dirty")
+        expect(strip).not_to_contain_text("from-b.py")
+        expect(strip).not_to_contain_text("other run")
+        expect(strip).not_to_contain_text("bbbbbbb2222222")
+        expect(strip.locator("a")).to_have_attribute("href", "#/run/root")
+        assert len(state["calls"]) == 2
+        assert not held
+    finally:
+        while held:
+            held.pop().abort()
+
+
+def test_failed_lineage_detail_refetches_after_repaint(page, ui_server):
+    """A failed refresh clears the rendered marker so the next paint retries once."""
+    page.allow_http_errors = True
+
+    def on_detail(route, index):
+        if index == 2:
+            route.fulfill(status=503, body="unavailable")
+            return
+        _fulfill_lineage_detail(route, "from-a.py", "aaaaaaa1111111")
+
+    state, strip, child = _open_focused_child(page, ui_server, on_detail)
+    meta = page.locator('.lineage-node[data-run-id="child"] .lineage-meta')
+    state["mode"] = "B"
+    page.clock.fast_forward(15000)
+    expect(meta).to_contain_text("bbbbbbb")
+    expect(strip.locator(".error")).to_contain_text("503")
+    expect(strip).not_to_contain_text("from-a.py")
+    assert len(state["calls"]) == 2
+    # The runs poll repaints the list, not the graph, so it must not retry.
+    child["summary"]["loss"] = 0.25
+    page.clock.fast_forward(5000)
+    expect(row(page, "child run").locator('.run-number[title="loss"]')).to_have_text("0.25")
+    assert len(state["calls"]) == 2
+    state["mode"] = "A"
+    page.clock.fast_forward(10000)
+    expect(meta).to_contain_text("aaaaaaa")
+    expect(strip).to_contain_text("from-a.py")
+    expect(strip).to_contain_text("root run")
+    expect(strip).to_contain_text("aaaaaaa1111111")
+    expect(strip).to_contain_text("dirty")
+    expect(strip.locator("a")).to_have_attribute("href", "#/run/root")
+    expect(strip.locator(".error")).to_have_count(0)
+    assert len(state["calls"]) == 3
+
+
+def test_failed_lineage_fetch_retries_without_running_runs(page, ui_server):
+    """An all-idle workspace retries a failed lineage fetch without a click or runs poll."""
+    runs = [{"run_id": "idle", "name": "idle run", "project": "demo", "status": "finished", "keys": []}]
+    mock_dashboard(page, runs)
+    attempts = []
+
+    def lineage(route):
+        attempts.append(route.request.url)
+        if len(attempts) == 1:
+            route.fulfill(status=503, body="unavailable")
+        else:
+            route.fulfill(content_type="application/json", body=json.dumps({"nodes": [runs[0]], "edges": []}))
+
+    page.route("**/api/lineage?project=demo", lineage)
+    page.allow_http_errors = True
+    page.clock.install()
+    home(page, ui_server)
+    expect(page.locator(".lineage-scroll .error")).to_be_visible()
+    expect(page.locator(".poll-status")).to_have_text("1 runs")
+    assert len(attempts) == 1
+    page.clock.fast_forward(1000)
+    expect(page.locator('.lineage-node[data-run-id="idle"]')).to_contain_text("idle run")
+    assert len(attempts) == 2
+
+
+def test_removed_project_drops_lineage_cache_and_retries(page, ui_server):
+    drop = {
+        "run_id": "temp", "name": "temp run", "project": "drop", "status": "finished", "keys": [],
+        "created_at": "2024-01-01T00:00:00Z",
+    }
+    flaky = {
+        "run_id": "flaky", "name": "flaky run", "project": "flaky", "status": "finished", "keys": [],
+        "created_at": "2024-01-02T00:00:00Z",
+    }
+    stay = {
+        "run_id": "live", "name": "live run", "project": "stay", "status": "running", "keys": [],
+        "created_at": "2024-01-03T00:00:00Z", "summary": {"loss": 1},
+    }
+    runs = [drop, flaky, stay]
+    mock_dashboard(page, runs)
+    flaky_attempts = []
+    drop_attempts = []
+
+    def lineage(route):
+        if "project=flaky" not in route.request.url:
+            route.fallback()
+            return
+        flaky_attempts.append(route.request.url)
+        route.fulfill(status=503, body="unavailable")
+
+    page.route("**/api/lineage**", lineage)
+    page.on(
+        "request",
+        lambda request: drop_attempts.append(request.url)
+        if "/api/lineage?" in request.url and "project=drop" in request.url
+        else None,
+    )
+    page.allow_http_errors = True
+    page.clock.install()
+    home(page, ui_server)
+    expect(page.locator('.lineage-node[data-run-id="temp"]')).to_be_visible()
+    expect(page.locator('.project-card[data-project="flaky"] .lineage-scroll .error')).to_be_visible()
+    assert len(drop_attempts) == 1
+    assert flaky_attempts
+    runs.remove(drop)
+    runs.remove(flaky)
+    page.clock.fast_forward(5000)
+    expect(page.locator('.project-card[data-project="drop"]')).to_have_count(0)
+    expect(page.locator('.project-card[data-project="flaky"]')).to_have_count(0)
+    failed = len(flaky_attempts)
+    dropped = len(drop_attempts)
+    for step in range(6):
+        stay["summary"]["loss"] = step + 2
+        page.clock.fast_forward(5000)
+        expect(row(page, "live run").locator('.run-number[title="loss"]')).to_have_text(str(step + 2))
+    assert len(flaky_attempts) == failed
+    assert len(drop_attempts) == dropped
+    runs.insert(0, drop)
+    page.clock.fast_forward(5000)
+    expect(page.locator('.lineage-node[data-run-id="temp"]')).to_be_visible()
+    assert len(drop_attempts) == dropped + 1
+    assert len(flaky_attempts) == failed

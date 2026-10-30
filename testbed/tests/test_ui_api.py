@@ -144,6 +144,106 @@ def test_time_media_and_code(api, ui_server):
     assert any(e["path"].endswith("dummytrain/model.py") for e in manifest)
 
 
+def test_compare_code_snapshots(api, ui_server):
+    base_id = ui_server.runs["explicit-baseline"]
+    target_id = ui_server.runs["zero-code"]
+    base, target = [
+        {entry["path"]: entry for entry in RunReader(ui_server.root, run_id).code_manifest()}
+        for run_id in (base_id, target_id)
+    ]
+    response = api("/api/compare/code", params={"base": base_id, "target": target_id})
+    assert response.status_code == 200 and response.headers["Cache-Control"] == "no-store"
+    result = response.json()
+    assert result["base"] == base_id and result["target"] == target_id
+    assert result["truncated"] is False and result["files"]
+    expected = {}
+    for path in base.keys() | target.keys():
+        expected[path] = ("added" if path not in base else "removed" if path not in target else
+                          "unchanged" if base[path]["sha256"] == target[path]["sha256"] else "modified")
+    assert {row["path"]: row["status"] for row in result["files"]} == expected
+    for status in ("added", "removed", "modified", "unchanged"):
+        assert result["summary"][status] == list(expected.values()).count(status)
+    assert result["files"] == sorted(result["files"], key=lambda row: (row["status"] == "unchanged", row["path"]))
+    for row in result["files"]:
+        assert not row["too_large"] and not row["binary"] and "error" not in row
+        for side, manifest in (("base", base), ("target", target)):
+            assert row[side + "_sha256"] == manifest.get(row["path"], {}).get("sha256")
+    same = api("/api/compare/code", params={"base": base_id, "target": base_id}).json()
+    assert same["summary"] == dict(added=0, removed=0, modified=0, unchanged=len(base),
+                                    lines_added=0, lines_deleted=0)
+    assert all(row["hunks"] == [] for row in same["files"])
+
+
+def test_compare_code_snapshot_regressions(tmp_path, ui_server_factory):
+    root = tmp_path / "compare-store"
+    repeated = b'}\n' * 220
+    files = [
+        {"repeated": repeated + b'old\n' + repeated,
+         "crlf": b'one\ntwo\n', "newline": b'one\n',
+         "separators": 'inside\fline\u2028one\nold\n'.encode()},
+        {"repeated": repeated + b'new\n' + repeated,
+         "crlf": b'one\r\ntwo\r\n', "newline": b'one',
+         "separators": 'inside\fline\u2028one\nnew\n'.encode(),
+         "long": b'x' * (1024 * 1024)},
+    ]
+    run_ids = []
+    for side in files:
+        run = RunWriter.create(root, meta={"project": "compare"})
+        run.add_code([
+            {"path": "invalid-missing"},
+            {"path": "invalid-hex", "sha256": "not-hex"},
+            {"path": "invalid-list", "sha256": []},
+        ], list(side.items()))
+        run_ids.append(run.run_id)
+        run.finish("finished")
+    with ui_server_factory(root) as server, http_api(server) as request:
+        response = request("/api/compare/code", params=dict(zip(("base", "target"), run_ids)))
+        assert response.status_code == 200
+        result = response.json()
+    rows = {row["path"]: row for row in result["files"]}
+    assert rows["repeated"]["added"] == rows["repeated"]["deleted"] == 1
+    assert rows["repeated"]["approximate"] is False
+    assert rows["crlf"]["added"] == rows["crlf"]["deleted"] == 2
+    assert rows["newline"]["newline_change"] is True
+    assert rows["newline"]["added"] == rows["newline"]["deleted"] == 1
+    assert rows["newline"]["hunks"]
+    separators = rows["separators"]["hunks"][0]["lines"]
+    assert separators[0]["text"] == 'inside\fline\u2028one'
+    assert separators[1]["base_line"] == separators[2]["target_line"] == 2
+    long_line = rows["long"]["hunks"][0]["lines"][0]
+    assert long_line["clipped"] is True and len(long_line["text"]) == 2000
+    for path in ("invalid-missing", "invalid-hex", "invalid-list"):
+        assert rows[path]["error"] == "snapshot unavailable"
+        assert rows[path]["status"] == "modified"
+        assert rows[path]["added"] is rows[path]["deleted"] is None
+        assert rows[path]["hunks"] == []
+    assert str(root) not in response.text
+
+
+def test_compare_code_large_repetitive_snapshot(tmp_path, ui_server_factory):
+    root = tmp_path / "compare-large-store"
+    before = ['}\n'] * 20000
+    after = before.copy()
+    for index in range(100, 20000, 400):
+        after[index] = f'edited = {index}\n'
+    run_ids = []
+    for lines in (before, after):
+        run = RunWriter.create(root, meta={"project": "compare"})
+        run.add_code([], [("repeated.py", ''.join(lines).encode())])
+        run_ids.append(run.run_id)
+        run.finish("finished")
+    with ui_server_factory(root) as server, http_api(server) as request:
+        response = request("/api/compare/code", params=dict(zip(("base", "target"), run_ids)))
+        assert response.status_code == 200
+        result = response.json()
+    row = result["files"][0]
+    assert row["approximate"] is True and row["too_large"] is False
+    assert row["added"] > 0 and row["deleted"] > 0 and row["hunks"]
+    hunk = row["hunks"][0]
+    assert hunk["base_start"] == hunk["target_start"] == 98
+    assert hunk["lines"][0] == dict(type="context", text="}", base_line=98, target_line=98)
+
+
 @pytest.mark.parametrize("hint,expected", [("text/x-python", "text/plain"), ("text/html", "text/plain"),
                                           ("application/x-unknown", "application/octet-stream"),
                                           ("application/json", "application/json")])

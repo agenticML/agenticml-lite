@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from contextlib import contextmanager
+import difflib
 import gzip
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,6 +32,7 @@ _FILES = {
     "app.css": "text/css; charset=utf-8",
     "charts.js": "text/javascript; charset=utf-8",
     "code.js": "text/javascript; charset=utf-8",
+    "codediff.js": "text/javascript; charset=utf-8",
 }
 _OBJECT_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp", "image/avif",
                  "image/bmp", "image/x-icon", "text/plain", "application/json"}
@@ -42,6 +44,17 @@ _CHUNK = 64 * 1024
 _CONNECTION_TIMEOUT = 60
 _DISCONNECT = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
 _LINEAGE_FILES = 500
+_CODE_DIFF_MAX_BYTES = 1024 * 1024
+_CODE_DIFF_MAX_LINES = 20000
+_CODE_DIFF_AUTOJUNK_THRESHOLD = 25_000_000
+_CODE_DIFF_TOTAL_BYTES = 16 * 1024 * 1024
+_CODE_DIFF_TEXT_BYTES = 2 * 1024 * 1024
+_CODE_DIFF_LINE_CHARS = 2000
+_CODE_DIFF_TIMEOUT = 5
+_CODE_DIFF_FILE_LINES = 2000
+_CODE_DIFF_TOTAL_LINES = 20000
+_CODE_DIFF_FILES = 500
+_CODE_DIFF_CACHE_SIZE = 256
 _GIT_TIMEOUT = 5
 _GIT_MAX_BYTES = 2 * 1024 * 1024
 _GIT_READ = 64 * 1024
@@ -154,6 +167,221 @@ def _open_regular_object(root, sha):
     if not stat.S_ISREG(info.st_mode):
         raise FileNotFoundError(sha)
     return layout.open_object(root, sha)
+
+
+def _code_diff_result(**overrides):
+    result = dict(added=None, deleted=None, binary=False, too_large=False,
+                  hunks=[], patch_truncated=False, newline_change=False, approximate=False)
+    result.update(overrides)
+    return result
+
+
+class _CodeDiffBudget:
+    def __init__(self):
+        self.bytes_left = _CODE_DIFF_TOTAL_BYTES
+        self.deadline = time.monotonic() + _CODE_DIFF_TIMEOUT
+
+    def exhausted(self):
+        return self.bytes_left <= 0 or time.monotonic() >= self.deadline
+
+
+def _code_pair_diff(root, base_sha, target_sha, byte_limit, line_limit, budget):
+    """Diff bounded UTF-8 snapshots. Missing sides are empty, never objects."""
+    result = _code_diff_result()
+    blobs = []
+    try:
+        for sha in (base_sha, target_sha):
+            if sha is None:
+                blobs.append(b"")
+            else:
+                if budget.exhausted():
+                    return _code_diff_result(patch_truncated=True)
+                read_limit = min(byte_limit + 1, budget.bytes_left)
+                with _open_regular_object(root, sha) as stream:
+                    blob = stream.read(read_limit)
+                budget.bytes_left -= len(blob)
+                # Stop at the first oversized side; do not open the other one.
+                if len(blob) > byte_limit:
+                    return _code_diff_result(too_large=True)
+                # A budget-limited read cannot establish EOF without more I/O.
+                if len(blob) == read_limit and read_limit <= byte_limit:
+                    return _code_diff_result(patch_truncated=True)
+                lines = blob.count(b"\n") + bool(blob and not blob.endswith(b"\n"))
+                if lines > _CODE_DIFF_MAX_LINES:
+                    return _code_diff_result(too_large=True)
+                blobs.append(blob)
+    except (OSError, ValueError):
+        result.update(too_large=True, error="snapshot unavailable")
+        return result
+    try:
+        if any(b"\x00" in blob for blob in blobs):
+            result["binary"] = True
+            return result
+        decoded = [blob.decode("utf-8") for blob in blobs]
+    except UnicodeDecodeError:
+        result["binary"] = True
+        return result
+
+    if budget.exhausted():
+        return _code_diff_result(patch_truncated=True)
+    # Only LF separates source lines. Include the terminator in matching so a
+    # final-newline edit produces a replacement, while CR and Unicode separators
+    # remain visible source text with their original line numbers.
+    snapshots = []
+    for text in decoded:
+        lines = text.split("\n") if text else []
+        terminated = text.endswith("\n")
+        if terminated:
+            lines.pop()
+        snapshots.append([(line, index < len(lines) - 1 or terminated)
+                          for index, line in enumerate(lines)])
+    a_lines, b_lines = snapshots
+    result["newline_change"] = (base_sha is not None and target_sha is not None and
+                                decoded[0].endswith("\n") != decoded[1].endswith("\n"))
+    # Trim equal edges before matching: even large repetitive files with a
+    # localized edit then retain exact counts without quadratic matching work.
+    prefix = 0
+    while prefix < min(len(a_lines), len(b_lines)) and a_lines[prefix] == b_lines[prefix]:
+        prefix += 1
+    a_end, b_end = len(a_lines), len(b_lines)
+    while a_end > prefix and b_end > prefix and a_lines[a_end - 1] == b_lines[b_end - 1]:
+        a_end -= 1
+        b_end -= 1
+    a_mid, b_mid = a_lines[prefix:a_end], b_lines[prefix:b_end]
+    approximate = len(a_mid) * len(b_mid) > _CODE_DIFF_AUTOJUNK_THRESHOLD
+    result["approximate"] = approximate
+    matcher = difflib.SequenceMatcher(None, a_mid, b_mid, autojunk=approximate)
+    opcodes = [(tag, i1 + prefix, i2 + prefix, j1 + prefix, j2 + prefix)
+               for tag, i1, i2, j1, j2 in matcher.get_opcodes()]
+    if prefix:
+        opcodes.insert(0, ("equal", 0, prefix, 0, prefix))
+    if a_end < len(a_lines):
+        opcodes.append(("equal", a_end, len(a_lines), b_end, len(b_lines)))
+    # Group the restored full-file opcodes so edge context and line numbers
+    # include the trimmed lines, without running the matcher on them again.
+    matcher.opcodes = opcodes
+    result["added"] = sum(j2 - j1 for tag, i1, i2, j1, j2 in opcodes
+                          if tag in ("insert", "replace"))
+    result["deleted"] = sum(i2 - i1 for tag, i1, i2, j1, j2 in opcodes
+                            if tag in ("delete", "replace"))
+    remaining = line_limit
+    for group in matcher.get_grouped_opcodes(3):
+        group_lines = sum((i2 - i1 if tag != "insert" else 0)
+                          + (j2 - j1 if tag in ("insert", "replace") else 0)
+                          for tag, i1, i2, j1, j2 in group)
+        if group_lines > remaining:
+            result["patch_truncated"] = True
+        if remaining <= 0:
+            result["patch_truncated"] = True
+            break
+        hunk = dict(base_start=group[0][1] + 1, base_count=0,
+                    target_start=group[0][3] + 1, target_count=0, lines=[])
+        for tag, i1, i2, j1, j2 in group:
+            # Build only emitted lines; replacements put removals before additions.
+            parts = []
+            if tag == "equal":
+                parts.append(("context", range(i1, i2), a_lines, i1, j1))
+            else:
+                if tag in ("delete", "replace"):
+                    parts.append(("removed", range(i1, i2), a_lines, i1, None))
+                if tag in ("insert", "replace"):
+                    parts.append(("added", range(j1, j2), b_lines, None, j1))
+            for kind, indices, texts, base, target in parts:
+                for offset, index in enumerate(indices):
+                    if remaining <= 0:
+                        result["patch_truncated"] = True
+                        break
+                    text = texts[index][0]
+                    clipped = len(text) > _CODE_DIFF_LINE_CHARS
+                    visible = text[:_CODE_DIFF_LINE_CHARS]
+                    line = dict(
+                        type=kind, text=visible,
+                        base_line=base + offset + 1 if base is not None else None,
+                        target_line=target + offset + 1 if target is not None else None,
+                    )
+                    if clipped:
+                        line["clipped"] = True
+                        result["patch_truncated"] = True
+                    hunk["lines"].append(line)
+                    hunk["base_count"] += base is not None
+                    hunk["target_count"] += target is not None
+                    remaining -= 1
+        if hunk["lines"]:
+            result["hunks"].append(hunk)
+    return result
+
+
+def _code_patch_budget(diff, limit, text_limit):
+    """Copy the visible patch so response trimming cannot mutate the pair cache."""
+    result = dict(diff, hunks=[])
+    for hunk in diff["hunks"]:
+        lines = []
+        for line in hunk["lines"]:
+            size = len(line["text"].encode("utf-8"))
+            if limit <= 0 or text_limit <= 0 or size > text_limit:
+                if size > text_limit:
+                    text_limit = 0
+                break
+            lines.append(line)
+            limit -= 1
+            text_limit -= size
+        if len(lines) < len(hunk["lines"]):
+            result["patch_truncated"] = True
+        if lines:
+            result["hunks"].append(dict(
+                hunk, lines=lines,
+                base_count=sum(line["base_line"] is not None for line in lines),
+                target_count=sum(line["target_line"] is not None for line in lines),
+            ))
+    return result, limit, text_limit
+
+
+def _compare_code(httpd, base_id, target_id, base_manifest, target_manifest, budget=None):
+    budget = budget if budget is not None else _CodeDiffBudget()
+    manifests = [{entry["path"]: entry for entry in manifest}
+                 for manifest in (base_manifest, target_manifest)]
+    base, target = manifests
+    summary = dict(added=0, removed=0, modified=0, unchanged=0, lines_added=0, lines_deleted=0)
+    rows = []
+    for path in base.keys() | target.keys():
+        a, b = base.get(path), target.get(path)
+        invalid = any(entry is not None and not layout.valid_sha(entry.get("sha256"))
+                      for entry in (a, b))
+        status = ("added" if a is None else "removed" if b is None else
+                  "modified" if invalid or a.get("sha256") != b.get("sha256") else "unchanged")
+        summary[status] += 1
+        rows.append(dict(path=path, status=status,
+                         base_sha256=a.get("sha256") if a is not None else None,
+                         target_sha256=b.get("sha256") if b is not None else None,
+                         base_size=a.get("size") if a is not None else None,
+                         target_size=b.get("size") if b is not None else None))
+        if invalid:
+            rows[-1]["error"] = "snapshot unavailable"
+    rows.sort(key=lambda row: (row["status"] == "unchanged", row["path"]))
+    files_total = len(rows)
+    truncated = files_total > _CODE_DIFF_FILES
+    rows = rows[:_CODE_DIFF_FILES]
+    remaining = _CODE_DIFF_TOTAL_LINES
+    text_left = _CODE_DIFF_TEXT_BYTES
+    for row in rows:
+        if "error" in row:
+            row.update(_code_diff_result(too_large=True))
+            continue
+        if row["status"] == "unchanged":
+            row.update(_code_diff_result(added=0, deleted=0))
+            continue
+        if remaining <= 0 or text_left <= 0 or budget.exhausted():
+            row.update(_code_diff_result(patch_truncated=True))
+            continue
+        diff = httpd.code_pair_diff(row["base_sha256"], row["target_sha256"], budget)
+        patch, remaining, text_left = _code_patch_budget(diff, remaining, text_left)
+        row.update(patch)
+        # Status totals cover the whole manifest union. Line totals cover only
+        # files actually diffed, including lines omitted by patch output caps.
+        summary["lines_added"] += row["added"] or 0
+        summary["lines_deleted"] += row["deleted"] or 0
+    return dict(base=base_id, target=target_id, summary=summary, files=rows,
+                files_total=files_total, truncated=truncated)
 
 
 def _opt_text(value, limit=240):
@@ -676,6 +904,8 @@ class DashboardServer(ThreadingHTTPServer):
         self.bind_host = host
         self.readers = OrderedDict()
         self.reader_lock = threading.Lock()
+        self.code_diffs = OrderedDict()
+        self.code_diff_lock = threading.Lock()
         super().__init__((host, port), DashboardHandler)
 
     def handle_error(self, request, client_address):
@@ -710,6 +940,26 @@ class DashboardServer(ThreadingHTTPServer):
         """
         with self.reader_lock:
             return self.readers.get(run_id)
+
+    def code_pair_diff(self, base_sha, target_sha, budget):
+        # Per-server scope prevents cross-store cache hits. File line/character
+        # caps also bound cached text. Response budgets trim copies of patches.
+        key = (base_sha, target_sha, _CODE_DIFF_MAX_BYTES, _CODE_DIFF_FILE_LINES,
+               _CODE_DIFF_MAX_LINES, _CODE_DIFF_LINE_CHARS, _CODE_DIFF_AUTOJUNK_THRESHOLD)
+        with self.code_diff_lock:
+            if key in self.code_diffs:
+                self.code_diffs.move_to_end(key)
+                return self.code_diffs[key]
+        result = _code_pair_diff(self.root, base_sha, target_sha,
+                                 _CODE_DIFF_MAX_BYTES, _CODE_DIFF_FILE_LINES, budget)
+        # Retry unavailable snapshots and reads cut short by a request budget.
+        if "error" not in result and not budget.exhausted():
+            with self.code_diff_lock:
+                self.code_diffs[key] = result
+                self.code_diffs.move_to_end(key)
+                while len(self.code_diffs) > _CODE_DIFF_CACHE_SIZE:
+                    self.code_diffs.popitem(last=False)
+        return result
 
 
 class IPv6DashboardServer(DashboardServer):
@@ -848,6 +1098,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
         path = unquote(url.path, errors="strict")
         query = parse_qs(url.query, keep_blank_values=True)
         arg = lambda key, default=None: query.get(key, [default])[0]
+        if path == "/api/compare/code":
+            base_id, target_id = arg("base"), arg("target")
+            if not layout.valid_run_id(base_id) or not layout.valid_run_id(target_id):
+                raise ValueError("invalid run id")
+            budget = _CodeDiffBudget()
+            manifests = []
+            for run_id in dict.fromkeys((base_id, target_id)):
+                run_path = self.server.root / "runs" / run_id
+                if not run_path.resolve().is_relative_to(self.server.root / "runs"):
+                    raise FileNotFoundError()
+                with self.server.run_reader(run_id) as run:
+                    # Recheck existence even if this reader was cached earlier.
+                    run.meta()
+                    manifests.append(run.code_manifest())
+            if base_id == target_id:
+                manifests.append(manifests[0])
+            return self._json(_compare_code(self.server, base_id, target_id, *manifests, budget=budget))
         if path == "/api/lineage":
             if "project" in query:
                 project = (query.get("project") or [""])[0]
