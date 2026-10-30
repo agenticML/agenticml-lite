@@ -1,6 +1,7 @@
 /* AgenticML local dashboard. Store strings enter the DOM only as text. */
 import { MetricChart, emaSmooth, colorForId, formatNumber } from "./charts.js";
 import { createCodeViewer } from "./code.js";
+import { createCodeDiff } from "./codediff.js";
 
 const app = document.querySelector("#app");
 const fmt = (value) =>
@@ -182,12 +183,22 @@ function focus(title, subtitle, className = "", onClose = () => {}) {
     } else if (event.key === "Tab") {
       const targets = [
         ...host.querySelectorAll(
-          'button:not(:disabled), input, a[href], [tabindex="0"]',
+          'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], summary, [tabindex]:not([tabindex="-1"])',
         ),
-      ].filter((node) => node.getClientRects().length);
+      ].filter((node) => {
+        if (node.tabIndex < 0 || node.matches(":disabled") ||
+            !node.getClientRects().length || getComputedStyle(node).visibility !== "visible")
+          return false;
+        for (let parent = node.parentElement; parent !== host; parent = parent.parentElement) {
+          if (parent.hidden || (parent.matches("details:not([open])") &&
+              !parent.querySelector(":scope > summary")?.contains(node))) return false;
+        }
+        return true;
+      });
       const index = targets.indexOf(document.activeElement);
       if (
-        (event.shiftKey && index <= 0) ||
+        index === -1 ||
+        (event.shiftKey && index === 0) ||
         (!event.shiftKey && index === targets.length - 1)
       ) {
         event.preventDefault();
@@ -241,8 +252,8 @@ const headline = (run) => {
 };
 const LINEAGE_W = 200;
 const LINEAGE_H = 64;
-const LINEAGE_GAP_X = 56;
-const LINEAGE_GAP_Y = 16;
+const LINEAGE_GAP_X = 32;
+const LINEAGE_GAP_Y = 48;
 const LINEAGE_PAD = 16;
 let lineageMarker = 0;
 function svgEl(tag, attrs = {}, ...children) {
@@ -273,6 +284,8 @@ const lineageTime = (value) => {
   return Number.isFinite(time) ? time : Number.POSITIVE_INFINITY;
 };
 const LINEAGE_REFRESH_MS = 15000;
+const LINEAGE_RETRY_MS = 1000;
+const LINEAGE_RETRY_MAX_MS = 30000;
 function lineageSignature(runs) {
   return runs
     .map((run) =>
@@ -283,8 +296,9 @@ function lineageSignature(runs) {
     .sort()
     .join("\n");
 }
-// Layer is the longest path from a root. A barycenter sweep then pulls
-// related nodes into the same band; ties stay in created_at order.
+// Generations run top to bottom: layer is the longest path from a root.
+// A barycenter sweep pulls related nodes into the same column; ties stay
+// in created_at order.
 function layoutLineage(nodes, edges) {
   const byId = new Map(nodes.map((node) => [node.run_id, node]));
   const parents = new Map();
@@ -358,26 +372,28 @@ function layoutLineage(nodes, edges) {
     }
   }
   const pos = new Map();
-  let height = 0;
-  layers.forEach((row, column) => {
-    row.forEach((node, position) => {
+  let breadth = 0;
+  layers.forEach((row, generation) => {
+    row.forEach((node, index) => {
       pos.set(node.run_id, {
-        x: LINEAGE_PAD + column * (LINEAGE_W + LINEAGE_GAP_X),
-        y: LINEAGE_PAD + position * (LINEAGE_H + LINEAGE_GAP_Y),
+        x: LINEAGE_PAD + index * (LINEAGE_W + LINEAGE_GAP_X),
+        y: LINEAGE_PAD + generation * (LINEAGE_H + LINEAGE_GAP_Y),
+        generation,
+        index,
       });
     });
-    height = Math.max(height, row.length);
+    breadth = Math.max(breadth, row.length);
   });
   return {
     pos,
     width:
       LINEAGE_PAD * 2 +
-      Math.max(layers.length, 1) * LINEAGE_W +
-      Math.max(layers.length - 1, 0) * LINEAGE_GAP_X,
+      Math.max(breadth, 1) * LINEAGE_W +
+      Math.max(breadth - 1, 0) * LINEAGE_GAP_X,
     height:
       LINEAGE_PAD * 2 +
-      Math.max(height, 1) * LINEAGE_H +
-      Math.max(height - 1, 0) * LINEAGE_GAP_Y,
+      Math.max(layers.length, 1) * LINEAGE_H +
+      Math.max(layers.length - 1, 0) * LINEAGE_GAP_Y,
   };
 }
 function renderLineageSvg(data, options) {
@@ -394,22 +410,27 @@ function renderLineageSvg(data, options) {
     const from = pos.get(edge.from);
     const to = pos.get(edge.to);
     if (!from || !to) return null;
-    const x1 = from.x + LINEAGE_W;
-    const y1 = from.y + LINEAGE_H / 2;
-    const x2 = to.x;
-    const y2 = to.y + LINEAGE_H / 2;
-    const bend = Math.max(24, (x2 - x1) / 2);
+    const x1 = from.x + LINEAGE_W / 2;
+    const y1 = from.y + LINEAGE_H;
+    const x2 = to.x + LINEAGE_W / 2;
+    const y2 = to.y;
+    const bend = Math.max(24, (y2 - y1) / 2);
     const faded = dimmed(edge.from) || dimmed(edge.to);
     return svgEl("path", {
       class: `lineage-edge${edge.inferred ? " is-inferred" : ""}${faded ? " is-dim" : ""}`,
       "data-from": edge.from,
       "data-to": edge.to,
-      d: `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`,
+      d: `M ${x1} ${y1} C ${x1} ${y1 + bend}, ${x2} ${y2 - bend}, ${x2} ${y2}`,
       "marker-end": `url(#${markerId})`,
     });
   });
   const glyphs = nodes.map((node) => {
-    const at = pos.get(node.run_id) || { x: LINEAGE_PAD, y: LINEAGE_PAD };
+    const at = pos.get(node.run_id) || {
+      x: LINEAGE_PAD,
+      y: LINEAGE_PAD,
+      generation: 0,
+      index: 0,
+    };
     const name = node.name || node.run_id || "run";
     const status = node.status || "unknown";
     const tone = ["running", "finished", "crashed", "stale"].includes(status)
@@ -440,6 +461,8 @@ function renderLineageSvg(data, options) {
         role: "button",
         tabindex: "0",
         "data-run-id": node.run_id,
+        "data-generation": at.generation ?? 0,
+        "data-sibling": at.index ?? 0,
         "data-picked": picked ? "true" : "false",
         "aria-pressed": picked ? "true" : "false",
         "aria-label": `${name}, ${status}, ${runId}`,
@@ -592,8 +615,49 @@ async function home(version) {
   const haystack = (run) =>
     `${run.name} ${run.run_id} ${(run.tags || []).join(" ")}`.toLowerCase();
   const lineageCache = new Map();
+  const lineageRetry = new Map();
   let lineageToken = 0;
   let detailToken = 0;
+  function clearLineageRetry(key) {
+    const pending = lineageRetry.get(key);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    lineageRetry.delete(key);
+  }
+  // 1s, 2s, 4s… capped at 30s. Independent of the runs poll, so an idle
+  // workspace still retries a failed /api/lineage fetch.
+  function scheduleLineageRetry(key) {
+    if (epoch !== version) return;
+    const pending = lineageRetry.get(key);
+    const delay = Math.min(
+      pending ? pending.delay * 2 : LINEAGE_RETRY_MS,
+      LINEAGE_RETRY_MAX_MS,
+    );
+    if (pending) clearTimeout(pending.timer);
+    const timer = setTimeout(() => {
+      if (epoch !== version) return;
+      const entry = lineageCache.get(key);
+      const card = entry?.card;
+      const shown = runs.some((run) => (run.project || "") === key);
+      if (!entry || !shown || !card?.isConnected) {
+        if (!shown) lineageCache.delete(key);
+        clearLineageRetry(key);
+        return;
+      }
+      // A newer fetch owns this project. Keep the delay for its failure.
+      if (!entry.error || entry.pending) return;
+      const siblings = runs.filter((run) => (run.project || "") === key);
+      const signature = lineageSignature(siblings);
+      card.dataset.signature = signature;
+      ensureLineage(
+        key,
+        signature,
+        card,
+        siblings.some((run) => run.status === "running"),
+      );
+    }, delay);
+    lineageRetry.set(key, { timer, delay });
+  }
   let pendingFocus = { runId: "", project: "" };
   function projectHead(key) {
     return el(
@@ -716,22 +780,57 @@ async function home(version) {
       ),
     ].filter((child) => child != null));
   }
+  function lineageDetailPayload(node) {
+    const parentId = node.parent_run_id || "";
+    const parent = runs.find((run) => run.run_id === parentId);
+    return JSON.stringify([
+      node.run_id || "",
+      parentId,
+      parent?.name || "",
+      node.parent_inference || "",
+      node.commit || "",
+      node.base_commit || "",
+      node.base_branch || "",
+      Boolean(node.base_dirty),
+    ]);
+  }
+  function detailResponseCurrent(card, token, payload) {
+    return (
+      epoch === version &&
+      card.isConnected &&
+      card.dataset.detailToken === token &&
+      card.dataset.detailWanted === payload
+    );
+  }
   function showLineageDetail(card, node) {
     const token = String(++detailToken);
+    const payload = lineageDetailPayload(node);
+    const sameNode = card.dataset.detailFor === node.run_id;
     card.dataset.detailToken = token;
     card.dataset.detailFor = node.run_id;
     card.dataset.focus = node.run_id;
+    card.dataset.detailWanted = payload;
+    card.dataset.detailPending = payload;
     const host = card.querySelector(".lineage-detail");
-    host.replaceChildren(el("p", { class: "muted", text: "Loading changes…" }));
+    // A refresh of the open strip keeps the previous parent, commit, and
+    // dirty flag until the new payload arrives.
+    if (!sameNode)
+      host.replaceChildren(el("p", { class: "muted", text: "Loading changes…" }));
     get(`${apiRun(node.run_id)}/lineage`)
       .then((detail) => {
-        if (epoch !== version || !card.isConnected || card.dataset.detailToken !== token)
-          return;
+        if (!detailResponseCurrent(card, token, payload)) return;
+        card.dataset.detailPayload = payload;
+        delete card.dataset.detailPending;
         renderDetail(host, node, detail);
       })
       .catch((error) => {
         if (epoch !== version || error.name === "AbortError") return;
-        if (!card.isConnected || card.dataset.detailToken !== token) return;
+        if (!detailResponseCurrent(card, token, payload)) return;
+        delete card.dataset.detailPending;
+        // The strip no longer shows this payload. Leaving the rendered
+        // marker set makes the next paint treat it as current and skip
+        // the refetch, so the error stays up.
+        delete card.dataset.detailPayload;
         showError(host, error);
       });
   }
@@ -755,6 +854,68 @@ async function home(version) {
         run_id: runId,
       }
     );
+  }
+  // Up/Down walk generations (along an edge when there is one). Left/Right
+  // walk siblings in the same generation.
+  function moveLineageFocus(card, event) {
+    const key = event.key;
+    const vertical = key === "ArrowUp" || key === "ArrowDown";
+    const horizontal = key === "ArrowLeft" || key === "ArrowRight";
+    if (!vertical && !horizontal) return false;
+    if (event.altKey || event.metaKey || event.ctrlKey || event.shiftKey)
+      return false;
+    const target = event.target;
+    if (!target || !target.closest) return false;
+    const glyph = target.closest(".lineage-node");
+    if (!glyph || !card.contains(glyph)) return false;
+    event.preventDefault();
+    const scroll = glyph.closest(".lineage-scroll");
+    if (!scroll) return true;
+    const nodes = [...scroll.querySelectorAll(".lineage-node")];
+    const generation = Number(glyph.dataset.generation);
+    const sibling = Number(glyph.dataset.sibling);
+    const axis = (node, name) =>
+      Number(node.querySelector(".lineage-shape")?.getAttribute(name)) || 0;
+    let candidates = [];
+    if (horizontal) {
+      const step = key === "ArrowRight" ? 1 : -1;
+      candidates = nodes.filter(
+        (node) =>
+          Number(node.dataset.generation) === generation &&
+          Number(node.dataset.sibling) === sibling + step,
+      );
+    } else {
+      const down = key === "ArrowDown";
+      const id = glyph.getAttribute("data-run-id");
+      const ids = new Set(
+        [...scroll.querySelectorAll(".lineage-edge")]
+          .filter((edge) =>
+            down ? edge.dataset.from === id : edge.dataset.to === id,
+          )
+          .map((edge) => (down ? edge.dataset.to : edge.dataset.from)),
+      );
+      candidates = nodes.filter((node) =>
+        ids.has(node.getAttribute("data-run-id")),
+      );
+      if (!candidates.length) {
+        const nextGeneration = generation + (down ? 1 : -1);
+        candidates = nodes.filter(
+          (node) => Number(node.dataset.generation) === nextGeneration,
+        );
+      }
+    }
+    if (!candidates.length) return true;
+    const x = axis(glyph, "x");
+    const y = axis(glyph, "y");
+    candidates.sort(
+      (a, b) =>
+        Math.abs(axis(a, "x") - x) - Math.abs(axis(b, "x") - x) ||
+        Math.abs(axis(a, "y") - y) - Math.abs(axis(b, "y") - y) ||
+        Number(a.dataset.sibling) - Number(b.dataset.sibling) ||
+        String(a.dataset.runId).localeCompare(String(b.dataset.runId)),
+    );
+    candidates[0].focus();
+    return true;
   }
   function bindLineageCard(card) {
     if (card.dataset.lineageBound === "1") return;
@@ -781,6 +942,7 @@ async function home(version) {
       location.hash = routeRun(node.run_id);
     });
     card.addEventListener("keydown", (event) => {
+      if (moveLineageFocus(card, event)) return;
       if (event.key !== "Enter" && event.key !== " ") return;
       const node = lineageNodeFrom(card, event);
       if (!node) return;
@@ -823,6 +985,7 @@ async function home(version) {
       : blurredHere
         ? pendingFocus.runId
         : "";
+    const top = scroll.scrollTop;
     const left = scroll.scrollLeft;
     if (!data.nodes.length) {
       scroll.replaceChildren(
@@ -844,6 +1007,7 @@ async function home(version) {
         selected,
       }),
     );
+    scroll.scrollTop = top;
     scroll.scrollLeft = left;
     restoreLineageHover(card);
     if (restoreId && !typing) {
@@ -856,6 +1020,7 @@ async function home(version) {
         } catch {
           live.focus();
         }
+        scroll.scrollTop = top;
         scroll.scrollLeft = left;
       }
     }
@@ -863,7 +1028,26 @@ async function home(version) {
     const focusId = card.dataset.focus;
     if (!focusId) return;
     const node = data.nodes.find((item) => item.run_id === focusId);
-    if (node && card.dataset.detailFor !== focusId) showLineageDetail(card, node);
+    if (!node) return;
+    const payload = lineageDetailPayload(node);
+    // Wanted is whatever the most recent paint asked to show. A response
+    // may render only while it is still that payload.
+    if (payload !== card.dataset.detailWanted) {
+      const rendered =
+        payload === card.dataset.detailPayload &&
+        card.dataset.detailFor === focusId;
+      card.dataset.detailWanted = payload;
+      if (rendered) {
+        card.dataset.detailToken = String(++detailToken);
+        delete card.dataset.detailPending;
+      } else showLineageDetail(card, node);
+      return;
+    }
+    if (
+      card.dataset.detailFor !== focusId ||
+      (card.dataset.detailPayload !== payload && card.dataset.detailPending !== payload)
+    )
+      showLineageDetail(card, node);
   }
   function dimLineage(card, siblings, query) {
     const matching = new Set(
@@ -925,6 +1109,7 @@ async function home(version) {
         current.data = data;
         current.pending = false;
         current.error = null;
+        clearLineageRetry(key);
         const target = current.card;
         if (target?.isConnected && target.dataset.signature === signature)
           paintLineage(target, data);
@@ -942,6 +1127,9 @@ async function home(version) {
           if (target.isConnected && !current.data)
             showError(target.querySelector(".lineage-scroll"), error);
         }
+        if (target?.isConnected && runs.some((run) => (run.project || "") === key))
+          scheduleLineageRetry(key);
+        else clearLineageRetry(key);
       });
   }
   function draw() {
@@ -965,6 +1153,17 @@ async function home(version) {
       !a ? -1 : !b ? 1 : a.localeCompare(b),
     );
     if (project !== null && !groups.has(project)) project = null;
+    for (const key of [...lineageCache.keys()]) {
+      if (!groups.has(key)) {
+        clearLineageRetry(key);
+        lineageCache.delete(key);
+      }
+    }
+    const shownProjects = new Set(
+      projects.filter((key) => project === null || key === project),
+    );
+    for (const key of [...lineageRetry.keys()])
+      if (!shownProjects.has(key)) clearLineageRetry(key);
     for (const tab of tabs.querySelectorAll("button")) tab.remove();
     tabs.prepend(
       ...[null, ...projects].map((key) =>
@@ -1228,7 +1427,10 @@ async function home(version) {
       }
     }
   }
-  cleanup = () => clearTimeout(timer);
+  cleanup = () => {
+    clearTimeout(timer);
+    for (const key of [...lineageRetry.keys()]) clearLineageRetry(key);
+  };
   await refresh();
 }
 
@@ -2027,11 +2229,12 @@ async function comparePage(ids, version) {
     },
   );
   app.replaceChildren();
-  let timer;
+  let timer, codeDiff;
   const panel = metricsPanel(runs, true, signal);
   cleanup = () => {
     clearTimeout(timer);
     panel.destroy();
+    codeDiff?.destroy();
     overlay.close();
   };
   if (runs.length < 2) {
@@ -2046,6 +2249,7 @@ async function comparePage(ids, version) {
   const colors = Object.fromEntries(
     runs.map((run, index) => [run.run_id, `var(--s${(index % 5) + 1})`]),
   );
+  codeDiff = createCodeDiff({ runs, colors, signal, el, get, button });
   const selected = el(
     "div",
     { class: "inline", "data-testid": "selected-runs" },
@@ -2102,6 +2306,7 @@ async function comparePage(ids, version) {
         el("h2", { class: "eyebrow", text: "Params & metrics comparison" }),
         comparison,
       ),
+      codeDiff.node,
       el(
         "section",
         { class: "stack" },
@@ -2118,6 +2323,7 @@ async function comparePage(ids, version) {
       const next = await loadRuns();
       if (epoch !== version) return;
       runs = next;
+      codeDiff.update(runs);
       draw();
       await panel.update(runs);
       if (epoch !== version) return;
