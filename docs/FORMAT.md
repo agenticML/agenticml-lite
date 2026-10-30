@@ -24,6 +24,7 @@ Nothing here is uploaded. Paths below are relative to a root resolved by
     meta.json
     run.lock                     writer/GC/prune lifetime flock
     events.jsonl
+    notes.md
     scalars/index.json
     scalars/<id>.bin             one file per series, <id> is a decimal int
     scalars/<id>.ovw             overview at finish, only if the series has > 65536 points
@@ -196,6 +197,22 @@ and `kind`):
 `copy=false` does not hash and does not write an object. The file can change
 later; the record is a reference. `copy=true` snapshots the bytes into
 `objects/` under `sha256`. The recorded `path` is still the source path.
+
+## `notes.md`
+
+Optional UTF-8 Markdown text with `\n` line endings, capped at 256 KiB.
+One note per run, stored at `<root>/runs/<run_id>/notes.md`. A missing
+`notes.md` falls back to the `notes` string in `meta.json` in the dashboard.
+An empty `notes.md` means the note was cleared, so that launch note stays
+hidden. Clearing the note deletes the file when the run has no launch note.
+Notes stay local: `agenticml sync` does not upload them, and `agenticml gc`
+deletes them together with the run.
+
+The dashboard is read-only except for notes. Writes use
+`PUT /api/runs/<run_id>/notes`, which requires a same-origin request and the
+`X-AgenticML-Request: 1` header. Reads use `GET /api/runs/<run_id>/notes`
+and `GET /api/notes[?project=P]`. `agenticml ui --read-only` disables note
+editing.
 
 ## Scalars
 

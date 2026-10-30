@@ -1627,3 +1627,382 @@ pre,
   white-space: nowrap;
   color: var(--text-2);
 }
+
+/* Run notepad and workspace notebook share the dashboard's semantic colours. */
+.note-live {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.notepad,
+.note-card,
+.note-body,
+.note-edit,
+.notebook,
+.notebook-body,
+.notebook-entry,
+.notebook-content,
+.note-markdown {
+  min-width: 0;
+  max-width: 100%;
+}
+.notepad > .eyebrow {
+  margin-bottom: 12px;
+}
+.note-card,
+.notebook {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: var(--shadow-1);
+}
+.note-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--hairline);
+}
+.note-title,
+.note-controls,
+.note-modes {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.note-title h2 {
+  font-size: 17px;
+  margin: 0;
+}
+.note-card > .note-launch {
+  margin: 0;
+  padding: 12px 20px 0;
+}
+.note-launch {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.note-save {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.note-modes {
+  padding: 3px;
+  border-radius: 10px;
+  background: var(--surface-3);
+  gap: 2px;
+}
+.note-modes .btn[aria-pressed="true"] {
+  background: var(--surface);
+  box-shadow: var(--shadow-1);
+  color: var(--text);
+}
+.note-card .btn,
+.notebook .btn {
+  min-height: 40px;
+}
+.note-card [hidden],
+.notebook [hidden] {
+  display: none;
+}
+.note-body {
+  padding: 20px;
+}
+.note-body > .muted {
+  margin: 0;
+}
+.note-add {
+  font: inherit;
+  color: var(--text-3);
+  background: transparent;
+  border: 0;
+  text-align: left;
+  cursor: pointer;
+  width: 100%;
+  min-height: 48px;
+  padding: 8px 0;
+}
+.note-body:has(.note-edit) {
+  padding: 0;
+}
+.note-toolbar {
+  position: sticky;
+  top: 56px;
+  z-index: 1;
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 4px;
+  width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  padding: 8px 12px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--hairline);
+  border-radius: 0;
+}
+.note-toolbar .btn {
+  flex: 0 0 auto;
+  min-width: 40px;
+}
+.note-editor {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  min-height: 180px;
+  padding: 20px;
+  border: 0;
+  border-radius: 0 0 12px 12px;
+  resize: vertical;
+  font-family: var(--font-sans-stack);
+  font-size: 16px;
+  line-height: 1.75;
+  color: var(--text-2);
+  background: var(--surface);
+  overflow-wrap: anywhere;
+}
+.note-conflict,
+.note-truncate {
+  padding: 12px 20px;
+  background: var(--warn-soft);
+  color: var(--warn-text);
+  border-bottom: 1px solid var(--warn-border);
+  overflow-wrap: anywhere;
+}
+.note-conflict p,
+.note-truncate p {
+  margin: 0 0 8px;
+}
+.note-conflict .btn,
+.note-truncate .btn {
+  margin-right: 8px;
+}
+.note-markdown {
+  font-size: 15px;
+  line-height: 1.75;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+.note-markdown > :first-child {
+  margin-top: 0;
+}
+.note-markdown > :last-child {
+  margin-bottom: 0;
+}
+.note-markdown h1,
+.note-markdown h2,
+.note-markdown h3,
+.note-markdown h4 {
+  color: var(--text);
+  margin: 20px 0 8px;
+  line-height: 1.35;
+  letter-spacing: -0.02em;
+}
+.note-markdown h1 {
+  font-size: 24px;
+}
+.note-markdown h2 {
+  font-size: 21px;
+}
+.note-markdown h3 {
+  font-size: 18px;
+}
+.note-markdown h4 {
+  font-size: 16px;
+}
+.note-markdown p {
+  margin: 12px 0;
+}
+.note-markdown ul,
+.note-markdown ol {
+  padding-left: 24px;
+  margin: 10px 0;
+}
+.note-markdown li > ul,
+.note-markdown li > ol {
+  margin: 2px 0;
+}
+.note-markdown li {
+  padding-left: 2px;
+}
+.note-markdown .note-task {
+  list-style: none;
+  padding-left: 0;
+}
+.note-task > label {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-height: 44px;
+  padding: 8px 0;
+  cursor: pointer;
+}
+.note-task input {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  margin: 3px 0 0;
+  accent-color: var(--accent);
+}
+.note-task label > span {
+  min-width: 0;
+}
+.note-task.is-done > label > span {
+  text-decoration: line-through;
+  color: var(--text-3);
+}
+.note-task:has(input:disabled) > label {
+  cursor: default;
+}
+.note-markdown blockquote {
+  border-left: 3px solid var(--accent-border);
+  padding: 4px 16px;
+  margin: 12px 0;
+  color: var(--text-3);
+}
+.note-markdown code {
+  font-family: var(--font-mono-stack);
+  font-size: 0.88em;
+  padding: 2px 5px;
+  background: var(--surface-3);
+  border-radius: 4px;
+}
+.note-markdown pre {
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 16px;
+  margin: 12px 0;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  white-space: pre;
+  overflow-wrap: normal;
+}
+.note-markdown pre code {
+  padding: 0;
+  background: transparent;
+  border-radius: 0;
+}
+.note-markdown hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 20px 0;
+}
+.note-markdown a {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.notebook > summary {
+  min-height: 56px;
+  padding: 16px 20px;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+  font-weight: 600;
+}
+.notebook > summary .muted {
+  font-size: 12px;
+  font-weight: 400;
+  margin-left: 12px;
+}
+.notebook-body {
+  padding: 0 16px 16px;
+  display: grid;
+  gap: 12px;
+}
+.notebook-body > p {
+  margin: 8px 4px;
+}
+.notebook-entry {
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+}
+.notebook-entry-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--hairline);
+  border-radius: var(--r) var(--r) 0 0;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.notebook-run {
+  display: flex;
+  align-items: center;
+  min-height: 40px;
+  min-width: 0;
+  max-width: 100%;
+  font-size: 14px;
+}
+.notebook-content {
+  padding: 16px;
+  max-height: 340px;
+  overflow: hidden;
+}
+.notebook-content.is-expanded {
+  max-height: none;
+}
+.notebook-entry .note-more {
+  margin: 0 16px 12px;
+}
+.note-message {
+  font-size: 13px;
+  color: var(--warn-text);
+  margin: 0;
+  padding: 12px 16px;
+  overflow-wrap: anywhere;
+}
+.note-truncated {
+  margin: 0;
+  padding: 8px 16px 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-3);
+  overflow-wrap: anywhere;
+}
+@media (max-width: 480px) {
+  .note-header {
+    padding: 12px 16px;
+  }
+  .note-card > .note-launch {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+  .note-controls {
+    width: 100%;
+    justify-content: space-between;
+  }
+  .note-body,
+  .note-editor {
+    padding: 16px;
+  }
+  .notebook > summary {
+    padding: 16px;
+  }
+  .notebook > summary .muted {
+    display: block;
+    margin: 4px 0 0 18px;
+  }
+  .notebook-body {
+    padding: 0 10px 10px;
+  }
+  .notebook-entry-header,
+  .notebook-content {
+    padding: 12px;
+  }
+  .note-truncated {
+    padding-left: 12px;
+    padding-right: 12px;
+  }
+}

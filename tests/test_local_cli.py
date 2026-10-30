@@ -51,8 +51,10 @@ def test_ui_dispatch_defaults_and_options(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "serve", lambda *args: calls.append(args))
     cli.main(["ui"])
     cli.main(["ui", "--dir", str(tmp_path / "other"), "--host", "0.0.0.0", "--port", "8123", "--open"])
-    assert calls == [(tmp_path, "127.0.0.1", 6006, False),
-                     (tmp_path / "other", "0.0.0.0", 8123, True)]
+    cli.main(["ui", "--read-only"])
+    assert calls == [(tmp_path, "127.0.0.1", 6006, False, False),
+                     (tmp_path / "other", "0.0.0.0", 8123, True, False),
+                     (tmp_path, "127.0.0.1", 6006, False, True)]
 
 
 def test_ui_bind_errors_are_one_line(tmp_path, capsys):

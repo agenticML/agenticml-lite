@@ -108,7 +108,7 @@ def cmd_ui(args):
     from .ui.server import serve
 
     try:
-        serve(resolve_root(args.dir), args.host, args.port, args.open)
+        serve(resolve_root(args.dir), args.host, args.port, args.open, args.read_only)
     except KeyboardInterrupt:
         print("stopped")
         return 0
@@ -545,6 +545,7 @@ def main(argv=None):
     p_ui.add_argument("--host", default="127.0.0.1")
     p_ui.add_argument("--port", type=int, default=6006)
     p_ui.add_argument("--open", action="store_true", help="Open the dashboard in a browser")
+    p_ui.add_argument("--read-only", action="store_true", help="Disable note editing in the dashboard")
     p_ui.set_defaults(func=cmd_ui)
 
     p_sync = sub.add_parser("sync", help="Incrementally upload local runs to a server")

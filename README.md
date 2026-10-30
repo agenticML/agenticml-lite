@@ -100,10 +100,13 @@ The zero-code toy example captures config, code and system information, but no t
 agenticml ui          # http://127.0.0.1:6006
 agenticml ls          # newest first
 agenticml ui --open --port 6006 --host 127.0.0.1
+agenticml ui --read-only
 agenticml ls --project demo --json
 ```
 
 `agenticml ui` binds to `127.0.0.1` and port 6006. On loopback it answers only loopback `Host` headers. `--dir` selects the store (else `AGENTICML_DIR`, else `~/.agenticml`). `ls` prints run id, project, name, status, created time, and last step. A run stays `running` while its lifetime lock is held, even when it logs infrequently. If the lock is free, it is shown as `crashed`; sync finalizes it with `_exit_reason: "process died"`. On filesystems without locking, mtimes older than 120 seconds are the fallback for `stale` status.
+
+Every run page has an autosaving Markdown notepad, and view mode allows ticking checklist items directly. The home page includes a collapsible Notes notebook that shows each run's note grouped under the run name, following the project tab and filter box. The dashboard is read-only except for notes; `--read-only` disables note editing (recommended when exposing a non-loopback `--host`). A run's launch note (`--notes` / `init(notes=)`) is shown until the notepad is edited.
 
 ## Where data lives
 
@@ -115,6 +118,7 @@ The store root is `init(dir=...)`, else `AGENTICML_DIR`, else `~/.agenticml`. La
   runs/<run_id>/
     meta.json                    project, config, status, summary, env, git
     events.jsonl                 config updates, code, artifacts, finish
+    notes.md                     run note (Markdown, up to 256 KiB)
     sync.json                    per-host upload cursor, after a sync
     scalars/<id>.bin             8 bytes per point: uint32 step, float32 value
     scalars/<id>.ovw             overview, at finish, if the series has > 65536 points
