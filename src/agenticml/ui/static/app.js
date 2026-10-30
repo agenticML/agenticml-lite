@@ -130,8 +130,23 @@ async function get(url, signal = controller?.signal) {
   return response.json();
 }
 function showError(node, error) {
-  if (error.name !== "AbortError")
-    node.replaceChildren(el("p", { class: "error", text: error.message }));
+  if (error.name === "AbortError") return;
+  const message = error.message;
+  // Repeated polls must not rebuild the same alert or screen readers re-announce it.
+  const current = node.querySelector(":scope > .error");
+  if (current?.textContent === message) return;
+  node.replaceChildren(el("p", { class: "error", role: "alert", text: message }));
+}
+const loading = (text) =>
+  el("p", { class: "muted", role: "status", "aria-live": "polite", text });
+const pollStatusNode = () =>
+  el("span", {
+    class: "poll-status",
+    role: "status",
+    "aria-live": "polite",
+  });
+function setPollStatus(node, text) {
+  if (node.textContent !== text) node.textContent = text;
 }
 let theme = "system";
 try {
@@ -257,6 +272,7 @@ const LINEAGE_GAP_X = 32;
 const LINEAGE_GAP_Y = 48;
 const LINEAGE_PAD = 16;
 let lineageMarker = 0;
+let lineageLane = 0;
 function svgEl(tag, attrs = {}, ...children) {
   const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
   for (const [key, value] of Object.entries(attrs)) {
@@ -290,9 +306,10 @@ const LINEAGE_RETRY_MAX_MS = 30000;
 function lineageSignature(runs) {
   return runs
     .map((run) =>
-      [run.run_id, run.status || "", run.name || "", run.created_at || ""].join(
-        "\t",
-      ),
+      JSON.stringify([
+        run.run_id, run.status || "", run.name || "", run.created_at || "",
+        run.task || "", run.task_source || "", run.arch || null,
+      ]),
     )
     .sort()
     .join("\n");
@@ -300,7 +317,7 @@ function lineageSignature(runs) {
 // Generations run top to bottom: layer is the longest path from a root.
 // A barycenter sweep pulls related nodes into the same column; ties stay
 // in created_at order.
-function layoutLineage(nodes, edges) {
+function layoutLineage(nodes, edges, nodeHeight = LINEAGE_H) {
   const byId = new Map(nodes.map((node) => [node.run_id, node]));
   const parents = new Map();
   const children = new Map();
@@ -326,7 +343,7 @@ function layoutLineage(nodes, edges) {
     return value;
   };
   for (const node of nodes) layer(node.run_id);
-  const depth = Math.max(0, ...[...layerOf.values(), 0]);
+  const depth = [...layerOf.values()].reduce((max, value) => Math.max(max, value), 0);
   const layers = Array.from({ length: depth + 1 }, () => []);
   const ordered = [...nodes].sort(
     (a, b) =>
@@ -378,7 +395,7 @@ function layoutLineage(nodes, edges) {
     row.forEach((node, index) => {
       pos.set(node.run_id, {
         x: LINEAGE_PAD + index * (LINEAGE_W + LINEAGE_GAP_X),
-        y: LINEAGE_PAD + generation * (LINEAGE_H + LINEAGE_GAP_Y),
+        y: LINEAGE_PAD + generation * (nodeHeight + LINEAGE_GAP_Y),
         generation,
         index,
       });
@@ -393,16 +410,95 @@ function layoutLineage(nodes, edges) {
       Math.max(breadth - 1, 0) * LINEAGE_GAP_X,
     height:
       LINEAGE_PAD * 2 +
-      Math.max(layers.length, 1) * LINEAGE_H +
+      Math.max(layers.length, 1) * nodeHeight +
       Math.max(layers.length - 1, 0) * LINEAGE_GAP_Y,
   };
+}
+const lineageTask = (node) => typeof node.task === "string" ? node.task : "";
+function lineageBadges(node, byId) {
+  const badges = [];
+  const parent = byId.get(node.parent_run_id);
+  if (node.base_dirty) badges.push(["dirty", "lineage-dirty", "Base tree was dirty"]);
+  if (node.same_tree_as_parent)
+    badges.push(["same code", "lineage-same", "Same tree as parent"]);
+  if (node.error) badges.push(["error", "lineage-error", String(node.error)]);
+  if (node.cross_task && parent)
+    badges.push([
+      `from ${lineageTask(parent) || "No task"}`, "lineage-cross-task",
+      `from ${lineageTask(parent) || "No task"}: ${parent.name || parent.run_id} (${parent.run_id})`,
+    ]);
+  if (node.arch_changed)
+    badges.push([
+      "arch changed", "lineage-arch-changed",
+      `${parent?.arch?.model_class || "—"} → ${node.arch?.model_class || "—"}`,
+    ]);
+  return badges;
+}
+function renderLineageLanes(data, options) {
+  const lanes = new Map();
+  const byId = new Map(data.nodes.map((node) => [node.run_id, node]));
+  for (const node of data.nodes) {
+    const task = lineageTask(node);
+    if (!lanes.has(task)) lanes.set(task, []);
+    lanes.get(task).push(node);
+  }
+  const graph = (nodes) => {
+    const ids = new Set(nodes.map((node) => node.run_id));
+    return renderLineageSvg({
+      nodes,
+      edges: data.edges.filter((edge) =>
+        edge && !edge.cross_task && ids.has(edge.from) && ids.has(edge.to)),
+    }, { ...options, byId });
+  };
+  // Preserve the original DOM and layout for the single unassigned stream.
+  if (lanes.size === 1 && lanes.has("")) return [graph(data.nodes)];
+  const timestamps = new Map(data.nodes.map((node) => {
+    const time = Date.parse(node.created_at);
+    return [node.run_id, Number.isFinite(time) ? time : -Infinity];
+  }));
+  const orderedLanes = [...lanes].map(([task, nodes]) => {
+    nodes.sort((a, b) => timestamps.get(b.run_id) - timestamps.get(a.run_id) ||
+      String(a.run_id).localeCompare(String(b.run_id)));
+    const recent = nodes.reduce((max, node) => Math.max(max, timestamps.get(node.run_id)), -Infinity);
+    return [task, nodes, recent];
+  });
+  return orderedLanes.sort(([a, , aa], [b, , bb]) =>
+    bb - aa || a.localeCompare(b),
+  ).map(([task, nodes]) => {
+    const source = nodes.find((node) => node.task_source)?.task_source;
+    const hint = source === "entry" ? `from ${task}/` :
+      source === "marker" ? "agenticml.toml" : source || "";
+    const headingId = `lineage-lane-title-${++lineageLane}`;
+    return el("section", { class: "lineage-lane", "data-task": task, "aria-labelledby": headingId },
+      el("header", { class: "lineage-lane-head" },
+        el("h3", { id: headingId, class: "lineage-lane-title", text: task || "No task" }),
+        hint ? el("span", { class: "muted lineage-lane-source", text: hint }) : null,
+      ),
+      el("div", { class: "lineage-lane-scroll" }, graph(nodes)),
+    );
+  });
 }
 function renderLineageSvg(data, options) {
   const nodes = data.nodes || [];
   const edges = (data.edges || []).filter(
     (edge) => edge && edge.from && edge.to && edge.from !== edge.to,
   );
-  const { pos, width, height } = layoutLineage(nodes, edges);
+  const badgesById = new Map(nodes.map((node) => {
+    let x = 28, row = 0;
+    const badges = lineageBadges(node, options.byId).map(([label, className, tip]) => {
+      const text = shorten(label, 26);
+      const size = text.length * 5.6 + 10;
+      if (x > 28 && x + size > LINEAGE_W - 6) { x = 28; row++; }
+      const badge = { text, className, tip, x, row, label };
+      x += size;
+      return badge;
+    });
+    return [node.run_id, badges];
+  }));
+  const rows = [...badgesById.values()].reduce((max, badges) =>
+    badges.reduce((max, badge) => Math.max(max, badge.row + 1), max), 1);
+  const nodeHeight = LINEAGE_H + (rows - 1) * 14;
+  const { pos, width, height } = layoutLineage(nodes, edges, nodeHeight);
   const markerId = `lineage-arrow-${++lineageMarker}`;
   const filtering = options.filtering;
   const matching = options.matching || new Set();
@@ -412,7 +508,7 @@ function renderLineageSvg(data, options) {
     const to = pos.get(edge.to);
     if (!from || !to) return null;
     const x1 = from.x + LINEAGE_W / 2;
-    const y1 = from.y + LINEAGE_H;
+    const y1 = from.y + nodeHeight;
     const x2 = to.x + LINEAGE_W / 2;
     const y2 = to.y;
     const bend = Math.max(24, (y2 - y1) / 2);
@@ -437,21 +533,14 @@ function renderLineageSvg(data, options) {
     const tone = ["running", "finished", "crashed", "stale"].includes(status)
       ? status
       : "unknown";
-    const badges = [];
-    if (node.base_dirty) badges.push(["dirty", "lineage-dirty", "Base tree was dirty"]);
-    if (node.same_tree_as_parent)
-      badges.push(["same code", "lineage-same", "Same tree as parent"]);
-    if (node.error) badges.push(["error", "lineage-error", String(node.error)]);
-    let badgeX = at.x + 28;
-    const badgeNodes = badges.map(([label, className, tip]) => {
-      const item = svgEl(
+    const badges = badgesById.get(node.run_id);
+    const badgeNodes = badges.map(({ text, className, tip, x, row }) =>
+      svgEl(
         "text",
-        { class: className, x: badgeX, y: at.y + 54, text: label },
+        { class: className, x: at.x + x, y: at.y + 54 + row * 14, text },
         svgEl("title", { text: tip }),
-      );
-      badgeX += label.length * 5.6 + 10;
-      return item;
-    });
+      ),
+    );
     const commit = node.commit ? String(node.commit).slice(0, 7) : "—";
     const picked = options.selected?.has(node.run_id);
     const runId = node.run_id || "";
@@ -466,7 +555,7 @@ function renderLineageSvg(data, options) {
         "data-sibling": at.index ?? 0,
         "data-picked": picked ? "true" : "false",
         "aria-pressed": picked ? "true" : "false",
-        "aria-label": `${name}, ${status}, ${runId}`,
+        "aria-label": [name, status, runId, ...badges.map((badge) => badge.label)].join(", "),
       },
       svgEl("title", { text: `${name}\n${runId}` }),
       svgEl("rect", {
@@ -474,7 +563,7 @@ function renderLineageSvg(data, options) {
         x: at.x,
         y: at.y,
         width: LINEAGE_W,
-        height: LINEAGE_H,
+        height: nodeHeight,
         rx: "8",
       }),
       svgEl("circle", {
@@ -555,7 +644,7 @@ async function home(version) {
     "data-testid": "selection-bar",
   });
   const content = el("div", { class: "stack" });
-  const status = el("span", { class: "poll-status" });
+  const status = pollStatusNode();
   const count = el("span", { class: "muted" });
   app.replaceChildren(
     el(
@@ -739,6 +828,14 @@ async function home(version) {
             text: `${base || "—"}${node.base_dirty ? " · dirty" : ""}`,
           }),
         ),
+        node.arch ? el("div", {},
+          el("div", { class: "eyebrow", text: "Model class" }),
+          el("span", { class: "mono", text: node.arch.model_class || "—" }),
+        ) : null,
+        node.arch?.model_type ? el("div", {},
+          el("div", { class: "eyebrow", text: "Model type" }),
+          el("span", { class: "mono", text: node.arch.model_type }),
+        ) : null,
       ),
       detail.error ? el("p", { class: "error", text: detail.error }) : null,
       el("div", { class: "eyebrow", text: "Files changed vs parent" }),
@@ -795,6 +892,8 @@ async function home(version) {
       node.base_commit || "",
       node.base_branch || "",
       Boolean(node.base_dirty),
+      node.task || "",
+      node.arch || null,
     ]);
   }
   function detailResponseCurrent(card, token, payload) {
@@ -818,7 +917,7 @@ async function home(version) {
     // A refresh of the open strip keeps the previous parent, commit, and
     // dirty flag until the new payload arrives.
     if (!sameNode)
-      host.replaceChildren(el("p", { class: "muted", text: "Loading changes…" }));
+      host.replaceChildren(loading("Loading changes…"));
     get(`${apiRun(node.run_id)}/lineage`)
       .then((detail) => {
         if (!detailResponseCurrent(card, token, payload)) return;
@@ -874,7 +973,8 @@ async function home(version) {
     event.preventDefault();
     const scroll = glyph.closest(".lineage-scroll");
     if (!scroll) return true;
-    const nodes = [...scroll.querySelectorAll(".lineage-node")];
+    const graph = glyph.closest(".lineage-graph");
+    const nodes = [...graph.querySelectorAll(".lineage-node")];
     const generation = Number(glyph.dataset.generation);
     const sibling = Number(glyph.dataset.sibling);
     const axis = (node, name) =>
@@ -891,7 +991,7 @@ async function home(version) {
       const down = key === "ArrowDown";
       const id = glyph.getAttribute("data-run-id");
       const ids = new Set(
-        [...scroll.querySelectorAll(".lineage-edge")]
+        [...graph.querySelectorAll(".lineage-edge")]
           .filter((edge) =>
             down ? edge.dataset.from === id : edge.dataset.to === id,
           )
@@ -905,6 +1005,18 @@ async function home(version) {
         candidates = nodes.filter(
           (node) => Number(node.dataset.generation) === nextGeneration,
         );
+      }
+      // At a lane boundary, continue in the adjacent lane. Tab also reaches
+      // every run; within a lane the original generation/sibling rules apply.
+      if (!candidates.length) {
+        const graphs = [...scroll.querySelectorAll(".lineage-graph")];
+        const adjacent = graphs[graphs.indexOf(graph) + (down ? 1 : -1)];
+        if (adjacent) {
+          const nextNodes = [...adjacent.querySelectorAll(".lineage-node")];
+          const generations = nextNodes.map((node) => Number(node.dataset.generation));
+          const boundary = down ? Math.min(...generations) : Math.max(...generations);
+          candidates = nextNodes.filter((node) => Number(node.dataset.generation) === boundary);
+        }
       }
     }
     if (!candidates.length) return true;
@@ -990,6 +1102,9 @@ async function home(version) {
         : "";
     const top = scroll.scrollTop;
     const left = scroll.scrollLeft;
+    const laneScrolls = new Map([...scroll.querySelectorAll(".lineage-lane")].map(
+      (lane) => [lane.dataset.task, lane.querySelector(".lineage-lane-scroll").scrollLeft],
+    ));
     if (!data.nodes.length) {
       scroll.replaceChildren(
         el("p", { class: "muted", text: "No runs to graph." }),
@@ -1004,12 +1119,14 @@ async function home(version) {
         .map((run) => run.run_id),
     );
     scroll.replaceChildren(
-      renderLineageSvg(data, {
+      ...renderLineageLanes(data, {
         filtering: Boolean(query),
         matching,
         selected,
       }),
     );
+    for (const lane of scroll.querySelectorAll(".lineage-lane"))
+      lane.querySelector(".lineage-lane-scroll").scrollLeft = laneScrolls.get(lane.dataset.task) || 0;
     scroll.scrollTop = top;
     scroll.scrollLeft = left;
     restoreLineageHover(card);
@@ -1081,7 +1198,7 @@ async function home(version) {
       else if (!card.querySelector(".lineage-graph"))
         card
           .querySelector(".lineage-scroll")
-          .replaceChildren(el("p", { class: "muted", text: "Loading lineage…" }));
+          .replaceChildren(loading("Loading lineage…"));
       return;
     }
     const token = ++lineageToken;
@@ -1100,9 +1217,7 @@ async function home(version) {
     if (scroll && !scroll.querySelector(".lineage-graph")) {
       if (kept) paintLineage(card, kept);
       else
-        scroll.replaceChildren(
-          el("p", { class: "muted", text: "Loading lineage…" }),
-        );
+        scroll.replaceChildren(loading("Loading lineage…"));
     }
     get(`/api/lineage?${new URLSearchParams({ project: key })}`)
       .then((data) => {
@@ -1211,7 +1326,7 @@ async function home(version) {
         const scroll = el(
           "div",
           { class: "lineage-scroll" },
-          el("p", { class: "muted", text: "Loading lineage…" }),
+          loading("Loading lineage…"),
         );
         const detail = el(
           "div",
@@ -1422,9 +1537,10 @@ async function home(version) {
         if (!runs.some((run) => run.run_id === id)) selected.delete(id);
       draw();
       const live = runs.some((run) => run.status === "running");
-      status.textContent = live
-        ? "Live · refreshes every 5 s"
-        : `${runs.length} runs`;
+      setPollStatus(
+        status,
+        live ? "Live · refreshes every 5 s" : `${runs.length} runs`,
+      );
       if (live) timer = setTimeout(refresh, 5000);
     } catch (error) {
       if (epoch === version) {
@@ -1511,7 +1627,9 @@ function metricsPanel(initialRuns, compare, signal) {
   const count = el("span", { class: "muted" }),
     content = el("div", { class: "stack" }),
     note = el("div", { class: "muted" }),
-    failure = el("div");
+    failure = el("div", { role: "alert" });
+  // Joined error text from the last paint. update() runs on every poll.
+  let failureText = "";
   node.append(
     el(
       "div",
@@ -1830,15 +1948,25 @@ function metricsPanel(initialRuns, compare, signal) {
           `${runs[i].name || runs[i].run_id}: ${result.reason.message}`,
         );
     });
-    failure.replaceChildren(
-      ...errors.map((text) => el("p", { class: "error", text })),
-    );
+    // Repeated polls must not rebuild the same alert or screen readers re-announce it.
+    if (errors.length) {
+      const nextFailure = errors.join("\n");
+      if (nextFailure !== failureText) {
+        failureText = nextFailure;
+        failure.replaceChildren(
+          ...errors.map((text) => el("p", { class: "error", text })),
+        );
+      }
+    } else if (failureText) {
+      failureText = "";
+      failure.replaceChildren();
+    }
     note.textContent = truncated
       ? "Some metric keys were truncated by the server."
       : "";
     if (changed || !charts.size) draw();
   }
-  content.append(el("p", { class: "muted", text: "Loading metrics…" }));
+  content.append(loading("Loading metrics…"));
   return {
     node,
     update,
@@ -1944,12 +2072,12 @@ async function runPage(id, version) {
     subline = el("div", { class: "subline" }),
     facts = el("div", { "data-testid": "identity" }),
     anatomy = el("div", { class: "anatomy" });
-  const pollStatus = el("span", { class: "poll-status" }),
+  const pollStatus = pollStatusNode(),
     pollError = el("div");
   const codeContainer = el(
     "div",
     { class: "code-container" },
-    el("p", { class: "muted", text: "Loading code snapshot…" }),
+    loading("Loading code snapshot…"),
   );
   const gitAside = el("span", { class: "muted", text: "Finding baseline…" });
   const parameterSearch = el("input", {
@@ -2045,8 +2173,10 @@ async function runPage(id, version) {
       card("Artifacts", artifacts),
       mediaCard(media),
     );
-    pollStatus.textContent =
-      run.status === "running" ? "Live · refreshes every 5 s" : "Up to date";
+    setPollStatus(
+      pollStatus,
+      run.status === "running" ? "Live · refreshes every 5 s" : "Up to date",
+    );
   }
   const fullButton = button("Open full window ⤢", () => code?.openFull());
   app.replaceChildren(
@@ -2280,7 +2410,7 @@ async function comparePage(ids, version) {
   const comparison = el("div", { class: "card anatomy-card" }),
     config = el("div", { class: "card anatomy-card" }),
     pollError = el("div"),
-    pollStatus = el("span", { class: "poll-status" });
+    pollStatus = pollStatusNode();
   function draw() {
     comparison.replaceChildren(comparisonTable(runs, colors));
     config.replaceChildren(
@@ -2297,9 +2427,12 @@ async function comparePage(ids, version) {
         ),
       }),
     );
-    pollStatus.textContent = runs.some((run) => run.status === "running")
-      ? "Live · refreshes every 5 s"
-      : "Up to date";
+    setPollStatus(
+      pollStatus,
+      runs.some((run) => run.status === "running")
+        ? "Live · refreshes every 5 s"
+        : "Up to date",
+    );
   }
   overlay.body.append(
     el(
@@ -2360,7 +2493,7 @@ async function route() {
   cleanup = () => {};
   document.querySelector("#lightbox").close();
   controller = new AbortController();
-  app.replaceChildren(el("p", { class: "muted", text: "Loading runs…" }));
+  app.replaceChildren(loading("Loading runs…"));
   try {
     const hash = location.hash.slice(1) || "/";
     if (hash.startsWith("/run/"))

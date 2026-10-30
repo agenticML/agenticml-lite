@@ -8,6 +8,7 @@ import logging
 import os
 import threading
 
+from .code_tracking import _normalize_task
 from .distributed import is_main_process
 from .run import Run
 
@@ -21,6 +22,7 @@ _active_run = None  # may be a Run or _DisabledRun
 
 class _DisabledRun:
     run_id = None
+    task = None
     notes = None
     group = None
     job_type = None
@@ -159,6 +161,13 @@ def _attach(run, project, name, kwargs):
         project is not None and current_project is not missing and project != current_project
     )
     name_differs = name is not None and current_name is not missing and name != current_name
+    task = kwargs.get("task")
+    current_task = getattr(run, "task", missing)
+    if task is not None and current_task is not missing and _normalize_task(task) != current_task:
+        logger.warning(
+            "agenticml run already started task %r; keeping it instead of task=%r",
+            current_task, task,
+        )
     if project_differs or name_differs:
         logger.warning(
             "agenticml run already started run %r in project %r; "

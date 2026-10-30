@@ -165,20 +165,23 @@ export function renderMarkdown(text, { el, onToggle, interactive = false }) {
       quote = null;
       const depth = Math.floor(match[1].replace(/\t/g, "  ").length / 2);
       const kind = /\d/.test(match[2]) ? "ol" : "ul";
-      while (lists.length && lists.at(-1).depth > depth) lists.pop();
-      if (
-        lists.length &&
-        lists.at(-1).depth === depth &&
-        lists.at(-1).kind !== kind
-      )
+      let tail = lists[lists.length - 1];
+      while (tail && tail.depth > depth) {
         lists.pop();
-      if (!lists.length || lists.at(-1).depth < depth) {
+        tail = lists[lists.length - 1];
+      }
+      if (tail && tail.depth === depth && tail.kind !== kind) {
+        lists.pop();
+        tail = lists[lists.length - 1];
+      }
+      if (!tail || tail.depth < depth) {
         const list = el(kind);
         if (kind === "ol") list.start = parseInt(match[2], 10);
-        (lists.at(-1)?.item || root).append(list);
-        lists.push({ depth, kind, list, item: null });
+        (tail && tail.item ? tail.item : root).append(list);
+        tail = { depth, kind, list, item: null };
+        lists.push(tail);
       }
-      const current = lists.at(-1);
+      const current = tail;
       const item = el("li");
       const task = line.match(taskLine);
       if (task) {
@@ -381,8 +384,12 @@ export function createNotepad({ runId, el, button, signal }) {
   const retry = button(
     "Retry",
     () => {
+      // A closed gate stays closed. Retry must not arm a truncated write.
+      if (gateClosed()) {
+        showSaveAnyway();
+        return;
+      }
       failed = "";
-      if (tooLarge) truncateArmed = true;
       flush(false);
     },
     "ghost",
@@ -406,18 +413,45 @@ export function createNotepad({ runId, el, button, signal }) {
     role: "alert",
     hidden: true,
   });
+  const truncateCopy = el("p", {
+    class: "note-truncate-copy",
+    text: "This note is larger than 256 KiB and is shown truncated.",
+  });
+  const saveHint = el("p", {
+    class: "note-truncate-hint",
+    text: "Use Save anyway to replace the file.",
+    hidden: true,
+  });
   const saveAnyway = button("Save anyway", () => confirmTruncate());
   const truncateBanner = el(
     "div",
     { class: "note-truncate", role: "alert", hidden: true },
-    el("p", {
-      text: "This note is larger than 256 KiB and is shown truncated. Saving will drop the rest of the file.",
-    }),
+    truncateCopy,
+    saveHint,
     saveAnyway,
   );
+  // Gate closed: the file stays truncated until Save anyway arms one write.
+  function gateClosed() {
+    return tooLarge && !truncateArmed;
+  }
+  function showSaveAnyway() {
+    if (!writable) return;
+    saveHint.hidden = false;
+    saveAnyway.focus();
+  }
   function syncTruncate() {
-    truncateBanner.hidden = !tooLarge;
+    truncateCopy.textContent = writable
+      ? "This note is larger than 256 KiB and is shown truncated. Saving will drop the rest of the file."
+      : "This note is larger than 256 KiB and is shown truncated.";
     saveAnyway.hidden = !writable;
+    if (!writable) saveHint.hidden = true;
+    // A Ctrl+S hint belongs only to a closed gate. Once the gate opens, drop
+    // it so a later conflict that sets tooLarge again does not show it.
+    if (!gateClosed()) saveHint.hidden = true;
+    truncateBanner.hidden = !tooLarge;
+    const locked = !writable || !!conflict || gateClosed();
+    for (const box of body.querySelectorAll('input[type="checkbox"]'))
+      box.disabled = locked;
   }
   const body = el(
     "div",
@@ -569,7 +603,7 @@ export function createNotepad({ runId, el, button, signal }) {
       body.replaceChildren(
         renderMarkdown(text, {
           el,
-          interactive: writable && !conflict,
+          interactive: writable && !conflict && !gateClosed(),
           onToggle: (line, checked) => {
             text = toggleTask(text, line, checked);
             paintBody();
@@ -638,8 +672,10 @@ export function createNotepad({ runId, el, button, signal }) {
     ) {
       event.preventDefault();
       const key = event.key.toLowerCase();
-      if (key === "s") flush(false);
-      else editSelection(area, key === "b" ? "Bold" : "Italic");
+      if (key === "s") {
+        if (gateClosed()) showSaveAnyway();
+        else flush(false);
+      } else editSelection(area, key === "b" ? "Bold" : "Italic");
     } else if (event.key === "Enter") continueList(event, area);
   };
   // A canceled keydown suppresses beforeinput in browsers. IMEs that omit Enter
@@ -652,6 +688,8 @@ export function createNotepad({ runId, el, button, signal }) {
   };
   function confirmTruncate() {
     if (!writable || !loaded) return;
+    // An in-flight flush returns that promise and would leave a new arm set.
+    if (pending) return;
     failed = "";
     if (conflict) {
       revision = conflict.revision;
@@ -666,7 +704,7 @@ export function createNotepad({ runId, el, button, signal }) {
     unloading = keepalive;
     clearTimeout(timer);
     // Saving replaces the whole file, so a truncated note stays local until
-    // Save anyway arms one write. Autosave, ticks, and unload do not.
+    // Save anyway arms one write. Autosave, ticks, unload, and Retry do not.
     const forced = truncateArmed && tooLarge;
     if (
       !writable ||

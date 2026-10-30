@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import hashlib
+import json
 import logging
 import math
 import mimetypes
@@ -26,9 +27,10 @@ from .code_tracking import (
     default_run_name,
     find_repo_root,
     main_file,
+    resolve_task,
 )
 from .env import capture_environment
-from .lineage import get_git_metadata, snapshot as snapshot_lineage
+from .lineage import get_git_metadata, run_task, snapshot as snapshot_lineage
 from .media import _Media, is_media
 from ._source_inspect import stage_source_and_metadata
 from .auto_tracking import AutoTracker
@@ -283,6 +285,7 @@ class Run(metaclass=_RunType):
         log_every=1,
         sync_tensorboard=False,
         lineage=True,
+        task=None,
     ):
         if resume not in _VALID_RESUME:
             raise ValueError(f"resume must be one of {_VALID_RESUME}")
@@ -405,6 +408,7 @@ class Run(metaclass=_RunType):
 
         # Sync maps these nested fields to the server's /init payload.
         repo_root = self.lineage.get("repo_root") or str(find_repo_root(Path.cwd()))
+        self.task, task_source = resolve_task(task, repo_root, main_file())
         try:
             git_payload = {**get_git_metadata(repo_root), "repo_root": repo_root}
         except Exception:
@@ -415,6 +419,8 @@ class Run(metaclass=_RunType):
         meta = {
             "project": project,
             "name": name,
+            "task": self.task,
+            "task_source": task_source,
             "config": self.config,
             "tags": self.tags,
             "notes": self.notes or "",
@@ -437,6 +443,7 @@ class Run(metaclass=_RunType):
                     result = snapshot_lineage(
                         self.root, project, repo_root, self.writer.run_id,
                         parent_run_id=parent_run_id,
+                        task=self.task,
                         created_at=self.writer._meta["created_at"],
                         max_file_bytes=DEFAULT_MAX_FILE_BYTES if max_file_bytes is None else max_file_bytes,
                         max_total_bytes=DEFAULT_MAX_TOTAL_BYTES if max_total_bytes is None else max_total_bytes,
@@ -449,6 +456,7 @@ class Run(metaclass=_RunType):
         else:
             previous = RunReader(self.root, id).meta()
             self.project = previous.get("project", project)
+            self.task = run_task(previous)[0] or None
             self.name = previous.get("name", name)
             self.config = {**previous.get("config", {}), **self.config}
             self.summary = dict(previous.get("summary", {}))
@@ -823,6 +831,33 @@ class Run(metaclass=_RunType):
     def _accepting_tracks(self) -> bool:
         return not self._finished or self._auto_finalizing
 
+    def _record_arch(self, staged, kind, name):
+        """Merge the first model/loss identity from staged inspection metadata."""
+        try:
+            manifest = metadata_manifest_path(kind, sanitize_component_name(name))
+            path = next(path for path, label in staged if label == manifest)
+            metadata = json.loads(path.read_text(encoding="utf-8"))
+            module, qualname = metadata.get("module"), metadata.get("qualname")
+            if not isinstance(module, str) or not isinstance(qualname, str) or not qualname:
+                return
+            field = "model_class" if kind == "model" else "loss_class"
+            with self._state_lock:
+                stored = self.writer._meta.get("arch")
+                arch = dict(stored) if isinstance(stored, dict) else {}
+                if arch.get(field):
+                    return
+                arch[field] = f"{module}.{qualname}" if module else qualname
+                if kind == "model":
+                    config = metadata.get("config")
+                    config = config if isinstance(config, dict) else {}
+                    model_type, architectures = config.get("model_type"), config.get("architectures")
+                    arch["model_type"] = model_type if isinstance(model_type, str) else None
+                    arch["architectures"] = (architectures if isinstance(architectures, list)
+                                             and all(isinstance(item, str) for item in architectures) else None)
+                self.writer.set_meta_fields(arch=arch)
+        except Exception:
+            logger.debug("failed to record architecture fingerprint", exc_info=True)
+
     def track_model(self, model, name="default", extra_metadata=None):
         """Snapshot the architecture source of an instantiated module.
 
@@ -843,6 +878,8 @@ class Run(metaclass=_RunType):
                 model, staging, name=name, extra_metadata=extra_metadata
             )
             self._attach_staged_files(staged, source="model")
+            if model is not None:
+                self._record_arch(staged, "model", name)
         except Exception:
             logger.exception("failed to track model")
 
@@ -890,6 +927,7 @@ class Run(metaclass=_RunType):
                     loss, staging, name=name, extra_metadata=extra_metadata
                 )
                 self._attach_staged_files(staged, source="loss")
+                self._record_arch(staged, "loss", name)
             except Exception:
                 logger.exception("failed to track loss")
             return

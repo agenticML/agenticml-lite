@@ -7,10 +7,13 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import site
+import stat
 import sys
 import sysconfig
 import threading
+import unicodedata
 import weakref
 from dataclasses import dataclass
 from functools import lru_cache
@@ -475,6 +478,74 @@ def main_file() -> str | Path | None:
     main = sys.modules.get("__main__")
     main_file = getattr(main, "__file__", None) if main is not None else None
     return main_file if isinstance(main_file, (str, Path)) else None
+
+
+def _normalize_task(value):
+    if not isinstance(value, str):
+        return None
+    if any(unicodedata.category(c).startswith(("C", "Zl", "Zp")) for c in value):
+        return None
+    value = value.strip()
+    if not value or len(value) > 128:
+        return None
+    return value
+
+
+def _marker_task(content):
+    try:
+        import tomllib
+    except ImportError:
+        # Python 3.9/3.10: only a top-level, single-line string is needed.
+        for line in content.splitlines():
+            line = line.strip()
+            if line.startswith("["):
+                break
+            match = re.fullmatch(r'''task\s*=\s*("(?:[^"\\]|\\.)*"|'[^']*')\s*(?:#.*)?''', line)
+            if match:
+                raw = match[1]
+                return json.loads(raw) if raw.startswith('"') else raw[1:-1]
+        return None
+    return tomllib.loads(content).get("task")
+
+
+def resolve_task(explicit, repo_root, entry_file=None):
+    """Resolve the first valid task signal without disrupting the run."""
+    for value, source in ((explicit, "explicit"), (os.environ.get("AGENTICML_TASK"), "env")):
+        task = _normalize_task(value)
+        if task is not None:
+            return task, source
+        if value is not None:
+            logger.warning("invalid %s task; ignoring", source)
+    try:
+        root = Path(repo_root).resolve()
+        start = Path(entry_file).resolve().parent if entry_file else Path.cwd().resolve()
+        relative = start.relative_to(root)
+        directory = start
+        while True:
+            marker = directory / "agenticml.toml"
+            try:
+                st = marker.lstat()
+                if stat.S_ISREG(st.st_mode) and st.st_size <= 64 * 1024:
+                    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                    with os.fdopen(os.open(marker, flags), "rb") as handle:
+                        st = os.fstat(handle.fileno())
+                        content = handle.read(64 * 1024 + 1) if stat.S_ISREG(st.st_mode) and st.st_size <= 64 * 1024 else b""
+                    if len(content) <= 64 * 1024:
+                        task = _normalize_task(_marker_task(content.decode("utf-8")))
+                        if task is not None:
+                            return task, "marker"
+            except Exception:
+                logger.debug("cannot read task marker %s", marker, exc_info=True)
+            if directory == root:
+                break
+            directory = directory.parent
+        if entry_file and relative != Path("."):
+            task = _normalize_task(relative.as_posix())
+            if task is not None:
+                return task, "entry"
+    except Exception:
+        logger.debug("cannot resolve task path", exc_info=True)
+    return None, None
 
 
 def _main_directory() -> Path:

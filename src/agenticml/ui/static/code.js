@@ -709,7 +709,7 @@ export async function createCodeViewer({
       } catch (error) {
         if (error.name !== "AbortError" && ticket === generation && !disposed)
           lines.replaceChildren(
-            el("p", { class: "error", text: error.message }),
+            el("p", { class: "error", role: "alert", text: error.message }),
           );
       }
     }

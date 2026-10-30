@@ -197,6 +197,25 @@ def test_script_in_subfolder_name(project, explicit):
                          name="scripts/train.py")
     assert proc.returncode == 0, proc.stderr
     assert runs[0].meta()["name"] == ("x" if explicit else "scripts/train.py")
+    assert runs[0].meta()["task"] == "scripts"
+    assert runs[0].meta()["task_source"] == "entry"
+
+
+@pytest.mark.parametrize("task", ["imagegen", "asr", " asr "])
+def test_script_init_task_keeps_launcher_task(project, task):
+    (project / "asr").mkdir()
+    proc, runs = _launch(project, "asr/train.py", name="asr/train.py", script=f"""
+        import agenticml
+        run = agenticml.init(task={task!r})
+        assert run.task == "asr"
+    """)
+    assert proc.returncode == 0, proc.stderr
+    assert len(runs) == 1
+    assert runs[0].meta()["task"] == "asr"
+    if task == "imagegen":
+        assert "keeping it instead of task='imagegen'" in proc.stderr
+    else:
+        assert "already started task" not in proc.stderr
 
 
 def test_unnamed_init_attaches_without_warning(project):

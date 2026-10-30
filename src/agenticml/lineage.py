@@ -8,8 +8,9 @@ import stat
 import subprocess
 import tempfile
 import time
+import unicodedata
 from contextlib import contextmanager, nullcontext
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .code_tracking import (
     DEFAULT_MAX_FILE_BYTES,
@@ -18,6 +19,7 @@ from .code_tracking import (
     SKIP_FILE_SUFFIXES,
     SKIP_PATH_SUFFIXES,
     _should_skip,
+    _normalize_task,
 )
 from .store import layout
 from .store.reader import RunReader, list_runs
@@ -145,6 +147,27 @@ def shadow_repo(root, project, *, timeout=30, deadline=None) -> Path:
     return repo
 
 
+def run_task(meta):
+    """Task key and origin, including entry-path names from older runs."""
+    if not isinstance(meta, dict):
+        return "", None
+    if "task" in meta:
+        task = meta["task"]
+        if task not in (None, "") and _normalize_task(task) is None:
+            return "", None
+        source = _normalize_task(meta.get("task_source"))
+        return _normalize_task(task) or "", source
+    name = meta.get("name")
+    if (not isinstance(name, str) or "\\" in name or not name.endswith(".py")
+            or any(unicodedata.category(c).startswith(("C", "Zl", "Zp")) for c in name)):
+        return "", None
+    path = PurePosixPath(name)
+    if path.is_absolute() or ".." in path.parts or path.parent == PurePosixPath("."):
+        return "", None
+    task = _normalize_task(path.parent.as_posix())
+    return (task, "legacy") if task else ("", None)
+
+
 def _parent_candidates(metas):
     """Read preloaded metadata once; malformed candidates cannot break inference."""
     for meta in metas:
@@ -158,16 +181,17 @@ def _parent_candidates(metas):
             resolved = Path(previous_root).resolve() if previous_root else None
         except (RuntimeError, TypeError, OSError, ValueError, KeyError, AttributeError):
             continue
-        yield order, project, resolved
+        yield order, (project, run_task(meta)[0]), resolved
 
 
-def infer_parent(root, project, repo_root, created_before, exclude_run_id=None):
-    """Prefer the latest eligible source-directory run, then project run."""
+def infer_parent(root, project, repo_root, created_before, exclude_run_id=None, task=None):
+    """Prefer the latest source-directory run within the same project/task."""
     before = (layout.parse_timestamp(created_before), exclude_run_id or "")
     current_root = Path(repo_root).resolve()
     latest = same_root = None
-    for order, candidate_project, previous_root in _parent_candidates(list_runs(root)):
-        if candidate_project != project or order[1] == exclude_run_id:
+    task = run_task({"task": task})[0]
+    for order, candidate_group, previous_root in _parent_candidates(list_runs(root)):
+        if candidate_group != (project, task) or order[1] == exclude_run_id:
             continue
         if order[0] > before[0] or (order[0] == before[0] and
                                   exclude_run_id is not None and order >= before):
@@ -177,20 +201,20 @@ def infer_parent(root, project, repo_root, created_before, exclude_run_id=None):
         if previous_root == current_root and (same_root is None or order > same_root):
             same_root = order
     return ((same_root[1], "repo_root") if same_root else
-            (latest[1], "project") if latest else (None, None))
+            (latest[1], "task" if task else "project") if latest else (None, None))
 
 
 def infer_parents(metas):
     """Infer every parent in O(n) from list_runs' newest-first metadata."""
     latest, by_root, parents = {}, {}, {}
-    for order, project, repo_root in _parent_candidates(reversed(metas)):
-        previous = by_root.get((project, repo_root)) if repo_root is not None else None
-        inference = "repo_root" if previous is not None else "project"
-        previous = previous if previous is not None else latest.get(project)
+    for order, group, repo_root in _parent_candidates(reversed(metas)):
+        previous = by_root.get((group, repo_root)) if repo_root is not None else None
+        inference = "repo_root" if previous is not None else "task" if group[1] else "project"
+        previous = previous if previous is not None else latest.get(group)
         parents[order[1]] = ((previous[1], inference) if previous and previous < order else (None, None))
-        latest[project] = order
+        latest[group] = order
         if repo_root is not None:
-            by_root[project, repo_root] = order
+            by_root[group, repo_root] = order
     return parents
 
 
@@ -207,6 +231,7 @@ def _resolve_commit(repo, run_id, timeout=30):
 
 
 def snapshot(root, project, repo_root, run_id, parent_run_id=None, *, created_at=None,
+             task=None,
              max_file_bytes=DEFAULT_MAX_FILE_BYTES, max_total_bytes=DEFAULT_MAX_TOTAL_BYTES,
              timeout=30, max_files=20000) -> dict:
     """Capture startup code with a private index; failures become metadata."""
@@ -215,7 +240,7 @@ def snapshot(root, project, repo_root, run_id, parent_run_id=None, *, created_at
         parent_run_id = None
     result = {"version": 1, "error": None, "parent_run_id": parent_run_id,
               "parent_inference": "explicit" if parent_run_id else None,
-              "project_key": None, "repo_root": str(repo_root)}
+              "project_key": None, "repo_root": str(repo_root), "task": task}
     index = ignore = None
     try:
         root = layout.resolve_root(root)
@@ -224,7 +249,7 @@ def snapshot(root, project, repo_root, run_id, parent_run_id=None, *, created_at
         _ref(run_id)
         if not parent_run_id:
             parent_run_id, inference = infer_parent(root, project, worktree,
-                                                    created_at or layout.format_timestamp(), run_id)
+                                                    created_at or layout.format_timestamp(), run_id, task=task)
             result.update(parent_run_id=parent_run_id, parent_inference=inference)
         repo = shadow_repo(root, project, deadline=deadline)
         base = get_git_metadata(worktree, deadline=deadline) if (worktree / ".git").exists() else {}
@@ -300,7 +325,7 @@ def snapshot(root, project, repo_root, run_id, parent_run_id=None, *, created_at
         _git([*config, "update-index", "--add", "-z", "--stdin"], repo=repo, worktree=worktree,
              index=index, timeout=_remaining(deadline), input=b"".join(p + b"\0" for p in kept))
         tree = _git(["write-tree"], repo=repo, index=index, timeout=_remaining(deadline)).stdout.decode().strip()
-        message = f"agenticml run {run_id}\n\nproject: {project}\nbase_commit: {base.get('git_commit') or ''}"
+        message = f"agenticml run {run_id}\n\nproject: {project}\ntask: {task or ''}\nbase_commit: {base.get('git_commit') or ''}"
         with _locked(root, repo, deadline=deadline):
             parent_commit = (_resolve_commit(repo, parent_run_id, _remaining(deadline))
                              if parent_run_id else None)

@@ -188,37 +188,42 @@ def cmd_lineage(args):
                     project, rid = meta.get("project", ""), meta["run_id"]
                     if not isinstance(project, str) or not isinstance(rid, str):
                         continue
-                    projects.setdefault(project, {})[rid] = meta
+                    task, _ = lineage.run_task(meta)
+                    if args.task is not None and task != args.task:
+                        continue
+                    projects.setdefault(project, {}).setdefault(task, {})[rid] = meta
                 except (KeyError, TypeError, AttributeError):
                     continue
-            for project, members in projects.items():
+            for project, tasks in projects.items():
                 if args.project is not None and project != args.project:
                     continue
                 print(project)
-                children = {}
-                for rid, meta in members.items():
-                    try:
-                        info = meta.get("lineage") or {}
-                        parent = info.get("parent_run_id") or meta.get("parent_run_id")
-                        if not parent or parent == rid:
-                            parent, _ = inferred.get(rid, (None, None))
-                        if not isinstance(parent, str):
+                for task, members in tasks.items():
+                    print(f"  [{task or 'no task'}]")
+                    children = {}
+                    for rid, meta in members.items():
+                        try:
+                            info = meta.get("lineage") or {}
+                            parent = info.get("parent_run_id") or meta.get("parent_run_id")
+                            if not parent or parent == rid:
+                                parent, _ = inferred.get(rid, (None, None))
+                            if not isinstance(parent, str):
+                                parent = None
+                        except (RuntimeError, TypeError, OSError, ValueError, AttributeError):
                             parent = None
-                    except (RuntimeError, TypeError, OSError, ValueError, AttributeError):
-                        parent = None
-                    children.setdefault(parent if parent in members else None, []).append(rid)
-                seen = set()
-                # One iterative traversal, including roots of explicit cycles.
-                for first in [*children.get(None, []), *members]:
-                    stack = [(first, 1)]
-                    while stack:
-                        rid, depth = stack.pop()
-                        if rid in seen:
-                            continue
-                        seen.add(rid)
-                        meta = members[rid]
-                        print(f"{'  ' * depth}{rid}  {meta.get('name') or ''}".rstrip())
-                        stack.extend((child, depth + 1) for child in reversed(children.get(rid, [])))
+                        children.setdefault(parent if parent in members else None, []).append(rid)
+                    seen = set()
+                    # One iterative traversal, including roots of explicit cycles.
+                    for first in [*children.get(None, []), *members]:
+                        stack = [(first, 2)]
+                        while stack:
+                            rid, depth = stack.pop()
+                            if rid in seen:
+                                continue
+                            seen.add(rid)
+                            meta = members[rid]
+                            print(f"{'  ' * depth}{rid}  {meta.get('name') or ''}".rstrip())
+                            stack.extend((child, depth + 1) for child in reversed(children.get(rid, [])))
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
         print(f"agenticml lineage: {exc}", file=sys.stderr)
         return 1
@@ -519,6 +524,7 @@ def main(argv=None):
         child.set_defaults(func=cmd_lineage)
         if command == "ls":
             child.add_argument("--project", default=None)
+            child.add_argument("--task", default=None)
         else:
             child.add_argument("run_id")
             if command == "checkout":

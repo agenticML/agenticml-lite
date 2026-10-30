@@ -89,11 +89,14 @@ atomically (see below). Fields:
 | `format_version` | `1`. Not changeable after create. |
 | `run_id` | Directory name. Not changeable. |
 | `project`, `name` | Strings. Default `""`. |
+| `task` | String or `null`. |
+| `task_source` | `explicit`, `env`, `marker`, `entry`, or `null`. |
 | `config` | JSON object. Default `{}`. |
 | `tags` | JSON array. Default `[]`. |
 | `notes` | String. Default `""`. |
 | `group`, `job_type`, `parent_run_id` | String or `null`. |
 | `env`, `git` | JSON objects. Default `{}`. |
+| `arch` | Optional architecture object; fields below. |
 | `lineage` | Optional startup shadow snapshot; fields below. |
 | `status` | `running`, `finished`, or `crashed`. |
 | `summary` | JSON object. Default `{}`. |
@@ -106,20 +109,53 @@ Extra keys from the caller are preserved. Create always forces
 `format_version`, `run_id`, `status=running`, `created_at`, `finished_at=null`,
 `pid`, and `hostname`, even if the caller passed them.
 
+### Task resolution
+
+A run has a task (e.g. `"asr"`, `"imagegen"`). Lineage graphs and parent inference
+are per `(project, task)` instead of per project. Parent inference never crosses
+tasks; an explicit `parent_run_id` may cross tasks.
+
+Task resolution evaluates signals at init in order (first match wins, recorded as `task_source`):
+
+| `task_source` | Signal |
+| --- | --- |
+| `explicit` | `agenticml.init(task="asr")` / `Run(task=...)`. |
+| `env` | `AGENTICML_TASK` environment variable. |
+| `marker` | Nearest `agenticml.toml` with a top-level `task = "..."`, searched from the entry script's directory (cwd if none) up to and including the project repo root. Must be a regular, non-symlink file of at most 64 KiB; unreadable/invalid files are skipped. |
+| `entry` | Entry script's directory relative to the repo root in POSIX form (e.g. `asr/train.py` -> `asr`, `src/tts/train.py` -> `src/tts`). Not used when the script is at the repo root or outside it. |
+| `null` | No signal matched; `task` is `null` and the whole project is one stream (previous behaviour). |
+
+Values are stripped; empty, longer than 128 characters, or containing control/format/separator characters (Unicode categories C*, Zl, Zp) are ignored (a warning for explicit/env) and resolution falls through to the next signal. Resume keeps the stored task. Under `agenticml run`, an `init(task=...)` that differs from the launcher run's task logs a warning and the launcher's run is kept.
+
+Older runs without a `task` field: if their `name` is a relative `.py` path with a directory part (the default run name, e.g. `asr/train.py`), the task is read as that directory with source `legacy` (read-time only, nothing is rewritten); otherwise they count as no task.
+
+### `arch`
+
+Optional architecture object recorded on `meta.json` from the first model or loss tracked. The first value wins and is never overwritten:
+
+| Field | Meaning |
+| --- | --- |
+| `model_class` | `"module.qualname"` string from the first `track_model`. |
+| `model_type` | String from a Hugging Face config or `null`. |
+| `architectures` | Array of strings from a Hugging Face config or `null`. |
+| `loss_class` | `"module.qualname"` string from the first `track_loss`. |
+
 ### `lineage`
 
 New runs capture code synchronously at init; resume keeps the existing snapshot.
 The user's project and Git index, HEAD, and refs are read-only. A project key is
 its lowercase filesystem-safe slug (up to 48 characters, fallback `project`),
 then `-` and the first eight hex digits of SHA-256 of the exact project string.
+The shadow Git repository is still one per project.
 All store paths are containment-checked.
 
 | Field | Meaning |
 | --- | --- |
 | `version` | `1`. |
+| `task` | String or `null`. |
 | `commit`, `tree` | Shadow Git object ids. |
 | `parent_commit`, `parent_run_id` | Parent snapshot commit and run id, or null. |
-| `parent_inference` | `explicit`, `repo_root`, `project`, or null. |
+| `parent_inference` | `explicit`, `repo_root`, `task`, `project`, or null. |
 | `project_key`, `repo_root` | Shadow repository key and absolute source directory. |
 | `base_commit`, `base_branch`, `base_dirty` | User Git state, or null outside Git. |
 | `files`, `bytes` | Kept file count and total lstat size. |
@@ -128,21 +164,58 @@ All store paths are containment-checked.
 
 On failure only `version`, `error`, `parent_run_id`, `parent_inference`,
 `project_key`, and `repo_root` are required. Tracking continues without Git.
-Parents are explicit (except self-parents), else the latest eligible run in the
-same project and source directory, else the latest eligible project run. Eligibility
-requires `(created_at, run_id)` strictly before the current run, allowing equal
-timestamps with a smaller run id. Invalid source paths are skipped. The top-level
-`parent_run_id` remains explicit-only. Git ignores, `.agenticmlignore`, hard
-skip directories/suffixes, nested Git repositories, and escaping symlinks are
-excluded. File/total caps are checked before hashing (defaults 10/100 MiB).
-Only the first 20,000 candidate paths are inspected; excess paths are counted
-without sorting or stat calls. Individual path errors are skipped and recorded.
-The entire snapshot shares a 30-second deadline, including lock waits and Git
-commands. `.agenticmlignore` is not applied when larger than 1 MiB.
-The parent ref is resolved inside the repository lock immediately before
-`commit-tree` and `update-ref`. If the parent is still unpublished, the child has
-no Git parent and `parent_commit` is null; diff resolves `parent_run_id` live on
-later calls. Existing commits and metadata are not rewritten.
+The shadow commit message gains a `task: ...` line:
+`agenticml run <run_id>\n\nproject: <project>\ntask: <task or ''>\nbase_commit: <base_commit or ''>`.
+
+Lineage graphs and parent inference are per `(project, task)` instead of per
+project. Parent inference never crosses tasks; an explicit `parent_run_id` may
+cross tasks. Parents are explicit (except self-parents), else inferred within
+the same project and task: the latest strictly earlier run with the same project,
+same task, and same repo root (`repo_root`); else the latest strictly earlier run
+with the same project and task (`task` for a non-empty task, `project` when the
+task is empty); else no parent. Eligibility requires `(created_at, run_id)`
+strictly before the current run, allowing equal timestamps with a smaller run id.
+Invalid source paths are skipped. The top-level `parent_run_id` remains
+explicit-only. Git ignores, `.agenticmlignore`, hard skip directories/suffixes,
+nested Git repositories, and escaping symlinks are excluded. File/total caps are
+checked before hashing (defaults 10/100 MiB). Only the first 20,000 candidate
+paths are inspected; excess paths are counted without sorting or stat calls.
+Individual path errors are skipped and recorded. The entire snapshot shares a
+30-second deadline, including lock waits and Git commands. `.agenticmlignore` is
+not applied when larger than 1 MiB. The parent ref is resolved inside the
+repository lock immediately before `commit-tree` and `update-ref`. If the parent
+is still unpublished, the child has no Git parent and `parent_commit` is null;
+diff resolves `parent_run_id` live on later calls. Existing commits and metadata
+are not rewritten.
+
+CLI: `agenticml lineage ls [--project P] [--task T]` groups output by project,
+then `[task]` (`[no task]` for none).
+
+### Dashboard `/api/lineage`
+
+The dashboard endpoint `GET /api/lineage[?project=P]` returns `{nodes: [...], edges: [...]}`:
+
+| Node field | Meaning |
+| --- | --- |
+| `run_id`, `name`, `project` | Run identifier, run name, and project string. |
+| `task` | Task name string (empty string when no task). |
+| `task_source` | `explicit`, `env`, `marker`, `entry`, `legacy`, or `null`. |
+| `arch` | `arch` object from `meta.json`, or `null`. |
+| `arch_changed` | Boolean: true when both own and parent `model_class` are known and different. |
+| `cross_task` | Boolean: true when an emitted edge links runs of different tasks. |
+| `status`, `created_at` | Effective run status and ISO 8601 UTC creation timestamp. |
+| `commit`, `tree` | Shadow Git commit and tree hashes, or `null`. |
+| `base_commit`, `base_branch`, `base_dirty` | Base repository Git state, or `null`. |
+| `parent_run_id` | Resolved parent run id, or `null`. |
+| `parent_inference` | `explicit`, `repo_root`, `task`, `project`, or `null`. |
+| `same_tree_as_parent` | Boolean: true when child and parent shadow trees match. |
+| `error` | Lineage error diagnostic string, or `null`. |
+
+| Edge field | Meaning |
+| --- | --- |
+| `from`, `to` | Parent and child run ids. |
+| `inferred` | Boolean: true when parent was inferred rather than explicit. |
+| `cross_task` | Boolean: true when the emitted edge links runs of different tasks. |
 
 Timestamps are `YYYY-MM-DDTHH:MM:SS.ffffffZ` (UTC, 6-digit microseconds,
 `Z` suffix). The width is fixed so `created_at` sorts lexicographically.

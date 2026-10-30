@@ -85,7 +85,7 @@ def test_routes(dashboard):
     assert runs[0]['summary'] == {'loss':.5,'label':'ok'}
     assert set(runs[0]) == {
         'run_id','project','name','status','created_at','finished_at','tags','group',
-        'summary','config','last_step',
+        'summary','config','last_step','task','task_source','arch',
     }
     assert runs[0]['config'] == {'lr': .01}
     assert runs[0]['last_step'] == 119
@@ -917,8 +917,9 @@ _NODE_KEYS = {
     'run_id', 'name', 'project', 'status', 'created_at', 'commit', 'tree',
     'base_commit', 'base_branch', 'base_dirty', 'parent_run_id', 'parent_inference',
     'same_tree_as_parent', 'error',
+    'task', 'task_source', 'arch', 'arch_changed', 'cross_task',
 }
-_EDGE_KEYS = {'from', 'to', 'inferred'}
+_EDGE_KEYS = {'from', 'to', 'inferred', 'cross_task'}
 _DIFF_KEYS = {
     'run_id', 'commit', 'parent_run_id', 'parent_commit', 'files', 'truncated',
     'checkout', 'error',
@@ -2814,3 +2815,154 @@ def test_oversized_note_get_is_truncated_and_put_uses_prefix_revision(dashboard)
     assert status == 200
     assert json.loads(body)['text'] == 'trimmed'
     assert path.read_text(encoding='utf-8') == 'trimmed'
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_runs_task_metadata_and_architecture(dashboard, legacy):
+    path = dashboard[1].root / 'runs' / 'run-1' / 'meta.json'
+    meta = json.loads(path.read_text())
+    meta['name'] = 'asr/train.py'
+    if not legacy:
+        meta.update(task='asr', task_source='entry')
+    meta['arch'] = {
+        'model_class': 'models.Encoder', 'model_type': 'encoder',
+        'architectures': ['Encoder'], 'loss_class': 'losses.CTC',
+        'extra': 'not exposed',
+    }
+    path.write_text(json.dumps(meta))
+    row = load(dashboard, '/api/runs')[0]
+    node = load(dashboard, '/api/lineage')['nodes'][0]
+    assert row['task'] == node['task'] == 'asr'
+    assert row['task_source'] == node['task_source'] == ('legacy' if legacy else 'entry')
+    assert row['arch'] == node['arch'] == {
+        'model_class': 'models.Encoder', 'model_type': 'encoder',
+        'architectures': ['Encoder'], 'loss_class': 'losses.CTC',
+    }
+
+    # The list signature must see task/source-only and architecture-only edits.
+    meta.update(task='imagegen', task_source='env')
+    path.write_text(json.dumps(meta))
+    updated = load(dashboard, '/api/runs')[0]
+    assert updated == dict(row, task='imagegen', task_source='env')
+    meta['arch']['model_class'] = 'models.Diffusion'
+    path.write_text(json.dumps(meta))
+    assert load(dashboard, '/api/runs')[0] == dict(
+        updated, arch=dict(row['arch'], model_class='models.Diffusion'))
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_lineage_task_streams_and_architecture(tmp_path, legacy):
+    specs = [
+        ('asr-a', 'asr', None, 'models.First', '/repo'),
+        ('image-a', 'imagegen', None, 'models.Image', '/repo'),
+        ('asr-b', 'asr', None, 'models.Second', '/repo'),
+        ('cross', 'imagegen', 'asr-b', 'models.Image', '/repo'),
+        ('asr-c', 'asr', None, None, '/other'),
+    ]
+    for second, (rid, task, parent, model_class, repo) in enumerate(specs, 1):
+        _seed_run(tmp_path, rid, project='shared', name=f'{task}/train.py', second=second,
+                  parent_run_id=parent, git={'repo_root': repo})
+        path = tmp_path / 'runs' / rid / 'meta.json'
+        meta = json.loads(path.read_text())
+        if not legacy:
+            meta.update(task=task, task_source='entry')
+        meta['arch'] = {'model_class': model_class, 'model_type': 'fake', 'architectures': ['First']}
+        path.write_text(json.dumps(meta))
+    httpd, thread = _serve(tmp_path)
+    try:
+        payload = _body(httpd, '/api/lineage?project=shared')
+    finally:
+        _stop(httpd, thread)
+    nodes, edges = _index(payload), _edges(payload)
+    assert nodes['asr-a']['parent_run_id'] is None
+    assert nodes['image-a']['parent_run_id'] is None
+    assert nodes['asr-b']['parent_run_id'] == 'asr-a'
+    assert nodes['asr-b']['parent_inference'] == 'repo_root'
+    assert nodes['asr-c']['parent_run_id'] == 'asr-b'
+    assert nodes['asr-c']['parent_inference'] == 'task'
+    assert nodes['asr-b']['task'] == 'asr'
+    assert nodes['image-a']['task'] == 'imagegen'
+    assert nodes['asr-b']['task_source'] == ('legacy' if legacy else 'entry')
+    assert nodes['asr-b']['arch']['model_class'] == 'models.Second'
+    assert nodes['asr-b']['arch_changed'] is True
+    assert nodes['asr-a']['arch_changed'] is False
+    assert nodes['asr-c']['arch_changed'] is False
+    assert nodes['cross']['parent_run_id'] == 'asr-b'
+    assert nodes['cross']['parent_inference'] == 'explicit'
+    assert nodes['cross']['cross_task'] is True
+    assert edges[('asr-b', 'cross')]['cross_task'] is True
+    assert edges[('asr-b', 'cross')]['inferred'] is False
+    assert nodes['asr-b']['cross_task'] is False
+    assert edges[('asr-a', 'asr-b')]['cross_task'] is False
+    assert ('asr-a', 'image-a') not in edges
+    assert ('image-a', 'asr-b') not in edges
+
+
+def test_lineage_cross_task_requires_emitted_edge(tmp_path):
+    specs = [
+        ('parent', 'other', 'asr', None),
+        ('child', 'shared', 'imagegen', 'parent'),
+        ('cycle-old', 'shared', 'asr', 'cycle-new'),
+        ('cycle-new', 'shared', 'imagegen', 'cycle-old'),
+    ]
+    for second, (rid, project, task, parent) in enumerate(specs, 1):
+        _seed_run(tmp_path, rid, project=project, name=f'{task}/train.py', second=second,
+                  parent_run_id=parent)
+        path = tmp_path / 'runs' / rid / 'meta.json'
+        meta = json.loads(path.read_text())
+        meta.update(task=task, task_source='explicit')
+        path.write_text(json.dumps(meta))
+
+    payload = server._lineage_graph(tmp_path, 'shared')
+    nodes, edges = _index(payload), _edges(payload)
+    assert 'parent' not in nodes
+    assert nodes['child']['parent_run_id'] == 'parent'
+    assert nodes['child']['cross_task'] is False
+    assert ('parent', 'child') not in edges
+    assert nodes['cycle-old']['cross_task'] is True
+    assert edges[('cycle-new', 'cycle-old')]['cross_task'] is True
+    assert nodes['cycle-new']['cross_task'] is False
+    assert ('cycle-old', 'cycle-new') not in edges
+
+    whole = server._lineage_graph(tmp_path, None)
+    assert _index(whole)['child']['cross_task'] is True
+    assert _edges(whole)[('parent', 'child')]['cross_task'] is True
+
+
+def test_lineage_malformed_task_and_arch(tmp_path):
+    malformed = [None, [], 42, 'x' * 257, 'a\nb']
+    for second, value in enumerate(malformed, 1):
+        rid = f'bad-{second}'
+        _seed_run(tmp_path, rid, project='bad', name={'bad': True}, second=second)
+        path = tmp_path / 'runs' / rid / 'meta.json'
+        meta = json.loads(path.read_text())
+        meta.update(task=value, task_source={'bad': True}, arch=value)
+        path.write_text(json.dumps(meta))
+    _seed_run(tmp_path, 'bad-fields', project='bad', name=None, second=6)
+    path = tmp_path / 'runs' / 'bad-fields' / 'meta.json'
+    meta = json.loads(path.read_text())
+    meta.update(task=None, arch={'model_class': 'x' * 257, 'model_type': 'bad\nvalue',
+                                 'architectures': ['Good', {}], 'loss_class': 42})
+    path.write_text(json.dumps(meta))
+    httpd, thread = _serve(tmp_path)
+    try:
+        payload = _body(httpd, '/api/lineage')
+        rows = _body(httpd, '/api/runs')
+    finally:
+        _stop(httpd, thread)
+    nodes = _index(payload)
+    assert len(nodes) == 6
+    assert len(rows) == len(nodes)
+    for row in rows:
+        assert {key: row[key] for key in ('task', 'task_source', 'arch')} == {
+            key: nodes[row['run_id']][key] for key in ('task', 'task_source', 'arch')
+        }
+    for node in nodes.values():
+        assert node['task'] == ''
+        assert node['task_source'] is None
+        assert node['cross_task'] is False
+        assert node['arch_changed'] is False
+    assert all(nodes[f'bad-{i}']['arch'] is None for i in range(1, 6))
+    assert nodes['bad-fields']['arch'] == {
+        'model_class': None, 'model_type': None, 'architectures': None, 'loss_class': None,
+    }

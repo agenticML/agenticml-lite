@@ -1486,6 +1486,36 @@ pre,
 .lineage-graph {
   display: block;
 }
+.lineage-lane,
+.lineage-lane-scroll {
+  min-width: 0;
+  max-width: 100%;
+}
+.lineage-lane + .lineage-lane {
+  border-top: 1px solid var(--hairline);
+}
+.lineage-lane-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  padding: 10px 16px 0;
+  overflow-wrap: anywhere;
+}
+.lineage-lane-title {
+  margin: 0;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+}
+.lineage-lane-source {
+  min-width: 0;
+  font-size: 11px;
+}
+.lineage-lane-scroll {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
 .lineage-node {
   cursor: pointer;
 }
@@ -1533,6 +1563,8 @@ pre,
 .lineage-meta,
 .lineage-dirty,
 .lineage-same,
+.lineage-cross-task,
+.lineage-arch-changed,
 .lineage-error {
   font-family: var(--font-mono-stack);
 }
@@ -1547,6 +1579,14 @@ pre,
   fill: var(--text-4);
 }
 .lineage-dirty {
+  font-size: 10px;
+  fill: var(--warn-text);
+}
+.lineage-cross-task {
+  font-size: 10px;
+  fill: var(--accent-text);
+}
+.lineage-arch-changed {
   font-size: 10px;
   fill: var(--warn-text);
 }
