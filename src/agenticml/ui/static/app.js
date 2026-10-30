@@ -1319,6 +1319,7 @@ async function home(version) {
           class: "run-name",
           href: routeRun(run.run_id),
           text: run.name || run.run_id,
+          title: run.name || run.run_id,
           onclick: (event) => event.stopPropagation(),
         });
         return el(
@@ -1529,7 +1530,7 @@ function metricsPanel(initialRuns, compare, signal) {
         ...runs.map((run) =>
           el(
             "span",
-            { class: "inline" },
+            { class: "inline run-label" },
             dot(colors[run.run_id]),
             run.name || run.run_id,
           ),
@@ -1586,7 +1587,7 @@ function metricsPanel(initialRuns, compare, signal) {
             tableRow([
               el(
                 "span",
-                { class: "inline mono" },
+                { class: "inline mono run-label" },
                 dot(colors[run.run_id]),
                 run.name || run.run_id,
               ),
@@ -2268,6 +2269,7 @@ async function comparePage(ids, version) {
         "span",
         {
           class: "chip inline",
+          title: run.name || run.run_id,
           style: `background:color-mix(in srgb,${colors[run.run_id]} 10%,var(--surface-3));border:1px solid color-mix(in srgb,${colors[run.run_id]} 40%,transparent);padding:4px 10px`,
         },
         dot(colors[run.run_id]),

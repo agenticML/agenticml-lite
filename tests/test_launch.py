@@ -8,11 +8,12 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from agenticml import cli
-from agenticml.launch import Target
+from agenticml.launch import Target, _resolve
 from agenticml.store import RunReader
 
 
@@ -40,7 +41,11 @@ def test_options_fall_back_to_env(monkeypatch):
     monkeypatch.setenv("AGENTICML_PROJECT", "from-env")
     monkeypatch.setenv("AGENTICML_TAGS", "x, y")
     monkeypatch.setenv("AGENTICML_AUTO_TRACK", "0")
+    monkeypatch.setenv("AGENTICML_NAME", "env-name")
+    settings, _raw, _rest = cli._parse_run_options(["t.py"])
+    assert settings.name == "env-name"
     settings, _raw, _rest = cli._parse_run_options(["--name", "n", "t.py"])
+    assert settings.name == "n"
     assert settings.project == "from-env"
     assert settings.tags == ["x", "y"]
     assert settings.auto_track is False
@@ -90,7 +95,9 @@ def test_python_dash_c_is_rejected():
 
 def test_help_exits_zero(capsys):
     assert cli.main(["run", "--help"]) == 0
-    assert "usage: agenticml run" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "usage: agenticml run" in out
+    assert "default: entry file path relative to the repo root (absolute outside a repo), or the module name" in out
 
 
 def test_usage_error_exits_two(capsys):
@@ -168,7 +175,7 @@ def test_script_runs_as_main(project):
     assert "ok 7" in proc.stdout
     (run,) = runs
     assert run.meta()["project"] == "proj"
-    assert run.meta()["name"] == "train"
+    assert run.meta()["name"] == "train.py"
     assert run.meta()["status"] == "finished"
     code_paths = {f["path"] for f in run.code_manifest()}
     assert {"train.py", "helper.py"} <= code_paths, code_paths
@@ -180,6 +187,64 @@ def test_project_and_name_options(project):
     assert proc.returncode == 0, proc.stderr
     init = runs[0].meta()
     assert (init["project"], init["name"], init["tags"]) == ("demo", "exp", ["a", "b"])
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_script_in_subfolder_name(project, explicit):
+    (project / "scripts").mkdir()
+    options = ["--name", "x"] if explicit else []
+    proc, runs = _launch(project, *options, "scripts/train.py", script="pass\n",
+                         name="scripts/train.py")
+    assert proc.returncode == 0, proc.stderr
+    assert runs[0].meta()["name"] == ("x" if explicit else "scripts/train.py")
+
+
+def test_unnamed_init_attaches_without_warning(project):
+    proc, runs = _launch(project, "--name", "launcher-name", "train.py", script="""
+        import agenticml
+        run = agenticml.init()
+        assert run.name == "launcher-name"
+        agenticml.finish()
+    """)
+    assert proc.returncode == 0, proc.stderr
+    assert "keeping it instead of" not in proc.stderr
+    assert len(runs) == 1
+    assert runs[0].meta()["name"] == "launcher-name"
+
+
+@pytest.mark.parametrize(
+    "name_arg, expected",
+    [("", "scripts/train.py"), ("name=''", ""), ("name='explicit'", "explicit")],
+)
+def test_plain_python_init_name(project, name_arg, expected):
+    scripts = project / "scripts"
+    scripts.mkdir()
+    script = scripts / "train.py"
+    script.write_text(textwrap.dedent(f"""
+        import agenticml
+        run = agenticml.init({name_arg})
+        assert run.name == {expected!r}, run.name
+        agenticml.finish()
+    """))
+    out = project.parent / "out"
+    env = {key: value for key, value in os.environ.items() if not key.startswith("AGENTICML_")}
+    env["AGENTICML_DIR"] = str(out)
+    proc = subprocess.run([sys.executable, str(script)], cwd=project, env=env,
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    assert _read_runs(out)[0].meta()["name"] == expected
+
+
+def test_plain_python_init_without_main_file(project):
+    out = project.parent / "out"
+    env = {key: value for key, value in os.environ.items() if not key.startswith("AGENTICML_")}
+    env["AGENTICML_DIR"] = str(out)
+    proc = subprocess.run(
+        [sys.executable, "-c", "import agenticml; r = agenticml.init(); assert r.name is None; agenticml.finish()"],
+        cwd=project, env=env, capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert _read_runs(out)[0].meta()["name"] is None
 
 
 def test_exception_marks_run_crashed(project):
@@ -249,7 +314,7 @@ def test_script_init_and_finish_attach_to_launcher_run(project):
     )
     assert proc.returncode == 0, proc.stderr
     (run,) = runs
-    assert run.meta()["name"] == "train"
+    assert run.meta()["name"] == "train.py"
     assert len([event for event in run.events() if event["kind"] == "finish"]) == 1
     assert run.meta()["config"]["lr"] == 0.1
     assert run.meta()["tags"] == ["script"]
@@ -277,7 +342,30 @@ def test_module_target_runs_package_main(project):
     proc, runs = _launch(project, "-m", "pkg", "a", "b")
     assert proc.returncode == 0, proc.stderr
     assert "pkg pkg ['a', 'b']" in proc.stdout
-    assert runs[0].meta()["name"] == "pkg"
+    assert runs[0].meta()["name"] == "pkg/__main__.py"
+
+
+def test_module_target_uses_resolved_file_name(project):
+    pkg = project / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").touch()
+    (pkg / "train.py").write_text("pass\n")
+    proc, runs = _launch(project, "-m", "pkg.train")
+    assert proc.returncode == 0, proc.stderr
+    assert runs[0].meta()["name"] == "pkg/train.py"
+
+
+@pytest.mark.parametrize("origin", [None, "built-in", "frozen", "archive.zip/pkg/train.py"])
+def test_module_without_file_keeps_module_name(project, tmp_path, monkeypatch, origin):
+    monkeypatch.chdir(tmp_path)
+    spec = SimpleNamespace(
+        origin=origin, submodule_search_locations=None,
+        loader=SimpleNamespace(get_code=lambda name: compile("pass", name, "exec")),
+    )
+    monkeypatch.setattr("agenticml.launch.importlib.util.find_spec", lambda name: spec)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    resolved = _resolve(Target("module", "pkg.train"))
+    assert resolved.default_name == "pkg.train"
 
 
 def test_missing_script_exits_two(project):

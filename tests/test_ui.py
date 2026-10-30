@@ -20,7 +20,7 @@ from agenticml import Run
 from agenticml.code_tracking import default_project
 
 pytest.importorskip("agenticml.store")
-from agenticml.store import notes, reader
+from agenticml.store import RunWriter, notes, reader
 from agenticml.ui import server
 
 
@@ -817,7 +817,7 @@ def test_init_project_defaults_to_repo_directory(tmp_path, monkeypatch):
     script = nested / 'train.py'
     script.write_text('pass\n')
     monkeypatch.delenv('AGENTICML_PROJECT', raising=False)
-    monkeypatch.setattr(sys.modules['__main__'], '__file__', str(script), raising=False)
+    monkeypatch.setattr(sys.modules['__main__'], '__file__', script, raising=False)
     store = tmp_path / 'store'
     run = _init_run(store, name='exp')
     try:
@@ -837,7 +837,7 @@ def test_init_project_defaults_to_repo_directory(tmp_path, monkeypatch):
     run = _init_run(store)
     try:
         assert run.project == 'from-env'
-        assert run.name is None
+        assert run.name == 'pkg/train.py'
     finally:
         agenticml.finish()
 
@@ -859,6 +859,7 @@ def test_init_project_uses_cwd_without_main_file(tmp_path, monkeypatch):
     run = _init_run(tmp_path / 'store')
     try:
         assert run.project == 'cwdproj'
+        assert run.name is None
     finally:
         agenticml.finish()
 
@@ -885,6 +886,23 @@ def test_resume_keeps_stored_project(tmp_path, monkeypatch):
         assert resumed.name == 'kept'
     assert reader.RunReader(store, 'resume-me').meta()['project'] == 'widgetlab'
     assert reader.RunReader(store, 'resume-me').meta()['name'] == 'kept'
+
+
+@pytest.mark.parametrize('stored_name', ['original', '', None])
+def test_resume_keeps_stored_name_with_default(tmp_path, monkeypatch, stored_name):
+    script = tmp_path / 'train.py'
+    script.write_text('pass\n')
+    (tmp_path / 'pyproject.toml').touch()
+    monkeypatch.setattr(sys.modules['__main__'], '__file__', script, raising=False)
+    store = tmp_path / 'store'
+    writer = RunWriter.create(store, run_id='resume-name', meta={'name': stored_name})
+    writer.finish('finished')
+    run = _init_run(store, id='resume-name', resume='must')
+    try:
+        assert run.name == stored_name
+    finally:
+        agenticml.finish()
+    assert reader.RunReader(store, 'resume-name').meta()['name'] == stored_name
 
 
 def test_default_project_empty_directory_name(monkeypatch):

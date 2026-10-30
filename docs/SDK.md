@@ -53,7 +53,7 @@ agenticml ui            # http://127.0.0.1:6006
 
 | Call | What it does |
 | --- | --- |
-| `agenticml.init(project, name, **opts)` | Start the active run. Returns a `Run`. |
+| `agenticml.init(project, name, **opts)` | Start the active run. Returns a `Run`. Omit `name` and it defaults to the main script's path relative to the repo root (e.g. `scripts/train.py`), or its absolute path outside a repo (empty without a main file). |
 | `agenticml.log(metrics, step=None, commit=True)` | Log a dict of scalars (and `Image`s). `step` auto-increments if omitted. `commit=False` merges into the same step. |
 | `agenticml.config` | Dict-like config of the active run. `agenticml.config["lr"] = 0.1` |
 | `agenticml.summary` | Dict-like summary of the active run. Set final values here. |

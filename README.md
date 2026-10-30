@@ -31,7 +31,7 @@ agenticml.summary["best_loss"] = 0.1
 agenticml.finish()
 ```
 
-`init(project, name, ...)` starts the one active run. Omit `project` and it defaults to the repository or directory name (`AGENTICML_PROJECT` overrides that; an explicit project wins). `log` advances the step when `step` is omitted; `commit=False` merges later metrics into the same step. `config` and `summary` are dicts on the active run. `init(verbose=True)` prints the run id, the run directory, and the `agenticml ui` command.
+`init(project, name, ...)` starts the one active run. Omit `project` and it defaults to the repository or directory name (`AGENTICML_PROJECT` overrides that; an explicit project wins). Omit `name` and it defaults to the main script's path relative to the repo root (e.g. `scripts/train.py`), or its absolute path outside a repo (empty without a main file). `log` advances the step when `step` is omitted; `commit=False` merges later metrics into the same step. `config` and `summary` are dicts on the active run. `init(verbose=True)` prints the run id, the run directory, and the `agenticml ui` command.
 
 `init` also turns on runtime code snapshots and PyTorch component detection (`auto_track=True`). Automatic loss / learning-rate / epoch metrics and TensorBoard mirroring stay off until you pass `auto_metrics=True` and `sync_tensorboard=True`. System metrics are on (every 10 seconds) when `psutil` is installed; `system_metrics=False` disables them.
 
@@ -72,6 +72,7 @@ Rules that apply to every form:
 
 - Agenticml options (`--project`, `--name`, ...) must come before the script or module. Everything after the target is the script's own argv, passed through untouched.
 - With `run`, the `--` separator is optional when the target is a bare script or `-m` module. It is needed in front of `python ...` so that the options before it are not read as Python flags.
+- The default run name is the script's repo-relative path (e.g. `scripts/train.py`), or the module's file path for `-m`, unless `--name` is given.
 - `python -c "..."` and reading the script from stdin are not supported. Put the code in a file.
 - Only Python targets are supported. To track a shell script, call `agenticml run -- python ...` from inside it.
 - Multi-GPU: launch as `torchrun ... -m agenticml run -- train.py`. Only rank 0 logs.
