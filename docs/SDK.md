@@ -76,7 +76,7 @@ never crosses tasks; an explicit `parent_run_id` may cross tasks. The shadow Git
 repository is still one per project.
 
 Task resolution at init checks, in order (first match wins, recorded as `task_source`):
-- `explicit`: `agenticml.init(task="asr")` / `Run(task=...)`
+- `explicit`: `agenticml.init(task="asr")` / `Run(task=...)` / `agenticml run --task asr`
 - `env`: `AGENTICML_TASK`
 - `marker`: nearest `agenticml.toml` with a top-level `task = "..."`, searched from
   the entry script's directory (cwd if none) up to and including the project repo root.

@@ -79,6 +79,8 @@ Rules that apply to every form:
 
 Options go before the script; everything after it is the script's own argv. See `agenticml run -h`. `--project`, `--name`, `--tags`, `--notes`, `--group`, `--job-type`, `--mode`, `--dir`, and `--log-every` read `AGENTICML_PROJECT`, `AGENTICML_NAME`, `AGENTICML_TAGS`, `AGENTICML_NOTES`, `AGENTICML_GROUP`, `AGENTICML_JOB_TYPE`, `AGENTICML_MODE`, `AGENTICML_DIR`, and `AGENTICML_LOG_EVERY`. The off switches are in the table. `--verbose` has no variable.
 
+`--task` sets the run's task and overrides `AGENTICML_TASK`, an `agenticml.toml` `task`, and the entry script's folder (see [docs/SDK.md](docs/SDK.md)).
+
 | What | Where it comes from | Turn off |
 | --- | --- | --- |
 | Config | `argparse` parses of `sys.argv`, and `@hydra.main` | `--no-capture-args` (`AGENTICML_CAPTURE_ARGS=0`) |

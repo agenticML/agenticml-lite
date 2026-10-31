@@ -119,7 +119,7 @@ Task resolution evaluates signals at init in order (first match wins, recorded a
 
 | `task_source` | Signal |
 | --- | --- |
-| `explicit` | `agenticml.init(task="asr")` / `Run(task=...)`. |
+| `explicit` | `agenticml.init(task="asr")` / `Run(task=...)` / `agenticml run --task asr`. |
 | `env` | `AGENTICML_TASK` environment variable. |
 | `marker` | Nearest `agenticml.toml` with a top-level `task = "..."`, searched from the entry script's directory (cwd if none) up to and including the project repo root. Must be a regular, non-symlink file of at most 64 KiB; unreadable/invalid files are skipped. |
 | `entry` | Entry script's directory relative to the repo root in POSIX form (e.g. `asr/train.py` -> `asr`, `src/tts/train.py` -> `src/tts`). Not used when the script is at the repo root or outside it. |

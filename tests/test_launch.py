@@ -56,6 +56,31 @@ def test_unknown_option_is_a_usage_error():
         cli._parse_run_options(["--bogus", "t.py"])
 
 
+@pytest.mark.parametrize("options", [["--task", "asr"], ["--task=asr"]])
+def test_task_option(options):
+    settings, raw, rest = cli._parse_run_options([*options, "t.py"])
+    assert settings.task == "asr"
+    assert raw == options
+    assert rest == ["t.py"]
+
+
+def test_task_option_is_normalized():
+    settings, _raw, _rest = cli._parse_run_options(["--task", " asr ", "t.py"])
+    assert settings.task == "asr"
+
+
+@pytest.mark.parametrize("value", ["", "a" * 129])
+def test_bad_task_is_a_usage_error(value):
+    with pytest.raises(cli._UsageError, match="--task must be a non-empty name"):
+        cli._parse_run_options(["--task", value, "t.py"])
+
+
+def test_task_env_is_not_explicit(monkeypatch):
+    monkeypatch.setenv("AGENTICML_TASK", "asr")
+    settings, _raw, _rest = cli._parse_run_options(["t.py"])
+    assert settings.task is None
+
+
 def test_missing_option_value_is_a_usage_error():
     with pytest.raises(cli._UsageError):
         cli._parse_run_options(["--project"])
@@ -97,6 +122,7 @@ def test_help_exits_zero(capsys):
     assert cli.main(["run", "--help"]) == 0
     out = capsys.readouterr().out
     assert "usage: agenticml run" in out
+    assert "--task NAME" in out
     assert "default: entry file path relative to the repo root (absolute outside a repo), or the module name" in out
 
 
@@ -116,21 +142,26 @@ def project(tmp_path: Path) -> Path:
     return root
 
 
-def _launch(project: Path, *args: str, script: str | None = None, name: str = "train.py"):
+def _launch(
+    project: Path, *args: str, script: str | None = None, name: str = "train.py",
+    env: dict | None = None,
+):
     if script is not None:
         (project / name).write_text(textwrap.dedent(script))
     out = project.parent / "out"
-    env = {
+    process_env = {
         **os.environ,
         "AGENTICML_MODE": "offline",
         "AGENTICML_DIR": str(out),
     }
-    env.pop("AGENTICML_PROJECT", None)
-    env.pop("AGENTICML_NAME", None)
+    process_env.pop("AGENTICML_PROJECT", None)
+    process_env.pop("AGENTICML_NAME", None)
+    process_env.pop("AGENTICML_TASK", None)
+    process_env.update(env or {})
     proc = subprocess.run(
         [sys.executable, "-m", "agenticml", "run", *args],
         cwd=project,
-        env=env,
+        env=process_env,
         capture_output=True,
         text=True,
         timeout=120,
@@ -187,6 +218,64 @@ def test_project_and_name_options(project):
     assert proc.returncode == 0, proc.stderr
     init = runs[0].meta()
     assert (init["project"], init["name"], init["tags"]) == ("demo", "exp", ["a", "b"])
+
+
+def test_task_option_records_explicit_task(project):
+    proc, runs = _launch(project, "--task", "asr", "t.py", script="pass\n", name="t.py")
+    assert proc.returncode == 0, proc.stderr
+    assert runs[0].meta()["task"] == "asr"
+    assert runs[0].meta()["task_source"] == "explicit"
+
+
+def test_task_option_survives_interpreter_reexec(project):
+    proc, runs = _launch(
+        project, "--task", "asr", "--", sys.executable, "-u", "t.py",
+        script="pass\n", name="t.py",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert len(runs) == 1
+    assert runs[0].meta()["task"] == "asr"
+    assert runs[0].meta()["task_source"] == "explicit"
+
+
+def test_task_env_records_env_task(project):
+    proc, runs = _launch(
+        project, "t.py", script="pass\n", name="t.py", env={"AGENTICML_TASK": "asr"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert len(runs) == 1
+    assert runs[0].meta()["task"] == "asr"
+    assert runs[0].meta()["task_source"] == "env"
+
+
+def test_task_option_beats_entry_folder(project):
+    (project / "scripts").mkdir()
+    proc, runs = _launch(project, "--task", "asr", "scripts/train.py", script="pass\n",
+                         name="scripts/train.py")
+    assert proc.returncode == 0, proc.stderr
+    assert runs[0].meta()["task"] == "asr"
+    assert runs[0].meta()["task_source"] == "explicit"
+
+
+def test_task_option_beats_marker(project):
+    (project / "agenticml.toml").write_text('task = "marker"\n')
+    proc, runs = _launch(project, "--task", "asr", "t.py", script="pass\n", name="t.py")
+    assert proc.returncode == 0, proc.stderr
+    assert runs[0].meta()["task"] == "asr"
+    assert runs[0].meta()["task_source"] == "explicit"
+
+
+def test_script_init_task_keeps_explicit_launcher_task(project):
+    proc, runs = _launch(project, "--task", "asr", "t.py", name="t.py", script="""
+        import agenticml
+        run = agenticml.init(task="imagegen")
+        assert run.task == "asr"
+    """)
+    assert proc.returncode == 0, proc.stderr
+    assert len(runs) == 1
+    assert runs[0].meta()["task"] == "asr"
+    assert runs[0].meta()["task_source"] == "explicit"
+    assert "keeping it instead of task='imagegen'" in proc.stderr
 
 
 @pytest.mark.parametrize("explicit", [False, True])
