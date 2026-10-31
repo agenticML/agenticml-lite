@@ -54,6 +54,7 @@ agenticml = "agenticml.cli:main"
 
 [project.urls]
 Homepage = "https://agenticml.xyz"
+Documentation = "https://agenticml.github.io/agenticml-lite/"
 Source   = "https://github.com/agenticML/agenticml-lite"
 Issues   = "https://github.com/agenticML/agenticml-lite/issues"
 
