@@ -107,7 +107,8 @@ def test_ignores_caps_symlinks_and_nested_repos(project, tmp_path):
     (project / "large.bin").write_bytes(b"x" * 1000)
     (tmp_path / "outside").write_text("outside")
     (project / "outside-link").symlink_to(tmp_path / "outside")
-    (project / "inside-link").symlink_to(project / "train.py")
+    # Relative, so the link's own size (its target path) stays under the cap.
+    (project / "inside-link").symlink_to("train.py")
     root = tmp_path / "store"
     data = lineage.snapshot(root, "test", project, "one", max_file_bytes=100)
     assert data["error"] is None

@@ -4,16 +4,18 @@ Unfinished work, highest priority first. See [AGENTS.md](AGENTS.md) for how
 these are prioritized. When a task is done, delete its entry in the same
 change that finishes it.
 
-## Fix failing dashboard connection-limit tests
+## Deliver the note PUT 408 before closing on macOS
 
-- **Where:** `tests/test_ui_limits.py`
-  (`test_nonreading_clients_are_evicted_when_full`,
-  `test_slow_writer_is_not_evicted_below_capacity`).
-- **Problem:** both fail on `main` (as of e13dd25, macOS) with "server did not
-  reach the expected state"; the full suite also showed a few other
-  intermittent failures in the same run.
-- **Fix:** find whether the eviction logic or the test's wait/timing is wrong
-  and correct that side.
+- **Where:** `src/agenticml/ui/server.py` (the `TimeoutError` branch of the
+  notes PUT that sends 408) and
+  `tests/test_ui.py::test_put_notes_trickled_body_hits_absolute_deadline`.
+- **Problem:** the server closes the socket right after the 408 while the
+  client is still trickling body bytes. Closing with unread input makes macOS
+  send a reset, so the client gets `ConnectionResetError` and never sees the
+  408. The test fails on every macOS run.
+- **Fix:** after the 408, `shutdown(SHUT_WR)` and drain input for a short,
+  bounded time (lingering close) before closing, without letting the drain
+  hold a connection slot past the existing deadlines.
 - **Done when:** `pytest -q tests` passes repeatedly on macOS and in CI.
 
 ## Send `task` and `arch` when syncing a run
