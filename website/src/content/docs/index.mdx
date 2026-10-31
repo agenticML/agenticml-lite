@@ -1,0 +1,47 @@
+---
+title: agenticml-lite
+description: Local-first experiment tracking for machine learning. Files on disk, a dashboard on localhost, optional sync.
+template: splash
+hero:
+  tagline: Track every training run as files on disk. Browse them in a local dashboard. No server, database, or Docker required.
+  actions:
+    - text: Get started
+      link: /agenticml-lite/getting-started/quickstart/
+      icon: right-arrow
+    - text: View on GitHub
+      link: https://github.com/agenticML/agenticml-lite
+      icon: github
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+```bash
+pip install agenticml-lite
+```
+
+## Why agenticml-lite
+
+<CardGrid>
+	<Card title="Local-first" icon="laptop">
+		Metrics, config, code, and media are written to plain files under `~/.agenticml`. Nothing leaves your machine unless you sync.
+	</Card>
+	<Card title="Zero-code tracking" icon="rocket">
+		`agenticml run train.py` captures args, code, PyTorch components, and TensorBoard logs without editing your script.
+	</Card>
+	<Card title="Built-in dashboard" icon="seti:html">
+		`agenticml ui` serves charts, media, and per-run notes on localhost, straight from the files.
+	</Card>
+	<Card title="Fast and small" icon="random">
+		About 3 µs per `log()` call and about 8 bytes per scalar point on disk.
+	</Card>
+</CardGrid>
+
+## Start here
+
+<CardGrid>
+	<LinkCard title="Quickstart" description="Log your first run in under a minute." href="/agenticml-lite/getting-started/quickstart/" />
+	<LinkCard title="Zero-code runs" description="Track an existing script with agenticml run." href="/agenticml-lite/guides/zero-code/" />
+	<LinkCard title="Dashboard" description="View runs, charts, and notes locally." href="/agenticml-lite/guides/dashboard/" />
+	<LinkCard title="Sync to AgenticML" description="Optionally upload runs to agenticml.xyz." href="/agenticml-lite/guides/sync/" />
+</CardGrid>

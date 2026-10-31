@@ -2,6 +2,8 @@
 
 agenticml-lite is a local-first experiment tracker. Training writes metrics, config, code, and media to files on disk, and `agenticml ui` serves a TensorBoard-style dashboard from those files. There is no server, database, or Docker image to run. Upload to [AgenticML](https://agenticml.xyz) is optional, with `agenticml login` and `agenticml sync`. Install the package as `agenticml-lite` and import it as `agenticml`. The API is pre-alpha (`0.1.0.dev0`).
 
+Documentation: <https://agenticml.github.io/agenticml-lite/>
+
 ## Install
 
 ```bash
