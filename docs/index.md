@@ -57,3 +57,15 @@ agenticml run train.py --lr 1e-3
   and CLI reference.
 - [Issues](https://github.com/agenticML/agenticml-lite/issues): bugs and
   feature requests.
+
+## Improve these docs
+
+The pages are Markdown files in the
+[`docs/`](https://github.com/agenticML/agenticml-lite/tree/main/docs) folder.
+Edit one (or use the edit icon on any page) and open a pull request. The site
+is rebuilt when the change merges to `main`. To preview locally:
+
+```bash
+pip install "mkdocs-material>=9.5,<10"
+mkdocs serve
+```
