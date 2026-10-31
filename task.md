@@ -30,16 +30,6 @@ change that finishes it.
   keys).
 - **Done when:** a sync test asserts the three fields reach the payload and an
   older-server response does not fail the sync.
-
-## Loading messages may not be announced
-
-- **Where:** `src/agenticml/ui/static/app.js` (`loading()`) and
-  `src/agenticml/ui/static/index.html` (initial "Loading runs…").
-- **Problem:** each loading message is inserted already populated inside its
-  own `role="status"`. Many screen readers do not announce content that is
-  present when a live region is inserted, so "Loading …" is usually silent.
-  Errors (`role="alert"`) and the poll/save statuses are unaffected.
-- **Fix:** insert an empty status region and set its text on the next tick,
-  or keep one persistent status region per route and write into it.
-- **Done when:** a UI test asserts the loading region exists empty in the DOM
-  before its text is set.
+- **Blocked:** the remote server's `/init` schema is not in this repo, so we
+  cannot tell yet whether it accepts these fields. Deferred until the cloud
+  deployment work.

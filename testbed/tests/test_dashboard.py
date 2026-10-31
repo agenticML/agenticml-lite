@@ -3562,6 +3562,109 @@ def _outside_live(locator):
     }""")
 
 
+def test_pending_lineage_keeps_loading_status_across_polls(page, ui_server):
+    runs = [{"run_id": "live", "name": "live run", "project": "demo", "status": "running", "keys": []}]
+    mock_dashboard(page, runs)
+    held = []
+
+    def stall_lineage(route):
+        held.append(route)
+
+    page.route("**/api/lineage?project=demo", stall_lineage)
+    page.clock.install()
+    page.set_viewport_size({"width": 375, "height": 812})
+    try:
+        home(page, ui_server)
+        loading = page.locator('.lineage-scroll [role="status"]')
+        expect(loading).to_have_text("Loading lineage…")
+        loading.evaluate("el => { el.dataset.keptLoading = 'original'; }")
+        page.evaluate("window.keptRow = document.querySelector('.run-row')")
+
+        # The live runs timer fires every 5 s; wait for the response and draw.
+        with page.expect_response("**/api/runs"):
+            page.clock.fast_forward(5000)
+        page.wait_for_function("() => !window.keptRow.isConnected")
+        expect(loading).to_have_attribute("data-kept-loading", "original")
+        assert len(held) == 1
+
+        # A changed lineage signature starts another fetch while still pending.
+        runs[0]["name"] = "renamed live run"
+        with page.expect_response("**/api/runs"):
+            page.clock.fast_forward(5000)
+        expect(row(page, "renamed live run")).to_be_visible()
+        expect(loading).to_have_attribute("data-kept-loading", "original")
+        expect(loading).to_have_text("Loading lineage…")
+        assert len(held) == 2
+        assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+    finally:
+        for route in held:
+            route.fulfill(content_type="application/json", body=json.dumps({"nodes": runs, "edges": []}))
+        page.unroute("**/api/lineage?project=demo", stall_lineage)
+    expect(page.locator(".lineage-node")).to_contain_text("renamed live run")
+    expect(loading).to_have_count(0)
+
+
+def test_loading_status_is_inserted_empty_before_text_is_set(page, ui_server):
+    page.add_init_script("""(() => {
+      window.loadingRegions = [];
+      new MutationObserver(mutations => {
+        for (const mutation of mutations) {
+          for (const node of mutation.addedNodes) {
+            if (!(node instanceof Element)) continue;
+            const regions = [...node.querySelectorAll('p[role=status]')];
+            if (node.matches('p[role=status]')) regions.push(node);
+            for (const region of regions) {
+              window.loadingRegions.push({
+                node: region,
+                insertedText: region.textContent,
+                insertedConnected: region.isConnected,
+                filledText: '',
+              });
+            }
+          }
+        }
+        for (const region of window.loadingRegions) {
+          if (region.node.isConnected) region.filledText = region.node.textContent;
+        }
+      }).observe(document, {childList: true, subtree: true, characterData: true});
+    })();""")
+    held = []
+
+    def stall_runs(route):
+        held.append(route)
+
+    # Keep the loading node mounted until both observer callbacks have run.
+    page.route("**/api/runs", stall_runs)
+    try:
+        html = page.request.get(ui_server.url).text()
+        page.goto(f"{ui_server.url}#/run/{ui_server.runs['explicit-baseline']}")
+        placeholder = page.evaluate("""html => {
+          const doc = new DOMParser().parseFromString(html, 'text/html');
+          const node = doc.querySelector('main#app > p');
+          return {text: node.textContent, className: node.className,
+            role: node.getAttribute('role'), live: node.getAttribute('aria-live')};
+        }""", html)
+        assert placeholder == {
+            "text": "Loading runs…", "className": "muted", "role": None, "live": None,
+        }
+        page.wait_for_function("""() => {
+          const first = window.loadingRegions[0];
+          return first?.filledText === 'Loading runs…' && first.node.isConnected;
+        }
+        """)
+        assert page.evaluate("window.loadingRegions[0].insertedText") == ""
+        assert page.evaluate("window.loadingRegions[0].insertedConnected")
+        loading = page.locator('#app > p[role="status"]')
+        expect(loading).to_have_text("Loading runs…")
+        expect(loading).to_have_attribute("aria-live", "polite")
+    finally:
+        for route in held:
+            route.continue_()
+        page.unroute("**/api/runs", stall_runs)
+    expect(page.get_by_role("heading", name="explicit-baseline", exact=True)).to_be_visible()
+    expect(page.locator(".poll-status")).to_have_text("Up to date")
+
+
 def test_page_live_regions_are_dedicated(page, tmp_path, ui_server_factory):
     """main is quiet; loading, route errors, poll status, and save state each speak for themselves."""
     root = tmp_path / "live-regions"
