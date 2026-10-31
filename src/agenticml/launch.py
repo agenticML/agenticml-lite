@@ -51,6 +51,7 @@ class RunSettings:
     notes: str | None = None
     group: str | None = None
     job_type: str | None = None
+    task: str | None = None
     mode: str | None = None
     dir: str | None = None
     auto_track: bool = True
@@ -219,6 +220,7 @@ def _start_run(settings: RunSettings, resolved: _Resolved):
             notes=settings.notes,
             group=settings.group,
             job_type=settings.job_type,
+            task=settings.task,
             auto_track=settings.auto_track,
             auto_metrics=settings.auto_metrics,
             log_every=settings.log_every,

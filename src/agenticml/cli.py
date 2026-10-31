@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 
+from .code_tracking import _normalize_task
 from .launch import LaunchError, RunSettings, Target, parse_log_every, run_target
 
 
@@ -311,6 +312,7 @@ options:
   --notes TEXT         run notes (env AGENTICML_NOTES)
   --group NAME         run group (env AGENTICML_GROUP)
   --job-type NAME      job type (env AGENTICML_JOB_TYPE)
+  --task NAME          run task (env AGENTICML_TASK; default: agenticml.toml task, else the entry script's folder)
   --mode MODE          local (default), offline (alias), or disabled (env AGENTICML_MODE)
   --dir DIR            local store root (default: $AGENTICML_DIR or ~/.agenticml)
   --no-auto-track      do not detect model/optimizer/loss/dataloader (env AGENTICML_AUTO_TRACK=0)
@@ -329,6 +331,7 @@ _RUN_VALUE_OPTIONS = {
     "--notes": "notes",
     "--group": "group",
     "--job-type": "job_type",
+    "--task": "task",
     "--mode": "mode",
     "--dir": "dir",
     "--log-every": "log_every",
@@ -389,6 +392,12 @@ def _parse_run_options(args):
             attr = _RUN_VALUE_OPTIONS[option]
             if attr == "tags":
                 value = [t.strip() for t in value.split(",") if t.strip()]
+            elif attr == "task":
+                normalized = _normalize_task(value)
+                if normalized is None:
+                    raise _UsageError("--task must be a non-empty name of at most 128 characters "
+                                      "without control characters")
+                value = normalized
             elif attr == "log_every":
                 try:
                     value = parse_log_every(value)
