@@ -220,6 +220,20 @@ pytest
 python scripts/bench.py --quick
 ```
 
+## Releasing
+
+GitHub Actions publishes to PyPI with Trusted Publishing (no API tokens).
+
+- **TestPyPI dry run:** run the "Publish to TestPyPI" workflow by hand from the Actions tab. Re-running with a version that is already there is a no-op.
+- **PyPI:** push a `v*` tag. The workflow fails if the tag does not match the version in `pyproject.toml` and `src/agenticml/__init__.py`.
+
+```bash
+# bump version in pyproject.toml and src/agenticml/__init__.py
+git commit -am "release: v0.1.0"
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
