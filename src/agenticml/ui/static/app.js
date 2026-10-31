@@ -43,9 +43,23 @@ const button = (text, onclick, kind = "ghost", attrs = {}) =>
   });
 const chip = (text, tone = "") =>
   el("span", { class: `chip ${tone}`, text, title: text });
-const statusChip = (status) =>
+const isNumber = (value) => typeof value === "number" && Number.isFinite(value);
+const lowerBetter = (key) => /loss|err|error/i.test(key);
+// Status words are lowercase. A finished run that never logged a metric
+// says so instead of looking like a clean result.
+const hasMetrics = (run) =>
+  run?.last_step != null ||
+  (run?.keys || []).length > 0 ||
+  Object.values(run?.summary || {}).some(isNumber);
+const statusText = (status, run) =>
+  status === "finished"
+    ? run && !hasMetrics(run)
+      ? "done · no metrics"
+      : "done"
+    : String(status || "unknown").toLowerCase();
+const statusChip = (status, run) =>
   chip(
-    status || "unknown",
+    statusText(status, run),
     { running: "accent", finished: "ok", crashed: "danger", stale: "warn" }[
       status
     ],
@@ -53,8 +67,109 @@ const statusChip = (status) =>
 const eyebrow = (text) => el("div", { class: "eyebrow", text });
 const dot = (color) =>
   el("span", { class: "dot", style: `background:${color}` });
-const isNumber = (value) => typeof value === "number" && Number.isFinite(value);
-const lowerBetter = (key) => /loss|err|error/i.test(key);
+// "best_val_acc" reads as "best val_acc ↑"; the arrow is the better direction.
+const metricLabel = (key) =>
+  `${/^best_/.test(key) ? `best ${key.slice(5)}` : key} ${lowerBetter(key) ? "↓" : "↑"}`;
+// Signed delta: true minus sign, and ±0 for no change.
+const formatDelta = (delta) =>
+  delta === 0
+    ? "±0"
+    : `${delta > 0 ? "+" : "−"}${formatNumber(Math.abs(delta))}`;
+const deltaTone = (delta, key) =>
+  delta == null || delta === 0
+    ? ""
+    : delta < 0 === lowerBetter(key)
+      ? "ok"
+      : "warn";
+// Identity fields differ between any two runs, so they never count as a change.
+const IDENTITY_KEYS = new Set(["name", "project", "out", "tags"]);
+const HYPERPARAMETERS = ["lr", "batch_size", "epochs", "steps_per_epoch", "seed"];
+function changedKeys(run, parent) {
+  const keys = new Set([
+    ...Object.keys(run.config || {}),
+    ...Object.keys(parent.config || {}),
+  ]);
+  return [...keys]
+    .filter(
+      (key) =>
+        !IDENTITY_KEYS.has(key) &&
+        JSON.stringify(run.config?.[key]) !==
+          JSON.stringify(parent.config?.[key]),
+    )
+    .sort();
+}
+// Root runs list their key hyperparameters (or, without any, the first params
+// that vary across the project); children list only what changed.
+function changedLine(run, parent, isRoot, siblingKeys = []) {
+  if (isRoot) {
+    const known = ["lr", "seed", "batch_size"].filter(
+      (key) => key in (run.config || {}),
+    );
+    const shown = known.length
+      ? known.map((key) => `${key}=${fmt(run.config[key])}`)
+      : varied(run, siblingKeys).split(" · ").filter(Boolean).slice(0, 3);
+    return ["root", ...shown].join(" · ");
+  }
+  const keys = changedKeys(run, parent);
+  if (!keys.length) return "no param changes";
+  return keys
+    .map(
+      (key) => `${key} ${fmt(parent.config?.[key])} → ${fmt(run.config?.[key])}`,
+    )
+    .join(" · ");
+}
+// Runs filter. Words match name, id and tags; "tag:x" and "status:x" (with
+// "failed" for crashed) narrow by tag and status; "key>n", "key<n", "key>=n",
+// "key<=n" and "key=v" test config, then summary, values. Every token must hold.
+const FILTER_COMPARISON = /^([^<>=:]+)(>=|<=|>|<|=)(.+)$/;
+function runMatches(run, query) {
+  const text = `${run.name} ${run.run_id} ${(run.tags || []).join(" ")}`.toLowerCase();
+  return query
+    .split(/\s+/)
+    .filter(Boolean)
+    .every((token) => {
+      if (token.startsWith("tag:"))
+        return (run.tags || []).some((tag) =>
+          String(tag).toLowerCase().includes(token.slice(4)),
+        );
+      if (token.startsWith("status:")) {
+        const wanted = token.slice(7) === "failed" ? "crashed" : token.slice(7);
+        return (
+          String(run.status || "").toLowerCase() === wanted ||
+          statusText(run.status, run).startsWith(wanted)
+        );
+      }
+      const compared = FILTER_COMPARISON.exec(token);
+      if (compared) {
+        const [, name, op, raw] = compared;
+        const pick = (source) =>
+          Object.keys(source || {}).find((key) => key.toLowerCase() === name);
+        const configKey = pick(run.config),
+          summaryKey = pick(run.summary);
+        if (configKey == null && summaryKey == null) return false;
+        const value =
+          configKey != null ? run.config[configKey] : run.summary[summaryKey];
+        const number = Number(raw);
+        if (op === "=")
+          return String(fmt(value)).toLowerCase() === raw || value === number;
+        if (!isNumber(value) || !Number.isFinite(number)) return false;
+        return op === ">"
+          ? value > number
+          : op === "<"
+            ? value < number
+            : op === ">="
+              ? value >= number
+              : value <= number;
+      }
+      return text.includes(token);
+    });
+}
+// Free-text part of a filter, for the notes notebook (no field operators).
+const filterWords = (query) =>
+  query
+    .split(/\s+/)
+    .filter((token) => token && !/^(tag|status):/.test(token) && !FILTER_COMPARISON.test(token))
+    .join(" ");
 function duration(run) {
   if (!run.created_at) return "—";
   const seconds = Math.max(
@@ -64,6 +179,7 @@ function duration(run) {
       1000,
   );
   if (!Number.isFinite(seconds)) return "—";
+  if (seconds < 1) return "<1 s";
   return seconds < 60
     ? `${formatNumber(Math.round(seconds))} s`
     : seconds < 3600
@@ -177,6 +293,8 @@ document.querySelector("#theme").onclick = () => {
 };
 systemTheme.addEventListener("change", applyTheme);
 applyTheme();
+// Where this dashboard is served from: always a local store.
+document.querySelector("#host").textContent = `local · ${location.host}`;
 document.querySelector("#close-lightbox").onclick = () =>
   document.querySelector("#lightbox").close();
 
@@ -272,7 +390,7 @@ const headline = (run) => {
   );
   return keys.find((key) => /loss|acc/i.test(key)) || keys[0];
 };
-const LINEAGE_W = 200;
+const LINEAGE_W = 236;
 const LINEAGE_H = 64;
 const LINEAGE_GAP_X = 32;
 const LINEAGE_GAP_Y = 48;
@@ -426,7 +544,7 @@ function lineageBadges(node, byId) {
   const parent = byId.get(node.parent_run_id);
   if (node.base_dirty) badges.push(["dirty", "lineage-dirty", "Base tree was dirty"]);
   if (node.same_tree_as_parent)
-    badges.push(["same code", "lineage-same", "Same tree as parent"]);
+    badges.push(["code unchanged", "lineage-same", "Same tree as parent"]);
   if (node.error) badges.push(["error", "lineage-error", String(node.error)]);
   if (node.cross_task && parent)
     badges.push([
@@ -580,16 +698,23 @@ function renderLineageSvg(data, options) {
       }),
       svgEl(
         "text",
-        { class: "lineage-name", x: at.x + 28, y: at.y + 24, text: shorten(name, 22) },
+        { class: "lineage-name", x: at.x + 28, y: at.y + 24, text: shorten(name, 20) },
         svgEl("title", { text: name }),
       ),
+      svgEl("text", {
+        class: "lineage-role",
+        x: at.x + LINEAGE_W - 12,
+        y: at.y + 24,
+        "text-anchor": "end",
+        text: node.parent_run_id ? "child" : "root",
+      }),
       svgEl(
         "text",
         {
           class: "lineage-meta",
           x: at.x + 28,
           y: at.y + 40,
-          text: `${shortRunId(runId)} · ${commit}`,
+          text: `run ${shortRunId(runId)} · snapshot ${commit}`,
         },
         svgEl("title", { text: runId }),
       ),
@@ -636,7 +761,7 @@ async function home(version) {
   const search = el("input", {
     type: "search",
     class: "field",
-    placeholder: "Filter runs…",
+    placeholder: "lr>0.1   tag:baseline   status:failed",
     "aria-label": "Filter runs",
   });
   const tabs = el("div", {
@@ -651,28 +776,55 @@ async function home(version) {
   });
   const content = el("div", { class: "stack" });
   const status = pollStatusNode();
-  const count = el("span", { class: "muted" });
+  const count = el("p", { class: "runs-summary" });
   app.replaceChildren(
     el(
       "div",
       { class: "workspace runs-workspace stack" },
       el(
         "div",
-        { class: "heading" },
-        el("div", {}, eyebrow("Workspace"), el("h1", { text: "Runs" })),
-        count,
+        { class: "heading runs-heading" },
+        el(
+          "div",
+          { class: "runs-title" },
+          eyebrow("Workspace · local"),
+          el("h1", { text: "Runs" }),
+          count,
+        ),
+        el(
+          "label",
+          { class: "runs-filter" },
+          el("span", { class: "field-label", text: "Filter runs" }),
+          search,
+        ),
       ),
-      tabs,
-      notebook.node,
+      el(
+        "div",
+        { class: "tabs-row" },
+        tabs,
+        el("span", {
+          class: "tabs-note",
+          text: "Grouped by project · sorted by start time",
+        }),
+      ),
       el("div", { class: "selection-slot" }, selection),
       content,
+      notebook.node,
       status,
     ),
   );
   let runs = [],
     project = null,
     timer;
-  const selectionCount = el("span", { text: "Select runs to compare" });
+  const EMPTY_SELECTION =
+    "Select two or more runs to overlay their curves and diff their configs.";
+  const selectionCount = el("span", { text: EMPTY_SELECTION });
+  const selectionChips = el("span", { class: "selection-chips", hidden: true });
+  const selectionHint = el("span", {
+    class: "selection-hint",
+    text: "Overlay curves and diff configs side by side.",
+    hidden: true,
+  });
   const compareButton = button(
     "Compare runs",
     () => {
@@ -691,13 +843,22 @@ async function home(version) {
       updateSelection();
     }),
   );
-  selection.append(selectionCount, selectionActions);
+  selection.append(selectionCount, selectionChips, selectionHint, selectionActions);
   function updateSelection() {
     selection.classList.toggle("is-empty", !selected.size);
     selectionActions.hidden = !selected.size;
+    selectionChips.hidden = !selected.size;
+    selectionHint.hidden = selected.size < 2;
     selectionCount.textContent = selected.size
       ? `${selected.size} run${selected.size === 1 ? "" : "s"} selected`
-      : "Select runs to compare";
+      : EMPTY_SELECTION;
+    const names = runs
+      .filter((run) => selected.has(run.run_id))
+      .map((run) => run.name || run.run_id);
+    if (selectionChips.dataset.names !== JSON.stringify(names)) {
+      selectionChips.dataset.names = JSON.stringify(names);
+      selectionChips.replaceChildren(...names.map((name) => chip(name)));
+    }
     compareButton.disabled = selected.size < 2;
     for (const row of content.querySelectorAll(".run-row")) {
       const picked = selected.has(row.dataset.runId);
@@ -710,8 +871,47 @@ async function home(version) {
       node.setAttribute("aria-pressed", picked ? "true" : "false");
     }
   }
-  const haystack = (run) =>
-    `${run.name} ${run.run_id} ${(run.tags || []).join(" ")}`.toLowerCase();
+  // "Changed vs parent" and "Δ vs parent" read the lineage parent. Until a
+  // project's lineage answers, both cells stay "—" rather than guessing.
+  function parentFacts(run, metricKey, data, keys) {
+    const unknown = { changed: "—", delta: "—", tone: "" };
+    if (!data?.nodes) return unknown;
+    data.byId ||= new Map(data.nodes.map((node) => [node.run_id, node]));
+    const node = data.byId.get(run.run_id);
+    if (!node) return unknown;
+    if (!node.parent_run_id)
+      return { ...unknown, changed: changedLine(run, null, true, keys) };
+    const parent = runs.find((other) => other.run_id === node.parent_run_id);
+    if (!parent) return unknown;
+    const value = run.summary?.[metricKey],
+      base = parent.summary?.[metricKey];
+    const delta = isNumber(value) && isNumber(base) ? value - base : null;
+    return {
+      changed: changedLine(run, parent, false),
+      delta: delta == null ? "—" : formatDelta(delta),
+      tone: deltaTone(delta, metricKey),
+    };
+  }
+  // Lineage lands after the table; patch the existing rows in place.
+  function annotateRows(card, data) {
+    const metricKey = card.dataset.headline;
+    const keys = variedKeys(
+      runs.filter((run) => (run.project || "") === (card.dataset.project || "")),
+    );
+    for (const row of card.querySelectorAll(".run-row")) {
+      const run = runs.find((other) => other.run_id === row.dataset.runId);
+      if (!run) continue;
+      const facts = parentFacts(run, metricKey, data, keys);
+      const changed = row.querySelector(".run-varied");
+      if (changed.textContent !== facts.changed) {
+        changed.textContent = facts.changed;
+        changed.title = facts.changed;
+      }
+      const delta = row.querySelector(".run-delta");
+      if (delta.textContent !== facts.delta) delta.textContent = facts.delta;
+      delta.className = `run-number run-delta ${facts.tone}`;
+    }
+  }
   const lineageCache = new Map();
   const lineageRetry = new Map();
   let lineageToken = 0;
@@ -762,13 +962,39 @@ async function home(version) {
       "header",
       { class: "project-head inline" },
       el("h2", { text: key || "No project" }),
+      el("span", { class: "project-meta" }),
       !key
         ? el("span", {
             class: "project-note",
             text: "no project — pass project= or run inside a repo",
           })
         : null,
+      el("span", { class: "project-metric" }),
     );
+  }
+  // A project's entrypoint is what its newest snapshot recorded as launched.
+  const entrypoints = new Map();
+  function projectMeta(card, siblings) {
+    const key = card.dataset.project || "";
+    const entry = entrypoints.get(key);
+    const text = [
+      `${siblings.length} run${siblings.length === 1 ? "" : "s"}`,
+      entry ? `entrypoint ${entry}` : null,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    const meta = card.querySelector(".project-meta");
+    if (meta.textContent !== text) meta.textContent = text;
+    if (entrypoints.has(key) || !siblings[0]) return;
+    entrypoints.set(key, null);
+    get(`${apiRun(siblings[0].run_id)}/code`)
+      .then((files) => {
+        const path = files.find?.((file) => file.source === "entrypoint")?.path;
+        if (!path || epoch !== version) return;
+        entrypoints.set(key, path);
+        if (card.isConnected) projectMeta(card, siblings);
+      })
+      .catch(() => {});
   }
   function renderDetail(host, node, detail) {
     const parentId = node.parent_run_id;
@@ -1121,7 +1347,7 @@ async function home(version) {
     const siblings = runs.filter((run) => (run.project || "") === projectKey);
     const matching = new Set(
       siblings
-        .filter((run) => haystack(run).includes(query))
+        .filter((run) => runMatches(run, query))
         .map((run) => run.run_id),
     );
     scroll.replaceChildren(
@@ -1177,7 +1403,7 @@ async function home(version) {
   }
   function dimLineage(card, siblings, query) {
     const matching = new Set(
-      siblings.filter((run) => haystack(run).includes(query)).map((run) => run.run_id),
+      siblings.filter((run) => runMatches(run, query)).map((run) => run.run_id),
     );
     const filtering = Boolean(query);
     for (const node of card.querySelectorAll(".lineage-node"))
@@ -1233,8 +1459,10 @@ async function home(version) {
         current.error = null;
         clearLineageRetry(key);
         const target = current.card;
-        if (target?.isConnected && target.dataset.signature === signature)
+        if (target?.isConnected && target.dataset.signature === signature) {
           paintLineage(target, data);
+          annotateRows(target, data);
+        }
       })
       .catch((error) => {
         if (epoch !== version || error.name === "AbortError") return;
@@ -1288,23 +1516,42 @@ async function home(version) {
       if (!shownProjects.has(key)) clearLineageRetry(key);
     for (const tab of tabs.querySelectorAll("button")) tab.remove();
     tabs.prepend(
-      ...[null, ...projects].map((key) =>
-        button(
-          key === null ? "All" : key || "No project",
+      ...[null, ...projects].map((key) => {
+        const label = key === null ? "All projects" : key || "No project";
+        const tab = button(
+          label,
           () => {
             project = key;
             draw();
           },
           "ghost",
-          { role: "tab", "aria-selected": key === project },
-        ),
-      ),
+          { role: "tab", "aria-selected": key === project, "aria-label": label },
+        );
+        tab.append(
+          el("span", {
+            class: "tab-count",
+            "aria-hidden": "true",
+            text: key === null ? runs.length : groups.get(key).length,
+          }),
+        );
+        return tab;
+      }),
     );
-    if (!search.parentNode) tabs.append(search);
-    count.textContent = `${runs.length} runs · grouped by project`;
+    const finished = runs
+      .map((run) => Date.parse(run.finished_at))
+      .filter(Number.isFinite);
+    count.textContent = [
+      `${runs.length} run${runs.length === 1 ? "" : "s"}`,
+      `${projects.length} project${projects.length === 1 ? "" : "s"}`,
+      finished.length
+        ? `last finished ${new Date(Math.max(...finished)).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })}`
+        : null,
+    ]
+      .filter(Boolean)
+      .join(" · ");
     updateSelection();
     const query = search.value.trim().toLowerCase();
-    notebook.update({ project, query });
+    notebook.update({ project, query: filterWords(query) });
     const cards = [];
     for (const key of projects) {
       if (project !== null && key !== project) continue;
@@ -1337,7 +1584,7 @@ async function home(version) {
           { class: "lineage-detail" },
           el("p", {
             class: "muted",
-            text: "Select a run to see its parent, commit, and files changed.",
+            text: "Pick a run to see its parent, commit and changed files.",
           }),
         );
         card = el(
@@ -1348,7 +1595,13 @@ async function home(version) {
             "div",
             { class: "project-body" },
             el("div", { class: "runs-pane" }),
-            el("div", { class: "lineage-body" }, scroll, detail),
+            el(
+              "div",
+              { class: "lineage-body" },
+              el("div", { class: "lineage-head" }, eyebrow("Lineage")),
+              scroll,
+              detail,
+            ),
           ),
         );
         bindLineageCard(card);
@@ -1367,43 +1620,36 @@ async function home(version) {
         )
           ensureLineage(key, signature, card, true);
       } else ensureLineage(key, signature, card, running);
-      const visible = siblings.filter((run) => haystack(run).includes(query));
+      const visible = siblings.filter((run) => runMatches(run, query));
       const keys = variedKeys(siblings);
       const headlineKey = siblings.map(headline).find(Boolean) || "Metric";
-      // Walk oldest first, batching equal timestamps so only strictly earlier
-      // finite samples can serve as a baseline. This is linear after sorting.
-      const previousValues = new Map();
-      let prior = null;
-      for (let end = siblings.length; end > 0;) {
-        let start = end - 1;
-        const time = Date.parse(siblings[start].created_at);
-        while (start > 0 && Date.parse(siblings[start - 1].created_at) === time)
-          start--;
-        for (let i = start; i < end; i++)
-          previousValues.set(
-            siblings[i].run_id,
-            Number.isFinite(time) ? prior : null,
-          );
-        if (Number.isFinite(time))
-          for (let i = start; i < end; i++)
-            if (isNumber(siblings[i].summary?.[headlineKey]))
-              prior = siblings[i].summary[headlineKey];
-        end = start;
+      card.dataset.headline = headlineKey;
+      projectMeta(card, siblings);
+      const metricText =
+        headlineKey === "Metric" ? "—" : metricLabel(headlineKey);
+      const metric = card.querySelector(".project-metric");
+      if (metric.dataset.value !== metricText) {
+        metric.dataset.value = metricText;
+        metric.replaceChildren(
+          "primary metric · ",
+          el("span", { class: "project-metric-name", text: metricText }),
+        );
       }
       const columns = el(
         "div",
         { class: "run-grid run-columns" },
         el("span"),
-        el("span", { text: "Run · varied" }),
-        el("span", { class: "run-progress", text: "Progress" }),
+        el("span", { text: "Run · changed vs parent" }),
+        el("span", { class: "run-status", text: "Status" }),
+        el("span", { class: "run-progress", text: "Last step" }),
         el("span", {
-          class: "run-number",
-          text: headlineKey,
+          class: "run-number run-metric",
+          text: headlineKey === "Metric" ? headlineKey : metricLabel(headlineKey),
           title: headlineKey,
         }),
-        el("span", { class: "run-number run-delta", text: "Δ" }),
-        el("span", { class: "run-number run-duration", text: "Duration" }),
-        el("span"),
+        el("span", { class: "run-number run-delta", text: "Δ vs parent" }),
+        el("span", { class: "run-number run-duration", text: "Wall time" }),
+        el("span", { class: "run-chevron" }),
       );
       const rows = visible.map((run) => {
         const pick = () => {
@@ -1423,17 +1669,7 @@ async function home(version) {
           onkeydown: (event) => event.stopPropagation(),
         });
         const metricKey = headlineKey;
-        const previous = previousValues.get(run.run_id);
-        const delta =
-          previous != null && isNumber(run.summary?.[metricKey])
-            ? run.summary[metricKey] - previous
-            : null;
-        const tone =
-          delta == null || delta === 0
-            ? ""
-            : delta < 0 === lowerBetter(metricKey)
-              ? "ok"
-              : "warn";
+        const facts = parentFacts(run, metricKey, lineageCache.get(key)?.data, keys);
         const name = el("a", {
           class: "run-name",
           href: routeRun(run.run_id),
@@ -1460,13 +1696,19 @@ async function home(version) {
           el(
             "div",
             { class: "run-identity" },
-            el("div", { class: "inline" }, name, statusChip(run.status)),
+            el(
+              "div",
+              { class: "inline" },
+              name,
+              el("span", { class: "run-id", text: shortRunId(run.run_id) }),
+            ),
             el("div", {
               class: "run-varied",
-              text: varied(run, keys),
-              title: varied(run, keys),
+              text: facts.changed,
+              title: facts.changed,
             }),
           ),
+          el("div", { class: "run-status" }, statusChip(run.status, run)),
           el("span", {
             class: "muted run-progress",
             text:
@@ -1477,16 +1719,16 @@ async function home(version) {
                   : String(run.last_step),
           }),
           el("span", {
-            class: "run-number",
+            class: "run-number run-metric",
             title: metricKey || "",
             text: fmt(run.summary?.[metricKey]),
           }),
           el("span", {
-            class: `run-number run-delta ${tone}`,
-            text: delta == null ? "—" : `${delta > 0 ? "+" : ""}${fmt(delta)}`,
+            class: `run-number run-delta ${facts.tone}`,
+            text: facts.delta,
           }),
           el("span", { class: "run-number run-duration", text: duration(run) }),
-          el("span", { class: "muted", text: "›" }),
+          el("span", { class: "run-chevron", "aria-hidden": "true", text: "›" }),
         );
       });
       for (const peer of card.querySelectorAll(".is-linked"))
@@ -1592,7 +1834,59 @@ async function loadMetrics(run, signal) {
     }
   return { metrics, truncated: results.some((result) => result.truncated) };
 }
-function metricsPanel(initialRuns, compare, signal) {
+// Metric key filter: plain text matches anywhere; "*" is a wildcard
+// ("val/*", "*loss").
+function keyFilter(text) {
+  const query = text.trim().toLowerCase();
+  if (!query.includes("*")) return (key) => key.toLowerCase().includes(query);
+  const pattern = new RegExp(
+    `^${query.split("*").map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`,
+  );
+  return (key) => pattern.test(key.toLowerCase());
+}
+// Direction words for chart headers; keys that are neither stay unlabelled.
+const metricDirection = (key) =>
+  lowerBetter(key)
+    ? "lower is better"
+    : /acc|f1|auc|precision|recall|score|reward|iou|bleu/i.test(key)
+      ? "higher is better"
+      : "";
+const EPOCH_KEY = /(^|\/)epoch$/i;
+// x-axis mappers built from logged data only: an epoch series, or the
+// (step, seconds) flush records in _time.bin. null when the run has neither.
+function axisMapper(axis, runMetrics, records) {
+  if (axis === "epoch") {
+    const key = Object.keys(runMetrics || {}).find((name) => EPOCH_KEY.test(name));
+    const samples = (runMetrics?.[key] || []).filter((point) => isNumber(point.value));
+    if (!samples.length) return null;
+    return (step) => {
+      let value = samples[0].value;
+      for (const sample of samples) {
+        if (sample.step > step) break;
+        value = sample.value;
+      }
+      return value;
+    };
+  }
+  if (axis === "wall time") {
+    if (!Array.isArray(records) || records.length < 2) return null;
+    const points = [...records].sort((a, b) => a[0] - b[0]);
+    if (points[0][0] > 0) points.unshift([0, 0]);
+    // Steps between two flushes are placed linearly between their times.
+    return (step) => {
+      if (step >= points.at(-1)[0]) return points.at(-1)[1];
+      for (let i = 1; i < points.length; i++)
+        if (step <= points[i][0]) {
+          const [s0, t0] = points[i - 1],
+            [s1, t1] = points[i];
+          return s1 === s0 ? t1 : t0 + ((step - s0) / (s1 - s0)) * (t1 - t0);
+        }
+      return points[0][1];
+    };
+  }
+  return (step) => step;
+}
+function metricsPanel(initialRuns, compare, signal, { onMetrics } = {}) {
   const node = el("div", { class: "metrics-panel stack" });
   let runs = initialRuns,
     metrics = Object.create(null),
@@ -1601,12 +1895,62 @@ function metricsPanel(initialRuns, compare, signal) {
     focusChart = null,
     hover = null,
     disposed = false;
+  // A single run plots in --s1. In a comparison the first run is the
+  // reference (dashed --s5); the others take --s1…--s4 in order.
   const colors = Object.fromEntries(
     runs.map((run, index) => [
       run.run_id,
-      compare ? `var(--s${(index % 5) + 1})` : colorForId(run.run_id),
+      !compare ? "var(--s1)" : index === 0 ? "var(--s5)" : `var(--s${((index - 1) % 4) + 1})`,
     ]),
   );
+  const reference = compare ? runs[0]?.run_id : null;
+  let xAxis = "step";
+  const timeIndex = new Map();
+  const axisSelect = el(
+    "select",
+    { class: "field axis-select", "aria-label": "x-axis" },
+    ...["step", "epoch", "wall time"].map((value) =>
+      el("option", { value, text: value }),
+    ),
+  );
+  const axisReasons = {
+    epoch: "No epoch series logged (e.g. epoch or auto/epoch)",
+    "wall time": "Needs at least two scalar flush times",
+  };
+  function refreshAxes() {
+    for (const option of axisSelect.options) {
+      if (option.value === "step") continue;
+      const usable = runs.some((run) =>
+        axisMapper(option.value, metrics[run.run_id], timeIndex.get(run.run_id)),
+      );
+      option.disabled = !usable;
+      option.title = usable ? "" : axisReasons[option.value];
+    }
+    if (axisSelect.selectedOptions[0]?.disabled) {
+      axisSelect.value = xAxis = "step";
+    }
+  }
+  // Points re-keyed onto the chosen x-axis; "at" keeps the logged step.
+  let viewCache = null;
+  function view() {
+    if (xAxis === "step") return metrics;
+    if (viewCache?.axis === xAxis && viewCache.metrics === metrics && viewCache.times === timeIndex.size)
+      return viewCache.view;
+    const mapped = Object.create(null);
+    for (const run of runs) {
+      const map = axisMapper(xAxis, metrics[run.run_id], timeIndex.get(run.run_id));
+      mapped[run.run_id] = Object.create(null);
+      if (!map) continue;
+      for (const [key, points] of Object.entries(metrics[run.run_id] || {}))
+        mapped[run.run_id][key] = points.map((point) => ({
+          step: map(point.step),
+          value: point.value,
+          at: point.step,
+        }));
+    }
+    viewCache = { axis: xAxis, metrics, times: timeIndex.size, view: mapped };
+    return mapped;
+  }
   const chartRuns = () => runs.map((run) => ({ ...run, id: run.run_id }));
   const slider = el("input", {
     type: "range",
@@ -1614,19 +1958,19 @@ function metricsPanel(initialRuns, compare, signal) {
     max: 0.99,
     step: 0.01,
     value: 0.6,
-    "aria-label": "Smoothing",
+    "aria-label": "EMA smoothing",
   });
   const smoothValue = el("span", { class: "mono", text: "0.60" });
   const outliers = el("input", {
     type: "checkbox",
     checked: true,
-    "aria-label": "Ignore outliers",
+    "aria-label": "Clip outliers on y-axis",
   });
   const filter = el("input", {
     class: "field",
     type: "search",
-    placeholder: "Filter tags…",
-    "aria-label": "Filter tags",
+    placeholder: "Filter metric keys — val/*",
+    "aria-label": "Filter metric keys",
   });
   const count = el("span", { class: "muted" }),
     content = el("div", { class: "stack" }),
@@ -1638,8 +1982,9 @@ function metricsPanel(initialRuns, compare, signal) {
     el(
       "div",
       { class: "card toolbar" },
-      el("label", {}, eyebrow("Smoothing"), slider, smoothValue),
-      el("label", {}, outliers, "Ignore outliers"),
+      el("label", {}, eyebrow("EMA smoothing"), slider, smoothValue),
+      el("label", {}, outliers, "Clip outliers on y-axis"),
+      el("label", {}, el("span", { class: "eyebrow", text: "x-axis" }), axisSelect),
       filter,
       count,
     ),
@@ -1652,7 +1997,7 @@ function metricsPanel(initialRuns, compare, signal) {
         ...runs.map((run) =>
           el(
             "span",
-            { class: "inline run-label" },
+            { class: `inline run-label${run.run_id === reference ? " is-reference" : ""}` },
             dot(colors[run.run_id]),
             run.name || run.run_id,
           ),
@@ -1662,11 +2007,14 @@ function metricsPanel(initialRuns, compare, signal) {
   node.append(failure, content, note);
   const options = (key) => ({
     runs: chartRuns(),
-    metrics,
+    metrics: view(),
     activeMetric: key,
     smoothing: Number(slider.value),
     ignoreOutliers: outliers.checked,
     colors,
+    xLabel: xAxis === "wall time" ? "wall time (s)" : xAxis,
+    ghostRaw: !compare,
+    dashed: reference ? [reference] : [],
   });
   let overlay = null,
     focusTable;
@@ -1695,7 +2043,7 @@ function metricsPanel(initialRuns, compare, signal) {
           hover == null ? "Step · latest" : "Step · hover",
         ],
         runs.flatMap((run) => {
-          const raw = metrics[run.run_id]?.[expanded] || [];
+          const raw = view()[run.run_id]?.[expanded] || [];
           if (!raw.length) return [];
           let i = raw.length - 1;
           if (hover != null) {
@@ -1715,7 +2063,7 @@ function metricsPanel(initialRuns, compare, signal) {
               ),
               fmt(smoothed(run, expanded)[i]),
               fmt(raw[i].value),
-              fmt(raw[i].step),
+              fmt(raw[i].at ?? raw[i].step),
             ]),
           ];
         }),
@@ -1772,6 +2120,13 @@ function metricsPanel(initialRuns, compare, signal) {
         );
       }),
     );
+    // One run: the header says which step the shown value is from.
+    if (!compare) {
+      const last = (metrics[runs[0]?.run_id]?.[key] || []).at(-1);
+      const text = last ? `@ step ${fmt(last.step)} ⤢` : "⤢";
+      const corner = chartCard.querySelector(".chart-key");
+      if (corner.textContent !== text) corner.textContent = text;
+    }
   }
   function updateFocus() {
     if (focusChart) {
@@ -1784,10 +2139,8 @@ function metricsPanel(initialRuns, compare, signal) {
     const keys = [
       ...new Set(runs.flatMap((run) => Object.keys(metrics[run.run_id] || {}))),
     ].sort();
-    const shown = keys.filter((key) =>
-      key.toLowerCase().includes(filter.value.trim().toLowerCase()),
-    );
-    count.textContent = `${shown.length} / ${keys.length} tags`;
+    const shown = keys.filter(keyFilter(filter.value));
+    count.textContent = `${shown.length} / ${keys.length} keys`;
     const layout = JSON.stringify(shown);
     if (chartLayout === layout && charts.size) {
       for (const [key, chart] of charts) {
@@ -1834,12 +2187,15 @@ function metricsPanel(initialRuns, compare, signal) {
                 el(
                   "header",
                   {},
-                  el("span", {
-                    text: key.includes("/")
-                      ? key.slice(key.indexOf("/") + 1)
-                      : key,
-                  }),
-                  el("span", { class: "chart-key", text: `${key} ⤢` }),
+                  el(
+                    "span",
+                    { class: "chart-title" },
+                    el("span", { class: "chart-name", text: key }),
+                    metricDirection(key)
+                      ? el("span", { class: "chart-dir", text: metricDirection(key) })
+                      : null,
+                  ),
+                  el("span", { class: "chart-key", text: "⤢" }),
                 ),
                 el("div", { class: "chart-host" }, canvas),
                 el(
@@ -1870,8 +2226,11 @@ function metricsPanel(initialRuns, compare, signal) {
             el(
               "div",
               { class: "inline" },
-              el("h3", { text: group }),
-              el("span", { class: "muted", text: groupKeys.length }),
+              el("h3", { text: group === "metrics" ? group : `${group}/` }),
+              el("span", {
+                class: "muted",
+                text: `${groupKeys.length} key${groupKeys.length === 1 ? "" : "s"}`,
+              }),
             ),
             grid,
           );
@@ -1898,7 +2257,7 @@ function metricsPanel(initialRuns, compare, signal) {
         el("p", {
           class: "muted",
           text: keys.length
-            ? "No tags match this filter."
+            ? "No metric keys match this filter."
             : "No metrics logged yet.",
         }),
       );
@@ -1921,6 +2280,11 @@ function metricsPanel(initialRuns, compare, signal) {
     focusChart?.update({ ignoreOutliers: outliers.checked });
   };
   filter.oninput = draw;
+  axisSelect.onchange = () => {
+    xAxis = axisSelect.value;
+    viewCache = null;
+    draw();
+  };
   async function update(nextRuns = runs) {
     runs = nextRuns;
     const signatures = runs.map((run) =>
@@ -1968,7 +2332,24 @@ function metricsPanel(initialRuns, compare, signal) {
     note.textContent = truncated
       ? "Some metric keys were truncated by the server."
       : "";
-    if (changed || !charts.size) draw();
+    // Flush times back the wall-time axis; tests and old stores may lack them.
+    const times = await Promise.all(
+      runs.map((run) =>
+        get(`${apiRun(run.run_id)}/time`, signal).catch(() => []),
+      ),
+    );
+    if (disposed || signal.aborted) return;
+    let timesChanged = false;
+    runs.forEach((run, i) => {
+      const records = Array.isArray(times[i]) ? times[i] : [];
+      if (JSON.stringify(timeIndex.get(run.run_id)) !== JSON.stringify(records)) {
+        timeIndex.set(run.run_id, records);
+        timesChanged = true;
+      }
+    });
+    refreshAxes();
+    if (changed || timesChanged || !charts.size) draw();
+    onMetrics?.(metrics);
   }
   content.append(loading("Loading metrics…"));
   return {
@@ -2039,24 +2420,24 @@ function identity(run) {
     {
       "Run id": run.run_id,
       Project: run.project || "No project",
-      Created: date(run.created_at),
+      Started: date(run.created_at),
       Finished: date(run.finished_at),
-      Duration: duration(run),
       Host: run.hostname || "—",
-      "Git commit": el(
+      Commit: el(
         "span",
         { class: "inline mono git-identity" },
         el("span", { text: `${git.git_commit?.slice(0, 8) || "—"} ·` }),
         el("span", { text: git.git_branch || "—" }),
         git.is_dirty ? chip("dirty", "warn") : null,
       ),
+      "Exit code": run.config?.exit_code ?? run.summary?._exit_code ?? "—",
     },
     true,
   );
 }
 async function runPage(id, version) {
   const signal = controller.signal;
-  const [detail, summaries, initialMedia] = await Promise.all([
+  let [detail, summaries, initialMedia] = await Promise.all([
     get(apiRun(id), signal),
     get("/api/runs", signal),
     get(`${apiRun(id)}/media`, signal),
@@ -2069,13 +2450,27 @@ async function runPage(id, version) {
     run_id: id,
     status: summaries.find((run) => run.run_id === id)?.status || detail.status,
   };
-  const siblings = summaries.filter(
+  let siblings = summaries.filter(
     (other) => (other.project || "") === (run.project || ""),
   );
-  const title = el("div", { class: "inline" }),
-    subline = el("div", { class: "subline" }),
+  // The lineage parent comes with the run; its config/summary come from the index.
+  // An explicit top-level parent wins over the snapshot's inferred one.
+  const parentId = () => run.parent_run_id || run.lineage?.parent_run_id || null;
+  const parentOf = () => summaries.find((other) => other.run_id === parentId());
+  const title = el("div", { class: "inline run-title" }),
+    subline = el("span", { class: "subline" }),
+    changeLabel = el("span", { class: "change-label" }),
+    changeNote = el("span", { class: "change-note" }),
+    strip = el("div", { class: "change-strip" }, changeLabel, subline, changeNote),
+    stats = el("dl", { class: "stat-row" }),
     facts = el("div", { "data-testid": "identity" }),
-    anatomy = el("div", { class: "anatomy" });
+    anatomy = el("div", { class: "anatomy" }),
+    outputs = el("div", { class: "anatomy outputs" }),
+    reproNote = el("span", { class: "muted" }),
+    snapshotNote = el("span", { class: "muted" });
+  // Parent snapshot tree, for "code unchanged"; fetched once when there is a parent.
+  let parentTree;
+  let lastValues = {};
   const pollStatus = pollStatusNode(),
     pollError = el("div");
   const codeContainer = el(
@@ -2083,40 +2478,147 @@ async function runPage(id, version) {
     { class: "code-container" },
     loading("Loading code snapshot…"),
   );
-  const gitAside = el("span", { class: "muted", text: "Finding baseline…" });
+  const gitAside = el("span", { class: "muted", text: "Finding parent…" });
   const parameterSearch = el("input", {
     class: "field",
     type: "search",
     placeholder: "Filter parameters…",
     "aria-label": "Search Parameters",
   });
-  const parameterValues = el("div");
+  const hyperValues = el("div"),
+    parameterValues = el("div");
   const filterParameters = () => {
     const query = parameterSearch.value.toLowerCase();
-    for (const row of parameterValues.querySelectorAll(".kv-list > div")) {
-      row.hidden = !row.textContent.toLowerCase().includes(query);
-    }
+    for (const host of [hyperValues, parameterValues])
+      for (const row of host.querySelectorAll(".kv-list > div")) {
+        row.hidden = !row.textContent.toLowerCase().includes(query);
+      }
   };
+  let entrypoint = null;
   parameterSearch.oninput = filterParameters;
   let code = null,
     timer;
-  const panel = metricsPanel([run], false, signal);
+  const panel = metricsPanel([run], false, signal, {
+    onMetrics: (metrics) => {
+      lastValues = metrics[id] || {};
+      drawStats();
+    },
+  });
   const notepad = createNotepad({ runId: id, el, button, signal });
+  // Headline numbers: the project's primary metric, final loss curves, steps
+  // and wall time. Δ vs parent wherever the parent logged the same summary key.
+  function drawStats() {
+    const parent = parentOf();
+    const items = [];
+    const stat = (label, value, delta, key, note) =>
+      items.push(
+        el(
+          "div",
+          { class: "stat" },
+          el("dt", { text: label }),
+          el("dd", { class: "stat-value", text: value }),
+          delta != null
+            ? el("dd", {
+                class: `stat-delta run-delta ${deltaTone(delta, key)}`,
+                text: `${formatDelta(delta)} vs parent`,
+              })
+            : note
+              ? el("dd", { class: "stat-delta", text: note })
+              : null,
+        ),
+      );
+    const primary = headline(run);
+    if (primary) {
+      const base = parent?.summary?.[primary];
+      stat(
+        primary.replace(/^best_/, "best ").replace(/^final_/, "final "),
+        fmt(run.summary[primary]),
+        isNumber(base) ? run.summary[primary] - base : null,
+        primary,
+      );
+    }
+    for (const key of Object.keys(lastValues).filter(lowerBetter).sort().slice(0, 2)) {
+      const point = [...lastValues[key]].reverse().find((p) => isNumber(p.value));
+      if (point) stat(`final ${key}`, fmt(point.value));
+    }
+    if (run.last_step != null) {
+      const steps = run.last_step + 1;
+      const { epochs, steps_per_epoch: per } = run.config || {};
+      stat(
+        "steps",
+        fmt(steps),
+        null,
+        "",
+        isNumber(epochs) && isNumber(per) && epochs * per === steps
+          ? `${epochs} epochs × ${per}`
+          : null,
+      );
+    }
+    stat("wall time", duration(run));
+    stats.replaceChildren(...items);
+  }
   function drawFacts() {
+    const parent = parentOf();
     title.replaceChildren(
       el("h1", { class: "mono", text: run.name || id }),
-      statusChip(run.status),
+      statusChip(run.status, run),
       ...(run.tags || []).map((tag) => chip(tag)),
+      parent
+        ? el(
+            "span",
+            { class: "run-parent" },
+            "child of ",
+            el("a", { href: routeRun(parent.run_id), text: parent.name || parent.run_id }),
+          )
+        : null,
+      el(
+        "div",
+        { class: "run-actions" },
+        parent
+          ? el("a", {
+              class: "btn btn-secondary btn-sm",
+              href: `#/compare?${new URLSearchParams([["selection", "1"], ["runs", parent.run_id], ["runs", id]])}`,
+              text: "Compare with parent",
+            })
+          : null,
+      ),
     );
-    subline.textContent = [
-      varied(run, variedKeys(siblings)),
-      run.hostname,
-      date(run.created_at),
-    ]
-      .filter(Boolean)
-      .join(" · ");
+    const root = run.lineage && !parentId();
+    changeLabel.textContent = parent ? "changed vs parent" : root ? "root run" : "params";
+    subline.textContent = parent
+      ? changedLine(run, parent, false)
+      : root
+        ? changedLine(run, null, true, variedKeys(siblings))
+        : varied(run, variedKeys(siblings)) || "—";
     subline.title = subline.textContent;
+    const tree = run.lineage?.tree;
+    changeNote.textContent = parent
+      ? [
+          changedKeys(run, parent).length ? "everything else inherited" : null,
+          parentTree === undefined || !tree
+            ? null
+            : parentTree === tree
+              ? "code unchanged"
+              : "code changed",
+        ]
+          .filter(Boolean)
+          .map((text) => `· ${text}`)
+          .join(" ")
+      : "";
+    if (parent && parentTree === undefined) {
+      parentTree = null;
+      get(apiRun(parent.run_id), signal)
+        .then((detail) => {
+          if (epoch !== version) return;
+          parentTree = detail.lineage?.tree || null;
+          drawFacts();
+        })
+        .catch(() => {});
+    }
+    drawStats();
     facts.replaceChildren(identity(run));
+    reproNote.textContent = `Everything needed to re-run ${run.name || id} exactly.`;
+    snapshotNote.textContent = `${run.git?.git_commit ? `@ ${run.git.git_commit.slice(0, 7)} · ` : ""}read-only`;
     const env = { ...(run.env || {}) },
       packages = env.packages;
     delete env.packages;
@@ -2126,7 +2628,7 @@ async function runPage(id, version) {
         el(
           "details",
           {},
-          el("summary", { text: "Packages" }),
+          el("summary", { text: "Packages (pip freeze)" }),
           el("pre", {
             text:
               typeof packages === "object"
@@ -2136,45 +2638,129 @@ async function runPage(id, version) {
         ),
       );
     const git = run.git || {};
+    // One row per artifact version, newest first; the newest carries "latest".
+    const versions = [...(run.artifacts || [])].sort(
+      (a, b) =>
+        String(a.name || "").localeCompare(String(b.name || "")) ||
+        (b.version ?? 0) - (a.version ?? 0),
+    );
+    const newest = new Map();
+    for (const artifact of versions)
+      if (!newest.has(artifact.name)) newest.set(artifact.name, artifact);
     const artifacts = el(
       "div",
       { class: "stack" },
-      ...(run.artifacts || []).map((artifact) =>
+      ...versions.map((artifact) =>
         el(
           "div",
           { class: "inline", "data-artifact": artifact.name },
           el("span", {
             class: "mono",
-            text: artifact.name || artifact.path || "artifact",
+            text: `${artifact.name || artifact.path || "artifact"}${artifact.version == null ? "" : `:v${artifact.version}`}`,
           }),
+          artifact.version != null && newest.get(artifact.name) === artifact
+            ? chip("latest", "accent")
+            : null,
           el("span", {
             class: "muted",
-            text: `${artifact.size == null ? "—" : formatBytes(artifact.size)}${artifact.type ? ` · ${artifact.type}` : ""}${artifact.version == null ? "" : ` · v${artifact.version}`}`,
+            text: [
+              artifact.type,
+              artifact.size == null ? "—" : formatBytes(artifact.size),
+            ]
+              .filter(Boolean)
+              .join(" · "),
           }),
         ),
       ),
     );
     if (!artifacts.children.length)
       artifacts.append(el("span", { class: "muted", text: "—" }));
-    parameterValues.replaceChildren(kv(run.config));
+    const changed = new Set(parent ? changedKeys(run, parent) : []);
+    const config = run.config || {};
+    const marked = (key) =>
+      changed.has(key)
+        ? el("span", { class: "inline" }, chip("changed", "accent"), fmt(config[key]))
+        : config[key];
+    const hyper = Object.fromEntries(
+      HYPERPARAMETERS.filter((key) => key in config).map((key) => [key, marked(key)]),
+    );
+    const rest = Object.fromEntries(
+      Object.keys(config)
+        .filter((key) => !HYPERPARAMETERS.includes(key))
+        .map((key) => [key, marked(key)]),
+    );
+    hyperValues.replaceChildren(kv(hyper));
+    parameterValues.replaceChildren(kv(rest));
     filterParameters();
+    // Δ only for logged results; counts echoed from the config are not metrics.
+    const summary = Object.fromEntries(
+      Object.entries(run.summary || {}).map(([key, value]) => {
+        const base = parent?.summary?.[key];
+        const delta =
+          isNumber(value) && isNumber(base) && !(key in config) ? value - base : null;
+        return [
+          key,
+          delta == null
+            ? value
+            : el(
+                "span",
+                { class: "inline summary-value" },
+                fmt(value),
+                el("span", {
+                  class: `run-delta ${deltaTone(delta, key)}`,
+                  text: formatDelta(delta),
+                  title: "Δ vs parent",
+                }),
+              ),
+        ];
+      }),
+    );
+    const hyperCount = Object.keys(hyper).length;
+    const hyperChanged = HYPERPARAMETERS.filter((key) => changed.has(key)).length;
+    const runConfig = el(
+      "div",
+      { class: "nested-card", "data-card": "Run config" },
+      el("h3", { class: "eyebrow", text: "Run config" }),
+      el("div", { class: "stack" }, parameterSearch, parameterValues),
+    );
     anatomy.replaceChildren(
       card(
-        "Parameters",
-        el("div", { class: "stack" }, parameterSearch, parameterValues),
+        "Hyperparameters",
+        hyperValues,
+        el("span", {
+          class: "muted",
+          text: hyperCount
+            ? `${hyperCount}${parent ? ` · ${hyperChanged} changed` : ""}`
+            : "",
+        }),
       ),
-      card("Metrics", kv(run.summary)),
       card(
-        "Git commit",
+        "Summary metrics",
+        el("div", { class: "stack" }, kv(run.summary ? summary : {}), runConfig),
+        el("span", { class: "muted", text: parent ? "Δ vs parent" : "final values" }),
+      ),
+      card(
+        "Source",
         kv({
-          Commit: git.git_commit,
-          Branch: git.git_branch,
-          State: git.is_dirty ? "dirty" : "clean",
+          commit: git.git_commit,
+          branch: git.git_branch,
+          "working tree": git.git_commit ? (git.is_dirty ? "dirty" : "clean") : null,
+          entrypoint,
         }),
         gitAside,
       ),
       card("Environment", environment),
-      card("Artifacts", artifacts),
+    );
+    const versionCount = (run.artifacts || []).length;
+    outputs.replaceChildren(
+      card(
+        "Artifacts",
+        artifacts,
+        el("span", {
+          class: "muted",
+          text: versionCount ? `${versionCount} version${versionCount === 1 ? "" : "s"}` : "",
+        }),
+      ),
       mediaCard(media),
     );
     setPollStatus(
@@ -2189,8 +2775,8 @@ async function runPage(id, version) {
       { class: "detail stack" },
       el("a", { href: "#/", text: "← All runs" }),
       title,
-      subline,
-      facts,
+      strip,
+      el("section", { class: "card run-facts" }, stats, facts),
       notepad.node,
       el(
         "div",
@@ -2199,15 +2785,27 @@ async function runPage(id, version) {
           "div",
           { class: "heading" },
           eyebrow("Metrics"),
-          el("span", { class: "muted", text: "click a chart to expand" }),
+          el("span", { class: "muted", text: "Click a chart to expand" }),
         ),
         panel.node,
       ),
-      el("div", { class: "stack" }, eyebrow("Run anatomy"), anatomy),
       el(
         "div",
         { class: "stack" },
-        el("div", { class: "heading" }, eyebrow("Code"), fullButton),
+        el("div", { class: "heading section-head" }, eyebrow("Reproducibility"), reproNote),
+        anatomy,
+      ),
+      outputs,
+      el(
+        "div",
+        { class: "stack" },
+        el(
+          "div",
+          { class: "heading section-head" },
+          eyebrow("Code snapshot"),
+          snapshotNote,
+          fullButton,
+        ),
         codeContainer,
       ),
       pollError,
@@ -2231,12 +2829,24 @@ async function runPage(id, version) {
     button,
     focus,
     objectURL,
-    onBaseline: (baseline) => {
+    parentId: parentId(),
+    onBaseline: (baseline, entry) => {
       if (epoch !== version) return;
+      if (entry !== entrypoint) {
+        entrypoint = entry;
+        drawFacts();
+      }
+      // The parent is the preferred baseline; an earlier run stands in only
+      // when the parent has no snapshot, and the label says which it is.
       gitAside.replaceChildren(
         baseline
-          ? button("View diff", () => code?.openFull())
-          : el("span", { text: "no baseline" }),
+          ? button(
+              baseline.run_id === parentId()
+                ? "View diff vs parent"
+                : `View diff vs ${baseline.name || shortRunId(baseline.run_id)}`,
+              () => code?.openFull(),
+            )
+          : el("span", { text: parentId() ? "parent has no snapshot" : "root run · no parent" }),
       );
     },
   })
@@ -2260,6 +2870,10 @@ async function runPage(id, version) {
       ]);
       if (epoch !== version) return;
       media = nextMedia;
+      summaries = index;
+      siblings = index.filter(
+        (other) => (other.project || "") === (next.project || ""),
+      );
       run = {
         ...next,
         last_step: index.find((item) => item.run_id === id)?.last_step,
@@ -2293,56 +2907,102 @@ function formatBytes(value) {
   }
   return `${size.toLocaleString([], { maximumFractionDigits: index ? 1 : 0 })} ${units[index]}`;
 }
-function comparisonTable(runs, colors) {
-  const keys = variedKeys(runs);
-  const rows = [];
-  function section(text) {
-    rows.push(
-      el(
-        "tr",
-        {},
-        el("td", { colSpan: runs.length + 1, class: "table-section", text }),
-      ),
-    );
-  }
-  section(
-    keys.length ? `Params that differ (${keys.length})` : "No params differ",
-  );
-  for (const key of keys)
-    rows.push(tableRow([key, ...runs.map((run) => fmt(run.config?.[key]))]));
-  section("Metrics");
-  const metrics = [
-    ...new Set(runs.flatMap((run) => Object.keys(run.summary || {}))),
-  ].sort();
-  for (const key of metrics) {
-    const values = runs.map((run) => run.summary?.[key]);
-    const numeric = values.filter(isNumber);
-    const best = numeric.length
-      ? lowerBetter(key)
-        ? Math.min(...numeric)
-        : Math.max(...numeric)
-      : null;
-    rows.push(
-      tableRow([
+// Compare: Δ is always "run − reference", where the reference is the first run.
+function percent(delta, base) {
+  if (!base) return "";
+  const share = Math.abs((delta / base) * 100);
+  return `${delta > 0 ? "+" : delta < 0 ? "−" : "±"}${share >= 10 ? Math.round(share) : share.toFixed(1)}%`;
+}
+function configDiff(runs, onlyDifferences) {
+  const all = [...new Set(runs.flatMap((run) => Object.keys(run.config || {})))].sort();
+  const differ = new Set(variedKeys(runs));
+  const keys = onlyDifferences ? all.filter((key) => differ.has(key)) : all;
+  const node = table(
+    ["Param", ...runs.map((run) => run.name || run.run_id)],
+    keys.map((key) => {
+      const row = tableRow([
         key,
-        ...values.map((value) =>
+        ...runs.map((run) =>
           el("span", {
-            class: `mono ${isNumber(value) && value === best ? "ok" : ""}`,
-            text: fmt(value),
+            class: differ.has(key) ? "diff-value" : "same-value",
+            text: fmt(run.config?.[key]),
           }),
         ),
-      ]),
-    );
-  }
-  const node = table(["", ...runs.map((run) => run.name || run.run_id)], rows);
-  const headers = node.querySelectorAll("th");
-  runs.forEach((run, index) =>
-    headers[index + 1].prepend(
-      dot(colors[run.run_id]),
-      document.createTextNode(" "),
-    ),
+      ]);
+      if (differ.has(key)) row.classList.add("is-diff");
+      return row;
+    }),
   );
-  return node;
+  return { node, count: `${differ.size} of ${all.length} params differ` };
+}
+function summaryDiff(runs) {
+  const [reference, ...others] = runs;
+  const configKeys = new Set(runs.flatMap((run) => Object.keys(run.config || {})));
+  const keys = [...new Set(runs.flatMap((run) => Object.keys(run.summary || {})))].sort();
+  const headers = [
+    "Metric",
+    ...runs.map((run) => run.name || run.run_id),
+    ...others.map((run) => (others.length > 1 ? `Δ ${run.name || run.run_id}` : "Δ")),
+  ];
+  const rows = keys.map((key) => {
+    const base = reference.summary?.[key];
+    const direction = metricDirection(key) ? (lowerBetter(key) ? "↓" : "↑") : "";
+    return tableRow([
+      el(
+        "span",
+        { class: "metric-name" },
+        key,
+        direction ? el("span", { class: "metric-dir", "aria-hidden": "true", text: ` ${direction}` }) : null,
+      ),
+      ...runs.map((run) => el("span", { class: "mono", text: fmt(run.summary?.[key]) })),
+      ...others.map((run) => {
+        const value = run.summary?.[key];
+        if (!isNumber(value) || !isNumber(base))
+          return el("span", { class: "run-delta", text: "—" });
+        const delta = value - base;
+        const tone = configKeys.has(key) ? "" : deltaTone(delta, key);
+        return el("span", {
+          class: `run-delta ${tone}`,
+          text: delta && base ? `${formatDelta(delta)} (${percent(delta, base)})` : formatDelta(delta),
+        });
+      }),
+    ]);
+  });
+  return table(headers, rows);
+}
+// One-line, data-only summary of a two-run comparison: what changed in the
+// config and the summary metric that moved most. No cause is claimed.
+function comparisonCallout(runs) {
+  if (runs.length !== 2) return null;
+  const [reference, other] = runs;
+  const configKeys = new Set(runs.flatMap((run) => Object.keys(run.config || {})));
+  const moves = Object.keys(reference.summary || {})
+    .filter(
+      (key) =>
+        !configKeys.has(key) &&
+        isNumber(reference.summary[key]) &&
+        isNumber(other.summary?.[key]),
+    )
+    .map((key) => {
+      const a = reference.summary[key],
+        b = other.summary[key];
+      return { key, a, b, delta: b - a, share: a ? Math.abs((b - a) / a) : Math.abs(b - a) };
+    });
+  if (!moves.length) return null;
+  const top = moves.reduce((best, move) => (move.share > best.share ? move : best));
+  const changes = changedKeys(other, reference)
+    .slice(0, 3)
+    .map((key) => `${key} ${fmt(reference.config?.[key])} → ${fmt(other.config?.[key])}`);
+  const unchanged = moves.filter((move) => move.delta === 0).map((move) => move.key);
+  const tone = top.delta === 0 ? "note" : deltaTone(top.delta, top.key) === "ok" ? "ok" : "warn";
+  const parts = [
+    changes.length ? changes.join(", ") : "no param changes",
+    top.delta === 0
+      ? `${top.key} unchanged`
+      : `${top.key} ${fmt(top.a)} → ${fmt(top.b)} (${percent(top.delta, top.a) || formatDelta(top.delta)}, ${tone === "ok" ? "better" : "worse"})`,
+    unchanged.length && top.delta !== 0 ? `${unchanged.slice(0, 2).join(", ")} unchanged` : null,
+  ].filter(Boolean);
+  return el("p", { class: `callout callout-${tone}`, role: "note", text: parts.join(" · ") });
 }
 async function comparePage(ids, version) {
   const signal = controller.signal;
@@ -2365,9 +3025,12 @@ async function comparePage(ids, version) {
   };
   let runs = await loadRuns();
   if (epoch !== version) return;
+  const projects = [...new Set(runs.map((run) => run.project || "No project"))];
   const overlay = focus(
-    "Compare runs",
-    `${runs.length} runs selected`,
+    `Compare ${runs.length} runs`,
+    runs.length > 1
+      ? `${projects.join(", ")} · reference = ${runs[0].name || runs[0].run_id} · Δ = run − reference`
+      : `${runs.length} run selected`,
     "compare-focus",
     () => {
       if (epoch === version) location.hash = "#/";
@@ -2391,46 +3054,58 @@ async function comparePage(ids, version) {
     );
     return;
   }
+  // Same palette as the overlaid curves: reference --s5, then --s1…--s4.
   const colors = Object.fromEntries(
-    runs.map((run, index) => [run.run_id, `var(--s${(index % 5) + 1})`]),
+    runs.map((run, index) => [
+      run.run_id,
+      index === 0 ? "var(--s5)" : `var(--s${((index - 1) % 4) + 1})`,
+    ]),
   );
   codeDiff = createCodeDiff({ runs, colors, signal, el, get, button });
+  const parentOfRun = (run) => run.parent_run_id || run.lineage?.parent_run_id;
   const selected = el(
     "div",
-    { class: "inline", "data-testid": "selected-runs" },
-    ...runs.map((run) =>
+    { class: "compare-legend", "data-testid": "selected-runs" },
+    ...runs.map((run, index) =>
       el(
         "span",
-        {
-          class: "chip inline",
+        { class: `legend-chip${index === 0 ? " is-reference" : ""}` },
+        el("span", {
+          class: "legend-swatch",
+          "aria-hidden": "true",
+          style: `--swatch:${colors[run.run_id]}`,
+        }),
+        el("span", {
+          class: "legend-name",
           title: run.name || run.run_id,
-          style: `background:color-mix(in srgb,${colors[run.run_id]} 10%,var(--surface-3));border:1px solid color-mix(in srgb,${colors[run.run_id]} 40%,transparent);padding:4px 10px`,
-        },
-        dot(colors[run.run_id]),
-        run.name || run.run_id,
+          text: run.name || run.run_id,
+        }),
+        el("span", {
+          class: "legend-role",
+          text: `${index === 0 ? "reference" : parentOfRun(run) === runs[0].run_id ? "child" : "run"} · ${shortRunId(run.run_id)}`,
+        }),
       ),
     ),
   );
-  const comparison = el("div", { class: "card anatomy-card" }),
-    config = el("div", { class: "card anatomy-card" }),
+  const onlyDifferences = el("input", {
+    type: "checkbox",
+    checked: true,
+    "aria-label": "Only differences",
+  });
+  const diffCount = el("span", { class: "muted" }),
+    configBody = el("div"),
+    summaryBody = el("div"),
+    callout = el("div"),
     pollError = el("div"),
     pollStatus = pollStatusNode();
+  onlyDifferences.onchange = () => draw();
   function draw() {
-    comparison.replaceChildren(comparisonTable(runs, colors));
-    config.replaceChildren(
-      el("pre", {
-        text: JSON.stringify(
-          Object.fromEntries(
-            runs.map((run) => [
-              run.name || run.run_id.slice(0, 8),
-              run.config || {},
-            ]),
-          ),
-          null,
-          2,
-        ),
-      }),
-    );
+    const diff = configDiff(runs, onlyDifferences.checked);
+    diffCount.textContent = diff.count;
+    configBody.replaceChildren(diff.node);
+    summaryBody.replaceChildren(summaryDiff(runs));
+    const note = comparisonCallout(runs);
+    callout.replaceChildren(...(note ? [note] : []));
     setPollStatus(
       pollStatus,
       runs.some((run) => run.status === "running")
@@ -2444,24 +3119,45 @@ async function comparePage(ids, version) {
       { class: "focus-content stack" },
       selected,
       el(
+        "div",
+        { class: "compare-grid" },
+        el(
+          "section",
+          { class: "card anatomy-card compare-card" },
+          el(
+            "header",
+            {},
+            el("h2", { class: "eyebrow", text: "Config diff" }),
+            diffCount,
+            el("label", { class: "inline only-diff" }, onlyDifferences, "Only differences"),
+          ),
+          configBody,
+        ),
+        el(
+          "section",
+          { class: "card anatomy-card compare-card" },
+          el(
+            "header",
+            {},
+            el("h2", { class: "eyebrow", text: "Summary metrics" }),
+            el("span", { class: "muted", text: "final values" }),
+          ),
+          summaryBody,
+          callout,
+        ),
+      ),
+      el(
         "section",
         { class: "stack" },
-        eyebrow("Comparative · all metrics"),
+        el(
+          "div",
+          { class: "heading section-head" },
+          el("h2", { class: "eyebrow", text: "Overlaid curves" }),
+          el("span", { class: "muted", text: "reference dashed" }),
+        ),
         panel.node,
       ),
-      el(
-        "section",
-        { class: "stack" },
-        el("h2", { class: "eyebrow", text: "Params & metrics comparison" }),
-        comparison,
-      ),
       codeDiff.node,
-      el(
-        "section",
-        { class: "stack" },
-        el("h2", { class: "eyebrow", text: "Config" }),
-        config,
-      ),
       pollError,
       pollStatus,
     ),

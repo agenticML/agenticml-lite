@@ -38,6 +38,8 @@ _FILES = {
     "code.js": "text/javascript; charset=utf-8",
     "codediff.js": "text/javascript; charset=utf-8",
     "notes.js": "text/javascript; charset=utf-8",
+    "InstrumentSans.woff2": "font/woff2",
+    "JetBrainsMono.woff2": "font/woff2",
 }
 _OBJECT_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp", "image/avif",
                  "image/bmp", "image/x-icon", "text/plain", "application/json"}

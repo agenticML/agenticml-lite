@@ -130,7 +130,8 @@ def test_single_no_task_preserves_badge_spacing(page, tmp_path, ui_server_factor
         shape = node.locator("rect")
         expect(shape).to_have_attribute("height", "64")
         x, y = float(shape.get_attribute("x")), float(shape.get_attribute("y"))
-        for selector, offset in ((".lineage-dirty", 28), (".lineage-same", 66), (".lineage-error", 126.4)):
+        # Each badge advances by len(label) * 5.6 + 10: "dirty", then "code unchanged".
+        for selector, offset in ((".lineage-dirty", 28), (".lineage-same", 66), (".lineage-error", 154.4)):
             badge = node.locator(selector)
             assert float(badge.get_attribute("x")) == pytest.approx(x + offset)
             assert float(badge.get_attribute("y")) == y + 54

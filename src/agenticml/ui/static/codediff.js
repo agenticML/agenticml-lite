@@ -70,7 +70,7 @@ export function createCodeDiff({
   });
   syncView();
   node.append(
-    el("h2", { class: "eyebrow", text: "Code diff" }),
+    el("h2", { class: "eyebrow", text: "Code & artifacts" }),
     el(
       "div",
       {
