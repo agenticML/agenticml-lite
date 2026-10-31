@@ -17,7 +17,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from .store import RunReader, RunWriter, RunFinishedError, check_budget
-from .store.layout import resolve_root, valid_run_id
+from .store.layout import resolve_root, run_dir, valid_run_id
 from .code_tracking import (
     DEFAULT_MAX_FILE_BYTES,
     DEFAULT_MAX_TOTAL_BYTES,
@@ -406,9 +406,28 @@ class Run(metaclass=_RunType):
 
         env_payload = capture_environment() if capture_env else {}
 
+        parent_task = None
+        if parent_run_id:
+            try:
+                if id is None or not run_dir(self.root, id).exists():
+                    parent_meta = RunReader(self.root, parent_run_id).meta()
+                    parent_task = run_task(parent_meta)[0]
+                    if parent_meta.get("project") != project:
+                        parent_task = None
+                        logger.warning(
+                            "parent run %r is in another project (%r); child project remains %r",
+                            parent_run_id, parent_meta.get("project"), project,
+                        )
+            except FileNotFoundError:
+                logger.warning("parent run %r not found in %s; recording it anyway",
+                               parent_run_id, self.root)
+            except Exception:
+                logger.warning("could not read parent run %r in %s; recording it anyway",
+                               parent_run_id, self.root, exc_info=True)
+
         # Sync maps these nested fields to the server's /init payload.
         repo_root = self.lineage.get("repo_root") or str(find_repo_root(Path.cwd()))
-        self.task, task_source = resolve_task(task, repo_root, main_file())
+        self.task, task_source = resolve_task(task, repo_root, main_file(), parent_task=parent_task)
         try:
             git_payload = {**get_git_metadata(repo_root), "repo_root": repo_root}
         except Exception:
@@ -434,6 +453,12 @@ class Run(metaclass=_RunType):
         if id is not None:
             self.writer = RunWriter.resume(self.root, id, must=(resume == "must"))
         if self.writer is None:
+            if (parent_task is not None and task_source in {"explicit", "env"}
+                    and (self.task or "") != parent_task):
+                logger.warning(
+                    "run task %r differs from parent run %r task %r; the lineage link crosses tasks",
+                    self.task, parent_run_id, parent_task,
+                )
             try:
                 self.writer = RunWriter.create(self.root, run_id=id, meta=meta)
             except Exception as exc:
@@ -455,6 +480,12 @@ class Run(metaclass=_RunType):
             _warn_store_budget(self.root)
         else:
             previous = RunReader(self.root, id).meta()
+            current_parent = previous.get("parent_run_id")
+            if parent_run_id is not None and parent_run_id != current_parent:
+                logger.warning(
+                    "resumed run has parent_run_id %r; keeping it instead of parent_run_id=%r",
+                    current_parent, parent_run_id,
+                )
             self.project = previous.get("project", project)
             self.task = run_task(previous)[0] or None
             self.name = previous.get("name", name)

@@ -90,7 +90,7 @@ atomically (see below). Fields:
 | `run_id` | Directory name. Not changeable. |
 | `project`, `name` | Strings. Default `""`. |
 | `task` | String or `null`. |
-| `task_source` | `explicit`, `env`, `marker`, `entry`, or `null`. |
+| `task_source` | `explicit`, `env`, `parent`, `marker`, `entry`, or `null`. |
 | `config` | JSON object. Default `{}`. |
 | `tags` | JSON array. Default `[]`. |
 | `notes` | String. Default `""`. |
@@ -121,6 +121,7 @@ Task resolution evaluates signals at init in order (first match wins, recorded a
 | --- | --- |
 | `explicit` | `agenticml.init(task="asr")` / `Run(task=...)` / `agenticml run --task asr`. |
 | `env` | `AGENTICML_TASK` environment variable. |
+| `parent` | Explicit parent's task from the local store in the same project, for a new run. |
 | `marker` | Nearest `agenticml.toml` with a top-level `task = "..."`, searched from the entry script's directory (cwd if none) up to and including the project repo root. Must be a regular, non-symlink file of at most 64 KiB; unreadable/invalid files are skipped. |
 | `entry` | Entry script's directory relative to the repo root in POSIX form (e.g. `asr/train.py` -> `asr`, `src/tts/train.py` -> `src/tts`). Not used when the script is at the repo root or outside it. |
 | `null` | No signal matched; `task` is `null` and the whole project is one stream (previous behaviour). |
@@ -199,7 +200,7 @@ The dashboard endpoint `GET /api/lineage[?project=P]` returns `{nodes: [...], ed
 | --- | --- |
 | `run_id`, `name`, `project` | Run identifier, run name, and project string. |
 | `task` | Task name string (empty string when no task). |
-| `task_source` | `explicit`, `env`, `marker`, `entry`, `legacy`, or `null`. |
+| `task_source` | `explicit`, `env`, `parent`, `marker`, `entry`, `legacy`, or `null`. |
 | `arch` | `arch` object from `meta.json`, or `null`. |
 | `arch_changed` | Boolean: true when both own and parent `model_class` are known and different. |
 | `cross_task` | Boolean: true when an emitted edge links runs of different tasks. |

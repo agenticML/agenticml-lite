@@ -23,6 +23,7 @@ import sys
 
 from .code_tracking import _normalize_task
 from .launch import LaunchError, RunSettings, Target, parse_log_every, run_target
+from .store.layout import valid_run_id
 
 
 logger = logging.getLogger("agenticml.cli")
@@ -312,7 +313,9 @@ options:
   --notes TEXT         run notes (env AGENTICML_NOTES)
   --group NAME         run group (env AGENTICML_GROUP)
   --job-type NAME      job type (env AGENTICML_JOB_TYPE)
-  --task NAME          run task (env AGENTICML_TASK; default: agenticml.toml task, else the entry script's folder)
+  --task NAME          run task (env AGENTICML_TASK; default: parent's task, agenticml.toml task, else the entry script's folder)
+  --parent RUN_ID      parent run for lineage (env AGENTICML_PARENT; default: inferred)
+  --allow-cross-task   allow --task to differ from the --parent run's task (env AGENTICML_ALLOW_CROSS_TASK=1)
   --mode MODE          local (default), offline (alias), or disabled (env AGENTICML_MODE)
   --dir DIR            local store root (default: $AGENTICML_DIR or ~/.agenticml)
   --no-auto-track      do not detect model/optimizer/loss/dataloader (env AGENTICML_AUTO_TRACK=0)
@@ -332,11 +335,13 @@ _RUN_VALUE_OPTIONS = {
     "--group": "group",
     "--job-type": "job_type",
     "--task": "task",
+    "--parent": "parent_run_id",
     "--mode": "mode",
     "--dir": "dir",
     "--log-every": "log_every",
 }
 _RUN_FLAG_OPTIONS = {
+    "--allow-cross-task": ("allow_cross_task", True),
     "--no-auto-track": ("auto_track", False),
     "--no-auto-metrics": ("auto_metrics", False),
     "--no-tensorboard": ("sync_tensorboard", False),
@@ -398,6 +403,9 @@ def _parse_run_options(args):
                     raise _UsageError("--task must be a non-empty name of at most 128 characters "
                                       "without control characters")
                 value = normalized
+            elif attr == "parent_run_id":
+                if not valid_run_id(value):
+                    raise _UsageError("--parent must be a valid run id")
             elif attr == "log_every":
                 try:
                     value = parse_log_every(value)
@@ -409,6 +417,38 @@ def _parse_run_options(args):
             raise _UsageError(f"unknown option {token!r}")
         break
     return settings, raw, args[index:]
+
+
+def _check_parent_task(settings):
+    """Refuse an explicit task that would cross the explicit parent's task."""
+    mode = (settings.mode or os.environ.get("AGENTICML_MODE") or "local").lower()
+    if not settings.parent_run_id or settings.allow_cross_task or mode == "disabled":
+        return
+    source = "--task" if settings.task is not None else "AGENTICML_TASK"
+    task = _normalize_task(settings.task if settings.task is not None
+                           else os.environ.get("AGENTICML_TASK"))
+    if task is None:
+        return
+    try:
+        from .lineage import run_task
+        from .store import RunReader
+        from .store.layout import resolve_root
+
+        parent_meta = RunReader(resolve_root(settings.dir), settings.parent_run_id).meta()
+        parent_task = run_task(parent_meta)[0]
+    except Exception:
+        return
+    if task != parent_task:
+        if parent_task:
+            message = (f"{source} {task!r} differs from parent run "
+                       f"{settings.parent_run_id!r} task {parent_task!r}")
+        else:
+            message = (f"{source} {task!r} is set, but parent run "
+                       f"{settings.parent_run_id!r} has no task")
+        raise _UsageError(
+            f"{message}; the lineage link would cross tasks. Drop {source} to join "
+            "the parent's task, or pass --allow-cross-task"
+        )
 
 
 def _parse_python_command(rest):
@@ -485,6 +525,7 @@ def _is_current_interpreter(python: str) -> bool:
 def cmd_run(args):
     try:
         settings, raw_options, rest = _parse_run_options(args)
+        _check_parent_task(settings)
         if rest and _is_python_executable(rest[0]):
             flags, target = _parse_python_command(rest)
             if flags or not _is_current_interpreter(rest[0]):

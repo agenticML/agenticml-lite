@@ -20,6 +20,7 @@ pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="requires gi
 
 @pytest.fixture(autouse=True)
 def clean_git_environment(monkeypatch):
+    monkeypatch.delenv("AGENTICML_TASK", raising=False)
     for key in tuple(os.environ):
         if key.startswith("GIT_"):
             monkeypatch.delenv(key)
@@ -107,7 +108,7 @@ def test_ignores_caps_symlinks_and_nested_repos(project, tmp_path):
     (project / "large.bin").write_bytes(b"x" * 1000)
     (tmp_path / "outside").write_text("outside")
     (project / "outside-link").symlink_to(tmp_path / "outside")
-    (project / "inside-link").symlink_to(project / "train.py")
+    (project / "inside-link").symlink_to("train.py")
     root = tmp_path / "store"
     data = lineage.snapshot(root, "test", project, "one", max_file_bytes=100)
     assert data["error"] is None
@@ -133,6 +134,219 @@ def test_explicit_parent_beats_inference(project, tmp_path):
         assert info(child)["parent_inference"] == "explicit"
         assert info(child)["parent_commit"] == info(first)["commit"]
         assert RunReader(root, child.run_id).meta()["parent_run_id"] == first.run_id
+
+
+@pytest.mark.parametrize("env_task", [None, "", "x" * 129])
+def test_init_inherits_parent_task(project, tmp_path, monkeypatch, env_task):
+    root = tmp_path / "store"
+    with start(root, task="a") as parent:
+        pass
+    (project / "agenticml.toml").write_text('task = "marker"\n')
+    monkeypatch.setattr(sys.modules["__main__"], "__file__", str(project / "train.py"))
+    if env_task is not None:
+        monkeypatch.setenv("AGENTICML_TASK", env_task)
+    with init("test", "child", dir=root, parent_run_id=parent.run_id, capture_env=False,
+              system_metrics=False, auto_track=False) as child:
+        meta = RunReader(root, child.run_id).meta()
+        assert child.task == meta["task"] == meta["lineage"]["task"] == "a"
+        assert meta["task_source"] == "parent"
+        assert meta["parent_run_id"] == parent.run_id
+        assert meta["lineage"]["parent_inference"] == "explicit"
+
+
+@pytest.mark.parametrize("parent_task", ["a", None])
+@pytest.mark.parametrize("source", ["explicit", "env"])
+def test_init_cross_task_warns(project, tmp_path, monkeypatch, caplog, parent_task, source):
+    root = tmp_path / "store"
+    with start(root, task=parent_task) as parent:
+        assert parent.task == parent_task
+    if source == "env":
+        monkeypatch.setenv("AGENTICML_TASK", "b")
+    caplog.clear()
+    with init("test", "child", dir=root, mode="local", parent_run_id=parent.run_id,
+              task="b" if source == "explicit" else None, capture_env=False,
+              system_metrics=False, auto_track=False) as child:
+        meta = RunReader(root, child.run_id).meta()
+        assert child.task == meta["task"] == "b"
+        assert meta["task_source"] == source
+        assert meta["parent_run_id"] == parent.run_id
+    warnings = [record for record in caplog.records if "lineage link crosses tasks" in record.message]
+    assert len(warnings) == 1
+    assert warnings[0].name == "agenticml.run"
+    assert warnings[0].levelname == "WARNING"
+    assert warnings[0].message == (
+        f"run task 'b' differs from parent run {parent.run_id!r} task {parent_task or ''!r}; "
+        "the lineage link crosses tasks"
+    )
+
+
+@pytest.mark.parametrize("case", ["matching", "no-parent", "missing", "other-project", "resumed"])
+@pytest.mark.parametrize("source", ["explicit", "env"])
+def test_init_no_cross_task_warning(project, tmp_path, monkeypatch, caplog, case, source):
+    root = tmp_path / "store"
+    parent_project = "other" if case == "other-project" else "test"
+    with Run(parent_project, "parent", dir=root, task="a", capture_env=False,
+             system_metrics=False, auto_track=False) as parent:
+        pass
+    parent_id = parent.run_id
+    if case == "no-parent":
+        parent_id = None
+    elif case == "missing":
+        parent_id = "missing"
+    options = {}
+    if case == "resumed":
+        with start(root, task="original") as original:
+            pass
+        options = {"id": original.run_id, "resume": "must"}
+    task = "a" if case == "matching" else "b"
+    if source == "env":
+        monkeypatch.setenv("AGENTICML_TASK", task)
+    caplog.clear()
+    with init("test", "child", dir=root, mode="local", parent_run_id=parent_id,
+              task=task if source == "explicit" else None, capture_env=False,
+              system_metrics=False, auto_track=False, **options) as child:
+        assert child.task == ("original" if case == "resumed" else task)
+    assert "lineage link crosses tasks" not in caplog.text
+
+
+@pytest.mark.parametrize("kind", ["missing", "corrupt", "unreadable"])
+def test_unavailable_parent_is_recorded(project, tmp_path, monkeypatch, caplog, kind):
+    root = tmp_path / "store"
+    if kind != "missing":
+        with start(root, id="parent", resume="allow", task="a"):
+            pass
+        if kind == "corrupt":
+            (root / "runs" / "parent" / "meta.json").write_text("[bad json")
+        else:
+            original = RunReader.meta
+
+            def meta(reader):
+                if reader.run_id == "parent":
+                    raise PermissionError("unreadable parent")
+                return original(reader)
+
+            monkeypatch.setattr(RunReader, "meta", meta)
+    (project / "agenticml.toml").write_text('task = "marker"\n')
+    monkeypatch.setattr(sys.modules["__main__"], "__file__", str(project / "train.py"))
+    caplog.clear()
+    with start(root, parent_run_id="parent") as child:
+        meta = RunReader(root, child.run_id).meta()
+        assert meta["parent_run_id"] == meta["lineage"]["parent_run_id"] == "parent"
+        assert meta["lineage"]["parent_inference"] == "explicit"
+        assert meta["task"] == meta["lineage"]["task"] == "marker"
+        assert meta["task_source"] == "marker"
+    warning = "not found" if kind == "missing" else "could not read"
+    assert warning in caplog.text
+    assert "recording it anyway" in caplog.text
+
+
+def test_parent_in_another_project_warns(project, tmp_path, monkeypatch, caplog):
+    root = tmp_path / "store"
+    with Run("other", "parent", dir=root, task="a", capture_env=False,
+             system_metrics=False, auto_track=False) as parent:
+        pass
+    (project / "agenticml.toml").write_text('task = "marker"\n')
+    monkeypatch.setattr(sys.modules["__main__"], "__file__", str(project / "train.py"))
+    caplog.clear()
+    with start(root, parent_run_id=parent.run_id) as child:
+        meta = RunReader(root, child.run_id).meta()
+        assert child.project == meta["project"] == "test"
+        assert meta["parent_run_id"] == meta["lineage"]["parent_run_id"] == parent.run_id
+        assert meta["lineage"]["parent_commit"] is None
+        assert child.task == meta["task"] == meta["lineage"]["task"] == "marker"
+        assert meta["task_source"] == "marker"
+    assert "is in another project ('other')" in caplog.text
+
+
+def test_parent_without_task_keeps_normal_resolution(project, tmp_path, monkeypatch):
+    root = tmp_path / "store"
+    with start(root) as parent:
+        assert parent.task is None
+    (project / "agenticml.toml").write_text('task = "marker"\n')
+    monkeypatch.setattr(sys.modules["__main__"], "__file__", str(project / "train.py"))
+    with start(root, parent_run_id=parent.run_id) as child:
+        meta = RunReader(root, child.run_id).meta()
+        assert meta["task"] == "marker"
+        assert meta["task_source"] == "marker"
+
+
+def test_resume_does_not_lookup_new_parent(project, tmp_path, caplog):
+    root = tmp_path / "store"
+    with start(root, task="a") as first:
+        pass
+    caplog.clear()
+    with start(root, id=first.run_id, resume="must", parent_run_id="missing") as resumed:
+        meta = RunReader(root, resumed.run_id).meta()
+        assert resumed.task == meta["task"] == "a"
+        assert meta["task_source"] == "explicit"
+        assert meta["parent_run_id"] is None
+    assert "parent run 'missing'" not in caplog.text
+
+
+def test_missing_resume_id_inherits_parent_task(project, tmp_path):
+    root = tmp_path / "store"
+    with start(root, task="a") as parent:
+        pass
+    with start(root, id="new-child", resume="allow", parent_run_id=parent.run_id) as child:
+        meta = RunReader(root, child.run_id).meta()
+        assert child.task == meta["task"] == meta["lineage"]["task"] == "a"
+        assert meta["task_source"] == "parent"
+        assert meta["parent_run_id"] == parent.run_id
+
+
+@pytest.mark.parametrize("signal", ["find_repo_root", "main_file", "resolve_task"])
+def test_resume_resolution_failure_leaves_run_finished(project, tmp_path, monkeypatch, signal):
+    import importlib
+
+    run_module = importlib.import_module("agenticml.run")
+    root = tmp_path / "store"
+    with start(root, track_source=False) as first:
+        pass
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("resolution failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(run_module, signal, fail)
+        with pytest.raises(RuntimeError, match="resolution failed"):
+            start(root, id=first.run_id, resume="must", track_source=False,
+                  parent_run_id="missing")
+    assert RunReader(root, first.run_id).meta()["status"] == "finished"
+    with start(root, id=first.run_id, resume="must", track_source=False):
+        pass
+
+
+@pytest.mark.parametrize("stored_parent, requested_parent, warns", [
+    ("stored-parent", "new-parent", True),
+    ("stored-parent", "stored-parent", False),
+    ("stored-parent", None, False),
+    (None, "new-parent", True),
+    (None, None, False),
+])
+def test_resume_keeps_stored_parent(project, tmp_path, caplog, stored_parent, requested_parent, warns):
+    root = tmp_path / "store"
+    with start(root, parent_run_id=stored_parent) as first:
+        pass
+    caplog.clear()
+    with start(root, id=first.run_id, resume="must", parent_run_id=requested_parent) as resumed:
+        assert RunReader(root, resumed.run_id).meta()["parent_run_id"] == stored_parent
+    assert ("keeping it instead of parent_run_id=" in caplog.text) == warns
+    if warns:
+        assert f"resumed run has parent_run_id {stored_parent!r}" in caplog.text
+
+
+def test_legacy_parent_task_is_inherited(project, tmp_path):
+    root = tmp_path / "store"
+    writer = RunWriter.create(root, run_id="legacy-parent",
+                              meta={"project": "test", "name": "asr/train.py"})
+    writer.finish("finished")
+    parent_meta = RunReader(root, "legacy-parent").meta()
+    assert "task" not in parent_meta
+    assert lineage.run_task(parent_meta) == ("asr", "legacy")
+    with start(root, parent_run_id="legacy-parent") as child:
+        meta = RunReader(root, child.run_id).meta()
+        assert child.task == meta["task"] == meta["lineage"]["task"] == "asr"
+        assert meta["task_source"] == "parent"
 
 
 def test_infer_parent_strict_time_and_project_fallback(project, tmp_path):
