@@ -4,21 +4,6 @@ Unfinished work, highest priority first. See [AGENTS.md](AGENTS.md) for how
 these are prioritized. When a task is done, delete its entry in the same
 change that finishes it.
 
-## Busy dashboard connections can still fill every handler slot
-
-- **Where:** `src/agenticml/ui/server.py` (`DashboardServer.process_request`,
-  `_MAX_CONNECTIONS`).
-- **Problem:** the connection cap evicts only connections still waiting for
-  headers. A client that sends complete headers and then stalls (a slow note
-  PUT body for up to 15 s, or not reading a response for up to the 60 s socket
-  timeout) holds a "busy" slot. Enough of them, re-opened as they expire, make
-  every new request get a 503.
-- **Fix:** bound "busy" time too, e.g. a total per-request deadline for the
-  response write, a lower cap on concurrent PUT bodies, or a per-client-address
-  share of the slots.
-- **Done when:** a test fills every slot with stalled PUT bodies or non-reading
-  clients and a normal GET still answers within a few seconds.
-
 ## Send `task` and `arch` when syncing a run
 
 - **Where:** `src/agenticml/sync.py` (`CONFIG_FIELDS` and the `/init` payload).
