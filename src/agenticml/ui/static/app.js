@@ -137,8 +137,14 @@ function showError(node, error) {
   if (current?.textContent === message) return;
   node.replaceChildren(el("p", { class: "error", role: "alert", text: message }));
 }
-const loading = (text) =>
-  el("p", { class: "muted", role: "status", "aria-live": "polite", text });
+const LOADING_ANNOUNCE_DELAY = 50;
+const loading = (text) => {
+  const node = el("p", { class: "muted", role: "status", "aria-live": "polite" });
+  setTimeout(() => {
+    node.textContent = text;
+  }, LOADING_ANNOUNCE_DELAY);
+  return node;
+};
 const pollStatusNode = () =>
   el("span", {
     class: "poll-status",
@@ -1185,6 +1191,7 @@ async function home(version) {
   }
   function ensureLineage(key, signature, card, running) {
     const now = Date.now();
+    const scroll = card.querySelector(".lineage-scroll");
     let entry = lineageCache.get(key);
     const same = entry && entry.signature === signature;
     const due =
@@ -1195,10 +1202,8 @@ async function home(version) {
     if (same && !due && !entry.error) {
       entry.card = card;
       if (entry.data) paintLineage(card, entry.data);
-      else if (!card.querySelector(".lineage-graph"))
-        card
-          .querySelector(".lineage-scroll")
-          .replaceChildren(loading("Loading lineage…"));
+      else if (scroll && !scroll.querySelector(".lineage-graph, [role=status]"))
+        scroll.replaceChildren(loading("Loading lineage…"));
       return;
     }
     const token = ++lineageToken;
@@ -1213,10 +1218,9 @@ async function home(version) {
       fetchedAt: now,
     };
     lineageCache.set(key, entry);
-    const scroll = card.querySelector(".lineage-scroll");
     if (scroll && !scroll.querySelector(".lineage-graph")) {
       if (kept) paintLineage(card, kept);
-      else
+      else if (!scroll.querySelector("[role=status]"))
         scroll.replaceChildren(loading("Loading lineage…"));
     }
     get(`/api/lineage?${new URLSearchParams({ project: key })}`)

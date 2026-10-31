@@ -49,6 +49,10 @@ _CHUNK = 64 * 1024
 _CONNECTION_TIMEOUT = 60
 _MAX_CONNECTIONS = 64
 _HEADER_DEADLINE = 10.0
+# A client that never reads blocks in sendall. When every slot is taken, a
+# write blocked at least this long is dropped so a new request can run.
+# Below capacity a slow download is left alone.
+_WRITE_STALL = 2.0
 _DISCONNECT = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
 _LINEAGE_FILES = 500
 _CODE_DIFF_MAX_BYTES = 1024 * 1024
@@ -70,6 +74,9 @@ _PROJECT_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,80}$")
 _INFERENCE_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 # Larger than a note so a normal JSON body fits, small enough to bound a PUT.
 _NOTE_PUT_MAX = 512 * 1024
+# Note bodies are not evicted: cutting one off would drop an in-flight PUT.
+# Cap how many can be read at once so they cannot occupy every handler slot.
+_MAX_NOTE_PUTS = 4
 # Absolute cap for receiving a note body. The socket timeout is per-read
 # inactivity, so a client that keeps the stream moving would otherwise hold
 # the handler forever. Past this deadline the PUT is 408 and is not written.
@@ -952,6 +959,9 @@ class DashboardServer(ThreadingHTTPServer):
         self.code_diffs = OrderedDict()
         self.code_diff_lock = threading.Lock()
         self.connections = OrderedDict()
+        # Start time of the sendall currently blocking each "writing" socket.
+        # Kept off ``connections`` so that map stays plain state strings.
+        self.write_started = {}
         self.connection_lock = threading.Lock()
         super().__init__((host, port), DashboardHandler)
 
@@ -972,9 +982,26 @@ class DashboardServer(ThreadingHTTPServer):
             if len(self.connections) >= _MAX_CONNECTIONS:
                 oldest = next((conn for conn, state in self.connections.items()
                                if state == "headers"), None)
+                if oldest is None:
+                    # No header waiter. Drop the oldest sendall that has
+                    # already stalled. Busy work and note bodies stay: one is
+                    # server-side progress, the other must not be cut off.
+                    now = time.monotonic()
+                    stall = _WRITE_STALL
+                    started_at = None
+                    for conn, state in self.connections.items():
+                        if state != "writing":
+                            continue
+                        started = self.write_started.get(conn)
+                        if started is None or now - started < stall:
+                            continue
+                        if started_at is None or started < started_at:
+                            oldest = conn
+                            started_at = started
                 if oldest is not None:
-                    # Wake its reader without waiting for the handler to exit.
-                    self.connections.pop(oldest)
+                    # Free the slot now. Waiting for the handler thread would
+                    # leave the server full. shutdown unblocks its read or send.
+                    self._pop_connection(oldest)
                     try:
                         oldest.shutdown(socket.SHUT_RDWR)
                     except OSError:
@@ -1002,7 +1029,7 @@ class DashboardServer(ThreadingHTTPServer):
             super().process_request(request, client_address)
         except Exception:
             with self.connection_lock:
-                self.connections.pop(request, None)
+                self._pop_connection(request)
             raise
 
     def process_request_thread(self, request, client_address):
@@ -1011,15 +1038,41 @@ class DashboardServer(ThreadingHTTPServer):
         finally:
             # The superclass has already called shutdown_request.
             with self.connection_lock:
-                self.connections.pop(request, None)
+                self._pop_connection(request)
+
+    def _pop_connection(self, request):
+        """Drop a handler slot. Caller holds ``connection_lock``."""
+        self.connections.pop(request, None)
+        self.write_started.pop(request, None)
 
     def _set_connection_state(self, request, state):
         with self.connection_lock:
             if request not in self.connections:
-                return False  # Evicted while finishing its headers.
+                return False  # Evicted; the handler must stop.
             self.connections[request] = state
             if state == "headers":
                 self.connections.move_to_end(request)
+            if state == "writing":
+                self.write_started[request] = time.monotonic()
+            else:
+                self.write_started.pop(request, None)
+            return True
+
+    def _admit_note_body(self, request):
+        """Enter the non-evictable "body" state, or return False if the cap is full.
+
+        A stalled note body holds its handler until the put deadline. Those
+        handlers are never evicted, so the cap leaves a slot for a normal request.
+        """
+        limit = min(_MAX_NOTE_PUTS, max(1, _MAX_CONNECTIONS - 1))
+        with self.connection_lock:
+            if request not in self.connections:
+                return False
+            active = sum(state == "body" for state in self.connections.values())
+            if active >= limit:
+                return False
+            self.connections[request] = "body"
+            self.write_started.pop(request, None)
             return True
 
     @contextmanager
@@ -1137,10 +1190,35 @@ class DashboardHandler(BaseHTTPRequestHandler):
             finally:
                 super().close()
 
+    class _ResponseWriter:
+        """Time each sendall so a full server can drop one that is not moving.
+
+        ``connections`` stays a plain state string. The start time lives in
+        ``write_started`` and is cleared when the write finishes or the slot
+        is dropped. An evicted socket must not keep sending.
+        """
+
+        def __init__(self, handler, raw):
+            self.handler = handler
+            self.raw = raw
+
+        def write(self, b):
+            server = self.handler.server
+            if not server._set_connection_state(self.handler.connection, "writing"):
+                raise BrokenPipeError("connection evicted")
+            try:
+                return self.raw.write(b)
+            finally:
+                server._set_connection_state(self.handler.connection, "busy")
+
+        def __getattr__(self, name):
+            return getattr(self.raw, name)
+
     def setup(self):
         super().setup()
         self._header_deadline = None
         self.rfile = io.BufferedReader(self._HeaderReader(self, self.rfile.detach()))
+        self.wfile = self._ResponseWriter(self, self.wfile)
 
     def handle_one_request(self):
         if not self.server._set_connection_state(self.connection, "headers"):
@@ -1399,7 +1477,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
         length = self._put_length()
         if length is None:
             return
-        body = self._read_put_body(length)
+        # A declared length of 0 reads nothing, so it must not occupy a body
+        # slot or be turned away while that cap is full. Admit only before a
+        # real read. Bodies are not evicted, so the cap is what keeps a
+        # stalled PUT from answering every later request with 503.
+        if length == 0:
+            body = self._read_put_body(length)
+        else:
+            if not self.server._admit_note_body(self.connection):
+                self.close_connection = True
+                self._send(b"", "application/json", 503)
+                return
+            try:
+                body = self._read_put_body(length)
+            finally:
+                # The receive is done. "body" is only that non-evictable read.
+                self.server._set_connection_state(self.connection, "busy")
         if len(body) != length:
             self.close_connection = True
             raise ValueError("short body")
