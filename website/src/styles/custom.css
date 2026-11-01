@@ -69,3 +69,17 @@
 [data-has-hero] .hero h1 {
 	letter-spacing: -0.03em;
 }
+
+/* Collapsible section titles: keep the disclosure marker on the title's line,
+   sized from the heading so it matches the title. */
+.sl-markdown-content details > summary:has(> h2) {
+	font-size: var(--sl-text-h2);
+}
+
+.sl-markdown-content details > summary:has(> h2)::before {
+	--sl-details-marker-size: 1.6em;
+}
+
+.sl-markdown-content details > summary > h2 {
+	display: inline;
+}

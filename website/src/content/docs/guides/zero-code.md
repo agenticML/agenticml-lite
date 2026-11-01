@@ -73,3 +73,75 @@ A missing or unreadable parent is still recorded, with a warning. A parent in an
 ## Exit status
 
 A script that calls `agenticml.init()` joins the launcher's run. Exit code 0 finishes the run as `finished`; any other exit finishes it as `crashed`, with `_exit_code` and `_exception` in the summary. Your script's exit code is preserved, and SIGTERM finishes the run and exits 143.
+
+<details>
+<summary><h2>Advanced</h2></summary>
+
+### Multiple lineages in one working directory (tasks)
+
+A lineage is grouped by project and task. Runs with the same task form one lineage lane. Use a different task to start a separate lineage in the same directory.
+
+Set the task per run:
+
+```bash
+agenticml run --task alpha train.py
+AGENTICML_TASK=alpha agenticml run train.py
+```
+
+Or set it per directory with an `agenticml.toml` file:
+
+```toml
+task = "alpha"
+```
+
+agenticml reads the nearest `agenticml.toml` from the script's folder up to the repo root.
+
+Task precedence: `--task` > `AGENTICML_TASK` > the parent run's task > `agenticml.toml` `task` > the entry script's folder (relative to the repo root). A script at the repo root with no task signal goes into a "no task" lane.
+
+A task is trimmed, must be 1 to 128 characters, and cannot contain control characters. See [Lineage parent and task](#lineage-parent-and-task) for the full rules. Use `--allow-cross-task` only to silence the cross-task warning when the cross-task link is intended.
+
+`agenticml lineage ls` shows the lanes:
+
+```text
+proj
+  [beta]
+    20261101T172034-fe500858  train.py
+  [no task]
+    20261101T172033-df1b1ee7  train.py
+  [alpha]
+    20261101T172032-3a1a2f2a  train.py
+```
+
+### Spawning an experiment from a parent run
+
+By default, agenticml infers the parent: the latest earlier run in the same project and the same task. A run from the same repo root is preferred.
+
+To choose the parent yourself, pass `--parent RUN_ID` (or `--parent=RUN_ID`, or env `AGENTICML_PARENT`). The CLI flag wins over the env var. Find run ids with `agenticml lineage ls`.
+
+```bash
+agenticml run --task alpha --parent 20261101T172032-3a1a2f2a train.py
+```
+
+After two runs in task `alpha`, the second run's metadata records `parent_run_id` as the first run, with `parent_inference` set to `repo_root`. An explicit `--parent` records `parent_inference` as `explicit`.
+
+`--parent` applies to new runs only. See [Lineage parent and task](#lineage-parent-and-task) for the rest.
+
+### Checking out a run's code
+
+`agenticml lineage checkout RUN_ID` creates a separate, detached git worktree at the code snapshot that run captured. It does not switch the branch of your own working copy.
+
+```bash
+agenticml lineage checkout 20261101T172034-fe500858
+cd "$(agenticml lineage checkout 20261101T172034-fe500858)"
+```
+
+The command prints the path it created. The default location is `<store>/worktrees/<project key>/<RUN_ID>`. The store is `~/.agenticml` unless `--dir` or `AGENTICML_DIR` is set.
+
+- `--path DIR` chooses the location: `agenticml lineage checkout RUN_ID --path ./run-alpha`
+- `--dir DIR` sets the store root.
+- Running checkout again for the same run returns the same path and does not fail.
+- It fails if the destination exists and is not a checkout of that run.
+
+To compare two runs, `agenticml lineage diff RUN_A [RUN_B]` lists the files added, deleted or changed between them.
+
+</details>
