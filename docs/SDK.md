@@ -153,6 +153,14 @@ agenticml.finish()
 agenticml.init(project="sdk-test", name="first-run", id=run_id, resume="must")
 ```
 
+Under `agenticml run`:
+
+```bash
+agenticml run --id "$run_id" --resume must -- python try_sdk.py
+```
+
+`--id` requires `--resume allow` or `must`. If the run cannot be resumed (missing under `must`, open in another process, pruned by `sync --prune`, or missing `meta.json`), `agenticml run` prints an error and exits 2 without running the script.
+
 **Disable tracking** (every call becomes a no-op):
 
 ```bash
@@ -172,6 +180,13 @@ agenticml run --no-auto-track --no-capture-args -- python try_sdk.py   # switch 
 
 ```bash
 agenticml ls [--project P] [--json]       # list runs, newest first
+agenticml show RUN_ID [--json]            # show run details, config, metrics, artifacts
+agenticml export RUN_ID [--key K] [--format csv|json] [-o PATH]  # export raw series
+agenticml edit RUN_ID [--tag T] [--config K=V] [--summary K=V]  # update ended run
+agenticml artifact add RUN_ID PATH [--name N] [--copy]  # record artifact on ended run
+agenticml finish RUN_ID --status finished|crashed       # finalize dead run
+agenticml note RUN_ID [--set TEXT | --file PATH | --clear]  # local dashboard notepad
+agenticml run --id RUN_ID --resume must -- python train.py  # resume run
 agenticml ui [--port 6006] [--open] [--read-only]  # local dashboard
 agenticml lineage checkout RUN_ID [--path DIR]  # detached shadow worktree
 agenticml lineage diff RUN_ID [OTHER_RUN_ID]   # numstat vs other or parent
@@ -210,7 +225,7 @@ Format details are in [FORMAT.md](FORMAT.md). To reset after testing, `rm -rf "$
 - **`log` does nothing**: check `AGENTICML_MODE`. `disabled` silences everything.
 - **`Image` fails with numpy or PIL input**: `pip install "agenticml-lite[media]"`.
 - **No system metrics**: `pip install "agenticml-lite[system]"` (CPU/memory), `[gpu]` for NVIDIA.
-- **A run shows `running` after a crash**: it is marked `crashed` once its lock is released. `agenticml sync` finalizes it.
+- **A run shows `running` after a crash**: it is marked `crashed` once its lock is released. `agenticml sync` finalizes it, or finalize it directly with `agenticml finish RUN_ID --status crashed`.
 - **Multi-GPU**: only rank 0 logs. Launch as `torchrun ... -m agenticml run -- train.py`.
 - **Quick end-to-end sample**: `python examples/train_toy.py --explicit`.
 

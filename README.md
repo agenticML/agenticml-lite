@@ -79,7 +79,21 @@ Rules that apply to every form:
 - Only Python targets are supported. To track a shell script, call `agenticml run -- python ...` from inside it.
 - Multi-GPU: launch as `torchrun ... -m agenticml run -- train.py`. Only rank 0 logs.
 
-Options go before the script; everything after it is the script's own argv. See `agenticml run -h`. `--project`, `--name`, `--tags`, `--notes`, `--group`, `--job-type`, `--mode`, `--dir`, and `--log-every` read `AGENTICML_PROJECT`, `AGENTICML_NAME`, `AGENTICML_TAGS`, `AGENTICML_NOTES`, `AGENTICML_GROUP`, `AGENTICML_JOB_TYPE`, `AGENTICML_MODE`, `AGENTICML_DIR`, and `AGENTICML_LOG_EVERY`. The off switches are in the table. `--verbose` has no variable.
+Options go before the script; everything after it is the script's own argv. See `agenticml run -h`. A CLI flag overrides its environment variable; a blank environment variable counts as unset. Repeatable flags replace (rather than extend) any environment variable list. There is no positive override flag: once a feature is disabled via its environment variable (such as `AGENTICML_SYSTEM_METRICS=0` or `AGENTICML_ALL_RANKS=1`), the CLI cannot re-enable it; unset the variable instead.
+
+`--project`, `--name`, `--tags`, `--notes`, `--group`, `--job-type`, `--mode`, `--dir`, and `--log-every` read `AGENTICML_PROJECT`, `AGENTICML_NAME`, `AGENTICML_TAGS`, `AGENTICML_NOTES`, `AGENTICML_GROUP`, `AGENTICML_JOB_TYPE`, `AGENTICML_MODE`, `AGENTICML_DIR`, and `AGENTICML_LOG_EVERY`. `--verbose` has no variable. `--all-ranks` (`AGENTICML_ALL_RANKS=1`) tracks every distributed rank instead of rank 0 only. `--flush-interval` (`AGENTICML_FLUSH_INTERVAL`, default 2 s) sets the background flush interval.
+
+`--config KEY=VALUE` (repeatable) passes explicit config values. `VALUE` parses as JSON when possible (`lr=1e-3` -> 0.001, `amp=true` -> true, `layers=[64,64]` -> list), else stays a string (`opt=adam`); quote to force a string (`--config 'tag="1e-3"'`). `NaN` and `Infinity` are rejected (exit 2). Later occurrences of a key win. `--config-file PATH` (`AGENTICML_CONFIG_FILE`) reads config from a JSON file with a top-level object. Merge precedence: config file < `--config` pairs < the script's own `init(config=...)`. These explicit keys are never overwritten by `argparse` or Hydra. Example:
+```bash
+agenticml run --config lr=1e-3 --config amp=true --config-file base.json -- python train.py
+```
+
+`--id RUN_ID` (`AGENTICML_RUN_ID`) and `--resume MODE` (`AGENTICML_RESUME`: `never`, `allow`, `must`) resume or name a run. `--id` requires `--resume allow` or `must`, and `--resume allow` or `must` requires `--id` (exit 2 otherwise). `must` requires the run to exist; `allow` resumes or creates it. A resumed run keeps its stored project, name, task, and parent (a differing `--parent` warns). Steps continue from the last stored step, and new config values merge over stored config. If the run cannot be resumed (missing under `must`, open in another process, pruned by `sync --prune`, or missing `meta.json`), `agenticml run` prints an error and exits 2 without running the script. An in-script `init(id=..., resume=...)` is ignored with a warning under `agenticml run`. Example:
+```bash
+agenticml run --id 20261101T130355-1cded4a7 --resume must -- python train.py
+```
+
+Code and environment capture switches: `--no-code` (`AGENTICML_TRACK_CODE=0`) disables source code tracking (`track_source=False`). `--track-file PATH` (repeatable; env `AGENTICML_TRACK_FILES`, path-separated) tracks additional source files. `--source-root DIR` (repeatable; env `AGENTICML_SOURCE_ROOTS`, path-separated) adds source directories. `--max-file-bytes N` (`AGENTICML_MAX_FILE_BYTES`, default 10 MiB) and `--max-total-bytes N` (`AGENTICML_MAX_TOTAL_BYTES`, default 100 MiB) cap snapshot sizes. `--no-lineage` (`AGENTICML_LINEAGE=0`) turns off shadow-Git lineage snapshots. `--no-env` (`AGENTICML_CAPTURE_ENV=0`) disables environment metadata. `--no-system-metrics` (`AGENTICML_SYSTEM_METRICS=0`) turns off CPU/GPU/memory sampling, and `--system-metrics-interval S` (`AGENTICML_SYSTEM_METRICS_INTERVAL`, default 10 s) sets the sample interval. Defaults differ between the SDK and CLI: `auto_metrics` and `sync_tensorboard` are off by default in `agenticml.init()` and on under `agenticml run` (disable with `--no-auto-metrics`, `--no-tensorboard`).
 
 `--task` sets the run's task and overrides `AGENTICML_TASK`, the parent's task, an `agenticml.toml` `task`, and the entry script's folder (see [docs/SDK.md](docs/SDK.md)). With an explicit parent that is readable, in the same project, and has a task, a differing `--task` or valid `AGENTICML_TASK` logs a warning that the lineage link crosses tasks. `--allow-cross-task` or `AGENTICML_ALLOW_CROSS_TASK=1` silences it.
 
@@ -88,11 +102,11 @@ Options go before the script; everything after it is the script's own argv. See 
 | What | Where it comes from | Turn off |
 | --- | --- | --- |
 | Config | `argparse` parses of `sys.argv`, and `@hydra.main` | `--no-capture-args` (`AGENTICML_CAPTURE_ARGS=0`) |
-| Code snapshot | imported project modules and files opened for reading | always on under `agenticml run` (`track_source=False` on `Run`) |
+| Code snapshot | imported project modules and files opened for reading | `--no-code` (`AGENTICML_TRACK_CODE=0`; `track_source=False` on `Run`) |
 | Model, optimizer, loss, dataloader | PyTorch construction hooks | `--no-auto-track` (`AGENTICML_AUTO_TRACK=0`) |
 | `auto/loss`, `auto/lr`, `auto/epoch` | `backward()` and `optimizer.step()` | `--no-auto-metrics` (`AGENTICML_AUTO_METRICS=0`); `--log-every N` |
 | TensorBoard | `SummaryWriter` / `tensorboardX` (scalars, images, figures, hparams) | `--no-tensorboard` (`AGENTICML_SYNC_TENSORBOARD=0`) |
-| System metrics | psutil, plus pynvml when installed | always requested under `agenticml run` (needs the `system` extra) |
+| System metrics | psutil, plus pynvml when installed | `--no-system-metrics` (`AGENTICML_SYSTEM_METRICS=0`; `--system-metrics-interval S`) |
 
 Loss is unscaled under `GradScaler` and averaged over gradient-accumulation steps. Several optimizers are prefixed (`auto/<name>/loss`, `auto/<name>/lr`); `auto/epoch` stays unprefixed. TensorBoard event files are still written. Keys passed to `init(config=...)` win over captured hyperparameters.
 
@@ -105,14 +119,38 @@ The zero-code toy example captures config, code and system information, but no t
 ```bash
 agenticml ui          # http://127.0.0.1:6006
 agenticml ls          # newest first
+agenticml ls --project demo --json
+agenticml show RUN_ID
+agenticml show RUN_ID --json
+agenticml export RUN_ID --format csv -o metrics.csv
+agenticml export RUN_ID --key loss --key acc --format json
 agenticml ui --open --port 6006 --host 127.0.0.1
 agenticml ui --read-only
-agenticml ls --project demo --json
 ```
 
 `agenticml ui` binds to `127.0.0.1` and port 6006. On loopback it answers only loopback `Host` headers. `--dir` selects the store (else `AGENTICML_DIR`, else `~/.agenticml`). `ls` prints run id, project, name, status, created time, and last step. A run stays `running` while its lifetime lock is held, even when it logs infrequently. If the lock is free, it is shown as `crashed`; sync finalizes it with `_exit_reason: "process died"`. On filesystems without locking, mtimes older than 120 seconds are the fallback for `stale` status.
 
+`agenticml show` displays run metadata (run, project, name, status, task, created, parent, and tags/group/job type/notes when set), config (internal keys starting with `_` hidden), summary, metrics table (KEY, LAST, STEP, POINTS), artifacts table (NAME, TYPE, VERSION, SIZE, PATH), and media item counts. `--json` outputs a strict JSON object (non-finite values become `null`). LAST/STEP reflect the last record written; for series pruned by `sync --prune`, they are the largest step and last finite value from the overview. Missing runs or corrupt metadata print one line to stderr and exit 1.
+
+`agenticml export` exports full raw metric series. Default output is CSV (`key,step,value` in file order, float32 formatted exactly, non-finite values as `nan`, `inf`, `-inf`). `--format json` outputs `{"run_id": ..., "series": {key: [[step, value], ...]}}` with non-finite values as `null`. Filter series with repeatable `--key K`. `-o PATH` writes to a file instead of stdout. Unknown keys fail before writing (exit 1). Series pruned by `sync --prune` are skipped with a warning; if all selected series were pruned, it exits 1.
+
 Every run page has an autosaving Markdown notepad, and view mode allows ticking checklist items directly. The home page includes a collapsible Notes notebook that shows each run's note grouped under the run name, following the project tab and filter box. The dashboard is read-only except for notes; `--read-only` disables note editing (recommended when exposing a non-loopback `--host`). A run's launch note (`--notes` / `init(notes=)`) is shown until the notepad is edited.
+
+## Editing ended runs
+
+Ended runs can be modified from the CLI. `edit`, `artifact add`, and `finish` refuse live runs whose lock is held (exit 1). They never mark a run running and never refresh its heartbeat. Changes are uploaded by the next `agenticml sync` (including for already-synced runs). Runs pruned by `sync --prune` cannot be edited.
+
+```bash
+agenticml edit RUN_ID --tag best --summary test_acc=0.913 --group sweep-3
+agenticml artifact add RUN_ID model.pt --name checkpoint --copy
+agenticml finish RUN_ID --status crashed
+agenticml note RUN_ID --set "Checked checkpoint at step 10k"
+```
+
+- `agenticml edit RUN_ID`: updates run metadata. `--tag T` and `--untag T` are repeatable (add if absent / remove every occurrence). `--notes TEXT` sets the launch note (`""` clears it). `--group NAME` and `--job-type NAME` set group and job type (cannot be cleared). `--config KEY=VALUE` and `--summary KEY=VALUE` merge values using the same JSON/string parsing rules as `run --config`. `--unset-summary KEY` removes a summary key. Project, name, task, parent, and id cannot be changed.
+- `agenticml artifact add RUN_ID PATH`: records an artifact on an ended run (`--name` defaults to file stem, `--type` defaults to `file`, `--metadata` accepts a JSON object). `--copy` stores bytes in `objects/`; otherwise only path, size, and mtime are recorded. Version increments per name.
+- `agenticml finish RUN_ID --status finished|crashed`: sets the final status of a run left `running`, `stale`, or `crashed` (or switches between finished and crashed), keeping its summary and writing overviews and `finished_at`. If already that status, prints a message and exits 0.
+- `agenticml note RUN_ID`: reads or writes the local Markdown notepad (`runs/<id>/notes.md`) using `--set TEXT`, `--file PATH` (`-` for stdin), or `--clear`. The notepad is not synced to the server. Works even while the run is live. Without options, prints the note (or the launch note if no notepad exists). Note that `note` operates on the local dashboard notepad, whereas `edit --notes` updates the synced launch note.
 
 ## Where data lives
 
@@ -202,7 +240,7 @@ The disk row is ten series of 10,000 points. Each series is under 65,536 points,
 
 ## Distributed, resume, disabled
 
-Rank 0 logs. `init(only_main_process=True)` (the default) gives every other rank a no-op run, using `RANK`, `PMI_RANK`, `OMPI_COMM_WORLD_RANK`, `SLURM_PROCID`, then `LOCAL_RANK`. Put the tracker inside the launcher so every rank runs the script:
+Rank 0 logs. `init(only_main_process=True)` (the default) gives every other rank a no-op run, using `RANK`, `PMI_RANK`, `OMPI_COMM_WORLD_RANK`, `SLURM_PROCID`, then `LOCAL_RANK`. Pass `--all-ranks` or set `AGENTICML_ALL_RANKS=1` to track every distributed rank instead (`only_main_process=False` in Python). Put the tracker inside the launcher so every rank runs the script:
 
 ```bash
 torchrun --nproc_per_node 4 -m agenticml run -- train.py
@@ -213,6 +251,14 @@ Resume with the same id. `resume="must"` errors if it is missing; `resume="allow
 ```python
 agenticml.init(project="demo", name="exp1", id=run_id, resume="allow")
 ```
+
+Under `agenticml run`, use `--id` and `--resume`:
+
+```bash
+agenticml run --id 20261101T130355-1cded4a7 --resume must -- python train.py
+```
+
+`--id` requires `--resume allow` or `must` (env `AGENTICML_RUN_ID` and `AGENTICML_RESUME`). A resumed run retains its stored project, name, task, and parent (a differing `--parent` warns). If the run cannot be resumed (missing under `must`, open in another process, pruned by `sync --prune`, or missing `meta.json`), `agenticml run` prints an error and exits 2 without running the script.
 
 `mode="disabled"` or `AGENTICML_MODE=disabled` makes `log`, `finish`, artifacts, and the `track_*` helpers no-ops. With `verbose=True`, init prints `agenticml: tracking disabled`.
 

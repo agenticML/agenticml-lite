@@ -35,6 +35,8 @@ Sync is incremental and resumable. A cursor in `runs/<id>/sync.json` records wha
 - `--dry-run` prints counts without sending anything.
 - `--reset` forgets the remote copy of the given runs on this host.
 
+Edits made to ended runs with `agenticml edit`, `agenticml artifact add`, or `agenticml finish` are uploaded on the next sync, including for runs already synced. Runs pruned by `sync --prune` cannot be edited.
+
 ## What is uploaded
 
 Project, name, config, tags, notes, group, job type, environment, git info, the parent run, scalar points, code files, media, artifacts, and the final summary and status.

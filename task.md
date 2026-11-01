@@ -18,27 +18,6 @@ change that finishes it.
   hold a connection slot past the existing deadlines.
 - **Done when:** `pytest -q tests` passes repeatedly on macOS and in CI.
 
-## Document the new CLI options and commands
-
-- **Where:** `docs/SDK.md` (CLI cheat sheet, "Resume a run"), `README.md`,
-  and the docs site under `website/`.
-- **Problem:** `agenticml run` gained `--id`/`--resume`, `--config`,
-  `--config-file`, `--no-system-metrics`, `--system-metrics-interval`,
-  `--no-lineage`, `--no-code`, `--no-env`, `--track-file`, `--source-root`,
-  `--max-file-bytes`, `--max-total-bytes`, `--flush-interval`, `--all-ranks`
-  and their env vars, and there are new `agenticml show` and
-  `agenticml export` commands. Only `RUN_USAGE` and `--help` describe them.
-- **Fix:** document each option and env var. Say that there is no
-  positive override flag: once `AGENTICML_SYSTEM_METRICS=0` or
-  `AGENTICML_ALL_RANKS=1` is set, the CLI cannot turn it back. Also say that
-  `--id` aborts the launch (exit 2, script not run) when the run cannot be
-  resumed, and that the SDK and CLI defaults for `auto_metrics` and
-  `sync_tensorboard` differ. For `show`, LAST/STEP come from the last
-  record written, except for series pruned by `sync --prune`, where they are
-  the largest step and the last finite value.
-- **Done when:** the docs list every option in `RUN_USAGE`, plus `show` and
-  `export`, and the docs site builds.
-
 ## Send `task` and `arch` when syncing a run
 
 - **Where:** `src/agenticml/sync.py` (`CONFIG_FIELDS` and the `/init` payload).
