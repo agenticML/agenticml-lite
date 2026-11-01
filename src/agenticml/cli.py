@@ -8,6 +8,7 @@ agenticml code in the script:
     python -m agenticml run train.py
     torchrun --nproc_per_node 4 -m agenticml run train.py
 
+`agenticml show` inspects a local run; `agenticml export` dumps its metric series.
 `agenticml sync` incrementally uploads local runs to a server.
 """
 
@@ -71,6 +72,81 @@ def _table_cell(value, *, missing=""):
     return str(value)
 
 
+def _json_safe(value):
+    """Replace non-finite floats with None so JSON never emits NaN/Infinity."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def _print_table(rows, *, indent=""):
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    for row in rows:
+        line = "  ".join(value.ljust(width) for value, width in zip(row, widths)).rstrip()
+        print(f"{indent}{line}" if indent else line)
+
+
+def _open_run_reader(root, run_id, command):
+    from .store import RunReader
+
+    try:
+        reader = RunReader(root, run_id)
+        return reader, reader.meta()
+    except FileNotFoundError:
+        print(f"agenticml {command}: no run {run_id!r} in {root}", file=sys.stderr)
+        return None, None
+    except (OSError, ValueError) as exc:
+        print(f"agenticml {command}: {exc}", file=sys.stderr)
+        return None, None
+
+
+def _series_snapshot(reader, key):
+    snap = reader.tail(key)
+    if snap is not None:
+        return snap
+    # Fallback: largest step and last finite value (pruned/overview-only series).
+    result = reader.series(key, max_points=1)
+    points = result.get("points") or []
+    count = result.get("total")
+    if not points:
+        return {"last_step": None, "last": None, "count": count}
+    point = points[0]
+    mode = result.get("mode")
+    if mode == "raw" and len(point) >= 2:
+        return {"last_step": point[0], "last": point[1], "count": count}
+    if mode == "overview" and len(point) >= 6:
+        return {"last_step": point[1], "last": point[5], "count": count}
+    return {"last_step": None, "last": None, "count": count}
+
+
+def _format_metric_last(value):
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        return format(value, ".6g")
+    return str(value)
+
+
+def _truncate_cli(text, limit=200):
+    if len(text) > limit:
+        return text[:limit] + "…"
+    return text
+
+
+def _artifact_path(event):
+    path = event.get("path")
+    if path:
+        return str(path)
+    sha = event.get("sha256")
+    if event.get("copy") and isinstance(sha, str) and sha:
+        return sha[:12]
+    return "-"
+
+
 def cmd_ls(args):
     import json
     from datetime import datetime
@@ -108,6 +184,254 @@ def cmd_ls(args):
     for row in rows:
         print("  ".join(value.ljust(width) for value, width in zip(row, widths)).rstrip())
     print(f"{len(runs)} run{'s' if len(runs) != 1 else ''}")
+    return 0
+
+
+def cmd_show(args):
+    import time
+    from datetime import datetime
+    from . import lineage
+    from .store.gc import _format_bytes
+    from .store.layout import resolve_root
+    from .store.reader import _effective_status
+
+    root = resolve_root(args.dir)
+    reader, meta = _open_run_reader(root, args.run_id, "show")
+    if reader is None:
+        return 1
+
+    try:
+        status = _effective_status(
+            meta, str(reader._meta_path), str(reader.run_dir), time.time(),
+        )
+        task, task_source = lineage.run_task(meta)
+        lin = meta.get("lineage")
+        parent = meta.get("parent_run_id") or (lin.get("parent_run_id") if isinstance(lin, dict) else None)
+        metrics = {}
+        for key in reader.keys():
+            try:
+                metrics[key] = _series_snapshot(reader, key)
+            except (OSError, ValueError, KeyError):
+                metrics[key] = None
+        artifacts = reader.artifacts()
+        media = reader.media()
+        media_counts = {name: len(rows) for name, rows in media.items()}
+    except (OSError, ValueError, KeyError, AttributeError, TypeError) as exc:
+        print(f"agenticml show: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        payload = {
+            "run_id": reader.run_id,
+            "meta": meta,
+            "effective_status": status,
+            "task": task,
+            "task_source": task_source,
+            "metrics": metrics,
+            "artifacts": artifacts,
+            "media": media_counts,
+        }
+        try:
+            print(json.dumps(
+                _json_safe(payload), indent=2, ensure_ascii=False, default=str, allow_nan=False,
+            ))
+        except RecursionError as exc:
+            print(f"agenticml show: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
+    created = meta.get("created_at") or ""
+    try:
+        created = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+        created = created.astimezone().strftime("%Y-%m-%d %H:%M")
+    except (ValueError, TypeError):
+        created = "-"
+    if task:
+        task_text = f"{task} ({task_source})" if task_source else task
+    else:
+        task_text = "-"
+
+    fields = [
+        ("run", reader.run_id),
+        ("project", _table_cell(meta.get("project"))),
+        ("name", _table_cell(meta.get("name"), missing="-")),
+        ("status", _table_cell(status, missing="-")),
+        ("task", task_text),
+        ("created", created),
+        ("parent", _table_cell(parent, missing="-")),
+    ]
+    tags = meta.get("tags")
+    if isinstance(tags, list) and tags:
+        fields.append(("tags", ", ".join(_table_cell(tag) for tag in tags)))
+    group = meta.get("group")
+    if group not in (None, ""):
+        fields.append(("group", str(group)))
+    job_type = meta.get("job_type")
+    if job_type not in (None, ""):
+        fields.append(("job type", str(job_type)))
+    notes = meta.get("notes")
+    if notes not in (None, ""):
+        lines = str(notes).splitlines()
+        shown = lines[0] if lines else ""
+        if len(lines) > 1:
+            shown += " …"
+        fields.append(("notes", shown))
+    label_width = max(len(label) for label, _ in fields)
+    for label, value in fields:
+        print(f"{label.ljust(label_width)}  {value}")
+
+    config = meta.get("config")
+    config_items = []
+    if isinstance(config, dict):
+        config_items = [
+            (key, config[key]) for key in sorted(config)
+            if not (isinstance(key, str) and key.startswith("_"))
+        ]
+    summary = meta.get("summary")
+    summary_items = []
+    if isinstance(summary, dict):
+        summary_items = [(key, summary[key]) for key in sorted(summary, key=str)]
+
+    has_config = bool(config_items)
+    has_summary = bool(summary_items)
+    has_metrics = bool(metrics)
+    has_artifacts = bool(artifacts)
+    has_media = bool(media_counts)
+    if has_config or has_summary or has_metrics or has_artifacts or has_media:
+        print()
+
+    if has_config:
+        print("config")
+        for key, value in config_items:
+            rendered = _truncate_cli(json.dumps(value, ensure_ascii=False, default=str))
+            print(f"  {key} = {rendered}")
+    if has_summary:
+        print("summary")
+        for key, value in summary_items:
+            rendered = _truncate_cli(json.dumps(value, ensure_ascii=False, default=str))
+            print(f"  {key} = {rendered}")
+    if (has_config or has_summary) and (has_metrics or has_artifacts or has_media):
+        print()
+
+    if has_metrics:
+        print(f"metrics ({len(metrics)})")
+        rows = [["KEY", "LAST", "STEP", "POINTS"]]
+        for key, snap in metrics.items():
+            if snap is None:
+                rows.append([key, "?", "?", "?"])
+                continue
+            last_step = snap.get("last_step")
+            rows.append([
+                key,
+                _format_metric_last(snap.get("last")),
+                "-" if last_step is None else str(last_step),
+                "-" if snap.get("count") is None else str(snap.get("count")),
+            ])
+        _print_table(rows, indent="  ")
+    if has_artifacts:
+        print(f"artifacts ({len(artifacts)})")
+        rows = [["NAME", "TYPE", "VERSION", "SIZE", "PATH"]]
+        for event in artifacts:
+            size = event.get("size")
+            rows.append([
+                _table_cell(event.get("name")),
+                _table_cell(event.get("type")),
+                _table_cell(event.get("version"), missing="-"),
+                _format_bytes(size) if isinstance(size, (int, float)) and not isinstance(size, bool) else "-",
+                _artifact_path(event),
+            ])
+        _print_table(rows, indent="  ")
+    if has_media:
+        print(f"media ({len(media_counts)})")
+        rows = [[key, f"{count} item(s)"] for key, count in media_counts.items()]
+        _print_table(rows, indent="  ")
+    return 0
+
+
+def cmd_export(args):
+    import csv
+    from .store.layout import resolve_root
+
+    root = resolve_root(args.dir)
+    reader, _meta = _open_run_reader(root, args.run_id, "export")
+    if reader is None:
+        return 1
+
+    try:
+        available = reader.keys()
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"agenticml export: {exc}", file=sys.stderr)
+        return 1
+
+    selected = list(args.key) if args.key else list(available)
+    have = set(available)
+    for key in selected:
+        if key not in have:
+            print(f"agenticml export: run {args.run_id} has no metric {key!r}", file=sys.stderr)
+            return 1
+
+    series = {}
+    for key in selected:
+        try:
+            records, _offset = reader.read_records(key)
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"agenticml export: {exc}", file=sys.stderr)
+            return 1
+        if not records:
+            try:
+                total = reader.series(key, max_points=1).get("total") or 0
+            except (OSError, ValueError, KeyError):
+                total = 0
+            if total > 0:
+                print(
+                    f"agenticml export: {key}: raw points were pruned by sync --prune; skipped",
+                    file=sys.stderr,
+                )
+                continue
+        series[key] = records
+
+    if selected and not series:
+        return 1
+
+    handle = None
+    try:
+        if args.output is not None:
+            dest = os.fspath(args.output)
+            kwargs = {"encoding": "utf-8"}
+            if args.format == "csv":
+                kwargs["newline"] = ""
+            handle = open(dest, "w", **kwargs)
+            out = handle
+        else:
+            out = sys.stdout
+        if args.format == "json":
+            payload = {
+                "run_id": reader.run_id,
+                "series": {
+                    key: [[step, value] for step, value in points]
+                    for key, points in series.items()
+                },
+            }
+            print(json.dumps(
+                _json_safe(payload), indent=2, ensure_ascii=False, default=str, allow_nan=False,
+            ), file=out)
+        else:
+            writer = csv.writer(out, lineterminator="\n")
+            writer.writerow(["key", "step", "value"])
+            for key, points in series.items():
+                for step, value in points:
+                    writer.writerow([
+                        key, step, repr(value) if isinstance(value, float) else value,
+                    ])
+    except (OSError, ValueError, RecursionError) as exc:
+        print(f"agenticml export: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
     return 0
 
 
@@ -637,6 +961,23 @@ def main(argv=None):
     p_ls.add_argument("--project", default=None, help="Filter by project")
     p_ls.add_argument("--json", action="store_true", help="Print run metadata as JSON")
     p_ls.set_defaults(func=cmd_ls)
+
+    p_show = sub.add_parser("show", help="Show one local run")
+    p_show.add_argument("run_id")
+    p_show.add_argument("--dir", default=None, help="Local root (default: AGENTICML_DIR or ~/.agenticml)")
+    p_show.add_argument("--json", action="store_true", help="Print run details as JSON")
+    p_show.set_defaults(func=cmd_show)
+
+    p_export = sub.add_parser("export", help="Export a run's metric series")
+    p_export.add_argument("run_id")
+    p_export.add_argument("--dir", default=None, help="Local root (default: AGENTICML_DIR or ~/.agenticml)")
+    p_export.add_argument("--key", action="append", default=None, metavar="K",
+                          help="Metric key; repeatable (default: all)")
+    p_export.add_argument("--format", choices=["csv", "json"], default="csv",
+                          help="Output format (default: csv)")
+    p_export.add_argument("-o", "--output", default=None, metavar="PATH",
+                          help="Write to PATH instead of stdout")
+    p_export.set_defaults(func=cmd_export)
 
     p_lineage = sub.add_parser("lineage", help="Inspect run code snapshots")
     p_lineage.add_argument("--dir", default=None, help="Local store root")

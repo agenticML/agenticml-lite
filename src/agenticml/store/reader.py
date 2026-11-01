@@ -553,6 +553,30 @@ class RunReader:
         path = self._c(self.run_dir / SCALARS_DIRNAME / TIME_BIN_NAME)
         return _last_complete_step(path)
 
+    def tail(self, key: str) -> dict | None:
+        """Last complete ``.bin`` record for ``key``, or None if missing or empty."""
+        info = self._series_info(key)
+        path = self._bin_path(_series_id(info))
+        size = _file_size(path)
+        complete = size - (size % RECORD_SIZE)
+        if complete < RECORD_SIZE:
+            return None
+        try:
+            with open_nofollow(path) as handle:
+                handle.seek(complete - RECORD_SIZE)
+                data = handle.read(RECORD_SIZE)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            if is_symlink_error(exc) or path.is_symlink():
+                logger.warning("refusing symlinked series file: %s", path)
+                return None
+            raise
+        if len(data) != RECORD_SIZE:
+            return None
+        step, value = RECORD_STRUCT.unpack(data)
+        return {"count": complete // RECORD_SIZE, "last_step": step, "last": value}
+
     def read_records(self, key: str, offset: int = 0, limit: int | None = None) -> tuple:
         """Raw records from a byte offset, for a sync cursor.
 

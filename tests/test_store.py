@@ -1395,6 +1395,35 @@ def test_read_records_limit_and_offsets(tmp_path):
         reader.read_records("loss", offset=0, limit="bad")
 
 
+def test_reader_tail(tmp_path):
+    writer = RunWriter.create(tmp_path, run_id="tail-run", meta={})
+    writer.write_scalars([(1, {"normal": 1.0}), (2, {"normal": 2.5})])
+    writer.write_scalars([(10, {"ooo": 1.0}), (2, {"ooo": 2.0}), (3, {"ooo": 3.0})])
+    writer.write_scalars([(1, {"nanlast": 1.0}), (2, {"nanlast": float("nan")})])
+    writer.write_scalars([(0, {"empty": 1.0}), (0, {"missing": 1.0})])
+    writer.finish("finished")
+    index = json.loads((writer.run_dir / "scalars" / "index.json").read_text(encoding="utf-8"))
+    empty_id = index["series"]["empty"]["id"]
+    missing_id = index["series"]["missing"]["id"]
+    normal_id = index["series"]["normal"]["id"]
+    (writer.run_dir / "scalars" / f"{empty_id}.bin").write_bytes(b"")
+    (writer.run_dir / "scalars" / f"{missing_id}.bin").unlink()
+
+    reader = RunReader(tmp_path, "tail-run")
+    assert reader.tail("normal") == {"count": 2, "last_step": 2, "last": 2.5}
+    with (writer.run_dir / "scalars" / f"{normal_id}.bin").open("ab") as handle:
+        handle.write(b"\x01\x02\x03")
+    assert reader.tail("normal") == {"count": 2, "last_step": 2, "last": 2.5}
+    assert reader.tail("ooo") == {"count": 3, "last_step": 3, "last": 3.0}
+    nan_snap = reader.tail("nanlast")
+    assert nan_snap["count"] == 2 and nan_snap["last_step"] == 2
+    assert math.isnan(nan_snap["last"])
+    assert reader.tail("empty") is None
+    assert reader.tail("missing") is None
+    with pytest.raises(KeyError):
+        reader.tail("unknown")
+
+
 def test_index_stat_caching_and_unbounded_series_query(tmp_path, monkeypatch):
     import agenticml.store.reader as reader_mod
     writer = RunWriter.create(tmp_path)
