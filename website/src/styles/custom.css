@@ -1,8 +1,8 @@
-/* Emerald accent and a softer, roomier layout. Dark is Starlight's default. */
+/* Brand blue accent (matches agenticml-server) and a softer, roomier layout. Dark is Starlight's default. */
 :root {
-	--sl-color-accent-low: #052e22;
-	--sl-color-accent: #10b981;
-	--sl-color-accent-high: #a7f3d0;
+	--sl-color-accent-low: #11284f;
+	--sl-color-accent: #2F6FDB;
+	--sl-color-accent-high: #8AB0FA;
 	--sl-color-white: #f8fafc;
 	--sl-color-gray-1: #e2e8f0;
 	--sl-color-gray-2: #cbd5e1;
@@ -16,9 +16,9 @@
 }
 
 :root[data-theme='light'] {
-	--sl-color-accent-low: #d1fae5;
-	--sl-color-accent: #047857;
-	--sl-color-accent-high: #064e3b;
+	--sl-color-accent-low: #dbe7fb;
+	--sl-color-accent: #2F6FDB;
+	--sl-color-accent-high: #1b3f85;
 	--sl-color-white: #0b0f17;
 	--sl-color-gray-1: #1e293b;
 	--sl-color-gray-2: #334155;

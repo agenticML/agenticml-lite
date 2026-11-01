@@ -11,7 +11,7 @@ export default defineConfig({
 		starlight({
 			title: 'agenticml-lite',
 			description: 'Local-first experiment tracking for machine learning.',
-			logo: { src: './src/assets/logo.svg', replacesTitle: false },
+			logo: { light: './src/assets/logo-light.svg', dark: './src/assets/logo-dark.svg', alt: 'agenticML', replacesTitle: true },
 			favicon: '/favicon.svg',
 			social: [
 				{ icon: 'github', label: 'GitHub', href: 'https://github.com/agenticML/agenticml-lite' },
