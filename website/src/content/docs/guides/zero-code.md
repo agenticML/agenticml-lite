@@ -8,11 +8,16 @@ sidebar:
 `agenticml run` executes a script inside a run. The script does not need to `import agenticml`.
 
 ```bash
+agenticml run train.py
 agenticml run train.py --lr 1e-3
+agenticml run -m mypkg.train
 agenticml run -m mypkg.train --epochs 3
 agenticml run --project demo -- python train.py --lr 1e-3
+agenticml python train.py
 agenticml python train.py --lr 1e-3
 ```
+
+Script arguments are optional. Without them, the script runs with its own defaults and `argparse` values are still captured as config. With them, everything after the script is passed through untouched.
 
 ## Command forms
 
