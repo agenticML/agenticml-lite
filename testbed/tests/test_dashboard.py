@@ -104,7 +104,7 @@ def compare(page, server):
     for name in COMPARE_RUNS:
         page.get_by_role("checkbox", name=f"Select {name}", exact=True).check()
     page.get_by_role("button", name="Compare runs", exact=True).click()
-    expect(page.get_by_role("heading", name="Compare runs", exact=True)).to_be_visible()
+    expect(page.get_by_role("heading", name=re.compile(r"^Compare \d+ runs$"))).to_be_visible()
     expect(page.locator('.chart-card[data-key="train/loss"]')).to_be_visible()
 
 
@@ -123,8 +123,9 @@ def test_home_lists_every_run(page, ui_server):
     home(page, ui_server)
     expect(page.locator(".run-row")).to_have_count(5)
     expect(page.locator(".poll-status")).to_have_text("5 runs")
-    expect(page.get_by_text("5 runs · grouped by project", exact=True)).to_be_visible()
-    for name, status, project in (("explicit-baseline", "finished", "testbed"), ("explicit-highlr", "finished", "testbed"), ("zero-code", "finished", "testbed"), ("crashed", "crashed", "testbed"), ("other-project", "finished", "other-project")):
+    expect(page.locator(".runs-summary")).to_have_text(re.compile(r"^5 runs · 2 projects · last finished "))
+    # Pure-Python zero-code training logs no metrics, and its status says so.
+    for name, status, project in (("explicit-baseline", "done", "testbed"), ("explicit-highlr", "done", "testbed"), ("zero-code", "done · no metrics", "testbed"), ("crashed", "crashed", "testbed"), ("other-project", "done", "other-project")):
         run = row(page, name)
         expect(run).to_be_visible()
         expect(run.locator(".chip")).to_have_text(status)
@@ -172,7 +173,7 @@ def test_long_path_run_names_fit_mobile(page, tmp_path, ui_server_factory):
         for name in names:
             page.get_by_role("checkbox", name=f"Select {name}", exact=True).check()
         page.get_by_role("button", name="Compare runs", exact=True).click()
-        expect(page.get_by_role("heading", name="Compare runs", exact=True)).to_be_visible()
+        expect(page.get_by_role("heading", name=re.compile(r"^Compare \d+ runs$"))).to_be_visible()
         selected = page.get_by_test_id("selected-runs")
         for name in names:
             expect(selected.get_by_text(name, exact=True)).to_have_attribute("title", name)
@@ -190,7 +191,7 @@ def test_project_filter_and_search(page, ui_server):
     expect(page.locator(".run-row")).to_have_count(4)
     page.get_by_role("tab", name="other-project", exact=True).click()
     expect(page.locator(".run-row")).to_have_count(1)
-    page.get_by_role("tab", name="All", exact=True).click()
+    page.get_by_role("tab", name="All projects", exact=True).click()
     search = page.get_by_label("Filter runs")
     for query, names in (("Zero-Code", ["zero-code"]), ("FIXTURE", ["explicit-baseline", "explicit-highlr", "crashed", "other-project"]), ("baseline", ["explicit-baseline", "crashed", "other-project"]), ("highlr", ["explicit-highlr"])):
         search.fill(query)
@@ -213,7 +214,7 @@ def test_selection_bar_and_compare_navigation(page, ui_server, width):
     expect(page.locator(".notebook summary")).not_to_contain_text("loading")
     bar = page.get_by_test_id("selection-bar")
     expect(bar).to_be_visible()
-    expect(bar).to_have_text("Select runs to compare", use_inner_text=True)
+    expect(bar).to_have_text("Select two or more runs to overlay their curves and diff their configs.", use_inner_text=True)
     expect(bar.get_by_role("button", name="Compare runs")).to_be_hidden()
     placeholder_box = bar.bounding_box()
     checkbox = page.get_by_role("checkbox", name="Select explicit-baseline", exact=True)
@@ -231,7 +232,7 @@ def test_selection_bar_and_compare_navigation(page, ui_server, width):
     expect(bar).to_contain_text("2 runs selected")
     expect(bar.get_by_role("button", name="Compare runs")).to_be_enabled()
     bar.get_by_role("button", name="Clear").click()
-    expect(bar).to_have_text("Select runs to compare", use_inner_text=True)
+    expect(bar).to_have_text("Select two or more runs to overlay their curves and diff their configs.", use_inner_text=True)
     expect(bar.get_by_role("button", name="Compare runs")).to_be_hidden()
     assert bar.bounding_box() == placeholder_box
     assert second.bounding_box() == position
@@ -239,36 +240,46 @@ def test_selection_bar_and_compare_navigation(page, ui_server, width):
     compare(page, ui_server)
     assert page.url.index(ui_server.runs["explicit-baseline"]) < page.url.index(ui_server.runs["explicit-highlr"])
     expect(page.get_by_test_id("selected-runs")).to_contain_text("explicit-baseline")
-    expect(page.get_by_role("heading", name="Params & metrics comparison")).to_be_visible()
-    expect(page.get_by_text(re.compile(r"Params that differ \(\d+\)"))).to_be_visible()
-    expect(page.locator(".compare-focus pre")).to_contain_text('"explicit-highlr"')
+    expect(page.get_by_role("heading", name="Config diff")).to_be_visible()
+    expect(page.get_by_text(re.compile(r"^\d+ of \d+ params differ$"))).to_be_visible()
+    expect(page.locator(".compare-card").first).to_contain_text("explicit-highlr")
     page.get_by_role("button", name="Exit focus").click()
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
 
 
 def test_run_facts_parameters_environment_artifacts_and_media(page, ui_server):
     open_run(page, ui_server)
-    expect(page.locator(".detail > .inline .chip").first).to_have_text("finished")
+    expect(page.locator(".detail > .inline .chip").first).to_have_text("done")
     identity = page.get_by_test_id("identity")
-    for label in ("Run id", "Project", "Created", "Finished", "Duration", "Host", "Git commit"):
+    for label in ("Run id", "Project", "Started", "Finished", "Host", "Commit", "Exit code"):
         expect(identity.locator("dt").filter(has_text=re.compile(f"^{label}$"))).to_be_visible()
     expect(identity).to_contain_text(ui_server.runs["explicit-baseline"])
     expect(identity).to_contain_text("testbed")
     assert all(value != "—" for value in identity.locator("dd").all_text_contents()[:6])
-    params = page.locator('[data-card="Parameters"]')
-    expect(params.locator("dt")).to_contain_text(["batch_size", "epochs", "lr"])
+    hyper = page.locator('[data-card="Hyperparameters"]')
+    expect(hyper.locator("dt")).to_contain_text(["lr", "batch_size", "epochs"])
+    params = page.locator('[data-card="Run config"]')
+    expect(params.locator("dt")).to_contain_text(["explicit", "name", "out"])
+    expect(params.locator("dt").filter(has_text=re.compile("^lr$"))).to_have_count(0)
     params.get_by_label("Search Parameters").fill("batch_size")
-    expect(params.locator("dt").filter(has_text=re.compile("^lr$"))).to_be_hidden()
-    expect(params.locator("dt").filter(has_text=re.compile("^batch_size$"))).to_be_visible()
+    expect(hyper.locator("dt").filter(has_text=re.compile("^lr$"))).to_be_hidden()
+    expect(hyper.locator("dt").filter(has_text=re.compile("^batch_size$"))).to_be_visible()
+    expect(params.locator("dt").filter(has_text=re.compile("^name$"))).to_be_hidden()
     params.get_by_label("Search Parameters").fill("")
+    expect(page.locator('[data-card="Summary metrics"]')).to_contain_text("final_loss")
+    source = page.locator('[data-card="Source"]')
+    expect(source.locator("dt")).to_contain_text(["commit", "branch", "working tree", "entrypoint"])
+    expect(source.locator("dd").last).to_have_text("dummytrain/train.py")
     environment = page.locator('[data-card="Environment"]')
     expect(environment).to_contain_text("python_version")
     expect(environment).to_contain_text("hostname")
-    environment.get_by_text("Packages", exact=True).click()
+    environment.get_by_text("Packages (pip freeze)", exact=True).click()
     expect(environment.locator("details")).to_have_js_property("open", True)
     artifacts = page.locator('[data-card="Artifacts"]')
     expect(artifacts.locator("[data-artifact]")).to_have_count(2)
-    expect(artifacts).to_contain_text("checkpoint")
+    expect(artifacts).to_contain_text("checkpoint:v2")
+    expect(artifacts).to_contain_text("checkpoint:v1")
+    expect(artifacts.locator(".chip")).to_have_text(["latest"])
     expect(artifacts).to_contain_text("model")
     image = page.locator(".media-strip img")
     expect(image).to_have_count(1)
@@ -338,20 +349,20 @@ def test_canvas_charts_compare_smoothing_filter_and_focus(page, ui_server):
     before = painted(canvas)
     paths = [stroke for stroke in before["strokes"] if stroke["width"] == 2 and len(stroke["path"]) > 2]
     assert len(paths) == 4 and sum(stroke["alpha"] == .22 for stroke in paths) == 2
-    expect(page.get_by_label("Smoothing", exact=True)).to_have_value("0.6")
-    page.get_by_label("Smoothing", exact=True).fill("0")
+    expect(page.get_by_label("EMA smoothing", exact=True)).to_have_value("0.6")
+    page.get_by_label("EMA smoothing", exact=True).fill("0")
     after = painted(canvas)
     assert len([s for s in after["strokes"] if s["width"] == 2 and len(s["path"]) > 2]) == 2
     assert [s["path"] for s in paths if s["alpha"] == 1] != [s["path"] for s in after["strokes"] if s["width"] == 2 and len(s["path"]) > 2]
-    page.get_by_label("Ignore outliers", exact=True).uncheck()
-    page.get_by_label("Ignore outliers", exact=True).check()
+    page.get_by_label("Clip outliers on y-axis", exact=True).uncheck()
+    page.get_by_label("Clip outliers on y-axis", exact=True).check()
     all_keys = page.locator(".chart-card").evaluate_all("nodes => nodes.map(el => el.dataset.key)")
     assert {"train/loss", "train/lr", "val/loss", "val/acc"} <= set(all_keys)
     for query in ("train/loss", "VAL/", "loss"):
-        page.get_by_label("Filter tags", exact=True).fill(query)
+        page.get_by_label("Filter metric keys", exact=True).fill(query)
         expected = sorted(key for key in all_keys if query.lower() in key.lower())
         assert sorted(page.locator(".chart-card").evaluate_all("nodes => nodes.map(el => el.dataset.key)")) == expected
-    page.get_by_label("Filter tags", exact=True).fill("")
+    page.get_by_label("Filter metric keys", exact=True).fill("")
     loss(page).click()
     overlay = page.locator(".chart-focus")
     expect(overlay).to_be_visible()
@@ -453,7 +464,7 @@ def test_no_project_group_is_first_and_escaped(page, tmp_path, ui_server_factory
         expect(page.locator(".run-row")).to_have_count(2)
         page.get_by_role("link", name=malicious, exact=True).click()
         expect(page.get_by_role("heading", name=malicious, exact=True)).to_be_visible()
-        expect(page.locator('[data-card="Parameters"]')).to_contain_text(malicious)
+        expect(page.locator('[data-card="Run config"]')).to_contain_text(malicious)
         assert page.locator("#app img").count() == 0
         assert page.evaluate("window.__xss") is None
 
@@ -474,7 +485,7 @@ def test_live_run_finishes_without_reload(page, tmp_path, ui_server_factory):
             expect(page.locator(".poll-status")).to_have_text("Live · refreshes every 5 s")
             page.evaluate("window.__stayed = true")
             agenticml.finish()
-            expect(row(page, "live-run").locator(".chip")).to_have_text("finished", timeout=LIVE_TIMEOUT)
+            expect(row(page, "live-run").locator(".chip")).to_have_text(re.compile(r"^done"), timeout=LIVE_TIMEOUT)
             expect(page.locator(".poll-status")).to_have_text("1 runs")
             assert page.evaluate("window.__stayed")
     finally:
@@ -491,8 +502,8 @@ def test_live_chart_retains_controls_and_open_focus(page, tmp_path, ui_server_fa
         with ui_server_factory(root) as server:
             page.goto(f"{server.url}#/run/{run.run_id}")
             expect(loss(page).locator("[data-points]")).to_have_attribute("data-points", "3")
-            page.get_by_label("Smoothing", exact=True).fill("0.9")
-            page.get_by_label("Filter tags", exact=True).fill("train/")
+            page.get_by_label("EMA smoothing", exact=True).fill("0.9")
+            page.get_by_label("Filter metric keys", exact=True).fill("train/")
             original_canvas = loss(page).locator("canvas").element_handle()
             loss(page).click()
             agenticml.log({"train/loss": .2, "train/extra": 1.25}, step=3)
@@ -504,10 +515,10 @@ def test_live_chart_retains_controls_and_open_focus(page, tmp_path, ui_server_fa
             expect(page.locator(".chart-focus")).to_be_visible()
             expect(page.locator(".chart-focus [data-testid=hover-table]")).to_contain_text("0.1")
             page.keyboard.press("Escape")
-            expect(page.get_by_label("Smoothing", exact=True)).to_have_value("0.9")
-            expect(page.get_by_label("Filter tags", exact=True)).to_have_value("train/")
+            expect(page.get_by_label("EMA smoothing", exact=True)).to_have_value("0.9")
+            expect(page.get_by_label("Filter metric keys", exact=True)).to_have_value("train/")
             agenticml.finish()
-            expect(page.locator(".detail > .inline .chip").first).to_have_text("finished", timeout=LIVE_TIMEOUT)
+            expect(page.locator(".detail > .inline .chip").first).to_have_text("done", timeout=LIVE_TIMEOUT)
             expect(page.locator(".poll-status")).to_have_text("Up to date")
     finally:
         agenticml.finish()
@@ -541,9 +552,9 @@ def test_compare_code_statuses_summary_and_line_numbers(page, tmp_path, ui_serve
     with ui_server_factory(root) as server:
         section = open_code_compare(page, server, base, target)
         expect(section.get_by_test_id("code-diff-summary")).to_have_text("3 files changed · +2 −2 · 1 unchanged file")
-        expect(page.get_by_role("heading", name="Code diff", exact=True)).to_have_count(1)
+        expect(page.get_by_role("heading", name="Code & artifacts", exact=True)).to_have_count(1)
         assert page.locator(".compare-focus h2.eyebrow").all_text_contents()[-3:] == [
-            "Params & metrics comparison", "Code diff", "Config",
+            "Summary metrics", "Overlaid curves", "Code & artifacts",
         ]
         for path, status in (("added.py", "Added"), ("removed.py", "Removed"), ("main.py", "Modified")):
             expect(section.locator(f'[data-path="{path}"] [data-testid="code-diff-status"]')).to_have_text(status)
@@ -995,8 +1006,8 @@ def test_compare_code_error_is_local_to_section(page, tmp_path, ui_server_factor
     with ui_server_factory(root) as server:
         section = open_code_compare(page, server, *ids)
         expect(section.get_by_role("alert")).to_contain_text("Diff temporarily unavailable")
-        expect(page.get_by_role("heading", name="Params & metrics comparison", exact=True)).to_be_visible()
-        expect(page.get_by_role("heading", name="Config", exact=True)).to_be_visible()
+        expect(page.get_by_role("heading", name="Config diff", exact=True)).to_be_visible()
+        expect(page.get_by_role("heading", name="Summary metrics", exact=True)).to_be_visible()
         expect(page.get_by_test_id("selected-runs")).to_contain_text("target")
         expect(page.locator(".poll-status")).to_have_text("Up to date")
 
@@ -1021,7 +1032,7 @@ def test_code_baseline_modified_marker_lazy_fetch_and_diff(page, tmp_path, ui_se
         viewer.locator('[data-path="same.py"]').click()
         expect(viewer.locator(".code-lines")).to_contain_text(common.strip())
         assert len(objects) == 3  # The identical baseline blob is never fetched.
-        page.get_by_role("button", name="View diff", exact=True).click()
+        page.get_by_role("button", name=re.compile(r"^View diff vs ")).click()
         full = page.locator(".code-full")
         expect(full.get_by_text("Differs from baseline", exact=True)).to_be_visible()
         expect(full.locator(".code-crumb")).to_have_text("same.py")
@@ -1055,7 +1066,7 @@ def test_metrics_chunk_keys_and_overview_points(page, tmp_path, ui_server_factor
     with ui_server_factory(root) as server:
         page.goto(f"{server.url}#/run/{writer.run_id}")
         expect(page.locator(".chart-card")).to_have_count(202)
-        expect(page.get_by_text("202 / 202 tags", exact=True)).to_be_visible()
+        expect(page.get_by_text("202 / 202 keys", exact=True)).to_be_visible()
         assert len(queries) == 2
         assert all(len(query["key"]) <= 200 for query in queries)
         assert len({key for query in queries for key in query["key"]}) == 202
@@ -1138,28 +1149,37 @@ def test_varied_progress_headline_delta_and_best_metric(page, tmp_path, ui_serve
     root = tmp_path / "table-facts"
     ids = []
     for index, (name, summary) in enumerate((("older", {"train/loss": .8, "quality": .5}), ("different-key", {"quality": .7}), ("newer", {"train/loss": .4, "quality": .9}))):
-        writer = RunWriter.create(root, meta={"name": name, "project": "project", "config": {"lr": index + 1, "epochs": 5}})
+        # "newer" names "older" as its parent, skipping the run in between.
+        parent = {"parent_run_id": ids[0]} if name == "newer" else {}
+        writer = RunWriter.create(root, meta={"name": name, "project": "project", "config": {"lr": index + 1, "epochs": 5}, **parent})
         writer.set_meta_fields(created_at=f"2024-01-0{index + 1}T00:00:00Z")
         writer.write_scalars([(1500, {"loss": .4})])
         writer.finish("finished", summary=summary)
         ids.append(writer.run_id)
     with ui_server_factory(root) as server:
         home(page, server)
-        expect(row(page, "newer").locator(".run-varied")).to_have_text("lr=3")
+        expect(row(page, "newer").locator(".run-varied")).to_have_text("lr 1 → 3")
+        expect(row(page, "older").locator(".run-varied")).to_have_text("root · lr=1")
         expect(row(page, "newer").locator(".run-progress")).to_have_text("1.5k")
         expect(row(page, "newer").locator('.run-number[title="train/loss"]')).to_have_text("0.4")
-        expect(row(page, "newer").locator(".run-delta")).to_have_text("-0.4")
+        expect(row(page, "newer").locator(".run-delta")).to_have_text("−0.4")
         expect(row(page, "newer").locator(".run-delta")).to_have_class(re.compile(r"\bok\b"))
-        # Skip the intervening run with a different headline key.
-        expect(page.locator(".run-columns")).to_contain_text("train/loss")
+        expect(row(page, "older").locator(".run-delta")).to_have_text("—")
+        expect(page.locator(".run-columns")).to_contain_text("train/loss ↓")
+        expect(page.locator(".run-columns")).to_contain_text("Δ vs parent")
         page.goto(f"{server.url}#/compare?runs={ids[0]},{ids[2]}")
-        table = page.locator(".compare-focus table").last
+        # Δ is run − reference (the first run), with the share of the reference.
+        table = page.locator(".compare-card table").last
         loss_row = table.locator("tr").filter(has=page.get_by_role("cell", name="train/loss", exact=True))
-        expect(loss_row.locator(".ok")).to_have_text("0.4")
+        expect(loss_row.locator(".run-delta")).to_have_text("−0.4 (−50%)")
+        expect(loss_row.locator(".run-delta")).to_have_class(re.compile(r"\bok\b"))
         quality_row = table.locator("tr").filter(has=page.get_by_role("cell", name="quality", exact=True))
-        expect(quality_row.locator(".ok")).to_have_text("0.9")
-        expect(table).to_contain_text("Params that differ (1)")
-        assert "epochs" not in table.inner_text()
+        expect(quality_row.locator(".run-delta")).to_have_text("+0.4 (+80%)")
+        config = page.locator(".compare-card").first
+        expect(config).to_contain_text("1 of 2 params differ")
+        assert "epochs" not in config.locator("table").inner_text()
+        config.get_by_label("Only differences").uncheck()
+        expect(config.locator("table")).to_contain_text("epochs")
 
 
 def test_theme_storage_denied_and_system_change(page, context, ui_server):
@@ -1259,23 +1279,29 @@ def test_compare_round_trips_punctuation_in_repeated_parameters(page, ui_server)
     expect(page.get_by_test_id("selected-runs")).to_contain_text("run 2")
 
 
-def test_project_headline_uses_chronology_and_skips_missing_values(page, ui_server):
+def test_project_headline_deltas_follow_lineage_parent(page, ui_server):
     runs = [
-        {"run_id": "middle", "created_at": "2024-01-02", "summary": {"quality": .7}},
+        {"run_id": "middle", "created_at": "2024-01-02", "summary": {"quality": .7}, "parent_run_id": "old"},
         {"run_id": "old", "created_at": "2024-01-01", "summary": {"loss": .8}},
-        {"run_id": "new", "created_at": "2024-01-03", "summary": {"loss": .4}},
-        {"run_id": "same-date", "created_at": "2024-01-03", "summary": {"loss": .6}},
+        {"run_id": "new", "created_at": "2024-01-03", "summary": {"loss": .4}, "parent_run_id": "old"},
+        {"run_id": "same-date", "created_at": "2024-01-03", "summary": {"loss": .6}, "parent_run_id": "new"},
         {"run_id": "invalid", "created_at": "invalid", "summary": {}},
+        {"run_id": "flat", "created_at": "2024-01-04", "summary": {"loss": .4}, "parent_run_id": "new"},
     ]
     for run in runs:
         run.update(name=run["run_id"], project="test", status="finished", keys=[])
     mock_dashboard(page, runs)
     home(page, ui_server)
-    assert page.locator(".run-row").evaluate_all("nodes => nodes.map(el => el.dataset.runId)") == ["new", "same-date", "middle", "old", "invalid"]
+    assert page.locator(".run-row").evaluate_all("nodes => nodes.map(el => el.dataset.runId)") == ["flat", "new", "same-date", "middle", "old", "invalid"]
+    # "middle" has a parent but never logged the headline metric; "old" is a root.
     expect(row(page, "middle").locator(".run-number").first).to_have_text("—")
     expect(row(page, "middle").locator(".run-delta")).to_have_text("—")
-    expect(row(page, "new").locator(".run-delta")).to_have_text("-0.4")
-    expect(row(page, "same-date").locator(".run-delta")).to_have_text("-0.2")
+    expect(row(page, "old").locator(".run-delta")).to_have_text("—")
+    expect(row(page, "new").locator(".run-delta")).to_have_text("−0.4")
+    expect(row(page, "new").locator(".run-delta")).to_have_class(re.compile(r"\bok\b"))
+    expect(row(page, "same-date").locator(".run-delta")).to_have_text("+0.2")
+    expect(row(page, "same-date").locator(".run-delta")).to_have_class(re.compile(r"\bwarn\b"))
+    expect(row(page, "flat").locator(".run-delta")).to_have_text("±0")
     expect(row(page, "invalid").locator(".run-duration")).to_have_text("—")
 
 
@@ -1301,8 +1327,8 @@ def test_long_values_are_contained_and_short_subtitles_have_titles(page, ui_serv
         if "run/0" in route:
             expect(page.locator(".subline")).to_have_attribute("title", re.compile("parameter"))
             assert long not in page.locator(".subline").inner_text()
-            expect(page.locator('[data-card="Parameters"]')).to_contain_text(long)
-            page.get_by_text("Packages", exact=True).click()
+            expect(page.locator('[data-card="Run config"]')).to_contain_text(long)
+            page.get_by_text("Packages (pip freeze)", exact=True).click()
         page.wait_for_load_state("networkidle")
         assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth"), page.evaluate("[...document.querySelectorAll('body *')].filter(el => el.getBoundingClientRect().right > innerWidth).map(el => [el.tagName, el.className, Math.round(el.getBoundingClientRect().width)]).slice(0, 20)")
 
@@ -1446,7 +1472,7 @@ def test_identical_code_has_no_diff_heading_and_baseline_suffix(page, tmp_path, 
             {"run_id": current, "created_at": "2024-01-03", "project": "p", "name": "different"},
         ])))
         page.goto(f"{server.url}#/run/{current}")
-        page.get_by_role("button", name="View diff", exact=True).click()
+        page.get_by_role("button", name=re.compile(r"^View diff vs ")).click()
         expect(page.locator(".code-outline")).to_contain_text(f"Differs from {old.rsplit('-', 1)[-1]}")
 
 
@@ -1503,7 +1529,7 @@ def test_baseline_discovery_is_bounded_parallel_and_chooses_nearest(page, tmp_pa
     })();""")
     with ui_server_factory(root) as server:
         page.goto(f"{server.url}#/run/{run_id}")
-        page.get_by_role("button", name="View diff", exact=True).click()
+        page.get_by_role("button", name=re.compile(r"^View diff vs ")).click()
         expect(page.locator(".code-outline")).to_contain_text("Differs from baseline 4")
         assert page.evaluate("manifestPeak") == 4
 
@@ -1576,7 +1602,7 @@ def test_lineage_graph_selects_and_opens_run(page, tmp_path, ui_server_factory):
         visible_id = node_label.locator(".lineage-meta").evaluate(
             "el => el.childNodes[0] ? el.childNodes[0].nodeValue : el.textContent"
         )
-        assert visible_id.split(" · ", 1)[0] == suffix
+        assert visible_id.split(" · ", 1)[0] == f"run {suffix}"
         assert ids[1] in node_label.get_attribute("aria-label")
         assert ids[1] in node_label.locator("title").first.text_content()
         overflow = page.evaluate(
@@ -1675,11 +1701,13 @@ def test_split_runs_layout_and_shared_selection(page, tmp_path, ui_server_factor
         expect(page.get_by_role("tab", name="Lineage", exact=True)).to_have_count(0)
         expect(page.get_by_role("tab", name="List", exact=True)).to_have_count(0)
         a, b = left.bounding_box(), right.bounding_box()
-        assert abs(a["width"] - b["width"]) <= 1
         if width > 1000:
+            # The run table leads; lineage is a fixed-width aside beside it.
             assert a["x"] < b["x"]
             assert abs(a["y"] - b["y"]) <= 1
+            assert a["width"] > b["width"] and 300 <= b["width"] <= 341
         else:
+            assert abs(a["width"] - b["width"]) <= 1
             assert abs(a["x"] - b["x"]) <= 1
             assert a["y"] + a["height"] <= b["y"]
         assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
@@ -1845,7 +1873,7 @@ def test_lineage_arrow_keys_move_between_generations_and_siblings(page, tmp_path
         expect(focused).to_have_attribute("data-run-id", root_id)
         focused.press("ArrowLeft")
         expect(focused).to_have_attribute("data-run-id", root_id)
-        expect(page.locator(".lineage-detail")).to_contain_text("Select a run")
+        expect(page.locator(".lineage-detail")).to_contain_text("Pick a run")
         focused.press("ArrowDown")
         focused.press("ArrowRight")
         expect(focused).to_have_attribute("data-run-id", right_id)
@@ -1972,7 +2000,7 @@ def test_lineage_rebuild_keeps_focus_scroll_and_detail(page, tmp_path, ui_server
         expect(page.locator(".poll-status")).to_contain_text("refreshes every 5 s")
         node = page.locator(f'.lineage-node[data-run-id="{child}"]')
         expect(node).to_be_visible()
-        expect(page.locator(".lineage-detail")).to_contain_text("Select a run")
+        expect(page.locator(".lineage-detail")).to_contain_text("Pick a run")
         node.focus()
         top = page.locator(".lineage-scroll").evaluate(
             "el => { el.scrollTop = Math.min(180, el.scrollHeight); return el.scrollTop; }"
@@ -2391,10 +2419,10 @@ def test_notepad_checklist_autosave_reload_and_tick(page, tmp_path, ui_server_fa
         pad = page.locator(".notepad")
         expect(pad.locator(".note-save")).to_have_text("Not saved yet")
         expect(pad.locator(".note-save")).not_to_contain_text("Saved")
-        expect(pad.get_by_role("button", name="View", exact=True)).to_have_attribute("aria-pressed", "true")
+        expect(pad.get_by_role("button", name="Preview", exact=True)).to_have_attribute("aria-pressed", "true")
         expect(pad.get_by_role("button", name="Edit", exact=True)).to_have_attribute("aria-pressed", "false")
         pad.get_by_role("button", name="Add a note…", exact=True).click()
-        expect(pad.get_by_role("button", name="View", exact=True)).to_have_attribute("aria-pressed", "false")
+        expect(pad.get_by_role("button", name="Preview", exact=True)).to_have_attribute("aria-pressed", "false")
         expect(pad.get_by_role("button", name="Edit", exact=True)).to_have_attribute("aria-pressed", "true")
         area = pad.get_by_label("Note Markdown")
         assert area.evaluate("el => parseFloat(getComputedStyle(el).fontSize)") >= 16
@@ -2406,12 +2434,12 @@ def test_notepad_checklist_autosave_reload_and_tick(page, tmp_path, ui_server_fa
         area.press_sequentially("Try lower learning rate")
         expect(pad.locator(".note-save")).to_contain_text("Saved", timeout=6000)
         assert _stored_note(page, server, run_id)["text"] == area.input_value()
-        pad.get_by_role("button", name="View", exact=True).click()
-        expect(pad.get_by_role("button", name="View", exact=True)).to_have_attribute("aria-pressed", "true")
+        pad.get_by_role("button", name="Preview", exact=True).click()
+        expect(pad.get_by_role("button", name="Preview", exact=True)).to_have_attribute("aria-pressed", "true")
         expect(pad.get_by_role("button", name="Edit", exact=True)).to_have_attribute("aria-pressed", "false")
         page.reload()
         expect(pad.get_by_role("checkbox")).to_have_count(2)
-        expect(pad.get_by_role("button", name="View", exact=True)).to_have_attribute("aria-pressed", "true")
+        expect(pad.get_by_role("button", name="Preview", exact=True)).to_have_attribute("aria-pressed", "true")
         expect(pad.get_by_role("button", name="Edit", exact=True)).to_have_attribute("aria-pressed", "false")
         pad.get_by_role("checkbox", name="Compare baseline", exact=True).check()
         expect(pad.locator(".note-progress")).to_have_text("1/2 done")
@@ -2454,7 +2482,7 @@ def test_notebook_request_does_not_block_runs_polling_or_lineage(page, ui_server
             assert page.evaluate("localStorage.getItem('agenticml-notebook-open')") is None
         else:
             assert len(held) == 1
-            expect(page.locator(".notebook summary")).to_have_text("Notes · loading…")
+            expect(page.locator(".notebook summary")).to_have_text("Run notes · loading…")
 
         runs[0]["name"] = "updated run"
         page.clock.fast_forward(5000)
@@ -2488,16 +2516,16 @@ def test_notebook_groups_filters_navigates_and_saves(page, tmp_path, ui_server_f
         book = page.locator(".notebook")
         expect(book).to_have_attribute("open", "")
         expect(book.locator(".notebook-entry")).to_have_count(2)
-        expect(book.locator("summary")).to_contain_text("Notes · 2 runs")
-        expect(book.locator("summary")).to_contain_text("1 open task")
+        expect(book.locator("summary")).to_contain_text("2 runs with notes")
+        expect(book.locator("summary")).to_contain_text("1 open follow-up")
         assert page.evaluate("localStorage.getItem('agenticml-notebook-open')") is None
         for name in ids:
             expect(book.get_by_role("link", name=name, exact=True)).to_be_visible()
         page.get_by_role("tab", name="alpha", exact=True).click()
         expect(book.locator(".notebook-entry")).to_have_count(1)
-        expect(book.locator("summary")).to_contain_text("Notes · 1 run")
+        expect(book.locator("summary")).to_contain_text("1 run with notes")
         expect(book.get_by_role("link", name="first notes run", exact=True)).to_be_visible()
-        page.get_by_role("tab", name="All", exact=True).click()
+        page.get_by_role("tab", name="All projects", exact=True).click()
         page.get_by_label("Filter runs").fill("ACCURACY")
         expect(book.locator(".notebook-entry")).to_have_count(1)
         expect(book.get_by_role("link", name="second notes run", exact=True)).to_be_visible()
@@ -2848,7 +2876,7 @@ def test_notes_task_source_lines_and_counts(page, tmp_path, ui_server_factory, n
         assert _stored_note(page, server, run_id)["text"] == expected
         if notebook:
             expect(surface.locator('[title="Tasks completed"]')).to_have_text("2/3")
-            expect(surface.locator("summary")).to_contain_text("1 open task")
+            expect(surface.locator("summary")).to_contain_text("1 open follow-up")
         else:
             expect(surface.locator(".note-progress")).to_have_text("2/3 done")
         # The public pure helpers must handle original CRLF text as well.
@@ -3381,7 +3409,7 @@ def test_truncated_note_warns_until_save_anyway(page, tmp_path, ui_server_factor
         assert _stored_note(page, server, run_id)["text"] == "- [ ] Confirmed task"
         expect(warning).to_be_hidden()
         assert puts() == 2
-        pad.get_by_role("button", name="View", exact=True).click()
+        pad.get_by_role("button", name="Preview", exact=True).click()
         with page.expect_response(note_write):
             pad.get_by_role("checkbox", name="Confirmed task", exact=True).check()
         expect(pad.get_by_role("checkbox", name="Confirmed task", exact=True)).to_be_checked()
@@ -3433,7 +3461,7 @@ def test_truncated_note_warns_until_save_anyway(page, tmp_path, ui_server_factor
         area.fill("- [ ] Server task")
         page.clock.fast_forward(800)
         assert puts() == 2
-        pad.get_by_role("button", name="View", exact=True).click()
+        pad.get_by_role("button", name="Preview", exact=True).click()
         server_box = pad.get_by_role("checkbox", name="Server task", exact=True)
         expect(server_box).to_be_disabled()
         page.clock.fast_forward(800)
@@ -3481,7 +3509,7 @@ def test_launch_note_shows_until_the_notepad_is_edited(page, tmp_path, ui_server
         pad = page.locator(".notepad")
         label = pad.locator(".note-launch")
         expect(label).to_be_visible()
-        expect(label).to_have_text("From launch notes")
+        expect(label).to_have_text("from launch")
         expect(label).to_have_attribute("title", launch_title)
         expect(pad).to_contain_text("Launch idea")
         expect(pad.locator(".note-save")).to_have_text("Not saved yet")
@@ -3491,7 +3519,7 @@ def test_launch_note_shows_until_the_notepad_is_edited(page, tmp_path, ui_server
         area = pad.get_by_label("Note Markdown")
         expect(area).to_have_value("Launch idea\n- [ ] check lr")
         _assert_notes_no_overflow(page)
-        pad.get_by_role("button", name="View", exact=True).click()
+        pad.get_by_role("button", name="Preview", exact=True).click()
         with page.expect_response(lambda response: response.request.method == "PUT" and response.ok) as saved:
             pad.get_by_role("checkbox", name="check lr", exact=True).check()
         assert saved.value.json()["source"] == "file"
@@ -3537,7 +3565,7 @@ def test_launch_note_shows_until_the_notepad_is_edited(page, tmp_path, ui_server
         page.goto(f"{server.url}#/run/{frozen_id}")
         pad = page.locator(".notepad")
         expect(pad.locator(".note-launch")).to_be_visible()
-        expect(pad.locator(".note-launch")).to_have_text("From launch notes")
+        expect(pad.locator(".note-launch")).to_have_text("from launch")
         expect(pad).to_contain_text("Frozen idea")
         expect(pad.get_by_role("checkbox", name="look", exact=True)).to_be_disabled()
         _assert_notes_no_overflow(page)

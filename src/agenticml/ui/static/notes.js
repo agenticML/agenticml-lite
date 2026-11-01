@@ -395,16 +395,16 @@ export function createNotepad({ runId, el, button, signal }) {
     "ghost",
     { hidden: true },
   );
-  const view = button("View", () => setMode(false), "ghost", {
+  const view = button("Preview", () => setMode(false), "ghost", {
     "aria-pressed": true,
   });
   const edit = button("Edit", () => setMode(true), "ghost", {
     "aria-pressed": false,
   });
   const modes = el("div", { class: "note-modes", hidden: true }, view, edit);
-  const launchLabel = el("p", {
-    class: "note-launch muted",
-    text: "From launch notes",
+  const launchLabel = el("span", {
+    class: "note-launch chip",
+    text: "from launch",
     title: launchNoteTitle,
     hidden: true,
   });
@@ -498,12 +498,12 @@ export function createNotepad({ runId, el, button, signal }) {
         el(
           "div",
           { class: "note-title" },
-          el("h2", { text: "Notes" }),
+          el("h2", { text: "Hypothesis & notes" }),
+          launchLabel,
           progress,
         ),
         el("div", { class: "note-controls" }, status, retry, modes),
       ),
-      launchLabel,
       banner,
       truncateBanner,
       body,
@@ -790,7 +790,7 @@ export function createNotepad({ runId, el, button, signal }) {
 
 export function createNotebook({ el, button, get, routeRun }) {
   const node = el("details", { class: "notebook" });
-  const summary = el("summary", { text: "Notes · loading…" });
+  const summary = el("summary", { text: "Run notes · loading…" });
   const body = el("div", { class: "notebook-body" });
   // Keep the live region connected while entries are redrawn.
   const announcement = el("span", {
@@ -903,10 +903,10 @@ export function createNotebook({ el, button, get, routeRun }) {
       return sum + counts.total - counts.done;
     }, 0);
     summary.replaceChildren(
-      el("span", { text: `Notes · ${shown.length} run${shown.length === 1 ? "" : "s"}` }),
+      el("span", { class: "notebook-title", text: "Run notes" }),
       el("span", {
         class: "muted",
-        text: `${open} open task${open === 1 ? "" : "s"}`,
+        text: `${shown.length} run${shown.length === 1 ? "" : "s"} with notes · ${open} open follow-up${open === 1 ? "" : "s"}`,
       }),
     );
     body.replaceChildren();
@@ -932,14 +932,14 @@ export function createNotebook({ el, button, get, routeRun }) {
         }),
         note.source === "launch"
           ? el("span", {
-              class: "note-launch muted",
-              text: "From launch notes",
+              class: "note-launch chip",
+              text: "from launch",
               title: launchNoteTitle,
             })
           : null,
         el("span", {
           class: `chip ${{ running: "accent", finished: "ok", crashed: "danger", stale: "warn" }[status] || ""}`,
-          text: status,
+          text: status === "finished" ? "done" : String(status).toLowerCase(),
         }),
         project === null
           ? el("span", { class: "muted", text: note.project || "No project" })
@@ -1079,7 +1079,7 @@ export function createNotebook({ el, button, get, routeRun }) {
       .catch((error) => {
         if (disposed || error.name === "AbortError" || token !== generation)
           return;
-        summary.textContent = "Notes";
+        summary.textContent = "Run notes";
         drawnKey = null;
         if (!initialized) node.open = true;
         body.replaceChildren(

@@ -189,7 +189,8 @@ def test_get_only(dashboard,method):
             assert json.loads(body) == {'error':'method not allowed'}
 
 
-@pytest.mark.parametrize('name',['index.html','app.js','app.css','charts.js','code.js','codediff.js','notes.js'])
+@pytest.mark.parametrize('name',['index.html','app.js','app.css','charts.js','code.js','codediff.js','notes.js',
+                                  'InstrumentSans.woff2','JetBrainsMono.woff2'])
 def test_static(dashboard,name):
     path = '/' if name == 'index.html' else '/static/'+name
     status, headers, body = dashboard[0](path)
@@ -200,7 +201,10 @@ def test_static(dashboard,name):
 
 
 def test_static_allowlist():
-    assert list(server._FILES) == ['index.html','app.js','app.css','charts.js','code.js','codediff.js','notes.js']
+    assert list(server._FILES) == ['index.html','app.js','app.css','charts.js','code.js','codediff.js','notes.js',
+                                   'InstrumentSans.woff2','JetBrainsMono.woff2']
+    assert server._FILES['InstrumentSans.woff2'] == 'font/woff2'
+    assert server._FILES['JetBrainsMono.woff2'] == 'font/woff2'
     assert server._FILES['charts.js'] == 'text/javascript; charset=utf-8'
     assert server._FILES['code.js'] == 'text/javascript; charset=utf-8'
     assert server._FILES['codediff.js'] == 'text/javascript; charset=utf-8'

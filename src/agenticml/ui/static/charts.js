@@ -1,8 +1,15 @@
 /* Canvas metrics: hosted chart rules, with explicit lifecycle cleanup. */
-const PAD = { top: 28, right: 28, bottom: 52, left: 68 };
-const PAD_COMPACT = { top: 10, right: 10, bottom: 24, left: 44 };
+const PAD = { top: 16, right: 20, bottom: 40, left: 64 };
+const PAD_COMPACT = { top: 10, right: 10, bottom: 22, left: 58 };
 export const formatNumber = (value) =>
   Number(value).toLocaleString([], { maximumFractionDigits: 4 });
+// Axis ticks: four significant digits keep labels short and aligned.
+const formatTick = (value) => {
+  const abs = Math.abs(value);
+  if (abs !== 0 && (abs >= 1e6 || abs < 1e-3))
+    return Number(value).toExponential(1);
+  return Number(value).toLocaleString([], { maximumSignificantDigits: 4 });
+};
 export const readToken = (name, fallback = "#2f6fdb") =>
   getComputedStyle(document.documentElement).getPropertyValue(name).trim() ||
   fallback;
@@ -89,6 +96,9 @@ export class MetricChart {
       ignoreOutliers = false,
       compact = false,
       colors,
+      xLabel = "step",
+      ghostRaw = false,
+      dashed = [],
     } = this.options;
     this.layout = null;
     this.paintOverlay = null;
@@ -106,10 +116,17 @@ export class MetricChart {
     // Canvas cannot resolve CSS variables — read the literal values each paint.
     const tk = {
       surface: readToken("--surface", "#ffffff"),
+      raised: readToken("--surface-3", "#f0f0f2"),
+      border: readToken("--border-strong", "#d4d4d8"),
       grid: readToken("--grid", "#eef0f1"),
+      text: readToken("--text", "#0a0a0b"),
+      text3: readToken("--text-3", "#6d757c"),
       text4: readToken("--text-4", "#9aa2a8"),
       ghost: readToken("--ghost", "#cbd0d3"),
+      sans: readToken("--font-sans", "ui-sans-serif, system-ui, sans-serif"),
+      mono: readToken("--font-mono", "ui-monospace, monospace"),
     };
+    const monoFont = (size) => `${size}px ${tk.mono}`;
 
     ctx.clearRect(0, 0, W, H);
     ctx.fillStyle = tk.surface;
@@ -129,8 +146,8 @@ export class MetricChart {
 
     if (!activeMetric || !runs.length) {
       drawGrid();
-      ctx.fillStyle = tk.ghost;
-      ctx.font = "13px 'Instrument Sans', ui-sans-serif, system-ui, sans-serif";
+      ctx.fillStyle = tk.text3;
+      ctx.font = `12px ${tk.sans}`;
       ctx.textAlign = "center";
       ctx.fillText("No chart data", W / 2, H / 2);
       return;
@@ -159,8 +176,8 @@ export class MetricChart {
 
     if (!series.length) {
       drawGrid();
-      ctx.fillStyle = tk.ghost;
-      ctx.font = "13px 'Instrument Sans', ui-sans-serif, system-ui, sans-serif";
+      ctx.fillStyle = tk.text3;
+      ctx.font = `12px ${tk.sans}`;
       ctx.textAlign = "center";
       ctx.fillText("No chart data", W / 2, H / 2);
       return;
@@ -261,13 +278,19 @@ export class MetricChart {
       ctx.lineWidth = 2;
       ctx.lineJoin = "round";
       ctx.lineCap = "round";
+      // The reference run in a comparison is dashed so it reads without hue.
+      const dash = dashed.includes(s.run.id) ? [5, 4] : [];
+      ctx.setLineDash(dash);
       if (smoothing > 0) {
         ctx.save();
-        ctx.globalAlpha = 0.22;
+        // A lone run shows its raw samples in the ghost colour under the EMA.
+        if (ghostRaw && single) ctx.strokeStyle = tk.ghost;
+        ctx.globalAlpha = ghostRaw && single ? 1 : 0.22;
         stroke(segments(s.raw));
         ctx.restore();
       }
       stroke(smoothSegments);
+      ctx.setLineDash([]);
 
       // Marker on the last point only.
       const last = smoothSegments.at(-1).at(-1);
@@ -285,23 +308,34 @@ export class MetricChart {
     }
 
     this.layout = { left: PAD_.left, right: W - PAD_.right, minStep, maxStep };
-    // Axis labels stay mono.
-    ctx.fillStyle = tk.text4;
-    ctx.font = `${compact ? 9.5 : 11}px 'JetBrains Mono', ui-monospace, monospace`;
-    ctx.textAlign = "center";
-    ctx.fillText(
-      compact ? formatNumber(minStep) : `step ${formatNumber(minStep)}`,
-      PAD_.left,
-      H - (compact ? 8 : 18),
-    );
-    ctx.fillText(
-      compact ? formatNumber(maxStep) : `step ${formatNumber(maxStep)}`,
-      W - PAD_.right,
-      H - (compact ? 8 : 18),
-    );
+    // Axis labels stay mono. Every grid line carries its value; compact
+    // cards label the extremes and the midpoint only.
+    ctx.fillStyle = tk.text3;
+    ctx.font = monoFont(compact ? 10 : 11);
     ctx.textAlign = "right";
-    ctx.fillText(formatNumber(maxVal), PAD_.left - 8, PAD_.top + 4);
-    ctx.fillText(formatNumber(minVal), PAD_.left - 8, H - PAD_.bottom + 4);
+    ctx.textBaseline = "middle";
+    for (let i = 0; i <= 4; i++) {
+      // A flat series sits mid-plot; label that line once.
+      if (minVal === maxVal ? i !== 2 : compact && i % 2) continue;
+      const value = maxVal - ((maxVal - minVal) * i) / 4;
+      ctx.fillText(formatTick(value), PAD_.left - 8, PAD_.top + (pH * i) / 4);
+    }
+    ctx.textBaseline = "alphabetic";
+    const ticks = compact || maxStep === minStep ? 1 : Math.max(1, Math.min(6, Math.floor(pW / 110)));
+    const tickY = H - PAD_.bottom + (compact ? 14 : 18);
+    for (let i = 0; i <= ticks; i++) {
+      const step = minStep + ((maxStep - minStep) * i) / ticks;
+      ctx.textAlign = i === 0 ? "left" : i === ticks ? "right" : "center";
+      ctx.fillText(
+        xLabel === "step" ? formatNumber(Math.round(step)) : formatTick(step),
+        i === 0 ? PAD_.left : i === ticks ? W - PAD_.right : sx(step),
+        tickY,
+      );
+    }
+    if (!compact) {
+      ctx.textAlign = "center";
+      ctx.fillText(xLabel, PAD_.left + pW / 2, H - 8);
+    }
 
     if (compact) return;
     // Keep the static chart in a backing canvas. Mouse movement only restores

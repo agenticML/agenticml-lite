@@ -214,15 +214,18 @@ export async function createCodeViewer({
   button,
   focus,
   objectURL,
+  parentId,
   onBaseline,
 }) {
   const api = (id) => `/api/runs/${encodeURIComponent(id)}/code`;
   const allFiles = (await get(api(run.run_id), signal)).sort((a, b) =>
     a.path.localeCompare(b.path),
   );
-  const entry = allFiles.find((file) =>
-    /(train|main|run)[^/]*\.py$/.test(file.path),
-  )?.path;
+  // The snapshot records which file was launched; the name guess is a fallback
+  // for manifests written before that was captured.
+  const entry =
+    allFiles.find((file) => file.source === "entrypoint")?.path ||
+    allFiles.find((file) => /(train|main|run)[^/]*\.py$/.test(file.path))?.path;
   const first =
     allFiles.find((file) => /config/i.test(file.path))?.path ||
     allFiles[0]?.path;
@@ -235,14 +238,23 @@ export async function createCodeViewer({
   const manifest = allFiles.filter((file) => chosen.has(file.path));
   let baseline = null,
     baseManifest = [];
-  const candidates = runs
-    .filter(
-      (candidate) =>
-        candidate.run_id !== run.run_id &&
-        (candidate.project || "") === (run.project || "") &&
-        new Date(candidate.created_at) < new Date(run.created_at),
-    )
-    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  // The lineage parent is the baseline when it has a snapshot; otherwise the
+  // nearest earlier run in the project stands in.
+  const parent = runs.find(
+    (candidate) => parentId && candidate.run_id === parentId && candidate.run_id !== run.run_id,
+  );
+  const candidates = [
+    ...(parent ? [parent] : []),
+    ...runs
+      .filter(
+        (candidate) =>
+          candidate !== parent &&
+          candidate.run_id !== run.run_id &&
+          (candidate.project || "") === (run.project || "") &&
+          new Date(candidate.created_at) < new Date(run.created_at),
+      )
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at)),
+  ];
   // Probe in bounded parallel batches, retaining nearest-earlier ordering.
   for (let start = 0; start < candidates.length && !baseline; start += 4) {
     const batch = candidates.slice(start, start + 4);
@@ -256,7 +268,7 @@ export async function createCodeViewer({
     }
   }
   if (signal.aborted) return null;
-  onBaseline?.(baseline);
+  onBaseline?.(baseline, entry || null);
   const baseByPath = new Map(baseManifest.map((file) => [file.path, file]));
   const files = new Map(
     manifest.map((file) => [
@@ -380,7 +392,7 @@ export async function createCodeViewer({
       el(
         "header",
         {},
-        el("span", { class: "eyebrow", text: "Explorer" }),
+        el("span", { class: "eyebrow", text: "Snapshot files" }),
         el("span", {
           class: "muted",
           text: `${run.git?.git_commit ? `@ ${run.git.git_commit.slice(0, 7)} · ` : ""}read-only`,
@@ -415,7 +427,14 @@ export async function createCodeViewer({
           el("span", {
             class: "file-marker",
             "data-modified": file.modified,
-            text: file.modified ? "M" : file.path === entry ? "entry" : "",
+            title: file.modified
+              ? baseline?.run_id === parentId
+                ? "Modified vs parent"
+                : "Modified vs baseline"
+              : file.path === entry
+                ? "Entrypoint"
+                : "",
+            text: file.modified ? "M" : file.path === entry ? "entrypoint" : "",
           }),
         ),
       );
