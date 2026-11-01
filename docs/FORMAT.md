@@ -242,6 +242,7 @@ Later appends in that process do not reread `events.jsonl`.
 | `kind` | Payload |
 | --- | --- |
 | `config_update` | `config`: the full new config object, not a diff. Emitted only when a later `set_config` changes the canonical JSON. Create does not emit one. |
+| `meta_update` | `fields`: object with the new full values of the meta keys an edit changed (`tags`, `notes`, `group`, `job_type`, `summary`). Written by `agenticml edit`. |
 | `code` | `manifest`: array of `{path, sha256, size, content_type, source, ...}`. `size` is bytes. Extra keys on the caller's manifest entry are kept. |
 | `artifact` | See below. |
 | `resume` | `pid` of the process that reopened the run. |
@@ -613,13 +614,14 @@ total across all keys.
 
 ## Who may write
 
-`RunWriter.create` and `resume` acquire an exclusive, non-blocking
+`RunWriter.create`, `resume`, and `amend` acquire an exclusive, non-blocking
 `fcntl.flock` on `<run_dir>/run.lock` before reading or changing run state.
 They hold the descriptor for the writer's lifetime, releasing it after a
-successful `finish`, on `close`, on failed create/resume, or at process exit.
-`close` releases ownership without marking the run finished. A locked create or
-resume retries ten times over about 0.5 seconds (a reader's shared lock probe
-may be brief), then raises `ValueError("run <id> is open in another process")`.
+successful `finish`, on `close`, on failed create/resume/amend, or at process exit.
+`close` releases ownership without marking the run finished. `amend` does not
+refresh `run.lock`'s mtime. A locked create, resume, or amend retries ten times
+over about 0.5 seconds (a reader's shared lock probe may be brief), then raises
+`RunLockedError("run <id> is open in another process")` (a `ValueError` subclass).
 `layout.try_lock_run(run_dir)` uses the same file and returns a handle or
 `None` if held; `layout.unlock_run(handle)` releases it. GC and prune use
 these helpers to coordinate with resumed writers. Windows uses no-op locks

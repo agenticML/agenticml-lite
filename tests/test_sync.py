@@ -1434,3 +1434,53 @@ def test_sync_snapshots_scalar_sizes_before_requests(tmp_path, server, monkeypat
         assert not state(writer)["complete"]
     finally:
         writer.close()
+
+
+def test_sync_picks_up_cli_edit(tmp_path, server, capsys):
+    writer = make_run(tmp_path)
+    assert sync(tmp_path, writer.run_id) == 0
+    capsys.readouterr()
+    assert main([
+        "edit", writer.run_id,
+        "--tag", "x", "--notes", "edited", "--group", "g1", "--job-type", "eval",
+        "--config", "lr=0.2", "--summary", "best=1",
+        "--dir", str(tmp_path),
+    ]) == 0
+    patches_before = len(server.bodies("/config", "PATCH"))
+    finalizes_before = len(server.bodies("/finalize"))
+    assert sync(tmp_path, writer.run_id) == 0
+    output = capsys.readouterr().out
+    assert "up to date" not in output
+    payload, = server.bodies("/config", "PATCH")
+    assert payload["tags"] == ["x"]
+    assert payload["notes"] == "edited"
+    assert payload["group"] == "g1"
+    assert payload["job_type"] == "eval"
+    assert payload["config"]["lr"] == 0.2
+    assert server.bodies("/finalize")[-1]["summary"]["best"] == 1
+    assert sync(tmp_path, writer.run_id) == 0
+    assert "up to date" in capsys.readouterr().out
+    assert len(server.bodies("/config", "PATCH")) == patches_before + 1
+    assert len(server.bodies("/finalize")) == finalizes_before + 1
+
+
+def test_sync_picks_up_cli_artifact(tmp_path, server):
+    writer = make_run(tmp_path)
+    assert sync(tmp_path, writer.run_id) == 0
+    path = tmp_path / "weights.bin"
+    path.write_bytes(b"weights")
+    assert main(["artifact", "add", writer.run_id, str(path), "--dir", str(tmp_path)]) == 0
+    assert sync(tmp_path, writer.run_id) == 0
+    versions = server.bodies("/artifacts/register-version")
+    assert any(item["name"] == "weights" for item in versions)
+
+
+def test_sync_picks_up_cli_finish(tmp_path, server):
+    writer = make_run(tmp_path, finished=False)
+    assert sync(tmp_path, writer.run_id) == 0
+    writer.close()
+    old = time.time() - 300
+    os.utime(writer.run_dir / "run.lock", (old, old))
+    assert main(["finish", writer.run_id, "--status", "finished", "--dir", str(tmp_path)]) == 0
+    assert sync(tmp_path, writer.run_id) == 0
+    assert server.bodies("/finalize")[-1]["status"] == "finished"

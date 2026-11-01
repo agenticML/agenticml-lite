@@ -35,6 +35,7 @@ from agenticml.store import (
     valid_run_id,
     valid_sha,
 )
+from agenticml.store.layout import RunLockedError
 from agenticml.store.reader import STALE_AFTER_SECONDS
 
 _RUN_ID_RE = re.compile(r"^\d{8}T\d{6}-[0-9a-f]{8}$")
@@ -2237,3 +2238,94 @@ def test_meta_update_serializes_once_and_skips_unchanged_write(tmp_path, monkeyp
     assert len(calls) == 2
     assert path.stat().st_mtime_ns == before
     writer.close()
+
+
+def test_amend_preserves_identity_and_writes_meta_update(tmp_path):
+    writer = RunWriter.create(tmp_path, run_id="done", meta={"tags": ["a"], "notes": "n"})
+    writer.finish("finished", {"best": 0.1})
+    meta_before = json.loads((writer.run_dir / "meta.json").read_text(encoding="utf-8"))
+    lock = writer.run_dir / "run.lock"
+    old = time.time() - 300
+    os.utime(lock, (old, old))
+    before_mtime = lock.stat().st_mtime_ns
+
+    amended = RunWriter.amend(tmp_path, "done")
+    assert amended._meta["status"] == meta_before["status"]
+    assert amended._meta["finished_at"] == meta_before["finished_at"]
+    assert amended._meta["pid"] == meta_before["pid"]
+    assert amended._meta["hostname"] == meta_before["hostname"]
+    amended.set_meta_fields(tags=["a", "b"], notes="nn")
+    amended.record_meta_update({"tags": ["a", "b"], "notes": "nn"})
+    amended.close()
+
+    assert lock.stat().st_mtime_ns == before_mtime
+    meta_after = json.loads((writer.run_dir / "meta.json").read_text(encoding="utf-8"))
+    assert meta_after["status"] == meta_before["status"]
+    assert meta_after["finished_at"] == meta_before["finished_at"]
+    assert meta_after["pid"] == meta_before["pid"]
+    assert meta_after["hostname"] == meta_before["hostname"]
+    assert meta_after["tags"] == ["a", "b"]
+    assert meta_after["notes"] == "nn"
+    events = RunReader(tmp_path, "done").events()
+    assert not any(event.get("kind") == "resume" for event in events)
+    updates = [event for event in events if event.get("kind") == "meta_update"]
+    assert len(updates) == 1
+    assert updates[0]["fields"] == {"tags": ["a", "b"], "notes": "nn"}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows has no-op run locks")
+def test_amend_rejects_open_run(tmp_path):
+    writer = RunWriter.create(tmp_path, run_id="live")
+    with pytest.raises(RunLockedError, match="open in another process"):
+        RunWriter.amend(tmp_path, "live")
+    writer.close()
+
+
+def test_amend_lockless_uses_heartbeat(tmp_path, monkeypatch):
+    import agenticml.store.writer as writer_mod
+    from agenticml.store.layout import try_lock_run as real_try_lock_run
+
+    writer = RunWriter.create(tmp_path, run_id="lockless")
+    writer.close()
+    events_path = writer.run_dir / "events.jsonl"
+    events_path.write_bytes(b'{"kind":"torn"')
+    events_before = events_path.read_bytes()
+    meta_before = (writer.run_dir / "meta.json").read_bytes()
+    os.utime(writer.run_dir / "run.lock", None)
+
+    def unlocked_try_lock(run_dir):
+        handle = real_try_lock_run(run_dir)
+        if handle is not None:
+            handle.locking_supported = False
+        return handle
+
+    monkeypatch.setattr(writer_mod, "try_lock_run", unlocked_try_lock)
+    with pytest.raises(RunLockedError, match="open in another process"):
+        RunWriter.amend(tmp_path, "lockless")
+    assert events_path.read_bytes() == events_before
+    assert (writer.run_dir / "meta.json").read_bytes() == meta_before
+
+    old = time.time() - (STALE_AFTER_SECONDS + 30)
+    os.utime(writer.run_dir / "run.lock", (old, old))
+    amended = RunWriter.amend(tmp_path, "lockless")
+    amended.close()
+    assert json.loads((writer.run_dir / "meta.json").read_text(encoding="utf-8"))["status"] == "running"
+
+
+def test_amend_missing_and_pruned(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        RunWriter.amend(tmp_path, "missing-run")
+    writer = RunWriter.create(tmp_path, run_id="pruned", meta={"notes": "before"})
+    writer.write_scalars([(step, {"loss": float(step)}) for step in range(_OVW_SERIES)])
+    writer.finish("finished", {"best": 1})
+    ovw = writer.run_dir / "scalars" / "0.ovw"
+    blob = ovw.read_bytes()
+    (writer.run_dir / "scalars" / "0.bin").unlink()
+    amended = RunWriter.amend(tmp_path, "pruned")
+    amended.set_meta_fields(notes="after")
+    amended.record_meta_update({"notes": "after"})
+    amended.close()
+    meta = RunReader(tmp_path, "pruned").meta()
+    assert meta["notes"] == "after"
+    assert meta["status"] == "finished"
+    assert ovw.read_bytes() == blob

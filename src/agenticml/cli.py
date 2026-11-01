@@ -10,6 +10,7 @@ agenticml code in the script:
 
 `agenticml show` inspects a local run; `agenticml export` dumps its metric series.
 `agenticml sync` incrementally uploads local runs to a server.
+`agenticml edit`, `artifact`, `finish`, and `note` update a finished run.
 """
 
 from __future__ import annotations
@@ -27,8 +28,8 @@ from pathlib import Path
 
 from .code_tracking import _normalize_task
 from .launch import (
-    LaunchError, RunSettings, Target, parse_log_every, parse_positive_float,
-    parse_positive_int, parse_resume, run_target,
+    LaunchError, RunSettings, Target, parse_config_pair, parse_json_value, parse_log_every,
+    parse_positive_float, parse_positive_int, parse_resume, run_target,
 )
 from .store.layout import valid_run_id
 
@@ -61,6 +62,38 @@ def cmd_whoami(args):
     from .auth import cmd_whoami as whoami
     try:
         return whoami(args)
+    except KeyboardInterrupt:
+        return 130
+
+
+def cmd_edit(args):
+    from .amend import cmd_edit as edit
+    try:
+        return edit(args)
+    except KeyboardInterrupt:
+        return 130
+
+
+def cmd_artifact(args):
+    from .amend import cmd_artifact as artifact
+    try:
+        return artifact(args)
+    except KeyboardInterrupt:
+        return 130
+
+
+def cmd_finish(args):
+    from .amend import cmd_finish as finish
+    try:
+        return finish(args)
+    except KeyboardInterrupt:
+        return 130
+
+
+def cmd_note(args):
+    from .amend import cmd_note as note
+    try:
+        return note(args)
     except KeyboardInterrupt:
         return 130
 
@@ -717,21 +750,6 @@ class _UsageError(Exception):
     pass
 
 
-class _NonFiniteConfigValue(ValueError):
-    pass
-
-
-def _reject_config_constant(value):
-    raise _NonFiniteConfigValue("must not be NaN or Infinity")
-
-
-def _parse_config_float(value):
-    result = float(value)
-    if not math.isfinite(result):
-        _reject_config_constant(value)
-    return result
-
-
 def _is_python_executable(token: str) -> bool:
     return bool(_PYTHON_NAME.match(os.path.basename(token)))
 
@@ -793,17 +811,11 @@ def _parse_run_options(args):
                 except ValueError as exc:
                     raise _UsageError(str(exc)) from None
             elif attr == "config":
-                key, equals, item = value.partition("=")
-                if not equals or not key:
-                    raise _UsageError("--config expects KEY=VALUE with a non-empty key")
                 try:
-                    config_pairs[key] = json.loads(
-                        item, parse_constant=_reject_config_constant, parse_float=_parse_config_float,
-                    )
-                except _NonFiniteConfigValue:
-                    raise _UsageError(f"--config value for {key!r} must not be NaN or Infinity") from None
-                except (ValueError, RecursionError):
-                    config_pairs[key] = item
+                    key, item = parse_config_pair(value, "--config")
+                except ValueError as exc:
+                    raise _UsageError(str(exc)) from None
+                config_pairs[key] = item
                 continue
             elif attr == "config_file":
                 config_file = value
@@ -836,11 +848,11 @@ def _parse_run_options(args):
         raise _UsageError("--resume needs --id")
     if config_file is not None:
         try:
-            config = json.loads(
+            config = parse_json_value(
                 Path(config_file).read_text(encoding="utf-8"),
-                parse_constant=_reject_config_constant, parse_float=_parse_config_float,
+                "",
             )
-        except (OSError, ValueError, RecursionError) as exc:
+        except (OSError, ValueError) as exc:
             raise _UsageError(f"cannot read config file {config_file!r}: {exc}") from None
         if not isinstance(config, dict):
             raise _UsageError(f"config file {config_file!r} must contain a JSON object")
@@ -1047,6 +1059,57 @@ def main(argv=None):
     p_whoami.add_argument("--offline", action="store_true", help="Skip server verification")
     p_whoami.add_argument("--insecure", action="store_true", help="Allow http:// to a non-local host")
     p_whoami.set_defaults(func=cmd_whoami)
+
+    p_edit = sub.add_parser("edit", help="Change tags, notes, group, job type, config, or summary on a finished run")
+    p_edit.add_argument("run_id")
+    p_edit.add_argument("--dir", default=None, help="Local root (default: AGENTICML_DIR or ~/.agenticml)")
+    p_edit.add_argument("--tag", action="append", default=None, metavar="T", help="Add a tag if absent; repeatable")
+    p_edit.add_argument("--untag", action="append", default=None, metavar="T", help="Remove a tag if present; repeatable")
+    p_edit.add_argument("--notes", default=None, help="Set the launch note (\"\" clears it)")
+    p_edit.add_argument("--group", default=None, metavar="NAME", help="Set the run group (cannot be cleared)")
+    p_edit.add_argument("--job-type", default=None, dest="job_type", metavar="NAME",
+                        help="Set the job type (cannot be cleared)")
+    p_edit.add_argument("--config", action="append", default=None, metavar="KEY=VALUE",
+                        help="Merge a config value; repeatable (JSON value or raw string)")
+    p_edit.add_argument("--summary", action="append", default=None, metavar="KEY=VALUE",
+                        help="Merge a summary value; repeatable (JSON value or raw string)")
+    p_edit.add_argument("--unset-summary", action="append", default=None, dest="unset_summary", metavar="KEY",
+                        help="Remove a summary key; repeatable")
+    p_edit.set_defaults(func=cmd_edit)
+
+    p_artifact = sub.add_parser("artifact", help="Record an artifact on a finished run")
+    artifact_sub = p_artifact.add_subparsers(dest="artifact_cmd", required=True)
+    p_artifact_add = artifact_sub.add_parser("add", help="Record a file as an artifact")
+    p_artifact_add.add_argument("run_id")
+    p_artifact_add.add_argument("path")
+    p_artifact_add.add_argument("--name", default=None, help="Artifact name (default: file stem)")
+    p_artifact_add.add_argument("--type", default="file", help="Artifact type (default: file)")
+    p_artifact_add.add_argument("--metadata", default=None, help="JSON object of extra metadata")
+    p_artifact_add.add_argument("--copy", action="store_true", help="Copy bytes into the object store")
+    p_artifact_add.add_argument("--dir", default=None, help="Local root (default: AGENTICML_DIR or ~/.agenticml)")
+    p_artifact_add.set_defaults(func=cmd_artifact)
+
+    p_finish = sub.add_parser("finish", help="Set the final status of a dead run")
+    p_finish.add_argument("run_id")
+    p_finish.add_argument("--status", required=True, choices=["finished", "crashed"],
+                          help="Final status")
+    p_finish.add_argument("--dir", default=None, help="Local root (default: AGENTICML_DIR or ~/.agenticml)")
+    p_finish.set_defaults(func=cmd_finish)
+
+    p_note = sub.add_parser(
+        "note",
+        help="Read or write the local dashboard notepad (not synced)",
+        description="Read or write the local notepad shown in the dashboard; not synced.",
+    )
+    p_note.add_argument("run_id")
+    p_note.add_argument("--dir", default=None, help="Local root (default: AGENTICML_DIR or ~/.agenticml)")
+    note_src = p_note.add_mutually_exclusive_group()
+    note_src.add_argument("--set", dest="note_text", default=None, metavar="TEXT",
+                          help="Replace the notepad text")
+    note_src.add_argument("--file", dest="note_file", default=None, metavar="PATH",
+                          help="Read notepad text from PATH ('-' = stdin)")
+    note_src.add_argument("--clear", action="store_true", help="Clear the notepad")
+    p_note.set_defaults(func=cmd_note)
 
     args = parser.parse_args(argv)
     if args.cmd == "run":

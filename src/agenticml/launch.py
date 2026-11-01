@@ -10,6 +10,7 @@ from __future__ import annotations
 import builtins
 import importlib.machinery
 import importlib.util
+import json
 import logging
 import math
 import os
@@ -172,6 +173,58 @@ def parse_resume(raw: str) -> str:
     if value not in {"never", "allow", "must"}:
         raise ValueError("--resume must be never, allow, or must")
     return value
+
+
+class NonFiniteJSONError(ValueError):
+    """JSON contained NaN or Infinity."""
+
+
+def _reject_config_constant(value):
+    raise NonFiniteJSONError("must not be NaN or Infinity")
+
+
+def _parse_config_float(value):
+    result = float(value)
+    if not math.isfinite(result):
+        _reject_config_constant(value)
+    return result
+
+
+def parse_json_value(raw, option):
+    """Parse ``raw`` as JSON, rejecting NaN and Infinity.
+
+    ``option`` is included in the ``NonFiniteJSONError``. Invalid JSON and
+    ``RecursionError`` raise ``ValueError``.
+    """
+    try:
+        return json.loads(
+            raw, parse_constant=_reject_config_constant, parse_float=_parse_config_float,
+        )
+    except NonFiniteJSONError:
+        prefix = f"{option} " if option else ""
+        raise NonFiniteJSONError(f"{prefix}must not be NaN or Infinity") from None
+    except RecursionError as exc:
+        raise ValueError(str(exc)) from None
+
+
+def parse_config_pair(raw: str, option: str):
+    """Parse ``KEY=VALUE``. JSON when possible; otherwise the raw string.
+
+    Split on the first ``=``. The key must be non-empty. The value is
+    ``json.loads``'d with NaN, Infinity, and overflow rejected; a value
+    that is not JSON (including one that overflows the recursion limit)
+    is kept as a string.
+    """
+    key, equals, item = raw.partition("=")
+    if not equals or not key:
+        raise ValueError(f"{option} expects KEY=VALUE with a non-empty key")
+    try:
+        value = parse_json_value(item, f"{option} value for {key!r}")
+    except NonFiniteJSONError:
+        raise
+    except ValueError:
+        value = item
+    return key, value
 
 
 @dataclass
