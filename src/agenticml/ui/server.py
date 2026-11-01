@@ -948,6 +948,9 @@ def _lineage_changes(root, run_id, meta):
 class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # The default backlog of 5 makes macOS reset a burst of parallel fetches
+    # (Linux queues the SYNs instead).
+    request_queue_size = 64
 
     def __init__(self, root, host, port, read_only=False):
         self.root = layout.resolve_root(root)

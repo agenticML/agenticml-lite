@@ -54,8 +54,9 @@ agenticml = "agenticml.cli:main"
 
 [project.urls]
 Homepage = "https://agenticml.xyz"
-Source   = "https://github.com/agenticML/agenticml"
-Issues   = "https://github.com/agenticML/agenticml/issues"
+Documentation = "https://agenticml.github.io/agenticml-lite/"
+Source   = "https://github.com/agenticML/agenticml-lite"
+Issues   = "https://github.com/agenticML/agenticml-lite/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

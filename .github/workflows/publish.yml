@@ -1,0 +1,61 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # A v* tag must match the version in pyproject.toml and __init__.py,
+      # since PyPI never lets a version be uploaded twice.
+      - name: Check tag matches package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pyproject=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          init=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' src/agenticml/__init__.py)
+          echo "tag=$tag pyproject=$pyproject __init__=$init"
+          test "$tag" = "$pyproject" && test "$tag" = "$init"
+
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Verify metadata
+        run: |
+          pip install twine
+          twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/agenticml-lite
+    permissions:
+      id-token: write   # required for PyPI Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish via OIDC
+        uses: pypa/gh-action-pypi-publish@release/v1

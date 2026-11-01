@@ -4,27 +4,19 @@ Unfinished work, highest priority first. See [AGENTS.md](AGENTS.md) for how
 these are prioritized. When a task is done, delete its entry in the same
 change that finishes it.
 
-## Fix tests that fail on `main` and the silently skipped browser tests
+## Deliver the note PUT 408 before closing on macOS
 
-- **Where:** `tests/test_ui.py`, `tests/test_ui_limits.py`,
-  `testbed/tests/test_dashboard.py`, `testbed/tests/conftest.py`.
-- **Problem:** on macOS these fail on commit 353a91b, before any other change:
-  `test_put_notes_trickled_body_hits_absolute_deadline`,
-  `test_nonreading_clients_are_evicted_when_full`,
-  `test_slow_writer_is_not_evicted_below_capacity` (socket timing), and
-  `test_notepad_formatting_and_retry`,
-  `test_notepad_blank_lines_undo_and_mobile_enter` (undo after a formatting
-  change leaves `*word*` / `- [ ] \nabc`; the tests press `Control+z`, which
-  is likely a no-op on macOS where undo is Cmd+Z, so try `ControlOrMeta+z`).
-  Separately, `conftest.py` defaults
-  `PLAYWRIGHT_BROWSERS_PATH` to `~/.cache/ms-playwright`, but on macOS
-  Playwright installs to `~/Library/Caches/ms-playwright`, so about 137
-  browser tests are skipped as "Chromium cannot launch" instead of running.
-- **Fix:** only set `PLAYWRIGHT_BROWSERS_PATH` when that directory exists (or
-  leave Playwright's default), then fix or loosen the five tests.
-- **Done when:** `testbed/.venv/bin/python -m pytest -q tests` and
-  `.venv/bin/python -m pytest -q -m ui` (from `testbed/`) pass on macOS with
-  no Chromium skips.
+- **Where:** `src/agenticml/ui/server.py` (the `TimeoutError` branch of the
+  notes PUT that sends 408) and
+  `tests/test_ui.py::test_put_notes_trickled_body_hits_absolute_deadline`.
+- **Problem:** the server closes the socket right after the 408 while the
+  client is still trickling body bytes. Closing with unread input makes macOS
+  send a reset, so the client gets `ConnectionResetError` and never sees the
+  408. The test fails on every macOS run.
+- **Fix:** after the 408, `shutdown(SHUT_WR)` and drain input for a short,
+  bounded time (lingering close) before closing, without letting the drain
+  hold a connection slot past the existing deadlines.
+- **Done when:** `pytest -q tests` passes repeatedly on macOS and in CI.
 
 ## Send `task` and `arch` when syncing a run
 

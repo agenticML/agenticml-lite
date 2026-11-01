@@ -2,6 +2,8 @@
 
 agenticml-lite is a local-first experiment tracker. Training writes metrics, config, code, and media to files on disk, and `agenticml ui` serves a TensorBoard-style dashboard from those files. There is no server, database, or Docker image to run. Upload to [AgenticML](https://agenticml.xyz) is optional, with `agenticml login` and `agenticml sync`. Install the package as `agenticml-lite` and import it as `agenticml`. The API is pre-alpha (`0.1.0.dev0`).
 
+Documentation: <https://agenticml.github.io/agenticml-lite/>
+
 ## Install
 
 ```bash
@@ -220,6 +222,20 @@ agenticml.init(project="demo", name="exp1", id=run_id, resume="allow")
 pip install -e ".[dev]"
 pytest
 python scripts/bench.py --quick
+```
+
+## Releasing
+
+GitHub Actions publishes to PyPI with Trusted Publishing (no API tokens).
+
+- **TestPyPI dry run:** run the "Publish to TestPyPI" workflow by hand from the Actions tab. Re-running with a version that is already there is a no-op.
+- **PyPI:** push a `v*` tag. The workflow fails if the tag does not match the version in `pyproject.toml` and `src/agenticml/__init__.py`.
+
+```bash
+# bump version in pyproject.toml and src/agenticml/__init__.py
+git commit -am "release: v0.1.0"
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
 ## License

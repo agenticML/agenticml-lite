@@ -172,7 +172,8 @@ def limit_send_buffer(httpd, monkeypatch):
     monkeypatch.setattr(httpd, 'get_request', get_request)
 
 
-def large_object(httpd, size=128 * 1024):
+def large_object(httpd, size=8 * 1024 * 1024):
+    # Big enough that macOS loopback buffers cannot absorb the whole response.
     sha = 'a' * 64
     directory = httpd.root / 'objects' / sha[:2]
     directory.mkdir(parents=True, exist_ok=True)
