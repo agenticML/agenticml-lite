@@ -33,7 +33,7 @@ from .distributed import get_rank, is_main_process
 from .media import Image
 from .run import Run
 
-__version__ = "0.1.0.dev0"
+__version__ = "1.0.0"
 
 __all__ = [
     "Image",
