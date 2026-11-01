@@ -49,7 +49,21 @@ Loss is unscaled under `GradScaler` and averaged over gradient-accumulation step
 
 ## Options and environment variables
 
-`--project`, `--name`, `--tags`, `--notes`, `--group`, `--job-type`, `--mode`, `--dir`, and `--log-every` each read a matching `AGENTICML_*` variable, for example `AGENTICML_PROJECT`. `--task` sets the run's task and overrides `AGENTICML_TASK`. Run `agenticml run -h` for the full list.
+`--project`, `--name`, `--tags`, `--notes`, `--group`, `--job-type`, `--mode`, `--dir`, and `--log-every` each read a matching `AGENTICML_*` variable, for example `AGENTICML_PROJECT`. `--task` sets the run's task and overrides `AGENTICML_TASK`. `--parent RUN_ID` reads `AGENTICML_PARENT`. Run `agenticml run -h` for the full list.
+
+## Lineage parent and task
+
+`--parent RUN_ID` (or `--parent=RUN_ID`, or env `AGENTICML_PARENT`) sets an explicit lineage parent for the new run. The CLI value wins over the env var. An invalid run id is a usage error (exit 2). `--parent` applies only to new runs: a resumed run keeps its stored parent and warns if `--parent` differs.
+
+```bash
+agenticml run --parent <RUN_ID> train.py
+```
+
+Without `--task` (and without a valid `AGENTICML_TASK`), the new run inherits the parent's task, so it shows up in the parent's lane in the lineage graph. The dashboard labels such lanes "from parent run". Task precedence: `--task` > `AGENTICML_TASK` > the parent's task > an `agenticml.toml` `task` > the entry script's folder.
+
+If `--task` or `AGENTICML_TASK` differs from the parent's task, the run still starts and logs this warning to stderr: `run task 'b' differs from parent run '<RUN_ID>' task 'a'; the lineage link crosses tasks`. This applies only when the parent can be read, is in the same project, and has a task. `--allow-cross-task` or `AGENTICML_ALLOW_CROSS_TASK=1` silences that warning when the cross-task link is intended. In Python, `agenticml.init(parent_run_id=..., task=..., allow_cross_task=True)` does the same.
+
+A missing or unreadable parent is still recorded, with a warning. A parent in another project is recorded, but its task is not inherited.
 
 ## Exit status
 
