@@ -62,8 +62,20 @@ export class MetricChart {
             (l.right - l.left),
         ),
       );
-      this.hoverX = f;
-      this.options.onHover?.(l.minStep + f * (l.maxStep - l.minStep));
+      let x = l.minStep + f * (l.maxStep - l.minStep);
+      if (this.options.snap && l.xs.length) {
+        x = l.xs.reduce((best, value) =>
+          Math.abs(value - x) < Math.abs(best - x) ? value : best,
+        );
+        this.hoverX = l.maxStep === l.minStep ? 0.5 : (x - l.minStep) / (l.maxStep - l.minStep);
+      } else this.hoverX = f;
+      const fy = (e.clientY - canvas.getBoundingClientRect().top - l.top) / (l.bottom - l.top);
+      const y = l.maxVal - Math.min(1, Math.max(0, fy)) * (l.maxVal - l.minVal);
+      this.options.onHover?.(x, {
+        clientX: e.clientX,
+        clientY: e.clientY,
+        value: this.options.log ? 10 ** y : y,
+      });
       this.paintOverlay?.();
     };
     this.leave = () => {
@@ -99,7 +111,13 @@ export class MetricChart {
       xLabel = "step",
       ghostRaw = false,
       dashed = [],
+      log = false,
+      rawAlpha = null,
+      epochs = [],
+      xFormat = null,
     } = this.options;
+    // Log scale plots log10 of positive values; others become gaps.
+    const ty = (v) => (v == null ? null : log ? (v > 0 ? Math.log10(v) : null) : v);
     this.layout = null;
     this.paintOverlay = null;
     const PAD_ = compact ? PAD_COMPACT : PAD;
@@ -168,8 +186,8 @@ export class MetricChart {
         );
         return {
           run,
-          raw,
-          points: raw.map((p, i) => ({ step: p.step, value: sm[i] })),
+          raw: raw.map((p) => ({ step: p.step, value: ty(p.value) })),
+          points: raw.map((p, i) => ({ step: p.step, value: ty(sm[i]) })),
         };
       })
       .filter((s) => s.points.some((point) => point.value != null));
@@ -211,6 +229,20 @@ export class MetricChart {
     const pH = H - PAD_.top - PAD_.bottom;
 
     drawGrid();
+
+    // Faint epoch boundaries behind the lines.
+    ctx.save();
+    ctx.strokeStyle = tk.grid;
+    ctx.setLineDash([2, 3]);
+    for (const x of epochs) {
+      if (!(x > minStep && x < maxStep)) continue;
+      const px = scale(x, minStep, maxStep, PAD_.left, PAD_.left + pW);
+      ctx.beginPath();
+      ctx.moveTo(px, PAD_.top);
+      ctx.lineTo(px, PAD_.top + pH);
+      ctx.stroke();
+    }
+    ctx.restore();
 
     const sx = (step) =>
       scale(step, minStep, maxStep, PAD_.left, PAD_.left + pW);
@@ -285,7 +317,7 @@ export class MetricChart {
         ctx.save();
         // A lone run shows its raw samples in the ghost colour under the EMA.
         if (ghostRaw && single) ctx.strokeStyle = tk.ghost;
-        ctx.globalAlpha = ghostRaw && single ? 1 : 0.22;
+        ctx.globalAlpha = rawAlpha ?? (ghostRaw && single ? 1 : 0.22);
         stroke(segments(s.raw));
         ctx.restore();
       }
@@ -307,7 +339,17 @@ export class MetricChart {
       ctx.stroke();
     }
 
-    this.layout = { left: PAD_.left, right: W - PAD_.right, minStep, maxStep };
+    this.layout = {
+      left: PAD_.left,
+      right: W - PAD_.right,
+      top: PAD_.top,
+      bottom: PAD_.top + pH,
+      minStep,
+      maxStep,
+      minVal,
+      maxVal,
+      xs: [...new Set(series.flatMap((s) => s.raw.map((p) => p.step)))].sort((a, b) => a - b),
+    };
     // Axis labels stay mono. Every grid line carries its value; compact
     // cards label the extremes and the midpoint only.
     ctx.fillStyle = tk.text3;
@@ -318,7 +360,7 @@ export class MetricChart {
       // A flat series sits mid-plot; label that line once.
       if (minVal === maxVal ? i !== 2 : compact && i % 2) continue;
       const value = maxVal - ((maxVal - minVal) * i) / 4;
-      ctx.fillText(formatTick(value), PAD_.left - 8, PAD_.top + (pH * i) / 4);
+      ctx.fillText(formatTick(log ? 10 ** value : value), PAD_.left - 8, PAD_.top + (pH * i) / 4);
     }
     ctx.textBaseline = "alphabetic";
     const ticks = compact || maxStep === minStep ? 1 : Math.max(1, Math.min(6, Math.floor(pW / 110)));
@@ -327,7 +369,7 @@ export class MetricChart {
       const step = minStep + ((maxStep - minStep) * i) / ticks;
       ctx.textAlign = i === 0 ? "left" : i === ticks ? "right" : "center";
       ctx.fillText(
-        xLabel === "step" ? formatNumber(Math.round(step)) : formatTick(step),
+        xFormat ? xFormat(step) : xLabel === "step" ? formatNumber(Math.round(step)) : formatTick(step),
         i === 0 ? PAD_.left : i === ticks ? W - PAD_.right : sx(step),
         tickY,
       );

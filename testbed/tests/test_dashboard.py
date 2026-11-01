@@ -9,7 +9,6 @@ from datetime import datetime, timezone
 
 import pytest
 from agenticml.store import RunWriter
-from agenticml.store.notes import write_note
 from agenticml.store.reader import RunReader
 
 pytest.importorskip("playwright.sync_api")
@@ -123,7 +122,7 @@ def test_home_lists_every_run(page, ui_server):
     home(page, ui_server)
     expect(page.locator(".run-row")).to_have_count(5)
     expect(page.locator(".poll-status")).to_have_text("5 runs")
-    expect(page.locator(".runs-summary")).to_have_text(re.compile(r"^5 runs · 2 projects · last finished "))
+    expect(page.locator(".runs-summary")).to_have_text("5 runs · 2 projects · 2 tasks")
     # Pure-Python zero-code training logs no metrics, and its status says so.
     for name, status, project in (("explicit-baseline", "done", "testbed"), ("explicit-highlr", "done", "testbed"), ("zero-code", "done · no metrics", "testbed"), ("crashed", "crashed", "testbed"), ("other-project", "done", "other-project")):
         run = row(page, name)
@@ -164,11 +163,8 @@ def test_long_path_run_names_fit_mobile(page, tmp_path, ui_server_factory):
         home(page, server)
         for name in names:
             expect(row(page, name).locator(".run-name")).to_have_attribute("title", name)
-        node = page.locator(f'.lineage-node[data-run-id="{ids[1]}"]')
-        expect(node).to_be_visible()
-        expect(node.locator(":scope > title")).to_contain_text(names[1])
-        node.click()
-        expect(page.locator(".lineage-detail")).to_contain_text(names[0])
+        expect(page.locator(".task-strip-dot")).to_have_count(2)
+        expect(page.locator(f'.task-strip-dot[title="{names[1]}"]')).to_have_count(1)
         assert_no_overflow()
         for name in names:
             page.get_by_role("checkbox", name=f"Select {name}", exact=True).check()
@@ -206,12 +202,10 @@ def test_project_filter_and_search(page, ui_server):
 
 @pytest.mark.parametrize("width", [375, 1400])
 def test_selection_bar_and_compare_navigation(page, ui_server, width):
-    # Keep the notebook, selection bar, and both target rows in view so these
-    # geometry assertions measure layout changes rather than automatic scrolling.
-    page.add_init_script("localStorage.setItem('agenticml-notebook-open','false')")
-    page.set_viewport_size({"width": width, "height": 1400})
+    # Keep the selection bar and both target rows in view so these geometry
+    # assertions measure layout changes rather than automatic scrolling.
+    page.set_viewport_size({"width": width, "height": 1800})
     home(page, ui_server)
-    expect(page.locator(".notebook summary")).not_to_contain_text("loading")
     bar = page.get_by_test_id("selection-bar")
     expect(bar).to_be_visible()
     expect(bar).to_have_text("Select two or more runs to overlay their curves and diff their configs.", use_inner_text=True)
@@ -363,15 +357,19 @@ def test_canvas_charts_compare_smoothing_filter_and_focus(page, ui_server):
         expected = sorted(key for key in all_keys if query.lower() in key.lower())
         assert sorted(page.locator(".chart-card").evaluate_all("nodes => nodes.map(el => el.dataset.key)")) == expected
     page.get_by_label("Filter metric keys", exact=True).fill("")
+    # A chart opens the metrics workspace with that chart enlarged.
     loss(page).click()
-    overlay = page.locator(".chart-focus")
+    overlay = page.locator(".ws")
     expect(overlay).to_be_visible()
-    expect(overlay.get_by_role("heading", name="train/loss", exact=True)).to_be_visible()
-    full_canvas = overlay.locator("canvas")
+    card = overlay.locator('.ws-card[data-key="train/loss"]')
+    expect(card).to_have_class(re.compile(r"\bis-wide\b"))
+    expect(overlay.locator(".ws-run input:checked")).to_have_count(len(COMPARE_RUNS))
+    full_canvas = card.locator("canvas")
     painted(full_canvas)
     box = full_canvas.bounding_box()
     page.mouse.move(box["x"] + box["width"] * .5, box["y"] + 100)
-    expect(overlay.get_by_test_id("hover-table")).to_contain_text("Step · hover")
+    expect(card.locator(".ws-tip")).to_contain_text("Smoothed")
+    expect(card.locator(".ws-tip .ws-tip-name")).to_have_count(len(COMPARE_RUNS))
     assert any(s["dash"] == [3, 3] for s in full_canvas.evaluate("el => el.__draw.strokes"))
     page.keyboard.press("Escape")
     expect(overlay).to_have_count(0)
@@ -407,7 +405,6 @@ def test_theme_cycles_persists_and_repaints_chart(page, ui_server):
 
 def test_back_and_forward_and_route_cancellation(page, ui_server):
     home(page, ui_server)
-    # The notebook lists the same run, so the row link is the one that navigates from the list.
     row(page, "explicit-baseline").locator(".run-name").click()
     expect(page.get_by_role("heading", name="explicit-baseline", exact=True)).to_be_visible()
     page.go_back()
@@ -418,7 +415,7 @@ def test_back_and_forward_and_route_cancellation(page, ui_server):
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
     page.evaluate("id => { location.hash = '#/run/' + id; setTimeout(() => { location.hash = '#/'; }, 5); }", ui_server.runs["explicit-highlr"])
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
-    expect(page.locator(".code-full, .chart-focus")).to_have_count(0)
+    expect(page.locator(".code-full, .ws")).to_have_count(0)
 
 
 @pytest.mark.parametrize(("run_id", "status"), [("unknown-valid-id", 404), (".hidden", 400)])
@@ -512,8 +509,12 @@ def test_live_chart_retains_controls_and_open_focus(page, tmp_path, ui_server_fa
             expect(loss(page).locator("[data-points]")).to_have_attribute("data-points", "5", timeout=LIVE_TIMEOUT)
             assert original_canvas.evaluate("el => el.isConnected")
             expect(page.locator('.chart-card[data-key="train/extra"] [data-points]')).to_have_attribute("data-points", "1")
-            expect(page.locator(".chart-focus")).to_be_visible()
-            expect(page.locator(".chart-focus [data-testid=hover-table]")).to_contain_text("0.1")
+            workspace = page.locator(".ws")
+            expect(workspace).to_be_visible()
+            expect(workspace.locator('.ws-card[data-key="train/extra"]')).to_be_visible()
+            box = workspace.locator('.ws-card[data-key="train/loss"] canvas').bounding_box()
+            page.mouse.move(box["x"] + box["width"] - 12, box["y"] + box["height"] / 2)
+            expect(workspace.locator('.ws-card[data-key="train/loss"] .ws-tip')).to_contain_text("0.1")
             page.keyboard.press("Escape")
             expect(page.get_by_label("EMA smoothing", exact=True)).to_have_value("0.9")
             expect(page.get_by_label("Filter metric keys", exact=True)).to_have_value("train/")
@@ -1214,8 +1215,6 @@ def mock_dashboard(page, runs):
         path = urlsplit(route.request.url).path
         if path == "/api/runs":
             body = runs
-        elif path == "/api/notes":
-            body = {"notes": [], "truncated": False, "writable": True}
         elif path == "/api/compare/code":
             body = {"files": [], "summary": dict(added=0, removed=0, modified=0, unchanged=0,
                                                 lines_added=0, lines_deleted=0), "truncated": False}
@@ -1227,9 +1226,7 @@ def mock_dashboard(page, runs):
             run_id = unquote(parts[0])
             run = next(run for run in runs if run["run_id"] == run_id)
             suffix = parts[1] if len(parts) > 1 else ""
-            body = {"scalars": {"series": {}}, "media": {}, "code": [],
-                    "notes": {"text": "", "revision": None, "updated_at": None,
-                              "writable": True}}.get(suffix, run)
+            body = {"scalars": {"series": {}}, "media": {}, "code": []}.get(suffix, run)
         route.fulfill(content_type="application/json", body=json.dumps(body))
 
     page.route("**/api/**", respond)
@@ -1292,7 +1289,10 @@ def test_project_headline_deltas_follow_lineage_parent(page, ui_server):
         run.update(name=run["run_id"], project="test", status="finished", keys=[])
     mock_dashboard(page, runs)
     home(page, ui_server)
+    assert page.locator(".run-row").evaluate_all("nodes => nodes.map(el => el.dataset.runId)") == ["flat", "new", "same-date", "middle", "old"]
+    page.get_by_role("button", name="Show 1 more", exact=True).click()
     assert page.locator(".run-row").evaluate_all("nodes => nodes.map(el => el.dataset.runId)") == ["flat", "new", "same-date", "middle", "old", "invalid"]
+    expect(page.get_by_role("button", name="Show latest 5 only", exact=True)).to_be_visible()
     # "middle" has a parent but never logged the headline metric; "old" is a root.
     expect(row(page, "middle").locator(".run-number").first).to_have_text("—")
     expect(row(page, "middle").locator(".run-delta")).to_have_text("—")
@@ -1319,7 +1319,7 @@ def test_long_values_are_contained_and_short_subtitles_have_titles(page, ui_serv
     subtitle = row(page, "run 0").locator(".run-varied")
     assert long not in subtitle.inner_text()
     assert subtitle.get_attribute("title") == subtitle.inner_text()
-    assert subtitle.evaluate("el => el.scrollWidth > el.clientWidth && getComputedStyle(el).whiteSpace === 'nowrap'")
+    assert subtitle.evaluate("el => getComputedStyle(el).whiteSpace === 'nowrap' && getComputedStyle(el).textOverflow === 'ellipsis' && getComputedStyle(el).overflowX === 'hidden'")
     header = page.locator(".run-columns .run-number").first
     expect(header).to_have_attribute("title", "best_val_accuracy_metric_with_a_long_name")
     for route in ("", "#/run/0", "#/compare?runs=0&runs=1"):
@@ -1553,78 +1553,6 @@ def test_code_content_length_is_rejected_before_reading(page, tmp_path, ui_serve
         assert page.evaluate("!bodyRead && downloadAborted")
 
 
-def test_lineage_graph_selects_and_opens_run(page, tmp_path, ui_server_factory):
-    root = tmp_path / "lineage-ui"
-    names = ("root-run", "child-run", "leaf-run")
-    writers = []
-    for name in names:
-        writer = RunWriter.create(root, meta={"name": name, "project": "demo", "tags": ["graph"]})
-        writer.finish("finished")
-        writers.append(writer)
-    ids = [writer.run_id for writer in writers]
-    stamps = (
-        "2026-10-27T00:00:00.000000Z",
-        "2026-10-27T00:01:00.000000Z",
-        "2026-10-27T00:02:00.000000Z",
-    )
-    parents = (None, ids[0], ids[1])
-    inferences = (None, "explicit", "repo_root")
-    shared_tree = "ab" * 20
-    for index, run_id in enumerate(ids):
-        path = root / "runs" / run_id / "meta.json"
-        meta = json.loads(path.read_text())
-        meta["created_at"] = stamps[index]
-        meta["parent_run_id"] = parents[index]
-        meta["lineage"] = {
-            "version": 1,
-            "commit": f"{index + 1:040x}",
-            "tree": shared_tree if index else "cd" * 20,
-            "parent_commit": None if index == 0 else f"{index:040x}",
-            "parent_run_id": parents[index],
-            "parent_inference": inferences[index],
-            "project_key": "demo-0123abcd",
-            "repo_root": "/tmp/demo",
-            "base_commit": "abc1234",
-            "base_branch": "main",
-            "base_dirty": index == 2,
-            "error": None,
-        }
-        path.write_text(json.dumps(meta))
-    with ui_server_factory(root) as server:
-        page.set_viewport_size({"width": 375, "height": 812})
-        home(page, server)
-        expect(page.locator(".run-row")).to_have_count(3)
-        expect(page.locator(".lineage-node")).to_have_count(3)
-        expect(page.locator(".lineage-edge")).to_have_count(2)
-        expect(page.locator(".lineage-edge.is-inferred")).to_have_count(1)
-        suffix = ids[1].rsplit("-", 1)[-1]
-        node_label = page.locator(".lineage-node", has_text="child-run")
-        visible_id = node_label.locator(".lineage-meta").evaluate(
-            "el => el.childNodes[0] ? el.childNodes[0].nodeValue : el.textContent"
-        )
-        assert visible_id.split(" · ", 1)[0] == f"run {suffix}"
-        assert ids[1] in node_label.get_attribute("aria-label")
-        assert ids[1] in node_label.locator("title").first.text_content()
-        overflow = page.evaluate(
-            "Math.max(document.documentElement.scrollWidth - document.documentElement.clientWidth, document.body.scrollWidth - document.body.clientWidth)"
-        )
-        assert overflow <= 0, f"lineage view scrolls horizontally by {overflow}px"
-        page.reload()
-        expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
-        expect(page.locator(".lineage-node")).to_have_count(3)
-        node = page.locator(".lineage-node", has_text="child-run")
-        node.click()
-        expect(page.get_by_test_id("selection-bar")).to_contain_text("1 run selected")
-        expect(node).to_have_attribute("data-picked", "true")
-        expect(page.locator(".lineage-detail")).to_contain_text("agenticml lineage checkout")
-        overflow = page.evaluate(
-            "Math.max(document.documentElement.scrollWidth - document.documentElement.clientWidth, document.body.scrollWidth - document.body.clientWidth)"
-        )
-        assert overflow <= 0, f"lineage detail scrolls horizontally by {overflow}px"
-        node.press("Enter")
-        expect(page.get_by_role("heading", name="child-run", exact=True)).to_be_visible()
-
-
 def _lineage_project(root, names=None, *, count=None, parents=None):
     if names is None:
         total = 3 if count is None else count
@@ -1679,233 +1607,11 @@ def test_split_runs_page_works_when_storage_throws(page, tmp_path, ui_server_fac
     writer.finish("finished")
     with ui_server_factory(root) as server:
         home(page, server)
-        expect(page.locator(".lineage-graph")).to_be_visible()
-        expect(page.locator(".lineage-node")).to_have_count(1)
+        expect(page.locator(".task-strip-dot")).to_have_count(1)
         expect(page.locator(".run-row")).to_have_count(1)
         page.reload()
-        expect(page.locator(".lineage-node")).to_have_count(1)
+        expect(page.locator(".task-strip-dot")).to_have_count(1)
         expect(page.locator(".run-row")).to_have_count(1)
-
-
-@pytest.mark.parametrize("width", [375, 650, 900, 1001, 1440])
-def test_split_runs_layout_and_shared_selection(page, tmp_path, ui_server_factory, width):
-    root = tmp_path / "lineage-split"
-    ids = _lineage_project(root)
-    with ui_server_factory(root) as server:
-        page.set_viewport_size({"width": width, "height": 900})
-        home(page, server)
-        left = page.locator(".runs-pane")
-        right = page.locator(".lineage-body")
-        expect(left).to_be_visible()
-        expect(right.locator(".lineage-graph")).to_be_visible()
-        expect(page.get_by_role("tab", name="Lineage", exact=True)).to_have_count(0)
-        expect(page.get_by_role("tab", name="List", exact=True)).to_have_count(0)
-        a, b = left.bounding_box(), right.bounding_box()
-        if width > 1000:
-            # The run table leads; lineage is a fixed-width aside beside it.
-            assert a["x"] < b["x"]
-            assert abs(a["y"] - b["y"]) <= 1
-            assert a["width"] > b["width"] and 300 <= b["width"] <= 341
-        else:
-            assert abs(a["width"] - b["width"]) <= 1
-            assert abs(a["x"] - b["x"]) <= 1
-            assert a["y"] + a["height"] <= b["y"]
-        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
-        assert left.evaluate("el => el.scrollWidth <= el.clientWidth")
-        node = page.locator(f'.lineage-node[data-run-id="{ids[0]}"]')
-        check = page.get_by_role("checkbox", name="Select root-run", exact=True)
-        check.check()
-        expect(node).to_have_attribute("data-picked", "true")
-        node.press("Space")
-        expect(check).not_to_be_checked()
-        expect(node).to_have_attribute("data-picked", "false")
-        expect(page.locator(".lineage-detail")).to_contain_text(ids[0])
-        if width == 1440:
-            run_row = row(page, "root-run")
-            run_row.hover()
-            expect(node).to_have_class(re.compile(r"\bis-linked\b"))
-            node.hover()
-            expect(run_row).to_have_class(re.compile(r"\bis-linked\b"))
-            page.get_by_role("heading", name="Runs", exact=True).hover()
-            expect(run_row).not_to_have_class(re.compile(r"\bis-linked\b"))
-
-
-def test_lineage_chain_fits_split_pane_top_to_bottom(page, tmp_path, ui_server_factory):
-    root = tmp_path / "lineage-vertical"
-    ids = _lineage_project(root, count=8)
-    with ui_server_factory(root) as server:
-        page.set_viewport_size({"width": 1440, "height": 900})
-        home(page, server)
-        expect(page.locator(".lineage-node")).to_have_count(8)
-        scroll = page.locator(".lineage-scroll")
-        assert scroll.evaluate("el => el.scrollWidth <= el.clientWidth")
-        geometry = scroll.evaluate(
-            """(el, ids) => {
-              const box = (id) => {
-                const shape = el.querySelector(`.lineage-node[data-run-id="${id}"] .lineage-shape`);
-                return {
-                  x: Number(shape.getAttribute("x")),
-                  y: Number(shape.getAttribute("y")),
-                  w: Number(shape.getAttribute("width")),
-                  h: Number(shape.getAttribute("height")),
-                };
-              };
-              const boxes = ids.map(box);
-              const edge = el.querySelector(
-                `.lineage-edge[data-from="${ids[0]}"][data-to="${ids[1]}"]`,
-              );
-              const nums = edge.getAttribute("d").split(/[^0-9.-]+/).filter(Boolean).map(Number);
-              return {boxes, x1: nums[0], y1: nums[1], x2: nums.at(-2), y2: nums.at(-1)};
-            }""",
-            ids,
-        )
-        xs = [box["x"] for box in geometry["boxes"]]
-        ys = [box["y"] for box in geometry["boxes"]]
-        assert xs == [xs[0]] * len(xs)
-        assert all(later > earlier for earlier, later in zip(ys, ys[1:]))
-        parent, child = geometry["boxes"][0], geometry["boxes"][1]
-        assert geometry["y1"] == parent["y"] + parent["h"]
-        assert geometry["x1"] == parent["x"] + parent["w"] / 2
-        assert geometry["y2"] == child["y"]
-        assert geometry["x2"] == child["x"] + child["w"] / 2
-        page.set_viewport_size({"width": 375, "height": 812})
-        overflow = page.evaluate(
-            "Math.max(document.documentElement.scrollWidth - document.documentElement.clientWidth, document.body.scrollWidth - document.body.clientWidth)"
-        )
-        assert overflow <= 0, f"lineage chain scrolls horizontally by {overflow}px"
-
-
-@pytest.mark.parametrize("width, height", [(375, 812), (1440, 900)])
-def test_oversized_lineage_detail_keeps_graph_and_strip_reachable(
-    page, tmp_path, ui_server_factory, width, height
-):
-    """A long parent name and base branch must not collapse the graph or clip the strip."""
-    root = tmp_path / "lineage-detail-overflow"
-    token = "wrapped-parent-" * 24
-    parent_name = " ".join([token] * 4)
-    branch = "release/" + "x" * (256 - len("release/"))
-    ids = _lineage_project(root, (parent_name, "child-run"))
-    meta_path = root / "runs" / ids[1] / "meta.json"
-    meta = json.loads(meta_path.read_text())
-    meta["lineage"]["base_branch"] = branch
-    meta_path.write_text(json.dumps(meta))
-    with ui_server_factory(root) as server:
-        page.set_viewport_size({"width": width, "height": height})
-        home(page, server)
-        node = page.locator(f'.lineage-node[data-run-id="{ids[1]}"]')
-        expect(node).to_be_visible()
-        node.click()
-        detail = page.locator(".lineage-detail")
-        expect(detail).to_contain_text(token)
-        expect(detail).to_contain_text(branch)
-        metrics = detail.evaluate(
-            """(strip) => {
-              const scroll = strip.parentElement.querySelector(".lineage-scroll");
-              const pane = strip.closest(".lineage-body");
-              const code = strip.querySelector(".lineage-checkout code");
-              const overlap = (a, b) => Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
-              const paneBox = pane.getBoundingClientRect();
-              const graphVisible = overlap(scroll.getBoundingClientRect(), paneBox);
-              strip.scrollTop = strip.scrollHeight;
-              const codeBox = code.getBoundingClientRect();
-              const stripBox = strip.getBoundingClientRect();
-              return {
-                scrollClient: scroll.clientHeight,
-                graphVisible,
-                stripClient: strip.clientHeight,
-                stripScroll: strip.scrollHeight,
-                overflowY: getComputedStyle(strip).overflowY,
-                codeVisible: Math.min(overlap(codeBox, stripBox), overlap(codeBox, paneBox)),
-              };
-            }"""
-        )
-        assert metrics["scrollClient"] > 0, "lineage graph scroller collapsed"
-        assert metrics["graphVisible"] > 0, "lineage graph is clipped by the pane"
-        assert metrics["stripScroll"] > metrics["stripClient"], "oversized detail did not overflow the strip"
-        if metrics["stripScroll"] > metrics["stripClient"]:
-            assert metrics["overflowY"] in ("auto", "scroll")
-        assert metrics["codeVisible"] > 0, "lineage detail bottom is not reachable"
-        if width == 375:
-            overflow = page.evaluate(
-                "Math.max(document.documentElement.scrollWidth - document.documentElement.clientWidth, document.body.scrollWidth - document.body.clientWidth)"
-            )
-            assert overflow <= 0, f"lineage detail scrolls horizontally by {overflow}px"
-
-
-def test_lineage_arrow_keys_move_between_generations_and_siblings(page, tmp_path, ui_server_factory):
-    root = tmp_path / "lineage-keys"
-    ids = _lineage_project(
-        root,
-        ("root-run", "left-run", "right-run", "grand-run"),
-        parents=(None, 0, 0, 1),
-    )
-    root_id, left_id, right_id, grand_id = ids
-    with ui_server_factory(root) as server:
-        page.set_viewport_size({"width": 1440, "height": 900})
-        home(page, server)
-        places = page.evaluate(
-            """(ids) => Object.fromEntries(ids.map((id) => {
-              const shape = document.querySelector(`.lineage-node[data-run-id="${id}"] .lineage-shape`);
-              return [id, {x: Number(shape.getAttribute("x")), y: Number(shape.getAttribute("y"))}];
-            }))""",
-            ids,
-        )
-        assert places[root_id]["y"] < places[left_id]["y"] < places[grand_id]["y"]
-        assert places[left_id]["y"] == places[right_id]["y"]
-        assert places[left_id]["x"] < places[right_id]["x"]
-        assert places[grand_id]["x"] == places[left_id]["x"]
-        node = lambda run_id: page.locator(f'.lineage-node[data-run-id="{run_id}"]')
-        focused = page.locator(".lineage-node:focus")
-        node(root_id).focus()
-        node(root_id).press("ArrowDown")
-        expect(focused).to_have_attribute("data-run-id", left_id)
-        focused.press("ArrowRight")
-        expect(focused).to_have_attribute("data-run-id", right_id)
-        focused.press("ArrowLeft")
-        expect(focused).to_have_attribute("data-run-id", left_id)
-        focused.press("ArrowDown")
-        expect(focused).to_have_attribute("data-run-id", grand_id)
-        focused.press("ArrowDown")
-        expect(focused).to_have_attribute("data-run-id", grand_id)
-        focused.press("ArrowUp")
-        expect(focused).to_have_attribute("data-run-id", left_id)
-        focused.press("ArrowUp")
-        expect(focused).to_have_attribute("data-run-id", root_id)
-        focused.press("ArrowLeft")
-        expect(focused).to_have_attribute("data-run-id", root_id)
-        expect(page.locator(".lineage-detail")).to_contain_text("Pick a run")
-        focused.press("ArrowDown")
-        focused.press("ArrowRight")
-        expect(focused).to_have_attribute("data-run-id", right_id)
-        focused.press("ArrowUp")
-        expect(focused).to_have_attribute("data-run-id", root_id)
-        focused.press("Space")
-        expect(node(root_id)).to_have_attribute("data-picked", "true")
-        expect(page.locator(".lineage-detail")).to_contain_text(root_id)
-
-
-def test_split_runs_search_keeps_unmatched_project_graphs(page, ui_server):
-    home(page, ui_server)
-    expect(page.locator(".lineage-node")).to_have_count(5)
-    page.evaluate("window.keptGraphs = [...document.querySelectorAll('.lineage-graph')]")
-    page.get_by_label("Filter runs").fill("explicit-highlr")
-    expect(page.locator(".run-row")).to_have_count(1)
-    expect(page.locator(".project-card")).to_have_count(2)
-    expect(page.locator('.project-card[data-project="other-project"] .runs-empty')).to_have_text("No runs match this filter.")
-    expect(page.locator(".lineage-node.is-dim")).to_have_count(4)
-    assert page.evaluate("keptGraphs.every(graph => graph.isConnected)")
-    page.get_by_label("Filter runs").fill("no-such-run")
-    expect(page.locator(".run-row")).to_have_count(0)
-    expect(page.locator(".project-card")).to_have_count(2)
-    expect(page.locator(".runs-empty")).to_have_count(2)
-    expect(page.locator(".empty")).to_have_text("No runs match this filter.")
-    expect(page.locator(".lineage-node.is-dim")).to_have_count(5)
-    page.get_by_role("tab", name="testbed", exact=True).click()
-    expect(page.locator(".project-card")).to_have_count(1)
-    expect(page.locator(".lineage-node")).to_have_count(4)
-    page.get_by_label("Filter runs").fill("")
-    expect(page.locator(".run-row")).to_have_count(4)
-    expect(page.locator(".lineage-node.is-dim")).to_have_count(0)
 
 
 @pytest.mark.parametrize("retry", ["poll", "reenter"])
@@ -1929,375 +1635,24 @@ def test_failed_lineage_refresh_retries_idle_project(page, ui_server, retry):
     page.clock.install()
     home(page, ui_server)
     page.get_by_role("tab", name="demo", exact=True).click()
-    node = page.locator('.lineage-node[data-run-id="idle"]')
-    expect(node).to_contain_text("old run")
-    page.evaluate("window.keptGraph = document.querySelector('.lineage-graph')")
+    node = page.locator(".task-strip-dot")
+    expect(node).to_have_attribute("title", "old run")
     runs[0]["name"] = "updated run"
-    page.clock.fast_forward(5000)
+    with page.expect_response(lambda response: "project=demo" in response.url and response.status == 503):
+        page.clock.fast_forward(5000)
     expect(row(page, "updated run")).to_be_visible()
-    page.wait_for_function("() => !document.querySelector('.project-card').dataset.signature")
     assert len(attempts) == 2
-    assert page.evaluate("keptGraph === document.querySelector('.lineage-graph')")
-    expect(node).to_contain_text("old run")
-    if retry == "poll":
-        page.clock.fast_forward(5000)
-    else:
-        page.get_by_role("tab", name="other", exact=True).click()
-        page.get_by_role("tab", name="demo", exact=True).click()
-    expect(node).to_contain_text("updated run")
+    # The failed refetch keeps the last lineage; dot labels follow /api/runs.
+    expect(node).to_have_count(1)
+    expect(row(page, "updated run").locator(".run-varied")).to_have_text("root")
+    with page.expect_response(lambda response: "project=demo" in response.url and response.status == 200):
+        if retry == "poll":
+            page.clock.fast_forward(5000)
+        else:
+            page.get_by_role("tab", name="other", exact=True).click()
+            page.get_by_role("tab", name="demo", exact=True).click()
+    expect(node).to_have_attribute("title", "updated run")
     assert len(attempts) == 3
-
-
-@pytest.mark.parametrize("source", ["run-row", "lineage-node"])
-def test_hover_link_survives_poll_filter_and_detached_mouseout(page, ui_server, source):
-    mock_dashboard(page, [{"run_id": "hover", "name": "hover run", "project": "demo", "status": "running", "keys": []}])
-    page.clock.install()
-    home(page, ui_server)
-    node = page.locator(".lineage-node")
-    run_row = page.locator(".run-row")
-    expect(node).to_be_visible()
-    page.locator(f".{source}").hover()
-    linked = re.compile(r"\bis-linked\b")
-    expect(node).to_have_class(linked)
-    expect(run_row).to_have_class(linked)
-    page.evaluate("window.oldRow = document.querySelector('.run-row')")
-    page.clock.fast_forward(5000)
-    page.wait_for_function("() => !oldRow.isConnected")
-    expect(node).to_have_class(linked)
-    expect(run_row).to_have_class(linked)
-    page.get_by_label("Filter runs").fill("run")
-    expect(node).to_have_class(linked)
-    expect(run_row).to_have_class(linked)
-    # Remove the event source during dispatch, then link its replacement before
-    # the old mouseout reaches the card's delegated handler.
-    run_row.evaluate("""old => {
-      old.addEventListener('mouseout', () => {
-        const fresh = old.cloneNode(true);
-        old.replaceWith(fresh);
-        fresh.dispatchEvent(new MouseEvent('mouseover', {bubbles: true}));
-      }, {once: true});
-      old.dispatchEvent(new MouseEvent('mouseout', {bubbles: true}));
-    }""")
-    expect(node).to_have_class(linked)
-    expect(run_row).to_have_class(linked)
-    page.get_by_role("heading", name="Runs", exact=True).hover()
-    expect(node).not_to_have_class(linked)
-    expect(run_row).not_to_have_class(linked)
-
-
-def test_lineage_rebuild_keeps_focus_scroll_and_detail(page, tmp_path, ui_server_factory):
-    root = tmp_path / "lineage-focus"
-    ids = _lineage_project(root, count=8)
-    root_meta = root / "runs" / ids[0] / "meta.json"
-    meta = json.loads(root_meta.read_text())
-    meta["status"] = "running"
-    root_meta.write_text(json.dumps(meta))
-    (root / "runs" / ids[0] / "run.lock").write_bytes(b"")
-    child = ids[1]
-    with ui_server_factory(root) as server:
-        page.set_viewport_size({"width": 375, "height": 812})
-        home(page, server)
-        expect(page.locator(".poll-status")).to_contain_text("refreshes every 5 s")
-        node = page.locator(f'.lineage-node[data-run-id="{child}"]')
-        expect(node).to_be_visible()
-        expect(page.locator(".lineage-detail")).to_contain_text("Pick a run")
-        node.focus()
-        top = page.locator(".lineage-scroll").evaluate(
-            "el => { el.scrollTop = Math.min(180, el.scrollHeight); return el.scrollTop; }"
-        )
-        assert top > 0, "lineage graph did not overflow its scroller"
-        path = root / "runs" / child / "meta.json"
-        updated = json.loads(path.read_text())
-        updated["name"] = "child-renamed"
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(updated))
-        temporary.replace(path)
-        expect(node).to_contain_text("child-renamed", timeout=12000)
-        expect(page.locator(".lineage-node:focus")).to_have_attribute("data-run-id", child)
-        assert page.locator(".lineage-scroll").evaluate("el => el.scrollTop") == top
-        page.locator(".lineage-node:focus").click()
-        expect(page.locator(".lineage-detail")).to_contain_text("agenticml lineage checkout")
-        expect(page.locator(".lineage-detail")).to_contain_text(child)
-
-
-def test_split_runs_poll_updates_list_and_preserves_lineage(page, tmp_path, ui_server_factory):
-    root = tmp_path / "lineage-poll"
-    ids = _lineage_project(root, count=8)
-    path = root / "runs" / ids[0] / "meta.json"
-    meta = json.loads(path.read_text())
-    meta.update(status="running", summary={"loss": .5})
-    path.write_text(json.dumps(meta))
-    (path.parent / "run.lock").write_bytes(b"")
-    requests = []
-    page.on("request", lambda request: requests.append(request.url) if "/api/lineage?" in request.url else None)
-    page.clock.install()
-    with ui_server_factory(root) as server:
-        page.set_viewport_size({"width": 375, "height": 812})
-        home(page, server)
-        node = page.locator(f'.lineage-node[data-run-id="{ids[1]}"]')
-        node.press("Space")
-        detail = page.locator(".lineage-detail")
-        expect(detail).to_contain_text(ids[1])
-        top = page.locator(".lineage-scroll").evaluate(
-            "el => { el.scrollTop = 180; return el.scrollTop; }"
-        )
-        assert top > 0
-        page.evaluate("""() => {
-          window.keptCard = document.querySelector('.project-card');
-          window.keptPane = document.querySelector('.lineage-body');
-          window.keptGraph = document.querySelector('.lineage-graph');
-          window.keptNode = document.activeElement;
-          window.keptDetail = document.querySelector('.lineage-detail').firstElementChild;
-          window.oldRow = document.querySelector('.run-row');
-        }""")
-        assert len(requests) == 1
-        meta["summary"]["loss"] = .25
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(meta))
-        temporary.replace(path)
-        page.clock.fast_forward(5000)
-        expect(row(page, "root-run").locator('.run-number[title="loss"]')).to_have_text("0.25")
-        assert page.evaluate("""keptCard === document.querySelector('.project-card') &&
-          keptPane === document.querySelector('.lineage-body') &&
-          keptGraph === document.querySelector('.lineage-graph') &&
-          keptNode === document.activeElement && keptNode.isConnected &&
-          keptDetail === document.querySelector('.lineage-detail').firstElementChild &&
-          !oldRow.isConnected""")
-        assert len(requests) == 1
-        assert page.locator(".lineage-scroll").evaluate("el => el.scrollTop") == top
-        expect(detail).to_contain_text(ids[1])
-        # Running projects still refresh their lineage at the longer interval.
-        page.clock.fast_forward(10000)
-        page.wait_for_function("() => keptGraph !== document.querySelector('.lineage-graph')")
-        assert len(requests) == 2
-        expect(page.locator(".lineage-node:focus")).to_have_attribute("data-run-id", ids[1])
-        assert page.locator(".lineage-scroll").evaluate("el => el.scrollTop") == top
-        assert page.evaluate("keptDetail === document.querySelector('.lineage-detail').firstElementChild")
-        expect(detail).to_contain_text(ids[1])
-
-
-def test_lineage_detail_updates_parent_commit_and_dirty_flag(page, ui_server):
-    """A focused node's parent, commit, and dirty flag refresh when the graph repaints."""
-    root = {
-        "run_id": "root", "name": "root run", "project": "demo", "status": "finished", "keys": [],
-        "created_at": "2024-01-01T00:00:00Z", "commit": "1111111aaaaaaa",
-        "base_commit": "abc1234", "base_branch": "main", "base_dirty": False,
-    }
-    child = {
-        "run_id": "child", "name": "child run", "project": "demo", "status": "running", "keys": [],
-        "created_at": "2024-01-02T00:00:00Z", "parent_run_id": "root", "parent_inference": "explicit",
-        "commit": "aaaaaaa1111111", "base_commit": "abc1234", "base_branch": "main", "base_dirty": True,
-        "summary": {"loss": 0.5},
-    }
-    other = {
-        "run_id": "other", "name": "other run", "project": "demo", "status": "finished", "keys": [],
-        "created_at": "2024-01-03T00:00:00Z",
-    }
-    mock_dashboard(page, [root, child, other])
-    page.clock.install()
-    home(page, ui_server)
-    page.locator('.lineage-node[data-run-id="child"]').click()
-    detail = page.locator(".lineage-detail")
-    expect(detail).to_contain_text("root run")
-    expect(detail).to_contain_text("aaaaaaa1111111")
-    expect(detail).to_contain_text("dirty")
-    expect(detail.locator("a")).to_have_attribute("href", "#/run/root")
-    page.evaluate("""() => {
-      const host = document.querySelector('.lineage-detail');
-      window.detailSawLoading = false;
-      new MutationObserver(() => {
-        if (host.textContent.includes('Loading changes')) window.detailSawLoading = true;
-      }).observe(host, {childList: true, subtree: true, characterData: true});
-    }""")
-    child.update(parent_run_id="other", parent_inference="repo_root", commit="bbbbbbb2222222", base_dirty=False)
-    child["summary"]["loss"] = 0.25
-    page.clock.fast_forward(5000)
-    expect(row(page, "child run").locator('.run-number[title="loss"]')).to_have_text("0.25")
-    # The runs poll alone does not repaint lineage, so the strip stays put.
-    expect(detail).to_contain_text("root run")
-    expect(detail).to_contain_text("aaaaaaa1111111")
-    expect(detail).to_contain_text("dirty")
-    child["summary"]["loss"] = 0.75
-    page.clock.fast_forward(10000)
-    expect(row(page, "child run").locator('.run-number[title="loss"]')).to_have_text("0.75")
-    expect(detail).to_contain_text("other run")
-    expect(detail).to_contain_text("repo_root")
-    expect(detail).to_contain_text("bbbbbbb2222222")
-    expect(detail).not_to_contain_text("dirty")
-    expect(detail).not_to_contain_text("aaaaaaa1111111")
-    expect(detail).not_to_contain_text("root run")
-    expect(detail.locator("a")).to_have_attribute("href", "#/run/other")
-    expect(detail).to_contain_text("agenticml lineage checkout child")
-    assert page.evaluate("detailSawLoading === false")
-
-
-_DETAIL_SETTLED = """
-(() => {
-  const json = Response.prototype.json;
-  const text = Response.prototype.text;
-  const note = (url) => {
-    if (!url.includes("/api/runs/") || !url.endsWith("/lineage")) return;
-    const count = Number(document.documentElement.dataset.detailSettled || 0) + 1;
-    document.documentElement.dataset.detailSettled = String(count);
-  };
-  Response.prototype.json = function (...args) {
-    const url = this.url || "";
-    return json.apply(this, args).finally(() => note(url));
-  };
-  Response.prototype.text = function (...args) {
-    const url = this.url || "";
-    return text.apply(this, args).finally(() => note(url));
-  };
-})();
-"""
-
-
-def _fulfill_lineage_detail(route, path, commit):
-    route.fulfill(
-        content_type="application/json",
-        body=json.dumps({
-            "commit": commit,
-            "files": [{"path": path, "added": 1, "deleted": 0}],
-            "checkout": "agenticml lineage checkout child",
-        }),
-    )
-
-
-def _open_focused_child(page, ui_server, on_detail):
-    """Runs page with a focused child whose graph payload can switch A/B."""
-    root = {
-        "run_id": "root", "name": "root run", "project": "demo", "status": "finished", "keys": [],
-        "created_at": "2024-01-01T00:00:00Z", "commit": "1111111aaaaaaa",
-    }
-    child = {
-        "run_id": "child", "name": "child run", "project": "demo", "status": "running", "keys": [],
-        "created_at": "2024-01-02T00:00:00Z", "parent_run_id": "root", "parent_inference": "explicit",
-        "commit": "aaaaaaa1111111", "base_commit": "abc1234", "base_branch": "main", "base_dirty": True,
-        "summary": {"loss": 0.5},
-    }
-    other = {
-        "run_id": "other", "name": "other run", "project": "demo", "status": "finished", "keys": [],
-        "created_at": "2024-01-03T00:00:00Z",
-    }
-    state = {"mode": "A", "calls": []}
-
-    def lineage(route):
-        fresh = state["mode"] == "A"
-        node = {
-            "run_id": "child", "name": "child run", "project": "demo", "status": "running",
-            "created_at": child["created_at"],
-            "parent_run_id": "root" if fresh else "other",
-            "parent_inference": "explicit" if fresh else "repo_root",
-            "commit": "aaaaaaa1111111" if fresh else "bbbbbbb2222222",
-            "base_commit": "abc1234", "base_branch": "main", "base_dirty": fresh,
-        }
-        route.fulfill(
-            content_type="application/json",
-            body=json.dumps({"nodes": [root, node, other], "edges": []}),
-        )
-
-    def detail(route):
-        state["calls"].append(route.request.url)
-        on_detail(route, len(state["calls"]))
-
-    mock_dashboard(page, [root, child, other])
-    page.route("**/api/lineage?project=demo", lineage)
-    page.route("**/api/runs/child/lineage", detail)
-    page.add_init_script(_DETAIL_SETTLED)
-    page.clock.install()
-    home(page, ui_server)
-    page.locator('.lineage-node[data-run-id="child"]').click()
-    strip = page.locator(".lineage-detail")
-    expect(strip).to_contain_text("from-a.py")
-    expect(strip).to_contain_text("root run")
-    expect(strip).to_contain_text("aaaaaaa1111111")
-    expect(strip).to_contain_text("dirty")
-    assert len(state["calls"]) == 1
-    return state, strip, child
-
-
-def test_superseded_lineage_detail_keeps_rendered_payload(page, ui_server):
-    """A late detail response must not paint over a graph that has moved back."""
-    page.allow_http_errors = True
-    held = []
-
-    def on_detail(route, index):
-        if index == 2:
-            held.append(route)
-            return
-        _fulfill_lineage_detail(route, "from-a.py", "aaaaaaa1111111")
-
-    state, strip, _child = _open_focused_child(page, ui_server, on_detail)
-    meta = page.locator('.lineage-node[data-run-id="child"] .lineage-meta')
-    try:
-        state["mode"] = "B"
-        page.clock.fast_forward(15000)
-        expect(meta).to_contain_text("bbbbbbb")
-        assert len(held) == 1
-        assert len(state["calls"]) == 2
-        # Same node: the previous strip stays up while B is in flight.
-        expect(strip).to_contain_text("from-a.py")
-        expect(strip).to_contain_text("root run")
-        expect(strip).not_to_contain_text("other run")
-        state["mode"] = "A"
-        page.clock.fast_forward(15000)
-        expect(meta).to_contain_text("aaaaaaa")
-        # A mistaken refetch would hit the route as soon as the graph paints.
-        page.wait_for_timeout(200)
-        assert len(state["calls"]) == 2
-        expect(page.locator("html")).to_have_attribute("data-detail-settled", "1")
-        expect(strip).to_contain_text("from-a.py")
-        expect(strip).to_contain_text("dirty")
-        _fulfill_lineage_detail(held.pop(), "from-b.py", "bbbbbbb2222222")
-        expect(page.locator("html")).to_have_attribute("data-detail-settled", "2")
-        expect(strip).to_contain_text("from-a.py")
-        expect(strip).to_contain_text("aaaaaaa1111111")
-        expect(strip).to_contain_text("root run")
-        expect(strip).to_contain_text("dirty")
-        expect(strip).not_to_contain_text("from-b.py")
-        expect(strip).not_to_contain_text("other run")
-        expect(strip).not_to_contain_text("bbbbbbb2222222")
-        expect(strip.locator("a")).to_have_attribute("href", "#/run/root")
-        assert len(state["calls"]) == 2
-        assert not held
-    finally:
-        while held:
-            held.pop().abort()
-
-
-def test_failed_lineage_detail_refetches_after_repaint(page, ui_server):
-    """A failed refresh clears the rendered marker so the next paint retries once."""
-    page.allow_http_errors = True
-
-    def on_detail(route, index):
-        if index == 2:
-            route.fulfill(status=503, body="unavailable")
-            return
-        _fulfill_lineage_detail(route, "from-a.py", "aaaaaaa1111111")
-
-    state, strip, child = _open_focused_child(page, ui_server, on_detail)
-    meta = page.locator('.lineage-node[data-run-id="child"] .lineage-meta')
-    state["mode"] = "B"
-    page.clock.fast_forward(15000)
-    expect(meta).to_contain_text("bbbbbbb")
-    expect(strip.locator(".error")).to_contain_text("503")
-    expect(strip).not_to_contain_text("from-a.py")
-    assert len(state["calls"]) == 2
-    # The runs poll repaints the list, not the graph, so it must not retry.
-    child["summary"]["loss"] = 0.25
-    page.clock.fast_forward(5000)
-    expect(row(page, "child run").locator('.run-number[title="loss"]')).to_have_text("0.25")
-    assert len(state["calls"]) == 2
-    state["mode"] = "A"
-    page.clock.fast_forward(10000)
-    expect(meta).to_contain_text("aaaaaaa")
-    expect(strip).to_contain_text("from-a.py")
-    expect(strip).to_contain_text("root run")
-    expect(strip).to_contain_text("aaaaaaa1111111")
-    expect(strip).to_contain_text("dirty")
-    expect(strip.locator("a")).to_have_attribute("href", "#/run/root")
-    expect(strip.locator(".error")).to_have_count(0)
-    assert len(state["calls"]) == 3
 
 
 def test_failed_lineage_fetch_retries_without_running_runs(page, ui_server):
@@ -2316,12 +1671,15 @@ def test_failed_lineage_fetch_retries_without_running_runs(page, ui_server):
     page.route("**/api/lineage?project=demo", lineage)
     page.allow_http_errors = True
     page.clock.install()
-    home(page, ui_server)
-    expect(page.locator(".lineage-scroll .error")).to_be_visible()
+    with page.expect_response(lambda response: "/api/lineage" in response.url and response.status == 503):
+        home(page, ui_server)
     expect(page.locator(".poll-status")).to_have_text("1 runs")
+    expect(row(page, "idle run").locator(".run-varied")).to_have_text("—")
+    expect(page.locator(".task-strip")).to_have_count(0)
     assert len(attempts) == 1
     page.clock.fast_forward(1000)
-    expect(page.locator('.lineage-node[data-run-id="idle"]')).to_contain_text("idle run")
+    expect(page.locator(".task-strip-dot")).to_have_attribute("title", "idle run")
+    expect(row(page, "idle run").locator(".run-varied")).to_have_text("root")
     assert len(attempts) == 2
 
 
@@ -2359,9 +1717,10 @@ def test_removed_project_drops_lineage_cache_and_retries(page, ui_server):
     )
     page.allow_http_errors = True
     page.clock.install()
-    home(page, ui_server)
-    expect(page.locator('.lineage-node[data-run-id="temp"]')).to_be_visible()
-    expect(page.locator('.project-card[data-project="flaky"] .lineage-scroll .error')).to_be_visible()
+    with page.expect_response(lambda response: "project=flaky" in response.url and response.status == 503):
+        home(page, ui_server)
+    expect(page.locator('.project-card[data-project="drop"] .task-strip-dot')).to_have_attribute("title", "temp run")
+    expect(page.locator('.project-card[data-project="flaky"] .task-strip')).to_have_count(0)
     assert len(drop_attempts) == 1
     assert flaky_attempts
     runs.remove(drop)
@@ -2379,1196 +1738,9 @@ def test_removed_project_drops_lineage_cache_and_retries(page, ui_server):
     assert len(drop_attempts) == dropped
     runs.insert(0, drop)
     page.clock.fast_forward(5000)
-    expect(page.locator('.lineage-node[data-run-id="temp"]')).to_be_visible()
+    expect(page.locator('.project-card[data-project="drop"] .task-strip-dot')).to_be_visible()
     assert len(drop_attempts) == dropped + 1
     assert len(flaky_attempts) == failed
-
-
-def _notes_runs(root):
-    """Each notes test owns its store; never mutate the trained session store."""
-    result = {}
-    for name, project in (("first notes run", "alpha"), ("second notes run", "beta")):
-        writer = RunWriter.create(root, meta={"name": name, "project": project})
-        writer.finish("finished")
-        result[name] = writer.run_id
-    return result
-
-
-def _seed_note(page, server, run_id, text, revision=None):
-    response = page.request.put(
-        f"{server.url}/api/runs/{run_id}/notes",
-        headers={"X-AgenticML-Request": "1"},
-        data={"text": text, "revision": revision},
-    )
-    assert response.ok, response.text()
-    return response.json()
-
-
-def _stored_note(page, server, run_id):
-    response = page.request.get(f"{server.url}/api/runs/{run_id}/notes")
-    assert response.ok, response.text()
-    return response.json()
-
-
-def test_notepad_checklist_autosave_reload_and_tick(page, tmp_path, ui_server_factory):
-    root = tmp_path / "notes"
-    ids = _notes_runs(root)
-    run_id = ids["first notes run"]
-    with ui_server_factory(root) as server:
-        page.goto(f"{server.url}#/run/{run_id}")
-        pad = page.locator(".notepad")
-        expect(pad.locator(".note-save")).to_have_text("Not saved yet")
-        expect(pad.locator(".note-save")).not_to_contain_text("Saved")
-        expect(pad.get_by_role("button", name="Preview", exact=True)).to_have_attribute("aria-pressed", "true")
-        expect(pad.get_by_role("button", name="Edit", exact=True)).to_have_attribute("aria-pressed", "false")
-        pad.get_by_role("button", name="Add a note…", exact=True).click()
-        expect(pad.get_by_role("button", name="Preview", exact=True)).to_have_attribute("aria-pressed", "false")
-        expect(pad.get_by_role("button", name="Edit", exact=True)).to_have_attribute("aria-pressed", "true")
-        area = pad.get_by_label("Note Markdown")
-        assert area.evaluate("el => parseFloat(getComputedStyle(el).fontSize)") >= 16
-        pad.get_by_role("button", name="Checklist", exact=True).click()
-        expect(area).to_have_value("- [ ] ")
-        area.press_sequentially("Compare baseline")
-        area.press("Enter")
-        expect(area).to_have_value("- [ ] Compare baseline\n- [ ] ")
-        area.press_sequentially("Try lower learning rate")
-        expect(pad.locator(".note-save")).to_contain_text("Saved", timeout=6000)
-        assert _stored_note(page, server, run_id)["text"] == area.input_value()
-        pad.get_by_role("button", name="Preview", exact=True).click()
-        expect(pad.get_by_role("button", name="Preview", exact=True)).to_have_attribute("aria-pressed", "true")
-        expect(pad.get_by_role("button", name="Edit", exact=True)).to_have_attribute("aria-pressed", "false")
-        page.reload()
-        expect(pad.get_by_role("checkbox")).to_have_count(2)
-        expect(pad.get_by_role("button", name="Preview", exact=True)).to_have_attribute("aria-pressed", "true")
-        expect(pad.get_by_role("button", name="Edit", exact=True)).to_have_attribute("aria-pressed", "false")
-        pad.get_by_role("checkbox", name="Compare baseline", exact=True).check()
-        expect(pad.locator(".note-progress")).to_have_text("1/2 done")
-        expect(pad.locator(".note-save")).to_contain_text("Saved")
-        assert "- [x] Compare baseline" in _stored_note(page, server, run_id)["text"]
-        page.reload()
-        expect(pad.get_by_role("checkbox", name="Compare baseline", exact=True)).to_be_checked()
-        pad.get_by_role("button", name="Edit", exact=True).click()
-        area.press("End")
-        area.press("Enter")
-        area.press("Enter")
-        expect(area).to_have_value("- [x] Compare baseline\n- [ ] Try lower learning rate\n")
-
-
-@pytest.mark.parametrize("response", ["failure", "hang"])
-def test_notebook_request_does_not_block_runs_polling_or_lineage(page, ui_server, response):
-    runs = [{"run_id": "live", "name": "live run", "project": "demo",
-             "status": "running", "keys": []}]
-    mock_dashboard(page, runs)
-    attempts, held = [], []
-
-    def notebook(route):
-        attempts.append(route.request.url)
-        if response == "failure":
-            route.fulfill(status=503, json={"error": "Notebook unavailable"})
-        else:
-            held.append(route)
-
-    page.route("**/api/notes", notebook)
-    page.allow_http_errors = response == "failure"
-    page.clock.install()
-    try:
-        home(page, ui_server)
-        expect(row(page, "live run")).to_be_visible()
-        expect(page.locator(".poll-status")).to_have_text("Live · refreshes every 5 s")
-        expect(page.locator(".lineage-node")).to_contain_text("live run")
-        if response == "failure":
-            expect(page.locator(".notebook .error")).to_contain_text("Could not load notebook")
-            expect(page.locator(".notebook")).to_have_attribute("open", "")
-            assert page.evaluate("localStorage.getItem('agenticml-notebook-open')") is None
-        else:
-            assert len(held) == 1
-            expect(page.locator(".notebook summary")).to_have_text("Run notes · loading…")
-
-        runs[0]["name"] = "updated run"
-        page.clock.fast_forward(5000)
-        expect(row(page, "updated run")).to_be_visible()
-        expect(page.locator(".lineage-node")).to_contain_text("updated run")
-        page.locator(".lineage-node").click()
-        expect(page.locator(".lineage-detail")).to_contain_text("agenticml lineage checkout live")
-        expect(page.get_by_test_id("selection-bar")).to_contain_text("1 run selected")
-        expect(page.locator(".runs-workspace > .stack .error")).to_have_count(0)
-
-        runs[0]["status"] = "finished"
-        page.clock.fast_forward(5000)
-        expect(page.locator(".poll-status")).to_have_text("1 runs")
-        if response == "failure":
-            expect(page.locator(".notebook .error")).to_contain_text("Could not load notebook")
-            assert len(attempts) >= 2
-        else:
-            assert len(held) == 1  # Polls proceed while the original GET stays pending.
-    finally:
-        for route in held:
-            route.fulfill(json={"notes": [], "truncated": False, "writable": True})
-
-
-def test_notebook_groups_filters_navigates_and_saves(page, tmp_path, ui_server_factory):
-    root = tmp_path / "notebook"
-    ids = _notes_runs(root)
-    with ui_server_factory(root) as server:
-        _seed_note(page, server, ids["first notes run"], "- [ ] Investigate loss plateau")
-        _seed_note(page, server, ids["second notes run"], "- [x] Record accuracy")
-        home(page, server)
-        book = page.locator(".notebook")
-        expect(book).to_have_attribute("open", "")
-        expect(book.locator(".notebook-entry")).to_have_count(2)
-        expect(book.locator("summary")).to_contain_text("2 runs with notes")
-        expect(book.locator("summary")).to_contain_text("1 open follow-up")
-        assert page.evaluate("localStorage.getItem('agenticml-notebook-open')") is None
-        for name in ids:
-            expect(book.get_by_role("link", name=name, exact=True)).to_be_visible()
-        page.get_by_role("tab", name="alpha", exact=True).click()
-        expect(book.locator(".notebook-entry")).to_have_count(1)
-        expect(book.locator("summary")).to_contain_text("1 run with notes")
-        expect(book.get_by_role("link", name="first notes run", exact=True)).to_be_visible()
-        page.get_by_role("tab", name="All projects", exact=True).click()
-        page.get_by_label("Filter runs").fill("ACCURACY")
-        expect(book.locator(".notebook-entry")).to_have_count(1)
-        expect(book.get_by_role("link", name="second notes run", exact=True)).to_be_visible()
-        page.get_by_label("Filter runs").fill(ids["first notes run"])
-        expect(book.locator(".notebook-entry")).to_have_count(1)
-        page.get_by_label("Filter runs").fill("")
-        box = book.get_by_role("checkbox", name="Investigate loss plateau", exact=True)
-        box.check()
-        expect(box).to_be_enabled()
-        expect(box).to_be_checked()
-        assert _stored_note(page, server, ids["first notes run"])["text"].startswith("- [x]")
-        book.get_by_role("link", name="first notes run", exact=True).click()
-        expect(page.get_by_role("heading", name="first notes run", exact=True)).to_be_visible()
-        expect(page.locator(".notepad").get_by_role("checkbox")).to_be_checked()
-        page.get_by_role("link", name="← All runs", exact=True).click()
-        expect(book.locator(".notebook-entry")).to_have_count(2)
-        book.locator("summary").click()
-        # Native details toggles persist in a queued event, after the click returns.
-        page.wait_for_function("() => localStorage.getItem('agenticml-notebook-open') === 'false'")
-        page.reload()
-        expect(book.locator(".notebook-entry")).to_have_count(2)
-        expect(book).not_to_have_attribute("open", "")
-
-
-def test_notes_read_only(page, tmp_path, ui_server_factory):
-    root = tmp_path / "readonly-notes"
-    ids = _notes_runs(root)
-    # Seed with a writable server, then exercise the actual CLI flag.
-    with ui_server_factory(root) as server:
-        _seed_note(page, server, ids["first notes run"], "- [ ] Cannot change this")
-    with ui_server_factory(root, extra_args=("--read-only",)) as server:
-        page.goto(f"{server.url}#/run/{ids['first notes run']}")
-        pad = page.locator(".notepad")
-        expect(pad.get_by_role("checkbox")).to_be_disabled()
-        expect(pad.get_by_role("button", name="Edit", exact=True)).to_be_hidden()
-        expect(pad).to_contain_text("Read-only dashboard")
-        home(page, server)
-        expect(page.locator(".notebook").get_by_role("checkbox")).to_be_disabled()
-
-
-@pytest.mark.parametrize("theme", ["light", "dark"])
-@pytest.mark.parametrize("width", [375, 360])
-def test_notes_mobile_overflow_and_toolbar(page, tmp_path, ui_server_factory, width, theme):
-    root = tmp_path / "mobile-notes"
-    ids = _notes_runs(root)
-    text = "- [ ] Mobile task\n\nhttps://example.com/" + "longword" * 80 + "\n\n```\n" + "code" * 160 + "\n```\n\n" + "line\n" * 20
-    page.set_viewport_size({"width": width, "height": 812})
-    page.add_init_script(f"localStorage.setItem('agenticml-theme', '{theme}')")
-    with ui_server_factory(root) as server:
-        _seed_note(page, server, ids["first notes run"], text)
-        page.goto(f"{server.url}#/run/{ids['first notes run']}")
-        pad = page.locator(".notepad")
-        expect(pad.get_by_role("checkbox")).to_be_visible()
-        _assert_notes_no_overflow(page)
-        pad.get_by_role("button", name="Edit", exact=True).click()
-        toolbar = pad.get_by_role("toolbar", name="Note formatting")
-        expect(toolbar).to_be_visible()
-        assert toolbar.evaluate("el => el.scrollWidth > el.clientWidth && getComputedStyle(el).overflowX === 'auto'")
-        for name in ("Checklist", "Link"):
-            control = toolbar.get_by_role("button", name=name, exact=True)
-            assert control.evaluate("el => el.offsetHeight >= 40 && el.offsetWidth >= 40")
-        _assert_notes_no_overflow(page)
-        home(page, server)
-        book = page.locator(".notebook")
-        expect(book.get_by_role("checkbox")).to_be_visible()
-        _assert_notes_no_overflow(page)
-        book.get_by_role("button", name="Show more", exact=True).click()
-        expect(book.get_by_role("button", name="Show less", exact=True)).to_be_visible()
-        _assert_notes_no_overflow(page)
-
-
-def _assert_notes_no_overflow(page):
-    overflow = page.evaluate("Math.max(document.documentElement.scrollWidth-document.documentElement.clientWidth, document.body.scrollWidth-document.body.clientWidth)")
-    assert overflow <= 0, f"notes overflow horizontally by {overflow}px"
-
-
-@pytest.mark.parametrize("width", [375, 360])
-def test_notebook_long_path_run_name_has_title_and_fits(page, tmp_path, ui_server_factory, width):
-    root = tmp_path / "notebook-long-name"
-    name = "experiments/very/long/nested/directory/structure/for/tests/train_with_a_really_long_script_name.py"
-    writer = RunWriter.create(root, meta={"name": name, "project": "demo"})
-    writer.finish("finished")
-    write_note(root, writer.run_id, "- [ ] todo", None)
-    page.set_viewport_size({"width": width, "height": 812})
-    with ui_server_factory(root) as server:
-        home(page, server)
-        link = page.locator(".notebook .notebook-run")
-        expect(link).to_be_visible()
-        expect(link).to_have_attribute("title", name)
-        assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
-        bounds = link.bounding_box()
-        assert 0 <= bounds["x"] and bounds["x"] + bounds["width"] <= width
-
-
-def test_notes_rendering_safety_and_markdown(page, tmp_path, ui_server_factory):
-    root = tmp_path / "safe-notes"
-    ids = _notes_runs(root)
-    text = ('# Results\nA **bold** and _italic_ note with `code` and ~~strike~~.\n'
-            '<img src=x onerror=window.noteXSS=1>\n[x](javascript:alert(1))\n\n'
-            '[upper](JAVASCRIPT:alert(1))\n[tab](java\tscript:alert(1))\n'
-            '[data](data:text/html,<script>alert(1)</script>)\n'
-            '[vb](vbscript:msgbox(1))\n[relative](//evil.com)\n'
-            'learning_rate and weight_decay; 2 * 3 * 4\n\n'
-            '- parent\n  - [ ] nested task\n\n> quoted\n\n---\n'
-            '[external](https://example.com)\n\n```\n- [ ] code, not a task\n<script>alert(1)</script>\n```')
-    with ui_server_factory(root) as server:
-        _seed_note(page, server, ids["first notes run"], text)
-        page.goto(f"{server.url}#/run/{ids['first notes run']}")
-        pad = page.locator(".notepad")
-        expect(pad.get_by_role("heading", name="Results", exact=True)).to_be_visible()
-        expect(pad.locator("strong")).to_have_text("bold")
-        expect(pad.locator("em")).to_have_text("italic")
-        expect(pad.locator("del")).to_have_text("strike")
-        expect(pad.locator("blockquote")).to_have_text("quoted")
-        expect(pad.locator("img, script, a[href^='javascript:']")).to_have_count(0)
-        expect(pad).to_contain_text("<img src=x onerror=window.noteXSS=1>")
-        expect(pad.get_by_role("checkbox")).to_have_count(1)
-        expect(pad.locator(".note-progress")).to_have_text("0/1 done")
-        expect(pad.locator("ul > li > ul .note-task")).to_have_count(1)
-        external = pad.get_by_role("link", name="external", exact=True)
-        expect(external).to_have_attribute("target", "_blank")
-        expect(external).to_have_attribute("rel", "noopener noreferrer")
-        assert page.evaluate("window.noteXSS === undefined")
-        for notebook in (False, True):
-            if notebook:
-                home(page, server)
-            surface = page.locator(".notebook") if notebook else pad
-            expect(surface.locator(".note-markdown")).to_contain_text("learning_rate and weight_decay; 2 * 3 * 4")
-            expect(surface.locator("em")).to_have_text("italic")
-            expect(surface.locator(".note-markdown a")).to_have_count(1)
-            expect(surface.locator("img, script")).to_have_count(0)
-            expect(surface.get_by_role("link", name="external", exact=True)).to_have_attribute("href", "https://example.com")
-        assert page.evaluate("window.noteXSS === undefined")
-
-
-def test_notes_underscore_boundaries(page, tmp_path, ui_server_factory):
-    root = tmp_path / "underscore-notes"
-    run_id = _notes_runs(root)["first notes run"]
-    text = ("_start_ **bold**_adjacent_ (_punctuation_) _one_ _two_\n"
-            "snake_case foo_bar _later_ snake_case_again 1_no_ _no_2 __no__")
-    with ui_server_factory(root) as server:
-        _seed_note(page, server, run_id, text)
-        page.goto(f"{server.url}#/run/{run_id}")
-        expect(page.locator(".notepad em")).to_have_text(
-            ["start", "adjacent", "punctuation", "one", "two", "later"]
-        )
-        expect(page.locator(".notepad .note-markdown")).to_contain_text(
-            "snake_case foo_bar later snake_case_again 1_no_ _no_2 __no__"
-        )
-
-
-def test_notepad_conflict_load_latest_and_keep_mine(page, tmp_path, ui_server_factory):
-    root = tmp_path / "conflict-notes"
-    ids = _notes_runs(root)
-    run_id = ids["first notes run"]
-    page.allow_http_errors = True  # 409 is the expected compare-and-swap response.
-    with ui_server_factory(root) as server:
-        original = _seed_note(page, server, run_id, "Original")
-        page.goto(f"{server.url}#/run/{run_id}")
-        pad = page.locator(".notepad")
-        pad.get_by_role("button", name="Edit", exact=True).click()
-        _seed_note(page, server, run_id, "Changed elsewhere", original["revision"])
-        area = pad.get_by_label("Note Markdown")
-        area.fill("My local draft")
-        expect(pad.get_by_role("alert")).to_contain_text("This note was changed elsewhere.")
-        expect(area).to_have_value("My local draft")
-        assert page.evaluate("""() => {
-            const event = new Event('beforeunload', {cancelable: true});
-            window.dispatchEvent(event);
-            return event.defaultPrevented;
-        }""")
-        pad.get_by_role("button", name="Keep mine", exact=True).click()
-        expect(pad.locator(".note-save")).to_contain_text("Saved")
-        mine = _stored_note(page, server, run_id)
-        assert mine["text"] == "My local draft"
-        _seed_note(page, server, run_id, "Latest server copy", mine["revision"])
-        area.fill("Another local draft")
-        expect(pad.get_by_role("alert")).to_be_visible()
-        pad.get_by_role("button", name="Load latest", exact=True).click()
-        expect(area).to_have_value("Latest server copy")
-        expect(pad.locator(".note-save")).to_contain_text("Saved")
-
-
-@pytest.mark.parametrize("text", ["Save before the debounce fires", "learning_rate " * 8000], ids=["small", "100kb"])
-def test_notepad_flush_on_route_change(page, tmp_path, ui_server_factory, text):
-    root = tmp_path / "flush-notes"
-    ids = _notes_runs(root)
-    run_id = ids["first notes run"]
-    page.add_init_script("""(() => {
-        const original = window.fetch;
-        window.routeNoteKeepalive = [];
-        window.fetch = function(url, options) {
-            if (options?.method === 'PUT') window.routeNoteKeepalive.push(options.keepalive);
-            return original.call(this, url, options);
-        };
-    })();""")
-    with ui_server_factory(root) as server:
-        if len(text) > 60000:
-            _seed_note(page, server, run_id, text + "before editing")
-        page.goto(f"{server.url}#/run/{run_id}")
-        pad = page.locator(".notepad")
-        pad.get_by_role("button", name="Edit" if len(text) > 60000 else "Add a note…", exact=True).click()
-        pad.get_by_label("Note Markdown").fill(text)
-        # Programmatic navigation does not blur the editor first.
-        with page.expect_response(lambda response: response.request.method == "PUT" and response.url.endswith("/notes")) as response:
-            page.evaluate("location.hash = '#/'")
-        assert response.value.ok
-        assert _stored_note(page, server, run_id)["text"] == text
-        assert page.evaluate("window.routeNoteKeepalive") == [False]
-
-
-def test_notepad_serializes_saves_and_keeps_edits_during_poll(page, tmp_path, ui_server_factory):
-    root = tmp_path / "pending-notes"
-    writer = RunWriter.create(root, meta={"name": "Live notes", "project": "alpha"})
-    held = []
-    reads = []
-    puts = []
-
-    def intercept(route):
-        if route.request.method == "PUT":
-            puts.append(route.request.post_data_json)
-            if len(puts) == 1:
-                held.append(route)
-                return
-        else:
-            reads.append(route.request.url)
-        route.continue_()
-
-    page.route(f"**/api/runs/{writer.run_id}/notes", intercept)
-    page.clock.install()
-    try:
-        with ui_server_factory(root) as server:
-            page.goto(f"{server.url}#/run/{writer.run_id}")
-            pad = page.locator(".notepad")
-            pad.get_by_role("button", name="Add a note…", exact=True).click()
-            area = pad.get_by_label("Note Markdown")
-            area.fill("First draft")
-            with page.expect_request(lambda request: request.method == "PUT" and request.url.endswith("/notes")):
-                page.clock.fast_forward(800)
-            expect(pad.locator(".note-save")).to_have_text("Saving…")
-            assert len(held) == 1
-            area.fill("New draft during save")
-            page.clock.fast_forward(5000)
-            expect(area).to_have_value("New draft during save")
-            assert len(puts) == 1
-            assert len(reads) == 1  # Polling must never re-fetch the note.
-            held.pop().continue_()
-            expect(pad.locator(".note-save")).to_contain_text("Saved")
-            assert len(puts) == 2
-            assert puts[1]["revision"] is not None
-            assert _stored_note(page, server, writer.run_id)["text"] == "New draft during save"
-    finally:
-        for route in held:
-            route.abort()
-        writer.finish("finished")
-
-
-def test_notepad_formatting_and_retry(page, tmp_path, ui_server_factory):
-    page.clock.install()
-    root = tmp_path / "format-notes"
-    ids = _notes_runs(root)
-    run_id = ids["first notes run"]
-    page.allow_http_errors = True
-    failures = []
-
-    def fail_once(route):
-        if route.request.method == "PUT" and len(failures) < 2:
-            failures.append(True)
-            route.fulfill(status=503, json={"error": "Try again later"})
-        else:
-            route.continue_()
-
-    page.route(f"**/api/runs/{run_id}/notes", fail_once)
-    with ui_server_factory(root) as server:
-        page.goto(f"{server.url}#/run/{run_id}")
-        pad = page.locator(".notepad")
-        pad.get_by_role("button", name="Add a note…", exact=True).click()
-        area = pad.get_by_label("Note Markdown")
-        area.fill("one\ntwo")
-        area.select_text()
-        pad.get_by_role("button", name="Bullet", exact=True).click()
-        expect(area).to_have_value("- one\n- two")
-        pad.get_by_role("button", name="Checklist", exact=True).click()
-        expect(area).to_have_value("- [ ] one\n- [ ] two")
-        pad.get_by_role("button", name="Checklist", exact=True).click()
-        expect(area).to_have_value("one\ntwo")
-        area.fill("word")
-        area.select_text()
-        area.press("Control+i")
-        expect(area).to_have_value("*word*")
-        area.press("Control+z")
-        expect(area).to_have_value("word")
-        area.select_text()
-        area.press("Control+b")
-        expect(area).to_have_value("**word**")
-        area.press("Control+s")
-        expect(pad.locator(".note-save")).to_contain_text("Save failed")
-        with page.expect_response(lambda response: response.status == 503):
-            assert page.evaluate("""() => {
-                const event = new Event('beforeunload', {cancelable: true});
-                window.dispatchEvent(event);
-                return event.defaultPrevented;
-            }""")
-        expect(pad.locator(".note-save")).to_contain_text("Save failed")
-        pad.get_by_role("button", name="Retry", exact=True).click()
-        expect(pad.locator(".note-save")).to_contain_text("Saved")
-        assert _stored_note(page, server, run_id)["text"] == "**word**"
-
-
-def test_notebook_conflict_refreshes_entry(page, tmp_path, ui_server_factory):
-    page.clock.install()
-    root = tmp_path / "notebook-conflict"
-    ids = _notes_runs(root)
-    run_id = ids["first notes run"]
-    page.allow_http_errors = True
-    with ui_server_factory(root) as server:
-        original = _seed_note(page, server, run_id, "- [ ] Old task")
-        home(page, server)
-        book = page.locator(".notebook")
-        expect(book.get_by_role("checkbox", name="Old task", exact=True)).to_be_visible()
-        book.get_by_role("status").evaluate("el => window.noteStatus = el")
-        _seed_note(page, server, run_id, "- [x] Latest task", original["revision"])
-        book.get_by_role("checkbox", name="Old task", exact=True).check()
-        expect(book.get_by_role("status")).to_contain_text("This note was changed elsewhere.")
-        expect(book.get_by_role("checkbox", name="Latest task", exact=True)).to_be_checked()
-        assert _stored_note(page, server, run_id)["text"] == "- [x] Latest task"
-        assert book.get_by_role("status").evaluate("el => el === window.noteStatus")
-        page.clock.fast_forward(5000)
-        expect(book.get_by_role("status")).to_be_empty()
-        expect(book.locator(".note-message")).to_have_count(0)
-
-
-@pytest.mark.parametrize("notebook", [False, True], ids=["notepad", "notebook"])
-def test_notes_task_source_lines_and_counts(page, tmp_path, ui_server_factory, notebook):
-    root = tmp_path / "task-lines"
-    run_id = _notes_runs(root)["first notes run"]
-    text = "```\n- [ ] fake\n```\n- [ ] real\n  - [ ] nested\n1. [ ] numbered"
-    with ui_server_factory(root) as server:
-        _seed_note(page, server, run_id, text)
-        page.goto(server.url if notebook else f"{server.url}#/run/{run_id}")
-        surface = page.locator(".notebook" if notebook else ".notepad")
-        expect(surface.get_by_role("checkbox")).to_have_count(3)
-        for name in ("real", "numbered"):
-            with page.expect_response(lambda response: response.request.method == "PUT" and response.url.endswith("/notes")):
-                surface.get_by_role("checkbox", name=name, exact=True).check()
-            expect(surface.get_by_role("checkbox", name=name, exact=True)).to_be_enabled()
-        expected = text.replace("- [ ] real", "- [x] real").replace("1. [ ] numbered", "1. [x] numbered")
-        assert _stored_note(page, server, run_id)["text"] == expected
-        if notebook:
-            expect(surface.locator('[title="Tasks completed"]')).to_have_text("2/3")
-            expect(surface.locator("summary")).to_contain_text("1 open follow-up")
-        else:
-            expect(surface.locator(".note-progress")).to_have_text("2/3 done")
-        # The public pure helpers must handle original CRLF text as well.
-        assert page.evaluate(r"""async () => {
-            const {taskCounts, toggleTask} = await import('/static/notes.js');
-            const source = '```\r\n- [ ] fake\r\n```\r\n-  [ ] real\r\n1. [ ] numbered\r\n';
-            const changed = toggleTask(source, 4, true);
-            return JSON.stringify(taskCounts(changed)) === JSON.stringify({done: 1, total: 2}) &&
-                changed === source.replace('1. [ ]', '1. [x]') &&
-                toggleTask(source, 1, true) === source &&
-                toggleTask(source, 3, true) === source.replace('-  [ ] real', '-  [x] real');
-        }""")
-
-
-def test_notepad_blank_lines_undo_and_mobile_enter(page, tmp_path, ui_server_factory):
-    page.clock.install()
-    root = tmp_path / "editing"
-    run_id = _notes_runs(root)["first notes run"]
-    with ui_server_factory(root) as server:
-        page.goto(f"{server.url}#/run/{run_id}")
-        pad = page.locator(".notepad")
-        pad.get_by_role("button", name="Add a note…", exact=True).click()
-        area = pad.get_by_label("Note Markdown")
-        area.fill("\nabc")
-        area.evaluate("el => el.setSelectionRange(0, 0)")
-        pad.get_by_role("button", name="Checklist", exact=True).click()
-        expect(area).to_have_value("- [ ] \nabc")
-        area.press("Control+z")
-        expect(area).to_have_value("\nabc")
-        area.fill("one\n\ntwo")
-        area.select_text()
-        pad.get_by_role("button", name="Numbered", exact=True).click()
-        expect(area).to_have_value("1. one\n\n2. two")
-        area.select_text()
-        pad.get_by_role("button", name="Numbered", exact=True).click()
-        expect(area).to_have_value("one\n\ntwo")
-        area.fill("- item")
-        area.press("End")
-        area.press("Enter")
-        expect(area).to_have_value("- item\n- ")
-        area.press("Control+z")
-        expect(area).to_have_value("- item")
-        # Android keyboards may send only beforeinput, with no Enter keydown.
-        for input_type in ("insertParagraph", "insertLineBreak"):
-            area.fill("- [ ] mobile")
-            area.press("End")
-            area.dispatch_event("keydown", {"key": "Unidentified", "keyCode": 229})
-            area.evaluate("""(el, inputType) => el.dispatchEvent(new InputEvent('beforeinput', {
-                inputType, bubbles: true, cancelable: true,
-            }))""", input_type)
-            expect(area).to_have_value("- [ ] mobile\n- [ ] ")
-        area.fill("- item")
-        area.press("End")
-        area.press("Shift+Enter")
-        expect(area).to_have_value("- item\n")
-
-
-@pytest.mark.parametrize("event", ["pagehide", "hidden", "beforeunload"])
-@pytest.mark.parametrize("large", [False, True], ids=["small", "large"])
-def test_notepad_unload_flush_limits_and_cleanup(page, tmp_path, ui_server_factory, event, large):
-    page.clock.install()
-    page.add_init_script("""(() => {
-        const original = window.fetch;
-        window.noteWrites = [];
-        window.fetch = function(url, options) {
-            if (options?.method === 'PUT') window.noteWrites.push({keepalive: options.keepalive,
-                bytes: new TextEncoder().encode(options.body).length});
-            return original.call(this, url, options);
-        };
-        const types = ['beforeunload', 'pagehide', 'visibilitychange', 'resize'];
-        window.noteLifecycle = {listeners: {}, intervals: {added: 0, removed: 0}};
-        for (const [name, target] of [['window', window], ['document', document]]) {
-            for (const type of types)
-                window.noteLifecycle.listeners[`${name}:${type}`] = {added: 0, removed: 0};
-            for (const [method, count] of [['addEventListener', 'added'], ['removeEventListener', 'removed']]) {
-                const original = target[method];
-                target[method] = function(type, ...args) {
-                    if (types.includes(type)) window.noteLifecycle.listeners[`${name}:${type}`][count]++;
-                    return original.call(this, type, ...args);
-                };
-            }
-        }
-        const set = window.setInterval, clear = window.clearInterval;
-        window.setInterval = function(...args) {
-            window.noteLifecycle.intervals.added++;
-            return set.apply(this, args);
-        };
-        window.clearInterval = function(...args) {
-            window.noteLifecycle.intervals.removed++;
-            return clear.apply(this, args);
-        };
-    })();""")
-    root = tmp_path / "unload-notes"
-    run_id = _notes_runs(root)["first notes run"]
-    text = "é" * (31000 if large else 100)
-    with ui_server_factory(root) as server:
-        page.goto(f"{server.url}#/run/{run_id}")
-        pad = page.locator(".notepad")
-        pad.get_by_role("button", name="Add a note…", exact=True).click()
-        pad.get_by_label("Note Markdown").fill(text)
-        with page.expect_response(lambda response: response.request.method == "PUT" and response.url.endswith("/notes")):
-            prevented = page.evaluate("""kind => {
-                if (kind === 'hidden') {
-                    Object.defineProperty(document, 'visibilityState', {configurable: true, value: 'hidden'});
-                    document.dispatchEvent(new Event('visibilitychange'));
-                    return false;
-                }
-                const event = new Event(kind, {cancelable: true});
-                window.dispatchEvent(event);
-                return event.defaultPrevented;
-            }""", event)
-        expect(pad.locator(".note-save")).to_contain_text("Saved")
-        assert _stored_note(page, server, run_id)["text"] == text
-        writes = page.evaluate("window.noteWrites")
-        assert len(writes) == 1
-        assert writes[0]["keepalive"] is (not large)
-        assert prevented is (event == "beforeunload" and large)
-        # Leave a fresh draft so teardown must remove an active unload guard too.
-        pad.get_by_label("Note Markdown").fill(text + " route draft")
-        active = page.evaluate("window.noteLifecycle")
-        for key in ("window:beforeunload", "window:pagehide", "document:visibilitychange", "window:resize"):
-            assert active["listeners"][key]["added"] - active["listeners"][key]["removed"] == 1
-        assert active["intervals"] == {"added": 1, "removed": 0}
-        # The empty compare route creates no replacement notebook listeners/timer.
-        with page.expect_response(lambda response: response.request.method == "PUT" and response.url.endswith("/notes")):
-            page.evaluate("location.hash = '#/compare'")
-        expect(pad).to_have_count(0)
-        expect(page.get_by_text("Select two or more runs from Runs to compare.", exact=True)).to_be_visible()
-        counts = page.evaluate("window.noteLifecycle")
-        for key, count in counts["listeners"].items():
-            assert count["added"] == count["removed"], (key, count)
-        assert counts["intervals"] == {"added": 1, "removed": 1}
-        assert _stored_note(page, server, run_id)["text"] == text + " route draft"
-        page.evaluate("""() => {
-            window.dispatchEvent(new Event('pagehide'));
-            document.dispatchEvent(new Event('visibilitychange'));
-            window.dispatchEvent(new Event('resize'));
-            window.dispatchEvent(new Event('beforeunload', {cancelable: true}));
-        }""")
-        page.clock.fast_forward(30000)
-        assert len(page.evaluate("window.noteWrites")) == 2
-        assert page.evaluate("window.noteLifecycle") == counts
-
-
-@pytest.mark.parametrize("width", [1400, 375])
-def test_notebook_clipped_controls_skip_tab_focus(page, tmp_path, ui_server_factory, width):
-    root = tmp_path / "clipped-notes"
-    run_id = _notes_runs(root)["first notes run"]
-    text = "- [ ] Visible task\n\n" + "a line of text\n" * 30 + "\n- [ ] Hidden task\n\n[Hidden link](https://example.com)"
-    page.set_viewport_size({"width": width, "height": 812})
-    with ui_server_factory(root) as server:
-        _seed_note(page, server, run_id, text)
-        home(page, server)
-        book = page.locator(".notebook")
-        content = book.locator(".notebook-content")
-        visible = book.get_by_role("checkbox", name="Visible task", exact=True)
-        hidden = content.locator('input[data-line="33"]')
-        hidden_link = content.locator("a")
-        more = book.get_by_role("button", name="Show more", exact=True)
-        expect(more).to_be_visible()
-        expect(visible).not_to_have_attribute("inert", "")
-        expect(hidden).to_have_attribute("inert", "")
-        expect(hidden_link).to_have_attribute("inert", "")
-        visible.focus()
-        page.keyboard.press("Tab")
-        expect(more).to_be_focused()
-        assert content.evaluate("el => el.scrollTop") == 0
-        # The visible checkbox remains usable while the rest is clamped.
-        visible.check()
-        expect(visible).to_be_enabled()
-        expect(visible).to_be_checked()
-        more.click()
-        expect(hidden).not_to_have_attribute("inert", "")
-        expect(hidden_link).not_to_have_attribute("inert", "")
-        visible.focus()
-        page.keyboard.press("Tab")
-        expect(hidden).to_be_focused()
-        book.get_by_role("button", name="Show less", exact=True).click()
-        expect(hidden).to_have_attribute("inert", "")
-        expect(hidden_link).to_have_attribute("inert", "")
-        # Resizing must remeasure which controls are clipped.
-        page.set_viewport_size({"width": 375 if width == 1400 else 1400, "height": 812})
-        visible.focus()
-        page.keyboard.press("Tab")
-        expect(more).to_be_focused()
-        assert content.evaluate("el => el.scrollTop") == 0
-        _assert_notes_no_overflow(page)
-
-
-def test_notebook_poll_preserves_dom_selection_and_focus(page, tmp_path, ui_server_factory):
-    page.clock.install()
-    root = tmp_path / "stable-notebook"
-    writer = RunWriter.create(root, meta={"name": "Live notebook", "project": "alpha"})
-    text = "- [ ] task\n\n" + "select this line\n" * 20
-    try:
-        with ui_server_factory(root) as server:
-            note = _seed_note(page, server, writer.run_id, text)
-            home(page, server)
-            book = page.locator(".notebook")
-            more = book.get_by_role("button", name="Show more", exact=True)
-            expect(more).to_be_visible()
-            more.focus()
-            book.locator(".notebook-entry").evaluate("""el => {
-                window.originalNoteEntry = el;
-                const range = document.createRange();
-                range.selectNodeContents(el.querySelector('.note-markdown p'));
-                const selection = window.getSelection();
-                selection.removeAllRanges();
-                selection.addRange(range);
-                window.noteSelection = selection.toString();
-            }""")
-            with page.expect_response(lambda response: response.url.endswith("/api/notes")):
-                page.clock.fast_forward(5000)
-            assert book.locator(".notebook-entry").evaluate("el => el === window.originalNoteEntry")
-            expect(more).to_be_focused()
-            assert page.evaluate("window.getSelection().toString() === window.noteSelection")
-            book.get_by_role("checkbox", name="task", exact=True).check()
-            expect(book.get_by_role("checkbox", name="task", exact=True)).to_be_enabled()
-            note = _stored_note(page, server, writer.run_id)
-            assert note["text"].startswith("- [x] task")
-            more.focus()
-            # An actual revision change redraws, retaining the focused control.
-            _seed_note(page, server, writer.run_id, text + "changed", note["revision"])
-            with page.expect_response(lambda response: response.url.endswith("/api/notes")):
-                page.clock.fast_forward(5000)
-            expect(book.locator(".note-markdown")).to_contain_text("changed")
-            expect(more).to_be_focused()
-            # The surviving entry handlers must save with the latest revision.
-            book.get_by_role("checkbox", name="task", exact=True).check()
-            expect(book.get_by_role("checkbox", name="task", exact=True)).to_be_enabled()
-            assert _stored_note(page, server, writer.run_id)["text"].startswith("- [x] task")
-    finally:
-        writer.finish("finished")
-
-
-def test_notes_long_line_guard_empty_task_and_relative_time(page, tmp_path, ui_server_factory):
-    page.clock.install()
-    root = tmp_path / "long-line"
-    run_id = _notes_runs(root)["first notes run"]
-    long_line = "[" * 10000 + " **plain**"
-    with ui_server_factory(root) as server:
-        _seed_note(page, server, run_id, "- [ ] \n" + long_line)
-        page.goto(f"{server.url}#/run/{run_id}")
-        pad = page.locator(".notepad")
-        expect(pad.get_by_role("checkbox", name="Task", exact=True)).to_be_visible()
-        expect(pad.locator("strong")).to_have_count(0)
-        expect(pad.locator(".note-markdown")).to_contain_text(long_line)
-        expect(pad.locator(".note-save")).to_have_text("Saved · just now")
-        state = pad.get_by_role("status")
-        expect(state).to_have_text("Saved")
-        # Observe live-region writes, including redundant writes of the same text.
-        state.evaluate("""el => {
-            window.noteAnnouncements = [];
-            new MutationObserver(() => window.noteAnnouncements.push(el.textContent))
-                .observe(el, {childList: true, characterData: true, subtree: true});
-        }""")
-        assert pad.locator(".note-save-time").evaluate(
-            "el => !el.closest('.notepad [aria-live], .notepad [role=status], .notepad [role=alert]')"
-        )
-        page.clock.fast_forward(60000)
-        expect(pad.locator(".note-save")).to_have_text("Saved · 1m ago")
-        assert page.evaluate("window.noteAnnouncements") == []
-        pad.get_by_role("button", name="Edit", exact=True).click()
-        pad.get_by_label("Note Markdown").fill("Updated note")
-        expect(state).to_have_text("Unsaved")
-        page.clock.fast_forward(800)
-        expect(state).to_have_text("Saved")
-        assert page.evaluate("window.noteAnnouncements") == ["Unsaved", "Saving…", "Saved"]
-        # The minute jump leaves the page clock ahead of server timestamps.
-        page.clock.set_system_time(datetime.now(timezone.utc))
-        home(page, server)
-        expect(page.locator(".notebook .note-time")).to_have_text("edited just now")
-        page.clock.fast_forward(60000)
-        expect(page.locator(".notebook .note-time")).to_have_text("edited 1m ago")
-
-
-def test_notepad_grow_preserves_scroll_and_follows_resize(page, tmp_path, ui_server_factory):
-    page.clock.install()
-    root = tmp_path / "grow-notes"
-    run_id = _notes_runs(root)["first notes run"]
-    with ui_server_factory(root) as server:
-        _seed_note(page, server, run_id, ("a moderately long line with several words " * 6 + "\n") * 50)
-        page.goto(f"{server.url}#/run/{run_id}")
-        pad = page.locator(".notepad")
-        pad.get_by_role("button", name="Edit", exact=True).click()
-        area = pad.get_by_label("Note Markdown")
-        assert area.evaluate("el => { window.scrollTo(0, el.offsetTop + 800); return window.scrollY; }") > 0
-        before, after = area.evaluate("""el => {
-            const before = window.scrollY;
-            el.dispatchEvent(new Event('input', {bubbles: true}));
-            return [before, window.scrollY];
-        }""")
-        assert abs(before - after) <= 1
-        height = area.evaluate("el => el.offsetHeight")
-        page.set_viewport_size({"width": 375, "height": 812})
-        page.wait_for_function("height => document.querySelector('.note-editor').offsetHeight > height", arg=height)
-        assert area.evaluate("el => el.clientHeight >= el.scrollHeight - 1")
-        _assert_notes_no_overflow(page)
-
-
-def test_truncated_note_warns_until_save_anyway(page, tmp_path, ui_server_factory):
-    page.clock.install()
-    page.add_init_script("""(() => {
-        const original = window.fetch;
-        window.notePuts = [];
-        window.fetch = function(url, options) {
-            if (options && options.method === 'PUT') window.notePuts.push(String(url));
-            return original.call(this, url, options);
-        };
-    })();""")
-    root = tmp_path / "truncated-notes"
-    ids = _notes_runs(root)
-    run_id = ids["first notes run"]
-    mode = {"conflict": False, "fail": False, "read_only": False}
-    warning_text = (
-        "This note is larger than 256 KiB and is shown truncated. "
-        "Saving will drop the rest of the file."
-    )
-    readonly_text = "This note is larger than 256 KiB and is shown truncated."
-    save_hint = "Use Save anyway to replace the file."
-
-    def run_notes(route):
-        if route.request.method == "PUT" and mode["fail"]:
-            mode["fail"] = False
-            route.fulfill(status=503, json={"error": "Try again later"})
-            return
-        if route.request.method == "PUT" and mode["conflict"]:
-            mode["conflict"] = False
-            route.fulfill(status=409, json={
-                "error": "conflict",
-                "note": {
-                    "text": "- [ ] Server task",
-                    "revision": "prefix-revision",
-                    "updated_at": "2026-01-01T00:00:00Z",
-                    "writable": True,
-                    "too_large": True,
-                },
-            })
-            return
-        if route.request.method == "GET":
-            upstream = route.fetch()
-            payload = upstream.json()
-            payload["too_large"] = True
-            if mode["read_only"]:
-                payload["writable"] = False
-            route.fulfill(status=upstream.status, json=payload)
-            return
-        route.continue_()
-
-    def notebook(route):
-        if route.request.method != "GET":
-            route.continue_()
-            return
-        route.fulfill(json={
-            "notes": [
-                {
-                    "run_id": run_id,
-                    "name": "first notes run",
-                    "project": "alpha",
-                    "status": "finished",
-                    "text": "- [ ] Keep the tail\n- [ ] Second task",
-                    "updated_at": "2026-01-01T00:00:00Z",
-                    "revision": "truncated",
-                    "too_large": True,
-                },
-                {
-                    "run_id": ids["second notes run"],
-                    "name": "second notes run",
-                    "project": "beta",
-                    "status": "finished",
-                    "text": "- [ ] Editable",
-                    "updated_at": "2026-01-01T00:00:00Z",
-                    "revision": "small",
-                },
-            ],
-            "truncated": False,
-            "writable": True,
-        })
-
-    def puts():
-        return page.evaluate("window.notePuts.length")
-
-    def note_write(response):
-        return response.request.method == "PUT" and response.url.endswith("/notes")
-
-    with ui_server_factory(root) as server:
-        original = _seed_note(page, server, run_id, "- [ ] Keep the tail")
-        page.route(re.compile(rf"/api/runs/{re.escape(run_id)}/notes(?:\?|$)"), run_notes)
-        page.route(re.compile(r"/api/notes(?:\?|$)"), notebook)
-        home(page, server)
-        book = page.locator(".notebook")
-        truncated = book.locator(".notebook-entry").filter(has_text="Truncated: open the run to edit")
-        boxes = truncated.get_by_role("checkbox")
-        expect(book).to_have_attribute("open", "")
-        expect(boxes).to_have_count(2)
-        expect(boxes.nth(0)).to_be_disabled()
-        expect(boxes.nth(1)).to_be_disabled()
-        expect(truncated.locator(".note-truncated")).to_have_text("Truncated: open the run to edit")
-        expect(book.get_by_role("checkbox", name="Editable", exact=True)).to_be_enabled()
-        assert truncated.locator(".note-truncated").evaluate(
-            "el => !el.closest('.notebook [role=status], .notebook [aria-live]')"
-        )
-        truncated.locator(".note-truncated").evaluate("el => { window.truncatedNote = el }")
-        page.clock.fast_forward(30000)
-        expect(truncated.locator(".note-truncated")).to_have_text("Truncated: open the run to edit")
-        assert truncated.locator(".note-truncated").evaluate("el => el === window.truncatedNote")
-        page.set_viewport_size({"width": 375, "height": 812})
-        _assert_notes_no_overflow(page)
-        page.set_viewport_size({"width": 1400, "height": 1000})
-
-        book.get_by_role("link", name="first notes run", exact=True).click()
-        expect(page.get_by_role("heading", name="first notes run", exact=True)).to_be_visible()
-        pad = page.locator(".notepad")
-        warning = pad.locator(".note-truncate")
-        expect(warning.locator(".note-truncate-copy")).to_have_text(warning_text)
-        expect(warning.get_by_role("button", name="Save anyway", exact=True)).to_be_visible()
-        expect(pad.get_by_role("status")).to_have_text("Unsaved")
-        expect(pad.get_by_role("status")).not_to_contain_text("256 KiB")
-        assert pad.locator(".note-save-time").evaluate(
-            "el => !el.closest('.notepad [aria-live], .notepad [role=status], .notepad [role=alert]')"
-        )
-        assert warning.evaluate("el => el.getAttribute('role') === 'alert' && !el.closest('[role=status]')")
-        kept = pad.get_by_role("checkbox", name="Keep the tail", exact=True)
-        expect(kept).to_be_disabled()
-        expect(kept).not_to_be_checked()
-        page.set_viewport_size({"width": 375, "height": 812})
-        _assert_notes_no_overflow(page)
-        page.set_viewport_size({"width": 1400, "height": 1000})
-        warning.evaluate("""el => {
-            window.truncateWarning = el;
-            window.truncateMutations = [];
-            new MutationObserver(records => {
-                for (const record of records)
-                    window.truncateMutations.push(record.type + ':' + (record.attributeName || ''));
-            }).observe(el, {subtree: true, childList: true, characterData: true, attributes: true});
-        }""")
-
-        pad.get_by_role("button", name="Edit", exact=True).click()
-        area = pad.get_by_label("Note Markdown")
-        expect(area).to_have_value("- [ ] Keep the tail")
-        area.fill("Still truncated")
-        page.clock.fast_forward(800)
-        expect(pad.get_by_role("status")).to_have_text("Unsaved")
-        assert puts() == 0
-        assert _stored_note(page, server, run_id)["text"] == original["text"]
-        page.clock.fast_forward(60000)
-        expect(warning.locator(".note-truncate-copy")).to_have_text(warning_text)
-        expect(pad.get_by_role("status")).to_have_text("Unsaved")
-        assert page.evaluate("window.truncateMutations") == []
-        assert warning.evaluate("el => el === window.truncateWarning")
-        assert puts() == 0
-
-        # Closed gate: lifecycle events must not PUT. beforeunload still warns.
-        page.evaluate("() => window.dispatchEvent(new Event('pagehide'))")
-        assert puts() == 0
-        seen = page.evaluate("""() => {
-            const proto = Document.prototype;
-            const previous = Object.getOwnPropertyDescriptor(proto, 'visibilityState');
-            Object.defineProperty(proto, 'visibilityState', {configurable: true, get: () => 'hidden'});
-            try {
-                const state = document.visibilityState;
-                document.dispatchEvent(new Event('visibilitychange'));
-                return state;
-            } finally {
-                Object.defineProperty(proto, 'visibilityState', previous);
-            }
-        }""")
-        assert seen == "hidden"
-        assert puts() == 0
-        unload = page.evaluate("""() => {
-            const event = new Event('beforeunload', {cancelable: true});
-            window.dispatchEvent(event);
-            return {defaultPrevented: event.defaultPrevented, returnValue: event.returnValue};
-        }""")
-        assert unload["defaultPrevented"] is True
-        # Chromium cannot construct BeforeUnloadEvent. On a synthetic Event,
-        # returnValue is the legacy boolean and false means the unload was cancelled.
-        # The handler still assigns "" for a real BeforeUnloadEvent.
-        assert unload["returnValue"] is False
-        assert puts() == 0
-        page.evaluate("() => { location.hash = '#/' }")
-        expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
-        assert puts() == 0
-        assert _stored_note(page, server, run_id)["text"] == original["text"]
-
-        page.locator(".notebook").get_by_role("link", name="first notes run", exact=True).click()
-        expect(page.get_by_role("heading", name="first notes run", exact=True)).to_be_visible()
-        pad = page.locator(".notepad")
-        warning = pad.locator(".note-truncate")
-        expect(warning.locator(".note-truncate-copy")).to_have_text(warning_text)
-        expect(pad.get_by_role("checkbox", name="Keep the tail", exact=True)).to_be_disabled()
-        pad.get_by_role("button", name="Edit", exact=True).click()
-        area = pad.get_by_label("Note Markdown")
-        area.fill("Still truncated")
-        page.clock.fast_forward(800)
-        expect(pad.get_by_role("status")).to_have_text("Unsaved")
-        assert puts() == 0
-        area.focus()
-        expect(area).to_be_focused()
-        area.evaluate("el => el.blur()")
-        expect(area).not_to_be_focused()
-        assert puts() == 0
-        page.set_viewport_size({"width": 375, "height": 812})
-        area.press("Control+s")
-        assert puts() == 0
-        expect(warning.get_by_role("button", name="Save anyway", exact=True)).to_be_focused()
-        expect(warning.locator(".note-truncate-hint")).to_have_text(save_hint)
-        _assert_notes_no_overflow(page)
-        page.set_viewport_size({"width": 1400, "height": 1000})
-        pad.locator("button", has_text="Retry").evaluate("el => el.click()")
-        assert puts() == 0
-        assert _stored_note(page, server, run_id)["text"] == original["text"]
-
-        with page.expect_response(note_write) as saved:
-            warning.get_by_role("button", name="Save anyway", exact=True).click()
-        assert saved.value.ok
-        assert saved.value.request.post_data_json == {"text": "Still truncated", "revision": original["revision"]}
-        assert _stored_note(page, server, run_id)["text"] == "Still truncated"
-        expect(warning).to_be_hidden()
-        expect(pad.get_by_role("status")).to_have_text("Saved")
-        assert pad.locator(".note-save-time").evaluate(
-            "el => !el.closest('.notepad [aria-live], .notepad [role=status], .notepad [role=alert]')"
-        )
-        assert puts() == 1
-
-        area.fill("- [ ] Confirmed task")
-        with page.expect_response(note_write) as autosaved:
-            page.clock.fast_forward(800)
-        assert autosaved.value.ok
-        assert _stored_note(page, server, run_id)["text"] == "- [ ] Confirmed task"
-        expect(warning).to_be_hidden()
-        assert puts() == 2
-        pad.get_by_role("button", name="Preview", exact=True).click()
-        with page.expect_response(note_write):
-            pad.get_by_role("checkbox", name="Confirmed task", exact=True).check()
-        expect(pad.get_by_role("checkbox", name="Confirmed task", exact=True)).to_be_checked()
-        assert _stored_note(page, server, run_id)["text"] == "- [x] Confirmed task"
-        expect(warning).to_be_hidden()
-        assert puts() == 3
-
-        # A reload is truncated again. Saving the unchanged prefix still replaces the file.
-        with page.expect_response(lambda response: response.request.method == "GET" and response.url.endswith("/notes")):
-            page.reload()
-        expect(warning).to_be_visible()
-        assert puts() == 0
-        # Reveal the hint, then replace the file. A later truncated conflict
-        # must not show that hint until Ctrl+S or Retry asks for it again.
-        pad.get_by_role("button", name="Edit", exact=True).click()
-        area = pad.get_by_label("Note Markdown")
-        area.press("Control+s")
-        expect(warning.locator(".note-truncate-hint")).to_be_visible()
-        expect(warning.locator(".note-truncate-hint")).to_have_text(save_hint)
-        with page.expect_response(note_write) as forced:
-            warning.get_by_role("button", name="Save anyway", exact=True).click()
-        assert forced.value.ok
-        assert forced.value.request.post_data_json["text"] == "- [x] Confirmed task"
-        expect(warning).to_be_hidden()
-        assert _stored_note(page, server, run_id)["text"] == "- [x] Confirmed task"
-        assert puts() == 1
-
-        page.allow_http_errors = True
-        mode["conflict"] = True
-        pad.get_by_role("button", name="Edit", exact=True).click()
-        area = pad.get_by_label("Note Markdown")
-        area.fill("- [ ] Local task")
-        with page.expect_response(lambda response: response.status == 409 and response.url.endswith("/notes")):
-            page.clock.fast_forward(800)
-        expect(warning.locator(".note-truncate-copy")).to_have_text(warning_text)
-        expect(warning.locator(".note-truncate-hint")).to_be_hidden()
-        expect(pad.locator(".note-conflict")).to_contain_text("This note was changed elsewhere.")
-        assert puts() == 2
-        area.fill("- [ ] Local task revised")
-        page.clock.fast_forward(800)
-        expect(pad.get_by_role("status")).to_have_text("Unsaved")
-        expect(warning).to_be_visible()
-        assert puts() == 2
-        pad.get_by_role("button", name="Keep mine", exact=True).click()
-        expect(pad.locator(".note-conflict")).to_be_hidden()
-        expect(warning).to_be_visible()
-        expect(area).to_have_value("- [ ] Local task revised")
-        assert puts() == 2
-        area.fill("- [ ] Server task")
-        page.clock.fast_forward(800)
-        assert puts() == 2
-        pad.get_by_role("button", name="Preview", exact=True).click()
-        server_box = pad.get_by_role("checkbox", name="Server task", exact=True)
-        expect(server_box).to_be_disabled()
-        page.clock.fast_forward(800)
-        assert puts() == 2
-        assert _stored_note(page, server, run_id)["text"] == "- [x] Confirmed task"
-
-        # A failed Save anyway leaves the gate closed, so Retry must not PUT.
-        mode["fail"] = True
-        with page.expect_response(lambda response: response.status == 503 and response.url.endswith("/notes")):
-            warning.get_by_role("button", name="Save anyway", exact=True).click()
-        assert puts() == 3
-        expect(pad.get_by_role("status")).to_have_text("Save failed")
-        pad.get_by_role("button", name="Retry", exact=True).click()
-        assert puts() == 3
-        expect(pad.get_by_role("status")).to_have_text("Save failed")
-        expect(warning.get_by_role("button", name="Save anyway", exact=True)).to_be_focused()
-        expect(warning.locator(".note-truncate-hint")).to_have_text(save_hint)
-        assert _stored_note(page, server, run_id)["text"] == "- [x] Confirmed task"
-
-        mode["read_only"] = True
-        with page.expect_response(lambda response: response.request.method == "GET" and response.url.endswith("/notes")):
-            page.reload()
-        expect(warning.locator(".note-truncate-copy")).to_have_text(readonly_text)
-        expect(warning).not_to_contain_text("Saving will drop")
-        expect(warning.locator("button", has_text="Save anyway")).to_be_hidden()
-        expect(pad.get_by_role("status")).to_have_text("Read-only dashboard")
-        expect(pad.get_by_role("checkbox", name="Confirmed task", exact=True)).to_be_disabled()
-
-
-def test_launch_note_shows_until_the_notepad_is_edited(page, tmp_path, ui_server_factory):
-    root = tmp_path / "launch-notes"
-    launch_title = "Set with --notes / init(notes=...). Saving here creates this run's notepad."
-
-    def start(name, project, notes):
-        writer = RunWriter.create(root, meta={"name": name, "project": project, "notes": notes})
-        writer.finish("finished")
-        return writer.run_id
-
-    run_id = start("launch run", "alpha", "Launch idea\n- [ ] check lr")
-    listed_id = start("listed launch", "beta", "Listed idea\n- [ ] keep")
-    frozen_id = start("frozen launch", "alpha", "Frozen idea\n- [ ] look")
-    page.set_viewport_size({"width": 375, "height": 812})
-    with ui_server_factory(root) as server:
-        page.goto(f"{server.url}#/run/{run_id}")
-        pad = page.locator(".notepad")
-        label = pad.locator(".note-launch")
-        expect(label).to_be_visible()
-        expect(label).to_have_text("from launch")
-        expect(label).to_have_attribute("title", launch_title)
-        expect(pad).to_contain_text("Launch idea")
-        expect(pad.locator(".note-save")).to_have_text("Not saved yet")
-        expect(pad.get_by_role("checkbox", name="check lr", exact=True)).to_be_enabled()
-        _assert_notes_no_overflow(page)
-        pad.get_by_role("button", name="Edit", exact=True).click()
-        area = pad.get_by_label("Note Markdown")
-        expect(area).to_have_value("Launch idea\n- [ ] check lr")
-        _assert_notes_no_overflow(page)
-        pad.get_by_role("button", name="Preview", exact=True).click()
-        with page.expect_response(lambda response: response.request.method == "PUT" and response.ok) as saved:
-            pad.get_by_role("checkbox", name="check lr", exact=True).check()
-        assert saved.value.json()["source"] == "file"
-        expect(pad.locator(".note-save")).to_contain_text("Saved")
-        expect(label).to_be_hidden()
-        note_path = root / "runs" / run_id / "notes.md"
-        assert "- [x] check lr" in note_path.read_text(encoding="utf-8")
-        page.reload()
-        expect(pad.locator(".note-launch")).to_be_hidden()
-        expect(pad.get_by_role("checkbox", name="check lr", exact=True)).to_be_checked()
-        expect(pad).to_contain_text("Launch idea")
-        pad.get_by_role("button", name="Edit", exact=True).click()
-        area = pad.get_by_label("Note Markdown")
-        with page.expect_response(lambda response: response.request.method == "PUT" and response.ok):
-            area.fill("")
-        expect(pad.locator(".note-save")).to_contain_text("Saved")
-        page.reload()
-        expect(pad.get_by_role("button", name="Add a note…", exact=True)).to_be_visible()
-        expect(pad.get_by_text("Launch idea")).to_have_count(0)
-        expect(pad.locator(".note-launch")).to_be_hidden()
-        assert note_path.read_bytes() == b""
-        _assert_notes_no_overflow(page)
-
-        home(page, server)
-        book = page.locator(".notebook")
-        expect(book).to_have_attribute("open", "")
-        frozen = book.locator(".notebook-entry").filter(has_text="frozen launch")
-        listed = book.locator(".notebook-entry").filter(has_text="listed launch")
-        expect(frozen.locator(".note-launch")).to_be_visible()
-        expect(frozen.locator(".note-launch")).to_have_attribute("title", launch_title)
-        expect(frozen).to_contain_text("Frozen idea")
-        expect(listed.locator(".note-launch")).to_be_visible()
-        expect(book.locator(".notebook-entry").filter(has_text="launch run")).to_have_count(0)
-        _assert_notes_no_overflow(page)
-        with page.expect_response(lambda response: response.request.method == "PUT" and response.ok) as ticked:
-            listed.get_by_role("checkbox", name="keep", exact=True).check()
-        assert ticked.value.json()["source"] == "file"
-        expect(listed.locator(".note-launch")).to_be_hidden()
-        assert "- [x] keep" in (root / "runs" / listed_id / "notes.md").read_text(encoding="utf-8")
-        expect(frozen.locator(".note-launch")).to_be_visible()
-
-    with ui_server_factory(root, extra_args=("--read-only",)) as server:
-        page.goto(f"{server.url}#/run/{frozen_id}")
-        pad = page.locator(".notepad")
-        expect(pad.locator(".note-launch")).to_be_visible()
-        expect(pad.locator(".note-launch")).to_have_text("from launch")
-        expect(pad).to_contain_text("Frozen idea")
-        expect(pad.get_by_role("checkbox", name="look", exact=True)).to_be_disabled()
-        _assert_notes_no_overflow(page)
 
 
 def _in_dedicated_live(locator):
@@ -3578,19 +1750,8 @@ def _in_dedicated_live(locator):
     }""")
 
 
-def _outside_live(locator):
-    # Ancestors only: the relative-time node itself is not a live region either.
-    assert locator.evaluate("""el => {
-      if (el.matches('[aria-live], [role=status], [role=alert]')) return false;
-      for (let node = el.parentElement; node; node = node.parentElement) {
-        const role = node.getAttribute('role');
-        if (node.hasAttribute('aria-live') || role === 'status' || role === 'alert') return false;
-      }
-      return true;
-    }""")
-
-
-def test_pending_lineage_keeps_loading_status_across_polls(page, ui_server):
+def test_pending_lineage_refetches_only_when_runs_change(page, ui_server):
+    """Polls never stack /api/lineage fetches; a changed run set asks once more."""
     runs = [{"run_id": "live", "name": "live run", "project": "demo", "status": "running", "keys": []}]
     mock_dashboard(page, runs)
     held = []
@@ -3603,16 +1764,14 @@ def test_pending_lineage_keeps_loading_status_across_polls(page, ui_server):
     page.set_viewport_size({"width": 375, "height": 812})
     try:
         home(page, ui_server)
-        loading = page.locator('.lineage-scroll [role="status"]')
-        expect(loading).to_have_text("Loading lineage…")
-        loading.evaluate("el => { el.dataset.keptLoading = 'original'; }")
+        expect(row(page, "live run").locator(".run-varied")).to_have_text("—")
+        expect(page.locator(".task-strip")).to_have_count(0)
         page.evaluate("window.keptRow = document.querySelector('.run-row')")
 
         # The live runs timer fires every 5 s; wait for the response and draw.
         with page.expect_response("**/api/runs"):
             page.clock.fast_forward(5000)
         page.wait_for_function("() => !window.keptRow.isConnected")
-        expect(loading).to_have_attribute("data-kept-loading", "original")
         assert len(held) == 1
 
         # A changed lineage signature starts another fetch while still pending.
@@ -3620,16 +1779,14 @@ def test_pending_lineage_keeps_loading_status_across_polls(page, ui_server):
         with page.expect_response("**/api/runs"):
             page.clock.fast_forward(5000)
         expect(row(page, "renamed live run")).to_be_visible()
-        expect(loading).to_have_attribute("data-kept-loading", "original")
-        expect(loading).to_have_text("Loading lineage…")
         assert len(held) == 2
         assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
     finally:
         for route in held:
             route.fulfill(content_type="application/json", body=json.dumps({"nodes": runs, "edges": []}))
         page.unroute("**/api/lineage?project=demo", stall_lineage)
-    expect(page.locator(".lineage-node")).to_contain_text("renamed live run")
-    expect(loading).to_have_count(0)
+    expect(page.locator(".task-strip-dot")).to_have_attribute("title", "renamed live run")
+    expect(row(page, "renamed live run").locator(".run-varied")).to_have_text("root")
 
 
 def test_loading_status_is_inserted_empty_before_text_is_set(page, ui_server):
@@ -3694,16 +1851,17 @@ def test_loading_status_is_inserted_empty_before_text_is_set(page, ui_server):
 
 
 def test_page_live_regions_are_dedicated(page, tmp_path, ui_server_factory):
-    """main is quiet; loading, route errors, poll status, and save state each speak for themselves."""
+    """main is quiet; loading, route errors, and poll status each speak for themselves."""
     root = tmp_path / "live-regions"
-    run_id = _notes_runs(root)["first notes run"]
+    writer = RunWriter.create(root, meta={"name": "first live run", "project": "alpha"})
+    writer.finish("finished")
+    run_id = writer.run_id
     held = []
 
     def stall_runs(route):
         held.append(route)
 
     with ui_server_factory(root) as server:
-        _seed_note(page, server, run_id, "A saved note")
         page.route("**/api/runs", stall_runs)
         try:
             page.goto(f"{server.url}#/run/{run_id}")
@@ -3716,19 +1874,13 @@ def test_page_live_regions_are_dedicated(page, tmp_path, ui_server_factory):
             for route in held:
                 route.continue_()
             page.unroute("**/api/runs", stall_runs)
-        expect(page.get_by_role("heading", name="first notes run", exact=True)).to_be_visible()
+        expect(page.get_by_role("heading", name="first live run", exact=True)).to_be_visible()
         assert page.locator("main#app").evaluate("el => !el.hasAttribute('aria-live')")
         status = page.locator(".poll-status")
         expect(status).to_have_text("Up to date")
         expect(status).to_have_attribute("role", "status")
         expect(status).to_have_attribute("aria-live", "polite")
         _in_dedicated_live(status)
-        pad = page.locator(".notepad")
-        expect(pad.get_by_role("status")).to_have_text("Saved")
-        _in_dedicated_live(pad.get_by_role("status"))
-        age = pad.locator(".note-save-time")
-        expect(age).to_contain_text(re.compile(r"just now|\d+[mhd] ago"))
-        _outside_live(age)
 
         page.allow_http_errors = True
         page.goto(f"{server.url}#/run/unknown-valid-id")
@@ -3740,9 +1892,6 @@ def test_page_live_regions_are_dedicated(page, tmp_path, ui_server_factory):
 
         home(page, server)
         expect(page.locator(".runs-workspace > .poll-status")).to_have_attribute("role", "status")
-        edited = page.locator(".notebook .note-time").filter(has_text=re.compile(r"edited "))
-        expect(edited).not_to_have_count(0)
-        _outside_live(edited.first)
 
         # Two identical /api/runs failures must keep the same alert node.
         page.allow_http_errors = True
