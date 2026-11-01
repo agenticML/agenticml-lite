@@ -28,6 +28,6 @@ A run stays `running` while its process holds the run's lock, even if it logs ra
 
 ## Notes
 
-Every run page has an autosaving Markdown notepad, and you can tick checklist items in view mode. The home page has a collapsible Notes notebook that groups each run's note under its name and follows the project tab and filter.
+The dashboard pages do not show run notes. Launch notes (`--notes` / `init(notes=)`) are still stored with the run.
 
-The dashboard is read-only except for notes. `--read-only` disables note editing. Use it if you expose the dashboard on a non-loopback `--host`.
+The server's only write is the `/api/runs/<id>/notes` endpoint. `--read-only` disables it. Use it if you expose the dashboard on a non-loopback `--host`.
