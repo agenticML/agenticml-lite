@@ -4,31 +4,6 @@ Unfinished work, highest priority first. See [AGENTS.md](AGENTS.md) for how
 these are prioritized. When a task is done, delete its entry in the same
 change that finishes it.
 
-## Review and verify the `--parent` cross-task check
-
-- **Where:** `_check_parent_task` in `src/agenticml/cli.py`,
-  `RunSettings.allow_cross_task` in `src/agenticml/launch.py`, the cross-task
-  warning in `Run.__init__` (`src/agenticml/run.py`), the new tests in
-  `tests/test_launch.py` and `tests/test_lineage.py`, and docs (README,
-  `docs/SDK.md`, `docs/FORMAT.md`).
-- **Problem:** `agenticml run --parent X` with an explicit task (`--task` or a
-  valid `AGENTICML_TASK`) that differs from X's task now exits with a usage
-  error before the script runs, unless `--allow-cross-task` /
-  `AGENTICML_ALLOW_CROSS_TASK=1` is given. `init(parent_run_id=..., task=...)`
-  only warns. This was implemented but not code-reviewed, and only the
-  targeted tests ran (`tests/test_launch.py tests/test_lineage.py
-  tests/test_local_cli.py`: 280 passed). The rest of the `--parent` feature was
-  reviewed and fully tested.
-- **Fix:** review those parts of the branch's `--parent` commit (look for:
-  `_check_parent_task` swallowing every exception, the mode check reading
-  `AGENTICML_MODE` itself, a parent with no task counting as a mismatch, the
-  Python-side warning firing when the CLI already allowed the cross-task
-  link), fix findings, then run the full suites.
-- **Done when:** review findings are addressed and
-  `testbed/.venv/bin/python -m pytest -q tests` plus `.venv/bin/python -m
-  pytest -q -m ui` (from `testbed/`) pass apart from the failures listed in the
-  next entry.
-
 ## Fix tests that fail on `main` and the silently skipped browser tests
 
 - **Where:** `tests/test_ui.py`, `tests/test_ui_limits.py`,

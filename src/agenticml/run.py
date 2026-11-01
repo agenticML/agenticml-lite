@@ -30,7 +30,7 @@ from .code_tracking import (
     resolve_task,
 )
 from .env import capture_environment
-from .lineage import get_git_metadata, run_task, snapshot as snapshot_lineage
+from .lineage import get_git_metadata, parent_lane_task, run_task, snapshot as snapshot_lineage
 from .media import _Media, is_media
 from ._source_inspect import stage_source_and_metadata
 from .auto_tracking import AutoTracker
@@ -286,6 +286,7 @@ class Run(metaclass=_RunType):
         sync_tensorboard=False,
         lineage=True,
         task=None,
+        allow_cross_task=False,
     ):
         if resume not in _VALID_RESUME:
             raise ValueError(f"resume must be one of {_VALID_RESUME}")
@@ -411,9 +412,8 @@ class Run(metaclass=_RunType):
             try:
                 if id is None or not run_dir(self.root, id).exists():
                     parent_meta = RunReader(self.root, parent_run_id).meta()
-                    parent_task = run_task(parent_meta)[0]
+                    parent_task = parent_lane_task(parent_meta, project)
                     if parent_meta.get("project") != project:
-                        parent_task = None
                         logger.warning(
                             "parent run %r is in another project (%r); child project remains %r",
                             parent_run_id, parent_meta.get("project"), project,
@@ -453,7 +453,8 @@ class Run(metaclass=_RunType):
         if id is not None:
             self.writer = RunWriter.resume(self.root, id, must=(resume == "must"))
         if self.writer is None:
-            if (parent_task is not None and task_source in {"explicit", "env"}
+            if (not allow_cross_task and parent_task is not None
+                    and task_source in {"explicit", "env"}
                     and (self.task or "") != parent_task):
                 logger.warning(
                     "run task %r differs from parent run %r task %r; the lineage link crosses tasks",

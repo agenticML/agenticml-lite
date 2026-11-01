@@ -154,12 +154,11 @@ def test_init_inherits_parent_task(project, tmp_path, monkeypatch, env_task):
         assert meta["lineage"]["parent_inference"] == "explicit"
 
 
-@pytest.mark.parametrize("parent_task", ["a", None])
 @pytest.mark.parametrize("source", ["explicit", "env"])
-def test_init_cross_task_warns(project, tmp_path, monkeypatch, caplog, parent_task, source):
+def test_init_cross_task_warns(project, tmp_path, monkeypatch, caplog, source):
     root = tmp_path / "store"
-    with start(root, task=parent_task) as parent:
-        assert parent.task == parent_task
+    with start(root, task="a") as parent:
+        assert parent.task == "a"
     if source == "env":
         monkeypatch.setenv("AGENTICML_TASK", "b")
     caplog.clear()
@@ -175,17 +174,18 @@ def test_init_cross_task_warns(project, tmp_path, monkeypatch, caplog, parent_ta
     assert warnings[0].name == "agenticml.run"
     assert warnings[0].levelname == "WARNING"
     assert warnings[0].message == (
-        f"run task 'b' differs from parent run {parent.run_id!r} task {parent_task or ''!r}; "
+        f"run task 'b' differs from parent run {parent.run_id!r} task 'a'; "
         "the lineage link crosses tasks"
     )
 
 
-@pytest.mark.parametrize("case", ["matching", "no-parent", "missing", "other-project", "resumed"])
+@pytest.mark.parametrize("case", ["matching", "no-parent", "missing", "other-project", "resumed", "no-task"])
 @pytest.mark.parametrize("source", ["explicit", "env"])
 def test_init_no_cross_task_warning(project, tmp_path, monkeypatch, caplog, case, source):
     root = tmp_path / "store"
     parent_project = "other" if case == "other-project" else "test"
-    with Run(parent_project, "parent", dir=root, task="a", capture_env=False,
+    parent_task = None if case == "no-task" else "a"
+    with Run(parent_project, "parent", dir=root, task=parent_task, capture_env=False,
              system_metrics=False, auto_track=False) as parent:
         pass
     parent_id = parent.run_id
@@ -206,6 +206,21 @@ def test_init_no_cross_task_warning(project, tmp_path, monkeypatch, caplog, case
               task=task if source == "explicit" else None, capture_env=False,
               system_metrics=False, auto_track=False, **options) as child:
         assert child.task == ("original" if case == "resumed" else task)
+    assert "lineage link crosses tasks" not in caplog.text
+
+
+def test_init_allow_cross_task_skips_warning(project, tmp_path, caplog):
+    root = tmp_path / "store"
+    with start(root, task="a") as parent:
+        pass
+    caplog.clear()
+    with init("test", "child", dir=root, mode="local", parent_run_id=parent.run_id,
+              task="b", allow_cross_task=True, capture_env=False,
+              system_metrics=False, auto_track=False) as child:
+        meta = RunReader(root, child.run_id).meta()
+        assert child.task == meta["task"] == "b"
+        assert meta["parent_run_id"] == parent.run_id
+        assert meta["lineage"]["parent_run_id"] == parent.run_id
     assert "lineage link crosses tasks" not in caplog.text
 
 

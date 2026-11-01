@@ -168,6 +168,13 @@ def run_task(meta):
     return (task, "legacy") if task else ("", None)
 
 
+def parent_lane_task(parent_meta, project):
+    """Parent's normalized non-empty task when it is in ``project``, else None."""
+    if parent_meta.get("project") != project:
+        return None
+    return run_task(parent_meta)[0] or None
+
+
 def _parent_candidates(metas):
     """Read preloaded metadata once; malformed candidates cannot break inference."""
     for meta in metas:

@@ -71,12 +71,22 @@ class _DisabledRun:
         return False
 
 
-def _resolve_mode(explicit):
+def _mode_name(explicit):
+    """Return ``local`` or ``disabled`` without logging.
+
+    Unknown values and ``offline`` become ``local``, matching ``_resolve_mode``.
+    """
     mode = (explicit or os.environ.get("AGENTICML_MODE") or "local").lower()
     if mode not in _VALID_MODES:
-        logger.warning("unknown AGENTICML_MODE=%r; falling back to 'local'", mode)
         mode = "local"
     return "local" if mode == "offline" else mode
+
+
+def _resolve_mode(explicit):
+    raw = (explicit or os.environ.get("AGENTICML_MODE") or "local").lower()
+    if raw not in _VALID_MODES:
+        logger.warning("unknown AGENTICML_MODE=%r; falling back to 'local'", raw)
+    return _mode_name(explicit)
 
 
 def init(
