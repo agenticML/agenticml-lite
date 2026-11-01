@@ -104,12 +104,10 @@ written to. Disable with `lineage=False` or `AGENTICML_LINEAGE=0` (`false`, `no`
 selects an explicit parent, as does `agenticml run --parent RUN_ID` (env
 `AGENTICML_PARENT`); a self-parent is ignored. New runs inherit the parent's
 task unless `task=` / `--task` or a valid `AGENTICML_TASK` supplies one.
-The CLI refuses a differing explicit `--task` or valid `AGENTICML_TASK` with
-exit 2 unless `--allow-cross-task` or `AGENTICML_ALLOW_CROSS_TASK=1` is set.
-The check applies only when the parent is readable, in the same project, and
-has a task. Disabled mode skips this check. The Python API warns instead when
-an explicit or environment task differs from an explicit parent's task in the
-same project, unless `init(..., allow_cross_task=True)`.
+The CLI and Python API both warn when an explicit or valid environment task
+differs from an explicit parent's task, if the parent is readable, in the same
+project, and has a task. Silence the warning with `--allow-cross-task`,
+`AGENTICML_ALLOW_CROSS_TASK=1` (CLI), or `init(..., allow_cross_task=True)`.
 Missing or unreadable parents are recorded with a warning; a parent in another
 project also warns and leaves the child's project unchanged. Its task is not
 inherited, and the child snapshot has no Git parent commit.

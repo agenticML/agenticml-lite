@@ -21,8 +21,8 @@ import shutil
 import subprocess
 import sys
 
-from .code_tracking import _normalize_task, default_project
-from .launch import LaunchError, RunSettings, Target, parse_log_every, project_start_dir, run_target
+from .code_tracking import _normalize_task
+from .launch import LaunchError, RunSettings, Target, parse_log_every, run_target
 from .store.layout import valid_run_id
 
 
@@ -315,7 +315,7 @@ options:
   --job-type NAME      job type (env AGENTICML_JOB_TYPE)
   --task NAME          run task (env AGENTICML_TASK; default: parent's task, agenticml.toml task, else the entry script's folder)
   --parent RUN_ID      parent run for lineage (env AGENTICML_PARENT; default: inferred)
-  --allow-cross-task   allow --task to differ from a readable same-project parent that has a task (env AGENTICML_ALLOW_CROSS_TASK=1)
+  --allow-cross-task   do not warn when --task differs from the --parent run's task (env AGENTICML_ALLOW_CROSS_TASK=1)
   --mode MODE          local (default), offline (alias), or disabled (env AGENTICML_MODE)
   --dir DIR            local store root (default: $AGENTICML_DIR or ~/.agenticml)
   --no-auto-track      do not detect model/optimizer/loss/dataloader (env AGENTICML_AUTO_TRACK=0)
@@ -419,36 +419,6 @@ def _parse_run_options(args):
     return settings, raw, args[index:]
 
 
-def _check_parent_task(settings, target):
-    """Refuse an explicit task that would cross the explicit parent's task."""
-    from ._globals import _mode_name
-
-    if not settings.parent_run_id or settings.allow_cross_task or _mode_name(settings.mode) == "disabled":
-        return
-    source = "--task" if settings.task is not None else "AGENTICML_TASK"
-    task = _normalize_task(settings.task if settings.task is not None
-                           else os.environ.get("AGENTICML_TASK"))
-    if task is None:
-        return
-    try:
-        from .lineage import parent_lane_task
-        from .store import RunReader
-        from .store.layout import resolve_root
-
-        project = settings.project or default_project(project_start_dir(target))
-        parent_meta = RunReader(resolve_root(settings.dir), settings.parent_run_id).meta()
-        parent_task = parent_lane_task(parent_meta, project)
-    except (OSError, ValueError, RuntimeError):
-        return
-    if parent_task is not None and task != parent_task:
-        raise _UsageError(
-            f"{source} {task!r} differs from parent run "
-            f"{settings.parent_run_id!r} task {parent_task!r}; the lineage link "
-            f"would cross tasks. Drop {source} to join the parent's task, or "
-            f"pass --allow-cross-task"
-        )
-
-
 def _parse_python_command(rest):
     """Parse `<python> [flags] <script | -m module> [args]`. Returns (flags, target)."""
     flags: list[str] = []
@@ -525,12 +495,10 @@ def cmd_run(args):
         settings, raw_options, rest = _parse_run_options(args)
         if rest and _is_python_executable(rest[0]):
             flags, target = _parse_python_command(rest)
-            _check_parent_task(settings, target)
             if flags or not _is_current_interpreter(rest[0]):
                 return _exec_interpreter(rest[0], flags, raw_options, target)
         else:
             target = _parse_target(rest)
-            _check_parent_task(settings, target)
     except _UsageError as exc:
         if exc.args and exc.args[0]:
             usage = RUN_USAGE.split("\n\n", 1)[0]

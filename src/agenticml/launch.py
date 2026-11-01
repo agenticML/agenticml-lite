@@ -44,13 +44,6 @@ class Target:
     argv: list[str] = field(default_factory=list)
 
 
-def project_start_dir(target: Target) -> Path:
-    """Directory used as ``default_project(start)`` for this target, without compiling it."""
-    if target.kind == "script":
-        return Path(target.value).expanduser().resolve().parent
-    return Path(os.getcwd())
-
-
 @dataclass
 class RunSettings:
     project: str | None = None
@@ -168,7 +161,7 @@ def _resolve(target: Target) -> _Resolved:
             code=code,
             filename=str(path),
             argv0=str(path),
-            path0=str(project_start_dir(target)),
+            path0=str(path.parent),
             default_name=default_run_name(path) or path.name,
             spec=None,
         )
@@ -198,7 +191,7 @@ def _resolve(target: Target) -> _Resolved:
             code=code,
             filename=origin,
             argv0=origin,
-            path0=str(project_start_dir(target)),
+            path0=cwd,
             default_name=default_run_name(spec.origin) or target.value,
             spec=spec,
         )

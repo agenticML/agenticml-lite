@@ -79,7 +79,7 @@ Rules that apply to every form:
 
 Options go before the script; everything after it is the script's own argv. See `agenticml run -h`. `--project`, `--name`, `--tags`, `--notes`, `--group`, `--job-type`, `--mode`, `--dir`, and `--log-every` read `AGENTICML_PROJECT`, `AGENTICML_NAME`, `AGENTICML_TAGS`, `AGENTICML_NOTES`, `AGENTICML_GROUP`, `AGENTICML_JOB_TYPE`, `AGENTICML_MODE`, `AGENTICML_DIR`, and `AGENTICML_LOG_EVERY`. The off switches are in the table. `--verbose` has no variable.
 
-`--task` sets the run's task and overrides `AGENTICML_TASK`, the parent's task, an `agenticml.toml` `task`, and the entry script's folder (see [docs/SDK.md](docs/SDK.md)). With an explicit parent that is readable, in the same project, and has a task, a differing `--task` or valid `AGENTICML_TASK` is a usage error (exit 2) unless `--allow-cross-task` or `AGENTICML_ALLOW_CROSS_TASK=1` is set. Disabled mode skips this check.
+`--task` sets the run's task and overrides `AGENTICML_TASK`, the parent's task, an `agenticml.toml` `task`, and the entry script's folder (see [docs/SDK.md](docs/SDK.md)). With an explicit parent that is readable, in the same project, and has a task, a differing `--task` or valid `AGENTICML_TASK` logs a warning that the lineage link crosses tasks. `--allow-cross-task` or `AGENTICML_ALLOW_CROSS_TASK=1` silences it.
 
 `--parent RUN_ID` (env `AGENTICML_PARENT`) selects an explicit lineage parent. New runs inherit the parent's task unless `--task` or a valid `AGENTICML_TASK` supplies one. A parent in another project is recorded, but its task is not inherited. An invalid `--parent` / `AGENTICML_PARENT` is a usage error (exit 2). `--parent` only applies to new runs: a resumed run keeps its stored parent, with a warning if it differs.
 

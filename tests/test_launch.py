@@ -336,7 +336,7 @@ def test_parent_task_from_another_folder(project, options, env, task, source):
 
 @pytest.mark.parametrize("task_source", ["--task", "AGENTICML_TASK"])
 @pytest.mark.parametrize("parent_source", ["--parent", "AGENTICML_PARENT"])
-def test_cross_task_refused_before_script(project, task_source, parent_source):
+def test_cross_task_warns_and_runs(project, task_source, parent_source):
     proc, runs = _launch(project, "--task", "a", "parent.py", script="pass\n", name="parent.py")
     assert proc.returncode == 0, proc.stderr
     parent = runs[0].run_id
@@ -350,20 +350,23 @@ def test_cross_task_refused_before_script(project, task_source, parent_source):
         from pathlib import Path
         Path("child-ran").touch()
     """)
-    assert proc.returncode == 2
-    message = (f"{task_source} 'b' differs from parent run {parent!r} task 'a'; "
-               f"the lineage link would cross tasks. Drop {task_source} to join "
-               "the parent's task, or pass --allow-cross-task")
-    assert message in proc.stderr.splitlines()[-1]
-    assert len(children) == len(runs) == 1
-    assert not (project / "child-ran").exists()
+    assert proc.returncode == 0, proc.stderr
+    message = (f"run task 'b' differs from parent run {parent!r} task 'a'; "
+               "the lineage link crosses tasks")
+    assert proc.stderr.splitlines().count(message) == 1
+    assert len(children) == 2
+    assert (project / "child-ran").exists()
+    meta = children[-1].meta()
+    assert meta["task"] == "b"
+    assert meta["task_source"] == ("explicit" if task_source == "--task" else "env")
+    assert meta["parent_run_id"] == parent
 
 
 @pytest.mark.parametrize("options, env", [
     (["--mode", "OFFLINE"], {}),
     ([], {"AGENTICML_MODE": "bogus"}),
 ])
-def test_cross_task_refused_in_local_like_modes(project, options, env):
+def test_cross_task_warns_in_local_like_modes(project, options, env):
     proc, runs = _launch(project, "--task", "a", "parent.py", script="pass\n", name="parent.py")
     assert proc.returncode == 0, proc.stderr
     parent = runs[0].run_id
@@ -374,10 +377,16 @@ def test_cross_task_refused_in_local_like_modes(project, options, env):
             Path("child-ran").touch()
         """,
     )
-    assert proc.returncode == 2
-    assert "the lineage link would cross tasks" in proc.stderr
-    assert len(children) == len(runs) == 1
-    assert not (project / "child-ran").exists()
+    assert proc.returncode == 0, proc.stderr
+    message = (f"run task 'b' differs from parent run {parent!r} task 'a'; "
+               "the lineage link crosses tasks")
+    assert proc.stderr.splitlines().count(message) == 1
+    assert len(children) == 2
+    assert (project / "child-ran").exists()
+    meta = children[-1].meta()
+    assert meta["task"] == "b"
+    assert meta["task_source"] == "explicit"
+    assert meta["parent_run_id"] == parent
 
 
 @pytest.mark.parametrize("options, env, task, source, recorded", [
@@ -438,13 +447,14 @@ def test_missing_parent_allows_explicit_task(project):
     )
     assert proc.returncode == 0, proc.stderr
     assert "parent run 'missing' not found" in proc.stderr
+    assert "lineage link crosses tasks" not in proc.stderr
     assert len(runs) == 1
     meta = runs[0].meta()
     assert meta["task"] == "b"
     assert meta["parent_run_id"] == meta["lineage"]["parent_run_id"] == "missing"
 
 
-def test_parent_task_check_uses_explicit_store_same_project(project):
+def test_cross_task_warns_with_explicit_store_same_project(project):
     store = project.parent / "explicit-store"
     proc, _runs = _launch(
         project, "--dir", str(store), "--project", "same", "--task", "a", "parent.py",
@@ -454,11 +464,19 @@ def test_parent_task_check_uses_explicit_store_same_project(project):
     parent = _read_runs(store)[0].run_id
     proc, runs = _launch(
         project, "--dir", str(store), "--project", "same", "--parent", parent, "--task", "b",
-        "child.py", script="raise AssertionError('child ran')\n", name="child.py",
+        "child.py", script="from pathlib import Path; Path('child-ran').touch()\n", name="child.py",
     )
-    assert proc.returncode == 2
-    assert f"differs from parent run {parent!r} task 'a'" in proc.stderr
-    assert len(_read_runs(store)) == 1
+    assert proc.returncode == 0, proc.stderr
+    message = (f"run task 'b' differs from parent run {parent!r} task 'a'; "
+               "the lineage link crosses tasks")
+    assert proc.stderr.splitlines().count(message) == 1
+    assert (project / "child-ran").exists()
+    stored = _read_runs(store)
+    assert len(stored) == 2
+    meta = stored[-1].meta()
+    assert meta["task"] == "b"
+    assert meta["task_source"] == "explicit"
+    assert meta["parent_run_id"] == parent
     assert runs == []
 
 
@@ -481,66 +499,30 @@ def test_parent_in_another_project_allows_explicit_task(project):
     assert meta["task"] == "b"
     assert meta["parent_run_id"] == parent
     assert "is in another project" in proc.stderr
+    assert "lineage link crosses tasks" not in proc.stderr
 
 
-@pytest.mark.parametrize("failure", ["corrupt", "unreadable", "root", "runtime"])
-def test_parent_task_check_lookup_failure_is_ignored(project, monkeypatch, failure):
+def test_cross_task_warns_after_interpreter_reexec(project):
     proc, runs = _launch(project, "--task", "a", "parent.py", script="pass\n", name="parent.py")
     assert proc.returncode == 0, proc.stderr
     parent = runs[0].run_id
-    store = project.parent / "out"
-    if failure == "corrupt":
-        (store / "runs" / parent / "meta.json").write_text("[bad json")
-    else:
-        error = (
-            RuntimeError("symlink loop") if failure == "runtime"
-            else PermissionError("unreadable store")
-        )
-
-        def fail(*args, **kwargs):
-            raise error
-
-        if failure == "root":
-            monkeypatch.setattr("agenticml.store.layout.resolve_root", fail)
-        else:
-            monkeypatch.setattr(RunReader, "meta", fail)
-    monkeypatch.delenv("AGENTICML_MODE", raising=False)
-    calls = []
-    monkeypatch.setattr(cli, "run_target", lambda *args: calls.append(args) or 0)
-    assert cli.cmd_run(["--dir", str(store), "--parent", parent, "--task", "b", "child.py"]) == 0
-    assert len(calls) == 1
-
-
-def test_parent_task_check_does_not_swallow_unexpected_errors(project, monkeypatch):
-    proc, runs = _launch(project, "--task", "a", "parent.py", script="pass\n", name="parent.py")
-    assert proc.returncode == 0, proc.stderr
-    parent = runs[0].run_id
-    store = project.parent / "out"
-    monkeypatch.setattr(
-        RunReader, "meta",
-        lambda self: (_ for _ in ()).throw(KeyError("unexpected store bug")),
+    proc, runs = _launch(
+        project, "--parent", parent, "--task", "b",
+        "--", sys.executable, "-u", "child.py", name="child.py", script="""
+            from pathlib import Path
+            Path("child-ran").touch()
+        """,
     )
-    monkeypatch.delenv("AGENTICML_MODE", raising=False)
-    settings = RunSettings(parent_run_id=parent, task="b", dir=str(store))
-    with pytest.raises(KeyError, match="unexpected store bug"):
-        cli._check_parent_task(settings, Target("script", str(project / "child.py")))
-
-
-def test_cross_task_check_precedes_interpreter_reexec(project, monkeypatch, capsys):
-    proc, runs = _launch(project, "--task", "a", "parent.py", script="pass\n", name="parent.py")
     assert proc.returncode == 0, proc.stderr
-    monkeypatch.delenv("AGENTICML_MODE", raising=False)
-
-    def unexpected(*args):
-        pytest.fail("cross-task check must run before interpreter re-exec or run_target")
-
-    monkeypatch.setattr(cli, "_exec_interpreter", unexpected)
-    monkeypatch.setattr(cli, "run_target", unexpected)
-    assert cli.cmd_run([
-        "--dir", str(project.parent / "out"), "--project", "proj",
-        "--parent", runs[0].run_id, "--task", "b", "--", sys.executable, "-u", "child.py",
-    ]) == 2
-    assert "the lineage link would cross tasks" in capsys.readouterr().err
+    message = (f"run task 'b' differs from parent run {parent!r} task 'a'; "
+               "the lineage link crosses tasks")
+    assert proc.stderr.splitlines().count(message) == 1
+    assert (project / "child-ran").exists()
+    assert len(runs) == 2
+    meta = runs[-1].meta()
+    assert meta["task"] == "b"
+    assert meta["task_source"] == "explicit"
+    assert meta["parent_run_id"] == parent
 
 
 def test_allow_cross_task_survives_interpreter_reexec(project):
