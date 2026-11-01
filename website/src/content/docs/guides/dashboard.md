@@ -2,7 +2,7 @@
 title: Dashboard
 description: Browse runs, charts, media, and notes with agenticml ui.
 sidebar:
-  order: 2
+  order: 3
 ---
 
 ```bash
