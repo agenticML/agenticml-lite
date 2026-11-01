@@ -11,6 +11,7 @@ import builtins
 import importlib.machinery
 import importlib.util
 import logging
+import math
 import os
 import signal
 import sys
@@ -22,7 +23,7 @@ from pathlib import Path
 from . import _globals
 from .code_tracking import default_project, default_run_name
 from .integrations.hyperparams import install_hyperparam_capture, uninstall_hyperparam_capture
-from .store.layout import valid_run_id
+from .store.layout import resolve_root, run_dir, valid_run_id
 
 logger = logging.getLogger("agenticml.launch")
 
@@ -55,6 +56,9 @@ class RunSettings:
     task: str | None = None
     parent_run_id: str | None = None
     allow_cross_task: bool = False
+    id: str | None = None
+    resume: str | None = None
+    config: dict = field(default_factory=dict)
     mode: str | None = None
     dir: str | None = None
     auto_track: bool = True
@@ -62,15 +66,42 @@ class RunSettings:
     log_every: int = 1
     sync_tensorboard: bool = True
     capture_args: bool = True
+    system_metrics: bool = True
+    system_metrics_interval: float = 10.0
+    lineage: bool = True
+    track_source: str | bool = "runtime"
+    capture_env: bool = True
+    extra_files: list[str] = field(default_factory=list)
+    source_roots: list[str] = field(default_factory=list)
+    max_file_bytes: int | None = None
+    max_total_bytes: int | None = None
+    flush_interval: float = 2
+    only_main_process: bool = True
     verbose: bool = False
 
     @classmethod
     def from_env(cls) -> "RunSettings":
         env = os.environ
+
+        def optional(name: str) -> str | None:
+            return (env.get(name) or "").strip() or None
+
         tags = [t.strip() for t in env.get("AGENTICML_TAGS", "").split(",") if t.strip()]
         parent_run_id = env.get("AGENTICML_PARENT") or None
         if parent_run_id is not None and not valid_run_id(parent_run_id):
             raise ValueError("AGENTICML_PARENT must be a valid run id")
+        run_id = optional("AGENTICML_RUN_ID")
+        if run_id is not None and not valid_run_id(run_id):
+            raise ValueError("AGENTICML_RUN_ID must be a valid run id")
+        resume = optional("AGENTICML_RESUME")
+        if resume is not None:
+            try:
+                resume = parse_resume(resume)
+            except ValueError:
+                raise ValueError("AGENTICML_RESUME must be never, allow, or must") from None
+
+        max_file_bytes = optional("AGENTICML_MAX_FILE_BYTES")
+        max_total_bytes = optional("AGENTICML_MAX_TOTAL_BYTES")
 
         def flag(name: str) -> bool:
             return env.get(name, "1").strip().lower() not in _FALSE_VALUES
@@ -83,6 +114,8 @@ class RunSettings:
             group=env.get("AGENTICML_GROUP") or None,
             job_type=env.get("AGENTICML_JOB_TYPE") or None,
             parent_run_id=parent_run_id,
+            id=run_id,
+            resume=resume,
             allow_cross_task=(
                 env.get("AGENTICML_ALLOW_CROSS_TASK", "").strip().lower() in {"1", "true", "yes", "on"}
             ),
@@ -91,16 +124,53 @@ class RunSettings:
             log_every=parse_log_every(env.get("AGENTICML_LOG_EVERY", "1")),
             sync_tensorboard=flag("AGENTICML_SYNC_TENSORBOARD"),
             capture_args=flag("AGENTICML_CAPTURE_ARGS"),
+            system_metrics=flag("AGENTICML_SYSTEM_METRICS"),
+            system_metrics_interval=parse_positive_float(
+                optional("AGENTICML_SYSTEM_METRICS_INTERVAL") or "10.0", "system-metrics-interval"
+            ),
+            track_source="runtime" if flag("AGENTICML_TRACK_CODE") else False,
+            capture_env=flag("AGENTICML_CAPTURE_ENV"),
+            extra_files=[p for p in env.get("AGENTICML_TRACK_FILES", "").split(os.pathsep) if p],
+            source_roots=[p for p in env.get("AGENTICML_SOURCE_ROOTS", "").split(os.pathsep) if p],
+            max_file_bytes=(parse_positive_int(max_file_bytes, "max-file-bytes")
+                            if max_file_bytes is not None else None),
+            max_total_bytes=(parse_positive_int(max_total_bytes, "max-total-bytes")
+                             if max_total_bytes is not None else None),
+            flush_interval=parse_positive_float(optional("AGENTICML_FLUSH_INTERVAL") or "2", "flush-interval"),
+            only_main_process=(
+                env.get("AGENTICML_ALL_RANKS", "").strip().lower() not in {"1", "true", "yes", "on"}
+            ),
         )
 
 
 def parse_log_every(raw: str) -> int:
+    return parse_positive_int(raw, "log-every")
+
+
+def parse_positive_int(raw: str, option: str) -> int:
     try:
         value = int(str(raw).strip())
     except ValueError:
-        raise ValueError(f"log-every must be a positive integer, got {raw!r}") from None
+        raise ValueError(f"{option} must be a positive integer, got {raw!r}") from None
     if value < 1:
-        raise ValueError(f"log-every must be a positive integer, got {raw!r}")
+        raise ValueError(f"{option} must be a positive integer, got {raw!r}")
+    return value
+
+
+def parse_positive_float(raw: str, option: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"{option} must be a positive finite number, got {raw!r}") from None
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{option} must be a positive finite number, got {raw!r}")
+    return value
+
+
+def parse_resume(raw: str) -> str:
+    value = raw.strip().lower()
+    if value not in {"never", "allow", "must"}:
+        raise ValueError("--resume must be never, allow, or must")
     return value
 
 
@@ -117,6 +187,9 @@ class _Resolved:
 def run_target(target: Target, settings: RunSettings) -> int:
     """Init a run, execute ``target`` as ``__main__``, finish, return the exit code."""
     resolved = _resolve(target)
+    if settings.resume == "must" and _globals._resolve_mode(settings.mode) != "disabled":
+        if not (run_dir(resolve_root(settings.dir), settings.id) / "meta.json").is_file():
+            raise LaunchError(f"run {settings.id} not found (--resume must)")
 
     sys.argv = [resolved.argv0, *target.argv]
     if not getattr(sys.flags, "safe_path", False):
@@ -129,7 +202,12 @@ def run_target(target: Target, settings: RunSettings) -> int:
     main = _make_main_module(resolved)
     sys.modules["__main__"] = main
 
-    run = _start_run(settings, resolved)
+    try:
+        run = _start_run(settings, resolved)
+    except BaseException:
+        if original_main is not None:
+            sys.modules["__main__"] = original_main
+        raise
     restore_sigterm = _install_sigterm_handler()
     try:
         exit_code, exception_name = _execute(resolved.code, main.__dict__)
@@ -237,8 +315,27 @@ def _start_run(settings: RunSettings, resolved: _Resolved):
             auto_metrics=settings.auto_metrics,
             log_every=settings.log_every,
             sync_tensorboard=settings.sync_tensorboard,
+            id=settings.id,
+            resume=settings.resume or "never",
+            config=settings.config or None,
+            system_metrics=settings.system_metrics,
+            system_metrics_interval=settings.system_metrics_interval,
+            lineage=settings.lineage,
+            track_source=settings.track_source,
+            capture_env=settings.capture_env,
+            extra_files=settings.extra_files or None,
+            source_roots=settings.source_roots or None,
+            max_file_bytes=settings.max_file_bytes,
+            max_total_bytes=settings.max_total_bytes,
+            flush_interval=settings.flush_interval,
+            only_main_process=settings.only_main_process,
+            _raise_init_errors=settings.id is not None,
         )
-    except Exception:
+    except Exception as exc:
+        if settings.id is not None:
+            lines = str(exc).splitlines()
+            detail = (lines[0] if lines else "") or type(exc).__name__
+            raise LaunchError(f"cannot resume run {settings.id}: {detail}") from None
         logger.exception("agenticml: failed to start a run; running the script untracked")
         return None
     run._launcher_owned = True

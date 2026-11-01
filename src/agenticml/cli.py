@@ -14,15 +14,21 @@ agenticml code in the script:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 from .code_tracking import _normalize_task
-from .launch import LaunchError, RunSettings, Target, parse_log_every, run_target
+from .launch import (
+    LaunchError, RunSettings, Target, parse_log_every, parse_positive_float,
+    parse_positive_int, parse_resume, run_target,
+)
 from .store.layout import valid_run_id
 
 
@@ -311,11 +317,15 @@ options:
   --name NAME          run name (env AGENTICML_NAME; default: entry file path relative to the repo root (absolute outside a repo), or the module name)
   --tags A,B           comma-separated tags (env AGENTICML_TAGS)
   --notes TEXT         run notes (env AGENTICML_NOTES)
+  --config KEY=VALUE   set a config value; repeatable (JSON value or raw string)
+  --config-file PATH   read config from a JSON object (env AGENTICML_CONFIG_FILE)
   --group NAME         run group (env AGENTICML_GROUP)
   --job-type NAME      job type (env AGENTICML_JOB_TYPE)
   --task NAME          run task (env AGENTICML_TASK; default: parent's task, agenticml.toml task, else the entry script's folder)
   --parent RUN_ID      parent run for lineage (env AGENTICML_PARENT; default: inferred)
   --allow-cross-task   do not warn when --task differs from the --parent run's task (env AGENTICML_ALLOW_CROSS_TASK=1)
+  --id RUN_ID          run id to resume (env AGENTICML_RUN_ID)
+  --resume MODE        never, allow, or must (env AGENTICML_RESUME; --id requires allow or must)
   --mode MODE          local (default), offline (alias), or disabled (env AGENTICML_MODE)
   --dir DIR            local store root (default: $AGENTICML_DIR or ~/.agenticml)
   --no-auto-track      do not detect model/optimizer/loss/dataloader (env AGENTICML_AUTO_TRACK=0)
@@ -323,6 +333,17 @@ options:
   --log-every N        log auto metrics every N optimizer steps (env AGENTICML_LOG_EVERY; default 1)
   --no-tensorboard     do not mirror TensorBoard SummaryWriter calls (env AGENTICML_SYNC_TENSORBOARD=0)
   --no-capture-args    do not record argparse/Hydra values in config (env AGENTICML_CAPTURE_ARGS=0)
+  --no-system-metrics  do not sample system metrics (env AGENTICML_SYSTEM_METRICS=0)
+  --system-metrics-interval S  system sampling interval in seconds (env AGENTICML_SYSTEM_METRICS_INTERVAL; default 10.0)
+  --no-lineage         do not snapshot lineage (env AGENTICML_LINEAGE=0)
+  --no-code            do not track source files (env AGENTICML_TRACK_CODE=0)
+  --no-env             do not capture environment metadata (env AGENTICML_CAPTURE_ENV=0)
+  --track-file PATH    extra source file; repeatable (env AGENTICML_TRACK_FILES; path-separated)
+  --source-root DIR    source directory; repeatable (env AGENTICML_SOURCE_ROOTS; path-separated)
+  --max-file-bytes N   source size cap per file (env AGENTICML_MAX_FILE_BYTES)
+  --max-total-bytes N  total source size cap (env AGENTICML_MAX_TOTAL_BYTES)
+  --flush-interval S   flush interval in seconds (env AGENTICML_FLUSH_INTERVAL; default 2)
+  --all-ranks          track every distributed rank (env AGENTICML_ALL_RANKS=1)
   --verbose            print the run id and asset paths
   -h, --help           show this help
 """
@@ -332,13 +353,23 @@ _RUN_VALUE_OPTIONS = {
     "--name": "name",
     "--tags": "tags",
     "--notes": "notes",
+    "--config": "config",
+    "--config-file": "config_file",
     "--group": "group",
     "--job-type": "job_type",
     "--task": "task",
     "--parent": "parent_run_id",
+    "--id": "id",
+    "--resume": "resume",
     "--mode": "mode",
     "--dir": "dir",
     "--log-every": "log_every",
+    "--system-metrics-interval": "system_metrics_interval",
+    "--track-file": "extra_files",
+    "--source-root": "source_roots",
+    "--max-file-bytes": "max_file_bytes",
+    "--max-total-bytes": "max_total_bytes",
+    "--flush-interval": "flush_interval",
 }
 _RUN_FLAG_OPTIONS = {
     "--allow-cross-task": ("allow_cross_task", True),
@@ -346,6 +377,11 @@ _RUN_FLAG_OPTIONS = {
     "--no-auto-metrics": ("auto_metrics", False),
     "--no-tensorboard": ("sync_tensorboard", False),
     "--no-capture-args": ("capture_args", False),
+    "--no-system-metrics": ("system_metrics", False),
+    "--no-lineage": ("lineage", False),
+    "--no-code": ("track_source", False),
+    "--no-env": ("capture_env", False),
+    "--all-ranks": ("only_main_process", False),
     "--verbose": ("verbose", True),
 }
 # Interpreter flags that consume the next token when not attached (-W ignore).
@@ -355,6 +391,21 @@ _PYTHON_NAME = re.compile(r"^python(\d+(\.\d+)*)?[tdmu]*(\.exe)?$", re.IGNORECAS
 
 class _UsageError(Exception):
     pass
+
+
+class _NonFiniteConfigValue(ValueError):
+    pass
+
+
+def _reject_config_constant(value):
+    raise _NonFiniteConfigValue("must not be NaN or Infinity")
+
+
+def _parse_config_float(value):
+    result = float(value)
+    if not math.isfinite(result):
+        _reject_config_constant(value)
+    return result
 
 
 def _is_python_executable(token: str) -> bool:
@@ -368,6 +419,9 @@ def _parse_run_options(args):
     except ValueError as exc:
         raise _UsageError(str(exc)) from None
     raw: list[str] = []
+    config_file = (os.environ.get("AGENTICML_CONFIG_FILE") or "").strip() or None
+    config_pairs = {}
+    seen_lists = set()
     index = 0
     while index < len(args):
         token = args[index]
@@ -406,9 +460,45 @@ def _parse_run_options(args):
             elif attr == "parent_run_id":
                 if not valid_run_id(value):
                     raise _UsageError("--parent must be a valid run id")
-            elif attr == "log_every":
+            elif attr == "id":
+                if not valid_run_id(value):
+                    raise _UsageError("--id must be a valid run id")
+            elif attr == "resume":
                 try:
-                    value = parse_log_every(value)
+                    value = parse_resume(value)
+                except ValueError as exc:
+                    raise _UsageError(str(exc)) from None
+            elif attr == "config":
+                key, equals, item = value.partition("=")
+                if not equals or not key:
+                    raise _UsageError("--config expects KEY=VALUE with a non-empty key")
+                try:
+                    config_pairs[key] = json.loads(
+                        item, parse_constant=_reject_config_constant, parse_float=_parse_config_float,
+                    )
+                except _NonFiniteConfigValue:
+                    raise _UsageError(f"--config value for {key!r} must not be NaN or Infinity") from None
+                except (ValueError, RecursionError):
+                    config_pairs[key] = item
+                continue
+            elif attr == "config_file":
+                config_file = value
+                continue
+            elif attr in {"extra_files", "source_roots"}:
+                if attr not in seen_lists:
+                    setattr(settings, attr, [])
+                    seen_lists.add(attr)
+                getattr(settings, attr).append(value)
+                continue
+            elif attr in {"log_every", "max_file_bytes", "max_total_bytes",
+                          "system_metrics_interval", "flush_interval"}:
+                try:
+                    if attr == "log_every":
+                        value = parse_log_every(value)
+                    elif attr in {"max_file_bytes", "max_total_bytes"}:
+                        value = parse_positive_int(value, option[2:])
+                    else:
+                        value = parse_positive_float(value, option[2:])
                 except ValueError as exc:
                     raise _UsageError(str(exc)) from None
             setattr(settings, attr, value)
@@ -416,6 +506,22 @@ def _parse_run_options(args):
         if token.startswith("-") and token != "-m":
             raise _UsageError(f"unknown option {token!r}")
         break
+    if settings.id is not None and settings.resume not in {"allow", "must"}:
+        raise _UsageError("--id needs --resume allow or must")
+    if settings.resume in {"allow", "must"} and settings.id is None:
+        raise _UsageError("--resume needs --id")
+    if config_file is not None:
+        try:
+            config = json.loads(
+                Path(config_file).read_text(encoding="utf-8"),
+                parse_constant=_reject_config_constant, parse_float=_parse_config_float,
+            )
+        except (OSError, ValueError, RecursionError) as exc:
+            raise _UsageError(f"cannot read config file {config_file!r}: {exc}") from None
+        if not isinstance(config, dict):
+            raise _UsageError(f"config file {config_file!r} must contain a JSON object")
+        settings.config.update(config)
+    settings.config.update(config_pairs)
     return settings, raw, args[index:]
 
 

@@ -18,6 +18,35 @@ change that finishes it.
   hold a connection slot past the existing deadlines.
 - **Done when:** `pytest -q tests` passes repeatedly on macOS and in CI.
 
+## Document the new `agenticml run` options
+
+- **Where:** `docs/SDK.md` (CLI cheat sheet, "Resume a run"), `README.md`,
+  and the docs site under `website/`.
+- **Problem:** `agenticml run` gained `--id`/`--resume`, `--config`,
+  `--config-file`, `--no-system-metrics`, `--system-metrics-interval`,
+  `--no-lineage`, `--no-code`, `--no-env`, `--track-file`, `--source-root`,
+  `--max-file-bytes`, `--max-total-bytes`, `--flush-interval`, `--all-ranks`
+  and their env vars. Only `RUN_USAGE` describes them.
+- **Fix:** document each option and env var. Say that there is no
+  positive override flag: once `AGENTICML_SYSTEM_METRICS=0` or
+  `AGENTICML_ALL_RANKS=1` is set, the CLI cannot turn it back. Also say that
+  `--id` aborts the launch (exit 2, script not run) when the run cannot be
+  resumed, and that the SDK and CLI defaults for `auto_metrics` and
+  `sync_tensorboard` differ.
+- **Done when:** the docs list every option in `RUN_USAGE` and the docs site
+  builds.
+
+## Add `agenticml show` and `agenticml export`
+
+- **Where:** `src/agenticml/cli.py`, using `store.RunReader`.
+- **Problem:** the SDK's reader exposes a run's meta, config, summary, metric
+  keys, series and artifacts, but the CLI only has the one-line `ls`.
+- **Fix:** `agenticml show RUN_ID [--json]` (meta, config, summary, keys with
+  last values, artifacts, parent, status) and
+  `agenticml export RUN_ID [--key K ...] [--format csv|json]` (full series).
+- **Done when:** tests in `tests/test_local_cli.py` cover both commands,
+  including `--json`, a missing run and a run with no metrics.
+
 ## Send `task` and `arch` when syncing a run
 
 - **Where:** `src/agenticml/sync.py` (`CONFIG_FIELDS` and the `/init` payload).
