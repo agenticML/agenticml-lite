@@ -508,7 +508,7 @@ def _marker_task(content):
     return tomllib.loads(content).get("task")
 
 
-def resolve_task(explicit, repo_root, entry_file=None):
+def resolve_task(explicit, repo_root, entry_file=None, parent_task=None):
     """Resolve the first valid task signal without disrupting the run."""
     for value, source in ((explicit, "explicit"), (os.environ.get("AGENTICML_TASK"), "env")):
         task = _normalize_task(value)
@@ -516,6 +516,9 @@ def resolve_task(explicit, repo_root, entry_file=None):
             return task, source
         if value is not None:
             logger.warning("invalid %s task; ignoring", source)
+    task = _normalize_task(parent_task)
+    if task is not None:
+        return task, "parent"
     try:
         root = Path(repo_root).resolve()
         start = Path(entry_file).resolve().parent if entry_file else Path.cwd().resolve()

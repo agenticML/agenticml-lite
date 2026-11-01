@@ -22,6 +22,7 @@ from pathlib import Path
 from . import _globals
 from .code_tracking import default_project, default_run_name
 from .integrations.hyperparams import install_hyperparam_capture, uninstall_hyperparam_capture
+from .store.layout import valid_run_id
 
 logger = logging.getLogger("agenticml.launch")
 
@@ -52,6 +53,8 @@ class RunSettings:
     group: str | None = None
     job_type: str | None = None
     task: str | None = None
+    parent_run_id: str | None = None
+    allow_cross_task: bool = False
     mode: str | None = None
     dir: str | None = None
     auto_track: bool = True
@@ -65,6 +68,9 @@ class RunSettings:
     def from_env(cls) -> "RunSettings":
         env = os.environ
         tags = [t.strip() for t in env.get("AGENTICML_TAGS", "").split(",") if t.strip()]
+        parent_run_id = env.get("AGENTICML_PARENT") or None
+        if parent_run_id is not None and not valid_run_id(parent_run_id):
+            raise ValueError("AGENTICML_PARENT must be a valid run id")
 
         def flag(name: str) -> bool:
             return env.get(name, "1").strip().lower() not in _FALSE_VALUES
@@ -76,6 +82,10 @@ class RunSettings:
             notes=env.get("AGENTICML_NOTES") or None,
             group=env.get("AGENTICML_GROUP") or None,
             job_type=env.get("AGENTICML_JOB_TYPE") or None,
+            parent_run_id=parent_run_id,
+            allow_cross_task=(
+                env.get("AGENTICML_ALLOW_CROSS_TASK", "").strip().lower() in {"1", "true", "yes", "on"}
+            ),
             auto_track=flag("AGENTICML_AUTO_TRACK"),
             auto_metrics=flag("AGENTICML_AUTO_METRICS"),
             log_every=parse_log_every(env.get("AGENTICML_LOG_EVERY", "1")),
@@ -221,6 +231,8 @@ def _start_run(settings: RunSettings, resolved: _Resolved):
             group=settings.group,
             job_type=settings.job_type,
             task=settings.task,
+            parent_run_id=settings.parent_run_id,
+            allow_cross_task=settings.allow_cross_task,
             auto_track=settings.auto_track,
             auto_metrics=settings.auto_metrics,
             log_every=settings.log_every,

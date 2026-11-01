@@ -168,6 +168,13 @@ def _attach(run, project, name, kwargs):
             "agenticml run already started task %r; keeping it instead of task=%r",
             current_task, task,
         )
+    parent_run_id = kwargs.get("parent_run_id")
+    current_parent = getattr(getattr(run, "writer", None), "_meta", {}).get("parent_run_id", missing)
+    if parent_run_id is not None and current_parent is not missing and parent_run_id != current_parent:
+        logger.warning(
+            "agenticml run already started parent_run_id %r; keeping it instead of parent_run_id=%r",
+            current_parent, parent_run_id,
+        )
     if project_differs or name_differs:
         logger.warning(
             "agenticml run already started run %r in project %r; "

@@ -473,7 +473,8 @@ function renderLineageLanes(data, options) {
   ).map(([task, nodes]) => {
     const source = nodes.find((node) => node.task_source)?.task_source;
     const hint = source === "entry" ? `from ${task}/` :
-      source === "marker" ? "agenticml.toml" : source || "";
+      source === "marker" ? "agenticml.toml" :
+      source === "parent" ? "from parent run" : source || "";
     const headingId = `lineage-lane-title-${++lineageLane}`;
     return el("section", { class: "lineage-lane", "data-task": task, "aria-labelledby": headingId },
       el("header", { class: "lineage-lane-head" },

@@ -99,15 +99,16 @@ def test_task_source_hints_no_task_and_long_mobile_lanes(page, tmp_path, ui_serv
     _tasks(root, [
         dict(task="", task_source=None), dict(task="asr", task_source="explicit"),
         dict(task="tts", task_source="env"), dict(task="old", task_source="legacy"),
+        dict(task="inherited", task_source="parent"),
         *[dict(task=long_task, task_source="entry",
                arch={"model_class": "models." + "HugeClass" * 24, "model_type": "x" * 256})
           for _ in range(6)],
-    ], parents=(None,) * 10)
+    ], parents=(None,) * 11)
     with ui_server_factory(root) as server:
         page.set_viewport_size({"width": 375, "height": 812})
         home(page, server)
-        expect(page.locator(".lineage-lane-title")).to_have_text([long_task, "old", "tts", "asr", "No task"])
-        expect(page.locator(".lineage-lane-source")).to_have_text([f"from {long_task}/", "legacy", "env", "explicit"])
+        expect(page.locator(".lineage-lane-title")).to_have_text([long_task, "inherited", "old", "tts", "asr", "No task"])
+        expect(page.locator(".lineage-lane-source")).to_have_text([f"from {long_task}/", "from parent run", "legacy", "env", "explicit"])
         scroller = page.locator(".lineage-lane-scroll").first
         assert scroller.evaluate("el => el.scrollWidth > el.clientWidth && getComputedStyle(el).overflowX === 'auto'")
         _no_overflow(page)

@@ -78,6 +78,7 @@ repository is still one per project.
 Task resolution at init checks, in order (first match wins, recorded as `task_source`):
 - `explicit`: `agenticml.init(task="asr")` / `Run(task=...)` / `agenticml run --task asr`
 - `env`: `AGENTICML_TASK`
+- `parent`: the explicit parent's task, if available in the local store (new runs only)
 - `marker`: nearest `agenticml.toml` with a top-level `task = "..."`, searched from
   the entry script's directory (cwd if none) up to and including the project repo root.
   Must be a regular, non-symlink file of at most 64 KiB; unreadable/invalid files are skipped.
@@ -100,8 +101,22 @@ otherwise they count as no task.
 under the store root, including for projects without Git. The project is never
 written to. Disable with `lineage=False` or `AGENTICML_LINEAGE=0` (`false`, `no`,
 `off` also work). Resume preserves the original snapshot. `parent_run_id=`
-selects an explicit parent; a self-parent is ignored. Otherwise parent inference
-selects the latest strictly earlier run with the same project, same task, and
+selects an explicit parent, as does `agenticml run --parent RUN_ID` (env
+`AGENTICML_PARENT`); a self-parent is ignored. New runs inherit the parent's
+task unless `task=` / `--task` or a valid `AGENTICML_TASK` supplies one.
+The CLI and Python API both warn when an explicit or valid environment task
+differs from an explicit parent's task, if the parent is readable, in the same
+project, and has a task. Silence the warning with `--allow-cross-task`,
+`AGENTICML_ALLOW_CROSS_TASK=1` (CLI), or `init(..., allow_cross_task=True)`.
+Missing or unreadable parents are recorded with a warning; a parent in another
+project also warns and leaves the child's project unchanged. Its task is not
+inherited, and the child snapshot has no Git parent commit.
+An invalid `--parent` / `AGENTICML_PARENT` is a usage error (exit 2).
+`--parent` only applies to new runs: a resumed run keeps its stored parent,
+with a warning if it differs. Under `agenticml run`,
+an `init(parent_run_id=...)` that differs logs a warning and keeps the launcher's
+run. Without an explicit parent, parent inference selects the latest strictly
+earlier run with the same project, same task, and
 same repo root; else the latest strictly earlier run with the same project and
 task; else no parent (ordered by `(created_at, run_id)` strictly before the
 current run). Parent inference never crosses tasks. `max_file_bytes` /
