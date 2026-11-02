@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agenticml-lite"
-version = "0.1.0.dev0"
+version = "1.0.0"
 description = "Lean, local-first experiment tracker for AgenticML. Installs as `agenticml-lite`, imports as `agenticml`."
 readme = "README.md"
 license = { text = "MIT" }

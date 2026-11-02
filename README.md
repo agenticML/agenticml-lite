@@ -134,7 +134,7 @@ agenticml ui --read-only
 
 `agenticml export` exports full raw metric series. Default output is CSV (`key,step,value` in file order, float32 formatted exactly, non-finite values as `nan`, `inf`, `-inf`). `--format json` outputs `{"run_id": ..., "series": {key: [[step, value], ...]}}` with non-finite values as `null`. Filter series with repeatable `--key K`. `-o PATH` writes to a file instead of stdout. Unknown keys fail before writing (exit 1). Series pruned by `sync --prune` are skipped with a warning; if all selected series were pruned, it exits 1.
 
-Every run page has an autosaving Markdown notepad, and view mode allows ticking checklist items directly. The home page includes a collapsible Notes notebook that shows each run's note grouped under the run name, following the project tab and filter box. The dashboard is read-only except for notes; `--read-only` disables note editing (recommended when exposing a non-loopback `--host`). A run's launch note (`--notes` / `init(notes=)`) is shown until the notepad is edited.
+The dashboard pages do not show run notes. Launch notes (`--notes` / `init(notes=)`) are still stored with the run, and the server keeps the `/api/runs/<id>/notes` endpoint, which is the only write it accepts; `--read-only` disables it (recommended when exposing a non-loopback `--host`).
 
 ## Editing ended runs
 
@@ -150,7 +150,7 @@ agenticml note RUN_ID --set "Checked checkpoint at step 10k"
 - `agenticml edit RUN_ID`: updates run metadata. `--tag T` and `--untag T` are repeatable (add if absent / remove every occurrence). `--notes TEXT` sets the launch note (`""` clears it). `--group NAME` and `--job-type NAME` set group and job type (cannot be cleared). `--config KEY=VALUE` and `--summary KEY=VALUE` merge values using the same JSON/string parsing rules as `run --config`. `--unset-summary KEY` removes a summary key. Project, name, task, parent, and id cannot be changed.
 - `agenticml artifact add RUN_ID PATH`: records an artifact on an ended run (`--name` defaults to file stem, `--type` defaults to `file`, `--metadata` accepts a JSON object). `--copy` stores bytes in `objects/`; otherwise only path, size, and mtime are recorded. Version increments per name.
 - `agenticml finish RUN_ID --status finished|crashed`: sets the final status of a run left `running`, `stale`, or `crashed` (or switches between finished and crashed), keeping its summary and writing overviews and `finished_at`. If already that status, prints a message and exits 0.
-- `agenticml note RUN_ID`: reads or writes the local Markdown notepad (`runs/<id>/notes.md`) using `--set TEXT`, `--file PATH` (`-` for stdin), or `--clear`. The notepad is not synced to the server. Works even while the run is live. Without options, prints the note (or the launch note if no notepad exists). Note that `note` operates on the local dashboard notepad, whereas `edit --notes` updates the synced launch note.
+- `agenticml note RUN_ID`: reads or writes the run's local Markdown note (`runs/<id>/notes.md`) using `--set TEXT`, `--file PATH` (`-` for stdin), or `--clear`. The notepad is not synced to the server. Works even while the run is live. Without options, prints the note (or the launch note if no notepad exists). Note that `note` operates on the local note file, whereas `edit --notes` updates the synced launch note.
 
 ## Where data lives
 

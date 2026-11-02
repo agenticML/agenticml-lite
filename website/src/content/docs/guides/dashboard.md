@@ -28,9 +28,9 @@ A run stays `running` while its process holds the run's lock, even if it logs ra
 
 ## Notes
 
-Every run page has an autosaving Markdown notepad, and you can tick checklist items in view mode. The home page has a collapsible Notes notebook that groups each run's note under its name and follows the project tab and filter.
+The dashboard pages do not show run notes. Launch notes (`--notes` / `init(notes=)`) are still stored with the run.
 
-The dashboard is read-only except for notes. `--read-only` disables note editing. Use it if you expose the dashboard on a non-loopback `--host`.
+The server's only write is the `/api/runs/<id>/notes` endpoint. `--read-only` disables it. Use it if you expose the dashboard on a non-loopback `--host`.
 
 ## Inspecting and editing runs from the CLI
 
@@ -63,6 +63,6 @@ agenticml note RUN_ID --set "Validation score confirmed"
 - `agenticml edit RUN_ID`: Updates metadata on an ended run. `--tag T` and `--untag T` are repeatable (add if absent, remove every occurrence). `--notes TEXT` updates the launch note (`""` clears it). `--group NAME` and `--job-type NAME` set the group and job type (cannot be cleared). `--config KEY=VALUE` and `--summary KEY=VALUE` merge values using the same JSON/string parsing rules as `run --config`. `--unset-summary KEY` removes a summary key. Project, name, task, parent, and run ID cannot be changed.
 - `agenticml artifact add RUN_ID PATH`: Records an artifact on an ended run (`--name` defaults to file stem, `--type` defaults to `file`, `--metadata` accepts a JSON object). `--copy` stores file bytes in the object store; otherwise only path, size, and mtime are recorded. Version increments per name.
 - `agenticml finish RUN_ID --status finished|crashed`: Finalizes a run left `running`, `stale`, or `crashed` (or toggles finished/crashed), writing overviews and `finished_at` while preserving summary metrics. If the run is already in that status, exits 0.
-- `agenticml note RUN_ID`: Reads or updates the local Markdown notepad (`runs/<id>/notes.md`) using `--set TEXT`, `--file PATH` (`-` for stdin), or `--clear`. The notepad is local and not synced. Unlike the other commands, `note` works even while the run is live. Without flags, it prints the current note.
+- `agenticml note RUN_ID`: Reads or updates the run's local Markdown note (`runs/<id>/notes.md`) using `--set TEXT`, `--file PATH` (`-` for stdin), or `--clear`. The notepad is local and not synced. Unlike the other commands, `note` works even while the run is live. Without flags, it prints the current note.
 
-Note that `agenticml note` modifies the local dashboard notepad (`notes.md`). To change the run's synced launch note, use `agenticml edit --notes TEXT`.
+Note that `agenticml note` modifies the local note file (`notes.md`). To change the run's synced launch note, use `agenticml edit --notes TEXT`.

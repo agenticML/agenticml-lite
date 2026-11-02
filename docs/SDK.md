@@ -185,7 +185,7 @@ agenticml export RUN_ID [--key K] [--format csv|json] [-o PATH]  # export raw se
 agenticml edit RUN_ID [--tag T] [--config K=V] [--summary K=V]  # update ended run
 agenticml artifact add RUN_ID PATH [--name N] [--copy]  # record artifact on ended run
 agenticml finish RUN_ID --status finished|crashed       # finalize dead run
-agenticml note RUN_ID [--set TEXT | --file PATH | --clear]  # local dashboard notepad
+agenticml note RUN_ID [--set TEXT | --file PATH | --clear]  # local run note (not synced)
 agenticml run --id RUN_ID --resume must -- python train.py  # resume run
 agenticml ui [--port 6006] [--open] [--read-only]  # local dashboard
 agenticml lineage checkout RUN_ID [--path DIR]  # detached shadow worktree

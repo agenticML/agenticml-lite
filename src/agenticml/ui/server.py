@@ -37,7 +37,6 @@ _FILES = {
     "charts.js": "text/javascript; charset=utf-8",
     "code.js": "text/javascript; charset=utf-8",
     "codediff.js": "text/javascript; charset=utf-8",
-    "notes.js": "text/javascript; charset=utf-8",
     "InstrumentSans.woff2": "font/woff2",
     "JetBrainsMono.woff2": "font/woff2",
 }

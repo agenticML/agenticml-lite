@@ -2,7 +2,6 @@
 import { MetricChart, emaSmooth, colorForId, formatNumber } from "./charts.js";
 import { createCodeViewer } from "./code.js";
 import { createCodeDiff } from "./codediff.js";
-import { createNotepad, createNotebook } from "./notes.js";
 
 const app = document.querySelector("#app");
 const fmt = (value) =>
@@ -118,8 +117,8 @@ function changedLine(run, parent, isRoot, siblingKeys = []) {
     )
     .join(" · ");
 }
-// Runs filter. Words match name, id and tags; "tag:x" and "status:x" (with
-// "failed" for crashed) narrow by tag and status; "key>n", "key<n", "key>=n",
+// Runs filter. Words match name, id and tags; "task:x", "tag:x" and
+// "status:x" (with "failed" for crashed) narrow by task, tag and status; "key>n", "key<n", "key>=n",
 // "key<=n" and "key=v" test config, then summary, values. Every token must hold.
 const FILTER_COMPARISON = /^([^<>=:]+)(>=|<=|>|<|=)(.+)$/;
 function runMatches(run, query) {
@@ -128,6 +127,8 @@ function runMatches(run, query) {
     .split(/\s+/)
     .filter(Boolean)
     .every((token) => {
+      if (token.startsWith("task:"))
+        return taskName(run).toLowerCase().includes(token.slice(5));
       if (token.startsWith("tag:"))
         return (run.tags || []).some((tag) =>
           String(tag).toLowerCase().includes(token.slice(4)),
@@ -164,12 +165,6 @@ function runMatches(run, query) {
       return text.includes(token);
     });
 }
-// Free-text part of a filter, for the notes notebook (no field operators).
-const filterWords = (query) =>
-  query
-    .split(/\s+/)
-    .filter((token) => token && !/^(tag|status):/.test(token) && !FILTER_COMPARISON.test(token))
-    .join(" ");
 function duration(run) {
   if (!run.created_at) return "—";
   const seconds = Math.max(
@@ -298,6 +293,32 @@ document.querySelector("#host").textContent = `local · ${location.host}`;
 document.querySelector("#close-lightbox").onclick = () =>
   document.querySelector("#lightbox").close();
 
+// Tab and Shift+Tab wrap inside a modal host instead of leaving it.
+function trapTab(host, event) {
+  const targets = [
+    ...host.querySelectorAll(
+      'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], summary, [tabindex]:not([tabindex="-1"])',
+    ),
+  ].filter((node) => {
+    if (node.tabIndex < 0 || node.matches(":disabled") ||
+        !node.getClientRects().length || getComputedStyle(node).visibility !== "visible")
+      return false;
+    for (let parent = node.parentElement; parent !== host; parent = parent.parentElement) {
+      if (parent.hidden || (parent.matches("details:not([open])") &&
+          !parent.querySelector(":scope > summary")?.contains(node))) return false;
+    }
+    return true;
+  });
+  const index = targets.indexOf(document.activeElement);
+  if (
+    index === -1 ||
+    (event.shiftKey && index === 0) ||
+    (!event.shiftKey && index === targets.length - 1)
+  ) {
+    event.preventDefault();
+    (event.shiftKey ? targets.at(-1) : targets[0])?.focus();
+  }
+}
 // Focus hosts own their keyboard handler so nested focus views close independently.
 function focus(title, subtitle, className = "", onClose = () => {}) {
   const previous = document.activeElement;
@@ -316,35 +337,12 @@ function focus(title, subtitle, className = "", onClose = () => {}) {
   };
   const keydown = (event) => {
     const topmost = [...document.querySelectorAll(".focus-overlay")].at(-1);
-    if (topmost !== host || document.querySelector("#lightbox[open]")) return;
+    // A workspace or lineage dialog above this view owns the keyboard.
+    if (topmost !== host || document.querySelector("#lightbox[open], .ws, .lv-backdrop")) return;
     if (event.key === "Escape") {
       event.stopImmediatePropagation();
       close();
-    } else if (event.key === "Tab") {
-      const targets = [
-        ...host.querySelectorAll(
-          'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], summary, [tabindex]:not([tabindex="-1"])',
-        ),
-      ].filter((node) => {
-        if (node.tabIndex < 0 || node.matches(":disabled") ||
-            !node.getClientRects().length || getComputedStyle(node).visibility !== "visible")
-          return false;
-        for (let parent = node.parentElement; parent !== host; parent = parent.parentElement) {
-          if (parent.hidden || (parent.matches("details:not([open])") &&
-              !parent.querySelector(":scope > summary")?.contains(node))) return false;
-        }
-        return true;
-      });
-      const index = targets.indexOf(document.activeElement);
-      if (
-        index === -1 ||
-        (event.shiftKey && index === 0) ||
-        (!event.shiftKey && index === targets.length - 1)
-      ) {
-        event.preventDefault();
-        (event.shiftKey ? targets.at(-1) : targets[0])?.focus();
-      }
-    }
+    } else if (event.key === "Tab") trapTab(host, event);
   };
   const exit = button("Exit focus", close, "secondary");
   host.append(
@@ -390,40 +388,12 @@ const headline = (run) => {
   );
   return keys.find((key) => /loss|acc/i.test(key)) || keys[0];
 };
-const LINEAGE_W = 236;
-const LINEAGE_H = 64;
-const LINEAGE_GAP_X = 32;
-const LINEAGE_GAP_Y = 48;
-const LINEAGE_PAD = 16;
-let lineageMarker = 0;
-let lineageLane = 0;
-function svgEl(tag, attrs = {}, ...children) {
-  const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
-  for (const [key, value] of Object.entries(attrs)) {
-    if (value == null) continue;
-    if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
-    else if (key === "text") node.textContent = value;
-    else node.setAttribute(key, value);
-  }
-  node.append(...children.filter((child) => child != null));
-  return node;
-}
-const cssEscape = (value) =>
-  window.CSS?.escape ? CSS.escape(String(value)) : String(value).replace(/"/g, '\\"');
-const shorten = (value, max) => {
-  const text = value || "";
-  return text.length > max ? `${text.slice(0, Math.max(1, max - 1))}…` : text;
-};
 const RUN_ID_SUFFIX = /^(\d{8}T\d{6})-([0-9a-fA-F]{8})$/;
 function shortRunId(id) {
   const text = String(id || "");
   const matched = RUN_ID_SUFFIX.exec(text);
   return matched ? matched[2] : text.slice(0, 8);
 }
-const lineageTime = (value) => {
-  const time = Date.parse(value);
-  return Number.isFinite(time) ? time : Number.POSITIVE_INFINITY;
-};
 const LINEAGE_REFRESH_MS = 15000;
 const LINEAGE_RETRY_MS = 1000;
 const LINEAGE_RETRY_MAX_MS = 30000;
@@ -438,331 +408,174 @@ function lineageSignature(runs) {
     .sort()
     .join("\n");
 }
-// Generations run top to bottom: layer is the longest path from a root.
-// A barycenter sweep pulls related nodes into the same column; ties stay
-// in created_at order.
-function layoutLineage(nodes, edges, nodeHeight = LINEAGE_H) {
-  const byId = new Map(nodes.map((node) => [node.run_id, node]));
-  const parents = new Map();
-  const children = new Map();
-  for (const edge of edges) {
-    if (!byId.has(edge.from) || !byId.has(edge.to) || edge.from === edge.to)
-      continue;
-    if (!parents.has(edge.to)) parents.set(edge.to, []);
-    parents.get(edge.to).push(edge.from);
-    if (!children.has(edge.from)) children.set(edge.from, []);
-    children.get(edge.from).push(edge.to);
+const taskName = (run) => (typeof run?.task === "string" ? run.task : "");
+const createdTime = (run) => {
+  const time = Date.parse(run?.created_at);
+  return Number.isFinite(time) ? time : -Infinity;
+};
+const newestFirst = (a, b) =>
+  createdTime(b) - createdTime(a) ||
+  String(a.run_id).localeCompare(String(b.run_id));
+// A task is judged by the first headline metric any of its runs logged.
+const primaryMetric = (runs) => runs.map(headline).find(Boolean) || null;
+// Smaller is better; runs without the metric sort last.
+const metricScore = (run, key) => {
+  const value = run?.summary?.[key];
+  return key && isNumber(value) ? (lowerBetter(key) ? value : -value) : Infinity;
+};
+// A crashed run's partial metric never counts as the best result.
+function bestRun(runs, key) {
+  let best = null;
+  for (const run of runs)
+    if (run.status !== "crashed" && metricScore(run, key) < metricScore(best, key)) best = run;
+  return best;
+}
+// Lineage inside one task. A parent outside the task starts a new root (an
+// explicit parent_run_id may cross tasks). Siblings are ordered so the subtree
+// holding the best metric keeps its parent's lane; every later sibling opens
+// a new lane below.
+function taskTree(runs, parentOf, metricKey) {
+  const items = new Map(
+    runs.map((run) => [run.run_id, { run, parent: null, kids: [], depth: 0, lane: 0 }]),
+  );
+  for (const item of items.values()) {
+    const parent = items.get(parentOf(item.run.run_id));
+    if (parent && parent !== item) {
+      item.parent = parent;
+      parent.kids.push(item);
+    }
   }
-  const layerOf = new Map();
-  const visiting = new Set();
-  const layer = (id) => {
-    if (layerOf.has(id)) return layerOf.get(id);
-    if (visiting.has(id)) return 0;
-    visiting.add(id);
-    let value = 0;
-    for (const parent of parents.get(id) || [])
-      value = Math.max(value, layer(parent) + 1);
-    visiting.delete(id);
-    layerOf.set(id, value);
+  const scores = new Map();
+  const score = (item, trail = new Set()) => {
+    if (scores.has(item)) return scores.get(item);
+    if (trail.has(item)) return Infinity;
+    trail.add(item);
+    let value = metricScore(item.run, metricKey);
+    for (const kid of item.kids) value = Math.min(value, score(kid, trail));
+    scores.set(item, value);
     return value;
   };
-  for (const node of nodes) layer(node.run_id);
-  const depth = [...layerOf.values()].reduce((max, value) => Math.max(max, value), 0);
-  const layers = Array.from({ length: depth + 1 }, () => []);
-  const ordered = [...nodes].sort(
-    (a, b) =>
-      lineageTime(a.created_at) - lineageTime(b.created_at) ||
-      String(a.run_id).localeCompare(String(b.run_id)),
-  );
-  for (const node of ordered) layers[layerOf.get(node.run_id) || 0].push(node);
-  const index = new Map();
-  const reindex = () => {
-    index.clear();
-    layers.forEach((row) =>
-      row.forEach((node, position) => index.set(node.run_id, position)),
-    );
-  };
-  const barycenter = (row, neighborOf) => {
-    const ranked = row.map((node, position) => {
-      const neighbors = (neighborOf(node.run_id) || []).filter((id) =>
-        index.has(id),
-      );
-      const center = neighbors.length
-        ? neighbors.reduce((sum, id) => sum + index.get(id), 0) /
-          neighbors.length
-        : position;
-      return { node, center, position };
-    });
-    ranked.sort(
-      (a, b) =>
-        a.center - b.center ||
-        lineageTime(a.node.created_at) - lineageTime(b.node.created_at) ||
-        String(a.node.run_id).localeCompare(String(b.node.run_id)) ||
-        a.position - b.position,
-    );
-    return ranked.map((item) => item.node);
-  };
-  reindex();
-  for (let pass = 0; pass < 2; pass++) {
-    for (let i = 1; i < layers.length; i++) {
-      layers[i] = barycenter(layers[i], (id) => parents.get(id));
-      reindex();
+  const rank = (a, b) =>
+    score(a) - score(b) ||
+    createdTime(a.run) - createdTime(b.run) ||
+    String(a.run.run_id).localeCompare(String(b.run.run_id));
+  const order = [];
+  const seen = new Set();
+  let lane = -1;
+  const walk = (item, depth, at) => {
+    seen.add(item);
+    item.depth = depth;
+    item.lane = at;
+    order.push(item);
+    let first = true;
+    for (const kid of item.kids.sort(rank)) {
+      if (seen.has(kid)) continue;
+      walk(kid, depth + 1, first ? at : ++lane);
+      first = false;
     }
-    for (let i = layers.length - 2; i >= 0; i--) {
-      layers[i] = barycenter(layers[i], (id) => children.get(id));
-      reindex();
-    }
+  };
+  for (const root of [...items.values()].filter((item) => !item.parent).sort(rank))
+    walk(root, 0, ++lane);
+  // A parent cycle has no root; break it at its oldest run.
+  for (const item of [...items.values()].sort((a, b) => rank(a, b))) {
+    if (seen.has(item)) continue;
+    item.parent = null;
+    walk(item, 0, ++lane);
   }
-  const pos = new Map();
-  let breadth = 0;
-  layers.forEach((row, generation) => {
-    row.forEach((node, index) => {
-      pos.set(node.run_id, {
-        x: LINEAGE_PAD + index * (LINEAGE_W + LINEAGE_GAP_X),
-        y: LINEAGE_PAD + generation * (nodeHeight + LINEAGE_GAP_Y),
-        generation,
-        index,
-      });
-    });
-    breadth = Math.max(breadth, row.length);
-  });
   return {
-    pos,
-    width:
-      LINEAGE_PAD * 2 +
-      Math.max(breadth, 1) * LINEAGE_W +
-      Math.max(breadth - 1, 0) * LINEAGE_GAP_X,
-    height:
-      LINEAGE_PAD * 2 +
-      Math.max(layers.length, 1) * nodeHeight +
-      Math.max(layers.length - 1, 0) * LINEAGE_GAP_Y,
+    items,
+    order,
+    lanes: lane + 1,
+    depth: order.reduce((max, item) => Math.max(max, item.depth + 1), 0),
   };
 }
-const lineageTask = (node) => typeof node.task === "string" ? node.task : "";
-function lineageBadges(node, byId) {
-  const badges = [];
-  const parent = byId.get(node.parent_run_id);
-  if (node.base_dirty) badges.push(["dirty", "lineage-dirty", "Base tree was dirty"]);
-  if (node.same_tree_as_parent)
-    badges.push(["code unchanged", "lineage-same", "Same tree as parent"]);
-  if (node.error) badges.push(["error", "lineage-error", String(node.error)]);
-  if (node.cross_task && parent)
-    badges.push([
-      `from ${lineageTask(parent) || "No task"}`, "lineage-cross-task",
-      `from ${lineageTask(parent) || "No task"}: ${parent.name || parent.run_id} (${parent.run_id})`,
-    ]);
-  if (node.arch_changed)
-    badges.push([
-      "arch changed", "lineage-arch-changed",
-      `${parent?.arch?.model_class || "—"} → ${node.arch?.model_class || "—"}`,
-    ]);
-  return badges;
-}
-function renderLineageLanes(data, options) {
-  const lanes = new Map();
-  const byId = new Map(data.nodes.map((node) => [node.run_id, node]));
-  for (const node of data.nodes) {
-    const task = lineageTask(node);
-    if (!lanes.has(task)) lanes.set(task, []);
-    lanes.get(task).push(node);
+const STATUS_TONE = { finished: "ok", running: "accent", crashed: "warn", stale: "warn" };
+// Mini lineage: one 7px dot per run, generations left to right, a branch
+// drops to the next lane.
+function lineageStrip(tree, task) {
+  const x = (item) => 3 + item.depth * 22;
+  const y = (item) => 3 + item.lane * 8;
+  const lines = [];
+  for (const item of tree.order) {
+    if (!item.parent) continue;
+    const px = x(item.parent) + 3,
+      py = y(item.parent) + 3,
+      cy = y(item) + 3;
+    if (cy !== py)
+      lines.push(el("span", {
+        class: "task-strip-line",
+        style: `left:${px}px;top:${Math.min(py, cy)}px;width:1px;height:${Math.abs(cy - py)}px`,
+      }));
+    lines.push(el("span", {
+      class: "task-strip-line",
+      style: `left:${px}px;top:${cy}px;width:${x(item) + 3 - px}px;height:1px`,
+    }));
   }
-  const graph = (nodes) => {
-    const ids = new Set(nodes.map((node) => node.run_id));
-    return renderLineageSvg({
-      nodes,
-      edges: data.edges.filter((edge) =>
-        edge && !edge.cross_task && ids.has(edge.from) && ids.has(edge.to)),
-    }, { ...options, byId });
-  };
-  // Preserve the original DOM and layout for the single unassigned stream.
-  if (lanes.size === 1 && lanes.has("")) return [graph(data.nodes)];
-  const timestamps = new Map(data.nodes.map((node) => {
-    const time = Date.parse(node.created_at);
-    return [node.run_id, Number.isFinite(time) ? time : -Infinity];
-  }));
-  const orderedLanes = [...lanes].map(([task, nodes]) => {
-    nodes.sort((a, b) => timestamps.get(b.run_id) - timestamps.get(a.run_id) ||
-      String(a.run_id).localeCompare(String(b.run_id)));
-    const recent = nodes.reduce((max, node) => Math.max(max, timestamps.get(node.run_id)), -Infinity);
-    return [task, nodes, recent];
-  });
-  return orderedLanes.sort(([a, , aa], [b, , bb]) =>
-    bb - aa || a.localeCompare(b),
-  ).map(([task, nodes]) => {
-    const source = nodes.find((node) => node.task_source)?.task_source;
-    const hint = source === "entry" ? `from ${task}/` :
-      source === "marker" ? "agenticml.toml" :
-      source === "parent" ? "from parent run" : source || "";
-    const headingId = `lineage-lane-title-${++lineageLane}`;
-    return el("section", { class: "lineage-lane", "data-task": task, "aria-labelledby": headingId },
-      el("header", { class: "lineage-lane-head" },
-        el("h3", { id: headingId, class: "lineage-lane-title", text: task || "No task" }),
-        hint ? el("span", { class: "muted lineage-lane-source", text: hint }) : null,
-      ),
-      el("div", { class: "lineage-lane-scroll" }, graph(nodes)),
-    );
-  });
-}
-function renderLineageSvg(data, options) {
-  const nodes = data.nodes || [];
-  const edges = (data.edges || []).filter(
-    (edge) => edge && edge.from && edge.to && edge.from !== edge.to,
+  const dots = tree.order.map((item) =>
+    el("span", {
+      class: `task-strip-dot ${STATUS_TONE[item.run.status] || ""}`,
+      title: item.run.name || item.run.run_id,
+      style: `left:${x(item)}px;top:${y(item)}px`,
+    }),
   );
-  const badgesById = new Map(nodes.map((node) => {
-    let x = 28, row = 0;
-    const badges = lineageBadges(node, options.byId).map(([label, className, tip]) => {
-      const text = shorten(label, 26);
-      const size = text.length * 5.6 + 10;
-      if (x > 28 && x + size > LINEAGE_W - 6) { x = 28; row++; }
-      const badge = { text, className, tip, x, row, label };
-      x += size;
-      return badge;
-    });
-    return [node.run_id, badges];
-  }));
-  const rows = [...badgesById.values()].reduce((max, badges) =>
-    badges.reduce((max, badge) => Math.max(max, badge.row + 1), max), 1);
-  const nodeHeight = LINEAGE_H + (rows - 1) * 14;
-  const { pos, width, height } = layoutLineage(nodes, edges, nodeHeight);
-  const markerId = `lineage-arrow-${++lineageMarker}`;
-  const filtering = options.filtering;
-  const matching = options.matching || new Set();
-  const dimmed = (id) => filtering && !matching.has(id);
-  const paths = edges.map((edge) => {
-    const from = pos.get(edge.from);
-    const to = pos.get(edge.to);
-    if (!from || !to) return null;
-    const x1 = from.x + LINEAGE_W / 2;
-    const y1 = from.y + nodeHeight;
-    const x2 = to.x + LINEAGE_W / 2;
-    const y2 = to.y;
-    const bend = Math.max(24, (y2 - y1) / 2);
-    const faded = dimmed(edge.from) || dimmed(edge.to);
-    return svgEl("path", {
-      class: `lineage-edge${edge.inferred ? " is-inferred" : ""}${faded ? " is-dim" : ""}`,
-      "data-from": edge.from,
-      "data-to": edge.to,
-      d: `M ${x1} ${y1} C ${x1} ${y1 + bend}, ${x2} ${y2 - bend}, ${x2} ${y2}`,
-      "marker-end": `url(#${markerId})`,
-    });
-  });
-  const glyphs = nodes.map((node) => {
-    const at = pos.get(node.run_id) || {
-      x: LINEAGE_PAD,
-      y: LINEAGE_PAD,
-      generation: 0,
-      index: 0,
-    };
-    const name = node.name || node.run_id || "run";
-    const status = node.status || "unknown";
-    const tone = ["running", "finished", "crashed", "stale"].includes(status)
-      ? status
-      : "unknown";
-    const badges = badgesById.get(node.run_id);
-    const badgeNodes = badges.map(({ text, className, tip, x, row }) =>
-      svgEl(
-        "text",
-        { class: className, x: at.x + x, y: at.y + 54 + row * 14, text },
-        svgEl("title", { text: tip }),
-      ),
-    );
-    const commit = node.commit ? String(node.commit).slice(0, 7) : "—";
-    const picked = options.selected?.has(node.run_id);
-    const runId = node.run_id || "";
-    return svgEl(
-      "g",
-      {
-        class: `lineage-node${dimmed(node.run_id) ? " is-dim" : ""}`,
-        role: "button",
-        tabindex: "0",
-        "data-run-id": node.run_id,
-        "data-generation": at.generation ?? 0,
-        "data-sibling": at.index ?? 0,
-        "data-picked": picked ? "true" : "false",
-        "aria-pressed": picked ? "true" : "false",
-        "aria-label": [name, status, runId, ...badges.map((badge) => badge.label)].join(", "),
-      },
-      svgEl("title", { text: `${name}\n${runId}` }),
-      svgEl("rect", {
-        class: "lineage-shape",
-        x: at.x,
-        y: at.y,
-        width: LINEAGE_W,
-        height: nodeHeight,
-        rx: "8",
-      }),
-      svgEl("circle", {
-        class: `lineage-dot ${tone}`,
-        cx: at.x + 16,
-        cy: at.y + 20,
-        r: "4",
-      }),
-      svgEl(
-        "text",
-        { class: "lineage-name", x: at.x + 28, y: at.y + 24, text: shorten(name, 20) },
-        svgEl("title", { text: name }),
-      ),
-      svgEl("text", {
-        class: "lineage-role",
-        x: at.x + LINEAGE_W - 12,
-        y: at.y + 24,
-        "text-anchor": "end",
-        text: node.parent_run_id ? "child" : "root",
-      }),
-      svgEl(
-        "text",
-        {
-          class: "lineage-meta",
-          x: at.x + 28,
-          y: at.y + 40,
-          text: `run ${shortRunId(runId)} · snapshot ${commit}`,
-        },
-        svgEl("title", { text: runId }),
-      ),
-      ...badgeNodes,
-    );
-  });
-  return svgEl(
-    "svg",
+  const runs = tree.order.length;
+  return el(
+    "div",
     {
-      class: "lineage-graph",
-      width: width,
-      height: height,
-      viewBox: `0 0 ${width} ${height}`,
-      role: "group",
-      "aria-label": "Run lineage",
+      class: "task-strip",
+      role: "img",
+      "aria-label": `Lineage of ${task || "no task"}: ${runs} run${runs === 1 ? "" : "s"}, ${tree.depth} level${tree.depth === 1 ? "" : "s"}`,
+      style: `width:${13 + Math.max(tree.depth - 1, 0) * 22}px;height:${13 + Math.max(tree.lanes - 1, 0) * 8}px`,
     },
-    svgEl(
-      "defs",
-      {},
-      svgEl(
-        "marker",
-        {
-          id: markerId,
-          viewBox: "0 0 8 8",
-          refX: "8",
-          refY: "4",
-          markerWidth: "7",
-          markerHeight: "7",
-          orient: "auto",
-        },
-        svgEl("path", {
-          class: "lineage-arrow",
-          d: "M0,0 L8,4 L0,8 Z",
-          style: "fill: var(--text-3)",
-        }),
-      ),
-    ),
-    ...paths,
-    ...glyphs,
+    ...lines,
+    ...dots,
   );
 }
+const shortTime = (time) =>
+  new Date(time).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+const stepText = (step) =>
+  step == null
+    ? "—"
+    : step >= 1000
+      ? `${(step / 1000).toFixed(step % 1000 && step < 10000 ? 1 : 0)}k`
+      : String(step);
+const metricShort = (key) => String(key || "metric").replace(/^best_/, "");
+// Badge for a run in the lineage view; the best run outranks its status.
+function lineageBadge(run, isBest) {
+  if (isBest) return ["★ best", "ok"];
+  if (run.status === "running") return ["running", "accent"];
+  if (run.status === "crashed") return ["failed", "warn"];
+  if (run.status === "finished") return hasMetrics(run) ? ["done", ""] : ["no metrics", ""];
+  return [statusText(run.status, run), "warn"];
+}
+// Why a run needs a second look, from what the run list already carries.
+function runWarning(run) {
+  if (run.status === "crashed") {
+    const code = run.summary?._exit_code;
+    return `Run failed${code != null ? ` with exit code ${fmt(code)}` : ""}${run.last_step != null ? ` at step ${stepText(run.last_step)}` : ""}.`;
+  }
+  if (run.status === "stale") return "No heartbeat: the process may have died.";
+  if (run.status === "finished" && !hasMetrics(run)) return "Finished without logging any metrics.";
+  return null;
+}
+// Lineage view geometry: 228×112 boxes in 268px generation columns and
+// 136px lanes, under a 40px row of generation labels.
+const LV_W = 228;
+const LV_H = 112;
+const LV_COL = 268;
+const LV_ROW = 136;
+const LV_PAD = 20;
+const LV_TOP = 40;
+const TASK_SHOWN = 5;
 async function home(version) {
   const selected = new Set();
+  // Keys are "project\0task"; a group stays collapsed or expanded across polls.
+  const collapsed = new Set();
+  const showAll = new Set();
   const search = el("input", {
     type: "search",
     class: "field",
-    placeholder: "lr>0.1   tag:baseline   status:failed",
+    placeholder: "task:imagegen   lr>0.1   status:failed",
     "aria-label": "Filter runs",
   });
   const tabs = el("div", {
@@ -770,7 +583,6 @@ async function home(version) {
     role: "tablist",
     "aria-label": "Projects",
   });
-  const notebook = createNotebook({ el, button, get, routeRun });
   const selection = el("div", {
     class: "selection-bar is-empty",
     "data-testid": "selection-bar",
@@ -805,22 +617,27 @@ async function home(version) {
         tabs,
         el("span", {
           class: "tabs-note",
-          text: "Grouped by project · sorted by start time",
+          text: "Grouped by project › task · newest first",
         }),
       ),
       el("div", { class: "selection-slot" }, selection),
       content,
-      notebook.node,
       status,
     ),
   );
   let runs = [],
     project = null,
     timer;
+  const groupKey = (run) => `${run.project || ""}\u0000${taskName(run)}`;
   const EMPTY_SELECTION =
     "Select two or more runs to overlay their curves and diff their configs.";
   const selectionCount = el("span", { text: EMPTY_SELECTION });
   const selectionChips = el("span", { class: "selection-chips", hidden: true });
+  const selectionWarn = el("span", {
+    class: "selection-warn",
+    text: "Different tasks — Δ isn't lineage-based",
+    hidden: true,
+  });
   const selectionHint = el("span", {
     class: "selection-hint",
     text: "Overlay curves and diff configs side by side.",
@@ -844,41 +661,91 @@ async function home(version) {
       updateSelection();
     }),
   );
-  selection.append(selectionCount, selectionChips, selectionHint, selectionActions);
+  selection.append(
+    selectionCount,
+    selectionChips,
+    selectionWarn,
+    selectionHint,
+    selectionActions,
+  );
   function updateSelection() {
+    const picked = runs.filter((run) => selected.has(run.run_id));
+    const crossTask = new Set(picked.map(groupKey)).size > 1;
     selection.classList.toggle("is-empty", !selected.size);
     selectionActions.hidden = !selected.size;
     selectionChips.hidden = !selected.size;
-    selectionHint.hidden = selected.size < 2;
+    selectionWarn.hidden = !crossTask;
+    selectionHint.hidden = selected.size < 2 || crossTask;
     selectionCount.textContent = selected.size
       ? `${selected.size} run${selected.size === 1 ? "" : "s"} selected`
       : EMPTY_SELECTION;
-    const names = runs
-      .filter((run) => selected.has(run.run_id))
-      .map((run) => run.name || run.run_id);
+    const names = picked.map((run) => run.name || run.run_id);
     if (selectionChips.dataset.names !== JSON.stringify(names)) {
       selectionChips.dataset.names = JSON.stringify(names);
       selectionChips.replaceChildren(...names.map((name) => chip(name)));
     }
     compareButton.disabled = selected.size < 2;
     for (const row of content.querySelectorAll(".run-row")) {
-      const picked = selected.has(row.dataset.runId);
-      row.dataset.picked = picked;
-      row.querySelector(".check").checked = picked;
+      const on = selected.has(row.dataset.runId);
+      row.dataset.picked = on;
+      row.querySelector(".check").checked = on;
     }
-    for (const node of content.querySelectorAll(".lineage-node")) {
-      const picked = selected.has(node.dataset.runId);
-      node.dataset.picked = picked;
-      node.setAttribute("aria-pressed", picked ? "true" : "false");
+  }
+  // One /api/lineage fetch per project, refetched when its runs change and
+  // every 15 s while one is running. Failures back off 1s, 2s, 4s… to 30s,
+  // independent of the runs poll.
+  const lineage = new Map();
+  function ensureLineage(key, siblings) {
+    const signature = lineageSignature(siblings);
+    let entry = lineage.get(key);
+    if (!entry) {
+      entry = { data: null, byId: new Map(), wanted: null, token: 0, fetchedAt: 0, retry: null, delay: 0 };
+      lineage.set(key, entry);
     }
+    const due =
+      siblings.some((run) => run.status === "running") &&
+      Date.now() - entry.fetchedAt >= LINEAGE_REFRESH_MS;
+    if (entry.wanted === signature && (entry.retry || !due)) return;
+    fetchLineage(key, entry, signature);
+  }
+  function fetchLineage(key, entry, signature) {
+    clearTimeout(entry.retry);
+    entry.retry = null;
+    const token = ++entry.token;
+    entry.wanted = signature;
+    entry.fetchedAt = Date.now();
+    const current = () =>
+      epoch === version && entry.token === token && lineage.get(key) === entry;
+    get(`/api/lineage?${new URLSearchParams({ project: key })}`)
+      .then((data) => {
+        if (!current()) return;
+        if (!Array.isArray(data?.nodes)) throw new Error("Invalid lineage response");
+        entry.data = data;
+        entry.byId = new Map(data.nodes.map((node) => [node.run_id, node]));
+        entry.delay = 0;
+        draw();
+      })
+      .catch((error) => {
+        if (error.name === "AbortError" || !current()) return;
+        entry.delay = Math.min(
+          entry.delay ? entry.delay * 2 : LINEAGE_RETRY_MS,
+          LINEAGE_RETRY_MAX_MS,
+        );
+        entry.retry = setTimeout(() => {
+          entry.retry = null;
+          if (current()) fetchLineage(key, entry, entry.wanted);
+        }, entry.delay);
+      });
+  }
+  function dropLineage(key) {
+    clearTimeout(lineage.get(key)?.retry);
+    lineage.delete(key);
   }
   // "Changed vs parent" and "Δ vs parent" read the lineage parent. Until a
   // project's lineage answers, both cells stay "—" rather than guessing.
-  function parentFacts(run, metricKey, data, keys) {
+  function parentFacts(run, metricKey, entry, keys) {
     const unknown = { changed: "—", delta: "—", tone: "" };
-    if (!data?.nodes) return unknown;
-    data.byId ||= new Map(data.nodes.map((node) => [node.run_id, node]));
-    const node = data.byId.get(run.run_id);
+    const node = entry?.byId.get(run.run_id);
     if (!node) return unknown;
     if (!node.parent_run_id)
       return { ...unknown, changed: changedLine(run, null, true, keys) };
@@ -893,607 +760,810 @@ async function home(version) {
       tone: deltaTone(delta, metricKey),
     };
   }
-  // Lineage lands after the table; patch the existing rows in place.
-  function annotateRows(card, data) {
-    const metricKey = card.dataset.headline;
-    const keys = variedKeys(
-      runs.filter((run) => (run.project || "") === (card.dataset.project || "")),
+  function runRow(run, metricKey, entry, keys) {
+    const check = el("input", {
+      type: "checkbox",
+      role: "checkbox",
+      class: "check",
+      checked: selected.has(run.run_id),
+      "aria-label": `Select ${run.name || run.run_id}`,
+      "data-focus": `check:${run.run_id}`,
+      onclick: (event) => event.stopPropagation(),
+      onchange: () => {
+        selected.has(run.run_id)
+          ? selected.delete(run.run_id)
+          : selected.add(run.run_id);
+        updateSelection();
+      },
+      onkeydown: (event) => event.stopPropagation(),
+    });
+    const facts = parentFacts(run, metricKey, entry, keys);
+    return el(
+      "div",
+      {
+        class: "run-grid run-row",
+        "data-run-id": run.run_id,
+        "data-picked": selected.has(run.run_id),
+        "data-focus": `row:${run.run_id}`,
+        role: "button",
+        tabIndex: 0,
+        onclick: () => {
+          location.hash = routeRun(run.run_id);
+        },
+        onkeydown: (event) => {
+          if (event.key === "Enter") location.hash = routeRun(run.run_id);
+        },
+      },
+      check,
+      el(
+        "div",
+        { class: "run-identity" },
+        el(
+          "div",
+          { class: "inline" },
+          el("a", {
+            class: "run-name",
+            href: routeRun(run.run_id),
+            text: run.name || run.run_id,
+            title: run.name || run.run_id,
+            "data-focus": `name:${run.run_id}`,
+            onclick: (event) => event.stopPropagation(),
+          }),
+          el("span", { class: "run-id", text: shortRunId(run.run_id) }),
+        ),
+        el("div", {
+          class: "run-varied",
+          text: facts.changed,
+          title: facts.changed,
+        }),
+      ),
+      el("div", { class: "run-status" }, statusChip(run.status, run)),
+      el("span", { class: "muted run-progress", text: stepText(run.last_step) }),
+      el("span", {
+        class: "run-number run-metric",
+        title: metricKey || "",
+        text: fmt(run.summary?.[metricKey]),
+      }),
+      el("span", {
+        class: `run-number run-delta ${facts.tone}`,
+        text: facts.delta,
+      }),
+      el("span", { class: "run-number run-duration", text: duration(run) }),
+      el("span", { class: "run-chevron", "aria-hidden": "true", text: "›" }),
     );
-    for (const row of card.querySelectorAll(".run-row")) {
-      const run = runs.find((other) => other.run_id === row.dataset.runId);
-      if (!run) continue;
-      const facts = parentFacts(run, metricKey, data, keys);
-      const changed = row.querySelector(".run-varied");
-      if (changed.textContent !== facts.changed) {
-        changed.textContent = facts.changed;
-        changed.title = facts.changed;
-      }
-      const delta = row.querySelector(".run-delta");
-      if (delta.textContent !== facts.delta) delta.textContent = facts.delta;
-      delta.className = `run-number run-delta ${facts.tone}`;
+  }
+  const columns = (metricKey) =>
+    el(
+      "div",
+      { class: "run-grid run-columns" },
+      el("span"),
+      el("span", { text: "Run · changed vs parent" }),
+      el("span", { class: "run-status", text: "Status" }),
+      el("span", { class: "run-progress", text: "Last step" }),
+      el("span", {
+        class: "run-number run-metric",
+        text: metricKey ? metricLabel(metricKey) : "Metric",
+        title: metricKey || "",
+      }),
+      el("span", { class: "run-number run-delta", text: "Δ vs parent" }),
+      el("span", { class: "run-number run-duration", text: "Wall time" }),
+      el("span", { class: "run-chevron" }),
+    );
+  // One dashed box per (project, task): header with the task's metric and a
+  // mini lineage, then its newest runs.
+  function taskGroup(key, task, taskRuns, visible, entry, keys) {
+    const id = `${key}\u0000${task}`;
+    const open = !collapsed.has(id);
+    const metricKey = primaryMetric(taskRuns);
+    const best = bestRun(taskRuns, metricKey);
+    const running = taskRuns.filter((run) => run.status === "running").length;
+    const failed = taskRuns.filter((run) => run.status === "crashed").length;
+    const finished = taskRuns
+      .map((run) => Date.parse(run.finished_at))
+      .filter(Number.isFinite);
+    const summary = [
+      `${taskRuns.length} run${taskRuns.length === 1 ? "" : "s"}`,
+      running ? `${running} running` : null,
+      failed ? `${failed} failed` : null,
+      running
+        ? "running now"
+        : finished.length
+          ? `last ${shortTime(Math.max(...finished))}`
+          : null,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    const source = taskRuns.find((run) => run.task_source)?.task_source;
+    const tree = entry?.data
+      ? taskTree(taskRuns, (runId) => entry.byId.get(runId)?.parent_run_id, metricKey)
+      : null;
+    const head = el(
+      "div",
+      { class: "task-head" },
+      el(
+        "button",
+        {
+          type: "button",
+          class: "task-toggle",
+          "aria-expanded": String(open),
+          "aria-label": `${open ? "Collapse" : "Expand"} ${task || "no task"}`,
+          "data-focus": `toggle:${id}`,
+          onclick: () => {
+            open ? collapsed.add(id) : collapsed.delete(id);
+            draw();
+          },
+        },
+        el("span", { class: "task-caret", "aria-hidden": "true", text: open ? "▾" : "▸" }),
+        el("span", { class: "task-name", text: task || "no task", title: task || "no task" }),
+      ),
+      task ? chip(`task · ${source || "—"}`, "task-source") : null,
+      el("span", { class: "task-summary", text: summary }),
+      metricKey
+        ? el(
+            "span",
+            { class: "task-metric" },
+            `${metricLabel(metricKey)} `,
+            el("span", {
+              class: "task-best",
+              text: best ? fmt(best.summary[metricKey]) : "—",
+            }),
+          )
+        : null,
+      el(
+        "div",
+        { class: "task-tools" },
+        tree ? lineageStrip(tree, task) : null,
+        button("Lineage ⤢", () => openLineageView(key, task), "secondary", {
+          "aria-haspopup": "dialog",
+          "aria-label": `Open lineage of ${task || "no task"}`,
+          "data-focus": `lineage:${id}`,
+        }),
+      ),
+    );
+    let body = null;
+    if (open) {
+      const shown = showAll.has(id) ? visible : visible.slice(0, TASK_SHOWN);
+      const hidden = visible.length - TASK_SHOWN;
+      body = el(
+        "div",
+        { class: "task-body" },
+        columns(metricKey),
+        ...shown.map((run) => runRow(run, metricKey, entry, keys)),
+        hidden > 0
+          ? el(
+              "div",
+              { class: "task-more" },
+              button(
+                showAll.has(id) ? `Show latest ${TASK_SHOWN} only` : `Show ${hidden} more`,
+                () => {
+                  showAll.has(id) ? showAll.delete(id) : showAll.add(id);
+                  draw();
+                },
+                "ghost",
+                { "data-focus": `more:${id}` },
+              ),
+            )
+          : null,
+      );
     }
-  }
-  const lineageCache = new Map();
-  const lineageRetry = new Map();
-  let lineageToken = 0;
-  let detailToken = 0;
-  function clearLineageRetry(key) {
-    const pending = lineageRetry.get(key);
-    if (!pending) return;
-    clearTimeout(pending.timer);
-    lineageRetry.delete(key);
-  }
-  // 1s, 2s, 4s… capped at 30s. Independent of the runs poll, so an idle
-  // workspace still retries a failed /api/lineage fetch.
-  function scheduleLineageRetry(key) {
-    if (epoch !== version) return;
-    const pending = lineageRetry.get(key);
-    const delay = Math.min(
-      pending ? pending.delay * 2 : LINEAGE_RETRY_MS,
-      LINEAGE_RETRY_MAX_MS,
+    return el(
+      "section",
+      {
+        class: "task-group",
+        "data-task": task,
+        "aria-label": `Task ${task || "no task"}`,
+      },
+      head,
+      body,
     );
-    if (pending) clearTimeout(pending.timer);
-    const timer = setTimeout(() => {
-      if (epoch !== version) return;
-      const entry = lineageCache.get(key);
-      const card = entry?.card;
-      const shown = runs.some((run) => (run.project || "") === key);
-      if (!entry || !shown || !card?.isConnected) {
-        if (!shown) lineageCache.delete(key);
-        clearLineageRetry(key);
+  }
+  // Lineage view: a fixed dialog with the task's full graph, a compare tray
+  // and an inspector for the focused run. Its selection is the table's.
+  let lineageView = null;
+  function openLineageView(key, task) {
+    lineageView?.close(false);
+    const id = `${key}\u0000${task}`;
+    const label = task || "no task";
+    const trigger = `lineage:${id}`;
+    let zoom = 1,
+      find = "",
+      bestOn = true,
+      focusId = null,
+      first = true;
+    const details = new Map();
+    const findField = el("input", {
+      type: "search",
+      class: "field lv-find",
+      placeholder: "Find run or param…",
+      "aria-label": "Find run or param",
+      oninput: () => {
+        find = findField.value.trim().toLowerCase();
+        render();
+      },
+    });
+    const bestBox = el("input", {
+      type: "checkbox",
+      checked: true,
+      onchange: () => {
+        bestOn = bestBox.checked;
+        render();
+      },
+    });
+    const zoomValue = el("span", { class: "lv-zoom-value", text: "100%" });
+    const setZoom = (value) => {
+      zoom = Math.min(2, Math.max(0.3, Math.round(value * 100) / 100));
+      render();
+    };
+    const source = el("span", { class: "lv-source" });
+    const meta = el("span", { class: "lv-meta" });
+    const canvas = el("div", { class: "lv-canvas-scroll" });
+    const tray = el("div", { class: "lv-tray" });
+    const inspector = el("aside", { class: "lv-inspector", "aria-label": "Selected run" });
+    const legendDot = (tone, text) =>
+      el("span", { class: "lv-legend-item" }, el("span", { class: `lv-dot ${tone}`, "aria-hidden": "true" }), text);
+    const dialog = el(
+      "section",
+      {
+        class: "lv-dialog",
+        role: "dialog",
+        "aria-modal": "true",
+        "aria-label": `Lineage of ${key ? `${key}/` : ""}${label}`,
+      },
+      el(
+        "header",
+        { class: "lv-head" },
+        el(
+          "div",
+          { class: "lv-title" },
+          eyebrow("Lineage"),
+          el("div", { class: "inline" }, el("span", { class: "lv-task", text: label, title: label }), source),
+        ),
+        meta,
+        el(
+          "div",
+          { class: "lv-controls" },
+          findField,
+          el("label", { class: "lv-best" }, bestBox, "Highlight best path"),
+          el(
+            "div",
+            { class: "lv-zoom", role: "group", "aria-label": "Zoom" },
+            button("−", () => setZoom(zoom - 0.1), "ghost", { "aria-label": "Zoom out", title: "Zoom out" }),
+            zoomValue,
+            button("+", () => setZoom(zoom + 0.1), "ghost", { "aria-label": "Zoom in", title: "Zoom in" }),
+            button("Fit", () => {
+              const size = canvas.firstElementChild?.firstElementChild;
+              const width = parseFloat(size?.style.width) || 1,
+                height = parseFloat(size?.style.height) || 1;
+              setZoom(Math.min(1, (canvas.clientWidth - 16) / width, (canvas.clientHeight - 16) / height));
+            }),
+          ),
+          button("✕", () => close(), "secondary", { "aria-label": "Close lineage", title: "Close lineage" }),
+        ),
+      ),
+      el(
+        "div",
+        { class: "lv-body" },
+        el(
+          "div",
+          { class: "lv-main" },
+          canvas,
+          tray,
+          el(
+            "div",
+            { class: "lv-legend" },
+            legendDot("ok", "done"),
+            legendDot("accent", "running"),
+            legendDot("warn", "failed"),
+            el("span", { class: "lv-legend-item" }, el("span", { class: "lv-legend-line is-best", "aria-hidden": "true" }), "best path"),
+            el("span", { class: "lv-legend-item" }, el("span", { class: "lv-legend-line", "aria-hidden": "true" }), "parent → child"),
+            el("span", {
+              class: "lv-footnote",
+              text: "Parents are inferred within a task only. An explicit parent_run_id can cross tasks.",
+            }),
+          ),
+        ),
+        inspector,
+      ),
+    );
+    const backdrop = el("div", {
+      class: "lv-backdrop",
+      onclick: (event) => {
+        if (event.target === backdrop) close();
+      },
+    }, dialog);
+    const keydown = (event) => {
+      if (document.querySelector(".focus-overlay")) return;
+      if (event.key === "Escape") {
+        event.stopImmediatePropagation();
+        close();
+      } else if (event.key === "Tab") trapTab(dialog, event);
+    };
+    const toggle = (runId) => {
+      selected.has(runId) ? selected.delete(runId) : selected.add(runId);
+      updateSelection();
+      render();
+    };
+    function close(restore = true) {
+      window.removeEventListener("keydown", keydown);
+      backdrop.remove();
+      document.documentElement.classList.remove("has-dialog");
+      if (lineageView === view) lineageView = null;
+      if (!restore) return;
+      const target = [...content.querySelectorAll("[data-focus]")].find(
+        (node) => node.dataset.focus === trigger,
+      );
+      target?.focus();
+    }
+    function render() {
+      const taskRuns = runs
+        .filter((run) => (run.project || "") === key && taskName(run) === task)
+        .sort(newestFirst);
+      if (!taskRuns.length) return close();
+      const entry = lineage.get(key);
+      zoomValue.textContent = `${Math.round(zoom * 100)}%`;
+      const taskSource = taskRuns.find((run) => run.task_source)?.task_source;
+      source.replaceChildren(...(task ? [chip(`task · ${taskSource || "—"}`, "task-source")] : []));
+      if (!entry?.data) {
+        if (!canvas.querySelector("[role=status]"))
+          canvas.replaceChildren(loading("Loading lineage…"));
         return;
       }
-      // A newer fetch owns this project. Keep the delay for its failure.
-      if (!entry.error || entry.pending) return;
-      const siblings = runs.filter((run) => (run.project || "") === key);
-      const signature = lineageSignature(siblings);
-      card.dataset.signature = signature;
-      ensureLineage(
-        key,
-        signature,
-        card,
-        siblings.some((run) => run.status === "running"),
-      );
-    }, delay);
-    lineageRetry.set(key, { timer, delay });
-  }
-  let pendingFocus = { runId: "", project: "" };
-  function projectHead(key) {
-    return el(
-      "header",
-      { class: "project-head inline" },
-      el("h2", { text: key || "No project" }),
-      el("span", { class: "project-meta" }),
-      !key
-        ? el("span", {
-            class: "project-note",
-            text: "no project — pass project= or run inside a repo",
-          })
-        : null,
-      el("span", { class: "project-metric" }),
-    );
-  }
-  // A project's entrypoint is what its newest snapshot recorded as launched.
-  const entrypoints = new Map();
-  function projectMeta(card, siblings) {
-    const key = card.dataset.project || "";
-    const entry = entrypoints.get(key);
-    const text = [
-      `${siblings.length} run${siblings.length === 1 ? "" : "s"}`,
-      entry ? `entrypoint ${entry}` : null,
-    ]
-      .filter(Boolean)
-      .join(" · ");
-    const meta = card.querySelector(".project-meta");
-    if (meta.textContent !== text) meta.textContent = text;
-    if (entrypoints.has(key) || !siblings[0]) return;
-    entrypoints.set(key, null);
-    get(`${apiRun(siblings[0].run_id)}/code`)
-      .then((files) => {
-        const path = files.find?.((file) => file.source === "entrypoint")?.path;
-        if (!path || epoch !== version) return;
-        entrypoints.set(key, path);
-        if (card.isConnected) projectMeta(card, siblings);
-      })
-      .catch(() => {});
-  }
-  function renderDetail(host, node, detail) {
-    const parentId = node.parent_run_id;
-    const parentRun = runs.find((run) => run.run_id === parentId);
-    const parent = parentId
-      ? el("a", {
-          href: routeRun(parentId),
-          text: parentRun?.name || parentId,
-        })
-      : el("span", { text: "—" });
-    const inferred =
-      node.parent_inference && node.parent_inference !== "explicit"
-        ? el("span", { class: "muted", text: node.parent_inference })
+      const active = dialog.contains(document.activeElement)
+        ? document.activeElement.closest("[data-focus]")?.dataset.focus
         : null;
-    const base = [
-      node.base_commit ? String(node.base_commit).slice(0, 7) : "",
-      node.base_branch || "",
+      const metricKey = primaryMetric(taskRuns);
+      const short = metricShort(metricKey);
+      const keys = variedKeys(runs.filter((run) => (run.project || "") === key));
+      const tree = taskTree(taskRuns, (runId) => entry.byId.get(runId)?.parent_run_id, metricKey);
+      const best = bestRun(taskRuns, metricKey);
+      const path = [];
+      for (let item = best && tree.items.get(best.run_id); item; item = item.parent)
+        path.unshift(item.run.run_id);
+      const onPath = new Set(bestOn ? path : []);
+      if (!tree.items.has(focusId)) focusId = (best || tree.order[0].run).run_id;
+      const running = taskRuns.filter((run) => run.status === "running").length;
+      const failed = taskRuns.filter((run) => run.status === "crashed").length;
+      meta.textContent = [
+        `${taskRuns.length} run${taskRuns.length === 1 ? "" : "s"}`,
+        `${tree.depth} generation${tree.depth === 1 ? "" : "s"}`,
+        `${tree.lanes} branch${tree.lanes === 1 ? "" : "es"}`,
+        running ? `${running} running` : null,
+        failed ? `${failed} failed` : null,
+        best ? `best ${best.name || best.run_id} (${short} ${fmt(best.summary[metricKey])})` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      // Find matches names, ids, tags and filter expressions, plus param names.
+      const matches = (run) =>
+        !find ||
+        runMatches(run, find) ||
+        Object.keys(run.config || {}).some((name) => name.toLowerCase().includes(find));
+      const x = (item) => LV_PAD + item.depth * LV_COL;
+      const y = (item) => LV_TOP + item.lane * LV_ROW;
+      const width = LV_PAD * 2 + Math.max(tree.depth - 1, 0) * LV_COL + LV_W;
+      const height = LV_TOP + Math.max(tree.lanes - 1, 0) * LV_ROW + LV_H + LV_PAD;
+      const parts = [];
+      for (let depth = 0; depth < tree.depth; depth++)
+        parts.push(el("span", {
+          class: "lv-gen",
+          style: `left:${LV_PAD + depth * LV_COL}px`,
+          text: depth ? `gen ${depth}` : "root",
+        }));
+      // Elbow connectors: out of the parent's right edge, down the gutter,
+      // into the child's left edge with an arrowhead.
+      for (const item of tree.order) {
+        if (!item.parent) continue;
+        const hot = onPath.has(item.run.run_id) && onPath.has(item.parent.run.run_id);
+        const dim = find && !(matches(item.run) && matches(item.parent.run));
+        const tone = `lv-edge${hot ? " is-best" : ""}${dim ? " is-dim" : ""}`;
+        const px = x(item.parent) + LV_W,
+          py = y(item.parent) + LV_H / 2,
+          cx = x(item),
+          cy = y(item) + LV_H / 2,
+          mx = px + (LV_COL - LV_W) / 2;
+        const segment = (left, top, w, h) =>
+          parts.push(el("span", { class: tone, style: `left:${left}px;top:${top}px;width:${w}px;height:${h}px` }));
+        const thick = hot ? 2 : 1;
+        segment(px, py, mx - px, thick);
+        if (cy !== py) segment(mx, Math.min(py, cy), thick, Math.abs(cy - py) + thick);
+        segment(mx, cy, cx - mx, thick);
+        parts.push(el("span", { class: `${tone} lv-arrow`, style: `left:${cx - 5}px;top:${cy - 4 + thick / 2}px` }));
+      }
+      for (const item of tree.order) {
+        const run = item.run;
+        const runId = run.run_id;
+        const name = run.name || runId;
+        const facts = parentFacts(run, metricKey, entry, keys);
+        const [badge, badgeTone] = lineageBadge(run, best?.run_id === runId);
+        const ticked = selected.has(runId);
+        const classes = [
+          "lv-node",
+          run.status === "crashed" || run.status === "stale" ? "is-failed" : "",
+          run.status === "running" ? "is-running" : "",
+          onPath.has(runId) ? "is-best-path" : "",
+          ticked ? "is-ticked" : "",
+          runId === focusId ? "is-focused" : "",
+          matches(run) ? "" : "is-dim",
+        ].filter(Boolean).join(" ");
+        parts.push(el(
+          "div",
+          { class: classes, "data-run-id": runId, style: `left:${x(item)}px;top:${y(item)}px` },
+          el(
+            "button",
+            {
+              type: "button",
+              class: "lv-box",
+              "aria-pressed": String(runId === focusId),
+              "aria-label": `${name}, ${statusText(run.status, run)}, ${short} ${fmt(run.summary?.[metricKey])}`,
+              "data-focus": `lv-node:${runId}`,
+              onclick: () => {
+                focusId = runId;
+                render();
+              },
+              ondblclick: () => {
+                location.hash = routeRun(runId);
+              },
+            },
+            el(
+              "span",
+              { class: "lv-box-top" },
+              el("span", { class: `lv-dot ${STATUS_TONE[run.status] || ""}`, "aria-hidden": "true" }),
+              el("span", { class: "lv-name", text: name, title: name }),
+              chip(badge, `lv-badge ${badgeTone}`),
+            ),
+            el("span", {
+              class: `lv-change${item.parent ? "" : " is-root"}`,
+              text: item.parent ? facts.changed : "root run",
+              title: item.parent ? facts.changed : "root run",
+            }),
+            el(
+              "span",
+              { class: "lv-box-metric" },
+              el("span", { class: "lv-metric-key", text: short }),
+              el("span", { class: "lv-metric-value", text: fmt(run.summary?.[metricKey]) }),
+              item.parent ? el("span", { class: `lv-delta ${facts.tone}`, text: facts.delta }) : null,
+              el("span", { class: "lv-foot", text: `${stepText(run.last_step)} steps · ${duration(run)}` }),
+            ),
+          ),
+          el("input", {
+            type: "checkbox",
+            class: "lv-tick",
+            checked: ticked,
+            "aria-label": `Select ${name} for comparison`,
+            "data-focus": `lv-tick:${runId}`,
+            onchange: () => toggle(runId),
+          }),
+        ));
+      }
+      const top = canvas.scrollTop,
+        left = canvas.scrollLeft;
+      canvas.replaceChildren(
+        el(
+          "div",
+          { class: "lv-sizer", style: `width:${width * zoom}px;height:${height * zoom}px` },
+          el("div", { class: "lv-canvas", style: `width:${width}px;height:${height}px;transform:scale(${zoom})` }, ...parts),
+        ),
+      );
+      canvas.scrollTop = top;
+      canvas.scrollLeft = left;
+      drawTray(taskRuns, tree, path);
+      drawInspector(tree, entry, metricKey, keys);
+      const target = active &&
+        [...dialog.querySelectorAll("[data-focus]")].find((node) => node.dataset.focus === active);
+      if (first) {
+        first = false;
+        const box = canvas.querySelector(`.lv-node.is-focused .lv-box`);
+        box?.focus({ preventScroll: true });
+        box?.scrollIntoView({ block: "nearest", inline: "nearest" });
+      } else if (active && !dialog.contains(document.activeElement)) target?.focus({ preventScroll: true });
+    }
+    // Ticks are scoped to this task but live in the page-wide selection.
+    function setTaskSelection(taskRuns, ids) {
+      for (const run of taskRuns) selected.delete(run.run_id);
+      for (const runId of ids) selected.add(runId);
+      updateSelection();
+      render();
+    }
+    function drawTray(taskRuns, tree, path) {
+      const ticked = tree.order.map((item) => item.run).filter((run) => selected.has(run.run_id));
+      const focused = tree.items.get(focusId);
+      const family = [
+        focused.run.run_id,
+        ...(focused.parent ? [focused.parent.run.run_id] : []),
+        ...focused.kids.map((kid) => kid.run.run_id),
+      ];
+      const query = new URLSearchParams({ selection: "1" });
+      for (const run of ticked) query.append("runs", run.run_id);
+      tray.classList.toggle("is-ready", ticked.length >= 2);
+      tray.replaceChildren(
+        el("span", {
+          class: ticked.length >= 2 ? "lv-tray-count" : "lv-tray-hint",
+          text: ticked.length >= 2
+            ? `${ticked.length} selected in ${label}`
+            : "Tick two or more runs in this task to compare them.",
+        }),
+        el(
+          "div",
+          { class: "lv-tray-chips" },
+          ...ticked.map((run) =>
+            el(
+              "button",
+              {
+                type: "button",
+                class: "lv-chip",
+                "aria-label": `Remove ${run.name || run.run_id} from comparison`,
+                "data-focus": `lv-chip:${run.run_id}`,
+                onclick: () => toggle(run.run_id),
+              },
+              el("span", { class: "lv-chip-name", text: run.name || run.run_id }),
+              el("span", { "aria-hidden": "true", text: "✕" }),
+            ),
+          ),
+        ),
+        el(
+          "div",
+          { class: "lv-tray-actions" },
+          el("span", { class: "lv-tray-label", text: "Quick select" }),
+          button("Best path", () => setTaskSelection(taskRuns, path), "secondary", {
+            disabled: !path.length,
+            "data-focus": "lv-pick-path",
+          }),
+          button(
+            `${focused.run.name || focused.run.run_id} + parent & children`,
+            () => setTaskSelection(taskRuns, family),
+            "secondary",
+            { class: "btn btn-secondary btn-sm lv-family", "data-focus": "lv-pick-family" },
+          ),
+          button("Clear", () => setTaskSelection(taskRuns, []), "ghost", { "data-focus": "lv-clear" }),
+          ticked.length >= 2
+            ? el("a", {
+                class: "btn btn-primary btn-sm",
+                href: `#/compare?${query}`,
+                text: `Compare ${ticked.length} runs`,
+              })
+            : null,
+        ),
+      );
+    }
+    function drawInspector(tree, entry, metricKey, keys) {
+      const item = tree.items.get(focusId);
+      const run = item.run;
+      const runId = run.run_id;
+      const node = entry.byId.get(runId) || {};
+      const parent = runs.find((other) => other.run_id === node.parent_run_id) || null;
+      let root = item;
+      while (root.parent) root = root.parent;
+      const facts = parentFacts(run, metricKey, entry, keys);
+      const value = run.summary?.[metricKey],
+        base = root.run.summary?.[metricKey];
+      const vsRoot = root !== item && isNumber(value) && isNumber(base) ? value - base : null;
+      const short = metricShort(metricKey);
+      const warning = runWarning(run);
+      const diff = parent
+        ? changedKeys(run, parent).map((name) => [name, fmt(parent.config?.[name]), fmt(run.config?.[name])])
+        : Object.keys(run.config || {})
+            .filter((name) => !IDENTITY_KEYS.has(name))
+            .sort()
+            .map((name) => [name, "—", fmt(run.config[name])]);
+      // Changed files come from the per-run lineage diff, fetched once.
+      if (parent && !node.same_tree_as_parent && !details.has(runId)) {
+        details.set(runId, null);
+        get(`${apiRun(runId)}/lineage`)
+          .then((detail) => {
+            details.set(runId, detail);
+            if (lineageView === view && focusId === runId) render();
+          })
+          .catch(() => details.set(runId, { error: true }));
+      }
+      const detail = details.get(runId);
+      const files = Array.isArray(detail?.files) ? detail.files : null;
+      const code = !parent
+        ? "baseline snapshot"
+        : node.same_tree_as_parent
+          ? "code unchanged"
+          : files
+            ? `${files.length} file${files.length === 1 ? "" : "s"} changed${files[0] ? ` · ${files[0].path}` : ""}`
+            : "code changed";
+      const stat = (name, text, tone = "") =>
+        el("div", {}, el("dt", { text: name }), el("dd", { class: tone, text }));
+      inspector.replaceChildren(
+        el(
+          "div",
+          { class: "lv-insp-head" },
+          el(
+            "div",
+            { class: "inline" },
+            el("span", { class: `lv-dot ${STATUS_TONE[run.status] || ""}`, "aria-hidden": "true" }),
+            el("span", { class: "lv-insp-name", text: run.name || runId, title: run.name || runId }),
+            statusChip(run.status, run),
+          ),
+          el("span", {
+            class: "lv-insp-sub",
+            text: `run ${shortRunId(runId)} · ${parent ? `child of ${parent.name || parent.run_id}` : `root of ${label}`} · gen ${item.depth}`,
+          }),
+          el(
+            "label",
+            { class: "lv-include" },
+            el("input", {
+              type: "checkbox",
+              checked: selected.has(runId),
+              "data-focus": "lv-include",
+              onchange: () => toggle(runId),
+            }),
+            "Include in comparison",
+          ),
+          el(
+            "div",
+            { class: "inline lv-insp-actions" },
+            el("a", { class: "btn btn-primary btn-sm", href: routeRun(runId), text: "Open run" }),
+            parent
+              ? el("a", {
+                  class: "btn btn-secondary btn-sm",
+                  href: `#/compare?${new URLSearchParams([["runs", parent.run_id], ["runs", runId]])}`,
+                  text: "Compare with parent",
+                })
+              : null,
+          ),
+        ),
+        el(
+          "div",
+          { class: "lv-insp-section" },
+          el(
+            "dl",
+            { class: "lv-stats" },
+            stat(short, fmt(value)),
+            stat("Δ vs parent", parent ? facts.delta : "—", facts.tone),
+            stat("Δ vs root", vsRoot == null ? "—" : formatDelta(vsRoot), deltaTone(vsRoot, metricKey)),
+          ),
+          warning ? el("p", { class: "callout callout-warn", role: "note", text: warning }) : null,
+        ),
+        el(
+          "div",
+          { class: "lv-insp-section" },
+          eyebrow(parent ? "Config diff vs parent" : "Root config"),
+          diff.length
+            ? el(
+                "div",
+                { class: "lv-diff" },
+                el("span", { text: "param" }),
+                el("span", { text: parent ? parent.name || parent.run_id : "—", title: parent?.name || "" }),
+                el("span", { text: "this run" }),
+                ...diff.flatMap(([name, from, to]) => [
+                  el("span", { class: "lv-diff-key", text: name, title: name }),
+                  el("span", { class: "lv-diff-from", text: from, title: from }),
+                  el("span", { class: "lv-diff-to", text: to, title: to }),
+                ]),
+              )
+            : el("p", { class: "muted", text: parent ? "No param changes." : "No params logged." }),
+        ),
+        el(
+          "div",
+          { class: "lv-insp-section" },
+          kv({
+            snapshot: node.commit ? String(node.commit).slice(0, 7) : "—",
+            code,
+            "last step": stepText(run.last_step),
+            "wall time": duration(run),
+          }),
+        ),
+        el(
+          "div",
+          { class: "lv-insp-section" },
+          eyebrow(item.kids.length ? `Children · ${item.kids.length}` : "Children"),
+          ...(item.kids.length
+            ? item.kids.map((kid) =>
+                el(
+                  "button",
+                  {
+                    type: "button",
+                    class: "lv-kid",
+                    "data-focus": `lv-kid:${kid.run.run_id}`,
+                    onclick: () => {
+                      focusId = kid.run.run_id;
+                      render();
+                      canvas.querySelector(".lv-node.is-focused")?.scrollIntoView({ block: "nearest", inline: "nearest" });
+                    },
+                  },
+                  el("span", { class: `lv-dot ${STATUS_TONE[kid.run.status] || ""}`, "aria-hidden": "true" }),
+                  el("span", { class: "lv-kid-name", text: kid.run.name || kid.run.run_id }),
+                  el("span", { class: "lv-kid-change", text: changedLine(kid.run, run, false) }),
+                  el("span", { class: "lv-kid-metric", text: fmt(kid.run.summary?.[metricKey]) }),
+                ),
+              )
+            : [el("p", { class: "muted", text: "No child runs yet." })]),
+        ),
+      );
+    }
+    const view = { key, task, render, close };
+    lineageView = view;
+    document.body.append(backdrop);
+    document.documentElement.classList.add("has-dialog");
+    window.addEventListener("keydown", keydown);
+    render();
+    if (!dialog.contains(document.activeElement)) findField.focus();
+  }
+  // Polls rebuild the groups; keyboard focus follows the control it was on.
+  function focusKey() {
+    const active = document.activeElement;
+    return content.contains(active) ? active.closest("[data-focus]")?.dataset.focus : null;
+  }
+  function restoreFocus(key) {
+    if (!key || content.contains(document.activeElement)) return;
+    const target = [...content.querySelectorAll("[data-focus]")].find(
+      (node) => node.dataset.focus === key,
+    );
+    try {
+      target?.focus({ preventScroll: true });
+    } catch {
+      target?.focus();
+    }
+  }
+  function projectCard(key, siblings, query) {
+    const entry = lineage.get(key);
+    const keys = variedKeys(siblings);
+    const tasks = new Map();
+    for (const run of siblings) {
+      const task = taskName(run);
+      if (!tasks.has(task)) tasks.set(task, []);
+      tasks.get(task).push(run);
+    }
+    // Newest activity first; runs without a task close the card.
+    const ordered = [...tasks].sort(([a, aRuns], [b, bRuns]) =>
+      !a ? 1 : !b ? -1 : createdTime(bRuns[0]) - createdTime(aRuns[0]) || a.localeCompare(b),
+    );
+    const groups = [];
+    for (const [task, taskRuns] of ordered) {
+      const visible = taskRuns.filter((run) => runMatches(run, query));
+      if (query && !visible.length) continue;
+      groups.push(taskGroup(key, task, taskRuns, visible, entry, keys));
+    }
+    const ids = ordered.map(([task]) => `${key}\u0000${task}`);
+    const allCollapsed = ids.every((id) => collapsed.has(id));
+    const named = ordered.filter(([task]) => task).length;
+    const meta = [
+      named ? `${named} task${named === 1 ? "" : "s"}` : null,
+      `${siblings.length} run${siblings.length === 1 ? "" : "s"}`,
     ]
       .filter(Boolean)
       .join(" · ");
-    const files = Array.isArray(detail.files) ? detail.files : [];
-    const shown = files.slice(0, 8);
-    const extra = files.length - shown.length;
-    const checkout =
-      detail.checkout || `agenticml lineage checkout ${node.run_id}`;
-    const copy = button("Copy", () => {
-      try {
-        const pending = navigator.clipboard.writeText(checkout);
-        Promise.resolve(pending).then(
-          () => {
-            copy.textContent = "Copied";
-          },
-          () => {
-            copy.textContent = "Copy failed";
-          },
-        );
-      } catch {
-        copy.textContent = "Copy failed";
-      }
-    });
-    host.replaceChildren(
-      ...[
+    let card = [...content.children].find(
+      (node) => node.classList.contains("project-card") && node.dataset.project === key,
+    );
+    card ||= el("section", { class: "card project-card", "data-project": key });
+    card.replaceChildren(
       el(
-        "div",
-        { class: "lineage-facts" },
-        el("div", {}, el("div", { class: "eyebrow", text: "Parent" }), el("div", { class: "inline" }, parent, inferred)),
-        el(
-          "div",
-          {},
-          el("div", { class: "eyebrow", text: "Commit" }),
-          el("span", {
-            class: "mono",
-            text: detail.commit || node.commit || "—",
-            title: detail.commit || node.commit || "",
-          }),
-        ),
-        el(
-          "div",
-          {},
-          el("div", { class: "eyebrow", text: "Base" }),
-          el("span", {
-            class: "mono",
-            text: `${base || "—"}${node.base_dirty ? " · dirty" : ""}`,
-          }),
-        ),
-        node.arch ? el("div", {},
-          el("div", { class: "eyebrow", text: "Model class" }),
-          el("span", { class: "mono", text: node.arch.model_class || "—" }),
-        ) : null,
-        node.arch?.model_type ? el("div", {},
-          el("div", { class: "eyebrow", text: "Model type" }),
-          el("span", { class: "mono", text: node.arch.model_type }),
-        ) : null,
-      ),
-      detail.error ? el("p", { class: "error", text: detail.error }) : null,
-      el("div", { class: "eyebrow", text: "Files changed vs parent" }),
-      shown.length
-        ? el(
-            "div",
-            { class: "lineage-files" },
-            ...shown.map((file) =>
-              el(
-                "div",
-                { class: "lineage-file" },
-                el("span", {
-                  class: "path",
-                  text: file.path || "—",
-                  title: file.path || "",
-                }),
-                el("span", {
-                  class: "added",
-                  text: file.added == null ? "—" : `+${file.added}`,
-                }),
-                el("span", {
-                  class: "deleted",
-                  text: file.deleted == null ? "—" : `-${file.deleted}`,
-                }),
-              ),
-            ),
-          )
-        : el("p", { class: "muted", text: detail.error ? "—" : "No file changes." }),
-      extra > 0
-        ? el("p", {
-            class: "muted",
-            text: `and ${extra} more${detail.truncated ? " (list truncated)" : ""}`,
-          })
-        : detail.truncated
-          ? el("p", { class: "muted", text: "list truncated" })
+        "header",
+        { class: "project-head inline" },
+        el("h2", { text: key || "No project" }),
+        el("span", { class: "project-meta", text: meta }),
+        !key
+          ? el("span", {
+              class: "project-note",
+              text: "no project — pass project= or run inside a repo",
+            })
           : null,
+        button(
+          allCollapsed ? "Expand all" : "Collapse all",
+          () => {
+            for (const id of ids) allCollapsed ? collapsed.delete(id) : collapsed.add(id);
+            draw();
+          },
+          "ghost",
+          { class: "btn btn-ghost btn-sm project-toggle", "data-focus": `all:${key}` },
+        ),
+      ),
       el(
         "div",
-        { class: "lineage-checkout" },
-        el("code", { text: checkout }),
-        copy,
+        { class: "task-groups" },
+        ...(groups.length
+          ? groups
+          : [el("p", { class: "runs-empty muted", text: "No runs match this filter." })]),
       ),
-    ].filter((child) => child != null));
-  }
-  function lineageDetailPayload(node) {
-    const parentId = node.parent_run_id || "";
-    const parent = runs.find((run) => run.run_id === parentId);
-    return JSON.stringify([
-      node.run_id || "",
-      parentId,
-      parent?.name || "",
-      node.parent_inference || "",
-      node.commit || "",
-      node.base_commit || "",
-      node.base_branch || "",
-      Boolean(node.base_dirty),
-      node.task || "",
-      node.arch || null,
-    ]);
-  }
-  function detailResponseCurrent(card, token, payload) {
-    return (
-      epoch === version &&
-      card.isConnected &&
-      card.dataset.detailToken === token &&
-      card.dataset.detailWanted === payload
     );
-  }
-  function showLineageDetail(card, node) {
-    const token = String(++detailToken);
-    const payload = lineageDetailPayload(node);
-    const sameNode = card.dataset.detailFor === node.run_id;
-    card.dataset.detailToken = token;
-    card.dataset.detailFor = node.run_id;
-    card.dataset.focus = node.run_id;
-    card.dataset.detailWanted = payload;
-    card.dataset.detailPending = payload;
-    const host = card.querySelector(".lineage-detail");
-    // A refresh of the open strip keeps the previous parent, commit, and
-    // dirty flag until the new payload arrives.
-    if (!sameNode)
-      host.replaceChildren(loading("Loading changes…"));
-    get(`${apiRun(node.run_id)}/lineage`)
-      .then((detail) => {
-        if (!detailResponseCurrent(card, token, payload)) return;
-        card.dataset.detailPayload = payload;
-        delete card.dataset.detailPending;
-        renderDetail(host, node, detail);
-      })
-      .catch((error) => {
-        if (epoch !== version || error.name === "AbortError") return;
-        if (!detailResponseCurrent(card, token, payload)) return;
-        delete card.dataset.detailPending;
-        // The strip no longer shows this payload. Leaving the rendered
-        // marker set makes the next paint treat it as current and skip
-        // the refetch, so the error stays up.
-        delete card.dataset.detailPayload;
-        showError(host, error);
-      });
-  }
-  function toggleLineage(card, node) {
-    if (selected.has(node.run_id)) selected.delete(node.run_id);
-    else selected.add(node.run_id);
-    card.dataset.focus = node.run_id;
-    updateSelection();
-    showLineageDetail(card, node);
-  }
-  function lineageNodeFrom(card, event) {
-    const target = event.target;
-    if (!target || !target.closest) return null;
-    const glyph = target.closest(".lineage-node");
-    if (!glyph || !card.contains(glyph)) return null;
-    const runId = glyph.getAttribute("data-run-id");
-    if (!runId) return null;
-    const data = lineageCache.get(card.dataset.project || "")?.data;
-    return (
-      (data?.nodes || []).find((node) => node.run_id === runId) || {
-        run_id: runId,
-      }
-    );
-  }
-  // Up/Down walk generations (along an edge when there is one). Left/Right
-  // walk siblings in the same generation.
-  function moveLineageFocus(card, event) {
-    const key = event.key;
-    const vertical = key === "ArrowUp" || key === "ArrowDown";
-    const horizontal = key === "ArrowLeft" || key === "ArrowRight";
-    if (!vertical && !horizontal) return false;
-    if (event.altKey || event.metaKey || event.ctrlKey || event.shiftKey)
-      return false;
-    const target = event.target;
-    if (!target || !target.closest) return false;
-    const glyph = target.closest(".lineage-node");
-    if (!glyph || !card.contains(glyph)) return false;
-    event.preventDefault();
-    const scroll = glyph.closest(".lineage-scroll");
-    if (!scroll) return true;
-    const graph = glyph.closest(".lineage-graph");
-    const nodes = [...graph.querySelectorAll(".lineage-node")];
-    const generation = Number(glyph.dataset.generation);
-    const sibling = Number(glyph.dataset.sibling);
-    const axis = (node, name) =>
-      Number(node.querySelector(".lineage-shape")?.getAttribute(name)) || 0;
-    let candidates = [];
-    if (horizontal) {
-      const step = key === "ArrowRight" ? 1 : -1;
-      candidates = nodes.filter(
-        (node) =>
-          Number(node.dataset.generation) === generation &&
-          Number(node.dataset.sibling) === sibling + step,
-      );
-    } else {
-      const down = key === "ArrowDown";
-      const id = glyph.getAttribute("data-run-id");
-      const ids = new Set(
-        [...graph.querySelectorAll(".lineage-edge")]
-          .filter((edge) =>
-            down ? edge.dataset.from === id : edge.dataset.to === id,
-          )
-          .map((edge) => (down ? edge.dataset.to : edge.dataset.from)),
-      );
-      candidates = nodes.filter((node) =>
-        ids.has(node.getAttribute("data-run-id")),
-      );
-      if (!candidates.length) {
-        const nextGeneration = generation + (down ? 1 : -1);
-        candidates = nodes.filter(
-          (node) => Number(node.dataset.generation) === nextGeneration,
-        );
-      }
-      // At a lane boundary, continue in the adjacent lane. Tab also reaches
-      // every run; within a lane the original generation/sibling rules apply.
-      if (!candidates.length) {
-        const graphs = [...scroll.querySelectorAll(".lineage-graph")];
-        const adjacent = graphs[graphs.indexOf(graph) + (down ? 1 : -1)];
-        if (adjacent) {
-          const nextNodes = [...adjacent.querySelectorAll(".lineage-node")];
-          const generations = nextNodes.map((node) => Number(node.dataset.generation));
-          const boundary = down ? Math.min(...generations) : Math.max(...generations);
-          candidates = nextNodes.filter((node) => Number(node.dataset.generation) === boundary);
-        }
-      }
-    }
-    if (!candidates.length) return true;
-    const x = axis(glyph, "x");
-    const y = axis(glyph, "y");
-    candidates.sort(
-      (a, b) =>
-        Math.abs(axis(a, "x") - x) - Math.abs(axis(b, "x") - x) ||
-        Math.abs(axis(a, "y") - y) - Math.abs(axis(b, "y") - y) ||
-        Number(a.dataset.sibling) - Number(b.dataset.sibling) ||
-        String(a.dataset.runId).localeCompare(String(b.dataset.runId)),
-    );
-    candidates[0].focus();
-    return true;
-  }
-  function bindLineageCard(card) {
-    if (card.dataset.lineageBound === "1") return;
-    card.dataset.lineageBound = "1";
-    for (const type of ["mouseover", "mouseout"])
-      card.addEventListener(type, (event) => {
-        const source = event.target.closest?.(".run-row, .lineage-node");
-        if (!source?.isConnected || source.contains(event.relatedTarget)) return;
-        for (const peer of card.querySelectorAll(
-          `[data-run-id="${cssEscape(source.dataset.runId)}"]`,
-        ))
-          peer.classList.toggle("is-linked", type === "mouseover");
-      });
-    card.addEventListener("click", (event) => {
-      if (event.detail > 1) return;
-      const node = lineageNodeFrom(card, event);
-      if (!node) return;
-      toggleLineage(card, node);
-    });
-    card.addEventListener("dblclick", (event) => {
-      const node = lineageNodeFrom(card, event);
-      if (!node) return;
-      event.preventDefault();
-      location.hash = routeRun(node.run_id);
-    });
-    card.addEventListener("keydown", (event) => {
-      if (moveLineageFocus(card, event)) return;
-      if (event.key !== "Enter" && event.key !== " ") return;
-      const node = lineageNodeFrom(card, event);
-      if (!node) return;
-      event.preventDefault();
-      if (event.key === "Enter") location.hash = routeRun(node.run_id);
-      else toggleLineage(card, node);
-    });
-  }
-  function restoreLineageHover(card) {
-    const source = card.querySelector(".run-row:hover, .lineage-node:hover");
-    if (!source) return;
-    for (const peer of card.querySelectorAll(
-      `[data-run-id="${cssEscape(source.dataset.runId)}"]`,
-    ))
-      peer.classList.add("is-linked");
-  }
-  function paintLineage(card, data) {
-    const scroll = card.querySelector(".lineage-scroll");
-    if (!scroll) return;
-    if (!data || !Array.isArray(data.nodes) || !Array.isArray(data.edges)) {
-      showError(scroll, new Error("Invalid lineage response"));
-      return;
-    }
-    const active = document.activeElement;
-    const focusedNode = active?.closest?.(".lineage-node");
-    const typing =
-      active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA");
-    const inThisGraph = Boolean(focusedNode && scroll.contains(focusedNode));
-    const projectKey = card.dataset.project ?? "";
-    const blurredHere =
-      !typing &&
-      !inThisGraph &&
-      pendingFocus.runId &&
-      pendingFocus.project === projectKey &&
-      (!active ||
-        active === document.body ||
-        active === document.documentElement);
-    const restoreId = inThisGraph
-      ? focusedNode.getAttribute("data-run-id") || ""
-      : blurredHere
-        ? pendingFocus.runId
-        : "";
-    const top = scroll.scrollTop;
-    const left = scroll.scrollLeft;
-    const laneScrolls = new Map([...scroll.querySelectorAll(".lineage-lane")].map(
-      (lane) => [lane.dataset.task, lane.querySelector(".lineage-lane-scroll").scrollLeft],
-    ));
-    if (!data.nodes.length) {
-      scroll.replaceChildren(
-        el("p", { class: "muted", text: "No runs to graph." }),
-      );
-      return;
-    }
-    const query = search.value.trim().toLowerCase();
-    const siblings = runs.filter((run) => (run.project || "") === projectKey);
-    const matching = new Set(
-      siblings
-        .filter((run) => runMatches(run, query))
-        .map((run) => run.run_id),
-    );
-    scroll.replaceChildren(
-      ...renderLineageLanes(data, {
-        filtering: Boolean(query),
-        matching,
-        selected,
-      }),
-    );
-    for (const lane of scroll.querySelectorAll(".lineage-lane"))
-      lane.querySelector(".lineage-lane-scroll").scrollLeft = laneScrolls.get(lane.dataset.task) || 0;
-    scroll.scrollTop = top;
-    scroll.scrollLeft = left;
-    restoreLineageHover(card);
-    if (restoreId && !typing) {
-      const live = scroll.querySelector(
-        `.lineage-node[data-run-id="${cssEscape(restoreId)}"]`,
-      );
-      if (live) {
-        try {
-          live.focus({ preventScroll: true });
-        } catch {
-          live.focus();
-        }
-        scroll.scrollTop = top;
-        scroll.scrollLeft = left;
-      }
-    }
-    updateSelection();
-    const focusId = card.dataset.focus;
-    if (!focusId) return;
-    const node = data.nodes.find((item) => item.run_id === focusId);
-    if (!node) return;
-    const payload = lineageDetailPayload(node);
-    // Wanted is whatever the most recent paint asked to show. A response
-    // may render only while it is still that payload.
-    if (payload !== card.dataset.detailWanted) {
-      const rendered =
-        payload === card.dataset.detailPayload &&
-        card.dataset.detailFor === focusId;
-      card.dataset.detailWanted = payload;
-      if (rendered) {
-        card.dataset.detailToken = String(++detailToken);
-        delete card.dataset.detailPending;
-      } else showLineageDetail(card, node);
-      return;
-    }
-    if (
-      card.dataset.detailFor !== focusId ||
-      (card.dataset.detailPayload !== payload && card.dataset.detailPending !== payload)
-    )
-      showLineageDetail(card, node);
-  }
-  function dimLineage(card, siblings, query) {
-    const matching = new Set(
-      siblings.filter((run) => runMatches(run, query)).map((run) => run.run_id),
-    );
-    const filtering = Boolean(query);
-    for (const node of card.querySelectorAll(".lineage-node"))
-      node.classList.toggle("is-dim", filtering && !matching.has(node.dataset.runId));
-    for (const edge of card.querySelectorAll(".lineage-edge")) {
-      const faded =
-        filtering &&
-        (!matching.has(edge.dataset.from) || !matching.has(edge.dataset.to));
-      edge.classList.toggle("is-dim", faded);
-    }
-  }
-  function ensureLineage(key, signature, card, running) {
-    const now = Date.now();
-    const scroll = card.querySelector(".lineage-scroll");
-    let entry = lineageCache.get(key);
-    const same = entry && entry.signature === signature;
-    const due =
-      Boolean(running) &&
-      same &&
-      !entry.pending &&
-      now - (entry.fetchedAt || 0) >= LINEAGE_REFRESH_MS;
-    if (same && !due && !entry.error) {
-      entry.card = card;
-      if (entry.data) paintLineage(card, entry.data);
-      else if (scroll && !scroll.querySelector(".lineage-graph, [role=status]"))
-        scroll.replaceChildren(loading("Loading lineage…"));
-      return;
-    }
-    const token = ++lineageToken;
-    const kept = entry?.data || null;
-    entry = {
-      signature,
-      token,
-      data: kept,
-      error: null,
-      pending: true,
-      card,
-      fetchedAt: now,
-    };
-    lineageCache.set(key, entry);
-    if (scroll && !scroll.querySelector(".lineage-graph")) {
-      if (kept) paintLineage(card, kept);
-      else if (!scroll.querySelector("[role=status]"))
-        scroll.replaceChildren(loading("Loading lineage…"));
-    }
-    get(`/api/lineage?${new URLSearchParams({ project: key })}`)
-      .then((data) => {
-        if (epoch !== version) return;
-        const current = lineageCache.get(key);
-        if (!current || current.token !== token) return;
-        current.data = data;
-        current.pending = false;
-        current.error = null;
-        clearLineageRetry(key);
-        const target = current.card;
-        if (target?.isConnected && target.dataset.signature === signature) {
-          paintLineage(target, data);
-          annotateRows(target, data);
-        }
-      })
-      .catch((error) => {
-        if (epoch !== version || error.name === "AbortError") return;
-        const current = lineageCache.get(key);
-        if (!current || current.token !== token) return;
-        current.pending = false;
-        current.error = error;
-        current.signature = null;
-        const target = current.card;
-        if (target?.dataset.signature === signature) {
-          delete target.dataset.signature;
-          if (target.isConnected && !current.data)
-            showError(target.querySelector(".lineage-scroll"), error);
-        }
-        if (target?.isConnected && runs.some((run) => (run.project || "") === key))
-          scheduleLineageRetry(key);
-        else clearLineageRetry(key);
-      });
+    return { card, matched: groups.length > 0 };
   }
   function draw() {
-    const active = document.activeElement;
-    const focusedNode = active?.closest?.(".lineage-node");
-    pendingFocus =
-      focusedNode && content.contains(focusedNode)
-        ? {
-            runId: focusedNode.getAttribute("data-run-id") || "",
-            project:
-              focusedNode.closest("[data-project]")?.dataset.project ?? "",
-          }
-        : { runId: "", project: "" };
+    const focused = focusKey();
     const groups = new Map();
     for (const run of runs) {
       const key = run.project || "";
@@ -1504,17 +1574,9 @@ async function home(version) {
       !a ? -1 : !b ? 1 : a.localeCompare(b),
     );
     if (project !== null && !groups.has(project)) project = null;
-    for (const key of [...lineageCache.keys()]) {
-      if (!groups.has(key)) {
-        clearLineageRetry(key);
-        lineageCache.delete(key);
-      }
-    }
-    const shownProjects = new Set(
-      projects.filter((key) => project === null || key === project),
-    );
-    for (const key of [...lineageRetry.keys()])
-      if (!shownProjects.has(key)) clearLineageRetry(key);
+    const shown = projects.filter((key) => project === null || key === project);
+    for (const key of [...lineage.keys()])
+      if (!shown.includes(key)) dropLineage(key);
     for (const tab of tabs.querySelectorAll("button")) tab.remove();
     tabs.prepend(
       ...[null, ...projects].map((key) => {
@@ -1538,217 +1600,26 @@ async function home(version) {
         return tab;
       }),
     );
-    const finished = runs
-      .map((run) => Date.parse(run.finished_at))
-      .filter(Number.isFinite);
+    const taskCount = new Set(
+      runs.filter((run) => taskName(run)).map(groupKey),
+    ).size;
+    const running = runs.filter((run) => run.status === "running").length;
     count.textContent = [
       `${runs.length} run${runs.length === 1 ? "" : "s"}`,
       `${projects.length} project${projects.length === 1 ? "" : "s"}`,
-      finished.length
-        ? `last finished ${new Date(Math.max(...finished)).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })}`
-        : null,
+      `${taskCount} task${taskCount === 1 ? "" : "s"}`,
+      running ? `${running} running` : null,
     ]
       .filter(Boolean)
       .join(" · ");
-    updateSelection();
     const query = search.value.trim().toLowerCase();
-    notebook.update({ project, query: filterWords(query) });
     const cards = [];
-    for (const key of projects) {
-      if (project !== null && key !== project) continue;
-      const siblings = groups
-        .get(key)
-        .sort(
-          (a, b) =>
-            (Number.isFinite(Date.parse(b.created_at))
-              ? Date.parse(b.created_at)
-              : -Infinity) -
-            (Number.isFinite(Date.parse(a.created_at))
-              ? Date.parse(a.created_at)
-              : -Infinity),
-        );
-      const signature = lineageSignature(siblings);
-      const running = siblings.some((run) => run.status === "running");
-      let card = [...content.children].find(
-        (node) =>
-          node.classList.contains("project-card") && node.dataset.project === key,
-      );
-      const unchanged = card && card.dataset.signature === signature;
-      if (!card) {
-        const scroll = el(
-          "div",
-          { class: "lineage-scroll" },
-          loading("Loading lineage…"),
-        );
-        const detail = el(
-          "div",
-          { class: "lineage-detail" },
-          el("p", {
-            class: "muted",
-            text: "Pick a run to see its parent, commit and changed files.",
-          }),
-        );
-        card = el(
-          "section",
-          { class: "card project-card", "data-project": key },
-          projectHead(key),
-          el(
-            "div",
-            { class: "project-body" },
-            el("div", { class: "runs-pane" }),
-            el(
-              "div",
-              { class: "lineage-body" },
-              el("div", { class: "lineage-head" }, eyebrow("Lineage")),
-              scroll,
-              detail,
-            ),
-          ),
-        );
-        bindLineageCard(card);
-      }
-      card.dataset.signature = signature;
-      // Keep the graph DOM, scroller, focus and detail strip on ordinary polls.
-      // Only changed signatures or the running-project refresh fetch/repaint it.
-      if (unchanged) {
-        dimLineage(card, siblings, query);
-        const entry = lineageCache.get(key);
-        if (
-          running &&
-          entry &&
-          !entry.pending &&
-          Date.now() - (entry.fetchedAt || 0) >= LINEAGE_REFRESH_MS
-        )
-          ensureLineage(key, signature, card, true);
-      } else ensureLineage(key, signature, card, running);
-      const visible = siblings.filter((run) => runMatches(run, query));
-      const keys = variedKeys(siblings);
-      const headlineKey = siblings.map(headline).find(Boolean) || "Metric";
-      card.dataset.headline = headlineKey;
-      projectMeta(card, siblings);
-      const metricText =
-        headlineKey === "Metric" ? "—" : metricLabel(headlineKey);
-      const metric = card.querySelector(".project-metric");
-      if (metric.dataset.value !== metricText) {
-        metric.dataset.value = metricText;
-        metric.replaceChildren(
-          "primary metric · ",
-          el("span", { class: "project-metric-name", text: metricText }),
-        );
-      }
-      const columns = el(
-        "div",
-        { class: "run-grid run-columns" },
-        el("span"),
-        el("span", { text: "Run · changed vs parent" }),
-        el("span", { class: "run-status", text: "Status" }),
-        el("span", { class: "run-progress", text: "Last step" }),
-        el("span", {
-          class: "run-number run-metric",
-          text: headlineKey === "Metric" ? headlineKey : metricLabel(headlineKey),
-          title: headlineKey,
-        }),
-        el("span", { class: "run-number run-delta", text: "Δ vs parent" }),
-        el("span", { class: "run-number run-duration", text: "Wall time" }),
-        el("span", { class: "run-chevron" }),
-      );
-      const rows = visible.map((run) => {
-        const pick = () => {
-          selected.has(run.run_id)
-            ? selected.delete(run.run_id)
-            : selected.add(run.run_id);
-          updateSelection();
-        };
-        const check = el("input", {
-          type: "checkbox",
-          role: "checkbox",
-          class: "check",
-          checked: selected.has(run.run_id),
-          "aria-label": `Select ${run.name || run.run_id}`,
-          onclick: (event) => event.stopPropagation(),
-          onchange: pick,
-          onkeydown: (event) => event.stopPropagation(),
-        });
-        const metricKey = headlineKey;
-        const facts = parentFacts(run, metricKey, lineageCache.get(key)?.data, keys);
-        const name = el("a", {
-          class: "run-name",
-          href: routeRun(run.run_id),
-          text: run.name || run.run_id,
-          title: run.name || run.run_id,
-          onclick: (event) => event.stopPropagation(),
-        });
-        return el(
-          "div",
-          {
-            class: "run-grid run-row",
-            "data-run-id": run.run_id,
-            "data-picked": selected.has(run.run_id),
-            role: "button",
-            tabIndex: 0,
-            onclick: () => {
-              location.hash = routeRun(run.run_id);
-            },
-            onkeydown: (event) => {
-              if (event.key === "Enter") location.hash = routeRun(run.run_id);
-            },
-          },
-          check,
-          el(
-            "div",
-            { class: "run-identity" },
-            el(
-              "div",
-              { class: "inline" },
-              name,
-              el("span", { class: "run-id", text: shortRunId(run.run_id) }),
-            ),
-            el("div", {
-              class: "run-varied",
-              text: facts.changed,
-              title: facts.changed,
-            }),
-          ),
-          el("div", { class: "run-status" }, statusChip(run.status, run)),
-          el("span", {
-            class: "muted run-progress",
-            text:
-              run.last_step == null
-                ? "—"
-                : run.last_step >= 1000
-                  ? `${(run.last_step / 1000).toFixed(run.last_step % 1000 && run.last_step < 10000 ? 1 : 0)}k`
-                  : String(run.last_step),
-          }),
-          el("span", {
-            class: "run-number run-metric",
-            title: metricKey || "",
-            text: fmt(run.summary?.[metricKey]),
-          }),
-          el("span", {
-            class: `run-number run-delta ${facts.tone}`,
-            text: facts.delta,
-          }),
-          el("span", { class: "run-number run-duration", text: duration(run) }),
-          el("span", { class: "run-chevron", "aria-hidden": "true", text: "›" }),
-        );
-      });
-      for (const peer of card.querySelectorAll(".is-linked"))
-        peer.classList.remove("is-linked");
-      card.querySelector(".runs-pane").replaceChildren(
-        ...(visible.length
-          ? [columns, ...rows]
-          : [
-              el("p", {
-                class: "runs-empty muted",
-                text: "No runs match this filter.",
-              }),
-            ]),
-      );
-      restoreLineageHover(card);
-      cards.push(card);
+    for (const key of shown) {
+      const siblings = groups.get(key).sort(newestFirst);
+      ensureLineage(key, siblings);
+      const { card, matched } = projectCard(key, siblings, query);
+      if (matched || !query) cards.push(card);
     }
-    if (cards.length && !cards.some((card) => card.querySelector(".run-row")))
-      cards.unshift(el("p", { class: "empty", text: "No runs match this filter." }));
     if (!cards.length) {
       content.replaceChildren(
         el("p", {
@@ -1772,10 +1643,11 @@ async function home(version) {
       }
     }
     updateSelection();
+    restoreFocus(focused);
+    lineageView?.render();
   }
   search.oninput = draw;
   async function refresh() {
-    notebook.refresh();
     try {
       const result = await get("/api/runs");
       if (epoch !== version) return;
@@ -1798,8 +1670,8 @@ async function home(version) {
   }
   cleanup = () => {
     clearTimeout(timer);
-    for (const key of [...lineageRetry.keys()]) clearLineageRetry(key);
-    notebook.destroy();
+    lineageView?.close(false);
+    for (const key of [...lineage.keys()]) dropLineage(key);
   };
   await refresh();
 }
@@ -1887,14 +1759,11 @@ function axisMapper(axis, runMetrics, records) {
   }
   return (step) => step;
 }
-function metricsPanel(initialRuns, compare, signal, { onMetrics } = {}) {
+function metricsPanel(initialRuns, compare, signal, { onMetrics, workspace: place = {} } = {}) {
   const node = el("div", { class: "metrics-panel stack" });
   let runs = initialRuns,
     metrics = Object.create(null),
     charts = new Map(),
-    expanded = null,
-    focusChart = null,
-    hover = null,
     disposed = false;
   // A single run plots in --s1. In a comparison the first run is the
   // reference (dashed --s5); the others take --s1…--s4 in order.
@@ -2017,92 +1886,571 @@ function metricsPanel(initialRuns, compare, signal, { onMetrics } = {}) {
     ghostRaw: !compare,
     dashed: reference ? [reference] : [],
   });
-  let overlay = null,
-    focusTable;
-  const smoothCache = new Map();
   const metricCache = new Map();
-  function smoothed(run, key) {
-    const raw = metrics[run.run_id]?.[key] || [];
-    const cached = smoothCache.get(run.run_id);
-    if (cached?.raw === raw && cached.weight === slider.value)
-      return cached.values;
-    const values = emaSmooth(
-      raw.map((point) => point.value),
-      Number(slider.value),
-    );
-    smoothCache.set(run.run_id, { raw, weight: slider.value, values });
-    return values;
-  }
-  function renderTable() {
-    if (!expanded || !focusTable) return;
-    focusTable.replaceChildren(
-      table(
-        [
-          "Run",
-          "Smoothed",
-          "Value",
-          hover == null ? "Step · latest" : "Step · hover",
-        ],
-        runs.flatMap((run) => {
-          const raw = view()[run.run_id]?.[expanded] || [];
-          if (!raw.length) return [];
-          let i = raw.length - 1;
-          if (hover != null) {
-            i = 0;
-            raw.forEach((point, index) => {
-              if (Math.abs(point.step - hover) < Math.abs(raw[i].step - hover))
-                i = index;
-            });
-          }
-          return [
-            tableRow([
-              el(
-                "span",
-                { class: "inline mono run-label" },
-                dot(colors[run.run_id]),
-                run.name || run.run_id,
-              ),
-              fmt(smoothed(run, expanded)[i]),
-              fmt(raw[i].value),
-              fmt(raw[i].at ?? raw[i].step),
-            ]),
-          ];
-        }),
-      ),
-    );
-  }
-  function open(key) {
-    expanded = key;
-    overlay = focus(
-      key,
-      runs.length > 1 ? `${runs.length} runs` : runs[0]?.name,
-      "chart-focus",
-      () => {
-        focusChart?.destroy();
-        focusChart = null;
-        overlay = null;
-        expanded = null;
-        hover = null;
-      },
-    );
-    const canvas = el("canvas", { "aria-label": `Metric chart ${key}` });
-    focusTable = el("div", { class: "card", "data-testid": "hover-table" });
-    overlay.body.append(
-      el(
-        "div",
-        { class: "focus-content stack" },
-        el("div", { class: "full-chart" }, canvas),
-        focusTable,
-      ),
-    );
-    focusChart = new MetricChart(canvas, {
-      ...options(key),
-      onHover: (step) => {
-        hover = step;
-        renderTable();
+  // Metrics workspace: every scalar chart in one full-window view, with the
+  // other runs of the task to overlay. Smoothing and outlier scaling are this
+  // panel's own controls, so both views always agree.
+  let workspace = null;
+  function openWorkspace(focusKey = null) {
+    workspace?.close(false);
+    const trigger = document.activeElement;
+    const primary = runs[0]?.run_id;
+    const parentId = place.parent?.() || null;
+    const state = {
+      filter: "",
+      columns: 2,
+      axis: "step",
+      sort: "default",
+      runFilter: "",
+      collapsed: new Set(),
+      wide: new Set(focusKey ? [focusKey] : []),
+      log: new Set(),
+    };
+    let candidates = runs.slice(),
+      version = 0,
+      closed = false,
+      wsCharts = [];
+    const checked = new Set(runs.map((run) => run.run_id));
+    const loaded = new Map();
+    const times = new Map();
+    const smoothedCache = new Map();
+    // This run --s1, its parent --s2, the rest --s3… in list order; a
+    // comparison keeps the panel's reference colours.
+    const colorOf = (run) => {
+      if (compare) return colors[run.run_id] || colorForId(run.run_id);
+      const index = candidates.findIndex((other) => other.run_id === run.run_id);
+      return `var(--s${(Math.max(index, 0) % 5) + 1})`;
+    };
+    const hasScalars = (run) =>
+      run.last_step != null || (run.keys || []).length > 0 || Boolean(metrics[run.run_id]);
+    const shown = () =>
+      candidates.filter((run) => checked.has(run.run_id) && loaded.has(run.run_id));
+    const relative = (run) =>
+      axisMapper("wall time", loaded.get(run.run_id), times.get(run.run_id));
+    const started = (run) => Date.parse(run.created_at) / 1000;
+    const usable = (axis) =>
+      axis === "step" ||
+      shown().some((run) => relative(run) && (axis === "relative" || Number.isFinite(started(run))));
+    // Seconds as "42 s", "3m 5s", "1.2 h"; wall clock as local time.
+    const seconds = (value) =>
+      !isNumber(value)
+        ? "—"
+        : value < 60
+          ? `${formatNumber(Math.round(value * 10) / 10)} s`
+          : value < 3600
+            ? `${Math.floor(value / 60)}m ${Math.floor(value % 60)}s`
+            : `${formatNumber(value / 3600)} h`;
+    const clock = (value) => new Date(value * 1000).toLocaleTimeString();
+    let viewCache = null;
+    function view() {
+      if (viewCache?.version === version && viewCache.axis === state.axis) return viewCache.view;
+      const mapped = Object.create(null);
+      for (const run of shown()) {
+        const data = loaded.get(run.run_id) || {};
+        const rel = relative(run);
+        const map =
+          state.axis === "step"
+            ? null
+            : state.axis === "relative"
+              ? rel
+              : rel && Number.isFinite(started(run))
+                ? (step) => started(run) + rel(step)
+                : null;
+        mapped[run.run_id] = Object.create(null);
+        if (state.axis !== "step" && !map) continue;
+        for (const [key, points] of Object.entries(data))
+          mapped[run.run_id][key] = map
+            ? points.map((point) => ({ step: map(point.step), value: point.value, at: point.step }))
+            : points;
+      }
+      viewCache = { version, axis: state.axis, view: mapped };
+      return mapped;
+    }
+    function smoothedValues(run, key) {
+      const raw = loaded.get(run.run_id)?.[key] || [];
+      const id = `${run.run_id}\u0000${key}`;
+      const cached = smoothedCache.get(id);
+      if (cached?.raw === raw && cached.weight === slider.value) return cached.values;
+      const values = emaSmooth(raw.map((point) => point.value), Number(slider.value));
+      smoothedCache.set(id, { raw, weight: slider.value, values });
+      return values;
+    }
+    // Epoch boundaries: where the first shown run's epoch series steps up.
+    function epochLines() {
+      const run = shown()[0];
+      if (!run) return [];
+      const data = loaded.get(run.run_id) || {};
+      const key = Object.keys(data).find((name) => EPOCH_KEY.test(name));
+      const points = view()[run.run_id]?.[key] || [];
+      const lines = [];
+      for (let i = 1; i < points.length; i++)
+        if (points[i].value !== points[i - 1].value) lines.push(points[i].step);
+      return lines;
+    }
+    const chartOptions = (key) => ({
+      runs: shown().map((run) => ({ ...run, id: run.run_id })),
+      metrics: view(),
+      activeMetric: key,
+      smoothing: Number(slider.value),
+      ignoreOutliers: outliers.checked,
+      colors: Object.fromEntries(shown().map((run) => [run.run_id, colorOf(run)])),
+      xLabel: state.axis === "step" ? "step" : state.axis === "relative" ? "relative time" : "wall time",
+      xFormat: state.axis === "relative" ? seconds : state.axis === "wall" ? clock : null,
+      rawAlpha: 0.3,
+      log: state.log.has(key),
+      epochs: epochLines(),
+      snap: true,
+      dashed: compare && reference ? [reference] : [],
+    });
+    const filterField = el("input", {
+      type: "search",
+      class: "field ws-filter",
+      placeholder: "Filter tags — e.g. loss, val/",
+      "aria-label": "Filter tags",
+      oninput: () => {
+        state.filter = filterField.value;
+        drawMain();
       },
     });
-    renderTable();
+    const columnButtons = [1, 2, 3].map((n) =>
+      button(String(n), () => {
+        state.columns = n;
+        drawMain();
+      }, "ghost", { "aria-label": `${n} column${n === 1 ? "" : "s"}`, title: `${n} column${n === 1 ? "" : "s"}` }),
+    );
+    const summary = el("span", { class: "ws-meta" });
+    const smoothValueWs = el("span", { class: "mono", text: Number(slider.value).toFixed(2) });
+    const smoothing = el("input", {
+      type: "range",
+      min: 0,
+      max: 0.99,
+      step: 0.01,
+      value: slider.value,
+      "aria-label": "Smoothing",
+      oninput: () => {
+        slider.value = smoothing.value;
+        smoothValueWs.textContent = Number(smoothing.value).toFixed(2);
+        slider.oninput();
+      },
+    });
+    const outliersWs = el("input", {
+      type: "checkbox",
+      checked: outliers.checked,
+      onchange: () => {
+        outliers.checked = outliersWs.checked;
+        outliers.onchange();
+      },
+    });
+    const axisButtons = [["step", "Step"], ["relative", "Relative"], ["wall", "Wall"]].map(([axis, label]) =>
+      button(label, () => {
+        state.axis = axis;
+        drawMain();
+      }, "ghost", { "data-axis": axis }),
+    );
+    const sortSelect = el(
+      "select",
+      { class: "field", onchange: () => (state.sort = sortSelect.value) },
+      el("option", { value: "default", text: "default (run order)" }),
+      el("option", { value: "descending", text: "descending value" }),
+      el("option", { value: "nearest", text: "nearest to cursor" }),
+    );
+    const runFilter = el("input", {
+      type: "search",
+      class: "field",
+      placeholder: "Filter runs (regex)",
+      "aria-label": "Filter runs",
+      oninput: () => {
+        state.runFilter = runFilter.value;
+        drawRuns();
+      },
+    });
+    const runList = el("div", { class: "ws-runs" });
+    const main = el("div", { class: "ws-main" });
+    const crumbs = place.crumbs?.() || (compare ? ["compare"] : [runs[0]?.name || primary || "run"]);
+    const host = el(
+      "section",
+      {
+        class: "ws",
+        role: "dialog",
+        "aria-modal": "true",
+        "aria-label": `Metrics workspace for ${crumbs.at(-1)}`,
+      },
+      el(
+        "header",
+        { class: "ws-head" },
+        el("span", { class: "ws-crumbs", text: `agenticml / ${crumbs.join(" / ")} /`, title: crumbs.join(" / ") }),
+        el("h2", { class: "ws-title", text: "Metrics" }),
+        summary,
+        el(
+          "div",
+          { class: "ws-controls" },
+          filterField,
+          el("div", { class: "ws-segment", role: "group", "aria-label": "Columns" },
+            el("span", { class: "ws-segment-label", text: "Columns" }), ...columnButtons),
+          button("Close ✕", () => close(), "ghost", { "aria-label": "Close metrics workspace" }),
+        ),
+      ),
+      el(
+        "div",
+        { class: "ws-body" },
+        el(
+          "aside",
+          { class: "ws-side", "aria-label": "Metrics settings" },
+          el(
+            "div",
+            { class: "ws-side-group" },
+            eyebrow("Settings"),
+            el("label", { class: "ws-field" },
+              el("span", { class: "ws-field-row" }, "Smoothing", smoothValueWs), smoothing),
+            el("label", { class: "ws-check" }, outliersWs, "Ignore outliers in chart scaling"),
+            el("div", { class: "ws-field" },
+              el("span", { text: "Horizontal axis" }),
+              el("div", { class: "ws-segment", role: "group", "aria-label": "Horizontal axis" }, ...axisButtons)),
+            el("label", { class: "ws-field" }, "Tooltip sorting", sortSelect),
+          ),
+          el(
+            "div",
+            { class: "ws-side-group" },
+            el("div", { class: "inline" }, eyebrow("Runs"),
+              el("span", { class: "ws-runs-scope", text: compare ? "this comparison" : place.scope?.() || "" })),
+            runFilter,
+            runList,
+          ),
+        ),
+        main,
+      ),
+    );
+    function drawRuns() {
+      let pattern = null;
+      try {
+        pattern = new RegExp(state.runFilter, "i");
+      } catch {}
+      const matches = (run) => {
+        const name = run.name || run.run_id;
+        return !state.runFilter || (pattern
+          ? pattern.test(name)
+          : name.toLowerCase().includes(state.runFilter.toLowerCase()));
+      };
+      const listed = candidates.filter(matches);
+      runList.replaceChildren(
+        ...(listed.length
+          ? listed.map((run) => {
+              const name = run.name || run.run_id;
+              const has = hasScalars(run);
+              const role = run.run_id === primary && !compare
+                ? "this run"
+                : run.run_id === parentId
+                  ? "parent"
+                  : `run ${shortRunId(run.run_id)}`;
+              return el(
+                "label",
+                { class: `ws-run${has ? "" : " is-disabled"}`, "data-run-id": run.run_id },
+                el("input", {
+                  type: "checkbox",
+                  checked: has && checked.has(run.run_id),
+                  disabled: !has,
+                  "aria-label": `Show ${name}`,
+                  onchange: (event) => toggleRun(run, event.target.checked),
+                }),
+                el("span", { class: "ws-swatch", style: `background:${colorOf(run)}`, "aria-hidden": "true" }),
+                el(
+                  "span",
+                  { class: "ws-run-text" },
+                  el("span", { class: "ws-run-name", text: name, title: name }),
+                  el("span", {
+                    class: "ws-run-meta",
+                    text: has ? `${role} · ${stepText(run.last_step)} steps` : `${role} · no scalars`,
+                  }),
+                ),
+              );
+            })
+          : [el("p", { class: "muted", text: "No runs match." })]),
+      );
+    }
+    async function toggleRun(run, on) {
+      if (on) checked.add(run.run_id);
+      else checked.delete(run.run_id);
+      if (on) await load([run]);
+      if (closed) return;
+      version++;
+      drawMain();
+    }
+    // The panel's own runs reuse its series; other runs load on first tick.
+    async function load(list) {
+      await Promise.all(list.map(async (run) => {
+        if (metrics[run.run_id]) {
+          loaded.set(run.run_id, metrics[run.run_id]);
+          times.set(run.run_id, timeIndex.get(run.run_id));
+          return;
+        }
+        if (loaded.has(run.run_id)) return;
+        try {
+          const [result, time] = await Promise.all([
+            loadMetrics(run, signal),
+            get(`${apiRun(run.run_id)}/time`, signal).catch(() => []),
+          ]);
+          loaded.set(run.run_id, result.metrics);
+          times.set(run.run_id, Array.isArray(time) ? time : []);
+        } catch (error) {
+          if (error.name !== "AbortError") checked.delete(run.run_id);
+        }
+      }));
+    }
+    function tagMatcher() {
+      const text = state.filter.trim();
+      if (!text) return () => true;
+      try {
+        const pattern = new RegExp(text, "i");
+        return (key) => pattern.test(key);
+      } catch {
+        return (key) => key.toLowerCase().includes(text.toLowerCase());
+      }
+    }
+    function showTip(card, key, x, info) {
+      const tip = card.querySelector(".ws-tip");
+      if (x == null) {
+        tip.hidden = true;
+        return;
+      }
+      const rows = shown().flatMap((run, order) => {
+        const points = view()[run.run_id]?.[key] || [];
+        if (!points.length) return [];
+        let i = 0;
+        points.forEach((point, index) => {
+          if (Math.abs(point.step - x) < Math.abs(points[i].step - x)) i = index;
+        });
+        const step = points[i].at ?? points[i].step;
+        return [{
+          run,
+          order,
+          smoothed: smoothedValues(run, key)[i],
+          value: points[i].value,
+          step,
+          relative: relative(run)?.(step),
+        }];
+      });
+      const rank = (row) => (isNumber(row.smoothed) ? row.smoothed : -Infinity);
+      if (state.sort === "descending") rows.sort((a, b) => rank(b) - rank(a) || a.order - b.order);
+      if (state.sort === "nearest")
+        rows.sort((a, b) =>
+          Math.abs((isNumber(a.smoothed) ? a.smoothed : Infinity) - info.value) -
+            Math.abs((isNumber(b.smoothed) ? b.smoothed : Infinity) - info.value) || a.order - b.order);
+      tip.replaceChildren(
+        el("span"), el("span", { text: "Run" }), el("span", { text: "Smoothed" }),
+        el("span", { text: "Value" }), el("span", { text: "Step" }), el("span", { text: "Relative" }),
+        ...rows.flatMap((row) => [
+          el("span", { class: "ws-swatch", style: `background:${colorOf(row.run)}` }),
+          el("span", { class: "ws-tip-name", text: row.run.name || row.run.run_id }),
+          el("span", { class: "ws-tip-strong", text: fmt(row.smoothed) }),
+          el("span", { text: fmt(row.value) }),
+          el("span", { text: fmt(row.step) }),
+          el("span", { text: seconds(row.relative) }),
+        ]),
+      );
+      tip.hidden = false;
+      const box = card.querySelector(".ws-chart").getBoundingClientRect();
+      const width = tip.offsetWidth,
+        height = tip.offsetHeight;
+      let left = info.clientX - box.left + 14;
+      if (left + width > box.width) left = Math.max(0, info.clientX - box.left - width - 14);
+      const top = Math.min(Math.max(0, info.clientY - box.top + 14), Math.max(0, box.height - height));
+      tip.style.left = `${left}px`;
+      tip.style.top = `${top}px`;
+    }
+    function download(key) {
+      const quote = (value) => `"${String(value ?? "").replace(/"/g, '""')}"`;
+      const lines = [["run", "run_id", "step", "value", "smoothed"].join(",")];
+      for (const run of shown()) {
+        const raw = loaded.get(run.run_id)?.[key] || [];
+        const smooth = smoothedValues(run, key);
+        raw.forEach((point, i) =>
+          lines.push([quote(run.name || run.run_id), quote(run.run_id), point.step, point.value ?? "", smooth[i] ?? ""].join(",")));
+      }
+      const url = URL.createObjectURL(new Blob([`${lines.join("\n")}\n`], { type: "text/csv" }));
+      const link = el("a", { href: url, download: `${key.replace(/[^\w.-]+/g, "_")}.csv` });
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    }
+    function drawMain() {
+      for (const chart of wsCharts) chart.destroy();
+      wsCharts = [];
+      if (!usable(state.axis)) state.axis = "step";
+      for (const node of axisButtons) {
+        node.setAttribute("aria-pressed", String(node.dataset.axis === state.axis));
+        node.disabled = !usable(node.dataset.axis);
+        node.title = node.disabled ? "Needs at least two scalar flush times" : node.textContent;
+      }
+      columnButtons.forEach((node, index) =>
+        node.setAttribute("aria-pressed", String(index + 1 === state.columns)));
+      const visible = shown();
+      const keys = [...new Set(visible.flatMap((run) => Object.keys(loaded.get(run.run_id) || {})))].sort();
+      const tags = keys.filter(tagMatcher());
+      summary.textContent = `${visible.length} run${visible.length === 1 ? "" : "s"} · ${tags.length} / ${keys.length} tags`;
+      const groups = new Map();
+      for (const key of tags) {
+        const group = key.includes("/") ? key.slice(0, key.indexOf("/")) : "metrics";
+        if (!groups.has(group)) groups.set(group, []);
+        groups.get(group).push(key);
+      }
+      const pending = [];
+      const sections = [...groups.entries()]
+        .sort(([a], [b]) => (a === "_system" ? 1 : b === "_system" ? -1 : a.localeCompare(b)))
+        .map(([group, groupKeys]) => {
+          const open = !state.collapsed.has(group);
+          const label = group === "metrics" ? group : `${group}/`;
+          return el(
+            "section",
+            { class: "ws-group", "data-group": group },
+            el(
+              "button",
+              {
+                type: "button",
+                class: "ws-group-toggle",
+                "aria-expanded": String(open),
+                onclick: () => {
+                  open ? state.collapsed.add(group) : state.collapsed.delete(group);
+                  drawMain();
+                },
+              },
+              el("span", { class: "task-caret", "aria-hidden": "true", text: open ? "▾" : "▸" }),
+              el("span", { class: "ws-group-name", text: label }),
+              el("span", { class: "ws-group-count", text: `${groupKeys.length} tag${groupKeys.length === 1 ? "" : "s"}` }),
+            ),
+            open
+              ? el(
+                  "div",
+                  { class: "ws-grid", style: `grid-template-columns:repeat(${state.columns}, minmax(0, 1fr))` },
+                  ...groupKeys.map((key) => {
+                    const wide = state.wide.has(key);
+                    const canvas = el("canvas", { "aria-label": `Metric chart ${key}` });
+                    const card = el(
+                      "div",
+                      { class: `card ws-card${wide ? " is-wide" : ""}`, "data-key": key },
+                      el(
+                        "header",
+                        { class: "ws-card-head" },
+                        el("span", { class: "ws-card-key", text: key, title: key }),
+                        metricDirection(key) ? el("span", { class: "chart-dir", text: metricDirection(key) }) : null,
+                        el(
+                          "div",
+                          { class: "ws-card-tools" },
+                          button(wide ? "⤡" : "⤢", () => {
+                            wide ? state.wide.delete(key) : state.wide.add(key);
+                            drawMain();
+                          }, "ghost", {
+                            "aria-label": `${wide ? "Shrink" : "Enlarge"} ${key}`,
+                            title: wide ? "Shrink" : "Enlarge",
+                            "data-focus": `ws-wide:${key}`,
+                          }),
+                          button("log", () => {
+                            state.log.has(key) ? state.log.delete(key) : state.log.add(key);
+                            drawMain();
+                          }, "ghost", {
+                            "aria-pressed": String(state.log.has(key)),
+                            "aria-label": `Log scale for ${key}`,
+                            title: "Log scale",
+                            "data-focus": `ws-log:${key}`,
+                          }),
+                          button("⭳", () => download(key), "ghost", {
+                            "aria-label": `Download ${key} as CSV`,
+                            title: "Download CSV",
+                          }),
+                        ),
+                      ),
+                      el("div", { class: "ws-chart" }, canvas, el("div", { class: "ws-tip", hidden: true })),
+                    );
+                    pending.push({ key, canvas, card });
+                    return card;
+                  }),
+                )
+              : null,
+          );
+        });
+      const active = document.activeElement?.dataset?.focus;
+      main.replaceChildren(
+        ...(sections.length
+          ? sections
+          : [el("p", {
+              class: "ws-empty",
+              text: !visible.length ? "No runs selected." : keys.length ? "No tags match the filter." : "No scalars logged yet.",
+            })]),
+      );
+      for (const { key, canvas, card } of pending)
+        wsCharts.push(new MetricChart(canvas, {
+          ...chartOptions(key),
+          onHover: (x, info) => showTip(card, key, x, info),
+        }));
+      if (active) [...main.querySelectorAll("[data-focus]")].find((node) => node.dataset.focus === active)?.focus();
+    }
+    function repaint() {
+      const options = { smoothing: Number(slider.value), ignoreOutliers: outliers.checked };
+      for (const chart of wsCharts) chart.update(options);
+      smoothing.value = slider.value;
+      smoothValueWs.textContent = Number(slider.value).toFixed(2);
+      outliersWs.checked = outliers.checked;
+    }
+    // Polls refresh the panel's runs in place.
+    function refresh() {
+      let changed = false;
+      for (const run of runs)
+        if (metrics[run.run_id] && loaded.get(run.run_id) !== metrics[run.run_id]) {
+          loaded.set(run.run_id, metrics[run.run_id]);
+          times.set(run.run_id, timeIndex.get(run.run_id));
+          changed = true;
+        }
+      if (!changed) return;
+      version++;
+      drawMain();
+    }
+    const keydown = (event) => {
+      if (document.querySelector("#lightbox[open]")) return;
+      if (event.key === "Escape") {
+        event.stopImmediatePropagation();
+        close();
+      } else if (event.key === "Tab") trapTab(host, event);
+    };
+    function close(restore = true) {
+      if (closed) return;
+      closed = true;
+      for (const chart of wsCharts) chart.destroy();
+      window.removeEventListener("keydown", keydown);
+      host.remove();
+      document.documentElement.classList.remove("has-dialog");
+      if (workspace === handle) workspace = null;
+      if (restore && trigger?.isConnected) trigger.focus();
+    }
+    const handle = { close, repaint, refresh };
+    workspace = handle;
+    document.body.append(host);
+    document.documentElement.classList.add("has-dialog");
+    window.addEventListener("keydown", keydown);
+    drawRuns();
+    summary.textContent = "Loading…";
+    (async () => {
+      const listed = await Promise.resolve(place.runs?.() || runs).catch(() => runs);
+      if (closed) return;
+      // The panel's runs stay first and carry their full detail.
+      candidates = [
+        ...runs,
+        ...listed.filter((run) => !runs.some((own) => own.run_id === run.run_id)),
+      ];
+      if (parentId && candidates.some((run) => run.run_id === parentId && hasScalars(run)))
+        checked.add(parentId);
+      drawRuns();
+      await load(candidates.filter((run) => checked.has(run.run_id)));
+      if (closed) return;
+      version++;
+      drawRuns();
+      drawMain();
+      const target = focusKey && [...main.querySelectorAll(".ws-card")].find((card) => card.dataset.key === focusKey);
+      if (target) {
+        target.scrollIntoView({ block: "nearest" });
+        target.querySelector(".ws-card-tools .btn")?.focus({ preventScroll: true });
+      } else if (!host.contains(document.activeElement)) filterField.focus();
+    })();
+    filterField.focus();
   }
   let chartLayout = null;
   function updateValues(key, chartCard) {
@@ -2129,12 +2477,6 @@ function metricsPanel(initialRuns, compare, signal, { onMetrics } = {}) {
       if (corner.textContent !== text) corner.textContent = text;
     }
   }
-  function updateFocus() {
-    if (focusChart) {
-      focusChart.update(options(expanded));
-      renderTable();
-    }
-  }
   function draw() {
     const pending = [];
     const keys = [
@@ -2148,7 +2490,7 @@ function metricsPanel(initialRuns, compare, signal, { onMetrics } = {}) {
         updateValues(key, chart.canvas.closest(".chart-card"));
         chart.update({ ...options(key), compact: true });
       }
-      updateFocus();
+      workspace?.refresh();
       return;
     }
     chartLayout = layout;
@@ -2182,8 +2524,8 @@ function metricsPanel(initialRuns, compare, signal, { onMetrics } = {}) {
                   type: "button",
                   class: "card chart-card",
                   "data-key": key,
-                  "aria-label": `Expand ${key}`,
-                  onclick: () => open(key),
+                  "aria-label": `Open ${key} in the metrics workspace`,
+                  onclick: () => openWorkspace(key),
                 },
                 el(
                   "header",
@@ -2262,23 +2604,20 @@ function metricsPanel(initialRuns, compare, signal, { onMetrics } = {}) {
             : "No metrics logged yet.",
         }),
       );
-    updateFocus();
+    workspace?.refresh();
   }
   slider.oninput = () => {
     smoothValue.textContent = Number(slider.value).toFixed(2);
     charts.forEach((chart) =>
       chart.update({ smoothing: Number(slider.value) }),
     );
-    if (focusChart) {
-      focusChart.update({ smoothing: Number(slider.value) });
-      renderTable();
-    }
+    workspace?.repaint();
   };
   outliers.onchange = () => {
     charts.forEach((chart) =>
       chart.update({ ignoreOutliers: outliers.checked }),
     );
-    focusChart?.update({ ignoreOutliers: outliers.checked });
+    workspace?.repaint();
   };
   filter.oninput = draw;
   axisSelect.onchange = () => {
@@ -2356,10 +2695,11 @@ function metricsPanel(initialRuns, compare, signal, { onMetrics } = {}) {
   return {
     node,
     update,
+    openWorkspace: () => openWorkspace(),
     destroy() {
       disposed = true;
       charts.forEach((chart) => chart.destroy());
-      overlay?.close();
+      workspace?.close(false);
     },
   };
 }
@@ -2499,13 +2839,24 @@ async function runPage(id, version) {
   parameterSearch.oninput = filterParameters;
   let code = null,
     timer;
+  // The workspace overlays the other runs of this run's task: parent first,
+  // then newest first.
+  const taskOfRun = () => taskName(summaries.find((item) => item.run_id === id));
   const panel = metricsPanel([run], false, signal, {
     onMetrics: (metrics) => {
       lastValues = metrics[id] || {};
       drawStats();
     },
+    workspace: {
+      crumbs: () => [run.project || "no project", taskOfRun() || "no task", run.name || id],
+      scope: () => `task ${taskOfRun() || "none"}`,
+      parent: parentId,
+      runs: () =>
+        summaries
+          .filter((other) => (other.project || "") === (run.project || "") && taskName(other) === taskOfRun())
+          .sort((a, b) => (b.run_id === parentId()) - (a.run_id === parentId()) || newestFirst(a, b)),
+    },
   });
-  const notepad = createNotepad({ runId: id, el, button, signal });
   // Headline numbers: the project's primary metric, final loss curves, steps
   // and wall time. Δ vs parent wherever the parent logged the same summary key.
   function drawStats() {
@@ -2778,7 +3129,6 @@ async function runPage(id, version) {
       title,
       strip,
       el("section", { class: "card run-facts" }, stats, facts),
-      notepad.node,
       el(
         "div",
         { class: "stack" },
@@ -2786,7 +3136,7 @@ async function runPage(id, version) {
           "div",
           { class: "heading" },
           eyebrow("Metrics"),
-          el("span", { class: "muted", text: "Click a chart to expand" }),
+          button("Open in full window ⤢", () => panel.openWorkspace(), "secondary"),
         ),
         panel.node,
       ),
@@ -2816,8 +3166,6 @@ async function runPage(id, version) {
   drawFacts();
   cleanup = () => {
     clearTimeout(timer);
-    notepad.flush();
-    notepad.destroy();
     panel.destroy();
     code?.destroy();
   };

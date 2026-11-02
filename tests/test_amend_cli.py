@@ -52,7 +52,7 @@ def test_note_help_says_local_only(capsys):
     assert _run(["note", "-h"]) == 0
     output = capsys.readouterr().out.lower()
     assert "not synced" in output
-    assert "dashboard" in output
+    assert "notes.md" in output
 
 
 def test_edit_updates_meta_and_events(tmp_path, capsys):

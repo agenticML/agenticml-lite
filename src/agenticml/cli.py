@@ -1098,8 +1098,8 @@ def main(argv=None):
 
     p_note = sub.add_parser(
         "note",
-        help="Read or write the local dashboard notepad (not synced)",
-        description="Read or write the local notepad shown in the dashboard; not synced.",
+        help="Read or write the run's local note (not synced)",
+        description="Read or write the run's local Markdown note (runs/<id>/notes.md); not synced.",
     )
     p_note.add_argument("run_id")
     p_note.add_argument("--dir", default=None, help="Local root (default: AGENTICML_DIR or ~/.agenticml)")
