@@ -222,6 +222,10 @@ def fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
+class RunLockedError(ValueError):
+    """Raised when a run's lifetime lock is held by another process."""
+
+
 def try_lock_run(run_dir: Path):
     """Take the run's non-blocking exclusive lifetime lock, or return None."""
     handle = open_nofollow(Path(run_dir) / "run.lock", "ab", buffering=0)

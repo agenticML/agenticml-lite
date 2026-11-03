@@ -28,6 +28,7 @@ from .layout import (
     parse_timestamp,
     read_file_nofollow,
     resolve_root,
+    RunLockedError,
     run_dir,
     try_lock_run,
     unlock_run,
@@ -176,7 +177,7 @@ def prune_run(root, run_id: str, keys, expected_fingerprint: str | None = None) 
     directory = run_dir(root, run_id)
     handle = try_lock_run(directory)
     if handle is None:
-        raise ValueError(f"run {run_id} is open in another process")
+        raise RunLockedError(f"run {run_id} is open in another process")
     try:
         if expected_fingerprint is not None and run_fingerprint(root, run_id) != expected_fingerprint:
             raise ValueError("run changed since sync; not pruning")

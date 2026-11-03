@@ -20,10 +20,306 @@ from agenticml.store import RunReader
 # ----- argument parsing -----
 
 
+_NEW_LAUNCH_ENV = (
+    "AGENTICML_RUN_ID", "AGENTICML_RESUME", "AGENTICML_CONFIG_FILE",
+    "AGENTICML_SYSTEM_METRICS", "AGENTICML_SYSTEM_METRICS_INTERVAL", "AGENTICML_LINEAGE",
+    "AGENTICML_TRACK_CODE", "AGENTICML_CAPTURE_ENV", "AGENTICML_TRACK_FILES",
+    "AGENTICML_SOURCE_ROOTS", "AGENTICML_MAX_FILE_BYTES", "AGENTICML_MAX_TOTAL_BYTES",
+    "AGENTICML_FLUSH_INTERVAL", "AGENTICML_ALL_RANKS",
+)
+
+
 @pytest.fixture(autouse=True)
 def clean_parent_env(monkeypatch):
     monkeypatch.delenv("AGENTICML_PARENT", raising=False)
     monkeypatch.delenv("AGENTICML_ALLOW_CROSS_TASK", raising=False)
+    for name in _NEW_LAUNCH_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_launch_defaults(monkeypatch):
+    for name in os.environ:
+        if name.startswith("AGENTICML_"):
+            monkeypatch.delenv(name)
+    settings = RunSettings.from_env()
+    assert settings == RunSettings()
+    assert settings.track_source == "runtime"
+    assert settings.system_metrics_interval == 10.0
+    assert settings.flush_interval == 2
+    assert settings.max_file_bytes is settings.max_total_bytes is None
+    assert settings.auto_track is settings.auto_metrics is settings.sync_tensorboard is True
+
+
+@pytest.mark.parametrize("value", ["", " \t\n "])
+def test_empty_launch_env_uses_defaults(monkeypatch, value):
+    for name in os.environ:
+        if name.startswith("AGENTICML_"):
+            monkeypatch.delenv(name)
+    for name in (
+        "AGENTICML_RUN_ID", "AGENTICML_RESUME", "AGENTICML_MAX_FILE_BYTES",
+        "AGENTICML_MAX_TOTAL_BYTES", "AGENTICML_SYSTEM_METRICS_INTERVAL",
+        "AGENTICML_FLUSH_INTERVAL", "AGENTICML_CONFIG_FILE",
+    ):
+        monkeypatch.setenv(name, value)
+    assert RunSettings.from_env() == RunSettings()
+    settings, _, _ = cli._parse_run_options(["t.py"])
+    assert settings == RunSettings()
+
+
+@pytest.mark.parametrize("attached", [False, True])
+@pytest.mark.parametrize("mode", ["allow", "MUST", " Allow "])
+def test_resume_options(attached, mode):
+    options = (["--id=run-1", f"--resume={mode}"] if attached
+               else ["--id", "run-1", "--resume", mode])
+    settings, raw, rest = cli._parse_run_options([*options, "t.py"])
+    assert (settings.id, settings.resume) == ("run-1", mode.strip().lower())
+    assert raw == options
+    assert rest == ["t.py"]
+
+
+def test_resume_env_and_cli_merge(monkeypatch):
+    monkeypatch.setenv("AGENTICML_RUN_ID", "env-id")
+    monkeypatch.setenv("AGENTICML_RESUME", " ALLOW ")
+    assert (RunSettings.from_env().id, RunSettings.from_env().resume) == ("env-id", "allow")
+    settings, _, _ = cli._parse_run_options(["t.py"])
+    assert (settings.id, settings.resume) == ("env-id", "allow")
+    settings, _, _ = cli._parse_run_options(["--id=cli-id", "--resume=must", "t.py"])
+    assert (settings.id, settings.resume) == ("cli-id", "must")
+    monkeypatch.delenv("AGENTICML_RESUME")
+    settings, _, _ = cli._parse_run_options(["--resume=must", "t.py"])
+    assert (settings.id, settings.resume) == ("env-id", "must")
+    monkeypatch.delenv("AGENTICML_RUN_ID")
+    monkeypatch.setenv("AGENTICML_RESUME", "allow")
+    settings, _, _ = cli._parse_run_options(["--id=cli-id", "t.py"])
+    assert (settings.id, settings.resume) == ("cli-id", "allow")
+
+
+@pytest.mark.parametrize("options, message", [
+    (["--id=../bad", "--resume=allow"], "--id must be a valid run id"),
+    (["--id=", "--resume=allow"], "--id must be a valid run id"),
+    (["--resume=bad"], "--resume must be never, allow, or must"),
+    (["--id=run-1"], "--id needs --resume allow or must"),
+    (["--id=run-1", "--resume=never"], "--id needs --resume allow or must"),
+    (["--resume=allow"], "--resume needs --id"),
+    (["--resume=must"], "--resume needs --id"),
+])
+def test_invalid_resume_options(options, message, capsys):
+    with pytest.raises(cli._UsageError, match=message):
+        cli._parse_run_options([*options, "t.py"])
+    assert cli.main(["run", *options, "t.py"]) == 2
+    assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("env", [
+    {"AGENTICML_RUN_ID": "run-1"},
+    {"AGENTICML_RUN_ID": "run-1", "AGENTICML_RESUME": "never"},
+    {"AGENTICML_RESUME": "allow"}, {"AGENTICML_RESUME": "must"},
+])
+def test_invalid_resume_env_combination(monkeypatch, env, capsys):
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    with pytest.raises(cli._UsageError):
+        cli._parse_run_options(["t.py"])
+    assert cli.main(["run", "t.py"]) == 2
+    assert "needs --" in capsys.readouterr().err
+
+
+def test_resume_never_without_id():
+    settings, _, _ = cli._parse_run_options(["--resume=NEVER", "t.py"])
+    assert settings.resume == "never"
+    assert settings.id is None
+
+
+def test_resume_env_error_names_env_var(monkeypatch, capsys):
+    message = "AGENTICML_RESUME must be never, allow, or must"
+    monkeypatch.setenv("AGENTICML_RESUME", "bad")
+    with pytest.raises(ValueError, match=f"^{message}$"):
+        RunSettings.from_env()
+    assert cli.main(["run", "t.py"]) == 2
+    assert message in capsys.readouterr().err
+    monkeypatch.delenv("AGENTICML_RESUME")
+    with pytest.raises(cli._UsageError, match="^--resume must be never, allow, or must$"):
+        cli._parse_run_options(["--resume=bad", "t.py"])
+
+
+def test_config_pairs():
+    options = ["--config", "lr=1e-3", "--config=amp=true", "--config", "name=resnet",
+               "--config", 'quoted="1e-3"', "--config", "lr=0.5", "--config", "data=[1,2]",
+               "--config", 'mapping={"a":1}', "--config", "none=null", "--config", "eq=a=b"]
+    settings, raw, rest = cli._parse_run_options([*options, "t.py"])
+    assert settings.config == {"lr": 0.5, "amp": True, "name": "resnet", "quoted": "1e-3",
+                               "data": [1, 2], "mapping": {"a": 1}, "none": None, "eq": "a=b"}
+    assert raw == options
+    assert rest == ["t.py"]
+
+
+@pytest.mark.parametrize("value", ["lr", "=1"])
+def test_invalid_config_pair(value, capsys):
+    with pytest.raises(cli._UsageError, match="--config expects KEY=VALUE"):
+        cli._parse_run_options(["--config", value, "t.py"])
+    assert cli.main(["run", "--config", value, "t.py"]) == 2
+    assert "--config expects KEY=VALUE" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity", "[NaN]", "1e999"])
+def test_nonfinite_config_pair_is_usage_error(value, capsys):
+    message = "--config value for 'k' must not be NaN or Infinity"
+    with pytest.raises(cli._UsageError, match=f"^{message}$"):
+        cli._parse_run_options(["--config", f"k={value}", "t.py"])
+    assert cli.main(["run", "--config", f"k={value}", "t.py"]) == 2
+    assert message in capsys.readouterr().err
+
+
+def test_deep_config_pair_falls_back_to_string():
+    value = "[" * 10000 + "0" + "]" * 10000
+    settings, _, _ = cli._parse_run_options(["--config", f"k={value}", "t.py"])
+    assert settings.config == {"k": value}
+
+
+@pytest.mark.parametrize("source", ["env", "separate", "attached"])
+def test_config_file_merge(tmp_path, monkeypatch, source):
+    path = tmp_path / "config.json"
+    path.write_text('{"lr": 0.1, "batch_size": 32}')
+    if source == "env":
+        monkeypatch.setenv("AGENTICML_CONFIG_FILE", str(path))
+        options = []
+    else:
+        monkeypatch.setenv("AGENTICML_CONFIG_FILE", str(tmp_path / "missing.json"))
+        options = [f"--config-file={path}"] if source == "attached" else ["--config-file", str(path)]
+    # CLI file replaces the env file; pairs override file values even when given first.
+    options = ["--config=lr=0.5", *options]
+    settings, raw, _ = cli._parse_run_options([*options, "t.py"])
+    assert settings.config == {"lr": 0.5, "batch_size": 32}
+    assert raw == options
+
+
+@pytest.mark.parametrize("contents", [
+    None, "{bad json", "[]", "null", "1", b"\xff",
+    '{"k": NaN}', '{"k": Infinity}', '{"k": 1e999}',
+    '{"k":' + "[" * 10000 + "0" + "]" * 10000 + "}",
+])
+@pytest.mark.parametrize("source", ["env", "cli"])
+def test_invalid_config_file(tmp_path, monkeypatch, contents, source, capsys):
+    path = tmp_path / "bad-config.json"
+    if isinstance(contents, bytes):
+        path.write_bytes(contents)
+    elif contents is not None:
+        path.write_text(contents)
+    if source == "env":
+        monkeypatch.setenv("AGENTICML_CONFIG_FILE", str(path))
+        options = []
+    else:
+        options = ["--config-file", str(path)]
+    with pytest.raises(cli._UsageError, match="bad-config.json"):
+        cli._parse_run_options([*options, "t.py"])
+    assert cli.main(["run", *options, "t.py"]) == 2
+    assert str(path) in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("option, attr", [
+    ("--no-system-metrics", "system_metrics"), ("--no-lineage", "lineage"),
+    ("--no-code", "track_source"), ("--no-env", "capture_env"),
+    ("--all-ranks", "only_main_process"),
+])
+def test_capture_switches(option, attr):
+    settings, raw, _ = cli._parse_run_options([option, "t.py"])
+    assert getattr(settings, attr) is False
+    assert raw == [option]
+
+
+@pytest.mark.parametrize("option, attr, env_name, value", [
+    ("--system-metrics-interval", "system_metrics_interval", "AGENTICML_SYSTEM_METRICS_INTERVAL", "0.5"),
+    ("--flush-interval", "flush_interval", "AGENTICML_FLUSH_INTERVAL", "0.2"),
+    ("--max-file-bytes", "max_file_bytes", "AGENTICML_MAX_FILE_BYTES", "42"),
+    ("--max-total-bytes", "max_total_bytes", "AGENTICML_MAX_TOTAL_BYTES", "128"),
+])
+@pytest.mark.parametrize("attached", [False, True])
+def test_capture_numbers(monkeypatch, option, attr, env_name, value, attached):
+    monkeypatch.setenv(env_name, value)
+    assert getattr(RunSettings.from_env(), attr) == float(value)
+    options = [f"{option}=3"] if attached else [option, "3"]
+    settings, raw, _ = cli._parse_run_options([*options, "t.py"])
+    assert getattr(settings, attr) == 3
+    assert isinstance(getattr(settings, attr), int if "bytes" in attr else float)
+    assert raw == options
+
+
+def test_cli_size_and_flush_interval_override_env(monkeypatch):
+    monkeypatch.setenv("AGENTICML_MAX_FILE_BYTES", "1024")
+    monkeypatch.setenv("AGENTICML_FLUSH_INTERVAL", "30")
+    settings, _, _ = cli._parse_run_options([
+        "--max-file-bytes=4096", "--flush-interval", "0.5", "t.py",
+    ])
+    assert settings.max_file_bytes == 4096
+    assert settings.flush_interval == 0.5
+
+
+@pytest.mark.parametrize("option", [
+    "--system-metrics-interval", "--flush-interval", "--max-file-bytes", "--max-total-bytes",
+])
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf", "bad", ""])
+def test_invalid_capture_numbers(option, value, capsys):
+    with pytest.raises(cli._UsageError, match="must be a positive"):
+        cli._parse_run_options([option, value, "t.py"])
+    assert cli.main(["run", option, value, "t.py"]) == 2
+    assert "must be a positive" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("name, value", [
+    ("AGENTICML_RUN_ID", "../bad"),
+    ("AGENTICML_RESUME", "bad"),
+    ("AGENTICML_SYSTEM_METRICS_INTERVAL", "nan"), ("AGENTICML_SYSTEM_METRICS_INTERVAL", "0"),
+    ("AGENTICML_FLUSH_INTERVAL", "inf"), ("AGENTICML_FLUSH_INTERVAL", "-1"),
+    ("AGENTICML_MAX_FILE_BYTES", "0"), ("AGENTICML_MAX_FILE_BYTES", "1.5"),
+    ("AGENTICML_MAX_TOTAL_BYTES", "bad"), ("AGENTICML_MAX_TOTAL_BYTES", "-1"),
+])
+def test_bad_launch_env(monkeypatch, name, value, capsys):
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError):
+        RunSettings.from_env()
+    with pytest.raises(cli._UsageError):
+        cli._parse_run_options(["t.py"])
+    assert cli.main(["run", "t.py"]) == 2
+    assert "agenticml run: error:" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value, enabled", [
+    ("0", False), ("false", False), (" NO ", False), ("off", False),
+    ("1", True), ("true", True), ("anything", True),
+])
+def test_capture_env_flags(monkeypatch, value, enabled):
+    for name in ("AGENTICML_SYSTEM_METRICS", "AGENTICML_TRACK_CODE", "AGENTICML_CAPTURE_ENV"):
+        monkeypatch.setenv(name, value)
+    settings = RunSettings.from_env()
+    assert settings.system_metrics is settings.capture_env is enabled
+    assert settings.track_source == ("runtime" if enabled else False)
+    settings, _, _ = cli._parse_run_options(["--no-system-metrics", "--no-code", "--no-env", "t.py"])
+    assert settings.system_metrics is settings.track_source is settings.capture_env is False
+
+
+@pytest.mark.parametrize("value, enabled", [
+    ("1", True), (" TrUe ", True), ("yes", True), ("on", True),
+    ("0", False), ("false", False), ("anything", False),
+])
+def test_all_ranks_env(monkeypatch, value, enabled):
+    monkeypatch.setenv("AGENTICML_ALL_RANKS", value)
+    assert RunSettings.from_env().only_main_process is (not enabled)
+
+
+@pytest.mark.parametrize("option, attr, env_name", [
+    ("--track-file", "extra_files", "AGENTICML_TRACK_FILES"),
+    ("--source-root", "source_roots", "AGENTICML_SOURCE_ROOTS"),
+])
+def test_repeatable_paths(monkeypatch, option, attr, env_name):
+    paths = ["relative path", "../other"]
+    monkeypatch.setenv(env_name, os.pathsep.join(paths))
+    assert getattr(RunSettings.from_env(), attr) == paths
+    settings, _, _ = cli._parse_run_options(["t.py"])
+    assert getattr(settings, attr) == paths
+    options = [option, "cli path", f"{option}=./other"]
+    settings, raw, _ = cli._parse_run_options([*options, "t.py"])
+    assert getattr(settings, attr) == ["cli path", "./other"]
+    assert raw == options
 
 
 def test_options_stop_at_first_non_option():
@@ -228,6 +524,8 @@ def _launch(
     process_env.pop("AGENTICML_TASK", None)
     process_env.pop("AGENTICML_PARENT", None)
     process_env.pop("AGENTICML_ALLOW_CROSS_TASK", None)
+    for key in _NEW_LAUNCH_ENV:
+        process_env.pop(key, None)
     process_env.update(env or {})
     proc = subprocess.run(
         [sys.executable, "-m", "agenticml", "run", *args],
@@ -245,7 +543,319 @@ def _read_runs(out: Path) -> list[dict]:
         return []
     return [RunReader(out, path.name) for path in sorted(
         (out / "runs").iterdir(), key=lambda path: path.stat().st_mtime
-    )]
+    ) if (path / "meta.json").is_file()]
+
+
+@pytest.mark.parametrize("reexec", [False, True])
+def test_resume_round_trip(project, reexec):
+    script = """
+        import agenticml
+        for i in range(3):
+            agenticml.log({"loss": i})
+    """
+    proc, runs = _launch(
+        project, "--project=original", "--name=original-name", "--task=original-task",
+        "--parent=parent-run", "--config=stored=1", "--config=lr=0.1", "train.py", script=script,
+    )
+    assert proc.returncode == 0, proc.stderr
+    rid = runs[0].run_id
+    assert runs[0].last_step() == 2
+    target = ["--", sys.executable, "-u", "train.py"] if reexec else ["train.py"]
+    proc, runs = _launch(
+        project, "--id", rid, "--resume", "must", "--project=changed", "--name=changed",
+        "--task=changed", "--parent=changed-parent", "--config=lr=0.5", *target,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert len(runs) == 1
+    run = runs[0]
+    assert run.run_id == rid
+    meta = run.meta()
+    assert meta["project"] == "original"
+    assert meta["name"] == "original-name"
+    assert meta["task"] == "original-task"
+    assert meta["parent_run_id"] == "parent-run"
+    assert "keeping it instead of parent_run_id=" in proc.stderr
+    assert meta["config"]["stored"] == 1
+    assert meta["config"]["lr"] == 0.5
+    assert meta["status"] == "finished"
+    assert run.last_step() == 5
+    assert [point[0] for point in run.series("loss")["points"]] == list(range(6))
+    assert any(event["kind"] == "resume" for event in run.events())
+
+
+@pytest.mark.parametrize("env_options", [False, True])
+def test_resume_must_missing_does_not_execute(project, env_options):
+    options = [] if env_options else ["--id=unknown", "--resume=must"]
+    env = {"AGENTICML_RUN_ID": "unknown", "AGENTICML_RESUME": "must"} if env_options else {}
+    proc, runs = _launch(project, *options, "train.py", env=env, script="""
+        from pathlib import Path
+        Path("executed").touch()
+    """)
+    assert proc.returncode == 2
+    assert proc.stderr.strip() == "agenticml run: run unknown not found (--resume must)"
+    assert not (project / "executed").exists()
+    assert runs == []
+    assert not (project.parent / "out").exists()
+
+
+@pytest.mark.parametrize("options, env", [
+    (["--mode=disabled"], {}), ([], {"AGENTICML_MODE": "disabled"}),
+])
+def test_resume_must_missing_in_disabled_mode(project, options, env):
+    proc, runs = _launch(
+        project, "--id=unknown", "--resume=must", *options, "train.py", env=env, script="""
+            from pathlib import Path
+            Path("executed").touch()
+        """,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert (project / "executed").exists()
+    assert runs == []
+
+
+@pytest.mark.parametrize("attached", [False, True])
+def test_resume_allow_unknown_creates_id_after_reexec(project, attached):
+    options = (["--id=chosen-id", "--resume=allow", "--config=lr=0.5"] if attached else
+               ["--id", "chosen-id", "--resume", "allow", "--config", "lr=0.5"])
+    proc, runs = _launch(
+        project, *options, "--", sys.executable, "-u", "train.py", script="""
+            import agenticml
+            assert agenticml.get_active_run().run_id == "chosen-id"
+            assert agenticml.config["lr"] == 0.5
+        """,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert len(runs) == 1
+    assert runs[0].run_id == "chosen-id"
+    assert runs[0].meta()["config"]["lr"] == 0.5
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX run locks")
+@pytest.mark.parametrize("mode", ["allow", "must"])
+def test_resume_locked_run_does_not_execute(project, mode):
+    from agenticml.store import RunWriter
+
+    root = project.parent / "out"
+    writer = RunWriter.create(root, run_id="locked-run", meta={"project": "proj"})
+    try:
+        before = (writer.run_dir / "meta.json").read_bytes()
+        proc, runs = _launch(project, "--id=locked-run", f"--resume={mode}", "train.py", script="""
+            from pathlib import Path
+            Path("executed").touch()
+        """)
+        assert proc.returncode == 2
+        assert proc.stderr.strip() == (
+            "agenticml run: cannot resume run locked-run: run locked-run is open in another process"
+        )
+        assert not (project / "executed").exists()
+        assert len(runs) == 1
+        assert (writer.run_dir / "meta.json").read_bytes() == before
+    finally:
+        writer.close()
+
+
+def test_resume_allow_directory_without_meta_does_not_execute(project):
+    directory = project.parent / "out" / "runs" / "incomplete-run"
+    directory.mkdir(parents=True)
+    proc, runs = _launch(project, "--id=incomplete-run", "--resume=allow", "train.py", script="""
+        from pathlib import Path
+        Path("executed").touch()
+    """)
+    assert proc.returncode == 2
+    assert proc.stderr.startswith("agenticml run: cannot resume run incomplete-run: ")
+    assert not (project / "executed").exists()
+    assert runs == []
+    assert not (directory / "meta.json").exists()
+
+
+@pytest.mark.parametrize("mode", ["allow", "must"])
+def test_resume_pruned_run_does_not_execute(project, mode):
+    from agenticml.store import RunWriter
+    from agenticml.store.overview import OVERVIEW_MIN_POINTS
+
+    writer = RunWriter.create(project.parent / "out", run_id="pruned-run")
+    writer.write_scalars([(i, {"loss": float(i)}) for i in range(OVERVIEW_MIN_POINTS + 1)])
+    writer.finish("finished")
+    (writer.run_dir / "scalars" / "0.bin").unlink()
+    before = (writer.run_dir / "meta.json").read_bytes()
+    proc, _ = _launch(project, "--id=pruned-run", f"--resume={mode}", "train.py", script="""
+        from pathlib import Path
+        Path("executed").touch()
+    """)
+    assert proc.returncode == 2
+    assert proc.stderr.startswith("agenticml run: cannot resume run pruned-run: ")
+    assert "was pruned after sync" in proc.stderr
+    assert not (project / "executed").exists()
+    assert (writer.run_dir / "meta.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("resume", [None, "allow", "must"])
+@pytest.mark.parametrize("error, detail", [
+    (RuntimeError("first line\nsecond line"), "first line"),
+    (ValueError(), "ValueError"),
+    (RuntimeError("\nsecond line"), "RuntimeError"),
+    (FileNotFoundError("meta disappeared"), "meta disappeared"),
+    (OSError("store unavailable"), "store unavailable"),
+])
+def test_init_failure_requires_resume_to_abort(tmp_path, monkeypatch, capsys, resume, error, detail):
+    from agenticml import _globals
+
+    script = tmp_path / "train.py"
+    marker = tmp_path / "executed"
+    script.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n")
+    root = tmp_path / "store"
+    directory = root / "runs" / "run-1"
+    directory.mkdir(parents=True)
+    (directory / "meta.json").write_text("{}")
+
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(_globals, "Run", fail)
+    monkeypatch.setattr(_globals, "_active_run", None)
+    monkeypatch.setattr(sys, "argv", sys.argv[:])
+    monkeypatch.setattr(sys, "path", sys.path[:])
+    options = ["--id=run-1", f"--resume={resume}"] if resume is not None else []
+    result = cli.main(["run", "--dir", str(root), *options, str(script)])
+    if resume is not None:
+        assert result == 2
+        assert not marker.exists()
+        assert capsys.readouterr().err == f"agenticml run: cannot resume run run-1: {detail}\n"
+    else:
+        assert result == 0
+        assert marker.exists()
+
+
+@pytest.mark.parametrize("id_expr, resume, warns", [
+    ('"other"', "must", True), ('"other"', "never", True),
+    ("run.run_id", "must", False), ("run.run_id", "never", False),
+    ("None", "never", False), ("None", None, False), ("None", "allow", True),
+])
+def test_script_init_resume_keeps_launcher_run(project, id_expr, resume, warns):
+    proc, runs = _launch(project, "train.py", script=f"""
+        import agenticml
+        run = agenticml.get_active_run()
+        attached = agenticml.init(id={id_expr}, resume={resume!r})
+        assert attached is run
+    """)
+    assert proc.returncode == 0, proc.stderr
+    assert len(runs) == 1
+    assert ("ignoring id=" in proc.stderr) == warns
+    if warns:
+        assert "(pass --id/--resume to agenticml run)" in proc.stderr
+
+
+def test_config_file_and_pairs_protect_from_argparse(project):
+    (project / "cfg.json").write_text('{"lr": 0.1, "batch_size": 32}')
+    proc, runs = _launch(
+        project, "--config", "lr=0.5", "--config-file", "cfg.json", "train.py", script="""
+            import argparse
+            import agenticml
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--lr", type=float, default=0.01)
+            parser.add_argument("--batch-size", type=int, default=8)
+            parser.add_argument("--epochs", type=int, default=10)
+            parser.parse_args()
+            assert agenticml.config["lr"] == 0.5
+            assert agenticml.config["batch_size"] == 32
+            assert agenticml.config["epochs"] == 10
+            agenticml.init(config={"batch_size": 64})
+        """,
+    )
+    assert proc.returncode == 0, proc.stderr
+    config = runs[0].meta()["config"]
+    assert config["lr"] == 0.5
+    assert config["batch_size"] == 64
+    assert config["epochs"] == 10
+
+
+@pytest.mark.parametrize("env_options", [False, True])
+def test_capture_disabled(project, env_options):
+    proc, runs = _launch(project, "train.py", script="""
+        import agenticml
+        run = agenticml.get_active_run()
+        assert run._system_sampler is not None
+        assert run._runtime_collector is not None
+        assert run._lineage_enabled
+        agenticml.log({"loss": 1})
+    """)
+    assert proc.returncode == 0, proc.stderr
+    default_run = runs[0]
+    assert default_run.meta()["env"]
+    assert default_run.meta()["lineage"]
+    assert default_run.meta()["snapshot_hash"]
+    assert default_run.code_manifest()
+    assert any(event["kind"] == "code" for event in default_run.events())
+
+    options = [] if env_options else ["--no-system-metrics", "--no-lineage", "--no-code", "--no-env"]
+    env = ({"AGENTICML_SYSTEM_METRICS": "0", "AGENTICML_LINEAGE": "0",
+            "AGENTICML_TRACK_CODE": "0", "AGENTICML_CAPTURE_ENV": "0"} if env_options else {})
+    proc, runs = _launch(project, *options, "train.py", env=env, script="""
+        import agenticml
+        run = agenticml.get_active_run()
+        assert run._system_sampler is None
+        assert run._runtime_collector is None
+        assert not run._lineage_enabled
+        agenticml.log({"loss": 1})
+    """)
+    assert proc.returncode == 0, proc.stderr
+    assert len(runs) == 2
+    run = runs[1]
+    assert run.meta()["env"] == {}
+    assert not run.meta().get("lineage")
+    assert not run.meta().get("snapshot_hash")
+    assert run.code_manifest() == []
+    assert not any(event["kind"] == "code" for event in run.events())
+
+
+@pytest.mark.parametrize("env_options", [False, True])
+def test_track_file_in_code_manifest(project, env_options):
+    (project / "extra.txt").write_text("tracked content\n")
+    options = [] if env_options else ["--track-file", "extra.txt"]
+    env = {"AGENTICML_TRACK_FILES": "extra.txt"} if env_options else {}
+    proc, runs = _launch(project, *options, "train.py", script="pass\n", env=env)
+    assert proc.returncode == 0, proc.stderr
+    assert "extra.txt" in {entry["path"] for entry in runs[0].code_manifest()}
+
+
+@pytest.mark.parametrize("env_options", [False, True])
+def test_capture_intervals_roots_and_caps_reach_run(project, env_options):
+    source_root = project.parent / "library"
+    source_root.mkdir()
+    (source_root / "data.txt").write_text("source root content")
+    options = ([] if env_options else [
+        "--source-root", str(source_root), "--system-metrics-interval=0.5",
+        "--flush-interval=0.25", "--max-file-bytes=4096", "--max-total-bytes=16384",
+    ])
+    env = ({"AGENTICML_SOURCE_ROOTS": str(source_root), "AGENTICML_SYSTEM_METRICS_INTERVAL": "0.5",
+            "AGENTICML_FLUSH_INTERVAL": "0.25", "AGENTICML_MAX_FILE_BYTES": "4096",
+            "AGENTICML_MAX_TOTAL_BYTES": "16384"} if env_options else {})
+    proc, runs = _launch(project, *options, "train.py", env=env, script="""
+        from pathlib import Path
+        import agenticml
+        run = agenticml.get_active_run()
+        assert run.flush_interval == 0.25
+        assert run._system_sampler.interval == 0.5
+        collector = run._runtime_collector
+        assert collector.max_file_bytes == 4096
+        assert collector.max_total_bytes == 16384
+        source_root = Path.cwd().parent / "library"
+        assert source_root in collector.roots
+        assert (source_root / "data.txt").read_text() == "source root content"
+    """)
+    assert proc.returncode == 0, proc.stderr
+    assert any(entry["path"].endswith("data.txt") for entry in runs[0].code_manifest())
+
+
+@pytest.mark.parametrize("options, env, tracked", [
+    ([], {"RANK": "1", "LOCAL_RANK": "1"}, False),
+    (["--all-ranks"], {"RANK": "1", "LOCAL_RANK": "1"}, True),
+    ([], {"RANK": "1", "LOCAL_RANK": "1", "AGENTICML_ALL_RANKS": "1"}, True),
+])
+def test_launcher_all_ranks(project, options, env, tracked):
+    proc, runs = _launch(project, *options, "train.py", script="pass\n", env=env)
+    assert proc.returncode == 0, proc.stderr
+    assert len(runs) == int(tracked)
 
 
 def test_script_runs_as_main(project):

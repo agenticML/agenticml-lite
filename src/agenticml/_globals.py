@@ -87,6 +87,7 @@ def init(
     dir=None,
     verbose=False,
     lineage=True,
+    _raise_init_errors=False,
     **kwargs,
 ):
     """Start a run and register it as the module-level active run.
@@ -142,6 +143,8 @@ def init(
                 **kwargs,
             )
         except Exception:
+            if _raise_init_errors:
+                raise
             logger.exception("could not initialize tracking; tracking disabled")
             _active_run = _DisabledRun()
         return _active_run
@@ -155,6 +158,15 @@ def _attach(run, project, name, kwargs):
     attribute is not a conflict either.
     """
     missing = object()
+    run_id = kwargs.get("id")
+    resume = kwargs.get("resume")
+    current_id = getattr(run, "run_id", None)
+    if run_id != current_id and (run_id is not None or resume in ("allow", "must")):
+        logger.warning(
+            "agenticml run already started run %r; ignoring id=%r resume=%r "
+            "(pass --id/--resume to agenticml run)",
+            current_id, run_id, resume,
+        )
     current_project = getattr(run, "project", missing)
     current_name = getattr(run, "name", missing)
     project_differs = (

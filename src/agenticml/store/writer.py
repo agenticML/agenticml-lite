@@ -45,6 +45,7 @@ from .layout import (
     open_nofollow,
     parse_timestamp,
     read_file_nofollow,
+    RunLockedError,
     run_dir,
     try_lock_run,
     unlock_run,
@@ -315,7 +316,7 @@ def _fsync_file(path: Path) -> None:
 
 
 class RunWriter:
-    """One open run. Construct with :meth:`create` or :meth:`resume`."""
+    """One open run. Construct with :meth:`create`, :meth:`resume`, or :meth:`amend`."""
 
     def __init__(self, root, run_id: str) -> None:
         if not valid_run_id(run_id):
@@ -433,16 +434,72 @@ class RunWriter:
             raise
         return writer
 
-    def _acquire_run_lock(self) -> None:
+    @classmethod
+    def amend(cls, root, run_id: str) -> RunWriter:
+        """Reopen a run that is not live to change metadata.
+
+        Takes the exclusive run lock without refreshing ``run.lock``'s mtime,
+        so a dead run does not look alive. Status, ``finished_at``, pid, and
+        hostname are left untouched; there is no ``resume`` event. Pruned
+        runs are allowed (metadata edits do not rewrite overviews). The
+        caller applies updates and then ``close()`` (no status change) or
+        ``finish()`` (used by ``agenticml finish``).
+        """
+        if not valid_run_id(run_id):
+            raise ValueError(f"invalid run id: {run_id!r}")
+        directory = run_dir(root, run_id)
+        if not directory.is_dir():
+            raise FileNotFoundError(directory)
+        writer = cls(root, run_id)
+        try:
+            lock_path = writer.run_dir / "run.lock"
+            lock_existed = os.path.lexists(lock_path)
+            writer._acquire_run_lock(heartbeat=False)
+            if not writer._meta_path.is_file():
+                raise FileNotFoundError(writer._meta_path)
+            if not lock_existed:
+                handle = writer._run_lock
+                if handle is not None and not handle.closed and os.utime in os.supports_fd:
+                    os.utime(handle.fileno(), (0, 0))
+                elif os.utime in os.supports_follow_symlinks:
+                    os.utime(lock_path, (0, 0), follow_symlinks=False)
+                else:
+                    os.utime(lock_path, (0, 0))
+            if not writer._run_lock.locking_supported:
+                from .reader import STALE_AFTER_SECONDS
+
+                try:
+                    raw_meta = json.loads(writer._meta_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, RecursionError, UnicodeError):
+                    raw_meta = None
+                if isinstance(raw_meta, dict) and raw_meta.get("status") == "running":
+                    try:
+                        age = time.time() - os.lstat(lock_path).st_mtime
+                    except FileNotFoundError:
+                        age = STALE_AFTER_SECONDS
+                    except OSError:
+                        age = 0.0
+                    if age < STALE_AFTER_SECONDS:
+                        raise RunLockedError(
+                            f"run {run_id} is open in another process"
+                        )
+            writer._load_existing()
+        except BaseException:
+            writer.close()
+            raise
+        return writer
+
+    def _acquire_run_lock(self, *, heartbeat: bool = True) -> None:
         # Short shared reader probes can briefly block an exclusive lock.
         for attempt in range(11):
             self._run_lock = try_lock_run(self.run_dir)
             if self._run_lock is not None:
-                self.heartbeat()
+                if heartbeat:
+                    self.heartbeat()
                 return
             if attempt < 10:
                 time.sleep(0.05)
-        raise ValueError(f"run {self.run_id} is open in another process")
+        raise RunLockedError(f"run {self.run_id} is open in another process")
 
     def heartbeat(self) -> None:
         """Refresh liveness even when the trainer has no metrics to flush."""
@@ -654,6 +711,15 @@ class RunWriter:
         with self._lock:
             self._check_open()
             self._update_meta(copied)
+
+    def record_meta_update(self, fields: dict) -> None:
+        """Append a ``meta_update`` event with the new full values of changed keys."""
+        if not isinstance(fields, dict):
+            raise TypeError("fields must be a dict")
+        fields = _copy.deepcopy(fields)
+        with self._lock:
+            self._check_open()
+            self._append_event({"t": time.time(), "kind": "meta_update", "fields": fields})
 
     def add_code(self, manifest_files: list, files: list) -> None:
         """Store code bytes in the object store and append a ``code`` event.
