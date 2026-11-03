@@ -953,7 +953,7 @@ class DashboardServer(ThreadingHTTPServer):
     # (Linux queues the SYNs instead).
     request_queue_size = 64
 
-    def __init__(self, root, host, port, read_only=False):
+    def __init__(self, root, host, port, read_only=False, handler_class=None):
         self.root = layout.resolve_root(root)
         self.verbose = False
         self.bind_host = host
@@ -967,7 +967,7 @@ class DashboardServer(ThreadingHTTPServer):
         # Kept off ``connections`` so that map stays plain state strings.
         self.write_started = {}
         self.connection_lock = threading.Lock()
-        super().__init__((host, port), DashboardHandler)
+        super().__init__((host, port), handler_class or DashboardHandler)
 
     def handle_error(self, request, client_address):
         if self.verbose:
@@ -1063,12 +1063,15 @@ class DashboardServer(ThreadingHTTPServer):
             return True
 
     def _admit_note_body(self, request):
+        return self._admit_body(request, _MAX_NOTE_PUTS)
+
+    def _admit_body(self, request, limit):
         """Enter the non-evictable "body" state, or return False if the cap is full.
 
         A stalled note body holds its handler until the put deadline. Those
         handlers are never evicted, so the cap leaves a slot for a normal request.
         """
-        limit = min(_MAX_NOTE_PUTS, max(1, _MAX_CONNECTIONS - 1))
+        limit = min(limit, max(1, _MAX_CONNECTIONS - 1))
         with self.connection_lock:
             if request not in self.connections:
                 return False

@@ -485,6 +485,61 @@ def cmd_ui(args):
     return 0
 
 
+def cmd_server_serve(args):
+    from .server import serve
+
+    try:
+        serve(args.data, args.host, args.port, args.public_url)
+    except KeyboardInterrupt:
+        print("stopped")
+        return 0
+    except (OSError, ValueError, OverflowError) as exc:
+        print(f"agenticml server: {str(exc).splitlines()[0]}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_server_keys(args):
+    from .server.app import resolve_data_dir
+    from .server.keys import KeyStore
+
+    try:
+        data = resolve_data_dir(args.data)
+        data.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory = data / "server"
+        directory.mkdir(mode=0o700, exist_ok=True)
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError("server directory is a symlink or not a directory")
+        keys = KeyStore(directory, env_key=None)
+        if args.keys_action == "list":
+            try:
+                keys = KeyStore(directory, os.environ.get("AGENTICML_SERVER_KEY"))
+            except ValueError as exc:
+                print(f"agenticml server: warning: {exc}; listing file keys only", file=sys.stderr)
+        if args.keys_action == "create":
+            _, key = keys.create(args.name, args.scope)
+            print(key)
+            print("shown once; store it now", file=sys.stderr)
+        elif args.keys_action == "revoke":
+            if not keys.revoke(args.name):
+                raise ValueError("unknown key name")
+        else:
+            records = [record.to_public() for record in keys.list()]
+            if args.json:
+                print(json.dumps(records))
+            else:
+                fields = ("name", "scope", "prefix", "created_at", "created_by", "last_used_at")
+                _print_table([list(fields)] + [[str(record[field] or "-") for field in fields]
+                                              for record in records])
+    except KeyboardInterrupt:
+        print("stopped")
+        return 0
+    except (OSError, ValueError, OverflowError) as exc:
+        print(f"agenticml server: {str(exc).splitlines()[0]}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_du(args):
     import json
     from .store.gc import _format_bytes, usage
@@ -1029,6 +1084,28 @@ def main(argv=None):
     p_ui.add_argument("--open", action="store_true", help="Open the dashboard in a browser")
     p_ui.add_argument("--read-only", action="store_true", help="Disable note editing in the dashboard")
     p_ui.set_defaults(func=cmd_ui)
+
+    p_server = sub.add_parser("server", help="Serve and administer an on-prem store")
+    server_sub = p_server.add_subparsers(dest="server_action", required=True)
+    p_serve = server_sub.add_parser("serve", help="Serve protocol v2 ingest")
+    p_serve.add_argument("--data", default=None)
+    p_serve.add_argument("--host", default="127.0.0.1")
+    p_serve.add_argument("--port", type=int, default=8080)
+    p_serve.add_argument("--public-url", default=None)
+    p_serve.set_defaults(func=cmd_server_serve)
+    p_keys = server_sub.add_parser("keys", help="Create, list, or revoke API keys")
+    keys_sub = p_keys.add_subparsers(dest="keys_action", required=True)
+    for action in ("create", "list", "revoke"):
+        child = keys_sub.add_parser(action)
+        child.add_argument("--data", default=None)
+        child.set_defaults(func=cmd_server_keys)
+        if action == "create":
+            child.add_argument("--name", required=True)
+            child.add_argument("--scope", choices=("sync", "admin"), default="sync")
+        elif action == "list":
+            child.add_argument("--json", action="store_true")
+        else:
+            child.add_argument("name")
 
     p_sync = sub.add_parser("sync", help="Incrementally upload local runs to a server")
     p_sync.add_argument("run_ids", nargs="*", metavar="RUN_ID")
