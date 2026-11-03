@@ -51,7 +51,7 @@ Update the status column in the PR that changes it. Values: `not started`,
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 0 | Test CI (Linux, Python 3.9 and 3.12, UI suite) | – | Codex | S | to write | not started |
+| 0 | Test CI (Linux, Python 3.9 and 3.12, UI suite) | – | Codex | S | [plan](packages/0-test-ci.md) | in review |
 | 1 † | Server ingest, keys, `/v2` endpoints, server lock | – | Codex | L | to write | not started |
 | 2 | Run status from `remote.json` | – | Cursor | S | to write | not started |
 | 3 | Sync client v2 and `docs/PROTOCOL.md` | 1 | Codex | L | to write | not started |
