@@ -2455,11 +2455,19 @@ def test_remote_invalid_status_falls_back(tmp_path, caplog, payload):
 
 
 @pytest.mark.parametrize(
-    "terminal,expected",
-    [(None, "stale"), ("finished", "finished")],
-    ids=["running", "finished"],
+    "terminal,payload,expected",
+    [
+        (None, {"owner": "one"}, "stale"),
+        ("finished", {"owner": "one"}, "finished"),
+        ("crashed", {"owner": "one"}, "crashed"),
+        (None, {}, "stale"),
+        ("finished", {}, "finished"),
+    ],
+    ids=["running", "finished", "crashed", "running-empty", "finished-empty"],
 )
-def test_remote_precommit_derives_status_from_meta(tmp_path, caplog, terminal, expected):
+def test_remote_precommit_derives_status_from_meta(
+    tmp_path, caplog, terminal, payload, expected
+):
     caplog.set_level(logging.WARNING, logger="agenticml.store.reader")
     writer = RunWriter.create(tmp_path, run_id="precommit", meta={})
     if terminal is None:
@@ -2467,9 +2475,9 @@ def test_remote_precommit_derives_status_from_meta(tmp_path, caplog, terminal, e
         (writer.run_dir / "run.lock").unlink(missing_ok=True)
     else:
         writer.finish(terminal, {})
-    _write_remote(writer.run_dir, raw='{"owner": "one"}')
+    _write_remote(writer.run_dir, payload=payload)
     caplog.clear()
-    remote = {"status": None, "last_sync_at": None, "owner": "one"}
+    remote = {"status": None, "last_sync_at": None, "owner": payload.get("owner")}
     assert read_remote(writer.run_dir) == remote
     assert _eff(writer.run_dir) == expected
     listed = {item["run_id"]: item for item in list_runs(tmp_path)}
