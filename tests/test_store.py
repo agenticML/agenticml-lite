@@ -13,6 +13,7 @@ import socket
 import struct
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -35,8 +36,16 @@ from agenticml.store import (
     valid_run_id,
     valid_sha,
 )
-from agenticml.store.layout import RunLockedError
-from agenticml.store.reader import STALE_AFTER_SECONDS
+from agenticml.store.layout import REMOTE_NAME, RunLockedError
+from agenticml.store.reader import (
+    REMOTE_STALE_ENV,
+    REMOTE_STALE_SECONDS,
+    STALE_AFTER_SECONDS,
+    _effective_status,
+    _remote_status,
+    read_remote,
+    remote_stale_seconds,
+)
 
 _RUN_ID_RE = re.compile(r"^\d{8}T\d{6}-[0-9a-f]{8}$")
 # finish persists <id>.ovw only strictly above OVERVIEW_MIN_POINTS.
@@ -2329,3 +2338,401 @@ def test_amend_missing_and_pruned(tmp_path):
     assert meta["notes"] == "after"
     assert meta["status"] == "finished"
     assert ovw.read_bytes() == blob
+
+
+_FIXED_NOW = int(datetime(2026, 11, 3, 12, 0, 0, tzinfo=timezone.utc).timestamp())
+
+
+@pytest.fixture(autouse=True)
+def clear_remote_stale_env(monkeypatch):
+    monkeypatch.delenv(REMOTE_STALE_ENV, raising=False)
+
+
+def _iso(unix_ts, *, z=True):
+    dt = datetime.fromtimestamp(unix_ts, tz=timezone.utc)
+    if z:
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return dt.replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _write_remote(run_dir, payload=None, raw=None, **fields):
+    path = Path(run_dir) / REMOTE_NAME
+    if raw is not None:
+        if isinstance(raw, bytes):
+            path.write_bytes(raw)
+        else:
+            path.write_text(raw, encoding="utf-8")
+        return path
+    body = {
+        "owner": "gpu-box-1",
+        "status": "running",
+        "fingerprint": "abc",
+        "last_sync_at": _iso(_FIXED_NOW),
+        "sizes": {"events.jsonl": 1},
+    }
+    if payload is not None:
+        body = payload
+    else:
+        body.update(fields)
+    path.write_text(json.dumps(body), encoding="utf-8")
+    return path
+
+
+def _eff(run_dir, now=_FIXED_NOW, meta=None):
+    run_dir = Path(run_dir)
+    if meta is None:
+        meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
+    return _effective_status(meta, str(run_dir / "meta.json"), str(run_dir), now)
+
+
+def _eff_without_remote(run_dir, now=_FIXED_NOW):
+    path = Path(run_dir) / REMOTE_NAME
+    hidden = Path(run_dir) / ".away-remote"
+    path.rename(hidden)
+    try:
+        return _eff(run_dir, now)
+    finally:
+        hidden.rename(path)
+
+
+def test_remote_missing_uses_lock_logic(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger="agenticml.store.reader")
+    writer = RunWriter.create(tmp_path, run_id="local-only", meta={})
+    writer.close()
+    caplog.clear()
+    assert read_remote(writer.run_dir) is None
+    assert _eff(writer.run_dir, time.time()) == "running"
+    listed = {item["run_id"]: item for item in list_runs(tmp_path)}
+    assert listed["local-only"]["effective_status"] == "running"
+    assert "last_sync_at" not in listed["local-only"]
+    assert not any("remote.json" in rec.getMessage() for rec in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["", "{", b"\xff\xfe", "[]", '"running"', "1"],
+    ids=["empty", "invalid-json", "invalid-utf8", "array", "string", "number"],
+)
+def test_remote_invalid_payload_falls_back(tmp_path, caplog, raw):
+    caplog.set_level(logging.WARNING, logger="agenticml.store.reader")
+    writer = RunWriter.create(tmp_path, run_id="bad-payload", meta={})
+    writer.finish("finished", {})
+    without = _eff(writer.run_dir)
+    assert without == "finished"
+    _write_remote(writer.run_dir, raw=raw)
+    caplog.clear()
+    assert _eff(writer.run_dir) == "finished"
+    assert _eff(writer.run_dir) == without
+    assert _eff(writer.run_dir) == _eff_without_remote(writer.run_dir)
+    assert read_remote(writer.run_dir) is None
+    assert len([rec for rec in caplog.records if "remote.json" in rec.getMessage()]) == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"owner": "gpu-box-1"},
+        {"status": 1},
+        {"status": None},
+        {"status": ["running"]},
+        {"status": "paused"},
+        {"status": "stale"},
+    ],
+    ids=["missing", "int", "null", "array", "paused", "stale"],
+)
+def test_remote_invalid_status_falls_back(tmp_path, caplog, payload):
+    caplog.set_level(logging.WARNING, logger="agenticml.store.reader")
+    writer = RunWriter.create(tmp_path, run_id="bad-status", meta={})
+    writer.finish("finished", {})
+    without = _eff(writer.run_dir)
+    assert without == "finished"
+    _write_remote(writer.run_dir, payload=payload)
+    caplog.clear()
+    assert _eff(writer.run_dir) == "finished"
+    assert _eff(writer.run_dir) == without
+    assert _eff(writer.run_dir) == _eff_without_remote(writer.run_dir)
+    assert read_remote(writer.run_dir) is None
+    assert len([rec for rec in caplog.records if "remote.json" in rec.getMessage()]) == 1
+
+
+def test_remote_directory_falls_back(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger="agenticml.store.reader")
+    writer = RunWriter.create(tmp_path, run_id="dir-remote", meta={})
+    writer.finish("finished", {})
+    without = _eff(writer.run_dir)
+    assert without == "finished"
+    (writer.run_dir / REMOTE_NAME).mkdir()
+    caplog.clear()
+    assert _eff(writer.run_dir) == "finished"
+    assert _eff(writer.run_dir) == without
+    assert _eff(writer.run_dir) == _eff_without_remote(writer.run_dir)
+    assert read_remote(writer.run_dir) is None
+    assert len([rec for rec in caplog.records if "remote.json" in rec.getMessage()]) == 1
+
+
+@pytest.mark.parametrize("status", ["finished", "crashed"])
+@pytest.mark.parametrize(
+    "last_sync_at",
+    ["2026-11-03T12:00:00Z", None, 123, "not-a-time", "omit"],
+    ids=["valid", "null", "int", "garbage", "missing"],
+)
+def test_remote_terminal_status_as_is(tmp_path, status, last_sync_at):
+    writer = RunWriter.create(tmp_path, run_id=f"{status}-run", meta={})
+    writer.finish("finished", {})
+    if last_sync_at == "omit":
+        payload = {"status": status, "owner": "gpu-box-1"}
+    else:
+        payload = {"status": status, "owner": "gpu-box-1", "last_sync_at": last_sync_at}
+    _write_remote(writer.run_dir, payload=payload)
+    remote = read_remote(writer.run_dir)
+    assert remote is not None
+    assert _remote_status(remote, _FIXED_NOW) == status
+    assert _eff(writer.run_dir) == status
+
+
+def test_remote_running_within_and_beyond_window(tmp_path):
+    writer = RunWriter.create(tmp_path, run_id="window-run", meta={})
+    writer.close()
+    _write_remote(writer.run_dir, status="running", last_sync_at=_iso(_FIXED_NOW - 10))
+    assert _eff(writer.run_dir) == "running"
+    assert _remote_status(read_remote(writer.run_dir), _FIXED_NOW) == "running"
+
+    _write_remote(writer.run_dir, status="running", last_sync_at=_iso(_FIXED_NOW - 600))
+    assert _eff(writer.run_dir) == "stale"
+    assert _remote_status(read_remote(writer.run_dir), _FIXED_NOW) == "stale"
+
+    _write_remote(writer.run_dir, status="running", last_sync_at=_iso(_FIXED_NOW - 601))
+    assert _eff(writer.run_dir) == "stale"
+
+
+@pytest.mark.parametrize(
+    "last_sync_at",
+    [
+        "omit",
+        None,
+        1,
+        "not-a-time",
+        "0001-01-01T00:00:00+05:00",
+        "9999-12-31T23:59:59-05:00",
+    ],
+    ids=["missing", "null", "int", "unparseable", "year-1-offset", "year-9999-offset"],
+)
+def test_remote_running_bad_timestamp_is_stale(tmp_path, last_sync_at):
+    writer = RunWriter.create(tmp_path, run_id="bad-ts", meta={})
+    writer.close()
+    if last_sync_at == "omit":
+        payload = {"status": "running", "owner": "gpu-box-1"}
+    else:
+        payload = {"status": "running", "owner": "gpu-box-1", "last_sync_at": last_sync_at}
+    _write_remote(writer.run_dir, payload=payload)
+    remote = read_remote(writer.run_dir)
+    assert remote is not None
+    assert remote["last_sync_at"] is None
+    assert _remote_status(remote, _FIXED_NOW) == "stale"
+    assert _eff(writer.run_dir) == "stale"
+
+
+@pytest.mark.parametrize(
+    "last_sync_at",
+    ["0001-01-01T00:00:00+05:00", "9999-12-31T23:59:59-05:00"],
+    ids=["year-1-offset", "year-9999-offset"],
+)
+def test_list_runs_overflow_timestamp_does_not_raise(tmp_path, last_sync_at):
+    writer = RunWriter.create(tmp_path, run_id="overflow-ts", meta={})
+    writer.close()
+    _write_remote(writer.run_dir, status="running", last_sync_at=last_sync_at)
+    listed = list_runs(tmp_path)
+    assert listed[0]["effective_status"] == "stale"
+    assert "last_sync_at" not in listed[0]
+
+
+def test_remote_running_future_timestamp(tmp_path):
+    writer = RunWriter.create(tmp_path, run_id="future-ts", meta={})
+    writer.close()
+    _write_remote(writer.run_dir, status="running", last_sync_at=_iso(_FIXED_NOW + 60))
+    assert _eff(writer.run_dir) == "running"
+    assert _remote_status(read_remote(writer.run_dir), _FIXED_NOW) == "running"
+    _write_remote(writer.run_dir, status="running", last_sync_at=_iso(_FIXED_NOW + 61))
+    assert _eff(writer.run_dir) == "stale"
+    assert _remote_status(read_remote(writer.run_dir), _FIXED_NOW) == "stale"
+
+
+def test_remote_running_naive_timestamp_is_utc(tmp_path):
+    writer = RunWriter.create(tmp_path, run_id="naive-ts", meta={})
+    writer.close()
+    _write_remote(writer.run_dir, status="running", last_sync_at=_iso(_FIXED_NOW - 10, z=False))
+    assert _eff(writer.run_dir) == "running"
+    remote = read_remote(writer.run_dir)
+    assert remote is not None
+    assert "Z" not in remote["last_sync_at"]
+    assert _remote_status(remote, _FIXED_NOW) == "running"
+
+
+def test_remote_overrides_meta_status(tmp_path):
+    done = RunWriter.create(tmp_path, run_id="meta-finished", meta={})
+    done.finish("finished", {})
+    _write_remote(done.run_dir, status="running", last_sync_at=_iso(_FIXED_NOW - 5))
+    assert json.loads((done.run_dir / "meta.json").read_text(encoding="utf-8"))["status"] == "finished"
+    assert _eff(done.run_dir) == "running"
+
+    live = RunWriter.create(tmp_path, run_id="meta-running", meta={})
+    live.close()
+    assert json.loads((live.run_dir / "meta.json").read_text(encoding="utf-8"))["status"] == "running"
+    _write_remote(live.run_dir, status="finished", last_sync_at=_iso(_FIXED_NOW - 5))
+    assert _eff(live.run_dir) == "finished"
+
+
+def test_remote_stale_seconds_env(tmp_path, monkeypatch, caplog):
+    import agenticml.store.reader as reader
+
+    caplog.set_level(logging.WARNING, logger="agenticml.store.reader")
+    monkeypatch.setattr(reader, "_REMOTE_STALE_WARNED", set())
+    caplog.clear()
+    assert remote_stale_seconds() == REMOTE_STALE_SECONDS
+    assert not any(REMOTE_STALE_ENV in rec.getMessage() for rec in caplog.records)
+
+    monkeypatch.setenv(REMOTE_STALE_ENV, "30")
+    assert remote_stale_seconds() == 30
+    writer = RunWriter.create(tmp_path, run_id="custom-window", meta={})
+    writer.close()
+    _write_remote(writer.run_dir, status="running", last_sync_at=_iso(_FIXED_NOW - 45))
+    assert _eff(writer.run_dir) == "stale"
+    _write_remote(writer.run_dir, status="running", last_sync_at=_iso(_FIXED_NOW - 15))
+    assert _eff(writer.run_dir) == "running"
+
+    monkeypatch.setenv(REMOTE_STALE_ENV, "1.5")
+    assert remote_stale_seconds() == 1.5
+
+    monkeypatch.setenv(REMOTE_STALE_ENV, "2")
+    assert remote_stale_seconds() == 2
+    _write_remote(writer.run_dir, status="running", last_sync_at=_iso(_FIXED_NOW - 1))
+    assert _eff(writer.run_dir) == "running"
+    _write_remote(writer.run_dir, status="running", last_sync_at=_iso(_FIXED_NOW - 2))
+    assert _eff(writer.run_dir) == "stale"
+
+    monkeypatch.setattr(reader, "_REMOTE_STALE_WARNED", set())
+    caplog.clear()
+    for bad in ("", "abc", "0", "-5", "nan", "inf"):
+        monkeypatch.setenv(REMOTE_STALE_ENV, bad)
+        assert remote_stale_seconds() == REMOTE_STALE_SECONDS
+        assert remote_stale_seconds() == REMOTE_STALE_SECONDS
+    messages = [rec.getMessage() for rec in caplog.records if REMOTE_STALE_ENV in rec.getMessage()]
+    assert len(messages) == 6
+
+
+def test_run_reader_remote_and_last_sync_at(tmp_path):
+    writer = RunWriter.create(tmp_path, run_id="reader-remote", meta={})
+    writer.close()
+    reader = RunReader(tmp_path, "reader-remote")
+    assert reader.remote() is None
+    assert reader.last_sync_at() is None
+
+    iso = _iso(_FIXED_NOW - 10)
+    _write_remote(writer.run_dir, status="running", last_sync_at=iso, owner="gpu-box-1")
+    remote = reader.remote()
+    assert remote == {"status": "running", "last_sync_at": iso, "owner": "gpu-box-1"}
+    assert reader.last_sync_at() == iso
+
+    _write_remote(writer.run_dir, raw="{")
+    assert reader.remote() is None
+    assert reader.last_sync_at() is None
+
+    _write_remote(writer.run_dir, status="running", last_sync_at="bogus", owner="gpu-box-1")
+    remote = reader.remote()
+    assert remote["status"] == "running"
+    assert remote["last_sync_at"] is None
+    assert reader.last_sync_at() is None
+
+
+def test_list_runs_remote_status_and_last_sync_at(tmp_path):
+    now = time.time()
+    fresh_iso = _iso(now - 120)
+    stale_iso = _iso(now - 3600)
+
+    fresh = RunWriter.create(tmp_path, run_id="remote-fresh", meta={})
+    fresh.close()
+    _write_remote(fresh.run_dir, status="running", last_sync_at=fresh_iso)
+
+    stale = RunWriter.create(tmp_path, run_id="remote-stale", meta={})
+    stale.close()
+    _write_remote(stale.run_dir, status="running", last_sync_at=stale_iso)
+
+    done = RunWriter.create(tmp_path, run_id="remote-finished", meta={})
+    done.finish("finished", {})
+    _write_remote(done.run_dir, status="finished", last_sync_at=fresh_iso)
+
+    crashed = RunWriter.create(tmp_path, run_id="remote-crashed", meta={})
+    crashed.finish("crashed", {})
+    _write_remote(crashed.run_dir, status="crashed", last_sync_at=fresh_iso)
+
+    invalid = RunWriter.create(tmp_path, run_id="remote-invalid", meta={})
+    invalid.finish("finished", {})
+    _write_remote(invalid.run_dir, raw="{")
+
+    local = RunWriter.create(tmp_path, run_id="local-run", meta={})
+    local.close()
+
+    bad_ts = RunWriter.create(tmp_path, run_id="bad-ts-run", meta={})
+    bad_ts.finish("finished", {})
+    _write_remote(bad_ts.run_dir, payload={"status": "finished", "last_sync_at": "nope"})
+
+    by_id = {item["run_id"]: item for item in list_runs(tmp_path)}
+    assert by_id["remote-fresh"]["effective_status"] == "running"
+    assert by_id["remote-fresh"]["last_sync_at"] == fresh_iso
+    assert by_id["remote-stale"]["effective_status"] == "stale"
+    assert by_id["remote-stale"]["last_sync_at"] == stale_iso
+    assert by_id["remote-finished"]["effective_status"] == "finished"
+    assert by_id["remote-crashed"]["effective_status"] == "crashed"
+    assert by_id["remote-invalid"]["effective_status"] == "finished"
+    assert "last_sync_at" not in by_id["remote-invalid"]
+    assert "last_sync_at" not in by_id["local-run"]
+    assert "last_sync_at" not in by_id["bad-ts-run"]
+
+    disk = json.loads((fresh.run_dir / "meta.json").read_text(encoding="utf-8"))
+    assert "effective_status" not in disk
+    assert "last_sync_at" not in disk
+    meta = RunReader(tmp_path, "remote-fresh").meta()
+    assert "effective_status" not in meta
+    assert "last_sync_at" not in meta
+
+
+def test_remote_corrupt_warns_once(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger="agenticml.store.reader")
+    writer = RunWriter.create(tmp_path, run_id="corrupt-remote", meta={})
+    writer.close()
+    _write_remote(writer.run_dir, raw="{")
+    caplog.clear()
+    list_runs(tmp_path)
+    list_runs(tmp_path)
+    list_runs(tmp_path)
+    messages = [rec.getMessage() for rec in caplog.records if "remote.json" in rec.getMessage()]
+    assert len(messages) == 1
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_remote_symlink_falls_back_without_reading_target(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger="agenticml.store.reader")
+    writer = RunWriter.create(tmp_path, run_id="sym-remote", meta={})
+    writer.close()
+    without = _eff(writer.run_dir)
+    secret = tmp_path / "secret-remote.json"
+    secret.write_text(
+        json.dumps({"status": "finished", "last_sync_at": _iso(_FIXED_NOW), "owner": "attacker"}),
+        encoding="utf-8",
+    )
+    (writer.run_dir / REMOTE_NAME).symlink_to(secret)
+    caplog.clear()
+    assert _eff(writer.run_dir) == without
+    assert _eff(writer.run_dir) == _eff_without_remote(writer.run_dir)
+    assert read_remote(writer.run_dir) is None
+    assert RunReader(tmp_path, "sym-remote").remote() is None
+    assert any("symlinked remote.json" in rec.getMessage() for rec in caplog.records)
+
+
+def test_writer_never_creates_remote_json(tmp_path):
+    writer = RunWriter.create(tmp_path, run_id="no-remote", meta={})
+    assert not (writer.run_dir / REMOTE_NAME).exists()
+    writer.write_scalars([(0, {"loss": 1.0})])
+    assert not (writer.run_dir / REMOTE_NAME).exists()
+    writer.finish("finished", {})
+    assert not (writer.run_dir / REMOTE_NAME).exists()

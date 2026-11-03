@@ -59,6 +59,7 @@ _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 
 META_NAME = "meta.json"
 EVENTS_NAME = "events.jsonl"
+REMOTE_NAME = "remote.json"
 INDEX_NAME = "index.json"
 TIME_BIN_NAME = "_time.bin"
 SCALARS_DIRNAME = "scalars"
