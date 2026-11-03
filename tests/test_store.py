@@ -2431,14 +2431,13 @@ def test_remote_invalid_payload_falls_back(tmp_path, caplog, raw):
 @pytest.mark.parametrize(
     "payload",
     [
-        {"owner": "gpu-box-1"},
         {"status": 1},
         {"status": None},
         {"status": ["running"]},
         {"status": "paused"},
         {"status": "stale"},
     ],
-    ids=["missing", "int", "null", "array", "paused", "stale"],
+    ids=["int", "null", "array", "paused", "stale"],
 )
 def test_remote_invalid_status_falls_back(tmp_path, caplog, payload):
     caplog.set_level(logging.WARNING, logger="agenticml.store.reader")
@@ -2453,6 +2452,35 @@ def test_remote_invalid_status_falls_back(tmp_path, caplog, payload):
     assert _eff(writer.run_dir) == _eff_without_remote(writer.run_dir)
     assert read_remote(writer.run_dir) is None
     assert len([rec for rec in caplog.records if "remote.json" in rec.getMessage()]) == 1
+
+
+@pytest.mark.parametrize(
+    "terminal,expected",
+    [(None, "stale"), ("finished", "finished")],
+    ids=["running", "finished"],
+)
+def test_remote_precommit_derives_status_from_meta(tmp_path, caplog, terminal, expected):
+    caplog.set_level(logging.WARNING, logger="agenticml.store.reader")
+    writer = RunWriter.create(tmp_path, run_id="precommit", meta={})
+    if terminal is None:
+        writer.close()
+        (writer.run_dir / "run.lock").unlink(missing_ok=True)
+    else:
+        writer.finish(terminal, {})
+    _write_remote(writer.run_dir, raw='{"owner": "one"}')
+    caplog.clear()
+    remote = {"status": None, "last_sync_at": None, "owner": "one"}
+    assert read_remote(writer.run_dir) == remote
+    assert _eff(writer.run_dir) == expected
+    listed = {item["run_id"]: item for item in list_runs(tmp_path)}
+    assert listed["precommit"]["effective_status"] == expected
+    assert "last_sync_at" not in listed["precommit"]
+    reader = RunReader(tmp_path, "precommit")
+    assert reader.remote() == remote
+    assert reader.last_sync_at() is None
+    assert not any("remote.json" in rec.getMessage() for rec in caplog.records)
+    if terminal is None:
+        assert _eff_without_remote(writer.run_dir) == "crashed"
 
 
 def test_remote_directory_falls_back(tmp_path, caplog):

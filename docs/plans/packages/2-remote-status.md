@@ -155,7 +155,8 @@ No changes to `ui/`, `cli.py`, `sync.py`, `gc.py`, `amend.py` or the writer.
 | --- | --- |
 | No `remote.json` | Today's lock-based logic |
 | Empty file, invalid JSON, invalid UTF-8, JSON array/string/number | Lock-based logic, one warning |
-| `status` missing, not a string, or unknown (`"paused"`, `"stale"`) | Lock-based logic, one warning |
+| Pre-commit file: a JSON object with no `status` key (package 1 writes `{"owner": ...}` when a run is created, before its first commit) | No warning. `meta.json` status `running` → `stale`; any other `meta.json` status as is. `remote()` returns `status: None` with the owner |
+| `status` present but not a string (including `null`), or unknown (`"paused"`, `"stale"`) | Lock-based logic, one warning |
 | `remote.json` is a symlink or a directory | Lock-based logic, one warning |
 | `finished` / `crashed`, any `last_sync_at` (even missing/garbage) | As is |
 | `running`, `last_sync_at` within window | `running` |

@@ -171,7 +171,11 @@ def _warn_remote_once(run_path, message, *args) -> None:
 
 
 def read_remote(run_path) -> dict | None:
-    """Normalised ``remote.json``, or None if the file is missing or invalid."""
+    """Normalised ``remote.json``, or None if the file is missing or invalid.
+
+    A JSON object with no ``status`` key is the pre-commit form: returned
+    with ``status`` and ``last_sync_at`` set to None, and no warning.
+    """
     directory = Path(run_path)
     path = directory / REMOTE_NAME
     try:
@@ -194,6 +198,11 @@ def read_remote(run_path) -> dict | None:
     if not isinstance(data, dict):
         _warn_remote_once(directory, "invalid remote.json in %s", directory)
         return None
+    owner = data.get("owner")
+    if not isinstance(owner, str):
+        owner = None
+    if "status" not in data:
+        return {"status": None, "last_sync_at": None, "owner": owner}
     status = data.get("status")
     if not isinstance(status, str) or status not in _REMOTE_STATUSES:
         _warn_remote_once(directory, "invalid remote.json status %r in %s", status, directory)
@@ -206,9 +215,6 @@ def read_remote(run_path) -> dict | None:
             last_sync_at = None
     else:
         last_sync_at = None
-    owner = data.get("owner")
-    if not isinstance(owner, str):
-        owner = None
     return {"status": status, "last_sync_at": last_sync_at, "owner": owner}
 
 
@@ -306,6 +312,11 @@ def _effective_status(meta: dict, meta_path: str, run_path: str, now: float, *, 
 
 def _status_from(meta: dict, run_path: str, now: float, remote, lock=None) -> str:
     if remote is not None:
+        if remote["status"] is None:
+            status = meta.get("status")
+            if not isinstance(status, str):
+                status = ""
+            return "stale" if status == "running" else status
         return _remote_status(remote, now)
     status = meta.get("status")
     if not isinstance(status, str):

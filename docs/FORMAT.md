@@ -294,7 +294,10 @@ editing.
 
 Server-only. `agenticml server` writes it atomically on each sync commit.
 Local writers and `agenticml sync` never create or upload it. A local store
-does not contain this file.
+does not contain this file. Before the first commit the file is
+`{"owner": "<key>"}` with no `status`; readers treat that as valid and show
+`stale` when `meta.json` is `running`, or the `meta.json` status as is
+otherwise.
 
 ```json
 {"owner": "gpu-box-1", "status": "running", "fingerprint": "...",
@@ -310,23 +313,25 @@ does not contain this file.
 | `sizes` | File sizes the server checked at commit. |
 
 Readers use `status`, `last_sync_at`, and `owner`. Other fields are ignored.
-When the file is present and valid it takes precedence over `meta.json`
-status and over lock-based liveness.
+When the file is present and valid it takes precedence over lock-based
+liveness, and over `meta.json` status once it has a `status`.
 
 | `remote.json` status | Shown as |
 | --- | --- |
 | `finished`, `crashed` | as is |
 | `running`, last sync within `AGENTICML_REMOTE_STALE_SECONDS` (default 600) | `running` |
 | `running`, older | `stale` |
+| no `status` key (pre-commit) | `stale` if `meta.json` is `running`, else `meta.json` status as is |
 | file missing or invalid | today's lock-based logic |
 
 `running` with a missing, non-string, or unparseable `last_sync_at` is
 `stale`. A timestamp up to 60 seconds in the future still counts as
 `running`; further ahead is `stale`. Naive timestamps without `Z` are
-parsed as UTC. An invalid file (not UTF-8, not a JSON object, unknown or
-missing `status`, a symlink, or a directory) is ignored and the lock-based
-rules apply. `list_runs` copies a valid `last_sync_at` onto the returned
-dict; it does not add the key when the timestamp is missing or invalid.
+parsed as UTC. An invalid file (not UTF-8, not a JSON object, a `status`
+key that is present but unknown or not a valid string, a symlink, or a
+directory) is ignored and the lock-based rules apply. `list_runs` copies a
+valid `last_sync_at` onto the returned dict; it does not add the key when
+the timestamp is missing or invalid.
 
 ## Scalars
 
