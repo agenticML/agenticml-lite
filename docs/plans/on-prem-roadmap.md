@@ -51,8 +51,8 @@ Update the status column in the PR that changes it. Values: `not started`,
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 0 | Test CI (Linux, Python 3.9 and 3.12, UI suite) | – | Codex | S | [plan](packages/0-test-ci.md) | in review |
-| 1 † | Server ingest, keys, `/v2` endpoints, server lock | – | Codex | L | to write | not started |
+| 0 | Test CI (Linux, Python 3.9 and 3.12, UI suite) | – | Codex | S | [plan](packages/0-test-ci.md) | done ([#24](https://github.com/agenticML/agenticml-lite/pull/24)) |
+| 1 † | Server ingest, keys, `/v2` endpoints, server lock | – | Codex | L | [plan](packages/1-server-ingest.md) | in review |
 | 2 | Run status from `remote.json` | – | Cursor | S | [plan](packages/2-remote-status.md) | in review |
 | 3 | Sync client v2 and `docs/PROTOCOL.md` | 1 | Codex | L | to write | not started |
 | 4 † | Server dashboard: key login, sessions, CSRF, last synced | 1, 2 | Cursor | M | to write | not started |
@@ -149,6 +149,21 @@ Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
+- **`agenticml server serve` has no SIGTERM handler.**
+  Where: `src/agenticml/server/app.py` (`serve`). Problem: `docker stop` and
+  ECS send SIGTERM, which kills the process with Python's default handler, so
+  in-flight requests are cut off and `server_close` (join workers, then
+  release `server.lock`) never runs. Appends roll back only on exceptions,
+  not on a kill. Fix: install a SIGTERM handler in `serve` that calls
+  `server.shutdown()` from another thread, then let `server_close` drain the
+  workers. Done when a test sends SIGTERM to a `serve` subprocess during an
+  append and the process exits 0 after the request completes. Needed before
+  package 6.
+- **Tests workflow does not run on pushes to `dev`.**
+  Where: `.github/workflows/test.yml`. Problem: `push` triggers only on
+  `main`, but package PRs merge into `dev`, so the merged `dev` head is never
+  tested on its own. Fix: add `dev` to `on.push.branches`. Done when a push to
+  `dev` starts the `Tests` workflow.
 - **FIFO at a run file hangs the reader.** Where: `store/layout.py`
   `read_file_nofollow`, used by `list_runs` for `meta.json` and
   `remote.json`. Problem: it opens without `O_NONBLOCK`, so a FIFO named
