@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>agenticml · First admin key</title>
+    <link rel="stylesheet" href="/static/app.css" />
+    <script type="module" src="/static/setup.js"></script>
+  </head>
+  <body class="login-page">
+    <main class="login-card" style="min-width: 0; overflow-wrap: anywhere">
+      <p class="eyebrow">agenticml</p>
+      <h1>First admin key</h1>
+      <form id="setup" autocomplete="off">
+        <label class="field-label" for="name">Key name</label>
+        <input id="name" class="field" name="name" value="admin"
+               pattern="[A-Za-z0-9._\-]{1,64}" maxlength="64" required />
+        <button class="btn btn-primary" type="submit">Create admin key</button>
+      </form>
+      <p id="error" class="error" role="alert" hidden></p>
+      <section id="result" hidden>
+        <p>This key is shown once and cannot be recovered.</p>
+        <p><code id="value" style="white-space: pre-wrap"></code></p>
+        <button id="copy-value" class="btn btn-secondary" type="button">Copy key</button>
+        <p><code id="command" style="white-space: pre-wrap"></code></p>
+        <button id="copy-command" class="btn btn-secondary" type="button">Copy command</button>
+        <p id="host-note" class="muted" hidden>No --public-url is set, so this uses the address you opened the dashboard at.</p>
+        <p><a class="btn btn-primary" href="/">Open dashboard</a></p>
+      </section>
+    </main>
+  </body>
+</html>

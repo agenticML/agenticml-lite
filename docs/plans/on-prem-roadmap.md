@@ -55,8 +55,8 @@ Update the status column in the PR that changes it. Values: `not started`,
 | 1 † | Server ingest, keys, `/v2` endpoints, server lock | – | Codex | L | [plan](packages/1-server-ingest.md) | done ([#26](https://github.com/agenticML/agenticml-lite/pull/26)) |
 | 2 | Run status from `remote.json` | – | Cursor | S | [plan](packages/2-remote-status.md) | done ([#25](https://github.com/agenticML/agenticml-lite/pull/25)) |
 | 3 | Sync client v2 and `docs/PROTOCOL.md` | 1 | Cursor (client), Codex (sync); prose Antigravity | L | [plan](packages/3-sync-client-v2.md) | done ([#27](https://github.com/agenticML/agenticml-lite/pull/27)) |
-| 4 † | Server dashboard: key login, sessions, CSRF, last synced | 1, 2 | Cursor | M | [plan](packages/4-server-dashboard.md) | in review |
-| 4b † | Key management in the dashboard: first-key setup, issue / list / revoke sync and admin keys | 1, 4 | Codex | M | to write | not started |
+| 4 † | Server dashboard: key login, sessions, CSRF, last synced | 1, 2 | Cursor | M | [plan](packages/4-server-dashboard.md) | done ([#28](https://github.com/agenticML/agenticml-lite/pull/28)) |
+| 4b † | Key management in the dashboard: first-key setup, issue / list / revoke sync and admin keys | 1, 4 | Codex | M | [plan](packages/4b-key-management.md) | in review |
 | 5 | `sync --follow` and systemd example | 3 | Cursor | M | to write | not started |
 | 6 | Image, deploy examples, docs, security policy, 2.0.0 release | 1, 3, 4, 4b, 5 | Codex; prose Antigravity | M | to write | not started |
 
@@ -182,4 +182,15 @@ priority.
   after `fstat`) so a non-regular file is refused without blocking. Matters
   more once the server writes runs on behalf of remote keys. Done when a test
   with a FIFO `meta.json` and a FIFO `remote.json` shows `list_runs` returning
-  promptly and skipping or falling back as for any invalid file.
+  promptly and skipping or falling back as for any invalid file. (Package 4b
+  fixed the same problem for `keys.lock` and `server.lock`.)
+- **Flaky lineage focus-trap UI test.** Where:
+  `testbed/tests/test_task_groups.py::test_lineage_view_traps_focus_and_flags_failures`.
+  Problem: it fails about 1 run in 40, both before and after package 4b (it
+  failed 1 of 40 runs on each, measured Nov 5, 2026). After the click on a
+  failed node, the async `/lineage` fetch re-renders the inspector. If that
+  lands inside the Tab loop, `document.activeElement` is briefly `<body>`, and
+  the per-press `contains` check fails. Fix: wait for the inspector to settle
+  (the fetch done and the node re-rendered) before the Tab loop, or make the
+  check retry until focus is back inside the dialog. Done when 100 runs of the
+  test pass in a row.

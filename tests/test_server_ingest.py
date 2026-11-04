@@ -175,6 +175,49 @@ def test_lock_tmp_cleanup_and_permissions(tmp_path, caplog):
         pass
 
 
+@pytest.mark.parametrize("reader", [False, True], ids=["no-reader", "with-reader"])
+def test_server_lock_fifo_fails_promptly(tmp_path, reader):
+    app.prepare_data_dir(tmp_path)
+    path = tmp_path / "server" / "server.lock"
+    os.mkfifo(path, 0o600)
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK) if reader else None
+    results, errors = [], []
+    def attempt():
+        try:
+            results.append(make_server(tmp_path, port=0))
+        except Exception as exc:
+            errors.append(exc)
+    before = len(os.listdir("/proc/self/fd")) if os.path.isdir("/proc/self/fd") else None
+    thread = threading.Thread(target=attempt, daemon=True)
+    try:
+        thread.start()
+        thread.join(timeout=3)
+        assert not thread.is_alive(), "server.lock FIFO blocked startup"
+        assert not results and len(errors) == 1
+        assert isinstance(errors[0], ValueError)
+        assert str(errors[0]) == "server.lock is not a regular file"
+        if before is not None:
+            assert len(os.listdir("/proc/self/fd")) == before
+    finally:
+        if fd is not None:
+            os.close(fd)
+        for httpd in results:
+            httpd.server_close()
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="requires procfs fd counts")
+@pytest.mark.parametrize("error", [OSError, KeyboardInterrupt])
+def test_server_lock_fdopen_failure_does_not_leak_fd(tmp_path, monkeypatch, error):
+    app.prepare_data_dir(tmp_path)
+    def fail(*args):
+        raise error("fdopen failed")
+    monkeypatch.setattr(os, "fdopen", fail)
+    before = len(os.listdir("/proc/self/fd"))
+    with pytest.raises(error, match="fdopen failed"):
+        make_server(tmp_path, port=0)
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
 def test_close_holds_lock_until_active_handler_finishes(tmp_path, monkeypatch):
     entered, release = threading.Event(), threading.Event()
     original = ingest.IngestHandler._object

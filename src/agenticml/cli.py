@@ -501,7 +501,7 @@ def cmd_server_serve(args):
 
 def cmd_server_keys(args):
     from .server.app import resolve_data_dir
-    from .server.keys import KeyStore
+    from .server.keys import KeyStore, KeyStoreUnavailable
 
     try:
         data = resolve_data_dir(args.data)
@@ -534,7 +534,7 @@ def cmd_server_keys(args):
     except KeyboardInterrupt:
         print("stopped")
         return 0
-    except (OSError, ValueError, OverflowError) as exc:
+    except (OSError, ValueError, OverflowError, KeyStoreUnavailable) as exc:
         print(f"agenticml server: {str(exc).splitlines()[0]}", file=sys.stderr)
         return 1
     return 0

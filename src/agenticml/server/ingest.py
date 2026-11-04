@@ -77,10 +77,12 @@ def _hash_prefix(handle, size):
 
 
 class IngestHandler(DashboardHandler):
-    def _json(self, value, status=200, headers=None):
+    def _begin(self, status, content_type, length, headers=None):
         if self.close_connection:
-            headers = {**(headers or {}), "Connection": "close"}
-        super()._json(value, status, headers)
+            headers = {name: value for name, value in (headers or {}).items()
+                       if name.lower() != "connection"}
+            headers["Connection"] = "close"
+        super()._begin(status, content_type, length, headers)
 
     def log_message(self, fmt, *args):
         # The base access log includes the raw request target, which may contain

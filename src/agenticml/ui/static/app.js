@@ -308,6 +308,7 @@ fetch("/api/server/session", { credentials: "same-origin" })
     }
     if (!response.ok || !data) return;
     serverMode = true;
+    document.querySelector("#nav-keys").hidden = false;
     const box = document.querySelector("#session");
     const label = document.querySelector("#session-label");
     label.textContent = `Signed in as ${data.key}`;
@@ -3602,6 +3603,267 @@ async function comparePage(ids, version) {
   if (epoch === version && runs.some((run) => run.status === "running"))
     timer = setTimeout(refresh, 5000);
 }
+function shellQuote(value) {
+  return "'" + value.replaceAll("'", "'\\''") + "'";
+}
+
+async function keysPage(version) {
+  const signal = controller.signal;
+  let activeDialog;
+  let refreshSequence = 0;
+  let disposed = false;
+  const closeDialog = () => {
+    const current = activeDialog;
+    if (!current) return;
+    current.wipe();
+    current.host.close();
+  };
+  const restorePage = (event) => {
+    if (event.persisted) closeDialog();
+  };
+  window.addEventListener("pagehide", closeDialog);
+  window.addEventListener("pageshow", restorePage);
+  const dispose = () => {
+    disposed = true;
+    window.removeEventListener("pagehide", closeDialog);
+    window.removeEventListener("pageshow", restorePage);
+    closeDialog();
+  };
+  cleanup = dispose;
+  const content = el("div", { class: "table-scroll" });
+  const columns = ["Name", "Scope", "Prefix", "Created", "Created by", "Last used", "Runs", "Revoke"];
+
+  async function request(url, method, body) {
+    const response = await fetch(url, {
+      method,
+      signal,
+      credentials: "same-origin",
+      headers: { "X-AgenticML-Request": "1", "Content-Type": "application/json" },
+      body: body == null ? undefined : JSON.stringify(body),
+    });
+    if (epoch !== version) throw new DOMException("Route changed", "AbortError");
+    if (response.status === 401) {
+      dispose();
+      location.assign("/login");
+      throw new DOMException("Redirecting to login", "AbortError");
+    }
+    const data = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(
+      (typeof data?.error === "string" && data.error) || `Key request failed (${response.status})`);
+    if (data === null || typeof data !== "object" || Array.isArray(data) ||
+        (method === "POST" && (typeof data.key !== "string" || typeof data.host !== "string")))
+      throw new Error(`Key request failed (${response.status})`);
+    return data;
+  }
+
+  function dialog(title) {
+    let copyTimer;
+    const copies = [];
+    const previous = document.activeElement;
+    const host = el("dialog", { class: "key-dialog", "aria-label": title });
+    const body = el("div", { class: "stack" });
+    const error = el("p", { class: "error", role: "alert", hidden: true });
+    const status = el("span", { class: "key-copy-status", role: "status", "aria-live": "polite" });
+    function wipe() {
+      clearTimeout(copyTimer);
+      const selection = window.getSelection();
+      for (let index = 0; index < (selection?.rangeCount || 0); index++) {
+        if (selection.getRangeAt(index).intersectsNode(host)) {
+          selection.removeAllRanges();
+          break;
+        }
+      }
+      host.querySelectorAll("code").forEach((node) => { node.textContent = ""; });
+      copies.length = 0;
+      host.replaceChildren();
+      if (activeDialog?.host === host) activeDialog = null;
+    }
+    function copyCode(label, code) {
+      const copy = button(label, async () => {
+        try {
+          await navigator.clipboard.writeText(code.textContent);
+          if (!code.isConnected) return;
+          copy.textContent = "Copied";
+        } catch {
+          if (!code.isConnected) return;
+          const range = document.createRange();
+          range.selectNodeContents(code);
+          const selection = window.getSelection();
+          selection.removeAllRanges();
+          selection.addRange(range);
+          copy.textContent = /Mac|iPhone|iPad/.test(navigator.platform)
+            ? "Press ⌘C to copy" : "Press Ctrl+C to copy";
+        }
+        status.textContent = copy.textContent;
+        clearTimeout(copyTimer);
+        copyTimer = setTimeout(() => {
+          copies.forEach(([node, text]) => { node.textContent = text; });
+          status.textContent = "";
+        }, 2000);
+      }, "secondary");
+      copies.push([copy, label]);
+      return copy;
+    }
+    host.append(
+      el("div", { class: "heading" },
+        el("h2", { text: title }),
+        button("Close", () => host.close(), "secondary")),
+      body, error, status,
+    );
+    host.addEventListener("keydown", (event) => {
+      if (event.key === "Tab") trapTab(host, event);
+    });
+    host.addEventListener("close", async () => {
+      wipe();
+      host.remove();
+      if (epoch === version && !disposed) {
+        try {
+          await refresh();
+        } catch (reason) {
+          if (epoch === version) showError(content, reason);
+        }
+        if (epoch === version && !activeDialog)
+          (previous?.isConnected ? previous : newKeyButton).focus();
+      }
+    }, { once: true });
+    activeDialog = { host, wipe };
+    app.append(host);
+    return { host, body, error, copyCode, wipe };
+  }
+
+  function failure(error, reason) {
+    if (reason.name === "AbortError") return;
+    error.textContent = reason.message;
+    error.hidden = false;
+  }
+
+  function newKey() {
+    const { host, body, error, copyCode } = dialog("New key");
+    const name = el("input", {
+      id: "key-name", class: "field", required: true, maxLength: 64,
+      pattern: "[A-Za-z0-9._\\-]{1,64}", autocomplete: "off",
+    });
+    const scope = el("select", { id: "key-scope", class: "field" },
+      el("option", { value: "sync", text: "sync" }),
+      el("option", { value: "admin", text: "admin" }));
+    const create = el("button", { type: "submit", class: "btn btn-primary", text: "Create" });
+    const form = el("form", { class: "stack" },
+      el("label", { class: "field-label", htmlFor: name.id, text: "Name" }), name,
+      el("label", { class: "field-label", htmlFor: scope.id, text: "Scope" }), scope, create);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      name.setCustomValidity(["env", ".", ".."].includes(name.value) ? "Invalid or reserved key name" : "");
+      if (!form.reportValidity()) return;
+      error.hidden = true;
+      create.disabled = true;
+      try {
+        const data = await request("/api/server/keys", "POST", { name: name.value, scope: scope.value });
+        if (epoch !== version || !host.open) {
+          data.key = null;
+          if (epoch === version) await refresh();
+          return;
+        }
+        const value = el("code", { class: "key-value", text: data.key });
+        const command = el("code", {
+          class: "key-command", text: `agenticml login --host ${shellQuote(data.host)} --key ${shellQuote(data.key)}`,
+        });
+        data.key = null;
+        body.replaceChildren(
+          el("p", { text: "This key is shown once and cannot be recovered." }),
+          value, copyCode("Copy key", value), command, copyCode("Copy command", command),
+          el("p", {
+            class: "muted", hidden: data.host_source !== "request",
+            text: "No --public-url is set, so this uses the address you opened the dashboard at.",
+          }),
+        );
+        body.querySelector("button").focus();
+      } catch (reason) {
+        if (epoch === version && host.open) failure(error, reason);
+        if (reason.name !== "AbortError") create.disabled = false;
+      }
+    });
+    name.addEventListener("input", () => name.setCustomValidity(""));
+    body.append(form);
+    host.showModal();
+    name.focus();
+  }
+
+  function revokeKey(key) {
+    const { host, body, error } = dialog(`Revoke ${key.name}?`);
+    const revoke = button("Revoke", async () => {
+      error.hidden = true;
+      revoke.disabled = true;
+      try {
+        const data = await request(`/api/server/keys/${encodeURIComponent(key.name)}`, "DELETE");
+        if (epoch !== version) return;
+        if (data.signed_out) location.assign("/login");
+        else if (host.open) host.close();
+        else await refresh();
+      } catch (reason) {
+        if (epoch === version && host.open) failure(error, reason);
+        if (reason.name !== "AbortError") revoke.disabled = false;
+      }
+    }, "primary");
+    body.append(el("p", {
+      text: `Revoke ${key.name}? Machines using it stop syncing on their next request, and its dashboard sessions end.`,
+    }), el("div", { class: "inline" }, button("Cancel", () => host.close(), "secondary"), revoke));
+    host.showModal();
+    body.querySelector("button").focus();
+  }
+
+  async function refresh() {
+    const sequence = ++refreshSequence;
+    const response = await fetch("/api/server/keys", { signal, credentials: "same-origin" });
+    if (epoch !== version || sequence !== refreshSequence || disposed) return;
+    if (response.status === 404) {
+      dispose();
+      cleanup = () => {};
+      await home(version);
+      return;
+    }
+    if (response.status === 401) {
+      dispose();
+      location.assign("/login");
+      return;
+    }
+    const data = await response.json().catch(() => null);
+    if (epoch !== version || sequence !== refreshSequence || disposed) return;
+    if (!response.ok) throw new Error(
+      (typeof data?.error === "string" && data.error) || `Could not load keys (${response.status})`);
+    if (!Array.isArray(data?.keys) || data.keys.some((key) =>
+      key === null || typeof key !== "object" || Array.isArray(key) ||
+      ["name", "scope", "prefix", "created_at", "created_by"].some((field) => typeof key[field] !== "string") ||
+      (key.last_used_at !== null && typeof key.last_used_at !== "string") ||
+      (key.runs !== null && (!Number.isInteger(key.runs) || key.runs < 0)) ||
+      typeof key.revocable !== "boolean"))
+      throw new Error(`Could not load keys (${response.status})`);
+    const rows = data.keys.map((key) => {
+      const values = [key.name, key.scope, `${key.prefix}…`, date(key.created_at),
+        key.created_by, key.last_used_at == null ? "never" : date(key.last_used_at),
+        key.runs == null ? "–" : String(key.runs),
+        key.revocable ? button("Revoke", () => revokeKey(key), "secondary") : "–"];
+      return el("tr", { role: "row" }, ...values.map((value, index) =>
+        el("td", { role: "cell", "data-label": columns[index] }, value == null ? "–" : value)));
+    });
+    content.replaceChildren(el("table", { class: "keys-table", role: "table", "aria-label": "Keys" },
+      el("thead", { role: "rowgroup" }, el("tr", { role: "row" },
+        ...columns.map((text) => el("th", { role: "columnheader", scope: "col", text })))),
+      el("tbody", { role: "rowgroup" }, ...rows)));
+  }
+
+  const newKeyButton = button("New key", newKey, "primary");
+  app.replaceChildren(el("div", { class: "workspace stack" },
+    el("div", { class: "heading" }, el("h1", { text: "Keys" }), newKeyButton),
+    content));
+  try {
+    await refresh();
+  } catch (reason) {
+    dispose();
+    if (epoch === version) cleanup = () => {};
+    throw reason;
+  }
+}
+
 async function route() {
   const version = ++epoch;
   controller?.abort();
@@ -3612,7 +3874,8 @@ async function route() {
   app.replaceChildren(loading("Loading runs…"));
   try {
     const hash = location.hash.slice(1) || "/";
-    if (hash.startsWith("/run/"))
+    if (hash === "/keys") await keysPage(version);
+    else if (hash.startsWith("/run/"))
       await runPage(decodeURIComponent(hash.slice(5)), version);
     else if (hash.startsWith("/compare")) {
       const query = new URLSearchParams(hash.slice(hash.indexOf("?") + 1));
