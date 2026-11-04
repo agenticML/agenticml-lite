@@ -52,8 +52,8 @@ Update the status column in the PR that changes it. Values: `not started`,
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | 0 | Test CI (Linux, Python 3.9 and 3.12, UI suite) | – | Codex | S | [plan](packages/0-test-ci.md) | done ([#24](https://github.com/agenticML/agenticml-lite/pull/24)) |
-| 1 † | Server ingest, keys, `/v2` endpoints, server lock | – | Codex | L | [plan](packages/1-server-ingest.md) | in review |
-| 2 | Run status from `remote.json` | – | Cursor | S | to write | not started |
+| 1 † | Server ingest, keys, `/v2` endpoints, server lock | – | Codex | L | [plan](packages/1-server-ingest.md) | done ([#26](https://github.com/agenticML/agenticml-lite/pull/26)) |
+| 2 | Run status from `remote.json` | – | Cursor | S | [plan](packages/2-remote-status.md) | in review |
 | 3 | Sync client v2 and `docs/PROTOCOL.md` | 1 | Codex | L | to write | not started |
 | 4 † | Server dashboard: key login, sessions, CSRF, last synced | 1, 2 | Cursor | M | to write | not started |
 | 4b † | Key management in the dashboard: first-key setup, issue / list / revoke sync and admin keys | 1, 4 | Codex | M | to write | not started |
@@ -164,3 +164,13 @@ priority.
   `main`, but package PRs merge into `dev`, so the merged `dev` head is never
   tested on its own. Fix: add `dev` to `on.push.branches`. Done when a push to
   `dev` starts the `Tests` workflow.
+- **FIFO at a run file hangs the reader.** Where: `store/layout.py`
+  `read_file_nofollow`, used by `list_runs` for `meta.json` and
+  `remote.json`. Problem: it opens without `O_NONBLOCK`, so a FIFO named
+  `meta.json` or `remote.json` blocks the open and hangs the dashboard listing
+  (found in the package 2 review; affects `meta.json` since before 2.0). Fix:
+  open with `O_NONBLOCK` (then clear it, or just rely on the `S_ISREG` check
+  after `fstat`) so a non-regular file is refused without blocking. Matters
+  more once the server writes runs on behalf of remote keys. Done when a test
+  with a FIFO `meta.json` and a FIFO `remote.json` shows `list_runs` returning
+  promptly and skipping or falling back as for any invalid file.
