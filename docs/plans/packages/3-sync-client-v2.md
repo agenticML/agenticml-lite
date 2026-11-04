@@ -472,6 +472,61 @@ for byte and checks every referenced object exists on the server.
 `test_sync_lock_unsupported_warns_once_and_continues` passing (adapt only
 what the rewrite forces).
 
+## Task D: testbed CLI tests (added after the first CI run)
+
+The first PR run failed 8 tests in `testbed/tests/test_cli.py`: they drive
+the CLI against a `fake_server` fixture that imitates the removed hosted API
+(`/init`, `/log/batch`, `x-api-key`). The plan above missed this file. Coder:
+Codex. Scope: `testbed/tests/test_cli.py` only (plus `testbed/tests/conftest.py`
+if a shared fixture is cleaner). No product code changes; if a test exposes a
+real client bug, stop and report it.
+
+- Replace `fake_server` with a fixture that runs a real package 1 server in
+  the test process: `make_server(tmp/data, port=0)` in a thread, keys created
+  with `KeyStore(data/"server").create(...)`. It exposes `host`, `key` (a sync
+  key), `store` (`data/"store"`), a `create_key(name)` helper, and a `calls`
+  list of `(method, path, authorization header, monotonic time)` recorded by
+  wrapping `IngestHandler`'s request dispatch (the server runs in-process, so
+  the subprocess CLI's requests are visible). Shut it down like the old
+  fixture.
+- A helper that asserts every allow-listed file under the local run dir is
+  byte-identical on the server (`meta.json` may differ only in `status` for a
+  dead-process run).
+- Rewrite each failing test to the same intent under v2:
+  - `test_sync_dry_run_and_no_key`: dry-run now needs a host (no default);
+    pass `--host http://127.0.0.1:1` (no request is made) and assert the
+    dry-run line with `files=`; no `sync.json`. Without a key: exit 1,
+    `not logged in`. Without any host: exit 1 with the "no server host"
+    message.
+  - `test_verified_login_and_online_whoami`: real key; `calls` are two
+    `GET /v2/whoami`; a wrong key exits 1; the key is never printed.
+  - `test_credentials_stdin_env_file_precedence_and_host_logout`: two real
+    keys (file, env); assert the `Authorization: Bearer <expected>` header on
+    the recorded calls and `remote.json` status `finished` instead of
+    `/finalize`. Logout part unchanged.
+  - `test_full_incremental_sync_reset_and_all`: byte-identical run, server
+    `remote.json` `finished`, `sync.json` entry `protocol: 2` and `complete`;
+    server `meta.json` keeps project, name, config and tags; referenced
+    objects exist on the server. Second sync `up to date` with no recorded
+    call other than the one `GET /v2/whoami` preflight per command. Resume, write step 40, finish, sync: identical again and the
+    append for that series starts at the previous size. `--all` completes
+    every run. `--reset` removes this host's entry without calls; the next
+    sync resends no append bytes (no `truncate=1`, appends replay as no-ops
+    or are skipped) and ends identical. Argument errors still exit 2.
+  - `test_dead_process_status_and_sync_finalization`: fresh heartbeat →
+    server status `running`, `complete` false; expired heartbeat → server
+    `meta.json` and `remote.json` status `crashed`; local `meta.json` still
+    `running`, local effective status `crashed`.
+  - `test_sync_watch_repeats_after_delay_and_completes`: first line
+    `partial (running)`; after finish the process exits 0, `complete` true,
+    server identical with both records, at least two commits whose times are
+    at least `0.9 * interval` apart.
+  - `test_synced_gc_and_object_grace`, `test_sync_prune_overview_and_resume_refusal`:
+    same assertions with the real server; the prune test also checks the
+    server still has the pruned series' `.bin`.
+- Checks: from `testbed/`, `.venv/bin/python -m pytest -q` (whole testbed
+  suite, including UI) green, plus the root suite.
+
 ## Checks (coder, before handing back)
 
 1. `testbed/.venv/bin/python -m pytest -q tests` from the repo root, all
