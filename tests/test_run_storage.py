@@ -408,9 +408,8 @@ def test_media_upload_after_finish_logs_debug(monkeypatch, caplog, tmp_path):
     run.finish()
 
 
-def test_sync_init_mapping_matches_run_metadata(tmp_path, monkeypatch):
+def test_run_metadata_records_env_git_and_parent(tmp_path, monkeypatch):
     from agenticml import run as run_module
-    from agenticml.sync import _init_payload
 
     env = {"python_version": "3.test", "platform": "test", "hostname": "host", "packages": {"p": "1"}}
     git = {"git_commit": "abc", "git_branch": "main", "is_dirty": True}
@@ -422,11 +421,5 @@ def test_sync_init_mapping_matches_run_metadata(tmp_path, monkeypatch):
     meta = RunReader(tmp_path, run.run_id).meta()
     assert meta["env"] == env
     assert meta["git"] == {**git, "repo_root": str(run_module.find_repo_root(run_module.Path.cwd()))}
-    payload = _init_payload(meta)
-    for key in ("python_version", "platform", "packages"):
-        assert payload[key] == env[key]
-    for key in git:
-        assert payload[key] == git[key]
-    assert payload["parent_run_id"] == "parent"
+    assert meta["parent_run_id"] == "parent"
     assert "snapshot_hash" not in meta
-    assert "snapshot_hash" not in payload

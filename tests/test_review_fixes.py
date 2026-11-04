@@ -14,39 +14,6 @@ from agenticml.integrations import hyperparams
 from agenticml.run import Run
 from agenticml.store import RunReader, RunWriter, layout, list_runs
 from agenticml.store import gc
-from agenticml.sync import _scalar_batches
-
-
-def test_thousand_key_scalar_round_budget_and_offsets():
-    rounds = []
-    limits = []
-
-    class Reader:
-        def record_sizes(self):
-            return dict.fromkeys(range(1000), 401 * 8)
-
-        def read_records(self, key, offset, limit):
-            if key == 0:
-                rounds.append(0)
-            limits.append(limit)
-            start = offset // 8
-            records = [(step, float(step)) for step in range(start, min(start + limit, 401))]
-            rounds[-1] += len(records)
-            return records, offset + len(records) * 8
-
-    offsets = {}
-    points = 0
-    for batch, current, skipped in _scalar_batches(Reader(), "remote", {}):
-        assert skipped == 0
-        for key, offset in current.items():
-            assert offset >= offsets.get(key, 0)
-        assert sum(current.values()) // 8 == points + sum(len(item["metrics"]) for item in batch)
-        points = sum(current.values()) // 8
-        offsets = current
-    assert rounds == [200_000, 200_000, 1000]
-    assert max(limits) == 200
-    assert points == 401_000
-    assert set(offsets.values()) == {401 * 8}
 
 
 def test_lifetime_lock_liveness_is_read_only_and_resume_works(tmp_path):
@@ -395,16 +362,3 @@ def test_verbose_store_failure_prints_reason(tmp_path, monkeypatch, capsys, fact
                   capture_env=False, system_metrics=False, auto_track=False)
     assert isinstance(run, _DisabledRun)
     assert capsys.readouterr().out == "agenticml: tracking disabled: store unavailable\n"
-
-
-def test_scalar_round_budget_when_keys_outnumber_budget(tmp_path, monkeypatch):
-    import agenticml.sync as sync_module
-    monkeypatch.setattr(sync_module, "ROUND_RECORDS", 3)
-    writer = RunWriter.create(tmp_path)
-    writer.write_scalars([(0, dict.fromkeys("abcde", 1))])
-    try:
-        batches = list(_scalar_batches(RunReader(tmp_path, writer.run_id), "remote", {}))
-        assert [sum(len(item["metrics"]) for item in batch) for batch, _, _ in batches] == [3, 2]
-        assert batches[-1][1] == dict.fromkeys("abcde", 8)
-    finally:
-        writer.close()

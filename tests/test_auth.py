@@ -1,16 +1,19 @@
 """Credentials and CLI authentication, using the actual HTTP Client."""
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import io
 import json
 import os
 import stat
+import threading
 
 import pytest
 import requests
-import responses
 
 from agenticml import auth
 from agenticml.cli import main
 from agenticml.client import Client
+from agenticml.server.app import make_server
 
 HOST = "https://auth.test"
 KEY = "abcdefgh-very-secret-api-key"
@@ -27,6 +30,61 @@ def credentials(tmp_path, monkeypatch):
 
 def saved(key=KEY, host=HOST):
     auth.write_credentials({"default_host": host, "hosts": {host: {"api_key": key}}})
+
+
+@contextmanager
+def running(data, env_key=None):
+    httpd = make_server(data, port=0, env_key=env_key)
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
+    thread.start()
+    try:
+        yield httpd
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()
+
+
+@pytest.fixture
+def server(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    with running(tmp_path / "data") as httpd:
+        _, httpd.test_key = httpd.keys.create("one")
+        yield httpd
+
+
+def origin(httpd):
+    host, port = httpd.server_address[:2]
+    return f"http://{host}:{port}"
+
+
+class _FakeHandler(BaseHTTPRequestHandler):
+    def log_message(self, *_args):
+        return
+
+    def do_GET(self):
+        self.send_response(self.server.status)
+        self.send_header("Content-Type", self.server.content_type)
+        body = self.server.body
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@contextmanager
+def fake_http(status=200, body=b'{"protocol": 1}', content_type="application/json"):
+    httpd = HTTPServer(("127.0.0.1", 0), _FakeHandler)
+    httpd.status = status
+    httpd.body = body
+    httpd.content_type = content_type
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{httpd.server_address[1]}"
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()
 
 
 def test_permissions_and_atomic_replace(credentials, monkeypatch):
@@ -82,52 +140,66 @@ def test_resolution_precedence(monkeypatch):
 
 
 def test_default_host(credentials):
-    assert auth.resolve() == (auth.DEFAULT_HOST, None)
+    with pytest.raises(ValueError, match="no server host"):
+        auth.resolve()
     assert not credentials.exists()
 
 
-@responses.activate
-def test_login_validates_before_saving(credentials, capsys):
-    def verify(request):
-        assert not credentials.exists()
-        assert request.headers["x-api-key"] == KEY
-        return 200, {}, "[]"
-
-    responses.add_callback(responses.GET, HOST + "/runs?limit=1", callback=verify)
-    assert main(["login", "--host", HOST + "/", "--key", KEY]) == 0
-    assert auth.resolve() == (HOST, KEY)
+def test_login_validates_before_saving(server, credentials, capsys):
+    url = origin(server)
+    assert not credentials.exists()
+    assert main(["login", "--host", url + "/", "--key", server.test_key]) == 0
+    assert auth.resolve() == (url, server.test_key)
     output = capsys.readouterr()
-    assert KEY not in output.out + output.err
-    assert "abcdefgh…" in output.out
+    blob = output.out + output.err
+    assert server.test_key not in blob
+    assert f"Logged in to {url} as one (scope sync) with key {auth.key_prefix(server.test_key)}" in output.out
 
 
-@pytest.mark.parametrize("status", [401, 403])
-@responses.activate
-def test_login_rejected_leaves_credentials_unchanged(credentials, capsys, status):
-    saved("old-key")
+def test_login_admin_key_warns(server, credentials, capsys):
+    url = origin(server)
+    _, admin = server.keys.create("boss", "admin")
+    assert main(["login", "--host", url, "--key", admin]) == 0
+    output = capsys.readouterr()
+    assert admin not in output.out + output.err
+    assert f"Logged in to {url} as boss (scope admin)" in output.out
+    assert "warning: this is an admin key; training machines should use a sync key" in output.err
+
+
+def test_login_rejected_leaves_credentials_unchanged(server, credentials, capsys):
+    url = origin(server)
+    saved("old-key", host=url)
     original = credentials.read_bytes()
-    responses.add(responses.GET, HOST + "/runs", status=status)
-    assert main(["login", "--host", HOST, "--key", KEY]) == 1
+    assert main(["login", "--host", url, "--key", KEY]) == 1
     assert credentials.read_bytes() == original
     output = capsys.readouterr()
     assert "invalid API key" in output.err
     assert KEY not in output.out + output.err
 
 
-@responses.activate
-def test_login_network_failure(credentials, capsys):
-    responses.add(responses.GET, HOST + "/runs", body=requests.ConnectionError("secret detail"))
-    assert main(["login", "--host", HOST, "--key", KEY]) == 1
+def test_login_protocol_error(credentials, capsys):
+    with fake_http(body=b'{"protocol": 1}') as url:
+        assert main(["login", "--host", url, "--key", KEY]) == 1
+    output = capsys.readouterr()
+    assert "is not an agenticml server with protocol 2 (agenticml server 2.0 or newer)" in output.err
+    assert KEY not in output.out + output.err
     assert not credentials.exists()
-    assert "ConnectionError" in capsys.readouterr().err
 
 
-@responses.activate
+def test_login_network_failure(credentials, capsys, monkeypatch):
+    monkeypatch.setattr("agenticml.client.time.sleep", lambda _delay: None)
+    assert main(["login", "--host", "http://127.0.0.1:1", "--key", KEY]) == 1
+    assert not credentials.exists()
+    err = capsys.readouterr().err
+    assert "ConnectionError" in err
+    assert "secret" not in err
+    assert KEY not in err
+
+
 def test_login_no_verify_stdin(credentials, monkeypatch, capsys):
     monkeypatch.setattr("sys.stdin", io.StringIO(KEY + "\n"))
     assert main(["login", "--host", HOST, "--no-verify"]) == 0
     assert auth.resolve() == (HOST, KEY)
-    assert not responses.calls
     assert KEY not in capsys.readouterr().out
 
 
@@ -142,6 +214,11 @@ def test_login_getpass(monkeypatch):
     assert auth.resolve() == (HOST, KEY)
 
 
+def test_logout_without_host(capsys):
+    assert main(["logout"]) == 1
+    assert "no host given and no default host saved" in capsys.readouterr().err
+
+
 def test_logout_clears_default_only_for_target(monkeypatch):
     auth.write_credentials({"default_host": HOST, "hosts": {
         HOST: {"api_key": KEY}, "https://other.test": {"api_key": "other"},
@@ -154,19 +231,47 @@ def test_logout_clears_default_only_for_target(monkeypatch):
     assert auth.read_credentials()["hosts"] == {}
 
 
-@pytest.mark.parametrize("status,exit_code", [(200, 0), (401, 1), (403, 1), (500, 1)])
-@responses.activate
-def test_whoami_verification(status, exit_code, capsys):
-    saved()
-    responses.add(responses.GET, HOST + "/runs", status=status, json=[])
-    assert main(["whoami"]) == exit_code
+def test_whoami_verification(server, capsys):
+    url = origin(server)
+    saved(key=server.test_key, host=url)
+    assert main(["whoami"]) == 0
     output = capsys.readouterr()
+    assert server.test_key not in output.out + output.err
+    assert "source=file" in output.out and "valid" in output.out
+    assert "name=one" in output.out and "scope=sync" in output.out
+
+
+def test_whoami_invalid_key(server, capsys):
+    url = origin(server)
+    saved(key=KEY, host=url)
+    assert main(["whoami"]) == 1
+    output = capsys.readouterr()
+    assert "invalid API key" in output.err
     assert KEY not in output.out + output.err
-    if status == 200:
-        assert "source=file" in output.out and "valid" in output.out
 
 
-@responses.activate
+def test_whoami_protocol_error(credentials, capsys):
+    with fake_http(status=404, body=b"nope", content_type="text/plain") as url:
+        saved(host=url)
+        assert main(["whoami"]) == 1
+    output = capsys.readouterr()
+    assert "is not an agenticml server with protocol 2 (agenticml server 2.0 or newer)" in output.err
+    assert KEY not in output.out + output.err
+
+
+def test_login_and_whoami_strip_ansi_and_missing_scope(credentials, capsys):
+    body = json.dumps({"protocol": 2, "key": "\x1b[31mevil\x07", "features": []}).encode()
+    with fake_http(status=200, body=body) as url:
+        assert main(["login", "--host", url, "--key", KEY]) == 0
+        assert main(["whoami"]) == 0
+    output = capsys.readouterr()
+    blob = output.out + output.err
+    assert "\x1b" not in blob
+    assert "\x07" not in blob
+    assert "scope ?" in output.out
+    assert "scope=?" in output.out
+
+
 def test_whoami_offline_and_no_credentials(capsys, monkeypatch):
     assert main(["whoami", "--offline"]) == 1
     saved()
@@ -175,15 +280,6 @@ def test_whoami_offline_and_no_credentials(capsys, monkeypatch):
     monkeypatch.setenv("AGENTICML_API_KEY", KEY)
     assert main(["whoami", "--offline"]) == 0
     assert "source=env" in capsys.readouterr().out
-    assert not responses.calls
-
-
-@pytest.mark.parametrize("status", [201, 204, 400, 500])
-@responses.activate
-def test_check_auth_raises_for_other_statuses(status):
-    responses.add(responses.GET, HOST + "/runs", status=status)
-    with pytest.raises((ValueError, requests.HTTPError)):
-        Client(base_url=HOST).check_auth()
 
 
 @pytest.mark.parametrize("key", ["x", "short", KEY])
@@ -300,7 +396,7 @@ def test_read_ignores_group_writable_file_or_dir(credentials, capsys):
     err = capsys.readouterr().err
     assert "writable" in err
     assert stat.S_IMODE(credentials.parent.stat().st_mode) == 0o775
-    assert main(["whoami", "--offline"]) == 1
+    assert main(["whoami", "--offline", "--host", HOST]) == 1
     captured = capsys.readouterr()
     assert "not logged in" in captured.err
     assert KEY not in captured.out + captured.err
@@ -314,7 +410,7 @@ def test_read_ignores_credentials_owned_by_someone_else(credentials, monkeypatch
     err = capsys.readouterr().err
     assert "owned" in err
     assert KEY not in err
-    assert main(["whoami", "--offline"]) == 1
+    assert main(["whoami", "--offline", "--host", HOST]) == 1
     assert "not logged in" in capsys.readouterr().err
 
 
@@ -344,7 +440,7 @@ def test_login_strips_surrounding_whitespace(credentials):
     client = Client(base_url=HOST, api_key=f"\n{KEY}  ")
     try:
         assert client.api_key == KEY
-        assert client.session.headers["x-api-key"] == KEY
+        assert client.session.headers["Authorization"] == f"Bearer {KEY}"
     finally:
         client.close()
 
@@ -366,7 +462,7 @@ def test_login_does_not_echo_invalid_header(monkeypatch, capsys):
     def boom(self):
         raise requests.exceptions.InvalidHeader(f"x-api-key: {secret}")
 
-    monkeypatch.setattr(Client, "check_auth", boom)
+    monkeypatch.setattr(Client, "whoami", boom)
     assert main(["login", "--host", HOST, "--key", KEY]) == 1
     captured = capsys.readouterr()
     assert secret not in captured.out + captured.err
@@ -390,22 +486,22 @@ def test_warns_when_env_or_flag_key_uses_saved_host(monkeypatch, capsys):
     assert "flag-secret" not in err
 
 
-def test_no_host_warning_for_builtin_default(monkeypatch, capsys):
+def test_no_host_without_default_raises(monkeypatch, capsys):
     monkeypatch.setenv("AGENTICML_API_KEY", "env-secret-key")
-    assert auth.resolve() == (auth.DEFAULT_HOST, "env-secret-key")
+    with pytest.raises(ValueError, match="no server host"):
+        auth.resolve()
     assert capsys.readouterr().err == ""
 
 
-@responses.activate
-def test_whoami_warns_before_request_to_saved_host(monkeypatch, capsys):
-    saved()
-    monkeypatch.setenv("AGENTICML_API_KEY", "env-secret-key")
-    responses.add(responses.GET, HOST + "/runs", json=[])
+def test_whoami_warns_before_request_to_saved_host(server, monkeypatch, capsys):
+    url = origin(server)
+    saved(key="unused-file-key", host=url)
+    monkeypatch.setenv("AGENTICML_API_KEY", server.test_key)
     assert main(["whoami"]) == 0
     err = capsys.readouterr().err
-    assert HOST in err
-    assert "env-secret-key" not in err
-    assert responses.calls
+    assert url in err
+    assert server.test_key not in err
+    assert "unused-file-key" not in err
 
 
 def test_whoami_and_logout_interrupts_are_quiet(monkeypatch, capsys):

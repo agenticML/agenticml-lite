@@ -190,7 +190,7 @@ agenticml sync --all --prune
 ## Upload
 
 ```bash
-agenticml login --host https://api.agenticml.xyz
+agenticml login --host https://aml.example.com
 agenticml whoami
 agenticml logout
 agenticml sync RUN_ID [RUN_ID ...]
@@ -199,13 +199,11 @@ agenticml sync --all --watch 30 --dry-run
 agenticml sync RUN_ID --reset
 ```
 
-`login` checks the key (skip with `--no-verify`) and writes `~/.config/agenticml/credentials.json` at mode `0600`. The directory is `AGENTICML_CONFIG_DIR`, else `$XDG_CONFIG_HOME/agenticml`, else `~/.config/agenticml`. The default host is `https://api.agenticml.xyz`. Use the `agenticml login` prompt to enter the key, or `AGENTICML_API_KEY` for sync. Avoid command-line `--key` / `--api-key`: their values are visible in `ps`. `login` also accepts stdin. `sync` takes the key from `--api-key`, then `AGENTICML_API_KEY`, then the file. `whoami` uses `AGENTICML_API_KEY`, then the file. `whoami --offline` skips the server check. `logout` removes the saved key for one host. On `login`, `whoami`, and `sync`, `--insecure` allows `http://` to a non-local host; localhost does not need it.
+`login` checks the key (skip with `--no-verify`) and writes `~/.config/agenticml/credentials.json` at mode `0600`. The directory is `AGENTICML_CONFIG_DIR`, else `$XDG_CONFIG_HOME/agenticml`, else `~/.config/agenticml`. `AGENTICML_HOST` has no default; `login` requires `--host` unless a default host is already saved. Use the `agenticml login` prompt to enter the key, or `AGENTICML_API_KEY` for sync. Avoid command-line `--key` / `--api-key`: their values are visible in `ps`. `login` also accepts stdin. `sync` sends runs to an `agenticml server` over [protocol v2](docs/PROTOCOL.md). `sync` takes the key from `--api-key`, then `AGENTICML_API_KEY`, then the file. `whoami` uses `AGENTICML_API_KEY`, then the file. `whoami --offline` skips the server check. `logout` removes the saved key for one host. On `login`, `whoami`, and `sync`, `--insecure` allows `http://` to a non-local host; localhost does not need it.
 
-Sync is incremental and resumable. A cursor in `runs/<id>/sync.json` stores scalar byte offsets and which code, media, and artifacts were sent. An interrupted sync retries at most the in-flight batch. `--all` selects runs that are incomplete or changed. `--watch N` repeats every N seconds until every selected run has synced, failed permanently, or gone stale. `--dry-run` prints counts without sending or saving state. `--reset` clears the saved remote id for explicit run ids on this host, and it rejects `--all`.
+Sync copies each run's store files byte for byte (`meta.json`, `events.jsonl`, scalars, overviews, indexes) plus the objects they reference (code, media, copied artifacts) to an `agenticml server` over [protocol v2](docs/PROTOCOL.md). A per-file cursor in `runs/<id>/sync.json` tracks accepted bytes, so an interrupted sync resumes from the last accepted request. `--all` selects runs that are incomplete or changed. `--watch N` repeats every N seconds until every selected run has synced, failed permanently, or gone stale. `--dry-run` prints counts without sending or saving state. `--reset` forgets this host's cursor for explicit run ids and the next sync resumes from the server's copy (rejects `--all`).
 
-Uploaded: project, name, config, tags, notes, group, job type, env, git, the parent's remote id, finite scalar points, code files, media, artifacts, and the summary plus status at finalize. `copy=True` artifacts come from the object store. By-reference artifacts are read from the logged path when it is still a regular file with the same size and mtime.
-
-Server-side gaps: `created_at` and `finished_at` are stamped by the server at sync time. Config keys cannot be deleted remotely, and `group` / `job_type` cannot be cleared (a null is omitted and the stored value stays).
+Not uploaded in 2.0: notes (`notes.md`), by-reference (`copy=False`) artifacts, and lineage code diffs. A run id already owned by another key on the server fails with an error naming that key. See [docs/PROTOCOL.md](docs/PROTOCOL.md) for protocol details.
 
 ## Configuration
 
@@ -213,7 +211,7 @@ Server-side gaps: `created_at` and `finished_at` are stamped by the server at sy
 | --- | --- | --- |
 | `AGENTICML_DIR` | `~/.agenticml` | Store root. `init(dir=)` and `--dir` win. |
 | `AGENTICML_MODE` | `local` | `local`, `offline` (alias of `local`), or `disabled`. Other values warn and use `local`. |
-| `AGENTICML_HOST` | `https://api.agenticml.xyz` | Server for `login`, `whoami`, and `sync`. |
+| `AGENTICML_HOST` | unset | Server for `login`, `whoami`, and `sync`. |
 | `AGENTICML_API_KEY` | unset | Key for `sync` and `whoami`. `login` ignores it. |
 | `AGENTICML_CONFIG_DIR` | `~/.config/agenticml` | Credential directory. Wins over `XDG_CONFIG_HOME`. |
 | `AGENTICML_MAX_BYTES` | 5 GiB | Warn when the local store is larger than this. Nothing is deleted automatically. |
