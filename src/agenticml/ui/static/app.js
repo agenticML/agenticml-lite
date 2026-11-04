@@ -233,7 +233,11 @@ let epoch = 0;
 let controller;
 let cleanup = () => {};
 async function get(url, signal = controller?.signal) {
-  const response = await fetch(url, { signal });
+  const response = await fetch(url, { signal, credentials: "same-origin" });
+  if (response.status === 401) {
+    location.assign("/login");
+    throw new Error("login required");
+  }
   if (!response.ok)
     throw new Error(
       `${response.status}: ${url.startsWith("/api/objects/") ? "Object unavailable" : await response.text()}`,
@@ -290,6 +294,35 @@ systemTheme.addEventListener("change", applyTheme);
 applyTheme();
 // Where this dashboard is served from: always a local store.
 document.querySelector("#host").textContent = `local · ${location.host}`;
+let serverMode = false;
+fetch("/api/server/session", { credentials: "same-origin" })
+  .then(async (response) => {
+    let data = null;
+    try {
+      data = await response.json();
+    } catch {}
+    if (response.status === 404) return;
+    if (response.status === 401) {
+      location.assign("/login");
+      return;
+    }
+    if (!response.ok || !data) return;
+    serverMode = true;
+    const box = document.querySelector("#session");
+    const label = document.querySelector("#session-label");
+    label.textContent = `Signed in as ${data.key}`;
+    box.title = label.textContent;
+    box.hidden = false;
+    document.querySelector("#sign-out").onclick = async () => {
+      await fetch("/logout", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "X-AgenticML-Request": "1" },
+      });
+      location.assign("/login");
+    };
+  })
+  .catch(() => {});
 document.querySelector("#close-lightbox").onclick = () =>
   document.querySelector("#lightbox").close();
 
@@ -533,6 +566,22 @@ function lineageStrip(tree, task) {
 }
 const shortTime = (time) =>
   new Date(time).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+function lastSyncedLabel(value) {
+  const ms = Date.parse(value);
+  if (!Number.isFinite(ms)) return null;
+  const deltaSec = (ms - Date.now()) / 1000;
+  const abs = Math.abs(deltaSec);
+  const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+  const relative =
+    abs < 60
+      ? rtf.format(Math.round(deltaSec), "second")
+      : abs < 3600
+        ? rtf.format(Math.round(deltaSec / 60), "minute")
+        : abs < 86400
+          ? rtf.format(Math.round(deltaSec / 3600), "hour")
+          : rtf.format(Math.round(deltaSec / 86400), "day");
+  return { text: `Last synced ${relative}`, title: date(value) };
+}
 const stepText = (step) =>
   step == null
     ? "—"
@@ -817,7 +866,14 @@ async function home(version) {
           title: facts.changed,
         }),
       ),
-      el("div", { class: "run-status" }, statusChip(run.status, run)),
+      el(
+        "div",
+        {
+          class: "run-status",
+          title: lastSyncedLabel(run.last_sync_at)?.text || "",
+        },
+        statusChip(run.status, run),
+      ),
       el("span", { class: "muted run-progress", text: stepText(run.last_step) }),
       el("span", {
         class: "run-number run-metric",
@@ -1356,14 +1412,20 @@ async function home(version) {
           .catch(() => details.set(runId, { error: true }));
       }
       const detail = details.get(runId);
-      const files = Array.isArray(detail?.files) ? detail.files : null;
+      const files = Array.isArray(detail?.files) && detail.files.length ? detail.files : null;
+      const lineageError =
+        serverMode && typeof detail?.error === "string" && detail.error
+          ? detail.error
+          : null;
       const code = !parent
         ? "baseline snapshot"
         : node.same_tree_as_parent
           ? "code unchanged"
-          : files
-            ? `${files.length} file${files.length === 1 ? "" : "s"} changed${files[0] ? ` · ${files[0].path}` : ""}`
-            : "code changed";
+          : lineageError
+            ? lineageError
+            : files
+              ? `${files.length} file${files.length === 1 ? "" : "s"} changed${files[0] ? ` · ${files[0].path}` : ""}`
+              : "code changed";
       const stat = (name, text, tone = "") =>
         el("div", {}, el("dt", { text: name }), el("dd", { class: tone, text }));
       inspector.replaceChildren(
@@ -3115,10 +3177,15 @@ async function runPage(id, version) {
       ),
       mediaCard(media),
     );
-    setPollStatus(
-      pollStatus,
-      run.status === "running" ? "Live · refreshes every 5 s" : "Up to date",
-    );
+    const live = run.status === "running" ? "Live · refreshes every 5 s" : "Up to date";
+    const synced = lastSyncedLabel(run.last_sync_at);
+    if (synced) {
+      setPollStatus(pollStatus, `${live} · ${synced.text}`);
+      pollStatus.title = synced.title;
+    } else {
+      setPollStatus(pollStatus, live);
+      pollStatus.removeAttribute("title");
+    }
   }
   const fullButton = button("Open full window ⤢", () => code?.openFull());
   app.replaceChildren(

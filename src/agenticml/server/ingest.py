@@ -95,10 +95,25 @@ class IngestHandler(DashboardHandler):
         self.headers = self.MessageClass()
         self._error({"error": "invalid request"}, code)
 
+    def _dashboard_request(self):
+        """True when the raw target is not /healthz or /v2, before ingest path policy."""
+        try:
+            target = self.raw_requestline.split()[1].decode("iso-8859-1")
+        except (IndexError, UnicodeDecodeError, AttributeError):
+            return False
+        raw_path = target.partition("?")[0]
+        return raw_path != "/healthz" and raw_path != "/v2" and not raw_path.startswith("/v2/")
+
     def _dispatch(self):
         self._started = False
         tmp = None
         try:
+            if self._dashboard_request():
+                if self.command == "GET":
+                    return DashboardHandler.do_GET(self)
+                if self.command == "PUT":
+                    return DashboardHandler.do_PUT(self)
+                return DashboardHandler._method_not_allowed(self)
             route, args, query = self._route()
             if route in ("health", "whoami", "state") and (
                     self.headers.get_all("Content-Length") or self.headers.get_all("Transfer-Encoding")):
@@ -180,7 +195,12 @@ class IngestHandler(DashboardHandler):
                 tmp.unlink(missing_ok=True)
 
     do_GET = do_PUT = do_POST = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = do_TRACE = do_CONNECT = _dispatch
-    _method_not_allowed = _dispatch
+
+    def _method_not_allowed(self):
+        """Dashboard PUTs must not recurse; ingest unknown methods still 405."""
+        if not self._dashboard_request():
+            return self._dispatch()
+        return DashboardHandler._method_not_allowed(self)
 
     def _route(self):
         # parse_request normalizes a leading //; inspect the original target so

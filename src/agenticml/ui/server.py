@@ -150,11 +150,38 @@ def _loopback_bind(value) -> bool:
         return False
 
 
-def _host_permitted(host_header: str, bind_host, bound_address) -> bool:
+def _origin_host(hostname: str) -> str:
+    try:
+        ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        return hostname.lower()
+    if ip.version == 6:
+        return f"[{ip}]"
+    return str(ip)
+
+
+def _public_origin(public_url: str) -> str:
+    """``scheme://host[:port]`` with default ports dropped, lowercased."""
+    parsed = urlsplit(public_url)
+    scheme = (parsed.scheme or "").lower()
+    host = _origin_host(parsed.hostname or "")
+    port = parsed.port
+    if port is None or (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
+        return f"{scheme}://{host}"
+    return f"{scheme}://{host}:{port}"
+
+
+def _host_permitted(host_header: str, bind_host, bound_address, public_url=None) -> bool:
     """True for loopback names, plus bind address, hostname, and IP literals off loopback."""
     host = _canonical_host(host_header)
     if host in _LOOPBACK_HOSTS:
         return True
+    if public_url:
+        try:
+            allowed = _canonical_host(urlsplit(public_url).netloc)
+        except ValueError:
+            return False
+        return bool(host) and host == allowed
     if not host or (_loopback_bind(bind_host) and _loopback_bind(bound_address)):
         return False
     allowed = {
@@ -882,7 +909,7 @@ def _git_numstat(args, cwd):
     return blob, truncated, None
 
 
-def _lineage_changes(root, run_id, meta):
+def _lineage_changes(root, run_id, meta, server_mode=False):
     """Numstat of one run's snapshot versus its parent commit.
 
     Missing git, a missing shadow repo, and runs without lineage answer 200
@@ -921,9 +948,10 @@ def _lineage_changes(root, run_id, meta):
         if not repo.is_dir():
             raise FileNotFoundError(key)
     except OSError:
+        missing = "code diff not available on this server" if server_mode else "lineage repository not found"
         return _diff_payload(
             run_id, commit=commit, parent_run_id=parent_run_id, parent_commit=parent_commit,
-            error="lineage repository not found",
+            error=missing,
         )
     git_dir = f"--git-dir={repo}"
     if parent_commit:
@@ -953,11 +981,14 @@ class DashboardServer(ThreadingHTTPServer):
     # (Linux queues the SYNs instead).
     request_queue_size = 64
 
-    def __init__(self, root, host, port, read_only=False, handler_class=None):
+    def __init__(self, root, host, port, read_only=False, handler_class=None,
+                 auth=None, public_url=None):
         self.root = layout.resolve_root(root)
         self.verbose = False
         self.bind_host = host
         self.read_only = read_only
+        self.auth = auth
+        self.public_url = public_url
         self.readers = OrderedDict()
         self.reader_lock = threading.Lock()
         self.code_diffs = OrderedDict()
@@ -1262,7 +1293,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         values = self.headers.get_all("Host")
         if not values or len(values) != 1:
             return False
-        return _host_permitted(values[0], self.server.bind_host, self.server.server_address[0])
+        return _host_permitted(
+            values[0], self.server.bind_host, self.server.server_address[0],
+            getattr(self.server, "public_url", None),
+        )
 
     def _begin(self, status, content_type, length, headers=None):
         self._started = True
@@ -1305,9 +1339,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except _DISCONNECT:
             self.close_connection = True
 
+    def _session_gated(self):
+        """True for dashboard responses that a session cookie can change."""
+        if getattr(self.server, "auth", None) is None:
+            return False
+        dashboard = getattr(self, "_dashboard_request", None)
+        return dashboard is None or dashboard()
+
+    def _with_cookie_vary(self, headers):
+        extra = dict(headers)
+        vary = extra.get("Vary", "")
+        parts = [part.strip() for part in vary.split(",") if part.strip()]
+        if "Cookie" not in parts:
+            parts.append("Cookie")
+            extra["Vary"] = ", ".join(parts)
+        return extra
+
     def _json(self, value, status=200, headers=None):
         body = json.dumps(_json_safe(value), separators=(",", ":"), allow_nan=False).encode()
         extra = {"Cache-Control": "no-store", "Vary": "Accept-Encoding", **(headers or {})}
+        if self._session_gated():
+            extra = self._with_cookie_vary(extra)
         encodings = {}
         for part in self.headers.get("Accept-Encoding", "").lower().split(","):
             fields = [x.strip() for x in part.split(";")]
@@ -1326,6 +1378,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if not self._host_allowed():
                 self._error({"error": "forbidden host"}, 403)
                 return
+            if self.server.auth is not None and self.server.auth.handle(self):
+                return
             self.close_connection = True
             allow = "GET, PUT" if _note_run_id(self.path) else "GET"
             self._json({"error": "method not allowed"}, 405, {"Allow": allow})
@@ -1340,6 +1394,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if not self._host_allowed():
                 self.close_connection = True
                 self._error({"error": "forbidden host"}, 403)
+                return
+            if self.server.auth is not None and self.server.auth.handle(self):
                 return
             self._put()
         except notes.NoteConflict as exc:
@@ -1368,30 +1424,46 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 traceback.print_exc()
             self._error({"error": "internal error"}, 500)
 
+    def _origin_ok(self, origin: str) -> bool:
+        got = origin.strip().lower()
+        host = self.headers.get("Host")
+        local = ("http://" + host.strip()).lower() if host is not None else None
+        public_url = getattr(self.server, "public_url", None)
+        if public_url:
+            try:
+                if got == _public_origin(public_url):
+                    return True
+            except ValueError:
+                return False
+            return bool(
+                host is not None and _canonical_host(host) in _LOOPBACK_HOSTS
+                and local is not None and got == local
+            )
+        return host is not None and local is not None and got == local
+
     def _csrf_ok(self) -> bool:
         token = self.headers.get_all("X-AgenticML-Request")
         if token is None or len(token) != 1 or token[0].strip() != "1":
             return False
         origins = self.headers.get_all("Origin")
         if origins:
-            if len(origins) != 1:
+            if len(origins) != 1 or not self._origin_ok(origins[0]):
                 return False
-            host = self.headers.get("Host")
-            if host is None or origins[0].strip().lower() != ("http://" + host.strip()).lower():
-                return False
+        elif getattr(self.server, "auth", None) is not None:
+            return False
         sites = self.headers.get_all("Sec-Fetch-Site")
         if sites:
             if len(sites) != 1 or sites[0].strip() not in ("same-origin", "none"):
                 return False
         return True
 
-    def _put_length(self):
+    def _put_length(self, limit=_NOTE_PUT_MAX):
         """Declared body length, or None when an error response was sent.
 
         ``Transfer-Encoding`` and a missing or non-digit ``Content-Length``
         are 411. Only ASCII digits count: ``str.isdigit`` is true for ``²``,
         and ``int`` of that would otherwise surface as 400. A length above
-        512 KiB is 413 and the body is not read. The connection is closed so
+        ``limit`` is 413 and the body is not read. The connection is closed so
         the unread bytes cannot desync keep-alive.
         """
         if self.headers.get("Transfer-Encoding") is not None:
@@ -1409,7 +1481,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._error({"error": "length required"}, 411)
             return None
         length = int(v)
-        if length > _NOTE_PUT_MAX:
+        if length > limit:
             self.close_connection = True
             self._error({"error": "payload too large"}, 413)
             return None
@@ -1493,7 +1565,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         else:
             if not self.server._admit_note_body(self.connection):
                 self.close_connection = True
-                self._send(b"", "application/json", 503)
+                headers = None
+                if self._session_gated():
+                    headers = self._with_cookie_vary({"Cache-Control": "no-store"})
+                self._send(b"", "application/json", 503, headers)
                 return
             try:
                 body = self._read_put_body(length)
@@ -1518,6 +1593,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             if not self._host_allowed():
                 self._error({"error": "forbidden host"}, 403)
+                return
+            if self.server.auth is not None and self.server.auth.handle(self):
                 return
             self._get()
         except _DISCONNECT:
@@ -1615,6 +1692,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 # Do not route this through run_reader: inserting every row
                 # evicts chart readers from the 64-entry LRU.
                 row["last_step"] = self._list_last_step(meta.get("run_id"))
+                last_sync_at = meta.get("last_sync_at")
+                if last_sync_at is not None or self.server.auth is not None:
+                    row["last_sync_at"] = last_sync_at
                 runs.append(row)
             return self._json(runs)
         if path.startswith("/api/runs/"):
@@ -1636,6 +1716,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if route == "":
                     result = dict(run.meta())
                     result.update(keys=run.keys(), artifacts=run.artifacts(), code_manifest_length=len(run.code_manifest()))
+                    last_sync_at = run.last_sync_at()
+                    if last_sync_at is not None or self.server.auth is not None:
+                        result["last_sync_at"] = last_sync_at
                 elif route == "scalars":
                     limit = max(10, min(5000, int(arg("max_points", "1000"))))
                     start, end = arg("start"), arg("end")
@@ -1677,7 +1760,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 elif route == "code":
                     result = run.code_manifest()
                 elif route == "lineage":
-                    result = _lineage_changes(self.server.root, run_id, run.meta())
+                    result = _lineage_changes(
+                        self.server.root, run_id, run.meta(),
+                        server_mode=self.server.auth is not None,
+                    )
                 else:
                     raise FileNotFoundError()
             return self._json(result)
@@ -1690,8 +1776,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             kind = "text/plain" if hint.startswith("text/") else hint
             if kind not in _OBJECT_TYPES:
                 kind = "application/octet-stream"
-            return self._stream(_open_regular_object(self.server.root, sha), kind,
-                                headers={"Cache-Control": "immutable, max-age=31536000"})
+            headers = {"Cache-Control": "immutable, max-age=31536000"}
+            if self._session_gated():
+                headers = {"Cache-Control": "no-store", "Vary": "Cookie"}
+            return self._stream(_open_regular_object(self.server.root, sha), kind, headers=headers)
         name = "index.html" if path == "/" else path[len("/static/"):] if path.startswith("/static/") else ""
         if name not in _FILES:
             raise FileNotFoundError()
@@ -1699,6 +1787,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         body = file.read_bytes()
         etag = '"' + hashlib.sha256(body).hexdigest() + '"'
         headers = {"ETag": etag, "Cache-Control": "no-cache"}
+        if self._session_gated():
+            headers["Cache-Control"] = "private, no-cache"
+            headers = self._with_cookie_vary(headers)
         if self.headers.get("If-None-Match") == etag:
             return self._send(b"", _FILES[name], 304, headers)
         return self._send(body, _FILES[name], headers=headers)
