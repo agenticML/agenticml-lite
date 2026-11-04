@@ -95,7 +95,18 @@ def run_references(root, run_id: str) -> dict[str, set[str]]:
     read_json(directory / META_NAME)
     media_path = directory / "media" / INDEX_NAME
     contained(root, media_path.parent)
-    media = read_json(media_path)
+    media_bytes = read_file_nofollow(media_path)
+    if not isinstance(json.loads(media_bytes), dict):
+        raise ValueError(f"expected object in {media_path}")
+    return references_from_bytes(media_bytes,
+                                 read_file_nofollow(directory / EVENTS_NAME), run_id)
+
+
+def references_from_bytes(media_bytes: bytes, events_bytes: bytes, run_id: str) -> dict[str, set[str]]:
+    """Collect references from exactly the snapshots being replicated."""
+    media = json.loads(media_bytes)
+    if not isinstance(media, dict):
+        raise ValueError(f"expected object in media index for run {run_id}")
     refs = {"media": set(), "artifacts": set(), "code": set()}
 
     def add(kind, row):
@@ -112,7 +123,7 @@ def run_references(root, run_id: str) -> dict[str, set[str]]:
             raise ValueError(f"invalid media rows in run {run_id}")
         for row in rows:
             add("media", row)
-    for line in read_file_nofollow(directory / EVENTS_NAME).split(b"\n"):
+    for line in events_bytes.split(b"\n"):
         if not line.strip():
             continue
         event = json.loads(line)

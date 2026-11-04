@@ -11,13 +11,17 @@ import shutil
 import signal
 import stat
 import subprocess
-import sys
 import threading
 import time
 from types import SimpleNamespace
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
+from agenticml.server.app import make_server
+from agenticml.server.ingest import IngestHandler
+from agenticml.server.keys import KeyStore
 from agenticml.store import RunReader, RunWriter, list_runs
+from agenticml.store.layout import object_path
+from agenticml.store.reader import run_references
 import pytest
 
 from conftest import CONSOLE, TESTBED, stop_process
@@ -269,106 +273,105 @@ def test_nonlocal_http_rejected(command, cli):
 
 def test_sync_dry_run_and_no_key(cli, copied_store):
     run_id = list_runs(copied_store)[0]["run_id"]
-    result = cli("sync", run_id, "--dir", copied_store, "--dry-run")
-    assert "dry-run (would send)" in result.stdout and "points=" in result.stdout
+    options = ["--dir", copied_store, "--host", "http://127.0.0.1:1"]
+    result = cli("sync", run_id, *options, "--dry-run")
+    assert "dry-run (would send; objects unchecked)" in result.stdout and "files=" in result.stdout
     assert not list(copied_store.rglob("sync.json"))
-    result = cli("sync", run_id, "--dir", copied_store, check=False)
+    result = cli("sync", run_id, *options, check=False)
     assert result.returncode == 1 and "not logged in" in result.stderr
+    result = cli("sync", run_id, "--dir", copied_store, check=False)
+    assert result.returncode == 1 and "no server host" in result.stderr
     assert not list(copied_store.rglob("sync.json"))
 
 
 @pytest.fixture
-def fake_server():
+def sync_server(tmp_path):
+    data = tmp_path / "data"
     calls = []
-    call_times = []
-    accepted_keys = {"testbed-key"}
-    remote_count = 0
 
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *args):
-            pass
+    class RecordingHandler(IngestHandler):
+        def _dispatch(self):
+            calls.append((self.command, self.path, self.headers.get("Authorization"), time.monotonic()))
+            return super()._dispatch()
 
-        def handle_request(self):
-            nonlocal remote_count
-            path = urlsplit(self.path).path
-            raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
-            payload = json.loads(raw) if raw and "application/json" in self.headers.get("Content-Type", "") else raw
-            calls.append((self.command, path, payload, dict(self.headers)))
-            call_times.append(time.monotonic())
-            status, result = 200, {}
-            if path.startswith("/upload/") and self.command == "PUT":
-                pass
-            elif self.headers.get("x-api-key") not in accepted_keys:
-                status, result = 401, {"detail": "invalid key"}
-            elif self.command == "GET" and path == "/runs":
-                result = {"runs": []}
-            elif path == "/init":
-                remote_count += 1
-                result = {"run_id": f"remote-{remote_count}"}
-            elif path == "/artifacts/exists":
-                result = {"existing": []}
-            elif re.fullmatch(r"/runs/remote-\d+/artifacts/presign-upload", path):
-                result = {"uploads": [{"path": f["path"], "url": host + "/upload/" + f["sha256"]}
-                                      for f in payload["files"]]}
-            elif path == "/log/batch" or re.fullmatch(
-                r"/runs/remote-\d+/(config|finalize|log_media|artifacts/register|artifacts/register-version)", path
-            ):
-                pass
-            else:
-                status, result = 404, {"detail": "unimplemented fake endpoint"}
-            body = json.dumps(result).encode()
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+        do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = _dispatch
 
-        do_GET = do_POST = do_PUT = do_PATCH = handle_request
+    def create_key(name):
+        return KeyStore(data / "server").create(name, scope="sync")[1]
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    host = f"http://127.0.0.1:{server.server_port}"
+    server = make_server(data, port=0)
+    server.RequestHandlerClass = RecordingHandler
     thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
     thread.start()
     try:
-        yield SimpleNamespace(host=host, calls=calls, call_times=call_times, accepted_keys=accepted_keys)
+        yield SimpleNamespace(host=f"http://127.0.0.1:{server.server_port}", key=create_key("testbed"),
+                              store=data / "store", create_key=create_key, calls=calls)
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
+        assert not thread.is_alive(), "ingest server did not stop"
 
 
-def test_verified_login_and_online_whoami(cli, fake_server):
-    assert "Logged in" in cli("login", "--host", fake_server.host, input="testbed-key\n").stdout
-    assert "valid" in cli("whoami").stdout
-    assert [path for method, path, _, _ in fake_server.calls] == ["/runs", "/runs"]
-    assert cli("login", "--host", fake_server.host, input="wrong-key\n", check=False).returncode == 1
-    assert "testbed-key" not in cli("whoami").stdout
+def assert_synced_run(root, run_id, server, *, dead=False):
+    """Compare protocol files and objects, excluding local bookkeeping."""
+    def files(directory):
+        return {path.relative_to(directory).as_posix(): path.read_bytes()
+                for path in directory.rglob("*") if path.is_file() and re.fullmatch(
+                    r"meta\.json|events\.jsonl|(?:scalars|media)/index\.json|"
+                    r"scalars/(?:_time\.bin|(?:0|[1-9][0-9]{0,8})\.(?:bin|ovw))",
+                    path.relative_to(directory).as_posix())}
+
+    expected = files(root / "runs" / run_id)
+    actual = files(server.store / "runs" / run_id)
+    if dead:
+        local_meta = json.loads(expected.pop("meta.json"))
+        remote_meta = json.loads(actual.pop("meta.json"))
+        assert local_meta["status"] == "running" and remote_meta["status"] == "crashed"
+        assert remote_meta == {**local_meta, "status": "crashed"}
+    assert actual == expected
+    for hashes in run_references(root, run_id).values():
+        for sha in hashes:
+            assert object_path(server.store, sha).read_bytes() == object_path(root, sha).read_bytes()
+    return json.loads((server.store / "runs" / run_id / "remote.json").read_text())
 
 
-def test_credentials_stdin_env_file_precedence_and_host_logout(cli, fake_server, tmp_path):
-    file_key, env_key = "file-testbed-key", "environment-testbed-key"
-    fake_server.accepted_keys.update({file_key, env_key})
-    options = ["--host", fake_server.host]
+def test_verified_login_and_online_whoami(cli, sync_server):
+    login = cli("login", "--host", sync_server.host, input=sync_server.key + "\n")
+    assert "Logged in" in login.stdout
+    whoami = cli("whoami")
+    assert "valid" in whoami.stdout
+    assert [(method, path) for method, path, _, _ in sync_server.calls] == [
+        ("GET", "/v2/whoami"), ("GET", "/v2/whoami")]
+    wrong = cli("login", "--host", sync_server.host, input="wrong-key\n", check=False)
+    assert wrong.returncode == 1 and "invalid API key" in wrong.stderr
+    assert sync_server.key not in login.stdout + login.stderr + whoami.stdout + whoami.stderr
+    assert "wrong-key" not in wrong.stdout + wrong.stderr
+
+
+def test_credentials_stdin_env_file_precedence_and_host_logout(cli, sync_server, tmp_path):
+    file_key, env_key = sync_server.create_key("file"), sync_server.create_key("env-key")
+    options = ["--host", sync_server.host]
     cli("login", *options, input=file_key + "\n", env={"AGENTICML_API_KEY": env_key})
     path = Path(os.environ["AGENTICML_CONFIG_DIR"]) / "credentials.json"
-    assert json.loads(path.read_text())["hosts"][fake_server.host]["api_key"] == file_key
-    assert fake_server.calls[-1][3]["x-api-key"] == file_key
+    assert json.loads(path.read_text())["hosts"][sync_server.host]["api_key"] == file_key
+    assert sync_server.calls[-1][2] == "Bearer " + file_key
 
-    before = len(fake_server.calls)
+    before = len(sync_server.calls)
     result = cli("whoami", *options, env={"AGENTICML_API_KEY": env_key})
     assert "source=env" in result.stdout and "valid" in result.stdout
-    assert [headers["x-api-key"] for _, _, _, headers in fake_server.calls[before:]] == [env_key]
+    assert [auth for _, _, auth, _ in sync_server.calls[before:]] == ["Bearer " + env_key]
 
     root = tmp_path / "credential-sync-store"
     for name, env, expected in (("env", {"AGENTICML_API_KEY": env_key}, env_key), ("file", {}, file_key)):
         writer = RunWriter.create(root, meta={"project": "credentials", "name": name})
         writer.write_scalars([(0, {"loss": 1})])
         writer.finish("finished")
-        before = len(fake_server.calls)
+        before = len(sync_server.calls)
         cli("sync", writer.run_id, "--dir", root, *options, env=env)
-        calls = fake_server.calls[before:]
-        assert any(url.endswith("/finalize") for _, url, _, _ in calls)
-        assert all(headers["x-api-key"] == expected for _, _, _, headers in calls)
+        calls = sync_server.calls[before:]
+        assert assert_synced_run(root, writer.run_id, sync_server)["status"] == "finished"
+        assert calls and all(auth == "Bearer " + expected for _, _, auth, _ in calls)
 
     other_host = "https://second.example.invalid"
     cli("login", "--host", other_host, "--no-verify", input="second-host-key\n")
@@ -377,46 +380,61 @@ def test_credentials_stdin_env_file_precedence_and_host_logout(cli, fake_server,
     assert "source=file" in cli("whoami", "--host", other_host, "--offline").stdout
 
 
-def test_full_incremental_sync_reset_and_all(cli, copied_store, fake_server):
+def test_full_incremental_sync_reset_and_all(cli, copied_store, sync_server):
     row = next(r for r in list_runs(copied_store) if r["name"] == "explicit-baseline")
     run_id = row["run_id"]
-    options = ["--dir", copied_store, "--host", fake_server.host]
-    env = {"AGENTICML_API_KEY": "testbed-key"}
+    options = ["--dir", copied_store, "--host", sync_server.host]
+    env = {"AGENTICML_API_KEY": sync_server.key}
     result = cli("sync", run_id, *options, env=env)
     assert "failed" not in result.stdout
+    assert assert_synced_run(copied_store, run_id, sync_server)["status"] == "finished"
     path = copied_store / "runs" / run_id / "sync.json"
-    state = json.loads(path.read_text())["hosts"][fake_server.host]
-    assert state["complete"] and state["finalized"]
-    assert state["remote_run_id"] == "remote-1"
-    assert state["offsets"]["train/loss"] == 32 * 8
-    assert state["media"] and state["artifacts"] and state["code"]
-    init = next(body for method, url, body, _ in fake_server.calls if url == "/init")
-    assert init["project"] == "testbed" and init["name"] == "explicit-baseline"
-    assert init["config"]["lr"] == 0.15 and init["tags"] == row["tags"]
-    finalize = next(body for _, url, body, _ in fake_server.calls if url.endswith("/finalize"))
-    assert finalize["status"] == "finished" and finalize["summary"]["final_loss"] < 0.2
-    puts = [call for call in fake_server.calls if call[0] == "PUT"]
-    assert puts and all("x-api-key" not in headers for _, _, _, headers in puts)
-    before = len(fake_server.calls)
+    state = json.loads(path.read_text())["hosts"][sync_server.host]
+    assert state["protocol"] == 2 and state["complete"]
+    remote_meta = RunReader(sync_server.store, run_id).meta()
+    assert remote_meta["project"] == "testbed" and remote_meta["name"] == "explicit-baseline"
+    assert remote_meta["config"]["lr"] == 0.15 and remote_meta["tags"] == row["tags"]
+    assert remote_meta["summary"]["final_loss"] < 0.2
+    series_id = json.loads((copied_store / "runs" / run_id / "scalars/index.json").read_text())[
+        "series"]["train/loss"]["id"]
+    series = f"scalars/{series_id}.bin"
+    previous_size = (sync_server.store / "runs" / run_id / series).stat().st_size
+    assert previous_size == 32 * 8 and state["files"][series]["size"] == previous_size
+    before = len(sync_server.calls)
     assert "up to date" in cli("sync", run_id, *options, env=env).stdout
-    assert len(fake_server.calls) == before
+    idle_calls = sync_server.calls[before:]
+    # Task B requires a command-level whoami even when the run is idle.
+    assert len(idle_calls) <= 1
+    assert all((method, path) == ("GET", "/v2/whoami") for method, path, _, _ in idle_calls)
+    before = len(sync_server.calls)
     writer = RunWriter.resume(copied_store, run_id, must=True)
-    writer.write_scalars([(40, {"train/loss": 0.01})])
-    writer.finish("finished")
+    try:
+        writer.write_scalars([(40, {"train/loss": 0.01})])
+        writer.finish("finished")
+    finally:
+        writer.close()
     cli("sync", run_id, *options, env=env)
-    batches = [body for _, url, body, _ in fake_server.calls[before:] if url == "/log/batch"]
-    assert batches == [{"items": [{"run_id": "remote-1", "step": 40,
-                                    "metrics": {"train/loss": pytest.approx(0.01)}}]}]
+    assert assert_synced_run(copied_store, run_id, sync_server)["status"] == "finished"
+    appends = [urlsplit(url) for method, url, _, _ in sync_server.calls[before:]
+               if method == "POST" and urlsplit(url).path == f"/v2/runs/{run_id}/append/{series}"]
+    assert len(appends) == 1 and parse_qs(appends[0].query) == {"offset": [str(previous_size)]}
     cli("sync", "--all", *options, env=env)
-    assert all(json.loads((copied_store / "runs" / r["run_id"] / "sync.json").read_text())
-               ["hosts"][fake_server.host]["complete"] for r in list_runs(copied_store))
-    assert len([c for c in fake_server.calls if c[1] == "/init"]) == 5
-    before = len(fake_server.calls)
+    for run in list_runs(copied_store):
+        state = json.loads((copied_store / "runs" / run["run_id"] / "sync.json").read_text())[
+            "hosts"][sync_server.host]
+        assert state["protocol"] == 2 and state["complete"]
+        assert_synced_run(copied_store, run["run_id"], sync_server)
+    before = len(sync_server.calls)
     cli("sync", run_id, "--reset", *options, env=env)
-    assert fake_server.host not in json.loads(path.read_text())["hosts"]
-    assert len(fake_server.calls) == before
-    cli("sync", run_id, *options, env=env)
-    assert len([c for c in fake_server.calls if c[1] == "/init"]) == 6
+    assert sync_server.host not in json.loads(path.read_text())["hosts"]
+    assert len(sync_server.calls) == before
+    result = cli("sync", run_id, *options, env=env)
+    assert "bytes=0" in result.stdout
+    assert not any("truncate=1" in url or "/append/" in url
+                   for _, url, _, _ in sync_server.calls[before:])
+    assert assert_synced_run(copied_store, run_id, sync_server)["status"] == "finished"
+    state = json.loads(path.read_text())["hosts"][sync_server.host]
+    assert state["protocol"] == 2 and state["complete"]
     assert cli("sync", "--all", "--reset", *options, env=env, check=False).returncode == 2
     assert cli("sync", "--reset", *options, env=env, check=False).returncode == 2
 
@@ -466,7 +484,7 @@ def test_gc_keeps_active_run(cli, tmp_path):
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX lifetime run locks")
-def test_dead_process_status_and_sync_finalization(cli, tmp_path, fake_server):
+def test_dead_process_status_and_sync_finalization(cli, tmp_path, sync_server):
     root = tmp_path / "dead-store"
     writer = RunWriter.create(root, run_id="abandoned", meta={"project": "p", "name": "dead"})
     writer.write_scalars([(0, {"loss": 1})])
@@ -475,22 +493,21 @@ def test_dead_process_status_and_sync_finalization(cli, tmp_path, fake_server):
     now = time.time()
     os.utime(lock_path, (now, now))
     assert list_runs(root)[0]["effective_status"] == "running"
-    cli("sync", "abandoned", "--dir", root, "--host", fake_server.host, env={"AGENTICML_API_KEY": "testbed-key"})
+    cli("sync", "abandoned", "--dir", root, "--host", sync_server.host, env={"AGENTICML_API_KEY": sync_server.key})
     assert list_runs(root)[0]["effective_status"] == "running"
-    assert not any(path.endswith("/finalize") for _, path, _, _ in fake_server.calls)
+    assert assert_synced_run(root, "abandoned", sync_server)["status"] == "running"
     state_path = root / "runs" / "abandoned" / "sync.json"
-    state = json.loads(state_path.read_text())["hosts"][fake_server.host]
-    assert state["finalized"] is False and state["complete"] is False
-    os.utime(root / "runs" / "abandoned" / "run.lock", (0, 0))
+    state = json.loads(state_path.read_text())["hosts"][sync_server.host]
+    assert state["complete"] is False
+    os.utime(lock_path, (0, 0))
     rows = json.loads(cli("ls", "--json", "--dir", root).stdout)
     assert rows[0]["status"] == "running" and rows[0]["effective_status"] == "crashed"
-    cli("sync", "abandoned", "--dir", root, "--host", fake_server.host, env={"AGENTICML_API_KEY": "testbed-key"})
-    rr = RunReader(root, "abandoned")
-    # Sync finalizes the remote run; local metadata remains resumable.
-    assert rr.meta()["status"] == "running"
+    cli("sync", "abandoned", "--dir", root, "--host", sync_server.host,
+        env={"AGENTICML_API_KEY": sync_server.key})
+    assert assert_synced_run(root, "abandoned", sync_server, dead=True)["status"] == "crashed"
+    assert RunReader(root, "abandoned").meta()["status"] == "running"
     assert list_runs(root)[0]["effective_status"] == "crashed"
-    final = next(body for _, path, body, _ in fake_server.calls if path.endswith("/finalize"))
-    assert final["status"] == "crashed" and final["summary"]["_exit_reason"] == "process died"
+    assert json.loads(state_path.read_text())["hosts"][sync_server.host]["complete"] is True
 
 
 @pytest.mark.parametrize("locked,expired_status", [(False, "crashed"), (None, "stale")])
@@ -511,15 +528,15 @@ def test_heartbeat_grace_boundary(tmp_path, monkeypatch, locked, expired_status)
     assert list_runs(root)[0]["effective_status"] == expired_status
 
 
-def test_sync_watch_repeats_after_delay_and_completes(tmp_path, fake_server):
+def test_sync_watch_repeats_after_delay_and_completes(tmp_path, sync_server):
     root = tmp_path / "watch-store"
     writer = RunWriter.create(root, meta={"project": "watch", "name": "live"})
     writer.write_scalars([(0, {"loss": 2})])
     interval = 0.4
     proc = subprocess.Popen(
-        [str(CONSOLE), "sync", writer.run_id, "--dir", str(root), "--host", fake_server.host,
+        [str(CONSOLE), "sync", writer.run_id, "--dir", str(root), "--host", sync_server.host,
          "--watch", str(interval)], cwd=TESTBED,
-        env=dict(os.environ, AGENTICML_API_KEY="testbed-key"),
+        env=dict(os.environ, AGENTICML_API_KEY=sync_server.key),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     lines = queue.Queue()
@@ -536,35 +553,34 @@ def test_sync_watch_repeats_after_delay_and_completes(tmp_path, fake_server):
         assert first and "partial (running)" in first, first
         assert proc.poll() is None
         state_path = root / "runs" / writer.run_id / "sync.json"
-        state = json.loads(state_path.read_text())["hosts"][fake_server.host]
-        assert state["complete"] is False and state["finalized"] is False
+        state = json.loads(state_path.read_text())["hosts"][sync_server.host]
+        assert state["complete"] is False
         writer.write_scalars([(1, {"loss": 1})])
         writer.finish("finished")
         assert proc.wait(timeout=10) == 0
         thread.join(timeout=2)
-        state = json.loads(state_path.read_text())["hosts"][fake_server.host]
-        assert state["complete"] is True and state["finalized"] is True
-        batches = [(body, when) for (_, path, body, _), when in zip(fake_server.calls, fake_server.call_times)
-                   if path == "/log/batch"]
-        assert len(batches) == 2
-        assert batches[0][0]["items"][0]["step"] == 0
-        assert batches[1][0]["items"][0]["step"] == 1
-        assert batches[1][1] - batches[0][1] >= interval * 0.9
-        assert sum(path.endswith("/finalize") for _, path, _, _ in fake_server.calls) == 1
+        state = json.loads(state_path.read_text())["hosts"][sync_server.host]
+        assert state["complete"] is True
+        assert assert_synced_run(root, writer.run_id, sync_server)["status"] == "finished"
+        assert RunReader(sync_server.store, writer.run_id).series("loss")["points"] == [[0, 2.0], [1, 1.0]]
+        commits = [when for method, path, _, when in sync_server.calls
+                   if method == "POST" and path == f"/v2/runs/{writer.run_id}/commit"]
+        assert len(commits) >= 2
+        assert commits[1] - commits[0] >= interval * 0.9
     finally:
         writer.close()
         stop_process(proc)
         thread.join(timeout=2)
 
 
-def test_synced_gc_and_object_grace(cli, tmp_path, fake_server):
+def test_synced_gc_and_object_grace(cli, tmp_path, sync_server):
     from agenticml.store import put_bytes
     root = tmp_path / "gc-store"
     writer = RunWriter.create(root, meta={"project": "p", "name": "synced"})
     writer.write_scalars([(0, {"loss": 1})])
     writer.finish("finished")
-    cli("sync", writer.run_id, "--dir", root, "--host", fake_server.host,
-        env={"AGENTICML_API_KEY": "testbed-key"})
+    cli("sync", writer.run_id, "--dir", root, "--host", sync_server.host,
+        env={"AGENTICML_API_KEY": sync_server.key})
     old, fresh = put_bytes(root, b"old orphan"), put_bytes(root, b"fresh orphan")
     old_path = root / "objects" / old[:2] / old
     fresh_path = root / "objects" / fresh[:2] / fresh
@@ -574,7 +590,7 @@ def test_synced_gc_and_object_grace(cli, tmp_path, fake_server):
     assert list_runs(root) == [] and not old_path.exists() and fresh_path.is_file()
 
 
-def test_sync_prune_overview_and_resume_refusal(cli, tmp_path, fake_server):
+def test_sync_prune_overview_and_resume_refusal(cli, tmp_path, sync_server):
     from agenticml.store import OVERVIEW_MIN_POINTS
     root = tmp_path / "pruned-store"
     writer = RunWriter.create(root, run_id="large-run", meta={"project": "p", "name": "large"})
@@ -587,9 +603,12 @@ def test_sync_prune_overview_and_resume_refusal(cli, tmp_path, fake_server):
     large_id, small_id = index["large"]["id"], index["small"]["id"]
     assert (scalar_dir / f"{large_id}.ovw").is_file()
     assert not (scalar_dir / f"{small_id}.ovw").exists()
-    options = ["--dir", root, "--host", fake_server.host]
-    env = {"AGENTICML_API_KEY": "testbed-key"}
+    options = ["--dir", root, "--host", sync_server.host]
+    env = {"AGENTICML_API_KEY": sync_server.key}
+    remote_raw = sync_server.store / "runs" / writer.run_id / "scalars" / f"{large_id}.bin"
+    raw_bytes = (scalar_dir / f"{large_id}.bin").read_bytes()
     cli("sync", writer.run_id, *options, "--prune", env=env)
+    assert remote_raw.read_bytes() == raw_bytes
     assert not (scalar_dir / f"{large_id}.bin").exists()
     assert (scalar_dir / f"{small_id}.bin").is_file()
     rr = RunReader(root, writer.run_id)
@@ -600,7 +619,10 @@ def test_sync_prune_overview_and_resume_refusal(cli, tmp_path, fake_server):
     assert "up to date" in cli("sync", writer.run_id, *options, env=env).stdout
     cli("sync", writer.run_id, *options, "--reset", env=env)
     result = cli("sync", writer.run_id, *options, env=env, check=False)
-    assert result.returncode == 1 and "pruned" in result.stdout
+    # Task B preserves pruned_hosts on reset, allowing this host to recover.
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert remote_raw.read_bytes() == raw_bytes
+    assert not (scalar_dir / f"{large_id}.bin").exists()
 
 
 def test_config_xdg_fallback_and_insecure_opt_in(cli, monkeypatch, tmp_path):
