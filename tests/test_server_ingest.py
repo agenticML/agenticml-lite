@@ -354,7 +354,10 @@ def test_public_url_and_directory_warning(tmp_path, caplog):
     "/v2/runs/run-1/files//meta.json", "/v2/runs/" + "a" * 129 + "/state",
     *["/v2/runs/run-1/files/" + name for name in ("run.lock", "notes.md", "sync.json", "remote.json", "scalars/01.ovw", "scalars/1000000000.ovw")]])
 def test_routes_and_traversal(server, path):
-    assert raw(server, "PUT", path, auth(server) + [("Content-Length", "2")], b"{}")[0] == 404
+    status = raw(server, "PUT", path, auth(server) + [("Content-Length", "2")], b"{}")[0]
+    ingest = path == "/v2" or path.startswith("/v2/")
+    # Dashboard paths see Host: arbitrary.example from raw() and 403 before auth.
+    assert status == (404 if ingest else 403)
     assert not (server.root / "runs").exists()
 
 

@@ -54,8 +54,8 @@ Update the status column in the PR that changes it. Values: `not started`,
 | 0 | Test CI (Linux, Python 3.9 and 3.12, UI suite) | – | Codex | S | [plan](packages/0-test-ci.md) | done ([#24](https://github.com/agenticML/agenticml-lite/pull/24)) |
 | 1 † | Server ingest, keys, `/v2` endpoints, server lock | – | Codex | L | [plan](packages/1-server-ingest.md) | done ([#26](https://github.com/agenticML/agenticml-lite/pull/26)) |
 | 2 | Run status from `remote.json` | – | Cursor | S | [plan](packages/2-remote-status.md) | done ([#25](https://github.com/agenticML/agenticml-lite/pull/25)) |
-| 3 | Sync client v2 and `docs/PROTOCOL.md` | 1 | Cursor (client), Codex (sync); prose Antigravity | L | [plan](packages/3-sync-client-v2.md) | in review |
-| 4 † | Server dashboard: key login, sessions, CSRF, last synced | 1, 2 | Cursor | M | to write | not started |
+| 3 | Sync client v2 and `docs/PROTOCOL.md` | 1 | Cursor (client), Codex (sync); prose Antigravity | L | [plan](packages/3-sync-client-v2.md) | done ([#27](https://github.com/agenticML/agenticml-lite/pull/27)) |
+| 4 † | Server dashboard: key login, sessions, CSRF, last synced | 1, 2 | Cursor | M | [plan](packages/4-server-dashboard.md) | in review |
 | 4b † | Key management in the dashboard: first-key setup, issue / list / revoke sync and admin keys | 1, 4 | Codex | M | to write | not started |
 | 5 | `sync --follow` and systemd example | 3 | Cursor | M | to write | not started |
 | 6 | Image, deploy examples, docs, security policy, 2.0.0 release | 1, 3, 4, 4b, 5 | Codex; prose Antigravity | M | to write | not started |
@@ -159,6 +159,15 @@ priority.
   workers. Done when a test sends SIGTERM to a `serve` subprocess during an
   append and the process exits 0 after the request completes. Needed before
   package 6.
+- **No throttling of failed dashboard logins.**
+  Where: `src/agenticml/server/webauth.py` (`POST /login`). Problem: failed
+  logins are not rate-limited. Generated keys carry 256 bits, but
+  `AGENTICML_SERVER_KEY` is operator-chosen (32–256 characters) and may have
+  less entropy, so online guessing is bounded only by request rate. Fix: a
+  small per-client-address failure counter with exponential delay (in memory,
+  capped), plus a startup warning when the env key looks low-entropy. Done
+  when a test shows repeated failures from one address are slowed while a
+  correct key from another address still signs in at once. Before package 6.
 - **Tests workflow does not run on pushes to `dev`.**
   Where: `.github/workflows/test.yml`. Problem: `push` triggers only on
   `main`, but package PRs merge into `dev`, so the merged `dev` head is never

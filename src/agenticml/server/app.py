@@ -9,12 +9,13 @@ from pathlib import Path
 import socket
 import stat
 import threading
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 import weakref
 
 from agenticml.store import layout
-from agenticml.ui.server import DashboardServer, _browser_host
+from agenticml.ui.server import DashboardServer, _browser_host, _loopback_bind
 from .keys import KeyStore, validate_env_key
+from .webauth import WebAuth
 
 logger = logging.getLogger("agenticml.server")
 ATOMIC_BODY_LIMIT = 16 * 1024 * 1024
@@ -92,17 +93,26 @@ def _clean_tmp(tmp_dir):
 
 
 def _validate_public_url(value):
+    """Return a normalized public URL, or None. Scheme and host are lowercased."""
     if value is None:
-        return
+        return None
+    stripped = value.strip()
     try:
-        parsed = urlsplit(value)
+        parsed = urlsplit(stripped)
         valid = (parsed.scheme in ("http", "https") and parsed.hostname
-                 and not parsed.query and not parsed.fragment and "?" not in value and "#" not in value)
+                 and not parsed.query and not parsed.fragment
+                 and "?" not in stripped and "#" not in stripped)
         parsed.port  # Reject malformed ports as a startup error too.
     except ValueError:
         valid = False
     if not valid:
         raise ValueError("public URL must be http:// or https:// with a host and no query or fragment")
+    host = parsed.hostname
+    if ":" in host:
+        host = "[" + host + "]"
+    port = parsed.port
+    netloc = host if port is None else f"{host}:{port}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 
 
 def _read_umask():
@@ -129,6 +139,7 @@ class IngestServer(DashboardServer):
         self.tmp_dir = self.data_dir / "server" / "tmp"
         self.keys = KeyStore(self.data_dir / "server", env_key)
         self.public_url = public_url
+        self.web = WebAuth(self.keys, public_url)
         self.store_file_mode = 0o666 & ~_read_umask()
         self.limits = Limits()
         self.run_locks = weakref.WeakValueDictionary()
@@ -136,7 +147,10 @@ class IngestServer(DashboardServer):
         self.objects_lock = threading.Lock()
         self._server_lock = None
         self._closing_workers = set()
-        super().__init__(self.data_dir / "store", host, port, handler_class=IngestHandler)
+        super().__init__(
+            self.data_dir / "store", host, port, read_only=False,
+            handler_class=IngestHandler, auth=self.web, public_url=public_url,
+        )
 
     def run_lock(self, run_id):
         with self.run_locks_lock:
@@ -177,7 +191,7 @@ class IPv6IngestServer(IngestServer):
 def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None):
     """Prepare and lock the data directory; port=0 chooses a free port."""
     validate_env_key(env_key)
-    _validate_public_url(public_url)
+    public_url = _validate_public_url(public_url)
     data = resolve_data_dir(data)
     prepare_data_dir(data)
     handle = acquire_server_lock(data / "server")
@@ -204,6 +218,12 @@ def serve(data=None, host="127.0.0.1", port=8080, public_url=None):
         address = _browser_host(server.server_address[0])
         print(f"AgenticML server: http://{address}:{server.server_address[1]} "
               f"(data: {server.data_dir})", flush=True)
+        if server.public_url:
+            print(f"Dashboard: {server.public_url}", flush=True)
+        elif not _loopback_bind(host) and not _loopback_bind(server.server_address[0]):
+            logger.warning(
+                "browsers reach the dashboard only through a Host it accepts; "
+                "set --public-url behind a proxy")
         server.serve_forever()
     finally:
         server.server_close()

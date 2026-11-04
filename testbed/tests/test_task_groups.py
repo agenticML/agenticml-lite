@@ -228,6 +228,21 @@ def test_lineage_view_graph_best_path_and_inspector(page, tmp_path, ui_server_fa
         expect(page.get_by_role("button", name="Open lineage of asr", exact=True)).to_be_focused()
 
 
+def test_lineage_inspector_code_changed_without_repo(page, tmp_path, ui_server_factory):
+    root = tmp_path / "lineage-code"
+    ids = _scored(root, [0.5, 0.9], parents=(None, 0))
+    with ui_server_factory(root) as server:
+        home(page, server)
+        dialog = _open_lineage(page)
+        page.locator(f'.lv-node[data-run-id="{ids[1]}"] .lv-box').click()
+        inspector = dialog.get_by_role("complementary", name="Selected run")
+        expect(page.locator(".lv-node.is-focused")).to_have_attribute("data-run-id", ids[1])
+        code = inspector.locator(".kv-list > div").filter(has=page.locator("dt", has_text="code")).locator("dd")
+        expect(code).to_have_text("code changed")
+        expect(inspector).not_to_contain_text("code diff not available on this server")
+        expect(inspector).not_to_contain_text("lineage repository not found")
+
+
 def test_lineage_tray_shares_selection_with_table(page, tmp_path, ui_server_factory):
     root = tmp_path / "lineage-tray"
     ids = _scored(root, [0.5, 0.6, 0.7, 0.9], parents=(None, 0, 0, 1))

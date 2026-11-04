@@ -66,3 +66,4 @@ testpaths = ["tests"]
 
 [tool.setuptools.package-data]
 "agenticml.ui" = ["static/*"]
+"agenticml.server" = ["static/*"]

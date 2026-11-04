@@ -79,6 +79,21 @@ def page(context):
     yield tab
     if tab.allow_http_errors:
         problems = [problem for problem in problems if not problem.startswith(("HTTP 4", "HTTP 503", "console: Failed to load resource:"))]
+    session_404 = any(
+        problem.startswith("HTTP 404:") and "/api/server/session" in problem
+        for problem in problems
+    )
+    problems = [
+        problem for problem in problems
+        if not (
+            (problem.startswith("HTTP 404:") and "/api/server/session" in problem)
+            or (
+                session_404
+                and problem.startswith("console: Failed to load resource:")
+                and "status of 404" in problem
+            )
+        )
+    ]
     assert not problems, "browser errors:\n" + "\n".join(problems)
     tab.close()
 
@@ -1213,6 +1228,10 @@ def mock_dashboard(page, runs):
 
     def respond(route):
         path = urlsplit(route.request.url).path
+        if path == "/api/server/session":
+            route.fulfill(status=404, content_type="application/json",
+                          body=json.dumps({"error": "not found"}))
+            return
         if path == "/api/runs":
             body = runs
         elif path == "/api/compare/code":

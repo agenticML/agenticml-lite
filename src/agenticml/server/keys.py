@@ -229,6 +229,17 @@ class KeyStore:
         return (record.last_used_at is None
                 or time.time() - layout.parse_timestamp(record.last_used_at).timestamp() >= 60)
 
+    def current(self, name, sha256):
+        """Return the live record with this exact name and hash, else None."""
+        records = self.list()
+        digest = sha256 if isinstance(sha256, str) else ""
+        result = None
+        for record in records:
+            hashed = record.sha256
+            if record.name == name and len(hashed) == len(digest) and hmac.compare_digest(hashed, digest):
+                result = record
+        return result
+
     def has_admin(self):
         """Whether a file or environment key can administer the server."""
         return any(record.scope == "admin" for record in self.list())
