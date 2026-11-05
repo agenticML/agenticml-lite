@@ -36,7 +36,7 @@ from agenticml.store import (
     valid_run_id,
     valid_sha,
 )
-from agenticml.store.layout import REMOTE_NAME, RunLockedError
+from agenticml.store.layout import REMOTE_NAME, RunLockedError, read_file_nofollow
 from agenticml.store.reader import (
     REMOTE_STALE_ENV,
     REMOTE_STALE_SECONDS,
@@ -756,6 +756,53 @@ def test_list_runs_order_skip_and_liveness(tmp_path):
     by_id = {item["run_id"]: item for item in list_runs(tmp_path)}
     assert by_id["quiet-run"]["effective_status"] == "running"
     assert list_runs(tmp_path / "does-not-exist") == []
+
+
+def _call_with_timeout(call):
+    results = []
+    errors = []
+
+    def worker():
+        try:
+            results.append(call())
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(timeout=5)
+    assert not thread.is_alive(), "reader blocked on a FIFO"
+    if errors:
+        raise errors[0]
+    return results[0]
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+def test_read_file_nofollow_refuses_fifo(tmp_path):
+    path = tmp_path / "fifo"
+    os.mkfifo(path)
+    with pytest.raises(OSError) as exc_info:
+        _call_with_timeout(lambda: read_file_nofollow(path))
+    assert exc_info.value.errno == errno.EINVAL
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+@pytest.mark.parametrize("filename", ["meta.json", REMOTE_NAME])
+def test_list_runs_fifo_falls_back(tmp_path, filename):
+    writer = RunWriter.create(tmp_path, run_id="fifo-run", meta={})
+    writer.finish("finished", {})
+    expected = list_runs(tmp_path)
+    path = writer.run_dir / filename
+    path.unlink(missing_ok=True)
+    os.mkfifo(path)
+
+    listed = _call_with_timeout(lambda: list_runs(tmp_path))
+    if filename == "meta.json":
+        assert listed == []
+    else:
+        assert listed == expected
+        assert listed[0]["effective_status"] == "finished"
+        assert "last_sync_at" not in listed[0]
 
 
 def test_list_runs_thousand_is_fast(tmp_path):

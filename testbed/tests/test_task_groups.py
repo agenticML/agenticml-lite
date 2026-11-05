@@ -287,7 +287,10 @@ def test_lineage_view_traps_focus_and_flags_failures(page, tmp_path, ui_server_f
         node = page.locator(f'.lv-node[data-run-id="{ids[1]}"]')
         expect(node).to_have_class(re.compile(r"\bis-failed\b"))
         expect(node.locator(".lv-badge")).to_have_text("failed")
-        node.locator(".lv-box").click()
+        with page.expect_response(
+            lambda response: "/api/runs/" in response.url and response.url.endswith("/lineage")
+        ):
+            node.locator(".lv-box").click()
         expect(dialog.locator(".callout-warn")).to_contain_text("Run failed")
         for _ in range(40):
             page.keyboard.press("Tab")
@@ -295,6 +298,62 @@ def test_lineage_view_traps_focus_and_flags_failures(page, tmp_path, ui_server_f
         # The backdrop closes the dialog; the page behind never scrolled.
         page.mouse.click(3, 3)
         expect(page.get_by_role("dialog")).to_have_count(0)
+
+
+def test_lineage_inspector_keeps_focus_across_gated_lineage_fetch(page, tmp_path, ui_server_factory):
+    """Re-render after /lineage must restore focus on Open run without another Tab."""
+    page.add_init_script("""
+    (() => {
+      const real = window.fetch.bind(window);
+      let release;
+      const gate = new Promise((resolve) => { release = resolve; });
+      window.__releaseLineage = release;
+      window.fetch = (url, ...rest) => {
+        const href = typeof url === "string" ? url : url.url;
+        if (/\\/api\\/runs\\/[^/]+\\/lineage/.test(href))
+          return real(url, ...rest).then((response) => gate.then(() => response));
+        return real(url, ...rest);
+      };
+    })();
+    """)
+    root = tmp_path / "lineage-focus-race"
+    ids = _scored(root, [0.5, 0.6], parents=(None, 0), extra={1: {"status": "crashed"}})
+    with ui_server_factory(root) as server:
+        home(page, server)
+        dialog = _open_lineage(page)
+        node = page.locator(f'.lv-node[data-run-id="{ids[1]}"]')
+        with page.expect_response(
+            lambda response: "/api/runs/" in response.url and response.url.endswith("/lineage")
+        ):
+            node.locator(".lv-box").click()
+        expect(dialog.locator(".callout-warn")).to_contain_text("Run failed")
+        try:
+            for _ in range(40):
+                page.keyboard.press("Tab")
+                if page.evaluate("document.activeElement.textContent === 'Open run'"):
+                    break
+            else:
+                raise AssertionError("never reached Open run link")
+            page.evaluate("window.__openBefore = document.querySelector('.lv-insp-actions a')")
+            assert page.evaluate(
+                "document.activeElement === window.__openBefore"
+                " && window.__openBefore.textContent === 'Open run'"
+            )
+            page.evaluate("window.__releaseLineage()")
+            page.wait_for_function(
+                "() => document.querySelector('.lv-insp-actions a') !== window.__openBefore"
+            )
+            page.evaluate("""() => new Promise((resolve) => {
+              requestAnimationFrame(() => setTimeout(resolve, 0));
+            })""")
+            assert page.evaluate(
+                "document.querySelector('.lv-dialog').contains(document.activeElement)"
+                " && document.activeElement.textContent === 'Open run'"
+            )
+        finally:
+            page.evaluate(
+                "typeof window.__releaseLineage === 'function' && window.__releaseLineage()"
+            )
 
 
 def test_lineage_view_follows_polls(page, ui_server):

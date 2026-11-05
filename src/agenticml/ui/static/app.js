@@ -1458,12 +1458,18 @@ async function home(version) {
           el(
             "div",
             { class: "inline lv-insp-actions" },
-            el("a", { class: "btn btn-primary btn-sm", href: routeRun(runId), text: "Open run" }),
+            el("a", {
+              class: "btn btn-primary btn-sm",
+              href: routeRun(runId),
+              text: "Open run",
+              "data-focus": "lv-open",
+            }),
             parent
               ? el("a", {
                   class: "btn btn-secondary btn-sm",
                   href: `#/compare?${new URLSearchParams([["runs", parent.run_id], ["runs", runId]])}`,
                   text: "Compare with parent",
+                  "data-focus": "lv-compare",
                 })
               : null,
           ),

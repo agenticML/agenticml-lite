@@ -56,7 +56,7 @@ Update the status column in the PR that changes it. Values: `not started`,
 | 2 | Run status from `remote.json` | – | Cursor | S | [plan](packages/2-remote-status.md) | done ([#25](https://github.com/agenticML/agenticml-lite/pull/25)) |
 | 3 | Sync client v2 and `docs/PROTOCOL.md` | 1 | Cursor (client), Codex (sync); prose Antigravity | L | [plan](packages/3-sync-client-v2.md) | done ([#27](https://github.com/agenticML/agenticml-lite/pull/27)) |
 | 4 † | Server dashboard: key login, sessions, CSRF, last synced | 1, 2 | Cursor | M | [plan](packages/4-server-dashboard.md) | done ([#28](https://github.com/agenticML/agenticml-lite/pull/28)) |
-| 4b † | Key management in the dashboard: first-key setup, issue / list / revoke sync and admin keys | 1, 4 | Codex | M | [plan](packages/4b-key-management.md) | in review |
+| 4b † | Key management in the dashboard: first-key setup, issue / list / revoke sync and admin keys | 1, 4 | Codex | M | [plan](packages/4b-key-management.md) | done ([#29](https://github.com/agenticML/agenticml-lite/pull/29)) |
 | 5 | `sync --follow` and systemd example | 3 | Cursor | M | to write | not started |
 | 6 | Image, deploy examples, docs, security policy, 2.0.0 release | 1, 3, 4, 4b, 5 | Codex; prose Antigravity | M | to write | not started |
 
@@ -120,7 +120,9 @@ and keeps a single v1 store; team state lives beside it in `<data>/server/`.
   dependency: the server trusts an identity header from a configured proxy
   (ALB OIDC `x-amzn-oidc-identity`, Tailscale `Tailscale-User-Login`, or
   oauth2-proxy `X-Forwarded-Email`), only on connections from configured proxy
-  addresses. Key login stays as a fallback.
+  addresses. Key login stays as a fallback. The failed-login throttle from
+  2.0 then keys by the forwarded client address, taken only from those proxy
+  connections, instead of the proxy's own address.
 - **14 Audit log.** Append-only `<data>/server/audit.jsonl`: key and user
   changes, logins, run creation, note edits.
 - **15 Admin page.** Manage users, roles and keys from the dashboard (admin
@@ -149,48 +151,32 @@ Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
-- **`agenticml server serve` has no SIGTERM handler.**
-  Where: `src/agenticml/server/app.py` (`serve`). Problem: `docker stop` and
-  ECS send SIGTERM, which kills the process with Python's default handler, so
-  in-flight requests are cut off and `server_close` (join workers, then
-  release `server.lock`) never runs. Appends roll back only on exceptions,
-  not on a kill. Fix: install a SIGTERM handler in `serve` that calls
-  `server.shutdown()` from another thread, then let `server_close` drain the
-  workers. Done when a test sends SIGTERM to a `serve` subprocess during an
-  append and the process exits 0 after the request completes. Needed before
-  package 6.
-- **No throttling of failed dashboard logins.**
-  Where: `src/agenticml/server/webauth.py` (`POST /login`). Problem: failed
-  logins are not rate-limited. Generated keys carry 256 bits, but
-  `AGENTICML_SERVER_KEY` is operator-chosen (32–256 characters) and may have
-  less entropy, so online guessing is bounded only by request rate. Fix: a
-  small per-client-address failure counter with exponential delay (in memory,
-  capped), plus a startup warning when the env key looks low-entropy. Done
-  when a test shows repeated failures from one address are slowed while a
-  correct key from another address still signs in at once. Before package 6.
-- **Tests workflow does not run on pushes to `dev`.**
-  Where: `.github/workflows/test.yml`. Problem: `push` triggers only on
-  `main`, but package PRs merge into `dev`, so the merged `dev` head is never
-  tested on its own. Fix: add `dev` to `on.push.branches`. Done when a push to
-  `dev` starts the `Tests` workflow.
-- **FIFO at a run file hangs the reader.** Where: `store/layout.py`
-  `read_file_nofollow`, used by `list_runs` for `meta.json` and
-  `remote.json`. Problem: it opens without `O_NONBLOCK`, so a FIFO named
-  `meta.json` or `remote.json` blocks the open and hangs the dashboard listing
-  (found in the package 2 review; affects `meta.json` since before 2.0). Fix:
-  open with `O_NONBLOCK` (then clear it, or just rely on the `S_ISREG` check
-  after `fstat`) so a non-regular file is refused without blocking. Matters
-  more once the server writes runs on behalf of remote keys. Done when a test
-  with a FIFO `meta.json` and a FIFO `remote.json` shows `list_runs` returning
-  promptly and skipping or falling back as for any invalid file. (Package 4b
-  fixed the same problem for `keys.lock` and `server.lock`.)
-- **Flaky lineage focus-trap UI test.** Where:
-  `testbed/tests/test_task_groups.py::test_lineage_view_traps_focus_and_flags_failures`.
-  Problem: it fails about 1 run in 40, both before and after package 4b (it
-  failed 1 of 40 runs on each, measured Nov 5, 2026). After the click on a
-  failed node, the async `/lineage` fetch re-renders the inspector. If that
-  lands inside the Tab loop, `document.activeElement` is briefly `<body>`, and
-  the per-press `contains` check fails. Fix: wait for the inspector to settle
-  (the fetch done and the node re-rendered) before the Tab loop, or make the
-  check retry until focus is back inside the dialog. Done when 100 runs of the
-  test pass in a row.
+- **Other run-file opens can still block on a FIFO.**
+  Where: `store/layout.py` `open_nofollow` (read and append modes) and
+  `open_object`, and `sync.py` `_open_local` (a check-then-open gap).
+  Problem: they open before checking `S_ISREG` and without `O_NONBLOCK`, so a
+  FIFO as `events.jsonl`, a scalar or media file, `run.lock` or an object
+  file hangs the reader, writer, gc or a dashboard request thread
+  (`ui/server.py` serving objects). Found in the backlog-fixes review; the
+  same fix as `read_file_nofollow` (Nov 5, 2026). Fix: one shared helper that
+  opens with `O_NONBLOCK`, checks `S_ISREG`, then clears non-blocking, used by
+  all three. Done when tests with a FIFO at an `events.jsonl`, a scalar
+  `.bin`, an object and `run.lock` show each caller failing fast instead of
+  hanging. Before package 6.
+- **Login throttle check and failure record are not atomic.**
+  Where: `src/agenticml/server/webauth.py` `_login` (`retry_after` before the
+  body read, `record_failure` after verify). Problem: several connections
+  that pass the check together and then send their bodies each get a guess
+  in. The body-admission cap bounds it to a few extra guesses per window.
+  Fix: charge the failure when the check passes (`begin_attempt`), refund it
+  on 400 and 403, clear it on success. Done when a test with concurrent
+  delayed bodies from one address sees at most one guess per allowed slot.
+- **Lineage tray "Compare N runs" link loses focus on re-render.**
+  Where: `src/agenticml/ui/static/app.js`, the lineage view's tray, which is
+  rebuilt by `render()`. Problem: the link has no `data-focus` key, so if it
+  has keyboard focus when a poll or a fetch re-renders the view, focus falls
+  to `<body>` until the next Tab. This is the same bug the backlog fixes
+  removed from the inspector links (Nov 5, 2026). Fix: give it a `data-focus`
+  key, and check the rest of the lineage view for focusable elements without
+  one. Done when a UI test focuses the link, triggers a re-render, and sees
+  focus still on it.

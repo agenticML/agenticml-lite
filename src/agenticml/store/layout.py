@@ -348,6 +348,8 @@ def open_nofollow(path: Path | str, mode: str = "rb", buffering: int = -1):
 def read_file_nofollow(path: Path | str) -> bytes:
     """Read full file contents without following symlinks."""
     flags = os.O_RDONLY
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    flags |= nonblock
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     else:
@@ -361,6 +363,8 @@ def read_file_nofollow(path: Path | str) -> bytes:
         st_fd = os.fstat(fd)
         if not stat.S_ISREG(st_fd.st_mode):
             raise OSError(errno.EINVAL, f"not a regular file: {path}")
+        if nonblock:
+            os.set_blocking(fd, True)
         size = st_fd.st_size
         chunks = []
         remaining = size

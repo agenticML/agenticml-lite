@@ -491,11 +491,11 @@ def cmd_server_serve(args):
     try:
         serve(args.data, args.host, args.port, args.public_url)
     except KeyboardInterrupt:
-        print("stopped")
-        return 0
+        pass
     except (OSError, ValueError, OverflowError) as exc:
         print(f"agenticml server: {str(exc).splitlines()[0]}", file=sys.stderr)
         return 1
+    print("stopped")
     return 0
 
 
