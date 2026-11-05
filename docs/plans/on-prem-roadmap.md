@@ -151,18 +151,6 @@ Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
-- **Other run-file opens can still block on a FIFO.**
-  Where: `store/layout.py` `open_nofollow` (read and append modes) and
-  `open_object`, and `sync.py` `_open_local` (a check-then-open gap).
-  Problem: they open before checking `S_ISREG` and without `O_NONBLOCK`, so a
-  FIFO as `events.jsonl`, a scalar or media file, `run.lock` or an object
-  file hangs the reader, writer, gc or a dashboard request thread
-  (`ui/server.py` serving objects). Found in the backlog-fixes review; the
-  same fix as `read_file_nofollow` (Nov 5, 2026). Fix: one shared helper that
-  opens with `O_NONBLOCK`, checks `S_ISREG`, then clears non-blocking, used by
-  all three. Done when tests with a FIFO at an `events.jsonl`, a scalar
-  `.bin`, an object and `run.lock` show each caller failing fast instead of
-  hanging. Before package 6.
 - **Lineage tray "Compare N runs" link loses focus on re-render.**
   Where: `src/agenticml/ui/static/app.js`, the lineage view's tray, which is
   rebuilt by `render()`. Problem: the link has no `data-focus` key, so if it
