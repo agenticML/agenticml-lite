@@ -71,7 +71,20 @@ def acquire_server_lock(server_dir):
         import fcntl
     except ImportError as exc:
         raise ValueError("the server needs POSIX fcntl") from exc
-    handle = layout.open_nofollow(Path(server_dir) / "server.lock", "ab")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        fd = os.open(Path(server_dir) / "server.lock", flags, 0o600)
+    except OSError as exc:
+        if exc.errno == errno.ENXIO:
+            raise ValueError("server.lock is not a regular file") from exc
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("server.lock is not a regular file")
+        handle = os.fdopen(fd, "ab")
+    except BaseException:
+        os.close(fd)
+        raise
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as exc:
@@ -151,6 +164,8 @@ class IngestServer(DashboardServer):
             self.data_dir / "store", host, port, read_only=False,
             handler_class=IngestHandler, auth=self.web, public_url=public_url,
         )
+        base = public_url or f"http://{_browser_host(self.server_address[0])}:{self.server_address[1]}"
+        self.web.arm_setup(base)
 
     def run_lock(self, run_id):
         with self.run_locks_lock:
@@ -213,8 +228,6 @@ def serve(data=None, host="127.0.0.1", port=8080, public_url=None):
         if not server.keys.list():
             logger.warning("no keys: every request except /healthz is rejected; "
                            "create a key with agenticml server keys create")
-        elif not server.keys.has_admin():
-            logger.warning("no admin key; create one with agenticml server keys create --scope admin")
         address = _browser_host(server.server_address[0])
         print(f"AgenticML server: http://{address}:{server.server_address[1]} "
               f"(data: {server.data_dir})", flush=True)

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from http.cookies import CookieError, SimpleCookie
 import hashlib
+import hmac
 import json
 import logging
 from pathlib import Path
@@ -10,7 +11,7 @@ import secrets
 import socket
 import threading
 import time
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from agenticml.ui.server import (
     _DISCONNECT,
@@ -18,6 +19,8 @@ from agenticml.ui.server import (
     _STATIC,
     _reject_nonfinite,
 )
+from . import keyspage
+from .keys import ClientError, KeyNameTaken, KeyStoreUnavailable, SetupClosed, validate_name
 
 logger = logging.getLogger("agenticml.server.webauth")
 SESSION_IDLE = 12 * 3600
@@ -27,6 +30,7 @@ LOGIN_BODY_MAX = 4 * 1024
 _LOGIN_STATIC = Path(__file__).with_name("static")
 _ASSETS = {
     "/static/login.js": (_LOGIN_STATIC / "login.js", "text/javascript; charset=utf-8"),
+    "/static/setup.js": (_LOGIN_STATIC / "setup.js", "text/javascript; charset=utf-8"),
     "/static/app.css": (_STATIC / "app.css", _FILES["app.css"]),
     "/static/InstrumentSans.woff2": (_STATIC / "InstrumentSans.woff2", _FILES["InstrumentSans.woff2"]),
     "/static/JetBrainsMono.woff2": (_STATIC / "JetBrainsMono.woff2", _FILES["JetBrainsMono.woff2"]),
@@ -42,11 +46,52 @@ class WebAuth:
         self.clock = clock
         self._lock = threading.Lock()
         self._sessions = {}
+        self.setup_token = None
+        self._setup_used = False
+        self._setup_lock = threading.Lock()
+
+    def arm_setup(self, base_url):
+        if not self.keys.prepare_setup():
+            return
+        self.setup_token = secrets.token_urlsafe(32)
+        self._setup_used = False
+        logger.warning(
+            "No admin key yet. Open %s/setup?token=%s to create one, or run: "
+            "agenticml server keys create --name admin --scope admin",
+            base_url.rstrip("/"), self.setup_token,
+        )
+
+    def _setup_armed(self):
+        """Caller holds _setup_lock; observing an admin permanently disarms setup."""
+        if self.keys.has_admin() or self.keys.setup_closed():
+            self._setup_used = True
+            self.setup_token = None
+        return self.setup_token is not None and not self._setup_used
+
+    def _setup_matches(self, token):
+        try:
+            return hmac.compare_digest(token.encode("ascii"), self.setup_token.encode("ascii"))
+        except UnicodeEncodeError:
+            return False
 
     def handle(self, handler) -> bool:
         """Answer login routes and rejected requests. False means continue."""
+        if handler.command in ("GET", "HEAD", "DELETE") and (
+                handler.headers.get_all("Content-Length") or handler.headers.get_all("Transfer-Encoding")):
+            handler.close_connection = True
         path = self._path(handler)
         try:
+            if path == "/setup":
+                with self._setup_lock:
+                    self._setup_armed()
+                if handler.command == "GET":
+                    self._setup_page(handler)
+                elif handler.command == "POST":
+                    self._setup(handler)
+                else:
+                    handler.close_connection = True
+                    handler._json({"error": "method not allowed"}, 405)
+                return True
             if handler.command == "GET" and path in _ASSETS:
                 self._asset(handler, path)
                 return True
@@ -67,6 +112,13 @@ class WebAuth:
                 self._refuse(handler, path)
                 return True
             handler.session = session
+            if path == "/api/server/keys" or (path or "").startswith("/api/server/keys/"):
+                keyspage.handle(self, handler, path)
+                return True
+            if (path or "").startswith("/api/server/") and path != "/api/server/session":
+                handler.close_connection = True
+                handler._json({"error": "not found"}, 404)
+                return True
             return False
         except _DISCONNECT:
             handler.close_connection = True
@@ -78,6 +130,10 @@ class WebAuth:
                     handler._error({"error": "request timeout"}, 408)
                 except OSError:
                     handler.close_connection = True
+            return True
+        except KeyStoreUnavailable:
+            if not getattr(handler, "_started", False):
+                handler._error({"error": "key store unavailable"}, 503)
             return True
         except ValueError:
             if not getattr(handler, "_started", False):
@@ -174,6 +230,65 @@ class WebAuth:
             return
         with self._lock:
             self._sessions.pop(digest, None)
+
+    def drop_sessions(self, name, sha256):
+        with self._lock:
+            for digest, entry in list(self._sessions.items()):
+                if entry["name"] == name and entry["sha256"] == sha256:
+                    del self._sessions[digest]
+
+    def _setup_page(self, handler):
+        tokens = parse_qs(urlsplit(handler.path).query, keep_blank_values=True).get("token", [])
+        with self._setup_lock:
+            allowed = self._setup_armed() and len(tokens) == 1 and self._setup_matches(tokens[0])
+        if not allowed:
+            handler._json({"error": "not found"}, 404)
+            return
+        handler._send(
+            (_LOGIN_STATIC / "setup.html").read_bytes(), "text/html; charset=utf-8",
+            headers=self._headers({"Referrer-Policy": "no-referrer"}),
+        )
+
+    def _setup(self, handler):
+        try:
+            payload = keyspage.read_json(handler, LOGIN_BODY_MAX)
+            if payload is None:
+                return
+            token, name = payload.get("token"), payload.get("name", "admin")
+            if not isinstance(token, str) or not isinstance(name, str):
+                raise ClientError("invalid setup body")
+            validate_name(name)
+            with self._setup_lock:
+                if not self._setup_armed() or not self._setup_matches(token):
+                    handler._json({"error": "not found"}, 404)
+                    return
+                if any(record.name == name for record in self.keys.list()):
+                    handler._json({"error": "key name already exists"}, 409)
+                    return
+                try:
+                    record, value = self.keys.create(
+                        name, "admin", created_by="setup", only_if_no_admin=True)
+                except SetupClosed:
+                    self._setup_used = True
+                    self.setup_token = None
+                    handler._json({"error": "not found"}, 404)
+                    return
+                except KeyNameTaken:
+                    handler._json({"error": "key name already exists"}, 409)
+                    return
+                except (KeyStoreUnavailable, OSError):
+                    handler._json({"error": "key store unavailable"}, 503)
+                    return
+                self._setup_used = True
+            cookie, entry = self._create_session(record)
+            handler.session = entry
+            handler._json(
+                {"ok": True, "key": name, "value": value, **keyspage.command_host(self, handler)},
+                201, self._headers({"Set-Cookie": self._cookie(cookie)}),
+            )
+        except ValueError as exc:
+            if not getattr(handler, "_started", False):
+                handler._error({"error": str(exc) if isinstance(exc, ClientError) else "invalid request"}, 400)
 
     def _headers(self, extra=None):
         headers = {"Cache-Control": "no-store"}

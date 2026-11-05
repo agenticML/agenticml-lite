@@ -20,7 +20,34 @@ from agenticml.store import layout
 logger = logging.getLogger("agenticml.server.keys")
 _NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
 _ENV_KEY = re.compile(r"[A-Za-z0-9._~+/=-]{32,256}")
+_SETUP_CLOSED = "setup-closed"
 _UNSET = object()
+
+
+class ClientError(ValueError):
+    """Validation failure with a fixed message safe to return to clients."""
+
+
+class KeyNameTaken(ValueError):
+    pass
+
+
+class LastAdminError(ValueError):
+    pass
+
+
+class SetupClosed(ValueError):
+    pass
+
+
+class KeyStoreUnavailable(RuntimeError):
+    pass
+
+
+def validate_name(name):
+    if (not isinstance(name, str) or not _NAME.fullmatch(name)
+            or name in ("env", ".", "..")):
+        raise ClientError("invalid or reserved key name")
 
 
 def validate_env_key(value):
@@ -60,6 +87,8 @@ class KeyStore:
         self._signature = _UNSET
         self._records = []
         self._env = None
+        self._touch_log_lock = threading.Lock()
+        self._touch_error_at = None
         if env_key is not None:
             self._env = KeyRecord("env", "admin", self._hash(env_key), "env",
                                   layout.format_timestamp(), "env", None)
@@ -93,9 +122,12 @@ class KeyStore:
                     or not layout.valid_sha(row["sha256"])
                     or len(row["prefix"]) != 8):
                 raise ValueError("invalid key record")
-            layout.parse_timestamp(row["created_at"])
-            if row["last_used_at"] is not None:
-                layout.parse_timestamp(row["last_used_at"])
+            try:
+                layout.parse_timestamp(row["created_at"])
+                if row["last_used_at"] is not None:
+                    layout.parse_timestamp(row["last_used_at"])
+            except ArithmeticError as exc:
+                raise ValueError("invalid key record") from exc
             names.add(row["name"])
             records.append(KeyRecord(**row))
         return records
@@ -124,7 +156,16 @@ class KeyStore:
             import fcntl
         except ImportError as exc:
             raise ValueError("the server needs POSIX fcntl") from exc
-        with layout.open_nofollow(self.server_dir / "keys.lock", "ab") as handle:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
+        fd = os.open(self.server_dir / "keys.lock", flags, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError("keys.lock is not a regular file")
+            handle = os.fdopen(fd, "ab")
+        except BaseException:
+            os.close(fd)
+            raise
+        with handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             yield
 
@@ -144,21 +185,103 @@ class KeyStore:
             tmp.unlink(missing_ok=True)
             self._signature = _UNSET
 
-    def create(self, name, scope="sync", created_by="cli"):
+    def _write_setup_closed(self):
+        """Empty <data>/server/setup-closed; atomic, no-follow, mode 0600."""
+        path = self.server_dir / _SETUP_CLOSED
+        tmp = layout.unique_tmp(self.server_dir, ".setup-closed")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        try:
+            fd = os.open(tmp, flags, 0o600)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp, path)
+            layout.fsync_dir(self.server_dir)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def setup_closed(self):
+        """Whether an admin key has ever been created in this data dir.
+
+        The path is not followed, so a planted symlink still counts as closed.
+        """
+        try:
+            os.lstat(self.server_dir / _SETUP_CLOSED)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        return True
+
+    def clear_setup_closed(self):
+        """Unlink the leftover marker.
+
+        Raises FileNotFoundError when the marker is already absent; the
+        caller treats that as success. Any other OSError is raised.
+        """
+        os.unlink(self.server_dir / _SETUP_CLOSED)
+
+    def prepare_setup(self):
+        """Clear a stale marker and say whether first-admin setup may arm.
+
+        Holds the cache lock and keys.lock so a CLI create cannot interleave
+        with the clear, the admin check (file records plus the env key), and
+        the strict keys.json read. A missing marker is fine. Any other
+        OSError while clearing, a failed strict read, or a lock that
+        cannot be taken, logs a fixed message and returns False.
+        """
+        with self._lock:
+            try:
+                file_lock = self._file_lock()
+                file_lock.__enter__()
+            except (OSError, ValueError):
+                logger.error("could not lock keys store; setup disabled until the "
+                             "file is fixed and the server restarts")
+                return False
+            try:
+                try:
+                    self.clear_setup_closed()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    logger.error("could not clear setup-closed marker; setup disabled until the "
+                                 "file is fixed and the server restarts")
+                    return False
+                try:
+                    records = self._read()
+                except (OSError, ValueError, TypeError, RecursionError):
+                    logger.error("could not load keys.json; setup disabled until the file is fixed "
+                                 "and the server restarts")
+                    return False
+                if self._env is not None or any(record.scope == "admin" for record in records):
+                    return False
+                return True
+            finally:
+                file_lock.__exit__(None, None, None)
+
+    def create(self, name, scope="sync", created_by="cli", *, only_if_no_admin=False):
         """Return (KeyRecord, secret); the secret is never persisted."""
-        if not isinstance(name, str) or not _NAME.fullmatch(name) or name == "env":
-            raise ValueError("invalid or reserved key name")
+        validate_name(name)
         if scope not in ("sync", "admin"):
-            raise ValueError("invalid key scope")
+            raise ClientError("invalid key scope")
         if not isinstance(created_by, str):
             raise ValueError("created_by must be a string")
         with self._lock, self._file_lock():
-            records = self._read()
+            try:
+                records = self._read()
+            except (OSError, ValueError, TypeError, RecursionError) as exc:
+                raise KeyStoreUnavailable("could not load keys.json") from exc
+            if only_if_no_admin and (self.setup_closed() or self._env is not None
+                                     or any(record.scope == "admin" for record in records)):
+                raise SetupClosed("setup closed")
             if any(record.name == name for record in records):
-                raise ValueError("key name already exists")
+                raise KeyNameTaken("key name already exists")
             key = "aml_" + secrets.token_urlsafe(32)
             record = KeyRecord(name, scope, self._hash(key), key[:8],
                                layout.format_timestamp(), created_by, None)
+            if scope == "admin":
+                self._write_setup_closed()
             self._write(records + [record])
             return record, key
 
@@ -171,8 +294,8 @@ class KeyStore:
             self._maybe_reload()
             return self._records[:] + ([self._env] if self._env is not None else [])
 
-    def revoke(self, name):
-        """Delete a named file key, returning whether it existed.
+    def revoke(self, name, *, keep_admin=False):
+        """Delete a named file key, returning the removed record or None.
 
         Names are run-owner identities: recreating a revoked name grants access
         to that name's runs. The env key cannot be revoked here.
@@ -180,12 +303,19 @@ class KeyStore:
         if name == "env":
             raise ValueError("the env key cannot be revoked")
         with self._lock, self._file_lock():
-            records = self._read()
+            try:
+                records = self._read()
+            except (OSError, ValueError, TypeError, RecursionError) as exc:
+                raise KeyStoreUnavailable("could not load keys.json") from exc
+            removed = next((record for record in records if record.name == name), None)
+            if removed is None:
+                return None
+            admins = sum(record.scope == "admin" for record in records) + (self._env is not None)
+            if keep_admin and removed.scope == "admin" and admins <= 1:
+                raise LastAdminError("last admin key; create another admin key first, or use the CLI")
             remaining = [record for record in records if record.name != name]
-            if len(remaining) == len(records):
-                return False
             self._write(remaining)
-            return True
+            return removed
 
     def verify(self, key_str):
         """Compare every digest, without an early exit or hash-index lookup."""
@@ -222,7 +352,11 @@ class KeyStore:
                             self._write(records)
                             break
         except Exception:
-            logger.error("could not update key last_used_at")
+            with self._touch_log_lock:
+                now = time.monotonic()
+                if self._touch_error_at is None or now - self._touch_error_at >= 60:
+                    self._touch_error_at = now
+                    logger.error("could not update key last_used_at")
 
     @staticmethod
     def _due(record):

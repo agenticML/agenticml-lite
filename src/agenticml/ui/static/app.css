@@ -3157,3 +3157,90 @@ pre,
   min-width: 0;
   overflow-wrap: anywhere;
 }
+
+/* Keys use the shared table and modal surfaces, with secrets wrapping in place. */
+.key-dialog {
+  width: min(560px, calc(100vw - 32px));
+  padding: var(--s-5);
+  overflow-wrap: anywhere;
+}
+.key-dialog > .heading {
+  margin-bottom: var(--s-4);
+}
+.key-dialog h2,
+.key-dialog p {
+  margin: 0;
+}
+.key-dialog .field {
+  width: 100%;
+  min-width: 0;
+}
+.key-dialog code {
+  display: block;
+  min-width: 0;
+  white-space: pre-wrap;
+  font: var(--fs-sm) / 1.6 var(--font-mono-stack);
+}
+.key-copy-status {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+.key-dialog .error:not([hidden]) {
+  margin-top: var(--s-4);
+}
+@media (max-width: 599px) {
+  .keys-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+  .keys-table,
+  .keys-table tbody,
+  .keys-table tr {
+    display: block;
+  }
+  .keys-table tr {
+    margin-bottom: var(--s-4);
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+  }
+  .keys-table td {
+    display: grid;
+    grid-template-columns: 80px minmax(0, 1fr);
+    gap: var(--s-3);
+    min-width: 0;
+  }
+  .keys-table td::before {
+    content: attr(data-label);
+    font-family: var(--font-sans-stack);
+    color: var(--text-3);
+  }
+  .keys-table td:last-child {
+    border-bottom: 0;
+  }
+}
+@media (max-width: 760px) {
+  .topbar:has(#nav-keys:not([hidden])) {
+    gap: var(--s-2);
+  }
+  .topbar:has(#nav-keys:not([hidden])) .topbar-host {
+    display: none;
+  }
+  .topbar:has(#nav-keys:not([hidden])) .breadcrumb {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    flex: 1;
+  }
+  .topbar:has(#nav-keys:not([hidden])) .topbar-session {
+    flex: 0 1 auto;
+  }
+  .topbar:has(#nav-keys:not([hidden])) .btn {
+    flex: none;
+  }
+}
