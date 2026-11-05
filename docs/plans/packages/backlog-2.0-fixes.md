@@ -162,6 +162,117 @@ bullet. Never trust `X-Forwarded-For` here.
 **Done when** those tests pass, the throttle and the warning are in. The supervisor then
 removes the Backlog entry "No throttling of failed dashboard logins".
 
+**Addendum after the second review (Nov 5, 2026): throttle bearer keys too.**
+The `/v2` API checks bearer keys in `IngestHandler._authenticate`
+(`server/ingest.py`) with the same `KeyStore.verify`, and the env key is
+valid there too. Without a throttle, `/v2/whoami` answers 401 or 200 for any
+guess while `/login` returns 429, so the login throttle alone does not
+protect a weak env key. Changes:
+
+1. One `LoginThrottle` per server, shared by both paths: `_authenticate`
+   uses `self.server.web.throttle` (the same instance `/login` uses), keyed
+   by `self.client_address[0]` through `_bucket`.
+2. In `_authenticate`, when an `Authorization` header is present, check
+   `retry_after` before `verify`. If the bucket is throttled, set
+   `close_connection = True` and raise `_RequestError(429, {"error": "too
+   many failed authentications; try again later"}, {"Retry-After": "<n>"})`,
+   even for a correct key, so throttled requests reveal nothing.
+3. Only a well-formed bearer key that `verify` rejects counts as a failure.
+   A missing or malformed header is a 401 as today, and does not count.
+4. A successful bearer request does not clear the bucket. A sync machine on
+   the same address (NAT) must not reset an attacker's count every pass.
+   Entries still expire 15 minutes after the last failure. Dashboard login
+   success still clears, as before.
+5. Sync clients already treat 429 as transient (`_TRANSIENT_STATUS`), so no
+   client change.
+
+Tests (add to `tests/test_server_login_throttle.py`):
+- Five wrong bearer keys on `/v2/whoami` from one address throttle that
+  address. Then `/v2/whoami` with the correct key gets 429 with
+  `Retry-After` and `Connection: close`, and so does `/login`.
+- Failures on `/login` throttle `/v2/whoami` from the same address.
+- A missing or malformed `Authorization` header never counts.
+- A correct bearer key does not clear a partly filled bucket.
+- A correct key from a different address still works at once.
+- The existing sync tests (`tests/test_sync.py`, `tests/test_client.py`,
+  `tests/test_server_ingest.py`) pass unchanged.
+
+**Addendum 2 (Nov 5, 2026): make admission atomic.** Codex showed that the
+check (`retry_after`), the key check and the failure record are separate
+steps. With four failures recorded, 16 bearer requests admitted together all
+got a guess, and bearer requests have no body-admission cap to bound this.
+Fix in `LoginThrottle`, used by both `/login` and `_authenticate`:
+
+1. Replace the check-then-record pair with `begin(address)`, which returns
+   `(retry_after, ticket)`. Under the lock: let `count = failures +
+   pending`. If `count >= FREE_FAILURES` and `now < allowed_at`, return the
+   whole seconds left and no ticket. Otherwise `pending += 1`, and
+   pessimistically set `allowed_at = now + delay(count + 1)`, as if this
+   attempt will fail. The next concurrent attempt then sees the slot taken.
+2. `finish(ticket, outcome)`, with outcome one of `"failed"`, `"ignored"`
+   or `"success"`: `pending -= 1`. For `failed`: `failures += 1`,
+   `last_failure = now`. For `ignored` (a valid bearer key, a 400 or 403
+   login, a malformed header): recompute `allowed_at` from
+   `last_failure + delay(failures + pending)`, which releases the
+   pessimistic hold. For `success` on `/login`: set `failures = 0` and keep
+   other attempts' `pending`. Drop the entry once `failures` and `pending`
+   are both 0. A bearer success uses `ignored`, so it still never resets the
+   count.
+3. Every admitted attempt calls `finish` exactly once, on every path,
+   including exceptions (`try/finally`). A leaked `pending` would lock the
+   address out until expiry. Eviction and expiry must never drop an entry
+   with `pending > 0`; skip such entries when evicting at the cap.
+4. Keep `retry_after`/`record_failure`/`clear` only if other code or tests
+   still need them. Otherwise remove them and update the tests.
+
+Tests:
+- Deterministic concurrency for both paths: with 4 failures recorded, hold
+  `verify` on an event (monkeypatch `server.keys.verify`), start 16
+  concurrent requests (bearer `/v2/whoami` with wrong keys, and `/login` with
+  wrong keys), release, and check that exactly one was admitted to verify
+  and the rest got 429. Use thread joins with timeouts.
+- An admitted attempt that raises still releases its slot.
+- A bearer success between failures does not reset the count.
+- A PUT to `/v2/...` with `Content-Length` and a body, from a throttled
+  address, gets 429 with `Connection: close`, and the body is not read (the
+  server doesn't wait for it: send headers only and the response arrives).
+
+**Addendum 2, revised after Codex's re-review (Nov 5, 2026): one hold per
+ticket.** One shared `allowed_at`, recomputed from the shared
+`last_failure` when an `ignored` attempt finishes, can erase the hold of a
+different attempt that is still pending, which lets a second guess into the
+same slot. Change the state to:
+
+- per bucket: `failures`, `last_failure`, and `holds`, a dict mapping each
+  pending ticket to its own deadline;
+- `base = last_failure + delay(failures)`, or 0 with no failures;
+- effective deadline `= max(base, *holds.values())`.
+
+`begin`: `count = failures + len(holds)`. Refuse when `count >=
+FREE_FAILURES` and `now <` the effective deadline. Otherwise create a unique
+ticket (for example `(bucket, next(counter))`) with hold `now +
+delay(count + 1)`. `finish(ticket, outcome)` removes only that ticket's
+hold. For `failed`: `failures += 1` and `last_failure = now`. For
+`success` (login only): `failures = 0`. For `ignored`: nothing else. Other
+holds are never touched. Drop the bucket when `failures == 0` and there are
+no holds. Expiry and eviction skip buckets that have holds. `finish` on an
+unknown ticket is a no-op. Compare tickets with `is None`, never by
+truthiness.
+
+Also: remove `retry_after`, `record_failure` and `clear` (production no
+longer uses them), and port their unit tests to `begin`/`finish`. Add a
+comment that while every bucket holds a ticket, the table can exceed
+`MAX_ENTRIES`, bounded by in-flight connections. Note in the docstring that
+about 6 truly simultaneous valid-key requests from one bucket can get a
+short spurious 429 (clients retry 429). That is accepted.
+
+Extra tests: a mixed completion (a malformed login finishes while a wrong-key
+guess admitted later is still pending) must not admit a second guess, for
+both `/login` and bearer; and direct `begin`/`finish` unit tests for
+`ignored` with another attempt pending, `success` with another pending,
+holds that never expire or get evicted, the drop at zero, and an unknown
+ticket.
+
 ## C. Tests workflow on pushes to `dev`
 
 In `.github/workflows/test.yml`, change `on.push.branches` from `[main]` to

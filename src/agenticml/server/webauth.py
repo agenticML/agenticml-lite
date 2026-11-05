@@ -6,6 +6,7 @@ from http.cookies import CookieError, SimpleCookie
 import hashlib
 import hmac
 import ipaddress
+import itertools
 import json
 import logging
 import math
@@ -61,6 +62,9 @@ class LoginThrottle:
 
     Spraying more than 1024 buckets (for example many /64s) can still
     evict entries. That is an accepted stopgap until package 13.
+
+    About 6 truly simultaneous valid-key requests from one bucket can get
+    a short spurious 429 (clients retry 429). That is accepted.
     """
 
     FREE_FAILURES = 5
@@ -71,43 +75,97 @@ class LoginThrottle:
     def __init__(self, clock=time.monotonic):
         self._clock = clock
         self._lock = threading.Lock()
+        self._tickets = itertools.count()
+        # address -> (failures, last_failure, holds). holds maps each pending
+        # ticket to its own deadline. While every bucket holds a ticket, the
+        # table can exceed MAX_ENTRIES, bounded by in-flight connections.
         self._entries = OrderedDict()
 
-    def retry_after(self, address):
-        """Whole seconds until the next attempt is allowed, or 0 if now."""
+    def _delay(self, n):
+        if n < self.FREE_FAILURES:
+            return 0
+        return min(2 ** (n - self.FREE_FAILURES), self.MAX_DELAY)
+
+    def _deadline(self, failures, last_failure, holds):
+        base = last_failure + self._delay(failures) if failures else 0
+        return max(base, *holds.values()) if holds else base
+
+    def begin(self, address):
+        """Reserve a slot. Returns (retry_after, ticket); ticket is None if refused."""
         address = _bucket(address)
         now = self._clock()
         with self._lock:
             entry = self._live(address, now)
             if entry is None:
-                return 0
-            wait = entry[2] - now
-            if wait <= 0:
-                return 0
-            return math.ceil(wait)
+                failures, last_failure, holds = 0, 0, {}
+                count = 0
+            else:
+                failures, last_failure, holds = entry
+                count = failures + len(holds)
+                deadline = self._deadline(failures, last_failure, holds)
+                if count >= self.FREE_FAILURES and now < deadline:
+                    return math.ceil(deadline - now), None
+            if entry is None and len(self._entries) >= self.MAX_ENTRIES:
+                self._evict()
+            ticket = (address, next(self._tickets))
+            # Hold this ticket's slot as if the attempt will fail, so concurrent
+            # callers see it taken before verify returns.
+            holds[ticket] = now + self._delay(count + 1)
+            self._entries[address] = (failures, last_failure, holds)
+            return 0, ticket
 
-    def record_failure(self, address):
-        address = _bucket(address)
+    def finish(self, ticket, outcome):
+        if ticket is None:
+            return
         now = self._clock()
         with self._lock:
-            entry = self._live(address, now)
-            n = 1 if entry is None else entry[0] + 1
-            if entry is None and len(self._entries) >= self.MAX_ENTRIES:
-                self._entries.popitem(last=False)
-            delay = min(2 ** (n - self.FREE_FAILURES), self.MAX_DELAY) if n >= self.FREE_FAILURES else 0
-            self._entries[address] = (n, now, now + delay)
-            self._entries.move_to_end(address)
+            try:
+                address = ticket[0]
+            except (TypeError, IndexError):
+                return
+            entry = self._entries.get(address)
+            if entry is None:
+                return
+            failures, last_failure, holds = entry
+            if ticket not in holds:
+                return
+            del holds[ticket]
+            if outcome == "failed":
+                failures += 1
+                last_failure = now
+                self._entries.move_to_end(address)
+            elif outcome == "success":
+                failures = 0
+            if failures == 0 and not holds:
+                self._entries.pop(address, None)
+                return
+            self._entries[address] = (failures, last_failure, holds)
 
-    def clear(self, address):
-        address = _bucket(address)
-        with self._lock:
-            self._entries.pop(address, None)
+    def _evict(self):
+        """Caller holds the lock. Drop the oldest last-failure with no holds.
+
+        While every bucket holds a ticket, the table can exceed MAX_ENTRIES,
+        bounded by in-flight connections.
+        """
+        victim = None
+        for address, entry in self._entries.items():
+            if not entry[2]:
+                victim = address
+                break
+        if victim is not None:
+            del self._entries[victim]
 
     def _live(self, address, now):
-        """Caller holds the lock. Drop the entry if it is gone or stale."""
+        """Caller holds the lock. Drop the entry if it is gone or stale.
+
+        A bucket with holds is never expired or evicted; dropping it would
+        leak the slot and lock the address out.
+        """
         entry = self._entries.get(address)
         if entry is None:
             return None
+        if entry[2]:
+            return entry
         if now - entry[1] >= self.EXPIRE_AFTER:
             del self._entries[address]
             return None
@@ -401,59 +459,63 @@ class WebAuth:
             handler._error({"error": "cross-site request refused"}, 403)
             return
         address = handler.client_address[0]
-        retry_after = self.throttle.retry_after(address)
-        if retry_after:
+        retry_after, ticket = self.throttle.begin(address)
+        if ticket is None:
             handler.close_connection = True
             handler._json(
                 {"error": "too many failed logins; try again later"},
                 429, self._headers({"Retry-After": str(retry_after)}),
             )
             return
-        length = handler._put_length(LOGIN_BODY_MAX)
-        if length is None:
-            return
-        if length == 0:
-            body = handler._read_put_body(length)
-        else:
-            if not handler.server._admit_body(handler.connection, 2):
-                handler.close_connection = True
-                handler._send(
-                    b"", "application/json", 503,
-                    handler._with_cookie_vary(self._headers()),
-                )
-                return
-            try:
-                body = handler._read_put_body(length)
-            finally:
-                handler.server._set_connection_state(handler.connection, "busy")
-        if len(body) != length:
-            handler.close_connection = True
-            raise ValueError("short body")
+        outcome = "ignored"
         try:
-            payload = json.loads(body.decode("utf-8"), parse_constant=_reject_nonfinite)
-        except (UnicodeDecodeError, ValueError, RecursionError) as exc:
-            raise ValueError("invalid login body") from exc
-        if not isinstance(payload, dict) or not isinstance(payload.get("key"), str):
-            raise ValueError("invalid login body")
-        record = self.keys.verify(payload["key"])
-        if record is None:
-            logger.info("login failed")
-            self.throttle.record_failure(address)
-            handler._json({"error": "invalid key"}, 401, self._headers())
-            return
-        if record.scope != "admin":
-            logger.info("login failed")
+            length = handler._put_length(LOGIN_BODY_MAX)
+            if length is None:
+                return
+            if length == 0:
+                body = handler._read_put_body(length)
+            else:
+                if not handler.server._admit_body(handler.connection, 2):
+                    handler.close_connection = True
+                    handler._send(
+                        b"", "application/json", 503,
+                        handler._with_cookie_vary(self._headers()),
+                    )
+                    return
+                try:
+                    body = handler._read_put_body(length)
+                finally:
+                    handler.server._set_connection_state(handler.connection, "busy")
+            if len(body) != length:
+                handler.close_connection = True
+                raise ValueError("short body")
+            try:
+                payload = json.loads(body.decode("utf-8"), parse_constant=_reject_nonfinite)
+            except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+                raise ValueError("invalid login body") from exc
+            if not isinstance(payload, dict) or not isinstance(payload.get("key"), str):
+                raise ValueError("invalid login body")
+            record = self.keys.verify(payload["key"])
+            if record is None:
+                logger.info("login failed")
+                outcome = "failed"
+                handler._json({"error": "invalid key"}, 401, self._headers())
+                return
+            if record.scope != "admin":
+                logger.info("login failed")
+                handler._json(
+                    {"error": "this is a sync key; sign in with an admin key"}, 403, self._headers())
+                return
+            outcome = "success"
+            token, entry = self._create_session(record)
+            self.keys.touch(record)
+            handler.session = entry
             handler._json(
-                {"error": "this is a sync key; sign in with an admin key"}, 403, self._headers())
-            return
-        self.throttle.clear(address)
-        token, entry = self._create_session(record)
-        self.keys.touch(record)
-        handler.session = entry
-        handler._json(
-            {"ok": True, "key": record.name},
-            headers=self._headers({"Set-Cookie": self._cookie(token)}),
-        )
+                {"ok": True, "key": record.name},
+                headers=self._headers({"Set-Cookie": self._cookie(token)}),
+            )
+        finally:
+            self.throttle.finish(ticket, outcome)
 
     def _logout(self, handler):
         if not handler._csrf_ok():

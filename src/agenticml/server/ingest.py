@@ -225,11 +225,29 @@ class IngestHandler(DashboardHandler):
 
     def _authenticate(self):
         values = self.headers.get_all("Authorization") or []
-        match = re.fullmatch(r"(?i:Bearer) ([A-Za-z0-9._~+/=-]+)", values[0]) if len(values) == 1 else None
-        record = self.server.keys.verify(match[1]) if match else None
-        if record is None:
-            raise _RequestError(401, {"error": "unauthorized"}, {"WWW-Authenticate": "Bearer"})
-        return record
+        ticket = None
+        if values:
+            retry_after, ticket = self.server.web.throttle.begin(self.client_address[0])
+            if ticket is None:
+                self.close_connection = True
+                raise _RequestError(
+                    429, {"error": "too many failed authentications; try again later"},
+                    {"Retry-After": str(retry_after)},
+                )
+        outcome = "ignored"
+        try:
+            match = re.fullmatch(r"(?i:Bearer) ([A-Za-z0-9._~+/=-]+)", values[0]) if len(values) == 1 else None
+            record = self.server.keys.verify(match[1]) if match else None
+            if record is None:
+                if match is not None:
+                    outcome = "failed"
+                raise _RequestError(401, {"error": "unauthorized"}, {"WWW-Authenticate": "Bearer"})
+            # Bearer success is ignored: a sync client on the same NAT must not
+            # reset an attacker's count every pass.
+            return record
+        finally:
+            if ticket is not None:
+                self.server.web.throttle.finish(ticket, outcome)
 
     def _body_length(self, limit):
         values = self.headers.get_all("Content-Length") or []

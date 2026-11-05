@@ -163,14 +163,6 @@ priority.
   all three. Done when tests with a FIFO at an `events.jsonl`, a scalar
   `.bin`, an object and `run.lock` show each caller failing fast instead of
   hanging. Before package 6.
-- **Login throttle check and failure record are not atomic.**
-  Where: `src/agenticml/server/webauth.py` `_login` (`retry_after` before the
-  body read, `record_failure` after verify). Problem: several connections
-  that pass the check together and then send their bodies each get a guess
-  in. The body-admission cap bounds it to a few extra guesses per window.
-  Fix: charge the failure when the check passes (`begin_attempt`), refund it
-  on 400 and 403, clear it on success. Done when a test with concurrent
-  delayed bodies from one address sees at most one guess per allowed slot.
 - **Lineage tray "Compare N runs" link loses focus on re-render.**
   Where: `src/agenticml/ui/static/app.js`, the lineage view's tray, which is
   rebuilt by `render()`. Problem: the link has no `data-focus` key, so if it
