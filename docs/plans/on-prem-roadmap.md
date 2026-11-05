@@ -27,10 +27,16 @@ plans live next to it:
 
 | Release | Theme | Contents | Exit criteria |
 | --- | --- | --- | --- |
-| **2.0** | Self-hosted server, single user | Test CI, server ingest, protocol v2 sync, shared dashboard with key login and key issuing, `sync --follow`, container image, ECS and laptop guides | Release checklist in the 2.0 plan, section 8 |
+| **2.0** | Self-hosted server, single user | Test CI, server ingest, protocol v2 sync, shared dashboard with key login and key issuing, `sync --follow`, systemd units and server guide (PyPI only; no container image) | Release checklist in the 2.0 plan, section 8 |
 | **2.1** | Full fidelity | Lineage code diffs on the server, by-reference artifacts, EFS performance check, operator tooling | A run synced to the server is indistinguishable from the local one in the dashboard, apart from notes |
 | **2.2** | Teams | Users and roles, per-user keys, dashboard sign-in through a trusted identity proxy, audit log | Two users with different roles share one server, each with the access their role allows, and every write is attributed |
 | Later | Scale and lifecycle | Unscheduled; see below | – |
+
+Decision (Nov 5, 2026): the server ships only as the `agenticml-lite`
+package on PyPI and runs as `agenticml server serve`, typically under
+systemd behind a TLS proxy. The Docker image, compose file, ECS/Terraform
+example and image workflow added in package 6 were removed
+([plan](packages/remove-docker-deployment.md)).
 
 ## Status
 
@@ -58,7 +64,7 @@ Update the status column in the PR that changes it. Values: `not started`,
 | 4 † | Server dashboard: key login, sessions, CSRF, last synced | 1, 2 | Cursor | M | [plan](packages/4-server-dashboard.md) | done ([#28](https://github.com/agenticML/agenticml-lite/pull/28)) |
 | 4b † | Key management in the dashboard: first-key setup, issue / list / revoke sync and admin keys | 1, 4 | Codex | M | [plan](packages/4b-key-management.md) | done ([#29](https://github.com/agenticML/agenticml-lite/pull/29)) |
 | 5 | `sync --follow` and systemd example | 3 | Cursor | M | [plan](packages/5-sync-follow.md) | done ([#31](https://github.com/agenticML/agenticml-lite/pull/31)) |
-| 6 | Image, deploy examples, docs, security policy, 2.0.0 release | 1, 3, 4, 4b, 5 | Codex, Cursor; prose Antigravity | M | [plan](packages/6-packaging-release.md) | done ([#34](https://github.com/agenticML/agenticml-lite/pull/34)) |
+| 6 | Packaging, docs, security policy, 2.0.0 release | 1, 3, 4, 4b, 5 | Codex, Cursor; prose Antigravity | M | [plan](packages/6-packaging-release.md) | done ([#34](https://github.com/agenticML/agenticml-lite/pull/34)) |
 
 † security-sensitive: needs a second read-only review from the other coder.
 
@@ -85,7 +91,8 @@ Update the status column in the PR that changes it. Values: `not started`,
   downloaded from the server dashboard, and a changed or missing source is
   skipped with one warning.
 - **9 EFS benchmark.** Run `scripts/bench.py` and `scripts/bench_store.py`
-  against a server on EFS with several machines syncing. Tune append batching
+  against a server whose data directory is on EFS (or another network
+  filesystem) with several machines syncing. Tune append batching
   and `--follow` intervals if needed. Done when the results and recommended
   settings are in `docs/SERVER.md`.
 - **10 Operator commands.** `agenticml server status` (runs, sizes, keys,

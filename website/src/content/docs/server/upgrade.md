@@ -1,52 +1,42 @@
 ---
 title: Upgrades and troubleshooting
-description: Upgrade server versions, verify image signatures, and resolve operational issues.
+description: Upgrade server versions and resolve operational issues.
 sidebar:
   order: 6
 ---
 
 ## Upgrades
 
+Back up the data directory first.
+
+One server process per data directory; downgrades are not supported. Always review the release notes before upgrading.
+
 To upgrade a self-hosted server:
 
-1. Pull the target image tag:
+1. Upgrade the package in the virtual environment:
    ```bash
-   docker pull ghcr.io/agenticml/agenticml-server:<new-version>
+   sudo /opt/agenticml/bin/pip install -U agenticml-lite
    ```
-2. Stop the running container cleanly:
+2. Restart the server service:
    ```bash
-   docker stop --time 30 agenticml-server
+   sudo systemctl restart agenticml-server
    ```
-3. Start the container with the new image, targeting the existing data volume.
-4. Verify server health:
+3. Verify server health:
    ```bash
    curl -s http://127.0.0.1:8080/healthz
    ```
 
-Because the server acquires an exclusive lock on `<data>/server/server.lock`, the old container must be stopped before the new one is started. Downgrades are not supported. Always review the release notes before upgrading.
-
-## Verifying image signatures
-
-Server container images are signed keylessly with Cosign using GitHub Actions OpenID Connect (OIDC). Verify an image before deployment:
-
-```bash
-cosign verify \
-  --certificate-identity-regexp '^https://github\.com/agenticML/agenticml-lite/\.github/workflows/image\.yml@refs/tags/v' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/agenticml/agenticml-server:2.0.0
-```
-
-Replace `2.0.0` with the specific tag or `@sha256:<digest>`.
+Because the server acquires an exclusive lock on `<data>/server/server.lock`, only one server process may run against a data directory at a time.
 
 ## Troubleshooting
 
 ### "another agenticml server is using <data>"
 
-The error means another server process (another container, or a process on the host) has the same data directory open. Stop it (`docker ps`, `docker stop`) and start again.
+The error means another server process has the same data directory open. Check `systemctl status agenticml-server` or look for running server processes on the host. Stop the other process and start again.
 
 ### HTTP 403 ("forbidden host") on dashboard
 
-When accessed through a reverse proxy, the browser sends the proxy's hostname in the `Host` header. The dashboard rejects non-loopback hostnames unless `--public-url` is configured, returning HTTP 403 with `{"error": "forbidden host"}`. Set `AGENTICML_SERVER_PUBLIC_URL=https://<hostname>` in the container environment.
+When accessed through a reverse proxy, the browser sends the proxy's hostname in the `Host` header. The dashboard rejects non-loopback hostnames unless `--public-url` is configured, returning HTTP 403 with `{"error": "forbidden host"}`. Set `AGENTICML_SERVER_PUBLIC_URL=https://<hostname>` in the server environment (or `/etc/agenticml-server.env` under systemd).
 
 ### `agenticml sync` exits with status 3 (`401 Unauthorized`)
 

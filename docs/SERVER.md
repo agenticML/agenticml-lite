@@ -14,94 +14,61 @@ The server runs as a single process backed by a single data directory.
 - **POSIX requirement**: The server relies on POSIX `fcntl` file locking. It runs on Linux and POSIX-compliant hosts. It does not run directly on Windows (the client CLI and `agenticml ui` support Windows).
 - **Network and TLS**: The server serves plain HTTP over a single TCP port. In production, run it behind a TLS-terminating reverse proxy such as AWS Application Load Balancer (ALB), Tailscale Serve, or Caddy.
 
-## Container image
+## Installation and running
 
-The official multi-architecture container image (`linux/amd64`, `linux/arm64`) is published to GitHub Packages:
-
-```
-ghcr.io/agenticml/agenticml-server:2.0.0
-ghcr.io/agenticml/agenticml-server:latest
-```
-
-Image properties:
-- **User**: Runs as non-root user `aml` (UID `10001`, GID `10001`).
-- **Data volume**: Declares `/data` as a volume mount point.
-- **Port**: Exposes TCP port `8080`.
-- **Entrypoint**: `["agenticml", "server", "serve"]`.
-- **Default CMD**: `["--data", "/data", "--host", "0.0.0.0", "--port", "8080"]`.
-- **Environment**: Sets `AGENTICML_SERVER_DATA=/data`.
-- **Health check**: Built-in container health check queries `http://127.0.0.1:8080/healthz` every 30 seconds using Python's `urllib`.
-- **Shutdown signal**: `SIGTERM` initiates a graceful shutdown.
-
-### Verifying image signatures
-
-Server images are signed keylessly with Cosign using GitHub Actions OpenID Connect (OIDC). Verify an image before running it:
+Install `agenticml-lite` into a virtual environment on a POSIX host (Python 3.10+):
 
 ```bash
-cosign verify \
-  --certificate-identity-regexp '^https://github\.com/agenticML/agenticml-lite/\.github/workflows/image\.yml@refs/tags/v' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/agenticml/agenticml-server:2.0.0
+sudo python3 -m venv /opt/agenticml
+sudo /opt/agenticml/bin/python -m pip install agenticml-lite
 ```
 
-Replace `2.0.0` with the specific tag or `@sha256:<digest>`.
+Run directly (a venv anywhere the user owns is fine, e.g. `python3 -m venv ~/agenticml-venv`):
+```bash
+/opt/agenticml/bin/agenticml server serve --data DIR --host 127.0.0.1 --port 8080 --public-url https://...
+```
+`--data` falls back to `AGENTICML_SERVER_DATA`, then `~/.agenticml-server`. `--public-url` falls back to `AGENTICML_SERVER_PUBLIC_URL`.
 
-## Laptop setup
+### TLS proxy
 
-Use Docker and `tailscale serve` to run the server on a workstation or personal server and share it securely over a Tailscale private network.
+The server serves plain HTTP over its configured port (typically loopback `127.0.0.1:8080`). In production or across a network, terminate TLS using a reverse proxy and configure the public URL:
 
-### Docker Compose
+- **Laptop or workstation (Tailscale):**
+  ```bash
+  tailscale serve --bg 8080
+  export AGENTICML_SERVER_PUBLIC_URL=https://<machine>.<tailnet>.ts.net
+  ```
+- **Production:** Run behind Caddy, Nginx, or a cloud load balancer. Set the public URL to the proxied HTTPS URL.
 
-`deploy/compose.yaml` binds the server to localhost (`127.0.0.1:8080`), drops all capabilities, mounts `/tmp` as a tmpfs, and enforces `read_only: true`.
+### Systemd service
 
-1. Publish port 8080 to your Tailscale network:
-   ```bash
-   tailscale serve --bg 8080
-   ```
-2. Note your Tailscale machine domain (for example `https://workstation.tailnet-xyz.ts.net`) and export it:
-   ```bash
-   export AGENTICML_SERVER_PUBLIC_URL=https://<machine>.<tailnet>.ts.net
-   ```
-3. Start the server:
-   ```bash
-   docker compose -f deploy/compose.yaml up -d
-   ```
-
-### Docker run
-
-To run the container directly without Compose:
+A production system unit example is provided in [deploy/systemd/agenticml-server.service](../deploy/systemd/agenticml-server.service). See [deploy/systemd/README.md](../deploy/systemd/README.md) for full setup instructions:
 
 ```bash
-docker run -d \
-  --name agenticml-server \
-  -p 127.0.0.1:8080:8080 \
-  -v agenticml-data:/data \
-  -e AGENTICML_SERVER_PUBLIC_URL=https://<machine>.<tailnet>.ts.net \
-  --read-only \
-  --tmpfs /tmp \
-  --cap-drop ALL \
-  --security-opt no-new-privileges:true \
-  ghcr.io/agenticml/agenticml-server:2.0.0
+sudo python3 -m venv /opt/agenticml
+sudo /opt/agenticml/bin/python -m pip install agenticml-lite
+sudo useradd --system --home /var/lib/agenticml-server --shell /usr/sbin/nologin agenticml
+sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.0.0/deploy/systemd/agenticml-server.service
 ```
 
-Named volumes (such as `agenticml-data`) are initialized with ownership set to UID `10001`. If you use a host bind mount instead of a named volume, set ownership before starting the container:
+Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`). Edit `AGENTICML_SERVER_PUBLIC_URL` in the unit (or `sudo systemctl edit agenticml-server`), then `daemon-reload` and `enable --now`:
 
 ```bash
-sudo chown -R 10001:10001 /path/to/host/data
+sudo systemctl daemon-reload
+sudo systemctl enable --now agenticml-server
 ```
 
-## Cloud deployment (AWS ECS Fargate)
+The unit runs under the `agenticml` user and group, stores data in `/var/lib/agenticml-server` (managed by `StateDirectory`), binds `127.0.0.1:8080`, and reads optional environment settings from `/etc/agenticml-server.env`.
 
-A complete production deployment example is in [deploy/ecs/README.md](../deploy/ecs/README.md).
-
-Architecture on AWS:
-- **Compute**: ECS Fargate task running `ghcr.io/agenticml/agenticml-server:2.0.0` with 0.5 vCPU and 1 GiB memory.
-- **Single task constraint**: The ECS service must be configured with `desired_count = 1`, `deployment_minimum_healthy_percent = 0`, and `deployment_maximum_percent = 100`. The server holds an exclusive lock on EFS; two tasks cannot share the filesystem.
-- **Storage**: AWS Elastic File System (EFS) encrypted with an access point enforcing POSIX user `10001:10001` mounted at `/data` with TLS encryption enabled.
-- **Ingress**: Internet-facing Application Load Balancer terminating HTTPS (port 443) with an ACM certificate and redirecting HTTP (port 80) to HTTPS. Target group checks `/healthz` on port 8080.
-- **Credentials**: Administrator key generated and stored in AWS Secrets Manager, injected via `AGENTICML_SERVER_KEY`.
-- **Backups**: AWS Backup plan performing daily backups of EFS with 35-day retention.
-- **Network**: Private subnets require a NAT gateway (or an ECR pull-through cache mirror) to pull the image from `ghcr.io`.
+Check service status and logs:
+```bash
+sudo systemctl status agenticml-server
+sudo journalctl -u agenticml-server -f
+```
+Stop the service:
+```bash
+sudo systemctl stop agenticml-server
+```
 
 ## Authentication and keys
 
@@ -125,9 +92,8 @@ No admin key yet. Open <public-url or http://host:port>/setup?token=<token> to c
 ```
 
 To retrieve the setup link:
-- Docker: `docker logs <container-name>`
-- Docker Compose: `docker compose -f deploy/compose.yaml logs server`
-- AWS ECS: Check the CloudWatch log group `/ecs/agenticml-server`
+- Terminal: Check the standard output from `agenticml server serve`.
+- systemd: Run `sudo journalctl -u agenticml-server`.
 
 Open the `/setup?token=<token>` link in a browser. It prompts for a key name, generates an admin key, displays it once, and signs the browser in.
 
@@ -140,6 +106,8 @@ You can pre-configure an admin key via environment variable:
 ```bash
 export AGENTICML_SERVER_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
 ```
+
+Under systemd, configure `AGENTICML_SERVER_KEY` in the unit's environment file (e.g. `/etc/agenticml-server.env`, owned by root with mode `0600`).
 
 Rules for `AGENTICML_SERVER_KEY`:
 - Named `env` on the server.
@@ -162,20 +130,26 @@ Administrators can manage keys from the web dashboard:
 
 The server CLI can create, list, and revoke keys on the server host while the server is running.
 
-In a running container:
-
 ```bash
 # Create a sync key (scope defaults to sync)
-docker exec agenticml-server agenticml server keys create --name worker-1 --scope sync --data /data
+agenticml server keys create --name worker-1 --scope sync --data DIR
 
 # Create an admin key
-docker exec agenticml-server agenticml server keys create --name operator-2 --scope admin --data /data
+agenticml server keys create --name operator-2 --scope admin --data DIR
 
 # List all keys
-docker exec agenticml-server agenticml server keys list --data /data
+agenticml server keys list --data DIR
 
 # Revoke a key
-docker exec agenticml-server agenticml server keys revoke worker-1 --data /data
+agenticml server keys revoke worker-1 --data DIR
+```
+
+Under systemd, run the commands as the service user with the same data directory:
+
+```bash
+sudo -u agenticml /opt/agenticml/bin/agenticml server keys create --name worker-1 --scope sync --data /var/lib/agenticml-server
+sudo -u agenticml /opt/agenticml/bin/agenticml server keys list --data /var/lib/agenticml-server
+sudo -u agenticml /opt/agenticml/bin/agenticml server keys revoke worker-1 --data /var/lib/agenticml-server
 ```
 
 `keys create` prints the plaintext key once to stdout and status information to stderr.
@@ -253,7 +227,12 @@ To run `agenticml sync --follow` as a background user daemon on Linux, install t
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp deploy/systemd/agenticml-sync.service ~/.config/systemd/user/
+curl -fsSL -o ~/.config/systemd/user/agenticml-sync.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.0.0/deploy/systemd/agenticml-sync.service
+```
+
+Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`).
+
+```bash
 systemctl --user daemon-reload
 systemctl --user enable --now agenticml-sync
 loginctl enable-linger $USER
@@ -289,8 +268,8 @@ Release 2.0 supports metric, scalar, event, media, and copied artifact synchroni
 
 | Option | Environment variable | Default | Description |
 | --- | --- | --- | --- |
-| `--data DIR` | `AGENTICML_SERVER_DATA` | `~/.agenticml-server` (`/data` in Docker) | Path to server data directory. |
-| `--host HOST` | | `127.0.0.1` (`0.0.0.0` in Docker) | Host interface to bind. |
+| `--data DIR` | `AGENTICML_SERVER_DATA` | `~/.agenticml-server` | Path to server data directory. |
+| `--host HOST` | | `127.0.0.1` | Host interface to bind. |
 | `--port PORT` | | `8080` | TCP port to listen on. |
 | `--public-url URL` | `AGENTICML_SERVER_PUBLIC_URL` | unset | Canonical public URL (e.g. `https://aml.example.com`). Required behind reverse proxies for Host header checks, Origin checks, and `__Host-` cookies. Empty string is treated as unset. |
 | | `AGENTICML_SERVER_KEY` | unset | Static admin API key named `env`. Stored only in memory. |
@@ -320,43 +299,51 @@ The server data directory contains two subdirectories:
 
 ### Performing backups
 
-1. **Local or Docker deployment**: Stop the server process cleanly (`docker stop agenticml-server`) to release `server.lock` and flush pending writes, then copy the entire `<data>` directory:
-   ```bash
-   docker stop agenticml-server
-   tar -czf agenticml-backup-$(date +%Y%m%d).tar.gz -C /path/to/data .
-   docker start agenticml-server
-   ```
-2. **ECS / AWS EFS deployment**: Use AWS Backup with daily snapshots of the EFS filesystem.
+Stop the service cleanly before backing up the data directory to release `server.lock` and flush pending writes:
+```bash
+sudo systemctl stop agenticml-server
+sudo tar czf agenticml-backup.tgz -C /var/lib/agenticml-server .
+sudo systemctl start agenticml-server
+```
 
 ### Restoring backups
 
-To restore a backup, stop the server, extract the backup directory into the data volume, verify permissions (`chown -R 10001:10001`), and start the server.
+To restore a backup, stop the service, extract the backup directory into the data directory, verify permissions, and start the service:
+```bash
+sudo systemctl stop agenticml-server
+sudo tar xzf agenticml-backup.tgz -C /var/lib/agenticml-server
+sudo chown -R agenticml:agenticml /var/lib/agenticml-server
+sudo systemctl start agenticml-server
+```
 
 ## Upgrades
 
-1. Pull the new container image version:
+Back up the data directory first.
+
+One server process per data directory; downgrades are not supported. Read release notes prior to upgrading.
+
+1. Upgrade the package in the virtual environment:
    ```bash
-   docker pull ghcr.io/agenticml/agenticml-server:<new-version>
+   sudo /opt/agenticml/bin/pip install -U agenticml-lite
    ```
-2. Stop the existing container to allow graceful shutdown:
+2. Restart the server service:
    ```bash
-   docker stop --time 30 agenticml-server
+   sudo systemctl restart agenticml-server
    ```
-3. Start the new container pointing at the same data volume or directory.
-4. Verify server health:
+3. Verify server health:
    ```bash
    curl -s http://127.0.0.1:8080/healthz
    ```
 
-Because the server holds an exclusive lock on `<data>/server/server.lock`, the old container must be stopped before the new container starts. Downgrades are not supported. Read release notes prior to upgrading.
+Because the server holds an exclusive lock on `<data>/server/server.lock`, only one server process may access the data directory at a time.
 
 ## Troubleshooting
 
 ### "another agenticml server is using <data>"
-The error means another server process (another container, or a process on the host) has the same data directory open. Stop it (`docker ps`, `docker stop`) and start again.
+The error means another server process has the same data directory open. Check `systemctl status agenticml-server` or look for running `agenticml server serve` processes on the host. Stop the other process and start again.
 
 ### HTTP 403 ("forbidden host") on dashboard
-When the server is accessed through a proxy or external hostname, the browser sends that hostname in the HTTP `Host` header. The dashboard accepts only loopback hostnames (`localhost`, `127.0.0.1`, `::1`) unless `--public-url` is configured; a refused Host receives HTTP 403 with `{"error": "forbidden host"}`. Set `AGENTICML_SERVER_PUBLIC_URL=https://<your-hostname>` in the server environment.
+When the server is accessed through a proxy or external hostname, the browser sends that hostname in the HTTP `Host` header. The dashboard accepts only loopback hostnames (`localhost`, `127.0.0.1`, `::1`) unless `--public-url` is configured; a refused Host receives HTTP 403 with `{"error": "forbidden host"}`. Set `AGENTICML_SERVER_PUBLIC_URL=https://<your-hostname>` in the server environment (or `/etc/agenticml-server.env` under systemd).
 
 ### `agenticml sync` exits with status 3 (`401 Unauthorized`)
 When running `agenticml sync` (including `--follow` and `--watch`), the client exits with status code 3 if the server returns 401 because the API key was rejected or revoked. Run `agenticml login --host https://...` to enter a new key, or check key status on the server with `agenticml server keys list`.

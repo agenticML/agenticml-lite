@@ -25,9 +25,8 @@ No admin key yet. Open <public-url or http://host:port>/setup?token=<token> to c
 ```
 
 To find the URL:
-- Docker: `docker logs <container-name>`
-- Docker Compose: `docker compose -f deploy/compose.yaml logs server`
-- AWS ECS: View CloudWatch log group `/ecs/agenticml-server`
+- Terminal: Check the standard output from `agenticml server serve`.
+- systemd: Run `sudo journalctl -u agenticml-server`.
 
 Open `/setup?token=<token>` in your browser to name your admin key, receive the key token, and automatically sign in. The setup token is single-use and kept only in memory. After an admin key is created, `/setup` returns 404.
 
@@ -38,6 +37,8 @@ You can define an administrator key using an environment variable before startin
 ```bash
 export AGENTICML_SERVER_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
 ```
+
+Under systemd, configure `AGENTICML_SERVER_KEY` in the unit's environment file (e.g. `/etc/agenticml-server.env`, owned by root with mode `0600`).
 
 The environment key:
 - Receives the name `env` on the server.
@@ -60,10 +61,17 @@ Signed-in administrators can issue and revoke keys from the web dashboard:
 The server CLI manages keys directly against `<data>/server/keys.json` while the server is running:
 
 ```bash
-# In a running container:
-docker exec agenticml-server agenticml server keys create --name worker-1 --scope sync --data /data
-docker exec agenticml-server agenticml server keys list --data /data
-docker exec agenticml-server agenticml server keys revoke worker-1 --data /data
+agenticml server keys create --name worker-1 --scope sync --data DIR
+agenticml server keys list --data DIR
+agenticml server keys revoke worker-1 --data DIR
+```
+
+Under systemd, run the commands as the service user with the same data directory:
+
+```bash
+sudo -u agenticml /opt/agenticml/bin/agenticml server keys create --name worker-1 --scope sync --data /var/lib/agenticml-server
+sudo -u agenticml /opt/agenticml/bin/agenticml server keys list --data /var/lib/agenticml-server
+sudo -u agenticml /opt/agenticml/bin/agenticml server keys revoke worker-1 --data /var/lib/agenticml-server
 ```
 
 `keys create` outputs the key to stdout and reminders to stderr. The `--scope` flag defaults to `sync`.

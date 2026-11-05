@@ -1,0 +1,34 @@
+# System unit for `agenticml server serve`.
+# Create the service user: useradd --system --home /var/lib/agenticml-server --shell /usr/sbin/nologin agenticml
+# Install the package into a venv at /opt/agenticml; adjust ExecStart as needed.
+
+[Unit]
+Description=AgenticML server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=agenticml
+Group=agenticml
+ExecStart=/opt/agenticml/bin/agenticml server serve --data /var/lib/agenticml-server --host 127.0.0.1 --port 8080
+Environment=AGENTICML_SERVER_PUBLIC_URL=https://aml.example.com
+# Optional AGENTICML_SERVER_KEY: keep this environment file root-owned, mode 0600.
+EnvironmentFile=-/etc/agenticml-server.env
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+NoNewPrivileges=yes
+ProtectSystem=strict
+# StateDirectory creates the writable store and assigns it to the service user.
+StateDirectory=agenticml-server
+StateDirectoryMode=0700
+UMask=0077
+PrivateTmp=yes
+ProtectHome=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

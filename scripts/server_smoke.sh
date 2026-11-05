@@ -5,7 +5,7 @@ set +x
 
 repo_dir=$(cd "$(dirname "$0")/.." && pwd)
 PYTHON=${PYTHON:-"$repo_dir/testbed/.venv/bin/python"}
-for command in docker curl "$PYTHON"; do
+for command in curl "$PYTHON"; do
     command -v "$command" >/dev/null || { echo "smoke: missing $command" >&2; exit 1; }
 done
 PYTHON=$(command -v "$PYTHON")
@@ -23,44 +23,46 @@ fi
 cd "$repo_dir"
 
 temp_dir=$(mktemp -d)
-container=""
-volume=""
+server_pid=""
 cleanup() {
     status=$?
     trap - EXIT
-    if [[ -n "$container" ]]; then
-        if (( status != 0 )); then docker logs "$container" >&2 || true; fi
-        docker rm -f -v "$container" >/dev/null 2>&1 || true
+    if [[ -n "$server_pid" ]]; then
+        if kill -0 "$server_pid" 2>/dev/null; then
+            kill -KILL "$server_pid" 2>/dev/null || true
+        fi
+        wait "$server_pid" 2>/dev/null || true
     fi
-    if [[ -n "$volume" ]]; then docker volume rm "$volume" >/dev/null 2>&1 || true; fi
+    if (( status != 0 )) && [[ -f "$temp_dir/server.log" ]]; then
+        cat "$temp_dir/server.log" >&2
+    fi
     rm -rf "$temp_dir"
     exit "$status"
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-image=${SMOKE_IMAGE:-agenticml-server:smoke}
-if [[ -z "${SMOKE_IMAGE:-}" ]]; then
-    docker build -f docker/Dockerfile -t "$image" .
-fi
-
-AGENTICML_SERVER_KEY=$("$PYTHON" -c 'import secrets; print(secrets.token_urlsafe(32))')
-volume=$(docker volume create)
-container=$(AGENTICML_SERVER_KEY="$AGENTICML_SERVER_KEY" docker run -d --read-only --tmpfs /tmp \
-    --cap-drop ALL --security-opt no-new-privileges:true \
-    --mount "type=volume,source=$volume,target=/data" \
-    -p 127.0.0.1::8080 --env AGENTICML_SERVER_KEY "$image")
-port=$(docker port "$container" 8080/tcp)
-base_url="http://127.0.0.1:${port##*:}"
+unset AGENTICML_SERVER_KEY AGENTICML_SERVER_PUBLIC_URL AGENTICML_SERVER_DATA
+admin_key=$("$PYTHON" -c 'import secrets; print(secrets.token_urlsafe(32))')
+AGENTICML_SERVER_KEY="$admin_key" "$PYTHON" -m agenticml server serve \
+    --data "$temp_dir/data" --host 127.0.0.1 --port 0 >"$temp_dir/server.log" 2>&1 &
+server_pid=$!
 deadline=$((SECONDS + 60))
-until curl --silent --fail --max-time 2 "$base_url/healthz" >"$temp_dir/health.json"; do
-    if [[ "$(docker inspect --format '{{.State.Running}}' "$container")" != true ]]; then
-        echo "smoke: container stopped before becoming healthy" >&2
-        exit 1 # The EXIT trap prints this container's docker logs.
+while true; do
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+        echo "smoke: server stopped before becoming healthy" >&2
+        exit 1 # The EXIT trap prints the server log.
+    fi
+    port=$(sed -n 's/^AgenticML server: http:\/\/127\.0\.0\.1:\([0-9][0-9]*\) (data: .*$/\1/p' "$temp_dir/server.log")
+    if [[ -n "$port" ]]; then
+        base_url="http://127.0.0.1:$port"
+        if curl --silent --fail --max-time 2 "$base_url/healthz" >"$temp_dir/health.json"; then
+            break
+        fi
     fi
     if (( SECONDS >= deadline )); then
         echo "smoke: health check timed out after 60s" >&2
-        exit 1 # The EXIT trap prints docker logs.
+        exit 1 # The EXIT trap prints the server log.
     fi
     sleep 1
 done
@@ -69,7 +71,7 @@ curl --silent --show-error --fail --max-time 5 \
     --header 'Host: arbitrary-health-check.example' "$base_url/healthz" >"$temp_dir/health.json"
 "$PYTHON" -c 'import json, sys; assert json.load(open(sys.argv[1])) == {"ok": True}' "$temp_dir/health.json"
 
-sync_key=$(docker exec "$container" agenticml server keys create --name smoke --scope sync --data /data)
+sync_key=$("$PYTHON" -m agenticml server keys create --name smoke --scope sync --data "$temp_dir/data")
 export AGENTICML_DIR="$temp_dir/local" AGENTICML_CONFIG_DIR="$temp_dir/config"
 unset AGENTICML_HOST AGENTICML_API_KEY
 "$PYTHON" - "$temp_dir" <<'PY'
@@ -80,13 +82,13 @@ import sys
 import agenticml
 
 temp = Path(sys.argv[1])
-run = agenticml.init(project="smoke", name="container smoke", system_metrics=False,
+run = agenticml.init(project="smoke", name="server smoke", system_metrics=False,
                      capture_env=False, auto_track=False, lineage=False)
 for step in range(3):
     run.log({"loss": 1.0 / (step + 1), "accuracy": step / 3.0}, step=step)
 # A text artifact produces an artifact event through the SDK.
 text = temp / "message.txt"
-text.write_text("container smoke event\n")
+text.write_text("server smoke event\n")
 run.log_artifact(text, name="message", copy=True)
 run.finish()
 directory = run.writer.run_dir
@@ -117,7 +119,7 @@ actual = {name: entry["size"] for name, entry in state["files"].items()}
 assert actual == expected, (actual, expected)
 PY
 
-printf '%s' "$AGENTICML_SERVER_KEY" | \
+printf '%s' "$admin_key" | \
     "$PYTHON" -c 'import json, sys; print(json.dumps({"key": sys.stdin.read()}))' | \
     curl --silent --show-error --fail --max-time 10 \
     --header 'Content-Type: application/json' --header 'X-AgenticML-Request: 1' --header "Origin: $base_url" \
@@ -137,10 +139,22 @@ status=$(printf '%s' "$sync_key" | \
     --data-binary @- "$base_url/login")
 [[ "$status" == 403 ]] || { echo "smoke: sync-key login returned $status, expected 403" >&2; exit 1; }
 
-started=$SECONDS
-docker stop --time 30 "$container" >/dev/null
-(( SECONDS - started <= 30 )) || { echo "smoke: shutdown exceeded 30s" >&2; exit 1; }
-[[ "$(docker inspect --format '{{.State.ExitCode}}' "$container")" == 0 ]] || {
-    echo "smoke: container exited nonzero" >&2; exit 1;
-}
+kill -TERM "$server_pid"
+deadline=$((SECONDS + 30))
+while kill -0 "$server_pid" 2>/dev/null; do
+    if (( SECONDS >= deadline )); then
+        echo "smoke: shutdown exceeded 30s" >&2
+        exit 1
+    fi
+    sleep 1
+done
+if wait "$server_pid"; then
+    server_pid=""
+else
+    status=$?
+    server_pid=""
+    echo "smoke: server exited $status on SIGTERM, expected 0" >&2
+    exit 1
+fi
+echo 'smoke: server exited 0 on SIGTERM'
 echo 'smoke: OK'

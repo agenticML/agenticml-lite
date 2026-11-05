@@ -3,8 +3,8 @@
 Nov 3, 2026 · @bharath · Status: approved, not started
 
 Release 2.0 ships `agenticml server`, a self-hosted sync server and shared
-dashboard, inside the public MIT-licensed `agenticml-lite` package, plus a
-public container image. This document is the implementation plan for 2.0. The
+dashboard, inside the public MIT-licensed `agenticml-lite` package on PyPI
+(the container image was dropped on Nov 5, 2026). This document is the implementation plan for 2.0. The
 release sequence after it (2.1 full fidelity, 2.2 teams) is in
 [on-prem-roadmap.md](on-prem-roadmap.md).
 
@@ -30,9 +30,9 @@ issued from the server dashboard with separate sync and admin scopes
 | Dependencies | Standard library only on the server. `pip install agenticml-lite` gets it; still only `requests` |
 | Licensing / paid tier | None. No license file, no tiers |
 | Version | `agenticml-lite` 2.0.0 (removing hosted sync is breaking) |
-| Image | `ghcr.io/agenticml/agenticml-server:2.0.0` and `latest` |
+| Image | None. Removed Nov 5, 2026: the server ships via PyPI only (`pip install agenticml-lite`) and runs under systemd behind a TLS proxy; see [packages/remove-docker-deployment.md](packages/remove-docker-deployment.md) |
 | PRs | One PR per work package, merged in the order of section 7 |
-| Platforms | Server: Linux (container) and any POSIX host. Test CI: Linux only. macOS is not a CI target and macOS-only test failures are not tracked |
+| Platforms | Server: Linux and any POSIX host. Test CI: Linux only. macOS is not a CI target and macOS-only test failures are not tracked |
 | Private `agenticml-server` repo | Left as is (the old hosted stack). Not used or changed |
 
 ## 2. What exists today
@@ -212,7 +212,7 @@ live run does not turn stale.
 | Host header | Server dashboard accepts the `--public-url` host plus loopback names |
 | Disclosure | `SECURITY.md`: private reporting address and GitHub private advisories |
 | Threat model | `docs/THREAT_MODEL.md`. In scope: network attacker with no key, a leaked or revoked key, malicious run files and paths, a second machine reusing a run id. Out of scope: a compromised server host or a compromised key holder's own runs |
-| Supply chain | Base image pinned by digest, cosign keyless signature, SBOM attached, Dependabot for the Dockerfile and Actions |
+| Supply chain | PyPI Trusted Publishing from a tag; Dependabot for Actions. (The container image, its signature and SBOM were dropped with the Docker deployment.) |
 | Review | Packages marked † get a second read-only review from the coder that did not write them, in addition to Sonnet |
 
 ### 5.1 Issuing API keys
@@ -246,8 +246,9 @@ or run: agenticml server keys create --name admin --scope admin
 
 `/setup` checks the token in constant time, creates the first admin key, shows
 it once, and signs the browser in. The token works once and is gone after use
-or a restart. Once an admin key exists, `/setup` returns 404. On ECS the line
-appears in CloudWatch; on a laptop, in `docker logs`.
+or a restart. Once an admin key exists, `/setup` returns 404. Under systemd
+the line appears in `journalctl -u agenticml-server`; otherwise in the
+terminal running `agenticml server serve`.
 
 **Issuing a key for a GPU machine (normal flow).**
 
@@ -449,6 +450,10 @@ and runs the checks → the `git` agent opens the PR.
 
 ### Package 6: Packaging and release 2.0.0 (Codex; prose by Antigravity, M)
 
+> Nov 5, 2026: the image, compose, ECS and image-workflow parts below were
+> built in #34 and then removed by decision; the server ships via PyPI only.
+> See [packages/remove-docker-deployment.md](packages/remove-docker-deployment.md).
+
 Depends on 1, 3, 4, 4b and 5.
 
 
@@ -483,11 +488,11 @@ Depends on 1, 3, 4, 4b and 5.
 
 - [ ] Packages 0–6 merged in order, each with its review record in the PR.
 - [ ] `pytest -q tests` and the UI suite green on `main` in CI.
-- [ ] Smoke script green against the image built from the release tag.
+- [ ] Smoke script green against the pip-installed server from the release tag
+      (it runs in the unit CI job).
 - [ ] Manual check: fresh laptop server over Tailscale, first admin key from
       the setup URL, a sync key issued on the Keys page, one training machine
       with `sync --follow`, live run visible and updating in the server
       dashboard, then the key revoked and the sync stopped.
-- [ ] Manual check: ECS example deployed once from `deploy/ecs/`.
-- [ ] Tag `v2.0.0`: `publish.yml` pushes PyPI, `image.yml` pushes the image.
+- [ ] Tag `v2.0.0`: `publish.yml` pushes PyPI.
 - [ ] Website pages live; README links to `docs/SERVER.md`.
