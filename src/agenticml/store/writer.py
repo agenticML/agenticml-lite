@@ -13,6 +13,7 @@ are fsynced, then the status flips to ``finished`` or ``crashed``.
 from __future__ import annotations
 
 import copy as _copy
+import errno
 import json
 import logging
 import math
@@ -36,10 +37,12 @@ from .layout import (
     RECORD_STRUCT,
     SCALARS_DIRNAME,
     TIME_BIN_NAME,
+    _open_regular_fd,
     atomic_write,
     contained,
     format_timestamp,
     fsync_dir,
+    is_symlink_error,
     load_events,
     new_run_id,
     open_nofollow,
@@ -232,7 +235,7 @@ def _heal_events(path: Path) -> None:
     Anything that does not parse is chopped back to the previous newline.
     """
     try:
-        data = path.read_bytes()
+        data = read_file_nofollow(path)
     except FileNotFoundError:
         return
     if not data or data.endswith(b"\n"):
@@ -306,9 +309,16 @@ def _write_all(handle, data: bytes) -> None:
 
 def _fsync_file(path: Path) -> None:
     try:
-        fd = os.open(path, os.O_RDONLY)
+        fd = _open_regular_fd(path, os.O_RDONLY)
     except FileNotFoundError:
         return
+    except OSError as exc:
+        # Durability is best-effort for missing or non-regular outputs.
+        if exc.errno == errno.EINVAL or is_symlink_error(exc):
+            reason = "symlink" if is_symlink_error(exc) else "not a regular file"
+            logger.debug("skipping fsync of %s: %s", path, reason)
+            return
+        raise
     try:
         os.fsync(fd)
     finally:
@@ -388,7 +398,8 @@ class RunWriter:
                 raise FileExistsError(writer._meta_path)
             writer._c(writer._scalars).mkdir(parents=True, exist_ok=True)
             writer._c(writer.run_dir / MEDIA_DIRNAME).mkdir(parents=True, exist_ok=True)
-            writer._events_path.touch(exist_ok=True)
+            with open_nofollow(writer._events_path, "ab"):
+                pass
             writer._heal_events_once()
             # Indexes before meta, so a crash mid-create is invisible to list_runs.
             writer._persist_index()
@@ -469,7 +480,7 @@ class RunWriter:
                 from .reader import STALE_AFTER_SECONDS
 
                 try:
-                    raw_meta = json.loads(writer._meta_path.read_text(encoding="utf-8"))
+                    raw_meta = json.loads(read_file_nofollow(writer._meta_path).decode("utf-8"))
                 except (OSError, ValueError, RecursionError, UnicodeError):
                     raw_meta = None
                 if isinstance(raw_meta, dict) and raw_meta.get("status") == "running":
@@ -1161,7 +1172,7 @@ class RunWriter:
 
     def _load_existing(self) -> None:
         try:
-            raw = json.loads(self._meta_path.read_text(encoding="utf-8"))
+            raw = json.loads(read_file_nofollow(self._meta_path).decode("utf-8"))
         except (ValueError, RecursionError) as exc:
             raise ValueError(f"corrupt meta.json for {self.run_id}") from exc
         if not isinstance(raw, dict):
@@ -1187,7 +1198,7 @@ class RunWriter:
             _heal_bin(self._c(self._scalars / TIME_BIN_NAME))
             return
         try:
-            data = json.loads(index_path.read_text(encoding="utf-8"))
+            data = json.loads(read_file_nofollow(index_path).decode("utf-8"))
         except (ValueError, RecursionError) as exc:
             raise ValueError(f"corrupt scalars index for {self.run_id}") from exc
         if not isinstance(data, dict) or data.get("version") != 1:
@@ -1216,7 +1227,7 @@ class RunWriter:
             self._media = {}
             return
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(read_file_nofollow(path).decode("utf-8"))
         except (ValueError, RecursionError) as exc:
             raise ValueError(f"corrupt media index for {self.run_id}") from exc
         if not isinstance(data, dict):

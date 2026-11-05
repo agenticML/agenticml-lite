@@ -25,8 +25,8 @@ from .auth import resolve
 from .client import Conflict, ProtocolError, SyncStopped
 from .store.gc import prunable_series, prune_run, run_fingerprint
 from .store.layout import (
-    RECORD_SIZE, _LOCK_UNSUPPORTED, open_nofollow, open_object,
-    read_file_nofollow, resolve_root, try_lock_run, unlock_run,
+    RECORD_SIZE, _LOCK_UNSUPPORTED, _open_regular_fd, fsync_dir, open_nofollow,
+    open_object, read_file_nofollow, resolve_root, try_lock_run, unlock_run,
 )
 from .store.reader import RunReader, _effective_status, list_runs, references_from_bytes
 
@@ -72,7 +72,7 @@ def _source_hash(reader):
 
 def _load_state(reader):
     try:
-        data = json.loads((reader.run_dir / "sync.json").read_text(encoding="utf-8"))
+        data = json.loads(read_file_nofollow(reader.run_dir / "sync.json").decode("utf-8"))
     except FileNotFoundError:
         return {"version": 1, "hosts": {}}
     if data.get("version") != 1 or not isinstance(data.get("hosts"), dict):
@@ -92,11 +92,7 @@ def _publish_sync_state(reader, data):
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        directory = os.open(reader.run_dir, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        fsync_dir(reader.run_dir)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -137,7 +133,7 @@ def _acquire_lock(run_dir):
         # is not guarded there.
         return None
     import fcntl
-    fd = os.open(run_dir / "sync.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    fd = _open_regular_fd(run_dir / "sync.lock", os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as exc:
@@ -353,12 +349,13 @@ def _pruned_upload_block(reader, host, state):
 
 
 def _open_local(path):
-    # Check before open too, so special files cannot block the snapshot.
+    # Check before open too, for a clearer error on special files.
     info = path.lstat()
     if stat.S_ISLNK(info.st_mode):
         raise OSError(errno.ELOOP, f"refusing symlink: {path}")
     if not stat.S_ISREG(info.st_mode):
         raise OSError(errno.EINVAL, f"not a regular file: {path}")
+    # The open itself is non-blocking, so a FIFO swapped in cannot hang it.
     handle = open_nofollow(path)
     if os.fstat(handle.fileno()).st_nlink > 1:
         handle.close()

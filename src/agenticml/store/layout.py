@@ -199,15 +199,18 @@ def atomic_write(path: Path, data: bytes, *, fsync: bool = False) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = unique_tmp(path.parent, f".{path.name}")
+    created = False
     try:
-        with tmp.open("wb") as handle:
+        with tmp.open("xb") as handle:
+            created = True
             handle.write(data)
             handle.flush()
             if fsync:
                 os.fsync(handle.fileno())
         os.replace(tmp, path)
     except Exception:
-        tmp.unlink(missing_ok=True)
+        if created:
+            tmp.unlink(missing_ok=True)
         raise
 
 
@@ -307,6 +310,22 @@ def is_symlink_error(exc: OSError) -> bool:
     return exc.errno in (errno.ELOOP, getattr(errno, "EMLINK", None))
 
 
+def _open_regular_fd(path: Path | str, flags: int, mode: int = 0o666) -> int:
+    """Open without blocking on special files, then require a regular file."""
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    flags |= nonblock | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, mode)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, f"not a regular file: {path}")
+        if nonblock:
+            os.set_blocking(fd, True)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def open_nofollow(path: Path | str, mode: str = "rb", buffering: int = -1):
     """Open a file without following symlinks.
 
@@ -322,9 +341,7 @@ def open_nofollow(path: Path | str, mode: str = "rb", buffering: int = -1):
     else:
         flags = os.O_RDONLY
 
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    else:
+    if not hasattr(os, "O_NOFOLLOW"):
         try:
             st = os.lstat(path)
             if stat.S_ISLNK(st.st_mode):
@@ -334,11 +351,8 @@ def open_nofollow(path: Path | str, mode: str = "rb", buffering: int = -1):
         except FileNotFoundError:
             if not (flags & os.O_CREAT):
                 raise
-    fd = os.open(path, flags, 0o666)
+    fd = _open_regular_fd(path, flags)
     try:
-        st_fd = os.fstat(fd)
-        if not stat.S_ISREG(st_fd.st_mode):
-            raise OSError(errno.EINVAL, f"not a regular file: {path}")
         return open(fd, mode, buffering=buffering)
     except Exception:
         os.close(fd)
@@ -347,24 +361,15 @@ def open_nofollow(path: Path | str, mode: str = "rb", buffering: int = -1):
 
 def read_file_nofollow(path: Path | str) -> bytes:
     """Read full file contents without following symlinks."""
-    flags = os.O_RDONLY
-    nonblock = getattr(os, "O_NONBLOCK", 0)
-    flags |= nonblock
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    else:
+    if not hasattr(os, "O_NOFOLLOW"):
         st = os.lstat(path)
         if stat.S_ISLNK(st.st_mode):
             raise OSError(errno.ELOOP, f"refusing symlink: {path}")
         if not stat.S_ISREG(st.st_mode):
             raise OSError(errno.EINVAL, f"not a regular file: {path}")
-    fd = os.open(path, flags)
+    fd = _open_regular_fd(path, os.O_RDONLY)
     try:
         st_fd = os.fstat(fd)
-        if not stat.S_ISREG(st_fd.st_mode):
-            raise OSError(errno.EINVAL, f"not a regular file: {path}")
-        if nonblock:
-            os.set_blocking(fd, True)
         size = st_fd.st_size
         chunks = []
         remaining = size
@@ -395,10 +400,7 @@ def open_object(root, sha: str):
     except ValueError as exc:
         raise FileNotFoundError(str(exc)) from exc
 
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    else:
+    if not hasattr(os, "O_NOFOLLOW"):
         try:
             st_link = os.lstat(path)
             if stat.S_ISLNK(st_link.st_mode):
@@ -407,7 +409,7 @@ def open_object(root, sha: str):
             raise FileNotFoundError(f"object not found: {sha}") from exc
 
     try:
-        fd = os.open(path, flags)
+        fd = _open_regular_fd(path, os.O_RDONLY)
     except OSError as exc:
         if is_symlink_error(exc):
             raise FileNotFoundError(f"refusing symlinked object: {path}") from exc
@@ -415,8 +417,6 @@ def open_object(root, sha: str):
 
     try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise FileNotFoundError(f"not a regular file: {path}")
         if st.st_nlink > 1:
             raise FileNotFoundError(f"refusing hard-linked object (st_nlink={st.st_nlink}): {path}")
         return open(fd, "rb")

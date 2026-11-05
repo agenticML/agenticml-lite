@@ -787,6 +787,345 @@ def test_read_file_nofollow_refuses_fifo(tmp_path):
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+@pytest.mark.parametrize("mode", ["rb", "ab"])
+def test_open_nofollow_refuses_fifo(tmp_path, mode):
+    from agenticml.store.layout import open_nofollow
+
+    writer = RunWriter.create(tmp_path, meta={})
+    writer.close()
+    path = writer.run_dir / "events.jsonl"
+    path.unlink()
+    os.mkfifo(path)
+
+    def open_fifo():
+        with open_nofollow(path, mode):
+            pass
+
+    with pytest.raises(OSError) as exc_info:
+        _call_with_timeout(open_fifo)
+    expected = (errno.EINVAL,) if mode == "rb" else (errno.ENXIO, errno.EINVAL)
+    assert exc_info.value.errno in expected
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+def test_reader_events_fifo_falls_back(tmp_path):
+    writer = RunWriter.create(tmp_path, meta={})
+    writer.set_config({"before": True})
+    writer.close()
+    path = writer.run_dir / "events.jsonl"
+    path.unlink()
+    os.mkfifo(path)
+
+    reader = RunReader(tmp_path, writer.run_id)
+    assert _call_with_timeout(reader.events) == []
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+def test_writer_events_refuses_fifo(tmp_path):
+    writer = RunWriter.create(tmp_path, meta={})
+    path = writer.run_dir / "events.jsonl"
+    path.unlink()
+    os.mkfifo(path)
+
+    def append_event():
+        try:
+            writer.set_config({"after": True})
+        finally:
+            writer.close()
+
+    with pytest.raises(OSError) as exc_info:
+        _call_with_timeout(append_event)
+    assert exc_info.value.errno in (errno.ENXIO, errno.EINVAL)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+def test_resume_heal_events_refuses_fifo(tmp_path):
+    writer = RunWriter.create(tmp_path)
+    writer.close()
+    path = writer.run_dir / "events.jsonl"
+    path.unlink()
+    os.mkfifo(path)
+
+    with pytest.raises(OSError) as exc_info:
+        _call_with_timeout(lambda: RunWriter.resume(tmp_path, writer.run_id, must=True))
+    assert exc_info.value.errno == errno.EINVAL
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+def test_create_events_refuses_fifo_before_open(tmp_path, monkeypatch):
+    path = tmp_path / "runs" / "fifo-create" / "events.jsonl"
+    real_open = os.open
+    swapped = []
+
+    def swap_before_open(candidate, flags, *args, **kwargs):
+        if Path(candidate) == path and not swapped:
+            os.mkfifo(path)
+            swapped.append(path)
+        return real_open(candidate, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swap_before_open)
+    with pytest.raises(OSError) as exc_info:
+        _call_with_timeout(lambda: RunWriter.create(tmp_path, run_id="fifo-create"))
+    assert exc_info.value.errno in (errno.ENXIO, errno.EINVAL)
+    assert swapped == [path]
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+@pytest.mark.parametrize("filename", [
+    "scalars/0.bin", "scalars/_time.bin", "scalars/index.json", "media/index.json",
+])
+def test_finish_skips_fifo_output(tmp_path, filename):
+    writer = RunWriter.create(tmp_path)
+    writer.write_scalars([(0, {"loss": 1.0})])
+    path = writer.run_dir / filename
+    path.unlink()
+    os.mkfifo(path)
+
+    def finish():
+        try:
+            return writer.finish("finished")
+        finally:
+            writer.close()
+
+    assert _call_with_timeout(finish) is None
+    assert RunReader(tmp_path, writer.run_id).meta()["status"] == "finished"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_finish_skips_symlink_output(tmp_path):
+    writer = RunWriter.create(tmp_path)
+    writer.write_scalars([(0, {"loss": 1.0})])
+    path = writer.run_dir / "scalars/0.bin"
+    path.unlink()
+    path.symlink_to(tmp_path / "outside")
+
+    def finish():
+        try:
+            return writer.finish("finished")
+        finally:
+            writer.close()
+
+    assert _call_with_timeout(finish) is None
+    assert RunReader(tmp_path, writer.run_id).meta()["status"] == "finished"
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+@pytest.mark.parametrize("filename,entry", [
+    ("meta.json", "resume"), ("meta.json", "amend"),
+    ("meta.json", "amend-unlocked"),
+    ("scalars/index.json", "resume"), ("scalars/index.json", "amend"),
+    ("media/index.json", "resume"), ("media/index.json", "amend"),
+])
+def test_reopen_json_refuses_fifo_after_check(tmp_path, monkeypatch, filename, entry):
+    writer = RunWriter.create(tmp_path)
+    writer.close()
+    path = writer.run_dir / filename
+    real_is_file = Path.is_file
+    checks = []
+    # Resume checks the scalar index once in _reject_pruned before _load_series.
+    swap_on = 2 if filename == "scalars/index.json" and entry == "resume" else 1
+
+    def swap_after_check(candidate):
+        result = real_is_file(candidate)
+        if candidate == path:
+            checks.append(result)
+            if len(checks) == swap_on:
+                assert result
+                path.unlink()
+                os.mkfifo(path)
+        return result
+
+    monkeypatch.setattr(Path, "is_file", swap_after_check)
+    if entry == "amend-unlocked":
+        real_acquire = RunWriter._acquire_run_lock
+
+        def acquire_unlocked(candidate, **kwargs):
+            real_acquire(candidate, **kwargs)
+            candidate._run_lock.locking_supported = False
+
+        monkeypatch.setattr(RunWriter, "_acquire_run_lock", acquire_unlocked)
+
+    def reopen():
+        if entry == "resume":
+            reopened = RunWriter.resume(tmp_path, writer.run_id, must=True)
+        else:
+            reopened = RunWriter.amend(tmp_path, writer.run_id)
+        reopened.close()
+
+    with pytest.raises(OSError) as exc_info:
+        _call_with_timeout(reopen)
+    assert exc_info.value.errno == errno.EINVAL
+    assert len(checks) >= swap_on
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+def test_sync_load_state_refuses_fifo(tmp_path):
+    import agenticml.sync as sync_mod
+
+    writer = RunWriter.create(tmp_path)
+    writer.close()
+    reader = RunReader(tmp_path, writer.run_id)
+    assert sync_mod._load_state(reader) == {"version": 1, "hosts": {}}
+    os.mkfifo(writer.run_dir / "sync.json")
+
+    with pytest.raises(OSError) as exc_info:
+        _call_with_timeout(lambda: sync_mod._load_state(reader))
+    assert exc_info.value.errno == errno.EINVAL
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+def test_sync_lock_refuses_fifo(tmp_path):
+    import agenticml.sync as sync_mod
+
+    writer = RunWriter.create(tmp_path)
+    writer.close()
+    os.mkfifo(writer.run_dir / "sync.lock")
+
+    with pytest.raises(OSError) as exc_info:
+        _call_with_timeout(lambda: sync_mod._acquire_lock(writer.run_dir))
+    assert exc_info.value.errno in (errno.ENXIO, errno.EINVAL)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+@pytest.mark.parametrize("operation", ["atomic", "put-bytes", "put-file"])
+def test_temp_write_refuses_existing_fifo(tmp_path, monkeypatch, operation):
+    import agenticml.store.layout as layout_mod
+    import agenticml.store.objects as objects_mod
+
+    writer = RunWriter.create(tmp_path)
+    writer.close()
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"source")
+    planted = []
+
+    def planted_temp(directory, prefix):
+        path = directory / ".planted.tmp"
+        os.mkfifo(path)
+        planted.append(path)
+        return path
+
+    if operation == "atomic":
+        monkeypatch.setattr(layout_mod, "unique_tmp", planted_temp)
+        call = lambda: layout_mod.atomic_write(writer.run_dir / "meta.json", b"{}")
+    else:
+        monkeypatch.setattr(objects_mod, "unique_tmp", planted_temp)
+        if operation == "put-bytes":
+            call = lambda: put_bytes(tmp_path, b"source")
+        else:
+            call = lambda: put_file(tmp_path, source)
+    with pytest.raises(FileExistsError):
+        _call_with_timeout(call)
+    assert len(planted) == 1
+    assert planted[0].exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+def test_put_file_refuses_fifo_source(tmp_path):
+    sha = put_bytes(tmp_path, b"source")
+    path = object_path(tmp_path, sha)
+    path.unlink()
+    os.mkfifo(path)
+
+    with pytest.raises(OSError) as exc_info:
+        _call_with_timeout(lambda: put_file(tmp_path, path))
+    assert exc_info.value.errno == errno.EINVAL
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_put_file_accepts_regular_symlink_source(tmp_path):
+    path = tmp_path / "source.bin"
+    path.write_bytes(b"source")
+    link = tmp_path / "source-link.bin"
+    link.symlink_to(path)
+    assert put_file(tmp_path, link) == (hashlib.sha256(b"source").hexdigest(), 6)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_put_file_refuses_symlink_loop(tmp_path):
+    a = tmp_path / "loop-a"
+    b = tmp_path / "loop-b"
+    a.symlink_to(b)
+    b.symlink_to(a)
+    with pytest.raises(OSError):
+        put_file(tmp_path, a)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+def test_reader_scalar_refuses_fifo_swapped_after_stat(tmp_path, monkeypatch):
+    import agenticml.store.reader as reader_mod
+
+    writer = RunWriter.create(tmp_path, meta={})
+    writer.write_scalars([(0, {"loss": 1.0})])
+    writer.close()
+    path = writer.run_dir / "scalars" / "0.bin"
+    real_file_size = reader_mod._file_size
+
+    def swap_after_stat(candidate):
+        size = real_file_size(candidate)
+        if candidate == path:
+            assert size > 0
+            path.unlink()
+            os.mkfifo(path)
+        return size
+
+    monkeypatch.setattr(reader_mod, "_file_size", swap_after_stat)
+    reader = RunReader(tmp_path, writer.run_id)
+    with pytest.raises(OSError) as exc_info:
+        _call_with_timeout(lambda: reader.read_records("loss"))
+    assert exc_info.value.errno == errno.EINVAL
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+def test_open_object_refuses_fifo(tmp_path):
+    writer = RunWriter.create(tmp_path, meta={})
+    sha = writer.add_media("frame", 0, b"fifo object", "image/png", None)
+    writer.close()
+    path = object_path(tmp_path, sha)
+    path.unlink()
+    os.mkfifo(path)
+
+    with pytest.raises(FileNotFoundError):
+        _call_with_timeout(lambda: open_object(tmp_path, sha))
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+def test_run_lock_refuses_fifo(tmp_path):
+    from agenticml.store.layout import is_run_locked, try_lock_run
+
+    writer = RunWriter.create(tmp_path, meta={})
+    writer.close()
+    path = writer.run_dir / "run.lock"
+    path.unlink()
+    os.mkfifo(path)
+
+    with pytest.raises(OSError) as exc_info:
+        _call_with_timeout(lambda: try_lock_run(writer.run_dir))
+    assert exc_info.value.errno in (errno.ENXIO, errno.EINVAL)
+    assert _call_with_timeout(lambda: is_run_locked(writer.run_dir)) is None
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+def test_open_local_refuses_fifo_swapped_after_lstat(tmp_path, monkeypatch):
+    import agenticml.sync as sync_mod
+
+    writer = RunWriter.create(tmp_path, meta={})
+    writer.close()
+    path = writer.run_dir / "events.jsonl"
+    real_open = sync_mod.open_nofollow
+
+    def swap_before_open(candidate):
+        assert candidate == path
+        path.unlink()
+        os.mkfifo(path)
+        return real_open(candidate)
+
+    monkeypatch.setattr(sync_mod, "open_nofollow", swap_before_open)
+    with pytest.raises(OSError) as exc_info:
+        _call_with_timeout(lambda: sync_mod._open_local(path))
+    assert exc_info.value.errno == errno.EINVAL
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
 @pytest.mark.parametrize("filename", ["meta.json", REMOTE_NAME])
 def test_list_runs_fifo_falls_back(tmp_path, filename):
     writer = RunWriter.create(tmp_path, run_id="fifo-run", meta={})
@@ -1013,16 +1352,18 @@ def test_finish_fsyncs_scalar_and_media_dirs(tmp_path, monkeypatch):
 
 
 def test_event_heal_does_not_reread_on_append(tmp_path, monkeypatch):
+    import agenticml.store.writer as writer_mod
+
     writer = RunWriter.create(tmp_path, meta={})
     reads = {"n": 0}
-    real = Path.read_bytes
+    real = writer_mod.read_file_nofollow
 
-    def counting(self, *args, **kwargs):
-        if self.name == "events.jsonl":
+    def counting(path):
+        if path.name == "events.jsonl":
             reads["n"] += 1
-        return real(self, *args, **kwargs)
+        return real(path)
 
-    monkeypatch.setattr(Path, "read_bytes", counting)
+    monkeypatch.setattr(writer_mod, "read_file_nofollow", counting)
     writer.set_config({"a": 1})
     writer.set_config({"a": 2})
     writer.finish("finished", {})
