@@ -10,7 +10,6 @@ import logging
 import os
 import socket
 import stat
-import sys
 import threading
 
 import pytest
@@ -24,6 +23,10 @@ from agenticml.server.keys import (
 from agenticml.server.webauth import WebAuth
 from agenticml.store import RunReader, RunWriter
 from agenticml.ui import server as ui_server
+
+
+# On Python 3.12+, the C json scanner's limit is separate from sys.getrecursionlimit().
+DEEP_JSON_DEPTH = 100_000
 
 
 @contextmanager
@@ -497,8 +500,11 @@ def test_setup_corrupt_at_startup_stays_disabled(tmp_path, caplog, nested):
     data = tmp_path / "data"
     prepare_data_dir(data)
     path = data / "server" / "keys.json"
-    depth = sys.getrecursionlimit() + 100
+    depth = DEEP_JSON_DEPTH
     contents = "[" * depth + "0" + "]" * depth if nested else "private corrupt contents"
+    if nested:
+        with pytest.raises(RecursionError):
+            json.loads(contents)
     path.write_text(contents)
     with running(data) as httpd:
         assert httpd.web.setup_token is None
@@ -987,7 +993,7 @@ def test_store_corruption_503_and_cli(tmp_path, capsys, monkeypatch, nested):
     with running(tmp_path / "data", env_key="e" * 32) as httpd:
         httpd.cookie = login(httpd, "e" * 32)
         httpd.keys.create("box")
-        depth = sys.getrecursionlimit() + 100
+        depth = DEEP_JSON_DEPTH
         contents = "[" * depth + "0" + "]" * depth if nested else "private corrupt contents"
         if nested:
             with pytest.raises(RecursionError):
