@@ -16,7 +16,8 @@ concurrency:
 jobs:
   unit:
     name: Unit tests (Python ${{ matrix.python }})
-    runs-on: ubuntu-latest
+    # Ubuntu 26.04 has no Python 3.9 build for setup-python; drop the pin with 3.9.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
       fail-fast: false

@@ -172,6 +172,12 @@ priority.
   key, and check the rest of the lineage view for focusable elements without
   one. Done when a UI test focuses the link, triggers a re-render, and sees
   focus still on it.
+- **Unit CI is pinned to Ubuntu 24.04 for Python 3.9.**
+  Where: `.github/workflows/test.yml`, `unit` job. Problem: `ubuntu-latest`
+  became Ubuntu 26.04, which has no Python 3.9 build for `setup-python`
+  (Nov 5, 2026), so the job runs on `ubuntu-24.04`. Fix: when 3.9 support
+  is dropped, remove 3.9 from the matrix and go back to `ubuntu-latest`.
+  Done when the unit job runs on `ubuntu-latest` again.
 - **`sync --follow` repeats the same failure line every pass.**
   Where: `src/agenticml/sync.py` `_follow` / `_emit_follow`. Problem: a
   failure that is neither permanent nor a network error (an explicit run id
