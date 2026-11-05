@@ -1,0 +1,30 @@
+# User unit for a long-lived `agenticml sync --follow`.
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp agenticml-sync.service ~/.config/systemd/user/
+#   # Point ExecStart at `which agenticml` if it is not ~/.local/bin/agenticml.
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now agenticml-sync
+#   loginctl enable-linger $USER
+#
+# Logs: journalctl --user -u agenticml-sync -f
+# Stop: systemctl --user stop agenticml-sync
+# Non-default store: Environment=AGENTICML_DIR=... under [Service].
+
+[Unit]
+Description=AgenticML sync to the team server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/agenticml sync --follow
+Restart=on-failure
+RestartSec=30
+# Exit status 3 means the API key was rejected: fix it with agenticml login.
+RestartPreventExitStatus=3
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

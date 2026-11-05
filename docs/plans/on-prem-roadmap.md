@@ -57,7 +57,7 @@ Update the status column in the PR that changes it. Values: `not started`,
 | 3 | Sync client v2 and `docs/PROTOCOL.md` | 1 | Cursor (client), Codex (sync); prose Antigravity | L | [plan](packages/3-sync-client-v2.md) | done ([#27](https://github.com/agenticML/agenticml-lite/pull/27)) |
 | 4 † | Server dashboard: key login, sessions, CSRF, last synced | 1, 2 | Cursor | M | [plan](packages/4-server-dashboard.md) | done ([#28](https://github.com/agenticML/agenticml-lite/pull/28)) |
 | 4b † | Key management in the dashboard: first-key setup, issue / list / revoke sync and admin keys | 1, 4 | Codex | M | [plan](packages/4b-key-management.md) | done ([#29](https://github.com/agenticML/agenticml-lite/pull/29)) |
-| 5 | `sync --follow` and systemd example | 3 | Cursor | M | to write | not started |
+| 5 | `sync --follow` and systemd example | 3 | Cursor | M | [plan](packages/5-sync-follow.md) | in review |
 | 6 | Image, deploy examples, docs, security policy, 2.0.0 release | 1, 3, 4, 4b, 5 | Codex; prose Antigravity | M | to write | not started |
 
 † security-sensitive: needs a second read-only review from the other coder.
@@ -172,3 +172,11 @@ priority.
   key, and check the rest of the lineage view for focusable elements without
   one. Done when a UI test focuses the link, triggers a re-render, and sees
   focus still on it.
+- **`sync --follow` repeats the same failure line every pass.**
+  Where: `src/agenticml/sync.py` `_follow` / `_emit_follow`. Problem: a
+  failure that is neither permanent nor a network error (an explicit run id
+  that does not exist, an `OSError` in the store) is retried every pass and
+  prints the same line every `--interval`, filling the journal. `--watch`
+  does the same. Fix: print a repeated identical failure once, then a
+  reminder at most every 10 minutes, and say when it clears. Done when a
+  test with a missing explicit run id shows one line over several passes.

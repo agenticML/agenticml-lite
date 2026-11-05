@@ -8,11 +8,12 @@ import io
 import json
 import socket
 import threading
+import time
 
 import pytest
 import requests
 
-from agenticml.client import Client, Conflict, ProtocolError
+from agenticml.client import Client, Conflict, ProtocolError, SyncStopped
 from agenticml.server.app import make_server
 from agenticml.server.keys import KeyStore
 
@@ -132,6 +133,19 @@ def test_whoami_protocol_error(status, body):
         with Client(base_url=url, api_key="secret-key") as client:
             with pytest.raises(ProtocolError, match="is not an agenticml server with protocol 2") as caught:
                 client.whoami()
+            assert "secret-key" not in str(caught.value)
+
+
+@pytest.mark.parametrize("status", [408, 429, 501, 520])
+def test_whoami_unreachable_http_error(status):
+    def handler(request):
+        request._send(status, b'{"error":"busy"}', {"Content-Type": "application/json"})
+
+    with fake_http(handler) as (_httpd, url):
+        with Client(base_url=url, api_key="secret-key", max_retries=0) as client:
+            with pytest.raises(requests.HTTPError) as caught:
+                client.whoami()
+            assert caught.value.response.status_code == status
             assert "secret-key" not in str(caught.value)
 
 
@@ -357,3 +371,37 @@ def test_host_is_normalised_and_remote_http_needs_insecure():
         Client(base_url="http://example.com")
     with pytest.raises(ValueError, match="scheme"):
         Client(base_url="ftp://example.com")
+
+
+def test_stop_event_blocks_request_and_wakes_backoff():
+    sent = []
+
+    def handler(request):
+        sent.append(request.path)
+        request._send(200, b'{"protocol":2,"key":"one","scope":"sync","features":[]}')
+
+    stop = threading.Event()
+    stop.set()
+    with fake_http(handler) as (_httpd, url):
+        with Client(base_url=url, api_key="secret-key", stop=stop) as client:
+            with pytest.raises(SyncStopped):
+                client.whoami()
+    assert sent == []
+
+    stop = threading.Event()
+    box = []
+    with Client(base_url="http://127.0.0.1:1", api_key="secret-key", stop=stop) as client:
+        def run():
+            try:
+                client._backoff(0, retry_after=30)
+            except SyncStopped as exc:
+                box.append(exc)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        time.sleep(0.05)
+        stop.set()
+        thread.join(1)
+        assert not thread.is_alive()
+        assert box
+        assert "secret-key" not in str(box[0])

@@ -22,6 +22,10 @@ class ProtocolError(ValueError):
     """The host answered, but it is not a protocol 2 agenticml server."""
 
 
+class SyncStopped(Exception):
+    """The caller asked the client to stop between HTTP requests."""
+
+
 class Conflict(Exception):
     """A 409 from the server. ``payload`` is the parsed JSON body (dict)."""
 
@@ -63,7 +67,7 @@ def _json_object(response):
 
 class Client:
     def __init__(self, base_url=None, api_key=None, *, timeout=30,
-                 max_retries=3, insecure=False):
+                 max_retries=3, insecure=False, stop=None):
         resolved = base_url if base_url is not None else (os.environ.get("AGENTICML_HOST") or None)
         if not resolved:
             raise ValueError("no server host: pass base_url or set AGENTICML_HOST")
@@ -75,6 +79,7 @@ class Client:
         self.timeout = timeout
         self.max_retries = max_retries
         self.api_key = resolved_key
+        self.stop = stop
         self.session = _session()
         if resolved_key:
             self.session.headers["Authorization"] = f"Bearer {resolved_key}"
@@ -97,13 +102,19 @@ class Client:
         else:
             delay = min(0.5 * (2 ** attempt), 30.0)
         if delay:
-            time.sleep(delay)
+            if self.stop is not None:
+                if self.stop.wait(delay):
+                    raise SyncStopped()
+            else:
+                time.sleep(delay)
 
     def _request(self, method, url, *, timeout=None, rewind=None, **kwargs):
         timeout = timeout if timeout is not None else (_CONNECT_TIMEOUT, self.timeout)
         attempts = 1 + max(self.max_retries, 0)
         last_error = None
         for attempt in range(attempts):
+            if self.stop is not None and self.stop.is_set():
+                raise SyncStopped()
             if rewind is not None:
                 handle, start = rewind
                 handle.seek(start)
@@ -153,7 +164,9 @@ class Client:
 
     def whoami(self) -> dict:
         response = self._request("GET", f"{self.base_url}/v2/whoami")
-        if response.status_code == 401:
+        if (response.status_code == 401
+                or response.status_code >= 500
+                or response.status_code in (408, 429)):
             response.raise_for_status()
         body = _json_object(response)
         if response.status_code != 200 or body is None or body.get("protocol") != 2:

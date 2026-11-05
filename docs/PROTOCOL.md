@@ -666,10 +666,14 @@ no-ops, commit overwrites `remote.json`).
 - Timeouts: 10 s connect timeout; 30 s read timeout for metadata calls; for
   `put_object`, read timeout scales to `max(30, 60 + size / 1 MiB)` seconds.
 
-### 10. Permanent failures and `--watch`
+### 10. Permanent failures, `--watch`, and `--follow`
 
 When running with `--watch N`, the client loops every N seconds until all
-selected runs have synced, gone stale, or failed permanently.
+selected runs have synced, gone stale, or failed permanently. `sync --follow`
+uses the same classification, looping until stopped (or until every explicit
+run id is complete or permanent): HTTP 401 exits 3; connection errors,
+timeouts, and 5xx/408/429 back off up to 5 minutes with jitter; a running run
+is committed at least every 60 s.
 
 - **Permanent failures** (stop `--watch` from retrying the run):
   - **Ownership conflict**: The run belongs to a different API key on the

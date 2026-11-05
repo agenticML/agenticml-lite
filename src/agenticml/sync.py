@@ -8,17 +8,21 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import secrets
+import signal
 import stat
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 
+import requests
 from requests import HTTPError
 
 from .auth import resolve
-from .client import Conflict, ProtocolError
+from .client import Conflict, ProtocolError, SyncStopped
 from .store.gc import prunable_series, prune_run, run_fingerprint
 from .store.layout import (
     RECORD_SIZE, _LOCK_UNSUPPORTED, open_nofollow, open_object,
@@ -28,6 +32,10 @@ from .store.reader import RunReader, _effective_status, list_runs, references_fr
 
 APPEND_CHUNK = 8 * 1024 * 1024
 _APPEND_LIMIT = 64 * 1024 * 1024
+FOLLOW_INTERVAL = 30.0
+HEARTBEAT = 60.0
+BACKOFF_MAX = 300.0
+_BACKOFF_EXP_CAP = 16
 _ATOMIC = re.compile(r"(?:meta\.json|scalars/index\.json|media/index\.json|scalars/(?:0|[1-9][0-9]{0,8})\.ovw)")
 _APPEND = re.compile(r"(?:events\.jsonl|scalars/_time\.bin|scalars/(?:0|[1-9][0-9]{0,8})\.bin)")
 _TRANSIENT_STATUS = frozenset({408, 429})
@@ -787,6 +795,47 @@ def _permanent_failure(exc):
     return False
 
 
+def _is_unauthorized(exc):
+    return getattr(getattr(exc, "response", None), "status_code", None) == 401
+
+
+def _is_unreachable(exc):
+    if isinstance(exc, RunMissingError):
+        return True
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout,
+                        requests.exceptions.ChunkedEncodingError)):
+        return True
+    code = getattr(getattr(exc, "response", None), "status_code", None)
+    return isinstance(code, int) and (code >= 500 or code in _TRANSIENT_STATUS)
+
+
+def _follow_backoff_delay(interval, consecutive):
+    # Cap the exponent: ``interval * 2 ** consecutive`` overflows a float
+    # around consecutive=1024 (a couple of days of outage) and would kill
+    # the follower with OverflowError.
+    return min(interval * (2 ** min(consecutive, _BACKOFF_EXP_CAP)), BACKOFF_MAX)
+
+
+def _sleep_stop(stop, seconds):
+    if seconds > 0 and stop.wait(seconds):
+        raise SyncStopped()
+
+
+def _emit_follow(result, last_status):
+    if result.failed or result.files or result.objects or result.bytes or last_status.get(result.run_id) != result.status:
+        print(result.line(), flush=True)
+        last_status[result.run_id] = result.status
+
+
+def _interrupted_summary(results, active=None):
+    if active is not None:
+        active.status = "partial (interrupted)"
+        print(active.line())
+    print(f"Interrupted: complete={sum(r.complete for r in results.values())} "
+          f"partial={sum(not r.complete and not r.failed for r in results.values())} "
+          f"failed={sum(r.failed for r in results.values())}")
+
+
 def _order_runs_lineage(root, run_ids):
     if len(run_ids) <= 1:
         return list(run_ids)
@@ -857,7 +906,156 @@ def _selected_ids(root, host, explicit, include_all, prune=False, key=None):
     return _order_runs_lineage(root, selected)
 
 
+def _follow(args, root, host, api_key):
+    from .client import Client
+
+    interval = args.interval if args.interval is not None else FOLLOW_INTERVAL
+    prune = getattr(args, "prune", False)
+    run_ids = list(args.run_ids)
+    include_all = bool(args.all) or not run_ids
+    stop = threading.Event()
+    received = []
+    previous = {}
+    client = None
+    results = {}
+    last_status = {}
+    permanent_ids = set()
+    consecutive = 0
+    active = None
+    try:
+        if threading.current_thread() is threading.main_thread():
+            def handle(signum, _frame):
+                received.append(signum)
+                stop.set()
+                if signum == signal.SIGINT:
+                    prior = previous.get(signal.SIGINT)
+                    signal.signal(
+                        signal.SIGINT,
+                        prior if callable(prior) else signal.default_int_handler,
+                    )
+
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                previous[sig] = signal.getsignal(sig)
+                signal.signal(sig, handle)
+        client = Client(base_url=host, api_key=api_key, insecure=args.insecure, stop=stop)
+        selected = _selected_ids(root, host, run_ids, include_all, prune=prune)
+        print(f"following {host}: {len(selected)} runs, every {interval:g}s", flush=True)
+        while True:
+            if stop.is_set():
+                raise SyncStopped()
+            unreachable = None
+            saw_running = False
+            try:
+                identity = _identity(client)
+            except SyncStopped:
+                raise
+            except ProtocolError as exc:
+                print(f"agenticml sync: {_short_error(exc)}", file=sys.stderr)
+                return 1
+            except Exception as exc:
+                if _is_unauthorized(exc):
+                    print(f"agenticml sync: {_short_error(exc)}", file=sys.stderr)
+                    return 3
+                if _is_unreachable(exc):
+                    unreachable = exc
+                    identity = None
+                else:
+                    print(f"agenticml sync: {_short_error(exc)}", file=sys.stderr)
+                    return 1
+            if identity is not None:
+                selected = [rid for rid in _selected_ids(
+                    root, host, run_ids, include_all, prune=prune, key=identity["key"],
+                ) if rid not in permanent_ids]
+                for run_id in selected:
+                    if stop.is_set():
+                        raise SyncStopped()
+                    active = SyncResult(run_id)
+                    results[run_id] = active
+                    try:
+                        reader = RunReader(root, run_id)
+                        try:
+                            if _effective(reader, reader.meta()) == "running":
+                                saw_running = True
+                        except Exception:
+                            pass
+                        sync_run(reader, host, client, active, prune=prune)
+                    except SyncStopped:
+                        raise
+                    except Exception as exc:
+                        if _is_unauthorized(exc):
+                            print(f"agenticml sync: {_short_error(exc)}", file=sys.stderr)
+                            return 3
+                        if _is_unreachable(exc):
+                            unreachable = exc
+                            active.failed = True
+                            active.status = f"failed: {_short_error(exc)}"
+                            active = None
+                            break
+                        active.failed = True
+                        active.permanent = _permanent_failure(exc)
+                        active.status = f"failed: {_short_error(exc)}"
+                        if active.permanent:
+                            permanent_ids.add(run_id)
+                    else:
+                        if active.status == "partial (running)":
+                            saw_running = True
+                        if active.permanent:
+                            permanent_ids.add(run_id)
+                    _emit_follow(active, last_status)
+                    active = None
+            if unreachable is None and run_ids:
+                pending = False
+                failed = False
+                for rid in dict.fromkeys(run_ids):
+                    if rid in permanent_ids:
+                        failed = True
+                    elif rid in results and (results[rid].complete or results[rid].stale):
+                        failed = failed or results[rid].failed
+                    else:
+                        pending = True
+                        break
+                if not pending:
+                    return 1 if failed else 0
+            if unreachable is not None:
+                delay = _follow_backoff_delay(interval, consecutive)
+                slept = random.uniform(delay / 2, delay)
+                consecutive += 1
+                print(f"server unreachable ({_short_error(unreachable)}); retrying in {slept:g}s",
+                      flush=True)
+                _sleep_stop(stop, slept)
+            else:
+                consecutive = 0
+                pause = min(interval, HEARTBEAT) if saw_running else interval
+                _sleep_stop(stop, pause)
+    except SyncStopped:
+        _interrupted_summary(results, active)
+        return 130 if signal.SIGINT in received else 0
+    except KeyboardInterrupt:
+        _interrupted_summary(results, active)
+        return 130
+    except Exception as exc:
+        print(f"agenticml sync: {_short_error(exc)}", file=sys.stderr)
+        return 1
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, signal.SIG_DFL if handler is None else handler)
+        if client is not None:
+            client.close()
+
+
 def cmd_sync(args):
+    follow = getattr(args, "follow", False)
+    interval = getattr(args, "interval", None)
+    if follow and (args.watch is not None or args.dry_run or getattr(args, "reset", False)):
+        print("agenticml sync: --follow cannot be combined with --watch, --dry-run or --reset",
+              file=sys.stderr)
+        return 2
+    if interval is not None and not follow:
+        print("agenticml sync: --interval requires --follow", file=sys.stderr)
+        return 2
+    if interval is not None and (not math.isfinite(interval) or interval <= 0):
+        print("agenticml sync: --interval must be a positive number of seconds", file=sys.stderr)
+        return 2
     if getattr(args, "reset", False):
         if args.all:
             print("agenticml sync: --reset requires explicit run ids, not --all", file=sys.stderr)
@@ -876,12 +1074,23 @@ def cmd_sync(args):
                 return 1
         return 0
 
-    if not args.run_ids and not args.all:
+    if not follow and not args.run_ids and not args.all:
         print("agenticml sync: specify RUN_ID ... or --all", file=sys.stderr)
         return 2
     if args.watch is not None and (not math.isfinite(args.watch) or args.watch <= 0):
         print("agenticml sync: --watch must be a positive number of seconds", file=sys.stderr)
         return 2
+    if follow:
+        try:
+            host, api_key = resolve(args.host, args.api_key, insecure=args.insecure)
+            if not api_key:
+                print("not logged in — run `agenticml login`", file=sys.stderr)
+                return 1
+            root = resolve_root(args.dir)
+        except Exception as exc:
+            print(f"agenticml sync: {_short_error(exc)}", file=sys.stderr)
+            return 1
+        return _follow(args, root, host, api_key)
     client = None
     results = {}
     failures = 0

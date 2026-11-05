@@ -195,6 +195,7 @@ agenticml du                              # store disk usage
 agenticml gc --dry-run                    # preview cleanup; nothing is deleted
 agenticml login --host URL / whoami / logout  # credentials (login needs --host of your own agenticml server)
 agenticml sync RUN_ID [--dry-run]             # send runs to the server (needs login)
+agenticml sync --follow [--interval S]        # keep syncing until stopped (implies --all)
 ```
 
 `lineage ls` groups output by project, then `[task]` (`[no task]` for none).
