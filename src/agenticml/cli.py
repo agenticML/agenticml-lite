@@ -1114,6 +1114,8 @@ def main(argv=None):
     p_sync.add_argument("--host", default=None, help="Server base URL (default: saved default host)")
     p_sync.add_argument("--api-key", default=None, help="API key")
     p_sync.add_argument("--watch", type=float, metavar="SECONDS", help="Repeat until all selected runs complete")
+    p_sync.add_argument("--follow", action="store_true", help="Keep syncing until stopped (implies --all)")
+    p_sync.add_argument("--interval", type=float, metavar="SECONDS", help="Pause between --follow passes (default: 30)")
     p_sync.add_argument("--dry-run", action="store_true", help="Show counts without sending or saving")
     p_sync.add_argument("--prune", action="store_true", help="Delete raw series (.bin) with valid overviews after sync")
     p_sync.add_argument("--reset", action="store_true", help="Forget this host's saved cursor for the given runs; the next sync resumes from the server")
