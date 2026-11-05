@@ -6,3 +6,11 @@ __pycache__/
 build/
 dist/
 .agenticml/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+crash.log
