@@ -356,6 +356,30 @@ def test_lineage_inspector_keeps_focus_across_gated_lineage_fetch(page, tmp_path
             )
 
 
+def test_lineage_tray_compare_keeps_focus_across_poll(page, ui_server):
+    """Re-render after a runs poll must restore focus on Compare N runs."""
+    runs = [
+        dict(run_id="a", name="parent", project="demo", status="running", keys=[], task="asr",
+             task_source="explicit", created_at="2026-10-01", summary={"loss": 1.0}),
+        dict(run_id="b", name="child", project="demo", status="finished", keys=[], task="asr",
+             task_source="explicit", created_at="2026-10-02", summary={"loss": 0.5},
+             parent_run_id="a"),
+    ]
+    mock_dashboard(page, runs)
+    page.clock.install()
+    home(page, ui_server)
+    dialog = _open_lineage(page)
+    expect(dialog.locator(".lv-node")).to_have_count(2)
+    dialog.get_by_role("checkbox", name="Select parent for comparison").check()
+    dialog.get_by_role("checkbox", name="Select child for comparison").check()
+    compare = dialog.get_by_role("link", name="Compare 2 runs")
+    expect(compare).to_have_attribute("data-focus", "lv-compare-tray")
+    compare.focus()
+    expect(compare).to_be_focused()
+    page.clock.fast_forward(5000)
+    expect(dialog.get_by_role("link", name="Compare 2 runs")).to_be_focused()
+
+
 def test_lineage_view_follows_polls(page, ui_server):
     runs = [
         dict(run_id="a", name="parent", project="demo", status="running", keys=[], task="asr",

@@ -35,6 +35,7 @@ _APPEND_LIMIT = 64 * 1024 * 1024
 FOLLOW_INTERVAL = 30.0
 HEARTBEAT = 60.0
 BACKOFF_MAX = 300.0
+FAILURE_REMINDER = 600.0
 _BACKOFF_EXP_CAP = 16
 _ATOMIC = re.compile(r"(?:meta\.json|scalars/index\.json|media/index\.json|scalars/(?:0|[1-9][0-9]{0,8})\.ovw)")
 _APPEND = re.compile(r"(?:events\.jsonl|scalars/_time\.bin|scalars/(?:0|[1-9][0-9]{0,8})\.bin)")
@@ -818,10 +819,44 @@ def _sleep_stop(stop, seconds):
         raise SyncStopped()
 
 
-def _emit_follow(result, last_status):
-    if result.failed or result.files or result.objects or result.bytes or last_status.get(result.run_id) != result.status:
+class _FailureLog:
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self._last = {}
+
+    def line(self, result):
+        # Dedupe on status, not the full line: counts and warnings can change
+        # while the failure itself is the same (e.g. HTTP 500 mid-upload).
+        status = result.status
+        now = self._clock()
+        prev = self._last.get(result.run_id)
+        if prev is None or prev[0] != status:
+            self._last[result.run_id] = (status, now)
+            return result.line()
+        if now - prev[1] >= FAILURE_REMINDER:
+            self._last[result.run_id] = (status, now)
+            return result.line() + " (still failing)"
+        return None
+
+    def clear(self, run_id):
+        self._last.pop(run_id, None)
+
+    def prune(self, keep_ids):
+        keep = set(keep_ids)
+        self._last = {rid: rec for rid, rec in self._last.items() if rid in keep}
+
+
+def _emit_follow(result, last_status, failure_log):
+    if result.failed:
+        line = failure_log.line(result)
+        if line is not None:
+            print(line, flush=True)
+            last_status[result.run_id] = result.status
+        return
+    if result.files or result.objects or result.bytes or last_status.get(result.run_id) != result.status:
         print(result.line(), flush=True)
         last_status[result.run_id] = result.status
+    failure_log.clear(result.run_id)
 
 
 def _interrupted_summary(results, active=None):
@@ -916,6 +951,7 @@ def _follow(args, root, host, api_key):
     client = None
     results = {}
     last_status = {}
+    failure_log = _FailureLog()
     permanent_ids = set()
     consecutive = 0
     active = None
@@ -963,6 +999,7 @@ def _follow(args, root, host, api_key):
                 selected = [rid for rid in _selected_ids(
                     root, host, run_ids, include_all, prune=prune, key=identity["key"],
                 ) if rid not in permanent_ids]
+                failure_log.prune(selected)
                 for run_id in selected:
                     if stop.is_set():
                         raise SyncStopped()
@@ -998,7 +1035,7 @@ def _follow(args, root, host, api_key):
                             saw_running = True
                         if active.permanent:
                             permanent_ids.add(run_id)
-                    _emit_follow(active, last_status)
+                    _emit_follow(active, last_status, failure_log)
                     active = None
             if unreachable is None and run_ids:
                 pending = False
@@ -1092,6 +1129,7 @@ def cmd_sync(args):
     results = {}
     failures = 0
     active = None
+    failure_log = _FailureLog()
     try:
         host, api_key = resolve(args.host, args.api_key, insecure=args.insecure)
         if not args.dry_run and not api_key:
@@ -1107,6 +1145,7 @@ def cmd_sync(args):
             failures = 0
             selected = _selected_ids(root, host, args.run_ids, args.all, prune=prune,
                                      key=_identity(client)["key"] if client is not None else None)
+            failure_log.prune(selected)
             if not selected and args.all:
                 print("up to date", flush=True)
             for run_id in selected:
@@ -1127,7 +1166,12 @@ def cmd_sync(args):
                     active.status = f"failed: {_short_error(exc)}"
                 if active.failed:
                     failures += 1
-                print(active.line(), flush=True)
+                    line = failure_log.line(active)
+                    if line is not None:
+                        print(line, flush=True)
+                else:
+                    print(active.line(), flush=True)
+                    failure_log.clear(active.run_id)
                 active = None
             if args.watch is None or args.dry_run or all(
                     item.complete or item.permanent or item.stale for item in results.values()):

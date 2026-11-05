@@ -205,19 +205,185 @@ Sync copies each run's store files byte for byte (`meta.json`, `events.jsonl`, s
 
 Not uploaded in 2.0: notes (`notes.md`), by-reference (`copy=False`) artifacts, and lineage code diffs. A run id already owned by another key on the server fails with an error naming that key. See [docs/PROTOCOL.md](docs/PROTOCOL.md) for protocol details.
 
-## Server
+## On-prem server
 
-Run a self-hosted sync server and shared dashboard:
+The server runs as a single process backed by a single data directory, serving the shared web dashboard and the sync API. It runs on your own machines; there is no vendor backend. See [docs/SERVER.md](docs/SERVER.md) for the full reference, and [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) and [SECURITY.md](SECURITY.md) for security.
 
+### Start the server
+
+Choose one:
+
+- **Laptop or workstation:**
+  ```bash
+  tailscale serve --bg 8080
+  export AGENTICML_SERVER_PUBLIC_URL=https://<machine>.<tailnet>.ts.net
+  docker compose -f deploy/compose.yaml up -d
+  ```
+  Or run the container directly with Docker:
+  ```bash
+  docker run -d --name agenticml-server \
+    -p 127.0.0.1:8080:8080 \
+    -v agenticml-data:/data \
+    -e AGENTICML_SERVER_PUBLIC_URL=https://<machine>.<tailnet>.ts.net \
+    --read-only \
+    --tmpfs /tmp \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    ghcr.io/agenticml/agenticml-server:2.0.0
+  ```
+- **AWS:** see [deploy/ecs/README.md](deploy/ecs/README.md).
+- **Without Docker (POSIX host):**
+  ```bash
+  pip install agenticml-lite
+  agenticml server serve --data DIR --host 127.0.0.1 --port 8080 --public-url https://...
+  ```
+
+### First admin key
+
+Read the setup link from the container logs (without Docker, the setup line is printed in the server's own terminal):
 ```bash
-docker run -d --name agenticml-server \
-  -p 127.0.0.1:8080:8080 \
-  -v agenticml-data:/data \
-  -e AGENTICML_SERVER_PUBLIC_URL=https://aml.example.com \
-  ghcr.io/agenticml/agenticml-server:2.0.0
+docker compose -f deploy/compose.yaml logs server
+# or: docker logs agenticml-server
+```
+Look for:
+```
+No admin key yet. Open <url>/setup?token=<token> to create one, or run: agenticml server keys create --name admin --scope admin
+```
+Open the `/setup?token=<token>` URL in a browser, name the key, and save it. It is shown once.
+
+Alternatives:
+```bash
+# Create via CLI in the running container
+docker exec agenticml-server agenticml server keys create --name admin --scope admin --data /data
 ```
 
-The multi-arch container image is published at `ghcr.io/agenticml/agenticml-server:2.0.0` (and `:latest` for stable releases). See [docs/SERVER.md](docs/SERVER.md) for full server setup, authentication, ECS deployment, and backup instructions.
+Or set an environment variable:
+- **With `docker run`:** add `-e AGENTICML_SERVER_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"`. Better, generate it into a variable first:
+  ```bash
+  KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+  ```
+  then pass `-e AGENTICML_SERVER_KEY="$KEY"` to `docker run`, and save `$KEY`. It is the admin key named `env`, and it can't be revoked from the Keys page.
+- **Without Docker:** export it before `agenticml server serve`:
+  ```bash
+  export AGENTICML_SERVER_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+  ```
+- **Compose:** `deploy/compose.yaml` does not pass it; use the setup URL or the `docker exec ... keys create` line instead.
+
+### Sign in
+
+Open the server's public URL in a browser and sign in with the admin key.
+
+### Issue a sync key per training machine
+
+On the **Keys** page, click **New key**, name it (e.g. `gpu-box-1`), and keep the default scope `sync`. Copy the shown `agenticml login` command.
+
+CLI alternative:
+```bash
+docker exec agenticml-server agenticml server keys create --name gpu-box-1 --data /data
+```
+The plaintext key is printed once.
+
+### Set up each training machine
+
+On each training machine (Python 3.10+):
+```bash
+pip install agenticml-lite
+agenticml login --host https://...
+```
+Paste the key at the prompt; do not pass `--key` on the command line (visible in `ps`).
+
+Verify authentication:
+```bash
+agenticml whoami
+```
+
+Sync runs once, or follow continuously:
+```bash
+agenticml sync --all       # sync all incomplete or changed runs once
+agenticml sync --follow    # keep syncing active and new runs
+```
+`--follow` picks up new runs, heartbeats running runs at least every 60 s, and backs off up to 5 min while the server is down. If the key is rejected, `sync` exits 3.
+
+For a user systemd unit, see [deploy/systemd/README.md](deploy/systemd/README.md).
+
+### Watch runs
+
+Watch runs in the shared dashboard at the public URL. Run statuses: `running`, `finished`, `crashed`, or `stale` (when no commit arrives for `AGENTICML_REMOTE_STALE_SECONDS`, default 600).
+
+Not uploaded in 2.0: notes, `copy=False` artifacts, lineage code diffs. Each run is owned by the key that created it.
+
+### Revoke a key
+
+From the dashboard: **Keys** page → **Revoke**.
+
+CLI alternative:
+```bash
+docker exec agenticml-server agenticml server keys revoke NAME --data /data
+```
+Revocation takes effect without a restart, and that machine's sync stops on its next request with exit 3. The last admin key cannot be revoked from the page; use the CLI.
+
+### Back up
+
+Stop the server cleanly before backing up the named volume:
+
+- **Docker run:**
+  ```bash
+  docker stop agenticml-server
+  docker run --rm -v agenticml-data:/data:ro -v "$PWD":/backup alpine tar czf /backup/agenticml-backup.tgz -C /data .
+  docker start agenticml-server
+  ```
+- **Compose:**
+  ```bash
+  docker compose -f deploy/compose.yaml stop server
+  docker run --rm -v deploy_data:/data:ro -v "$PWD":/backup alpine tar czf /backup/agenticml-backup.tgz -C /data .
+  docker compose -f deploy/compose.yaml start server
+  ```
+
+- **Restore:** stop the server, extract into the volume the same way (`tar xzf ... -C /data`), make it owned by `10001:10001` (`chown -R 10001:10001 /data` inside that alpine container), then start the server:
+  ```bash
+  docker stop agenticml-server
+  docker run --rm -v agenticml-data:/data -v "$PWD":/backup alpine sh -c 'tar xzf /backup/agenticml-backup.tgz -C /data && chown -R 10001:10001 /data'
+  docker start agenticml-server
+  ```
+- **Compose volume name:** the compose volume is named `<project>_data` (for example `deploy_data`), not `agenticml-data`. Run `docker volume ls` to find it.
+- **AWS ECS:** use EFS/AWS Backup (daily snapshots with 35-day retention; see [deploy/ecs/README.md](deploy/ecs/README.md)).
+
+### Upgrade
+
+Back up first.
+
+Only one server process may use a data directory at a time. Before starting the new container, stop the running container and remove it because the container name is still taken:
+
+- **Docker run:**
+  ```bash
+  docker pull ghcr.io/agenticml/agenticml-server:<new-version>
+  docker stop --time 30 agenticml-server
+  docker rm agenticml-server
+  docker run -d --name agenticml-server \
+    -p 127.0.0.1:8080:8080 \
+    -v agenticml-data:/data \
+    -e AGENTICML_SERVER_PUBLIC_URL=https://<machine>.<tailnet>.ts.net \
+    --read-only \
+    --tmpfs /tmp \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    ghcr.io/agenticml/agenticml-server:<new-version>
+  ```
+- **Compose:** change the image tag in `deploy/compose.yaml`, then:
+  ```bash
+  docker compose -f deploy/compose.yaml pull
+  docker compose -f deploy/compose.yaml up -d
+  ```
+
+### Verify the image (optional)
+
+Verify the container image signature with Cosign:
+```bash
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/agenticML/agenticml-lite/\.github/workflows/image\.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/agenticml/agenticml-server:2.0.0
+```
 
 ## Configuration
 

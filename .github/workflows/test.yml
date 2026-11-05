@@ -16,13 +16,12 @@ concurrency:
 jobs:
   unit:
     name: Unit tests (Python ${{ matrix.python }})
-    # Ubuntu 26.04 has no Python 3.9 build for setup-python; drop the pin with 3.9.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.9", "3.12"]
+        python: ["3.10", "3.12"]
     steps:
       - uses: actions/checkout@v7
 

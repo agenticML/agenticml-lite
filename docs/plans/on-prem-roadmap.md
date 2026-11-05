@@ -58,7 +58,7 @@ Update the status column in the PR that changes it. Values: `not started`,
 | 4 † | Server dashboard: key login, sessions, CSRF, last synced | 1, 2 | Cursor | M | [plan](packages/4-server-dashboard.md) | done ([#28](https://github.com/agenticML/agenticml-lite/pull/28)) |
 | 4b † | Key management in the dashboard: first-key setup, issue / list / revoke sync and admin keys | 1, 4 | Codex | M | [plan](packages/4b-key-management.md) | done ([#29](https://github.com/agenticML/agenticml-lite/pull/29)) |
 | 5 | `sync --follow` and systemd example | 3 | Cursor | M | [plan](packages/5-sync-follow.md) | done ([#31](https://github.com/agenticML/agenticml-lite/pull/31)) |
-| 6 | Image, deploy examples, docs, security policy, 2.0.0 release | 1, 3, 4, 4b, 5 | Codex, Cursor; prose Antigravity | M | [plan](packages/6-packaging-release.md) | in review |
+| 6 | Image, deploy examples, docs, security policy, 2.0.0 release | 1, 3, 4, 4b, 5 | Codex, Cursor; prose Antigravity | M | [plan](packages/6-packaging-release.md) | done ([#34](https://github.com/agenticML/agenticml-lite/pull/34)) |
 
 † security-sensitive: needs a second read-only review from the other coder.
 
@@ -151,34 +151,4 @@ Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
-- **Lineage tray "Compare N runs" link loses focus on re-render.**
-  Where: `src/agenticml/ui/static/app.js`, the lineage view's tray, which is
-  rebuilt by `render()`. Problem: the link has no `data-focus` key, so if it
-  has keyboard focus when a poll or a fetch re-renders the view, focus falls
-  to `<body>` until the next Tab. This is the same bug the backlog fixes
-  removed from the inspector links (Nov 5, 2026). Fix: give it a `data-focus`
-  key, and check the rest of the lineage view for focusable elements without
-  one. Done when a UI test focuses the link, triggers a re-render, and sees
-  focus still on it.
-- **Unit CI is pinned to Ubuntu 24.04 for Python 3.9.**
-  Where: `.github/workflows/test.yml`, `unit` job. Problem: `ubuntu-latest`
-  became Ubuntu 26.04, which has no Python 3.9 build for `setup-python`
-  (Nov 5, 2026), so the job runs on `ubuntu-24.04`. Fix: when 3.9 support
-  is dropped, remove 3.9 from the matrix and go back to `ubuntu-latest`.
-  Done when the unit job runs on `ubuntu-latest` again.
-- **Server image installs unpinned runtime dependencies.**
-  Where: `docker/Dockerfile`, runtime stage `pip install /wheels/*.whl`.
-  Problem: `requests>=2.31` and its dependencies resolve to whatever is
-  newest at build time, so two builds of the same tag can differ. Found in
-  the package 6 review (Nov 5, 2026). Fix: build a constraints file (or
-  wheels for every dependency, hash-pinned) in the build stage and install
-  only from it. Done when two builds of one commit list identical package
-  versions in their SBOMs.
-- **`sync --follow` repeats the same failure line every pass.**
-  Where: `src/agenticml/sync.py` `_follow` / `_emit_follow`. Problem: a
-  failure that is neither permanent nor a network error (an explicit run id
-  that does not exist, an `OSError` in the store) is retried every pass and
-  prints the same line every `--interval`, filling the journal. `--watch`
-  does the same. Fix: print a repeated identical failure once, then a
-  reminder at most every 10 minutes, and say when it clears. Done when a
-  test with a missing explicit run id shows one line over several passes.
+None open (Nov 5, 2026).

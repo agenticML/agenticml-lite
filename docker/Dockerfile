@@ -2,7 +2,10 @@
 FROM python:3.12-slim@sha256:e695ab189fa2d082b1c61c69a6b888a5adeca61ceeccad107b1ed2a125721a9e AS build
 WORKDIR /build
 COPY . .
-RUN pip wheel --no-deps --wheel-dir /wheels .
+# SOURCE_DATE_EPOCH makes the local wheel's zip timestamps (and thus the
+# wheel bytes) reproducible. pip freeze lists file:///wheels/... with no
+# hash, so freeze itself was never affected.
+RUN SOURCE_DATE_EPOCH=1 pip wheel --no-deps --wheel-dir /wheels .
 
 FROM python:3.12-slim@sha256:e695ab189fa2d082b1c61c69a6b888a5adeca61ceeccad107b1ed2a125721a9e AS runtime
 ARG VERSION=dev
@@ -15,7 +18,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 RUN --mount=type=bind,from=build,source=/wheels,target=/wheels \
-    pip install --no-cache-dir /wheels/*.whl
+    --mount=type=bind,source=docker/requirements.txt,target=/requirements.txt \
+    pip install --no-cache-dir --require-hashes -r /requirements.txt \
+    && pip install --no-cache-dir --no-deps /wheels/*.whl \
+    && pip check
 RUN groupadd --gid 10001 aml \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin aml \
     && mkdir /data && chown 10001:10001 /data

@@ -52,6 +52,7 @@ jobs:
           python -m venv testbed/.venv
           testbed/.venv/bin/python -m pip install --upgrade pip
           testbed/.venv/bin/python -m pip install -e .
+      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - name: Build smoke image
         uses: docker/build-push-action@v6
@@ -65,6 +66,14 @@ jobs:
         env:
           SMOKE_IMAGE: agenticml-server:smoke
         run: bash scripts/server_smoke.sh
+      - name: Build arm64 image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/arm64
+          push: false
+          load: false
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
