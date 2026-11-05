@@ -27,7 +27,7 @@ form.addEventListener("submit", async (event) => {
     return;
   }
   let message = "Sign in failed";
-  if (response.status === 401 || response.status === 403) {
+  if (response.status === 401 || response.status === 403 || response.status === 429) {
     try {
       const data = await response.json();
       if (typeof data.error === "string" && data.error) message = data.error;

@@ -6,15 +6,17 @@ import errno
 import logging
 import os
 from pathlib import Path
+import signal
 import socket
 import stat
 import threading
+import time
 from urllib.parse import urlsplit, urlunsplit
 import weakref
 
 from agenticml.store import layout
 from agenticml.ui.server import DashboardServer, _browser_host, _loopback_bind
-from .keys import KeyStore, validate_env_key
+from .keys import KeyStore, env_key_looks_weak, validate_env_key
 from .webauth import WebAuth
 
 logger = logging.getLogger("agenticml.server")
@@ -27,6 +29,10 @@ MISSING_HASH_LIMIT = 10000
 BODY_CONCURRENCY = 8
 BODY_DEADLINE = 30.0
 BODY_BYTES_PER_SECOND = 512 * 1024
+# Drain starts up to 0.5 s after SIGTERM (serve_forever poll) and must
+# finish, with cut-off and join, inside Docker's 10 s default stop timeout
+# (ECS: 30 s).
+SHUTDOWN_DRAIN = 8.0
 
 
 @dataclass
@@ -175,7 +181,30 @@ class IngestServer(DashboardServer):
                 self.run_locks[run_id] = lock
             return lock
 
-    def server_close(self):
+    def server_close(self, *, drain=0.0):
+        if drain > 0:
+            try:
+                self.socket.close()
+            except OSError:
+                pass
+            deadline = time.monotonic() + drain
+            while True:
+                with self.connection_lock:
+                    active = False
+                    for connection, state in self.connections.items():
+                        if state != "headers":
+                            active = True
+                            continue
+                        try:
+                            # Wake idle recv; leave the write side open so a
+                            # request already buffered in "headers" can reply.
+                            connection.shutdown(socket.SHUT_RD)
+                        except OSError:
+                            pass
+                remaining = deadline - time.monotonic()
+                if not active or remaining <= 0:
+                    break
+                time.sleep(min(0.05, remaining))
         with self.connection_lock:
             connections = list(self.connections)
         for connection in connections:
@@ -206,6 +235,10 @@ class IPv6IngestServer(IngestServer):
 def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None):
     """Prepare and lock the data directory; port=0 chooses a free port."""
     validate_env_key(env_key)
+    if env_key is not None and env_key_looks_weak(env_key):
+        logger.warning(
+            "AGENTICML_SERVER_KEY looks low-entropy; generate one with agenticml "
+            "server keys create or secrets.token_urlsafe(32)")
     public_url = _validate_public_url(public_url)
     data = resolve_data_dir(data)
     prepare_data_dir(data)
@@ -224,7 +257,18 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
 def serve(data=None, host="127.0.0.1", port=8080, public_url=None):
     """Run until interrupted, with an optional environment admin key."""
     server = make_server(data, host, port, public_url, os.environ.get("AGENTICML_SERVER_KEY"))
+    previous_handler = None
+    stopping = False
+
+    def terminate(signum, frame):
+        nonlocal stopping
+        if not stopping:
+            stopping = True
+            threading.Thread(target=server.shutdown, daemon=True).start()
+
     try:
+        if threading.current_thread() is threading.main_thread():
+            previous_handler = signal.signal(signal.SIGTERM, terminate)
         if not server.keys.list():
             logger.warning("no keys: every request except /healthz is rejected; "
                            "create a key with agenticml server keys create")
@@ -239,4 +283,8 @@ def serve(data=None, host="127.0.0.1", port=8080, public_url=None):
                 "set --public-url behind a proxy")
         server.serve_forever()
     finally:
-        server.server_close()
+        try:
+            server.server_close(drain=SHUTDOWN_DRAIN)
+        finally:
+            if previous_handler is not None:
+                signal.signal(signal.SIGTERM, previous_handler)

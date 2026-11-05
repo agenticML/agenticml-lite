@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -54,6 +55,16 @@ def validate_env_key(value):
     """Reject invalid environment keys without disclosing their value."""
     if value is not None and (not isinstance(value, str) or _ENV_KEY.fullmatch(value) is None):
         raise ValueError("AGENTICML_SERVER_KEY must be 32–256 allowed ASCII characters")
+
+
+def env_key_looks_weak(value):
+    """True when estimated entropy is below 128 bits. Never logs the value."""
+    if not value:
+        return True
+    alphabet = len(set(value))
+    if alphabet < 2:
+        return True
+    return len(value) * math.log2(alphabet) < 128
 
 
 @dataclass(frozen=True)

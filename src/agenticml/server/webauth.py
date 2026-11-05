@@ -1,11 +1,15 @@
 """Dashboard key login, in-memory sessions, and the request gate."""
 from __future__ import annotations
 
+from collections import OrderedDict
 from http.cookies import CookieError, SimpleCookie
 import hashlib
 import hmac
+import ipaddress
+import itertools
 import json
 import logging
+import math
 from pathlib import Path
 import secrets
 import socket
@@ -27,6 +31,147 @@ SESSION_IDLE = 12 * 3600
 SESSION_MAX_AGE = 7 * 86400
 SESSION_CAP = 1000
 LOGIN_BODY_MAX = 4 * 1024
+
+
+def _bucket(address):
+    """Collapse an address onto its throttle key.
+
+    IPv4-mapped IPv6 shares the inner IPv4 bucket. Other IPv6 is keyed by
+    /64 so rotating addresses in one network does not reset the delay.
+    """
+    try:
+        addr = ipaddress.ip_address(address.split("%")[0])
+    except ValueError:
+        return address
+    if addr.version == 6:
+        if addr.ipv4_mapped is not None:
+            return str(addr.ipv4_mapped)
+        return str(ipaddress.ip_network((addr, 64), strict=False))
+    return str(addr)
+
+
+class LoginThrottle:
+    """Failed-login delays keyed by client address. Responses never sleep.
+
+    Behind a reverse proxy every client has the proxy's address and shares
+    one bucket, so someone sending bad keys can delay the admin's sign-in
+    by up to 60 s at a time. The admin can still use the keys CLI. Package
+    13 (trusted identity proxy) is where to key the throttle by the
+    forwarded address, from configured proxy addresses only. Never trust
+    X-Forwarded-For here.
+
+    Spraying more than 1024 buckets (for example many /64s) can still
+    evict entries. That is an accepted stopgap until package 13.
+
+    About 6 truly simultaneous valid-key requests from one bucket can get
+    a short spurious 429 (clients retry 429). That is accepted.
+    """
+
+    FREE_FAILURES = 5
+    MAX_DELAY = 60.0
+    EXPIRE_AFTER = 15 * 60
+    MAX_ENTRIES = 1024
+
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._tickets = itertools.count()
+        # address -> (failures, last_failure, holds). holds maps each pending
+        # ticket to its own deadline. While every bucket holds a ticket, the
+        # table can exceed MAX_ENTRIES, bounded by in-flight connections.
+        self._entries = OrderedDict()
+
+    def _delay(self, n):
+        if n < self.FREE_FAILURES:
+            return 0
+        return min(2 ** (n - self.FREE_FAILURES), self.MAX_DELAY)
+
+    def _deadline(self, failures, last_failure, holds):
+        base = last_failure + self._delay(failures) if failures else 0
+        return max(base, *holds.values()) if holds else base
+
+    def begin(self, address):
+        """Reserve a slot. Returns (retry_after, ticket); ticket is None if refused."""
+        address = _bucket(address)
+        now = self._clock()
+        with self._lock:
+            entry = self._live(address, now)
+            if entry is None:
+                failures, last_failure, holds = 0, 0, {}
+                count = 0
+            else:
+                failures, last_failure, holds = entry
+                count = failures + len(holds)
+                deadline = self._deadline(failures, last_failure, holds)
+                if count >= self.FREE_FAILURES and now < deadline:
+                    return math.ceil(deadline - now), None
+            if entry is None and len(self._entries) >= self.MAX_ENTRIES:
+                self._evict()
+            ticket = (address, next(self._tickets))
+            # Hold this ticket's slot as if the attempt will fail, so concurrent
+            # callers see it taken before verify returns.
+            holds[ticket] = now + self._delay(count + 1)
+            self._entries[address] = (failures, last_failure, holds)
+            return 0, ticket
+
+    def finish(self, ticket, outcome):
+        if ticket is None:
+            return
+        now = self._clock()
+        with self._lock:
+            try:
+                address = ticket[0]
+            except (TypeError, IndexError):
+                return
+            entry = self._entries.get(address)
+            if entry is None:
+                return
+            failures, last_failure, holds = entry
+            if ticket not in holds:
+                return
+            del holds[ticket]
+            if outcome == "failed":
+                failures += 1
+                last_failure = now
+                self._entries.move_to_end(address)
+            elif outcome == "success":
+                failures = 0
+            if failures == 0 and not holds:
+                self._entries.pop(address, None)
+                return
+            self._entries[address] = (failures, last_failure, holds)
+
+    def _evict(self):
+        """Caller holds the lock. Drop the oldest last-failure with no holds.
+
+        While every bucket holds a ticket, the table can exceed MAX_ENTRIES,
+        bounded by in-flight connections.
+        """
+        victim = None
+        for address, entry in self._entries.items():
+            if not entry[2]:
+                victim = address
+                break
+        if victim is not None:
+            del self._entries[victim]
+
+    def _live(self, address, now):
+        """Caller holds the lock. Drop the entry if it is gone or stale.
+
+        A bucket with holds is never expired or evicted; dropping it would
+        leak the slot and lock the address out.
+        """
+        entry = self._entries.get(address)
+        if entry is None:
+            return None
+        if entry[2]:
+            return entry
+        if now - entry[1] >= self.EXPIRE_AFTER:
+            del self._entries[address]
+            return None
+        return entry
+
+
 _LOGIN_STATIC = Path(__file__).with_name("static")
 _ASSETS = {
     "/static/login.js": (_LOGIN_STATIC / "login.js", "text/javascript; charset=utf-8"),
@@ -40,10 +185,11 @@ _ASSETS = {
 class WebAuth:
     """Owns /login, /logout, /api/server/session, and the session cookie gate."""
 
-    def __init__(self, keys, public_url=None, clock=time.time):
+    def __init__(self, keys, public_url=None, clock=time.time, throttle_clock=time.monotonic):
         self.keys = keys
         self.public_url = public_url
         self.clock = clock
+        self.throttle = LoginThrottle(clock=throttle_clock)
         self._lock = threading.Lock()
         self._sessions = {}
         self.setup_token = None
@@ -312,49 +458,64 @@ class WebAuth:
             handler.close_connection = True
             handler._error({"error": "cross-site request refused"}, 403)
             return
-        length = handler._put_length(LOGIN_BODY_MAX)
-        if length is None:
-            return
-        if length == 0:
-            body = handler._read_put_body(length)
-        else:
-            if not handler.server._admit_body(handler.connection, 2):
-                handler.close_connection = True
-                handler._send(
-                    b"", "application/json", 503,
-                    handler._with_cookie_vary(self._headers()),
-                )
-                return
-            try:
-                body = handler._read_put_body(length)
-            finally:
-                handler.server._set_connection_state(handler.connection, "busy")
-        if len(body) != length:
+        address = handler.client_address[0]
+        retry_after, ticket = self.throttle.begin(address)
+        if ticket is None:
             handler.close_connection = True
-            raise ValueError("short body")
-        try:
-            payload = json.loads(body.decode("utf-8"), parse_constant=_reject_nonfinite)
-        except (UnicodeDecodeError, ValueError, RecursionError) as exc:
-            raise ValueError("invalid login body") from exc
-        if not isinstance(payload, dict) or not isinstance(payload.get("key"), str):
-            raise ValueError("invalid login body")
-        record = self.keys.verify(payload["key"])
-        if record is None:
-            logger.info("login failed")
-            handler._json({"error": "invalid key"}, 401, self._headers())
-            return
-        if record.scope != "admin":
-            logger.info("login failed")
             handler._json(
-                {"error": "this is a sync key; sign in with an admin key"}, 403, self._headers())
+                {"error": "too many failed logins; try again later"},
+                429, self._headers({"Retry-After": str(retry_after)}),
+            )
             return
-        token, entry = self._create_session(record)
-        self.keys.touch(record)
-        handler.session = entry
-        handler._json(
-            {"ok": True, "key": record.name},
-            headers=self._headers({"Set-Cookie": self._cookie(token)}),
-        )
+        outcome = "ignored"
+        try:
+            length = handler._put_length(LOGIN_BODY_MAX)
+            if length is None:
+                return
+            if length == 0:
+                body = handler._read_put_body(length)
+            else:
+                if not handler.server._admit_body(handler.connection, 2):
+                    handler.close_connection = True
+                    handler._send(
+                        b"", "application/json", 503,
+                        handler._with_cookie_vary(self._headers()),
+                    )
+                    return
+                try:
+                    body = handler._read_put_body(length)
+                finally:
+                    handler.server._set_connection_state(handler.connection, "busy")
+            if len(body) != length:
+                handler.close_connection = True
+                raise ValueError("short body")
+            try:
+                payload = json.loads(body.decode("utf-8"), parse_constant=_reject_nonfinite)
+            except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+                raise ValueError("invalid login body") from exc
+            if not isinstance(payload, dict) or not isinstance(payload.get("key"), str):
+                raise ValueError("invalid login body")
+            record = self.keys.verify(payload["key"])
+            if record is None:
+                logger.info("login failed")
+                outcome = "failed"
+                handler._json({"error": "invalid key"}, 401, self._headers())
+                return
+            if record.scope != "admin":
+                logger.info("login failed")
+                handler._json(
+                    {"error": "this is a sync key; sign in with an admin key"}, 403, self._headers())
+                return
+            outcome = "success"
+            token, entry = self._create_session(record)
+            self.keys.touch(record)
+            handler.session = entry
+            handler._json(
+                {"ok": True, "key": record.name},
+                headers=self._headers({"Set-Cookie": self._cookie(token)}),
+            )
+        finally:
+            self.throttle.finish(ticket, outcome)
 
     def _logout(self, handler):
         if not handler._csrf_ok():
