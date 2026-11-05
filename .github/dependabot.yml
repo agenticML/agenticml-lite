@@ -9,6 +9,12 @@ updates:
       interval: weekly
     target-branch: dev
     open-pull-requests-limit: 3
+  - package-ecosystem: pip
+    directory: /docker
+    schedule:
+      interval: weekly
+    target-branch: dev
+    open-pull-requests-limit: 3
   - package-ecosystem: github-actions
     directory: /
     schedule:

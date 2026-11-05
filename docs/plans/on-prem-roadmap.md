@@ -58,7 +58,7 @@ Update the status column in the PR that changes it. Values: `not started`,
 | 4 † | Server dashboard: key login, sessions, CSRF, last synced | 1, 2 | Cursor | M | [plan](packages/4-server-dashboard.md) | done ([#28](https://github.com/agenticML/agenticml-lite/pull/28)) |
 | 4b † | Key management in the dashboard: first-key setup, issue / list / revoke sync and admin keys | 1, 4 | Codex | M | [plan](packages/4b-key-management.md) | done ([#29](https://github.com/agenticML/agenticml-lite/pull/29)) |
 | 5 | `sync --follow` and systemd example | 3 | Cursor | M | [plan](packages/5-sync-follow.md) | done ([#31](https://github.com/agenticML/agenticml-lite/pull/31)) |
-| 6 | Image, deploy examples, docs, security policy, 2.0.0 release | 1, 3, 4, 4b, 5 | Codex, Cursor; prose Antigravity | M | [plan](packages/6-packaging-release.md) | in review |
+| 6 | Image, deploy examples, docs, security policy, 2.0.0 release | 1, 3, 4, 4b, 5 | Codex, Cursor; prose Antigravity | M | [plan](packages/6-packaging-release.md) | done ([#34](https://github.com/agenticML/agenticml-lite/pull/34)) |
 
 † security-sensitive: needs a second read-only review from the other coder.
 
@@ -151,11 +151,4 @@ Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
-- **Server image installs unpinned runtime dependencies.**
-  Where: `docker/Dockerfile`, runtime stage `pip install /wheels/*.whl`.
-  Problem: `requests>=2.31` and its dependencies resolve to whatever is
-  newest at build time, so two builds of the same tag can differ. Found in
-  the package 6 review (Nov 5, 2026). Fix: build a constraints file (or
-  wheels for every dependency, hash-pinned) in the build stage and install
-  only from it. Done when two builds of one commit list identical package
-  versions in their SBOMs.
+None open (Nov 5, 2026).

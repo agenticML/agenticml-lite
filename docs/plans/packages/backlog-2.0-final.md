@@ -10,7 +10,7 @@ roadmap; the supervisor removes each entry once its task is verified.
 | --- | --- | --- | --- | --- |
 | A | `sync --follow` repeats the same failure line | `sync.py`, `tests/test_sync_follow.py` | Cursor | – |
 | B | Lineage tray "Compare N runs" link loses focus | `ui/static/app.js`, `testbed/tests/test_task_groups.py` | Cursor or Codex | – |
-| C | Server image installs unpinned runtime dependencies | `docker/Dockerfile`, new `docker/constraints.txt`, `scripts/server_smoke.sh` (if needed), `.github/dependabot.yml` | Codex or Cursor | PR #34 merged |
+| C | Server image installs unpinned runtime dependencies | `docker/Dockerfile`, new `docker/requirements.txt`, `scripts/server_smoke.sh` (if needed), `.github/dependabot.yml` | Codex or Cursor | PR #34 merged |
 | D | Unit CI pinned to Ubuntu 24.04 for Python 3.9 | `.github/workflows/test.yml`, `pyproject.toml`, `README.md`, docs that say "3.9" | Codex or Cursor | Decision: drop Python 3.9 |
 
 Conventions: standard library only, no new runtime dependencies, match the
@@ -63,15 +63,15 @@ keyboard focus to `<body>`.
 
 ## C. Pinned runtime dependencies in the image
 
-1. Add `docker/constraints.txt` listing every runtime dependency of the
+1. Add `docker/requirements.txt` listing every runtime dependency of the
    wheel with exact versions and `--hash` entries (`requests` and its
    dependencies: `charset-normalizer`, `idna`, `urllib3`, `certifi`), for
    Python 3.12 on Linux. Generate it with `pip download` / `pip hash` in
    the pinned base image so the hashes match, and put the command that
    regenerates it in a comment at the top of the file.
 2. Dockerfile runtime stage: install with `pip install --no-cache-dir
-   --require-hashes -r docker/constraints.txt`, then the wheel with
-   `--no-deps`. The build stage copies `docker/constraints.txt` (check
+   --require-hashes -r docker/requirements.txt`, then the wheel with
+   `--no-deps`. The build stage copies `docker/requirements.txt` (check
    `.dockerignore` does not exclude it).
 3. Dependabot: add a `pip` entry for `/docker` so pinned versions get
    update PRs (Dependabot understands hashed requirements files).
@@ -90,6 +90,19 @@ keyboard focus to `<body>`.
    `docs/SDK.md`, AGENTS.md conventions if any). Leave code alone unless a
    3.10+ idiom is needed; no refactors.
 4. Check: `pytest -q tests` locally; CI runs on the PR.
+
+## E. On-prem guide in the README (user request, Nov 5, 2026)
+
+Not a backlog entry: the user asked for a document on how to use the on-prem
+version. Antigravity rewrites the README's short "Server" section into an
+end-to-end "On-prem server" walkthrough: start the server (compose or
+`docker run`, laptop with `tailscale serve`, or ECS), get the first admin key,
+sign in, issue a sync key, set up each training machine (`login`,
+`sync --follow`, systemd), view runs in the shared dashboard, revoke a key,
+back up and upgrade. Keep it task-ordered and short, with commands that match
+the code; link `docs/SERVER.md` for the full reference and
+`docs/THREAT_MODEL.md` / `SECURITY.md`. No code changes. The supervisor checks
+every command against the code.
 
 ## Done when
 
