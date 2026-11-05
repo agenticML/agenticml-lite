@@ -620,3 +620,204 @@ def test_follow_syncstopped_is_not_a_failure(remote, tmp_path, monkeypatch):
     assert command(remote, writer, "--follow", "--interval", "0.02") == 0
     assert "Interrupted:" in "".join(printed["out"])
     assert "agenticml sync:" not in "".join(printed["err"])
+
+
+def _count_emits(monkeypatch):
+    seen = []
+    real = sync._emit_follow
+
+    def wrapped(result, *args, **kwargs):
+        seen.append(result.run_id)
+        return real(result, *args, **kwargs)
+
+    monkeypatch.setattr(sync, "_emit_follow", wrapped)
+    return seen
+
+
+def _failure_clock(monkeypatch, start=0.0):
+    now = {"t": start}
+    real = sync._FailureLog
+    monkeypatch.setattr(sync, "_FailureLog", lambda: real(clock=lambda: now["t"]))
+    return now
+
+
+def _failure_lines(printed, run_id):
+    return [ln for ln in "".join(printed["out"]).splitlines()
+            if run_id in ln and "failed:" in ln]
+
+
+def test_follow_missing_run_prints_failure_once(remote, tmp_path, monkeypatch, follow_ctx):
+    writer = writer_at(tmp_path)
+    printed = capture_prints(monkeypatch)
+    emits = _count_emits(monkeypatch)
+    thread, box = spawn(lambda: command(
+        remote, writer, "missing-run", "--follow", "--interval", "0.02"))
+    try:
+        wait_until(lambda: emits.count("missing-run") >= 4, thread, box, follow_ctx,
+                   msg="follow did not retry the missing run")
+        lines = _failure_lines(printed, "missing-run")
+        assert len(lines) == 1
+        assert " (still failing)" not in lines[0]
+        assert thread.is_alive()
+    finally:
+        stop_follow(follow_ctx)
+        join_follow(thread, box, follow_ctx)
+
+
+def test_follow_missing_run_prints_reminder_after_interval(remote, tmp_path, monkeypatch, follow_ctx):
+    writer = writer_at(tmp_path)
+    printed = capture_prints(monkeypatch)
+    clock = _failure_clock(monkeypatch)
+    emits = _count_emits(monkeypatch)
+    thread, box = spawn(lambda: command(
+        remote, writer, "missing-run", "--follow", "--interval", "0.02"))
+    try:
+        wait_until(lambda: emits.count("missing-run") >= 2, thread, box, follow_ctx,
+                   msg="follow did not print the missing run")
+        first = _failure_lines(printed, "missing-run")
+        assert len(first) == 1
+        assert " (still failing)" not in first[0]
+        clock["t"] = sync.FAILURE_REMINDER
+        before = len(emits)
+        wait_until(lambda: any("(still failing)" in ln for ln in _failure_lines(printed, "missing-run")),
+                   thread, box, follow_ctx, msg="follow did not print a failure reminder")
+        wait_until(lambda: len(emits) >= before + 3, thread, box, follow_ctx,
+                   msg="follow did not keep retrying after the reminder")
+        lines = _failure_lines(printed, "missing-run")
+        assert len(lines) == 2
+        assert " (still failing)" not in lines[0]
+        assert lines[1].endswith(" (still failing)")
+        assert lines[1] == lines[0] + " (still failing)"
+    finally:
+        stop_follow(follow_ctx)
+        join_follow(thread, box, follow_ctx)
+
+
+def test_follow_failure_then_success_prints_once_each(remote, tmp_path, monkeypatch, follow_ctx):
+    writer = writer_at(tmp_path)
+    printed = capture_prints(monkeypatch)
+    calls = []
+    original = sync.sync_run
+
+    def fail_once(reader, *args, **kwargs):
+        if not calls:
+            calls.append(1)
+            raise OSError("disk")
+        return original(reader, *args, **kwargs)
+
+    monkeypatch.setattr(sync, "sync_run", fail_once)
+    thread, box = spawn(lambda: command(
+        remote, writer, writer.run_id, "--follow", "--interval", "0.02"))
+    code = join_follow(thread, box, follow_ctx, timeout=5)
+    assert code == 0
+    run_lines = [ln for ln in "".join(printed["out"]).splitlines() if writer.run_id in ln]
+    fail_lines = [ln for ln in run_lines if "failed:" in ln]
+    success_lines = [ln for ln in run_lines if "failed:" not in ln]
+    assert len(fail_lines) == 1
+    assert " (still failing)" not in fail_lines[0]
+    assert "OSError" in fail_lines[0]
+    assert len(success_lines) == 1
+
+
+def test_watch_repeated_failure_prints_once(remote, tmp_path, monkeypatch):
+    writer = writer_at(tmp_path)
+    printed = capture_prints(monkeypatch)
+    sleeps = []
+
+    def after_several(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) >= 3:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(sync.time, "sleep", after_several)
+    assert command(remote, writer, "missing-run", "--watch", ".01") == 130
+    lines = _failure_lines(printed, "missing-run")
+    assert len(lines) == 1
+    assert " (still failing)" not in lines[0]
+    assert len(sleeps) == 3
+
+
+def test_follow_fail_succeed_fail_prints_again(remote, tmp_path, monkeypatch, follow_ctx):
+    writer = writer_at(tmp_path, status=None)
+    printed = capture_prints(monkeypatch)
+    calls = []
+    original = sync.sync_run
+
+    def fail_succeed_fail(reader, *args, **kwargs):
+        n = len(calls)
+        calls.append(1)
+        if n % 2 == 0:
+            raise OSError("disk")
+        return original(reader, *args, **kwargs)
+
+    monkeypatch.setattr(sync, "sync_run", fail_succeed_fail)
+    thread, box = spawn(lambda: command(
+        remote, writer, writer.run_id, "--follow", "--interval", "0.02"))
+    try:
+        wait_until(lambda: len(_failure_lines(printed, writer.run_id)) >= 2,
+                   thread, box, follow_ctx, msg="second failure after success was not printed")
+        fail_lines = _failure_lines(printed, writer.run_id)
+        success_lines = [ln for ln in "".join(printed["out"]).splitlines()
+                         if writer.run_id in ln and "failed:" not in ln]
+        assert " (still failing)" not in fail_lines[0]
+        assert " (still failing)" not in fail_lines[1]
+        assert "OSError" in fail_lines[0]
+        assert "OSError" in fail_lines[1]
+        assert len(success_lines) >= 1
+    finally:
+        stop_follow(follow_ctx)
+        join_follow(thread, box, follow_ctx)
+        writer.close()
+
+
+def test_follow_failure_same_status_different_counts_prints_once(
+        remote, tmp_path, monkeypatch, follow_ctx):
+    writer = writer_at(tmp_path)
+    printed = capture_prints(monkeypatch)
+    emits = _count_emits(monkeypatch)
+    n = {"i": 0}
+
+    def fail_with_progress(reader, host, client, result, **kwargs):
+        n["i"] += 1
+        result.files = n["i"]
+        result.objects = n["i"]
+        result.bytes = n["i"] * 10
+        raise OSError("disk")
+
+    monkeypatch.setattr(sync, "sync_run", fail_with_progress)
+    thread, box = spawn(lambda: command(
+        remote, writer, writer.run_id, "--follow", "--interval", "0.02"))
+    try:
+        wait_until(lambda: emits.count(writer.run_id) >= 4, thread, box, follow_ctx,
+                   msg="follow did not retry the progressing failure")
+        lines = _failure_lines(printed, writer.run_id)
+        assert len(lines) == 1
+        assert " (still failing)" not in lines[0]
+        assert "files=1 objects=1 bytes=10" in lines[0]
+        assert "files=2" not in "".join(printed["out"])
+    finally:
+        stop_follow(follow_ctx)
+        join_follow(thread, box, follow_ctx)
+
+
+def test_watch_failure_prints_reminder_after_interval(remote, tmp_path, monkeypatch):
+    writer = writer_at(tmp_path)
+    printed = capture_prints(monkeypatch)
+    clock = _failure_clock(monkeypatch)
+    sleeps = []
+
+    def sleep_and_advance(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 1:
+            clock["t"] = sync.FAILURE_REMINDER
+        elif len(sleeps) >= 3:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(sync.time, "sleep", sleep_and_advance)
+    assert command(remote, writer, "missing-run", "--watch", ".01") == 130
+    lines = _failure_lines(printed, "missing-run")
+    assert len(lines) == 2
+    assert " (still failing)" not in lines[0]
+    assert lines[1].endswith(" (still failing)")
+    assert lines[1] == lines[0] + " (still failing)"
+    assert len(sleeps) == 3

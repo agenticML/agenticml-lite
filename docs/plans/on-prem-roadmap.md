@@ -150,27 +150,3 @@ largest open design question for teams.
 Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
-
-- **Lineage tray "Compare N runs" link loses focus on re-render.**
-  Where: `src/agenticml/ui/static/app.js`, the lineage view's tray, which is
-  rebuilt by `render()`. Problem: the link has no `data-focus` key, so if it
-  has keyboard focus when a poll or a fetch re-renders the view, focus falls
-  to `<body>` until the next Tab. This is the same bug the backlog fixes
-  removed from the inspector links (Nov 5, 2026). Fix: give it a `data-focus`
-  key, and check the rest of the lineage view for focusable elements without
-  one. Done when a UI test focuses the link, triggers a re-render, and sees
-  focus still on it.
-- **Unit CI is pinned to Ubuntu 24.04 for Python 3.9.**
-  Where: `.github/workflows/test.yml`, `unit` job. Problem: `ubuntu-latest`
-  became Ubuntu 26.04, which has no Python 3.9 build for `setup-python`
-  (Nov 5, 2026), so the job runs on `ubuntu-24.04`. Fix: when 3.9 support
-  is dropped, remove 3.9 from the matrix and go back to `ubuntu-latest`.
-  Done when the unit job runs on `ubuntu-latest` again.
-- **`sync --follow` repeats the same failure line every pass.**
-  Where: `src/agenticml/sync.py` `_follow` / `_emit_follow`. Problem: a
-  failure that is neither permanent nor a network error (an explicit run id
-  that does not exist, an `OSError` in the store) is retried every pass and
-  prints the same line every `--interval`, filling the journal. `--watch`
-  does the same. Fix: print a repeated identical failure once, then a
-  reminder at most every 10 minutes, and say when it clears. Done when a
-  test with a missing explicit run id shows one line over several passes.

@@ -1377,6 +1377,7 @@ async function home(version) {
                 class: "btn btn-primary btn-sm",
                 href: `#/compare?${query}`,
                 text: `Compare ${ticked.length} runs`,
+                "data-focus": "lv-compare-tray",
               })
             : null,
         ),
