@@ -30,8 +30,8 @@ BODY_CONCURRENCY = 8
 BODY_DEADLINE = 30.0
 BODY_BYTES_PER_SECOND = 512 * 1024
 # Drain starts up to 0.5 s after SIGTERM (serve_forever poll) and must
-# finish, with cut-off and join, inside Docker's 10 s default stop timeout
-# (ECS: 30 s).
+# finish, with cut-off and join, inside a typical service manager stop timeout
+# (for example, systemd TimeoutStopSec=30).
 SHUTDOWN_DRAIN = 8.0
 
 

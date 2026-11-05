@@ -5,7 +5,7 @@ sidebar:
   order: 5
 ---
 
-The server stores all state in a single directory specified by `--data` (default `/data` in the container).
+The server stores all state in a single directory specified by `--data` (falls back to `AGENTICML_SERVER_DATA`, then `~/.agenticml-server`).
 
 ## Data directory structure
 
@@ -31,43 +31,40 @@ Because `server/tmp/` and `store/` must perform atomic file renames during inges
 
 ## Backup methods
 
-### Local or Docker deployment
-
 To make a consistent offline backup:
 
-1. Stop the server container to release `server.lock` and flush all writes:
+1. Stop the server service cleanly to release `server.lock` and flush all writes:
    ```bash
-   docker stop --time 30 agenticml-server
+   sudo systemctl stop agenticml-server
    ```
 2. Archive the data directory:
    ```bash
-   tar -czf agenticml-backup-$(date +%Y%m%d).tar.gz -C /path/to/data .
+   sudo tar czf agenticml-backup.tgz -C /var/lib/agenticml-server .
    ```
-3. Restart the server:
+3. Restart the server service:
    ```bash
-   docker start agenticml-server
+   sudo systemctl start agenticml-server
    ```
-
-### AWS ECS with EFS
-
-When deployed on AWS ECS using EFS, configure automated backups using AWS Backup. The provided Terraform example sets up daily snapshots of the EFS volume with a 35-day retention period.
 
 ## Restoring a backup
 
 To restore from a backup:
 
-1. Stop the server process or scale down the ECS service to 0 tasks:
+1. Stop the server service:
    ```bash
-   docker stop agenticml-server
+   sudo systemctl stop agenticml-server
    ```
-2. Replace or extract the backup files into `<data>`.
-3. If using host bind mounts, ensure UID and GID 10001 own the restored files:
+2. Extract the backup files into the data directory:
    ```bash
-   sudo chown -R 10001:10001 /path/to/data
+   sudo tar xzf agenticml-backup.tgz -C /var/lib/agenticml-server
    ```
-4. Start the server container:
+3. Ensure the service user owns the restored files:
    ```bash
-   docker start agenticml-server
+   sudo chown -R agenticml:agenticml /var/lib/agenticml-server
+   ```
+4. Start the server service:
+   ```bash
+   sudo systemctl start agenticml-server
    ```
 
 ## Next

@@ -211,39 +211,39 @@ The server runs as a single process backed by a single data directory, serving t
 
 ### Start the server
 
-Choose one:
+Install `agenticml-lite` into a virtual environment on a POSIX host (Python 3.10+):
 
-- **Laptop or workstation:**
-  ```bash
-  tailscale serve --bg 8080
-  export AGENTICML_SERVER_PUBLIC_URL=https://<machine>.<tailnet>.ts.net
-  docker compose -f deploy/compose.yaml up -d
-  ```
-  Or run the container directly with Docker:
-  ```bash
-  docker run -d --name agenticml-server \
-    -p 127.0.0.1:8080:8080 \
-    -v agenticml-data:/data \
-    -e AGENTICML_SERVER_PUBLIC_URL=https://<machine>.<tailnet>.ts.net \
-    --read-only \
-    --tmpfs /tmp \
-    --cap-drop ALL \
-    --security-opt no-new-privileges:true \
-    ghcr.io/agenticml/agenticml-server:2.0.0
-  ```
-- **AWS:** see [deploy/ecs/README.md](deploy/ecs/README.md).
-- **Without Docker (POSIX host):**
-  ```bash
-  pip install agenticml-lite
-  agenticml server serve --data DIR --host 127.0.0.1 --port 8080 --public-url https://...
-  ```
+```bash
+sudo python3 -m venv /opt/agenticml
+sudo /opt/agenticml/bin/python -m pip install agenticml-lite
+```
+
+Run directly (a venv anywhere the user owns is fine, e.g. `python3 -m venv ~/agenticml-venv`):
+```bash
+/opt/agenticml/bin/agenticml server serve --data DIR --host 127.0.0.1 --port 8080 --public-url https://...
+```
+`--data` falls back to `AGENTICML_SERVER_DATA`, then `~/.agenticml-server`. `--public-url` falls back to `AGENTICML_SERVER_PUBLIC_URL`.
+
+Or run as a systemd service: see [deploy/systemd/README.md](deploy/systemd/README.md) and [deploy/systemd/agenticml-server.service](deploy/systemd/agenticml-server.service).
+```bash
+sudo useradd --system --home /var/lib/agenticml-server --shell /usr/sbin/nologin agenticml
+sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.0.0/deploy/systemd/agenticml-server.service
+```
+Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`). Edit `AGENTICML_SERVER_PUBLIC_URL` in the unit (or `sudo systemctl edit agenticml-server`), then `daemon-reload` and `enable --now`:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now agenticml-server
+```
+
+Put a TLS reverse proxy in front:
+- **Laptop or workstation:** `tailscale serve --bg 8080` and set `AGENTICML_SERVER_PUBLIC_URL=https://<machine>.<tailnet>.ts.net` (or pass `--public-url`).
+- **Production:** Caddy or a load balancer. Set the public URL to the proxied HTTPS URL.
 
 ### First admin key
 
-Read the setup link from the container logs (without Docker, the setup line is printed in the server's own terminal):
+When starting with an empty data directory, read the setup link from the server's terminal output, or from the journal under systemd:
 ```bash
-docker compose -f deploy/compose.yaml logs server
-# or: docker logs agenticml-server
+sudo journalctl -u agenticml-server
 ```
 Look for:
 ```
@@ -251,23 +251,19 @@ No admin key yet. Open <url>/setup?token=<token> to create one, or run: agenticm
 ```
 Open the `/setup?token=<token>` URL in a browser, name the key, and save it. It is shown once.
 
-Alternatives:
+CLI alternative (runs on the server host while the server is up):
 ```bash
-# Create via CLI in the running container
-docker exec agenticml-server agenticml server keys create --name admin --scope admin --data /data
+agenticml server keys create --name admin --scope admin --data DIR
+# or under systemd:
+sudo -u agenticml /opt/agenticml/bin/agenticml server keys create --name admin --scope admin --data /var/lib/agenticml-server
 ```
 
-Or set an environment variable:
-- **With `docker run`:** add `-e AGENTICML_SERVER_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"`. Better, generate it into a variable first:
-  ```bash
-  KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
-  ```
-  then pass `-e AGENTICML_SERVER_KEY="$KEY"` to `docker run`, and save `$KEY`. It is the admin key named `env`, and it can't be revoked from the Keys page.
-- **Without Docker:** export it before `agenticml server serve`:
-  ```bash
-  export AGENTICML_SERVER_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
-  ```
-- **Compose:** `deploy/compose.yaml` does not pass it; use the setup URL or the `docker exec ... keys create` line instead.
+Or set an environment variable by exporting `AGENTICML_SERVER_KEY` before `agenticml server serve`:
+```bash
+export AGENTICML_SERVER_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+```
+Under systemd, set it in `/etc/agenticml-server.env` (root-owned, mode 0600).
+It is the admin key named `env`, and it can't be revoked from the Keys page.
 
 ### Sign in
 
@@ -279,7 +275,9 @@ On the **Keys** page, click **New key**, name it (e.g. `gpu-box-1`), and keep th
 
 CLI alternative:
 ```bash
-docker exec agenticml-server agenticml server keys create --name gpu-box-1 --data /data
+agenticml server keys create --name gpu-box-1 --data DIR
+# or under systemd:
+sudo -u agenticml /opt/agenticml/bin/agenticml server keys create --name gpu-box-1 --data /var/lib/agenticml-server
 ```
 The plaintext key is printed once.
 
@@ -318,71 +316,37 @@ From the dashboard: **Keys** page → **Revoke**.
 
 CLI alternative:
 ```bash
-docker exec agenticml-server agenticml server keys revoke NAME --data /data
+agenticml server keys revoke NAME --data DIR
+# or under systemd:
+sudo -u agenticml /opt/agenticml/bin/agenticml server keys revoke NAME --data /var/lib/agenticml-server
 ```
 Revocation takes effect without a restart, and that machine's sync stops on its next request with exit 3. The last admin key cannot be revoked from the page; use the CLI.
 
 ### Back up
 
-Stop the server cleanly before backing up the named volume:
+Stop the service cleanly before copying the data directory:
+```bash
+sudo systemctl stop agenticml-server
+sudo tar czf agenticml-backup.tgz -C /var/lib/agenticml-server .
+sudo systemctl start agenticml-server
+```
 
-- **Docker run:**
-  ```bash
-  docker stop agenticml-server
-  docker run --rm -v agenticml-data:/data:ro -v "$PWD":/backup alpine tar czf /backup/agenticml-backup.tgz -C /data .
-  docker start agenticml-server
-  ```
-- **Compose:**
-  ```bash
-  docker compose -f deploy/compose.yaml stop server
-  docker run --rm -v deploy_data:/data:ro -v "$PWD":/backup alpine tar czf /backup/agenticml-backup.tgz -C /data .
-  docker compose -f deploy/compose.yaml start server
-  ```
-
-- **Restore:** stop the server, extract into the volume the same way (`tar xzf ... -C /data`), make it owned by `10001:10001` (`chown -R 10001:10001 /data` inside that alpine container), then start the server:
-  ```bash
-  docker stop agenticml-server
-  docker run --rm -v agenticml-data:/data -v "$PWD":/backup alpine sh -c 'tar xzf /backup/agenticml-backup.tgz -C /data && chown -R 10001:10001 /data'
-  docker start agenticml-server
-  ```
-- **Compose volume name:** the compose volume is named `<project>_data` (for example `deploy_data`), not `agenticml-data`. Run `docker volume ls` to find it.
-- **AWS ECS:** use EFS/AWS Backup (daily snapshots with 35-day retention; see [deploy/ecs/README.md](deploy/ecs/README.md)).
+Restore: stop the service, extract the backup into the data directory, set ownership, and start the service:
+```bash
+sudo systemctl stop agenticml-server
+sudo tar xzf agenticml-backup.tgz -C /var/lib/agenticml-server
+sudo chown -R agenticml:agenticml /var/lib/agenticml-server
+sudo systemctl start agenticml-server
+```
 
 ### Upgrade
 
 Back up first.
 
-Only one server process may use a data directory at a time. Before starting the new container, stop the running container and remove it because the container name is still taken:
-
-- **Docker run:**
-  ```bash
-  docker pull ghcr.io/agenticml/agenticml-server:<new-version>
-  docker stop --time 30 agenticml-server
-  docker rm agenticml-server
-  docker run -d --name agenticml-server \
-    -p 127.0.0.1:8080:8080 \
-    -v agenticml-data:/data \
-    -e AGENTICML_SERVER_PUBLIC_URL=https://<machine>.<tailnet>.ts.net \
-    --read-only \
-    --tmpfs /tmp \
-    --cap-drop ALL \
-    --security-opt no-new-privileges:true \
-    ghcr.io/agenticml/agenticml-server:<new-version>
-  ```
-- **Compose:** change the image tag in `deploy/compose.yaml`, then:
-  ```bash
-  docker compose -f deploy/compose.yaml pull
-  docker compose -f deploy/compose.yaml up -d
-  ```
-
-### Verify the image (optional)
-
-Verify the container image signature with Cosign:
+One server per data directory; downgrades aren't supported. Upgrade the package in the venv and restart the service:
 ```bash
-cosign verify \
-  --certificate-identity-regexp '^https://github\.com/agenticML/agenticml-lite/\.github/workflows/image\.yml@refs/tags/v' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/agenticml/agenticml-server:2.0.0
+sudo /opt/agenticml/bin/pip install -U agenticml-lite
+sudo systemctl restart agenticml-server
 ```
 
 ## Configuration
@@ -454,8 +418,6 @@ Bump the version in `pyproject.toml` and `src/agenticml/__init__.py`, then push 
 
 - **TestPyPI dry run:** run the "Publish to TestPyPI" workflow by hand from the Actions tab. Re-running with a version that is already there is a no-op.
 - **PyPI:** `publish.yml` publishes to PyPI with Trusted Publishing (no API tokens) when the tag matches the package version.
-- **Server image:** `image.yml` runs smoke tests, then builds, pushes, signs with Cosign, and verifies the multi-arch image (`linux/amd64`, `linux/arm64`) at `ghcr.io/agenticml/agenticml-server:<version>`. The `:latest` tag moves only for stable `X.Y.Z` tags.
-- **GHCR package visibility:** after the first image push, set the GHCR package `agenticml-server` to public and link it to the repository, since new GHCR packages start private.
 
 ```bash
 # bump version in pyproject.toml and src/agenticml/__init__.py

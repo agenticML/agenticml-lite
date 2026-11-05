@@ -31,7 +31,7 @@ The following threats are within the design and threat model of the system:
 
 The following threats are explicitly out of scope:
 
-- **Compromised server host**: If an attacker achieves code execution or root access on the host or container running the server, they can access server memory, disk storage, and plaintext environment variables.
+- **Compromised server host**: If an attacker achieves code execution or root access on the host running the server, they can access server memory, disk storage, and plaintext environment variables.
 - **Malicious key holder's own data**: An authenticated key holder has full authority to upload, append, or corrupt runs owned by that same key, within the constraints of protocol v2.
 
 ## Controls by module
