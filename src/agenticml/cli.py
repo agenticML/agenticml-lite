@@ -488,8 +488,11 @@ def cmd_ui(args):
 def cmd_server_serve(args):
     from .server import serve
 
+    public_url = args.public_url
+    if public_url is None:
+        public_url = os.environ.get("AGENTICML_SERVER_PUBLIC_URL") or None
     try:
-        serve(args.data, args.host, args.port, args.public_url)
+        serve(args.data, args.host, args.port, public_url)
     except KeyboardInterrupt:
         pass
     except (OSError, ValueError, OverflowError) as exc:
@@ -1088,10 +1091,10 @@ def main(argv=None):
     p_server = sub.add_parser("server", help="Serve and administer an on-prem store")
     server_sub = p_server.add_subparsers(dest="server_action", required=True)
     p_serve = server_sub.add_parser("serve", help="Serve protocol v2 ingest")
-    p_serve.add_argument("--data", default=None)
+    p_serve.add_argument("--data", default=None, help="Data directory (default: AGENTICML_SERVER_DATA or ~/.agenticml-server)")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8080)
-    p_serve.add_argument("--public-url", default=None)
+    p_serve.add_argument("--public-url", default=None, help="Public server URL (default: AGENTICML_SERVER_PUBLIC_URL)")
     p_serve.set_defaults(func=cmd_server_serve)
     p_keys = server_sub.add_parser("keys", help="Create, list, or revoke API keys")
     keys_sub = p_keys.add_subparsers(dest="keys_action", required=True)

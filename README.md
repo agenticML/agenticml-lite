@@ -205,6 +205,20 @@ Sync copies each run's store files byte for byte (`meta.json`, `events.jsonl`, s
 
 Not uploaded in 2.0: notes (`notes.md`), by-reference (`copy=False`) artifacts, and lineage code diffs. A run id already owned by another key on the server fails with an error naming that key. See [docs/PROTOCOL.md](docs/PROTOCOL.md) for protocol details.
 
+## Server
+
+Run a self-hosted sync server and shared dashboard:
+
+```bash
+docker run -d --name agenticml-server \
+  -p 127.0.0.1:8080:8080 \
+  -v agenticml-data:/data \
+  -e AGENTICML_SERVER_PUBLIC_URL=https://aml.example.com \
+  ghcr.io/agenticml/agenticml-server:2.0.0
+```
+
+The multi-arch container image is published at `ghcr.io/agenticml/agenticml-server:2.0.0` (and `:latest` for stable releases). See [docs/SERVER.md](docs/SERVER.md) for full server setup, authentication, ECS deployment, and backup instructions.
+
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -270,16 +284,18 @@ python scripts/bench.py --quick
 
 ## Releasing
 
-GitHub Actions publishes to PyPI with Trusted Publishing (no API tokens).
+Bump the version in `pyproject.toml` and `src/agenticml/__init__.py`, then push a `v*` tag.
 
 - **TestPyPI dry run:** run the "Publish to TestPyPI" workflow by hand from the Actions tab. Re-running with a version that is already there is a no-op.
-- **PyPI:** push a `v*` tag. The workflow fails if the tag does not match the version in `pyproject.toml` and `src/agenticml/__init__.py`.
+- **PyPI:** `publish.yml` publishes to PyPI with Trusted Publishing (no API tokens) when the tag matches the package version.
+- **Server image:** `image.yml` runs smoke tests, then builds, pushes, signs with Cosign, and verifies the multi-arch image (`linux/amd64`, `linux/arm64`) at `ghcr.io/agenticml/agenticml-server:<version>`. The `:latest` tag moves only for stable `X.Y.Z` tags.
+- **GHCR package visibility:** after the first image push, set the GHCR package `agenticml-server` to public and link it to the repository, since new GHCR packages start private.
 
 ```bash
 # bump version in pyproject.toml and src/agenticml/__init__.py
-git commit -am "release: v0.1.0"
-git tag v0.1.0
-git push origin v0.1.0
+git commit -am "release: v2.0.0"
+git tag v2.0.0
+git push origin v2.0.0
 ```
 
 ## License
