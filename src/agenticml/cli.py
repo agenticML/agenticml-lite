@@ -496,7 +496,7 @@ def cmd_server_serve(args):
     except KeyboardInterrupt:
         pass
     except (OSError, ValueError, OverflowError) as exc:
-        print(f"agenticml server: {str(exc).splitlines()[0]}", file=sys.stderr)
+        print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
         return 1
     print("stopped")
     return 0
@@ -538,9 +538,35 @@ def cmd_server_keys(args):
         print("stopped")
         return 0
     except (OSError, ValueError, OverflowError, KeyStoreUnavailable) as exc:
-        print(f"agenticml server: {str(exc).splitlines()[0]}", file=sys.stderr)
+        print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
         return 1
     return 0
+
+
+def _cmd_server_report(args, verify=False):
+    from .server import admin
+
+    try:
+        report = admin.verify(args.data, progress=not args.json) if verify else admin.status(args.data)
+        if args.json:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            print(admin.format_verify(report) if verify else admin.format_status(report))
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+    except (OSError, ValueError, OverflowError) as exc:
+        print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
+        return 2
+    return int(not report["ok"]) if verify else 0
+
+
+def cmd_server_status(args):
+    return _cmd_server_report(args)
+
+
+def cmd_server_verify(args):
+    return _cmd_server_report(args, verify=True)
 
 
 def cmd_du(args):
@@ -1096,6 +1122,13 @@ def main(argv=None):
     p_serve.add_argument("--port", type=int, default=8080)
     p_serve.add_argument("--public-url", default=None, help="Public server URL (default: AGENTICML_SERVER_PUBLIC_URL)")
     p_serve.set_defaults(func=cmd_server_serve)
+    for action, func, help_text in (
+            ("status", cmd_server_status, "Show runs, sizes, and key activity"),
+            ("verify", cmd_server_verify, "Check objects, run sizes, and lineage")):
+        child = server_sub.add_parser(action, help=help_text)
+        child.add_argument("--data", default=None)
+        child.add_argument("--json", action="store_true")
+        child.set_defaults(func=func)
     p_keys = server_sub.add_parser("keys", help="Create, list, or revoke API keys")
     keys_sub = p_keys.add_subparsers(dest="keys_action", required=True)
     for action in ("create", "list", "revoke"):

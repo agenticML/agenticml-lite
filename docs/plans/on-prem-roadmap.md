@@ -75,7 +75,7 @@ Update the status column in the PR that changes it. Values: `not started`,
 | 7 † | Lineage replication | 2.0 | Codex | M | [plan](packages/7-lineage-replication.md) | done (2.1 PR) |
 | 8 | By-reference artifacts | 2.0 | Cursor | S–M | [plan](packages/8-byref-artifacts.md) | done (2.1 PR) |
 | 9 | EFS benchmark and tuning | 2.0 | Cursor | S | [plan](packages/9-efs-benchmark.md) | done (2.1 PR; real-EFS run in Backlog) |
-| 10 | Server operator commands | 2.0 | Codex | S | [plan](packages/10-server-operator-commands.md) | plan ready |
+| 10 | Server operator commands | 2.0 | Codex | S | [plan](packages/10-server-operator-commands.md) | done (2.1 PR) |
 | 10b † | Server setup command (`server up`) | 2.0 | Cursor | M | [plan](packages/10b-server-up.md) | plan ready |
 
 - **7 † Lineage replication.** The client pushes a `git bundle` of each run's
@@ -202,13 +202,3 @@ priority.
     under `LC_ALL=C`) and answer 503 for the latter.
   - Done when: a test that makes `index-pack` fail with a simulated ENOSPC
     gets 503 and the client retries without remembering a skip.
-- **A stale `refs/runs/<id>.lock` blocks a run's lineage forever**
-  (found in package 7 review, Nov 6, 2026).
-  - Where: `src/agenticml/server/lineage.py` `receive()`.
-  - Problem: a server killed during `update-ref` can leave the ref lock
-    file; every later receive for that run then gets 503 `lineage busy`.
-  - Fix: under the repo flock (which already serializes writers), remove a
-    `refs/runs/<id>.lock` older than the receive timeout before
-    `update-ref`, or have `agenticml server verify` (package 10) report it.
-  - Done when: a test with a leftover lock file receives successfully, or
-    `server verify` reports it with the fix command.

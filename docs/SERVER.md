@@ -327,6 +327,36 @@ sudo chown -R agenticml:agenticml /var/lib/agenticml-server
 sudo systemctl start agenticml-server
 ```
 
+## Operator commands
+
+Inspect the data directory on the server host:
+
+```bash
+agenticml server status --data /var/lib/agenticml-server
+agenticml server verify --data /var/lib/agenticml-server
+```
+
+Both commands are read-only and work while the server is running. Add `--json`
+for machine-readable output. `status` shows run counts by effective dashboard
+status (`unsynced` before a remote status is committed), disk sizes, skipped
+size entries, and each key's run count and latest sync. JSON includes a
+top-level `warnings` list. Runs owned by `AGENTICML_SERVER_KEY` are marked
+`"env": true`. A corrupt or unreadable `keys.json` is a warning and still
+exits 0. Revoked owners remain visible; key secrets and hashes are never
+printed.
+
+`verify` streams SHA-256 checks of stored objects and checks committed run
+file sizes, missing references (including by-reference artifacts), lineage
+refs, and leftover Git ref locks. It exits 0 when clean (warnings are allowed),
+1 for problems, and 2 for usage errors or an unreadable data directory. Files
+that grew beyond a running run's committed sizes are warnings because a sync
+may be in progress. A ref lock younger than ten minutes is also a warning;
+older locks are problems. Stop the server before using the printed removal
+command for a leftover lock. Verification never repairs or removes files.
+
+After [restoring a backup](#restoring-backups), run `server verify` before
+resuming syncs. Recheck live-sync warnings once the run has finished.
+
 ## Network filesystems (EFS)
 
 Every append, atomic write, and object put on the server does `os.fsync` plus a directory fsync. That is the main extra cost when `<data>` is on EFS or another network filesystem. `server/tmp` and `store` must already be on the same filesystem (the server refuses to start otherwise). Run a single server process per data directory. NFSv4 emulates `flock` on `server.lock`; AWS documents NFSv4.1 (`nfsvers=4.1`) for EFS, and that is the recommended mount.
