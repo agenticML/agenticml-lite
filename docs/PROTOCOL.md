@@ -31,10 +31,13 @@ Authorization: Bearer <key>
 
 - **Key format**: The prefix `aml_` followed by 43 URL-safe base64 characters
   (32 random bytes, e.g. `aml_abc123...`).
-- **Scopes**: Keys are issued with either `sync` or `admin` scope. Both scopes
-  are accepted on all `/v2` endpoints. (`sync` keys can only access `/v2`;
-  `admin` keys can additionally sign in to the server dashboard and manage
-  keys).
+- **Scopes and roles**: Keys belong to users and are issued with either
+  `sync` or `admin` scope. A key whose user has role `viewer` can only call
+  `GET /v2/whoami`; every other `/v2` endpoint returns `403 Forbidden`
+  (`{"error": "role viewer cannot sync"}`). For users with role `member` or
+  `admin`, both scopes are accepted on all `/v2` endpoints. (`sync` keys can
+  only access `/v2`; `admin` keys can additionally sign in to the server
+  dashboard and manage keys and users).
 - **Verification**: The server hashes incoming bearer keys with SHA-256 and
   compares digests against its key store in constant time
   (`hmac.compare_digest`).
@@ -99,10 +102,11 @@ client recovery.
 | `200 OK` | Success | Request completed successfully. |
 | `201 Created` | Created | New content-addressed object stored (`PUT /v2/objects/{sha256}`). |
 | `401 Unauthorized` | Auth failed | Missing, invalid, or revoked bearer token (`WWW-Authenticate: Bearer`). |
+| `403 Forbidden` | Forbidden | Calling key belongs to a `viewer` user (`{"error": "role viewer cannot sync"}`). |
 | `404 Not Found` | Not found | Unknown route, invalid run ID, unallowed path, or unknown run on state/append/commit/non-meta PUT. |
 | `405 Method Not Allowed` | Method rejected | Method not allowed for endpoint (`Allow` header returned). |
 | `408 Request Timeout` | Timeout | Request body read exceeded deadline or client disconnected. |
-| `409 Conflict` | Conflict | State conflict: run owned by another key, append offset mismatch, append overlap mismatch, run not running, commit status mismatch, or commit size mismatch. |
+| `409 Conflict` | Conflict | State conflict: run owned by another user, append offset mismatch, append overlap mismatch, run not running, commit status mismatch, or commit size mismatch. |
 | `411 Length Required` | Missing length | `Content-Length` missing, non-digit, duplicated, or `Transfer-Encoding` present. |
 | `413 Payload Too Large` | Oversized body | Declared body length exceeds endpoint limit. |
 | `422 Unprocessable Entity` | Validation error | Malformed JSON, torn record, object hash mismatch, or invalid query parameters. |
@@ -127,15 +131,15 @@ client recovery.
 | Method and path | Request body | Success response | Error codes |
 | --- | --- | --- | --- |
 | `GET /healthz` | None | `200 {"ok": true}` | None |
-| `GET /v2/whoami` | None | `200 {"key": name, "scope": scope, "protocol": 2, "features": ["lineage", "byref"]}` | 401 |
-| `POST /v2/objects/missing` | `{"objects": [sha256, ...]}` | `200 {"missing": [sha256, ...]}` | 401, 411, 413, 422, 503 |
-| `PUT /v2/objects/{sha256}` | Raw bytes (`application/octet-stream`) | `201 {"sha256": sha256, "created": true}` or `200 {"sha256": sha256, "created": false}` | 401, 411, 413, 422, 503 |
-| `GET /v2/runs/{id}/state` | None | `200 {"owner": name, "files": {path: {"size": n, "sha256": h}}, "remote": {...}}` | 401, 404 |
-| `PUT /v2/runs/{id}/files/{path}` | Raw bytes | `200 {"size": n}` | 401, 404, 409, 411, 413, 422, 503 |
-| `POST /v2/runs/{id}/append/{path}?offset=N[&truncate=1]` | Raw bytes | `200 {"size": n}` | 401, 404, 409, 411, 413, 422, 503 |
-| `GET /v2/runs/{id}/lineage` | None | `200 {"commit": sha_or_null, "tips": [sha, ...]}` | 401, 404, 409, 422, 503 |
-| `PUT /v2/runs/{id}/lineage` | Git bundle | `201 {"commit": sha, "created": true}` or `200 {"commit": sha, "created": false}` | 401, 404, 409, 411, 413, 422, 503 |
-| `POST /v2/runs/{id}/commit` | `{"status": s, "fingerprint": f, "sizes": {path: n}}` | `200 {"complete": true, "fingerprint": f}` | 401, 404, 409, 411, 413, 422, 503 |
+| `GET /v2/whoami` | None | `200 {"key": name, "scope": scope, "user": user, "role": role, "protocol": 2, "features": ["lineage", "byref"]}` | 401 |
+| `POST /v2/objects/missing` | `{"objects": [sha256, ...]}` | `200 {"missing": [sha256, ...]}` | 401, 403, 411, 413, 422, 503 |
+| `PUT /v2/objects/{sha256}` | Raw bytes (`application/octet-stream`) | `201 {"sha256": sha256, "created": true}` or `200 {"sha256": sha256, "created": false}` | 401, 403, 411, 413, 422, 503 |
+| `GET /v2/runs/{id}/state` | None | `200 {"owner": name, "owner_user": user, "files": {path: {"size": n, "sha256": h}}, "remote": {...}}` | 401, 403, 404 |
+| `PUT /v2/runs/{id}/files/{path}` | Raw bytes | `200 {"size": n}` | 401, 403, 404, 409, 411, 413, 422, 503 |
+| `POST /v2/runs/{id}/append/{path}?offset=N[&truncate=1]` | Raw bytes | `200 {"size": n}` | 401, 403, 404, 409, 411, 413, 422, 503 |
+| `GET /v2/runs/{id}/lineage` | None | `200 {"commit": sha_or_null, "tips": [sha, ...]}` | 401, 403, 404, 409, 422, 503 |
+| `PUT /v2/runs/{id}/lineage` | Git bundle | `201 {"commit": sha, "created": true}` or `200 {"commit": sha, "created": false}` | 401, 403, 404, 409, 411, 413, 422, 503 |
+| `POST /v2/runs/{id}/commit` | `{"status": s, "fingerprint": f, "sizes": {path: n}}` | `200 {"complete": true, "fingerprint": f}` | 401, 403, 404, 409, 411, 413, 422, 503 |
 
 ### `GET /healthz`
 
@@ -149,7 +153,7 @@ Unauthenticated health check.
 
 ### `GET /v2/whoami`
 
-Identify the calling API key and check server capabilities.
+Identify the calling API key, owning user, role, and server capabilities.
 
 - **Request**: `GET /v2/whoami`
   - Header: `Authorization: Bearer <key>`
@@ -158,12 +162,18 @@ Identify the calling API key and check server capabilities.
   {
     "key": "gpu-box-1",
     "scope": "sync",
+    "user": "alice",
+    "role": "member",
     "protocol": 2,
     "features": ["lineage", "byref"]
   }
   ```
 - **Errors**:
   - `401 Unauthorized`: `{"error": "unauthorized"}` with `WWW-Authenticate: Bearer`.
+
+The `user` and `role` fields identify the key's owner and assigned role. A key
+belonging to a user with role `viewer` can call `whoami`, but every other `/v2`
+route returns `403 Forbidden` (`{"error": "role viewer cannot sync"}`).
 
 The `lineage` feature is present only when Git was found at server startup;
 without Git, lineage is omitted and the lineage endpoints return 404. The
@@ -178,7 +188,7 @@ first, capped at 10,000 refs. Only complete ref tips are advertised as bundle
 prerequisites. The project comes from the server's `meta.json.lineage`.
 
 Both lineage endpoints require bearer authentication and run ownership:
-401 for an invalid key, 404 for an unknown run, 409 for another key's run.
+401 for an invalid key, 403 for viewer keys, 404 for an unknown run, 409 for another user's run.
 A missing or invalid lineage block returns 422 `{"error": "run has no lineage"}`;
 its project key must match the lineage key format and the key derived from
 the string `meta.json.project`, and its commit must be 40 lowercase
@@ -285,7 +295,7 @@ Upload a single content-addressed object.
 ### `GET /v2/runs/{id}/state`
 
 Retrieve current file sizes, hashes, and sync metadata for a run. Readable with
-any valid key.
+any valid sync or admin key.
 
 - **Request**: `GET /v2/runs/{id}/state`
   - Header: `Authorization: Bearer <key>`
@@ -293,6 +303,7 @@ any valid key.
   ```json
   {
     "owner": "gpu-box-1",
+    "owner_user": "alice",
     "files": {
       "meta.json": {"size": 812, "sha256": "a1b2..."},
       "events.jsonl": {"size": 40960, "sha256": "c3d4..."},
@@ -301,6 +312,9 @@ any valid key.
     },
     "remote": {
       "owner": "gpu-box-1",
+      "owner_user": "alice",
+      "owner_key": "gpu-box-1",
+      "last_sync_key": "gpu-box-1",
       "status": "running",
       "fingerprint": "9abc...",
       "last_sync_at": "2026-11-04T05:00:00Z",
@@ -308,11 +322,19 @@ any valid key.
     }
   }
   ```
-  `owner` is the string key name or `null` if unowned. `files` lists all
-  allow-listed files present as regular files. `remote` contains the parsed
-  contents of `remote.json` (or `{}` if missing/unreadable).
+  - **Compatibility rule**: To preserve compatibility with 2.0 and 2.1 clients,
+    the `owner` field in `state`, `state.remote`, and 409 conflict payloads
+    returns the **calling key's name** if the caller's user owns the run. If
+    the run is owned by another user, `owner` returns the owning user's name.
+  - `owner_user` always carries the real user name of the owner, both at the
+    top level and inside `remote`.
+  - `owner_key` (the key that created the run) and `last_sync_key` (the key of
+    the last commit) in `remote` are visible only to keys belonging to the
+    owning user; they are omitted for callers of other users.
+  - `files` lists all allow-listed files present as regular files.
 - **Errors**:
   - `401 Unauthorized`: `{"error": "unauthorized"}`
+  - `403 Forbidden`: `{"error": "role viewer cannot sync"}`
   - `404 Not Found`: unknown run (`runs/<id>/meta.json` does not exist) or
     invalid run ID.
 
@@ -339,9 +361,10 @@ Atomically write or replace an allow-listed atomic file.
   ```
 - **Errors**:
   - `401 Unauthorized`: `{"error": "unauthorized"}`
+  - `403 Forbidden`: `{"error": "role viewer cannot sync"}`
   - `404 Not Found`: disallowed path, or unknown run for non-meta files
     (`{"error": "unknown run"}`).
-  - `409 Conflict`: `{"error": "run owned by another key", "owner": "<name>"}`
+  - `409 Conflict`: `{"error": "run owned by another user", "owner": "<name>", "owner_user": "<user>"}`
   - `411 Length Required`: `{"error": "length required"}`
   - `413 Payload Too Large`: `{"error": "payload too large"}`
   - `422 Unprocessable Entity`: `{"error": "invalid meta.json"}`,
@@ -374,9 +397,10 @@ Append records to an allow-listed append file, or atomically replace it when
   ```
 - **Errors**:
   - `401 Unauthorized`: `{"error": "unauthorized"}`
+  - `403 Forbidden`: `{"error": "role viewer cannot sync"}`
   - `404 Not Found`: disallowed path or unknown run.
   - `409 Conflict`:
-    - `{"error": "run owned by another key", "owner": "<name>"}`
+    - `{"error": "run owned by another user", "owner": "<name>", "owner_user": "<user>"}`
     - `{"size": S}` (gap: `offset > S`)
     - `{"size": S, "mismatch": true}` (overlapping bytes disagree)
     - `{"error": "run is not running", "status": "<status>"}` (`truncate=1` attempted
@@ -427,9 +451,10 @@ sizes before updating `remote.json`.
   ```
 - **Errors**:
   - `401 Unauthorized`: `{"error": "unauthorized"}`
+  - `403 Forbidden`: `{"error": "role viewer cannot sync"}`
   - `404 Not Found`: unknown run (`{"error": "unknown run"}`).
   - `409 Conflict`:
-    - `{"error": "run owned by another key", "owner": "<name>"}`
+    - `{"error": "run owned by another user", "owner": "<name>", "owner_user": "<user>"}`
     - `{"error": "status does not match meta.json", "status": "<server_status>"}`
     - `{"error": "size mismatch", "sizes": {path: server_size_or_null, ...}}`
   - `411 Length Required`: `{"error": "length required"}`
@@ -444,19 +469,28 @@ A run does not exist on the server until `meta.json` is created:
 1. **First write**: The first write to an unknown run must be
    `PUT /v2/runs/{id}/files/meta.json`.
    - The server creates directory `<data>/store/runs/{id}/`.
-   - It claims ownership by writing `remote.json` containing
-     `{"owner": "<key_name>"}`.
+   - It claims ownership for the authenticated key's user by writing
+     `remote.json` containing:
+     ```json
+     {
+       "owner": "alice",
+       "owner_key": "gpu-box-1"
+     }
+     ```
+     `owner` is the calling key's user name; `owner_key` records the key name
+     that created the run.
    - It then atomically writes `meta.json`.
-2. **Ownership guard**: The key name that performs the initial `PUT meta.json`
-   becomes the permanent owner of the run. Any later write (PUT, append, or
-   commit) with a key with a different name returns:
+2. **Ownership guard**: Runs belong to users, not keys. Any valid key belonging
+   to the owning user can write to the run (PUT, append, or commit). If a key
+   belonging to another user attempts to write to the run, the server returns:
    ```json
-   {"error": "run owned by another key", "owner": "gpu-box-1"}
+   {"error": "run owned by another user", "owner": "alice", "owner_user": "alice"}
    ```
-   with HTTP status `409 Conflict`.
-3. **Key names as identity**: Key names are unique across the server. If a key
-   is revoked and later re-created with the same name, it retains write access
-   to runs created under that name.
+   with HTTP status `409 Conflict`. (Under the compatibility rule, `owner` is
+   the owning user's name because the caller belongs to a different user).
+3. **Commit attribution**: When committing (`POST /v2/runs/{id}/commit`), the
+   server records `last_sync_key` (the key that performed the commit) alongside
+   `last_sync_at` in `remote.json`.
 4. **Validation**:
    - `meta.json` must be a valid UTF-8 JSON object.
    - Its `run_id` field must equal the `{id}` in the URL.
@@ -532,10 +566,12 @@ The commit request acts as a consistency barrier across all pushed files:
 3. **Write**: On success, the server atomically writes `remote.json`:
    ```json
    {
-     "owner": "gpu-box-1",
+     "owner": "alice",
+     "owner_key": "gpu-box-1",
      "status": "running",
      "fingerprint": "...",
      "last_sync_at": "2026-11-04T05:00:00Z",
+     "last_sync_key": "gpu-box-1",
      "sizes": {
        "meta.json": 812,
        "events.jsonl": 40960,
@@ -543,6 +579,8 @@ The commit request acts as a consistency barrier across all pushed files:
      }
    }
    ```
+   `owner` is the owning user name; `owner_key` is the key that created the
+   run; `last_sync_key` is the key that made the commit.
 
 ### Server dashboard status
 
@@ -627,6 +665,7 @@ The client maintains host-scoped sync state in `<root>/runs/<id>/sync.json`:
     "https://aml.example.com": {
       "protocol": 2,
       "owner": "gpu-box-1",
+      "owner_user": "alice",
       "files": {
         "meta.json": {"size": 812, "sha256": "a1b2..."},
         "events.jsonl": {"size": 40960, "tail": "c3d4..."},
@@ -654,8 +693,11 @@ The client maintains host-scoped sync state in `<root>/runs/<id>/sync.json`:
   `{"kind": "byref", "id": "<name>:v<version>", "reason": "..."}` in
   `skipped`. The `artifacts.json` cursor lives under `files` like other
   atomic files.
-- **Owner**: The key name (`owner`) is saved in the host entry only after
-  cursor recovery confirms ownership.
+- **Owner and user**: On servers that return `user` in `whoami`, the client
+  compares ownership by user (`owner_user`), allowing a machine to switch to
+  another key of the same user. It caches `owner_user` per host in `sync.json`.
+  When syncing against a server that omits `user` (version 2.0 or 2.1), the
+  client falls back to checking `owner` against its key name.
 - **Update timing**: `sync.json` is atomically replaced and directory-fsynced
   after every accepted HTTP write request, ensuring interrupted syncs resume
   where they left off.
@@ -689,9 +731,11 @@ When a host entry has no `files` map (new run, lost `sync.json`, after
 1. The client calls `GET /v2/runs/{id}/state`.
 2. If the run is unknown on the server (`404 Not Found`), the client starts with
    empty cursors.
-3. If `owner` is set and does not match the client's key name, sync fails
-   permanently: `run id {id} belongs to key {owner} on this server`. The key
-   name is saved in the host entry only after cursor recovery confirms ownership.
+3. If `owner_user` is present in remote state and `whoami` returned `user`,
+   the client checks that `owner_user` matches its user. Otherwise, if `owner`
+   is set and does not match the client's key name, sync fails permanently:
+   `run id {id} belongs to key {owner} on this server`. The owner and `owner_user`
+   are saved in the host entry only after cursor recovery confirms ownership.
 4. For each server file also present locally:
    - **Atomic**: Adopts the server's `size` and `sha256`.
    - **Append**: If the server size is at most the local capped size and the
@@ -704,7 +748,7 @@ When a host entry has no `files` map (new run, lost `sync.json`, after
 
 ### 6. Conflict handling
 
-- `409` with `"error": "run owned by another key"`: Fails permanently with an
+- `409` with `"error": "run owned by another user"`: Fails permanently with an
   ownership error.
 - `409` append with `"mismatch": true`: Triggers rewrite with `truncate=1`.
 - `409` append with only `"size"`: Triggers cursor recovery for that file and
@@ -771,7 +815,7 @@ timeouts, and 5xx/408/429 back off up to 5 minutes with jitter; a running run
 is committed at least every 60 s.
 
 - **Permanent failures** (stop `--watch` from retrying the run):
-  - **Ownership conflict**: The run belongs to a different API key on the
+  - **Ownership conflict**: The run belongs to a different user on the
     server (`OwnershipError`).
   - **Pruned-run guard**: The run was pruned after syncing to another host, so
     its raw scalar history is no longer local.
