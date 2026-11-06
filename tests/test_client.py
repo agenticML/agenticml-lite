@@ -101,7 +101,8 @@ def fake_http(handler):
 def test_whoami_sync_and_admin_and_revoked(server):
     with client_for(server) as client:
         assert client.whoami() == {
-            "key": "one", "scope": "sync", "protocol": 2, "features": [],
+            "key": "one", "scope": "sync", "protocol": 2,
+            "features": ["lineage"] if server.lineage_enabled else [],
         }
     _, admin = server.keys.create("boss", "admin")
     with client_for(server, admin) as client:
@@ -210,6 +211,26 @@ def test_put_object_retries_503_and_rewinds(monkeypatch):
     with fake_http(handler) as (_httpd, url):
         with Client(base_url=url, api_key="secret-key") as client:
             assert client.put_object(sha, io.BytesIO(payload), len(payload)) is True
+    assert bodies == [payload, payload]
+
+
+def test_put_lineage_retries_503_and_rewinds():
+    bodies = []
+
+    def handler(request):
+        bodies.append(request.server.requests[-1][3])
+        assert request.path == "/v2/runs/run-1/lineage"
+        if len(bodies) == 1:
+            request._send(503, b'{"error":"busy"}', {"Retry-After": "0"})
+        else:
+            request._send(201, b'{"created":true,"commit":"accepted"}')
+
+    payload = b"full-bundle-body"
+    with fake_http(handler) as (_httpd, url):
+        with Client(base_url=url, api_key="secret-key") as client:
+            assert client.put_lineage("run-1", io.BytesIO(payload), len(payload)) == {
+                "created": True, "commit": "accepted",
+            }
     assert bodies == [payload, payload]
 
 

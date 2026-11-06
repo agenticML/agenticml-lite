@@ -1,6 +1,6 @@
 # Threat Model
 
-This document outlines the security architecture, trust boundaries, threat landscape, and defensive controls of `agenticml server` (Release 2.0).
+This document outlines the security architecture, trust boundaries, threat landscape, and defensive controls of `agenticml server`.
 
 ## Assets
 
@@ -27,6 +27,36 @@ The following threats are within the design and threat model of the system:
 - **Malicious run files and paths**: An attacker attempts directory traversal (such as `../`), symlink traversal, special file injection (FIFOs, device nodes, Unix domain sockets), or hard links. Mitigated by strict path allow-lists, run ID format validation, path containment checks, no-follow opens (`O_NOFOLLOW`), non-blocking regular-file checks (`S_ISREG`), and hard-link detection.
 - **Run ID collision and hijacking**: A second machine or key attempts to write to or overwrite a run created by another machine. Mitigated by run ownership tracking (`owner` in `remote.json` bound to the creating key). Requests to modify an existing run with a differing key are rejected.
 
+- **Hostile lineage bundles**: An authenticated uploader may send malformed
+  headers, unexpected refs, missing prerequisites, non-commit tips, or corrupt
+  or unsafe Git objects. The server caps the body at 256 MiB and the header at
+  1 MiB, accepts exactly the metadata's run ref and SHA-1 commit, and binds
+  `lineage.project_key` to the key derived from the string `meta.json.project`.
+  It validates prerequisites with `git bundle verify` and checks the streamed
+  pack with `git index-pack --stdin --fix-thin --strict` in a temporary object
+  quarantine under `server/tmp`. The live project's objects are read-only
+  alternates during validation via a single absolute path in the quarantine's
+  `info/alternates` file. Connectivity and commit type are checked
+  before packs are promoted and an immutable run ref is atomically created;
+  rejected bundles leave existing refs and live objects unchanged. Rollback
+  compare-and-swap deletes only a ref published by that request and removes
+  promoted packs unless publication is confirmed or uncertain and ref deletion
+  did not succeed; retained packs keep any live ref's objects available.
+  Hooks, fsmonitor, automatic GC and commit-graph writes are disabled; only
+  the local file protocol is allowed. Inherited `GIT_*` variables and global
+  and system config are removed; internal environment overrides allow only
+  `GIT_OBJECT_DIRECTORY`. Subprocesses use argument lists, and stdin
+  is disconnected except for the streamed pack. Git uses the C locale and
+  timeouts of 60 seconds plus the body size divided by 4 MiB/s per command.
+  At most two receives run after body upload; exhaustion and transient Git
+  or filesystem failures (including repository initialization and ref
+  publication failures) return retryable 503 responses. Git output is never
+  returned to clients (only the first diagnostic line, capped at 240
+  characters, is logged). Bundle files and quarantines are removed after
+  every request; startup removes abandoned `lineage-*` quarantine directories
+  after a crash and warns about other subdirectories. The server never checks
+  out their contents. Git must be installed and kept patched by the operator.
+
 ## Out of scope
 
 The following threats are explicitly out of scope:
@@ -43,6 +73,7 @@ Each security control is enforced by a specific module:
 | `server/keys.py` | Key storage in `keys.json` (mode `0600`), SHA-256 key hashing, constant-time token comparison (`hmac.compare_digest`), scope validation (`sync` vs `admin`), key creation and revocation, concurrent key modification locking (`keys.lock`), and automatic in-memory key cache reload on file modification. |
 | `server/webauth.py` | Dashboard authentication, `POST /login` credential check (accepts `admin` keys only; rejects `sync` keys with 403), session management (always `HttpOnly`, `SameSite=Strict`, `Path=/`; cookie named `__Host-aml_session` with `Secure` when `--public-url` is HTTPS, otherwise `aml_session`), in-memory session lifetime (12-hour idle timeout, 7-day absolute cap), constant-time single-use bootstrap token verification (`/setup`), client IP-based failed login throttling, and CSRF protection (`X-AgenticML-Request` header and `Origin` validation against `--public-url`). |
 | `server/ingest.py` | Protocol v2 endpoint routing, bearer token validation against the key store, run ownership verification via `remote.json`, per-run serialization locking, request body size limits, record framing validation, and append offset verification. |
+| `server/lineage.py` | Bounded bundle headers, exact run ref and commit validation, immutable refs, Git verification/fsck and isolated subprocess configuration. |
 | `store/layout.py` | Run ID regex validation (`layout.valid_run_id`), atomic and append file path allow-lists, path containment verification (`contained()`), directory traversal prevention, symlink rejection with `O_NOFOLLOW`, non-blocking open with `S_ISREG` validation to prevent FIFO denial-of-service hangs, and rejection of hard links. |
 | `ui/server.py` | Server dashboard request handling, `Host` header enforcement (accepts only `--public-url` host and loopback names), session cookie validation, object serving containment and responses sent with `X-Content-Type-Options: nosniff`, and read-only run inspection. |
 

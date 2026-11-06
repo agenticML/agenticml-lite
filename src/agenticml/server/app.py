@@ -7,6 +7,7 @@ import logging
 import os
 from pathlib import Path
 import signal
+import shutil
 import socket
 import stat
 import threading
@@ -40,6 +41,7 @@ class Limits:
     atomic_body: int = ATOMIC_BODY_LIMIT
     append_body: int = APPEND_BODY_LIMIT
     object_body: int = OBJECT_BODY_LIMIT
+    lineage_body: int = 256 * 1024 * 1024
     missing_body: int = MISSING_BODY_LIMIT
     commit_body: int = COMMIT_BODY_LIMIT
     missing_hashes: int = MISSING_HASH_LIMIT
@@ -106,7 +108,10 @@ def acquire_server_lock(server_dir):
 def _clean_tmp(tmp_dir):
     for entry in tmp_dir.iterdir():
         if stat.S_ISDIR(entry.lstat().st_mode):
-            logger.warning("ignoring subdirectory in server/tmp: %s", entry)
+            if entry.name.startswith("lineage-"):
+                shutil.rmtree(entry)
+            else:
+                logger.warning("ignoring subdirectory in server/tmp: %s", entry)
         else:
             os.unlink(entry)
 
@@ -161,6 +166,10 @@ class IngestServer(DashboardServer):
         self.web = WebAuth(self.keys, public_url)
         self.store_file_mode = 0o666 & ~_read_umask()
         self.limits = Limits()
+        self.lineage_enabled = shutil.which("git") is not None
+        self.lineage_receives = threading.BoundedSemaphore(2)
+        if not self.lineage_enabled:
+            logger.warning("git is not installed; lineage code diffs are disabled")
         self.run_locks = weakref.WeakValueDictionary()
         self.run_locks_lock = threading.Lock()
         self.objects_lock = threading.Lock()

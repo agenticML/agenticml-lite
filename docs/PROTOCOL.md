@@ -15,10 +15,11 @@ re-encoding records.
   (such as an ALB, Caddy, or Tailscale Serve). The client enforces HTTPS for
   non-local hosts unless `--insecure` is explicitly passed.
 - **Protocol number**: `2`.
-- **Features**: Advertised by the server in `GET /v2/whoami`. In protocol 2.0,
-  the `features` list is empty (`[]`). The tokens `lineage` (shadow Git lineage
-  replication) and `byref` (by-reference artifact uploads) are reserved for
-  later releases. Clients must only enable features that the server explicitly
+- **Features**: Advertised by the server in `GET /v2/whoami`. The `lineage`
+  feature enables shadow Git replication when Git is installed on the server.
+  A 2.0 server returns an empty list (`[]`). The token `byref` (by-reference
+  artifact uploads) remains
+  reserved. Clients must only enable features that the server explicitly
   advertises.
 
 ## Authentication
@@ -114,6 +115,7 @@ client recovery.
 | --- | --- |
 | Atomic file body | 16 MiB (16,777,216 bytes) |
 | Append body | 64 MiB (67,108,864 bytes) |
+| Lineage bundle body | 256 MiB (268,435,456 bytes) |
 | Object body | 4 GiB (4,294,967,296 bytes) |
 | Missing hashes per call | 10,000 hashes (body cap 1 MiB) |
 | Commit body | 1 MiB (1,048,576 bytes) |
@@ -125,12 +127,14 @@ client recovery.
 | Method and path | Request body | Success response | Error codes |
 | --- | --- | --- | --- |
 | `GET /healthz` | None | `200 {"ok": true}` | None |
-| `GET /v2/whoami` | None | `200 {"key": name, "scope": scope, "protocol": 2, "features": []}` | 401 |
+| `GET /v2/whoami` | None | `200 {"key": name, "scope": scope, "protocol": 2, "features": ["lineage"]}` | 401 |
 | `POST /v2/objects/missing` | `{"objects": [sha256, ...]}` | `200 {"missing": [sha256, ...]}` | 401, 411, 413, 422, 503 |
 | `PUT /v2/objects/{sha256}` | Raw bytes (`application/octet-stream`) | `201 {"sha256": sha256, "created": true}` or `200 {"sha256": sha256, "created": false}` | 401, 411, 413, 422, 503 |
 | `GET /v2/runs/{id}/state` | None | `200 {"owner": name, "files": {path: {"size": n, "sha256": h}}, "remote": {...}}` | 401, 404 |
 | `PUT /v2/runs/{id}/files/{path}` | Raw bytes | `200 {"size": n}` | 401, 404, 409, 411, 413, 422, 503 |
 | `POST /v2/runs/{id}/append/{path}?offset=N[&truncate=1]` | Raw bytes | `200 {"size": n}` | 401, 404, 409, 411, 413, 422, 503 |
+| `GET /v2/runs/{id}/lineage` | None | `200 {"commit": sha_or_null, "tips": [sha, ...]}` | 401, 404, 409, 422, 503 |
+| `PUT /v2/runs/{id}/lineage` | Git bundle | `201 {"commit": sha, "created": true}` or `200 {"commit": sha, "created": false}` | 401, 404, 409, 411, 413, 422, 503 |
 | `POST /v2/runs/{id}/commit` | `{"status": s, "fingerprint": f, "sizes": {path: n}}` | `200 {"complete": true, "fingerprint": f}` | 401, 404, 409, 411, 413, 422, 503 |
 
 ### `GET /healthz`
@@ -155,11 +159,70 @@ Identify the calling API key and check server capabilities.
     "key": "gpu-box-1",
     "scope": "sync",
     "protocol": 2,
-    "features": []
+    "features": ["lineage"]
   }
   ```
 - **Errors**:
   - `401 Unauthorized`: `{"error": "unauthorized"}` with `WWW-Authenticate: Bearer`.
+
+The `lineage` feature is present only when Git was found at server startup;
+without Git, `features` is empty and the lineage endpoints return 404.
+
+### `GET /v2/runs/{id}/lineage`
+
+Returns `200 {"commit": "<sha>", "tips": ["<sha>", ...]}`. `commit`
+is the server's `refs/runs/{id}` tip, or JSON `null` if absent. `tips` lists
+distinct tips of `refs/runs/*` in the same project, newest by committer date
+first, capped at 10,000 refs. Only complete ref tips are advertised as bundle
+prerequisites. The project comes from the server's `meta.json.lineage`.
+
+Both lineage endpoints require bearer authentication and run ownership:
+401 for an invalid key, 404 for an unknown run, 409 for another key's run.
+A missing or invalid lineage block returns 422 `{"error": "run has no lineage"}`;
+its project key must match the lineage key format and the key derived from
+the string `meta.json.project`, and its commit must be 40 lowercase
+hexadecimal characters. A server without Git omits the `lineage` feature
+and returns 404 on both lineage routes.
+
+### `PUT /v2/runs/{id}/lineage`
+
+Uploads a raw Git v2 or v3 bundle (`application/octet-stream`), requiring
+`Content-Length` and limited to 256 MiB (411 if missing, 413 if too large).
+The header is limited to 1 MiB and must advertise exactly one ref:
+`<meta.json.lineage.commit> refs/runs/{id}`. Only the v3 capability
+`@object-format=sha1` is accepted. Prerequisite commit lines are allowed.
+
+The server validates the header and verifies prerequisites, then checks the
+streamed pack with `git index-pack --stdin --fix-thin --strict` in a temporary
+object quarantine under `server/tmp`, using the project's live objects only
+as alternates through a single absolute path in the quarantine's
+`info/alternates` file (data paths containing `:` are supported).
+Connectivity and commit type are checked in that environment
+before pack files are moved into the live repo and the run ref is atomically
+created. Hooks are disabled; Git uses a fixed configuration, no inherited
+`GIT_*` overrides, no system/global configuration, and the C locale.
+Git subprocess timeouts are 60 s plus the body size divided by 4 MiB/s.
+No checkout is made, and existing refs are never moved or deleted.
+
+- Success: 201 `{"commit": "<sha>", "created": true}`.
+- Replay with the same server ref: 200 `{"commit": "<sha>", "created": false}`.
+- Existing differing ref: 409 `{"error": "lineage ref differs", "commit": "<server-sha>"}`.
+- Malformed or hostile bundle: 422 `{"error": "invalid bundle"}`.
+- Missing prerequisite: 422 `{"error": "missing prerequisite"}`; resend a full bundle.
+- Body or receive concurrency exhaustion: 503 `{"error": "server busy"}`,
+  `Retry-After: 5`. At most two lineage receives run after body upload.
+- Repository initialization or ref publication failure, Git timeout, or
+  filesystem failure: 503 `{"error": "lineage busy"}`,
+  `Retry-After: 5`; retry without remembering a permanent skip. This also
+  applies to lineage state reads.
+
+Rejected bundles leave existing refs and live objects unchanged. If publication
+fails, rollback deletes only a ref published by that request, using its expected
+commit as a compare-and-swap guard. Promoted packs are removed unless the ref
+may still be published and deletion did not succeed; retaining those packs
+keeps any live ref's objects available. Uploaded temporary files and quarantines
+are removed after both successful and failed requests. Startup also removes
+abandoned `lineage-*` quarantine directories from `server/tmp` after a crash.
 
 ### `POST /v2/objects/missing`
 
@@ -508,7 +571,18 @@ The client synchronizes one run at a time under an advisory flock on
 4. **Overviews and indexes**: `scalars/<n>.ovw` sorted by numeric `n`,
    `scalars/index.json`, `media/index.json`, whenever the snapshot SHA-256
    differs from the saved cursor.
-5. **Commit**: The client commits (`POST /v2/runs/{id}/commit`) on every sync
+5. **Lineage**: If the server advertises `lineage` and the local run has a
+   valid snapshot matching its local ref, query `GET /lineage`. If the tip
+   differs, upload a bundle excluding advertised tips available locally.
+   Retry once with a full bundle on `missing prerequisite`. An empty bundle
+   is rebuilt in full when a descendant tip already includes the run's
+   commit. Other 422 errors and `lineage ref differs` are warned and
+   remembered as permanent lineage skips; transient failures leave the run
+   incomplete. A run completes only after its lineage is accepted or
+   permanently skipped. Complete runs synced to 2.0 servers are backfilled
+   when `lineage` becomes available. Dry runs count lineage as one file,
+   assuming the server lists lineage, without querying the server.
+6. **Commit**: The client commits (`POST /v2/runs/{id}/commit`) on every sync
    that is not idle (an idle run is complete, its fingerprint unchanged, and
    finished or crashed). `complete: true` is saved only after a successful
    commit, so a failed commit is retried on the next sync without resending
@@ -560,6 +634,9 @@ The client maintains host-scoped sync state in `<root>/runs/<id>/sync.json`:
   trailing 64 KiB window `[max(0, size - 65536), size)`). During append uploads,
   `tail` is computed from the bytes the server accepted (previous window plus the
   sent chunk), not by re-reading the local file.
+- **Lineage**: `lineage` stores the accepted shadow commit. Permanent lineage
+  skips use `{"kind": "lineage", "id": "<run-id>", "reason": "<error>"}` in
+  `skipped`.
 - **Owner**: The key name (`owner`) is saved in the host entry only after
   cursor recovery confirms ownership.
 - **Update timing**: `sync.json` is atomically replaced and directory-fsynced
@@ -661,10 +738,11 @@ no-ops, commit overwrites `remote.json`).
 - Default: up to 3 retries (4 attempts total).
 - Exponential backoff: `min(0.5 * 2^attempt, 30.0)` seconds.
 - Respects `Retry-After` header (in seconds, capped at 30 s) on HTTP `503`.
-- For streamed bodies (`put_object`), `Client` rewinds the file handle
-  (`handle.seek(start)`) before each retry attempt.
+- For streamed bodies (`put_object` and `put_lineage`), `Client` rewinds the
+  file handle (`handle.seek(start)`) before each retry attempt.
 - Timeouts: 10 s connect timeout; 30 s read timeout for metadata calls; for
-  `put_object`, read timeout scales to `max(30, 60 + size / 1 MiB)` seconds.
+  `put_object` and `put_lineage`, read timeout scales to
+  `max(30, 60 + size / 1 MiB)` seconds.
 
 ### 10. Permanent failures, `--watch`, and `--follow`
 

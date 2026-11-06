@@ -219,6 +219,21 @@ class Client:
             self._raise_http(response)
         return response.json()
 
+    def lineage_state(self, run_id) -> dict:
+        response = self._conflict_or_http(self._request(
+            "GET", f"{self.base_url}/v2/runs/{run_id}/lineage",
+        ))
+        return response.json()
+
+    def put_lineage(self, run_id, handle, size) -> dict:
+        response = self._conflict_or_http(self._request(
+            "PUT", f"{self.base_url}/v2/runs/{run_id}/lineage", data=handle,
+            timeout=(_CONNECT_TIMEOUT, max(self.timeout, 60 + size / _MIB)),
+            rewind=(handle, handle.tell()),
+            headers={"Content-Type": "application/octet-stream", "Content-Length": str(size)},
+        ))
+        return response.json()
+
     def put_file(self, run_id, path, data: bytes) -> dict:
         response = self._conflict_or_http(self._request(
             "PUT", f"{self.base_url}/v2/runs/{run_id}/files/{path}", data=data,

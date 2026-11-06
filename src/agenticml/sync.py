@@ -13,15 +13,19 @@ import re
 import secrets
 import signal
 import stat
+import subprocess
 import sys
 import threading
+import tempfile
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import requests
 from requests import HTTPError
 
 from .auth import resolve
+from . import lineage
 from .client import Conflict, ProtocolError, SyncStopped
 from .store.gc import prunable_series, prune_run, run_fingerprint
 from .store.layout import (
@@ -161,7 +165,7 @@ def _release_lock(lock):
 
 
 def _skipped_ids(state):
-    return {entry["id"] for entry in state.get("skipped") or []}
+    return {entry["id"] for entry in state.get("skipped") or [] if entry.get("kind") != "lineage"}
 
 
 def _remember_skip(state, kind, ident, reason):
@@ -171,7 +175,7 @@ def _remember_skip(state, kind, ident, reason):
         skips = []
         state["skipped"] = skips
     for entry in skips:
-        if isinstance(entry, dict) and entry.get("id") == ident:
+        if isinstance(entry, dict) and entry.get("id") == ident and entry.get("kind") == kind:
             return
     skips.append({"kind": kind, "id": ident, "reason": reason})
 
@@ -331,10 +335,34 @@ def _effective(reader, meta):
         unlock_run(handle)
 
 
-def _sync_idle(reader, state, source_hash, key=None):
+def _local_lineage(reader, features, state):
+    if "lineage" not in features:
+        return None
+    info = lineage.replication_info(reader.meta())
+    if info is None:
+        return None
+    if not _lineage_pending(reader, state, info["commit"]):
+        return info["commit"]
+    try:
+        repo = lineage._repo_path(reader.root, info["project_key"])
+        if repo.exists() and lineage._resolve_commit(repo, reader.run_id) == info["commit"]:
+            return info["commit"]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def _lineage_pending(reader, state, commit):
+    return bool(commit and state.get("lineage") != commit and not any(
+        entry.get("kind") == "lineage" and entry.get("id") == reader.run_id
+        for entry in state.get("skipped") or [] if isinstance(entry, dict)))
+
+
+def _sync_idle(reader, state, source_hash, key=None, features=()):
     return (state.get("protocol") == 2 and (key is None or state.get("owner") == key)
             and state.get("complete")
             and state.get("source_hash") == source_hash
+            and not _lineage_pending(reader, state, _local_lineage(reader, features, state))
             and _effective(reader, reader.meta()) in ("finished", "crashed"))
 
 
@@ -453,6 +481,61 @@ def _identity(client):
     return client._sync_identity
 
 
+def _push_lineage(reader, client, state, commit, result, save):
+    if not _lineage_pending(reader, state, commit):
+        return
+
+    def skip(reason):
+        result.warnings.append(f"lineage: {reason}")
+        _remember_skip(state, "lineage", reader.run_id, reason)
+        result.skipped += 1
+        save()
+
+    try:
+        remote = client.lineage_state(reader.run_id)
+        if remote.get("commit") != commit:
+            fd, name = tempfile.mkstemp(prefix="lineage-", suffix=".bundle", dir=reader.root)
+            os.close(fd)
+            path = Path(name)
+            try:
+                tips = remote.get("tips", [])
+                for attempt in range(2):
+                    try:
+                        lineage.bundle_for_run(reader.root, reader.run_id, tips, path)
+                    except (ValueError, subprocess.CalledProcessError) as exc:
+                        skip(str(exc))
+                        return
+                    size = path.stat().st_size
+                    try:
+                        with path.open("rb") as handle:
+                            client.put_lineage(reader.run_id, handle, size)
+                    except HTTPError as exc:
+                        if (attempt == 0 and exc.response is not None
+                                and exc.response.status_code == 422
+                                and _error_detail(exc.response) == "missing prerequisite"):
+                            tips = []
+                            continue
+                        raise
+                    result.files += 1
+                    result.bytes += size
+                    break
+            finally:
+                path.unlink(missing_ok=True)
+        state["lineage"] = commit
+        save()
+    except (Conflict, HTTPError) as exc:
+        if isinstance(exc, Conflict):
+            if exc.payload.get("error") != "lineage ref differs":
+                _check_owner(reader, client, exc.payload)
+                raise
+            reason = "lineage ref differs"
+        elif exc.response is not None and exc.response.status_code == 422:
+            reason = _error_detail(exc.response) or "invalid bundle"
+        else:
+            raise
+        skip(reason)
+
+
 def _check_owner(reader, client, payload):
     owner = payload.get("owner")
     if owner and owner != _identity(client)["key"]:
@@ -532,6 +615,8 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False):
         source_hash = hashlib.sha256(json.dumps({name: {k: v for k, v in item.items() if k != "data"}
                                                 for name, item in files.items()}, sort_keys=True).encode()).hexdigest()
     state = _host_state(reader, host)
+    features = ("lineage",) if dry_run else _identity(client).get("features", [])
+    lineage_commit = _local_lineage(reader, features, state)
 
     def save():
         if not dry_run:
@@ -545,7 +630,8 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False):
     if not dry_run and state.get("owner"):
         _check_owner(reader, client, state)
     if (state.get("complete") and state.get("source_hash") == source_hash
-            and effective in ("finished", "crashed")):
+            and effective in ("finished", "crashed")
+            and not _lineage_pending(reader, state, lineage_commit)):
         result.status = "up to date"
         result.complete = True
         if prune and not dry_run and not state.get("pruned"):
@@ -566,6 +652,8 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False):
                 result.files += 1
                 result.bytes += amount
         result.objects = len(set(hashes) - _skipped_ids(state))
+        if _lineage_pending(reader, state, lineage_commit):
+            result.files += 1
         result.status = "dry-run (would send; objects unchecked)"
         return
 
@@ -710,6 +798,7 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False):
                 append_file(name)
             for name in atomic_names:
                 atomic(name)
+            _push_lineage(reader, client, state, lineage_commit, result, save)
             # Every non-idle pass commits, even when a previous pass sent all
             # bytes and then failed to commit. Completion requires this success.
             try:
@@ -739,12 +828,14 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False):
                 raise RunMissingError(response=exc.response) from exc
             missing_retried = True
             state["files"].clear()
+            state.pop("lineage", None)
             save()
             rewrites = _recover(reader, client, files, state)
             save()
     state["source_hash"] = source_hash
     state["complete"] = bool(fingerprint_available and effective in ("finished", "crashed")
-                             and _source_hash(reader) == source_hash and not pending)
+                             and _source_hash(reader) == source_hash and not pending
+                             and not _lineage_pending(reader, state, lineage_commit))
     save()
     result.complete = state["complete"]
     result.status = "synced" if result.complete else "partial" if effective in ("finished", "crashed") else "partial (running)"
@@ -919,7 +1010,7 @@ def _order_runs_lineage(root, run_ids):
     return result
 
 
-def _selected_ids(root, host, explicit, include_all, prune=False, key=None):
+def _selected_ids(root, host, explicit, include_all, prune=False, key=None, features=()):
     selected = list(dict.fromkeys(explicit))
     if include_all:
         for meta in list_runs(root):
@@ -929,7 +1020,7 @@ def _selected_ids(root, host, explicit, include_all, prune=False, key=None):
             try:
                 reader = RunReader(root, run_id)
                 state = _host_state(reader, host)
-                if _sync_idle(reader, state, _source_hash(reader), key=key):
+                if _sync_idle(reader, state, _source_hash(reader), key=key, features=features):
                     if not (prune and not state.get("pruned")):
                         continue
             except Exception:
@@ -998,6 +1089,7 @@ def _follow(args, root, host, api_key):
             if identity is not None:
                 selected = [rid for rid in _selected_ids(
                     root, host, run_ids, include_all, prune=prune, key=identity["key"],
+                    features=identity.get("features", []),
                 ) if rid not in permanent_ids]
                 failure_log.prune(selected)
                 for run_id in selected:
@@ -1144,7 +1236,8 @@ def cmd_sync(args):
         while True:
             failures = 0
             selected = _selected_ids(root, host, args.run_ids, args.all, prune=prune,
-                                     key=_identity(client)["key"] if client is not None else None)
+                                     key=_identity(client)["key"] if client is not None else None,
+                                     features=_identity(client).get("features", []) if client is not None else ("lineage",))
             failure_log.prune(selected)
             if not selected and args.all:
                 print("up to date", flush=True)

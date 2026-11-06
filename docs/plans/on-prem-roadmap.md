@@ -72,11 +72,11 @@ Update the status column in the PR that changes it. Values: `not started`,
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 7 † | Lineage replication | 2.0 | Codex | M | to write | not started |
-| 8 | By-reference artifacts | 2.0 | Cursor | S–M | to write | not started |
-| 9 | EFS benchmark and tuning | 2.0 | Cursor | S | to write | not started |
-| 10 | Server operator commands | 2.0 | Codex | S | to write | not started |
-| 10b † | Server setup command (`server up`) | 2.0 | – | M | to write | not started |
+| 7 † | Lineage replication | 2.0 | Codex | M | [plan](packages/7-lineage-replication.md) | done (2.1 PR) |
+| 8 | By-reference artifacts | 2.0 | Cursor | S–M | [plan](packages/8-byref-artifacts.md) | plan ready |
+| 9 | EFS benchmark and tuning | 2.0 | Cursor | S | [plan](packages/9-efs-benchmark.md) | plan ready |
+| 10 | Server operator commands | 2.0 | Codex | S | [plan](packages/10-server-operator-commands.md) | plan ready |
+| 10b † | Server setup command (`server up`) | 2.0 | Cursor | M | [plan](packages/10b-server-up.md) | plan ready |
 
 - **7 † Lineage replication.** The client pushes a `git bundle` of each run's
   shadow commit (`lineage/<project-key>.git`, `refs/runs/<id>`), incremental
@@ -175,4 +175,25 @@ Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
-None open (Nov 5, 2026).
+- **Transient Git failures during a lineage receive become permanent skips**
+  (found in package 7 review, Nov 6, 2026).
+  - Where: `src/agenticml/server/lineage.py` `receive()`, the
+    `CalledProcessError` mapping for `index-pack`, `rev-list` and `cat-file`.
+  - Problem: a full disk (ENOSPC) or similar environment error from those
+    commands answers 422 `invalid bundle`, which the client records as a
+    permanent lineage skip for that run.
+  - Fix: tell validation failures apart from environment failures (check
+    free space first, or inspect the exit status and errno-like stderr
+    under `LC_ALL=C`) and answer 503 for the latter.
+  - Done when: a test that makes `index-pack` fail with a simulated ENOSPC
+    gets 503 and the client retries without remembering a skip.
+- **A stale `refs/runs/<id>.lock` blocks a run's lineage forever**
+  (found in package 7 review, Nov 6, 2026).
+  - Where: `src/agenticml/server/lineage.py` `receive()`.
+  - Problem: a server killed during `update-ref` can leave the ref lock
+    file; every later receive for that run then gets 503 `lineage busy`.
+  - Fix: under the repo flock (which already serializes writers), remove a
+    `refs/runs/<id>.lock` older than the receive timeout before
+    `update-ref`, or have `agenticml server verify` (package 10) report it.
+  - Done when: a test with a leftover lock file receives successfully, or
+    `server verify` reports it with the fix command.

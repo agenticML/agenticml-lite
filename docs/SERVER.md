@@ -253,13 +253,23 @@ The server tracks run lifecycle via commits recorded in `remote.json`:
 
 Runs uploaded with `sync --follow` commit heartbeats at least every 60 seconds while active, preventing live runs from showing as stale.
 
-## Unsupported features in 2.0
+## Sync features and limits
 
-Release 2.0 supports metric, scalar, event, media, and copied artifact synchronization over [protocol v2](PROTOCOL.md). The following features are not uploaded in 2.0:
+The server supports metric, scalar, event, media, copied artifact, and lineage synchronization over [protocol v2](PROTOCOL.md). Install `git` on the server to enable lineage code diffs. Git is detected at startup; if missing, the server logs a warning and leaves the `lineage` feature off. The client sends incremental shadow-repository bundles, and server code diffs then match local diffs. No server worktree checkout is needed.
+
+Lineage validation supports data directory paths containing `:`. Repository
+initialization and ref publication failures (including stale Git lock files),
+Git timeouts, and filesystem failures return retryable 503 `lineage busy`
+responses; clients leave the run incomplete without remembering a permanent
+skip. If a failed publication cannot be safely rolled back, the server retains
+the promoted packs so any published ref keeps its objects. Startup removes
+abandoned `lineage-*` quarantine directories under `server/tmp` after a crash
+and warns about other subdirectories.
+
+The following limits remain:
 
 - **Run notes (`notes.md`)**: Notes remain local to the machine where they were written.
 - **By-reference artifacts**: Artifacts logged with `copy=False` are not uploaded to the server (scheduled for Release 2.1).
-- **Lineage code diffs**: The server displays the lineage run graph, but Git diffs between commits are not replicated in 2.0 (the dashboard displays "code diff not available on this server"; scheduled for Release 2.1).
 - **Cross-key run collision**: A run ID is owned by the key that first created it. Pushing to an existing run ID using a different key fails with an error.
 
 ## Configuration reference

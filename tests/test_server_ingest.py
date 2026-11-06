@@ -104,7 +104,10 @@ def test_health_auth_scopes_and_revocation(server):
         assert status == 401 and obj == {"error": "unauthorized"}
         assert response_headers["WWW-Authenticate"] == "Bearer"
     assert raw(server, "GET", "/v2/whoami", [("Authorization", "bEaReR " + server.test_key)])[0] == 200
-    assert request(server, "/v2/whoami")[1] == {"key": "one", "scope": "sync", "protocol": 2, "features": []}
+    assert request(server, "/v2/whoami")[1] == {
+        "key": "one", "scope": "sync", "protocol": 2,
+        "features": ["lineage"] if server.lineage_enabled else [],
+    }
     _, admin = server.keys.create("admin", "admin")
     assert request(server, "/v2/whoami", key=admin)[1]["scope"] == "admin"
     assert put_meta(server, "admin-run", key=admin)[0] == 200
@@ -118,7 +121,7 @@ def test_zero_keys_and_environment(tmp_path):
         assert raw(httpd, "GET", "/v2/whoami")[0] == 401
     with running(tmp_path / "env", "a" * 32) as httpd:
         assert raw(httpd, "GET", "/v2/whoami", [("Authorization", "Bearer " + "a" * 32)])[1] == {
-            "key": "env", "scope": "admin", "protocol": 2, "features": [],
+            "key": "env", "scope": "admin", "protocol": 2, "features": ["lineage"] if httpd.lineage_enabled else [],
         }
         assert not (httpd.data_dir / "server" / "keys.json").exists()
 
@@ -173,6 +176,24 @@ def test_lock_tmp_cleanup_and_permissions(tmp_path, caplog):
         httpd.server_close()
     with make_server(tmp_path, port=0):
         pass
+
+
+def test_startup_removes_abandoned_lineage_quarantines(tmp_path, caplog):
+    app.prepare_data_dir(tmp_path)
+    tmp = tmp_path / "server" / "tmp"
+    pack = tmp / "lineage-abandoned" / "pack"
+    pack.mkdir(parents=True)
+    (pack / "partial.pack").write_bytes(b"partial")
+    (tmp / "other").mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "safe").write_bytes(b"safe")
+    (tmp / "lineage-link").symlink_to(outside, target_is_directory=True)
+    with make_server(tmp_path, port=0):
+        assert sorted(p.name for p in tmp.iterdir()) == ["other"]
+        assert (outside / "safe").read_bytes() == b"safe"
+        assert "ignoring subdirectory in server/tmp: " + str(tmp / "other") in caplog.text
+        assert "ignoring subdirectory in server/tmp: " + str(tmp / "lineage-abandoned") not in caplog.text
 
 
 @pytest.mark.parametrize("reader", [False, True], ids=["no-reader", "with-reader"])
