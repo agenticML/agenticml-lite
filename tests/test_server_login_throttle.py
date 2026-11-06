@@ -300,7 +300,7 @@ def test_http_throttle_refuses_even_a_good_key_other_address_signs_in(server):
             raise
         pytest.skip("cannot bind 127.0.0.2")
     assert status == 200
-    assert payload == {"ok": True, "key": "admin"}
+    assert payload == {"ok": True, "user": "admin", "role": "admin"}
     assert "Set-Cookie" in hdrs
 
 

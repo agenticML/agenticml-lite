@@ -1169,6 +1169,17 @@ def _media_type(value):
     return value.split(";", 1)[0].strip().lower()
 
 
+def _notes_writable(handler):
+    """Local mode follows read_only; server mode follows the principal's notes action."""
+    if getattr(handler.server, "auth", None) is None:
+        return not handler.server.read_only
+    principal = getattr(handler, "principal", None)
+    if principal is None:
+        return False
+    from agenticml.server.users import allowed
+    return allowed(principal, "notes")
+
+
 def _note_run_id(raw_path):
     """Run id when ``raw_path`` is exactly ``/api/runs/<id>/notes``."""
     try:
@@ -1400,7 +1411,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._put()
         except notes.NoteConflict as exc:
             note = dict(exc.note)
-            note["writable"] = True
+            note["writable"] = _notes_writable(self)
             self._error({"error": "conflict", "note": note}, 409)
         except notes.NoteTooLarge:
             self._error({"error": "note too large"}, 413)
@@ -1545,6 +1556,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             self._error({"error": "read-only"}, 403)
             return
+        if getattr(self.server, "auth", None) is not None and not _notes_writable(self):
+            self.close_connection = True
+            self._error({"error": "read-only"}, 403)
+            return
         if not self._csrf_ok():
             self.close_connection = True
             self._error({"error": "cross-site request refused"}, 403)
@@ -1580,7 +1595,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             raise ValueError("short body")
         text, revision = _parse_note_body(body)
         saved = notes.write_note(self.server.root, run_id, text, revision)
-        saved["writable"] = True
+        saved["writable"] = _notes_writable(self)
         self._json(saved)
 
     def __getattr__(self, name):
@@ -1668,7 +1683,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             else:
                 project = None
             listed = notes.list_notes(self.server.root, project)
-            listed["writable"] = not self.server.read_only
+            listed["writable"] = _notes_writable(self)
             return self._json(listed)
         if path == "/api/runs":
             from ..lineage import run_task
@@ -1712,7 +1727,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 raise FileNotFoundError()
             if route == "notes":
                 note = notes.read_note(self.server.root, run_id)
-                note["writable"] = not self.server.read_only
+                note["writable"] = _notes_writable(self)
                 return self._json(note)
             with self.server.run_reader(run_id) as run:
                 if route == "":

@@ -487,12 +487,23 @@ def cmd_ui(args):
 
 def cmd_server_serve(args):
     from .server import serve
+    from .server.webauth import parse_identity_header, parse_trusted_proxies
 
     public_url = args.public_url
     if public_url is None:
         public_url = os.environ.get("AGENTICML_SERVER_PUBLIC_URL") or None
+    if args.trusted_proxy is None:
+        raw = os.environ.get("AGENTICML_SERVER_TRUSTED_PROXIES", "")
+        proxies = [part.strip() for part in raw.split(",") if part.strip()]
+    else:
+        proxies = args.trusted_proxy
+    identity = args.identity_header
+    if identity is None:
+        identity = os.environ.get("AGENTICML_SERVER_IDENTITY_HEADER") or None
     try:
-        serve(args.data, args.host, args.port, public_url)
+        serve(args.data, args.host, args.port, public_url,
+              trusted_proxies=parse_trusted_proxies(proxies),
+              identity_header=parse_identity_header(identity))
     except KeyboardInterrupt:
         pass
     except (OSError, ValueError, OverflowError) as exc:
@@ -591,6 +602,37 @@ def cmd_server_keys(args):
     return 0
 
 
+def _invite_base(args):
+    url = getattr(args, "public_url", None) or os.environ.get("AGENTICML_SERVER_PUBLIC_URL")
+    if isinstance(url, str) and url.strip():
+        return url.strip().rstrip("/")
+    return None
+
+
+def _print_invite(token, base):
+    if base:
+        print(f"{base}/invite?token={token}")
+    else:
+        print(f"/invite?token={token}")
+        print("open it on your server's address")
+
+
+def _read_cli_password(args):
+    if getattr(args, "stdin", False):
+        raw = sys.stdin.readline()
+        if raw.endswith("\n"):
+            raw = raw[:-1]
+        if raw.endswith("\r"):
+            raw = raw[:-1]
+        return raw
+    import getpass
+    first = getpass.getpass("Password: ")
+    second = getpass.getpass("Confirm: ")
+    if first != second:
+        raise ValueError("passwords do not match")
+    return first
+
+
 def cmd_server_users(args):
     from .server.keys import KeyStore, KeyStoreUnavailable
     from .server.users import UserStore, migrate
@@ -605,6 +647,14 @@ def cmd_server_users(args):
         if args.users_action == "add":
             users.add(args.name, role=args.role, identity=args.identity,
                       reclaim_runs=args.reclaim_runs)
+            if not args.no_invite:
+                token = users.create_invite(args.name)
+                _print_invite(token, _invite_base(args))
+        elif args.users_action == "invite":
+            token = users.create_invite(args.name)
+            _print_invite(token, _invite_base(args))
+        elif args.users_action == "set-password":
+            users.set_password(args.name, _read_cli_password(args))
         elif args.users_action == "remove":
             revoked = users.remove(args.name)
             print(f"removed {args.name} ({revoked} keys)")
@@ -1213,6 +1263,10 @@ def main(argv=None):
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8080)
     p_serve.add_argument("--public-url", default=None, help="Public server URL (default: AGENTICML_SERVER_PUBLIC_URL)")
+    p_serve.add_argument("--trusted-proxy", action="append", default=None, metavar="CIDR",
+                        help="Trust this proxy CIDR for X-Forwarded-For and identity headers (repeatable)")
+    p_serve.add_argument("--identity-header", choices=("alb", "tailscale", "oauth2-proxy"),
+                        default=None, help="Honour this proxy identity header (requires --trusted-proxy)")
     p_serve.set_defaults(func=cmd_server_serve)
     p_up = server_sub.add_parser("up", help="Serve on loopback through Tailscale Funnel")
     p_up.add_argument("--data", default=None, help="Data directory (default: AGENTICML_SERVER_DATA or ~/.agenticml-server)")
@@ -1249,8 +1303,20 @@ def main(argv=None):
     p_users_add.add_argument("--role", choices=("viewer", "member", "admin"), default="member")
     p_users_add.add_argument("--identity", default=None)
     p_users_add.add_argument("--reclaim-runs", action="store_true")
+    p_users_add.add_argument("--no-invite", action="store_true")
+    p_users_add.add_argument("--public-url", default=None)
     p_users_add.add_argument("--data", default=None)
     p_users_add.set_defaults(func=cmd_server_users)
+    p_users_invite = users_sub.add_parser("invite")
+    p_users_invite.add_argument("name")
+    p_users_invite.add_argument("--public-url", default=None)
+    p_users_invite.add_argument("--data", default=None)
+    p_users_invite.set_defaults(func=cmd_server_users)
+    p_users_password = users_sub.add_parser("set-password")
+    p_users_password.add_argument("name")
+    p_users_password.add_argument("--stdin", action="store_true")
+    p_users_password.add_argument("--data", default=None)
+    p_users_password.set_defaults(func=cmd_server_users)
     p_users_list = users_sub.add_parser("list")
     p_users_list.add_argument("--json", action="store_true")
     p_users_list.add_argument("--data", default=None)

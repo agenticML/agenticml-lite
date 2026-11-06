@@ -268,7 +268,8 @@ class IngestHandler(DashboardHandler):
         values = self.headers.get_all("Authorization") or []
         ticket = None
         if values:
-            retry_after, ticket = self.server.web.throttle.begin(self.client_address[0])
+            retry_after, ticket = self.server.web.throttle.begin(
+                self.server.web.client_address(self))
             if ticket is None:
                 self.close_connection = True
                 raise _RequestError(

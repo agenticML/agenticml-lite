@@ -88,8 +88,17 @@ def assert_no_overflow(page):
 def sign_in(page, server, key):
     page.goto(server["url"])
     expect(page.get_by_role("heading", name="Sign in", exact=True)).to_be_visible()
+    page.get_by_role("button", name="Sign in with an admin key", exact=True).click()
     page.locator("#key").fill(key)
-    page.get_by_role("button", name="Sign in", exact=True).click()
+    page.locator("#login").get_by_role("button", name="Sign in", exact=True).click()
+
+
+def sign_in_password(page, server, user, password):
+    page.goto(server["url"])
+    expect(page.get_by_role("heading", name="Sign in", exact=True)).to_be_visible()
+    page.locator("#user").fill(user)
+    page.locator("#password").fill(password)
+    page.locator("#password-login").get_by_role("button", name="Sign in", exact=True).click()
 
 
 def test_login_sync_key_refused_admin_shows_run(page, server_ui):
@@ -97,7 +106,7 @@ def test_login_sync_key_refused_admin_shows_run(page, server_ui):
     sign_in(page, server_ui, server_ui["sync"])
     expect(page.get_by_role("alert")).to_have_text("this is a sync key; sign in with an admin key")
     page.locator("#key").fill(server_ui["admin"])
-    page.get_by_role("button", name="Sign in", exact=True).click()
+    page.locator("#login").get_by_role("button", name="Sign in", exact=True).click()
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
     expect(page.get_by_role("link", name="synced-run", exact=True)).to_be_visible()
     expect(page.get_by_text("Signed in as admin")).to_be_visible()
@@ -181,10 +190,54 @@ def test_no_overflow_login_list_and_detail(page, server_ui):
     page.goto(server_ui["url"])
     expect(page.get_by_role("heading", name="Sign in", exact=True)).to_be_visible()
     assert_no_overflow(page)
+    page.get_by_role("button", name="Sign in with an admin key", exact=True).click()
     page.locator("#key").fill(server_ui["admin"])
-    page.get_by_role("button", name="Sign in", exact=True).click()
+    page.locator("#login").get_by_role("button", name="Sign in", exact=True).click()
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
     assert_no_overflow(page)
     page.get_by_role("link", name="synced-run", exact=True).click()
     expect(page.get_by_role("heading", name="synced-run", exact=True)).to_be_visible()
     assert_no_overflow(page)
+
+
+def test_password_sign_in(page, tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    httpd = make_server(tmp_path / "data", port=0)
+    httpd.users.add("alice", role="member")
+    httpd.users.set_password("alice", "password1234")
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
+    thread.start()
+    server = {"url": f"http://127.0.0.1:{httpd.server_address[1]}"}
+    try:
+        sign_in_password(page, server, "alice", "password1234")
+        expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()
+
+
+def test_invite_page_sets_password_and_overflow(page, tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    httpd = make_server(tmp_path / "data", port=0)
+    httpd.users.add("bob", role="member")
+    token = httpd.users.create_invite("bob")
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        page.set_viewport_size({"width": 375, "height": 812})
+        page.goto(f"{url}/invite?token={token}")
+        expect(page.get_by_role("heading", name="Choose a password", exact=True)).to_be_visible()
+        expect(page).to_have_url(f"{url}/invite")
+        assert token not in page.url
+        assert_no_overflow(page)
+        page.locator("#password").fill("password1234")
+        page.locator("#password2").fill("password1234")
+        page.get_by_role("button", name="Save password", exact=True).click()
+        expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+        assert_no_overflow(page)
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()

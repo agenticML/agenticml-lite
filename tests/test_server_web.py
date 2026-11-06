@@ -96,7 +96,7 @@ def test_login_admin_cookie_and_failures(server, caplog):
     caplog.set_level("INFO", logger="agenticml.server.webauth")
     status, payload, hdrs = login(server)
     assert status == 200
-    assert payload == {"ok": True, "key": "admin"}
+    assert payload == {"ok": True, "user": "admin", "role": "admin"}
     name, token, flags = cookie_parts(hdrs["Set-Cookie"])
     assert name == "aml_session"
     assert token
@@ -267,7 +267,10 @@ def test_session_endpoint_and_local_ui(server, tmp_path):
     status, _, body, _ = authed(server, "/api/server/session")
     assert status == 200
     assert json.loads(body) == {
-        "server": True, "key": "admin", "scope": "admin", "user": "admin", "role": "admin"}
+        "server": True, "user": "admin", "role": "admin", "via": "key", "key": "admin",
+        "scope": "admin",
+        "can": {"notes": True, "own_keys": True, "all_keys": True, "users": True, "audit": True},
+        "password_set": False, "identity_proxy": False}
 
     httpd = ui_server.make_server(tmp_path, "127.0.0.1", 0)
     thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
@@ -380,11 +383,14 @@ def test_env_key_signs_in(tmp_path, monkeypatch):
         httpd.admin_key = env
         status, payload, hdrs = login(httpd, env)
         assert status == 200
-        assert payload == {"ok": True, "key": "env"}
+        assert payload == {"ok": True, "user": "env", "role": "admin"}
         status, _, body, _ = authed(httpd, "/api/server/session", cookie=hdrs["Set-Cookie"])
         assert status == 200
         assert json.loads(body) == {
-            "server": True, "key": "env", "scope": "admin", "user": "env", "role": "admin"}
+            "server": True, "user": "env", "role": "admin", "via": "key", "key": "env",
+            "scope": "admin",
+            "can": {"notes": True, "own_keys": True, "all_keys": True, "users": True, "audit": True},
+            "password_set": False, "identity_proxy": False}
 
 
 def test_current_matches_name_and_hash(server):

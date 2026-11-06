@@ -245,3 +245,24 @@ and `cli.py` to the functions named here.
 - Update the roadmap Backlog entry for the Funnel throttle bucket (remove
   it; package 13's status line records the fix).
 - Report any deviation from this plan instead of changing the approach.
+
+## As built (review outcome)
+
+Reviewed by Sonnet (three rounds) and Codex (second review). Changes from
+the plan that came out of review:
+
+- Every user has an account-lifetime `id` (32 hex characters) in
+  `users.json`; sessions bind to `id` and `generation`, so a deleted and
+  recreated user name never revives an old cookie.
+- Sessions are minted only for the exact record that was verified (password,
+  invite, setup, key); a concurrent re-invite or role change in between
+  answers 401.
+- Identities are unique case-insensitively, and an ambiguous proxy match
+  fails closed.
+- The current-password check on `/api/server/account/password` shares the
+  login throttle; a wrong `/setup` token and an expired invite count as
+  failures.
+- A failed `/setup` rolls back the user it created and the `setup-closed`
+  marker, so setup stays armed.
+- `X-Forwarded-For` entries with a port are accepted; `::ffff:a.b.c.d/N`
+  trusted ranges are treated as IPv4.
