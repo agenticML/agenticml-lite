@@ -17,6 +17,7 @@ import weakref
 
 from agenticml.store import layout
 from agenticml.ui.server import DashboardServer, _browser_host, _loopback_bind
+from .audit import AuditLog
 from .keys import KeyStore, env_key_looks_weak, validate_env_key
 from .users import UserStore, migrate
 from .audit import AuditLog

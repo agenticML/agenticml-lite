@@ -109,7 +109,7 @@ def test_login_sync_key_refused_admin_shows_run(page, server_ui):
     page.locator("#login").get_by_role("button", name="Sign in", exact=True).click()
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
     expect(page.get_by_role("link", name="synced-run", exact=True)).to_be_visible()
-    expect(page.get_by_text("Signed in as admin")).to_be_visible()
+    expect(page.get_by_text("Signed in as admin · admin")).to_be_visible()
 
 
 def test_last_synced_and_sign_out(page, server_ui):
@@ -170,7 +170,7 @@ def test_lineage_inspector_shows_server_code_diff_message(page, tmp_path, monkey
     try:
         sign_in(page, server, admin)
         expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
-        expect(page.get_by_text("Signed in as admin")).to_be_visible()
+        expect(page.get_by_text("Signed in as admin · admin")).to_be_visible()
         page.get_by_role("button", name="Open lineage of asr", exact=True).click()
         dialog = page.get_by_role("dialog")
         expect(dialog).to_be_visible()

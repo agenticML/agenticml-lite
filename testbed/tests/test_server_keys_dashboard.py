@@ -53,7 +53,7 @@ def create_key(page, name, scope="sync"):
 
 
 def key_row(page, name):
-    return page.get_by_role("row").filter(has=page.locator('td[data-label="Name"]').filter(
+    return page.get_by_role("row").filter(has=page.locator('td[data-label="Name"] .key-name').filter(
         has_text=re.compile(f"^{re.escape(name)}$")))
 
 
@@ -208,7 +208,8 @@ def test_create_copy_close_and_revoke_sync_key(page, context, server_ui):
     expect(row).to_be_visible()
     expect(row.get_by_role("cell", name="sync", exact=True)).to_be_visible()
     expect(row.get_by_role("cell", name="never", exact=True)).to_be_visible()
-    expect(row.get_by_role("cell", name="admin", exact=True)).to_be_visible()
+    expect(row.locator('td[data-label="User"]')).to_have_text("admin")
+    expect(row.locator('td[data-label="Created by"]')).to_have_text("admin")
     expect(row.get_by_role("cell", name="0", exact=True)).to_be_visible()
     expect(row.get_by_role("cell", name=f"{value[:8]}…", exact=True)).to_be_visible()
     assert_key_cleared(page, value)
