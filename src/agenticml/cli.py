@@ -502,6 +502,34 @@ def cmd_server_serve(args):
     return 0
 
 
+def _parse_up_port(value):
+    try:
+        port = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("port must be 1..65535")
+    if port != 0 and not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be 1..65535")
+    return port
+
+
+def cmd_server_up(args):
+    from .server.up import UpError, up
+
+    try:
+        up(args.data, args.port, install=args.install, force=args.force)
+    except KeyboardInterrupt:
+        pass
+    except UpError as exc:
+        print((str(exc).splitlines() or [type(exc).__name__])[0], file=sys.stderr)
+        return 1
+    except (OSError, ValueError, OverflowError) as exc:
+        print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
+        return 1
+    if not args.install:
+        print("stopped")
+    return 0
+
+
 def cmd_server_keys(args):
     from .server.app import resolve_data_dir
     from .server.keys import KeyStore, KeyStoreUnavailable
@@ -1122,6 +1150,12 @@ def main(argv=None):
     p_serve.add_argument("--port", type=int, default=8080)
     p_serve.add_argument("--public-url", default=None, help="Public server URL (default: AGENTICML_SERVER_PUBLIC_URL)")
     p_serve.set_defaults(func=cmd_server_serve)
+    p_up = server_sub.add_parser("up", help="Serve on loopback through Tailscale Funnel")
+    p_up.add_argument("--data", default=None, help="Data directory (default: AGENTICML_SERVER_DATA or ~/.agenticml-server)")
+    p_up.add_argument("--port", type=_parse_up_port, default=8080)
+    p_up.add_argument("--install", action="store_true", help="Write a user service that runs server up, then exit")
+    p_up.add_argument("--force", action="store_true", help="Overwrite an existing user service file")
+    p_up.set_defaults(func=cmd_server_up)
     for action, func, help_text in (
             ("status", cmd_server_status, "Show runs, sizes, and key activity"),
             ("verify", cmd_server_verify, "Check objects, run sizes, and lineage")):

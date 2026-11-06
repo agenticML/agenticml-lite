@@ -29,6 +29,26 @@ Run directly (a venv anywhere the user owns is fine, e.g. `python3 -m venv ~/age
 ```
 `--data` falls back to `AGENTICML_SERVER_DATA`, then `~/.agenticml-server`. `--public-url` falls back to `AGENTICML_SERVER_PUBLIC_URL`.
 
+### Quick start on a laptop: `server up`
+
+On a Mac or Linux machine with Tailscale already installed and logged in:
+
+```bash
+agenticml server up
+```
+
+`server up` makes the server reachable from the public internet through Tailscale Funnel: anyone can reach the login page; only keys grant access. It takes port 443 of this machine's Tailscale serve config. This checks that Tailscale is running and that HTTPS certificates and Funnel are already allowed in the admin console (those approvals stay manual), creates the first admin key if none exists, serves on loopback, and turns Funnel on until the server stops. `Ctrl+C`, SIGTERM, or SIGHUP (closing the terminal) turns Funnel off. After SIGKILL, a crash, or power loss, Funnel stays on. The next `server up` on the same port turns it back on and off again; a stale Funnel entry for a different port is refused ("Tailscale already serves port 443 on this machine: check `tailscale funnel status` and turn it off first") and must be turned off with `tailscale funnel --https=443 off` first. All Funnel visitors reach the server from `127.0.0.1`, so they share one failed-login throttle bucket — someone sending bad keys can delay sign-in and syncs by up to 60 s (fixed by package 13 in 2.2).
+
+To start at login (systemd user unit on Linux, launchd agent on macOS):
+
+```bash
+agenticml server up --install
+```
+
+Then run the `systemctl --user` / `loginctl enable-linger` or `launchctl load` command it prints.
+
+The rest of this page is the manual path: `server serve` plus your own TLS proxy (including production systemd).
+
 ### TLS proxy
 
 The server serves plain HTTP over its configured port (typically loopback `127.0.0.1:8080`). In production or across a network, terminate TLS using a reverse proxy and configure the public URL:
@@ -38,6 +58,7 @@ The server serves plain HTTP over its configured port (typically loopback `127.0
   tailscale serve --bg 8080
   export AGENTICML_SERVER_PUBLIC_URL=https://<machine>.<tailnet>.ts.net
   ```
+  Or replace those steps with `agenticml server up` (Funnel instead of Serve; see above).
 - **Production:** Run behind Caddy, Nginx, or a cloud load balancer. Set the public URL to the proxied HTTPS URL.
 
 ### Systemd service

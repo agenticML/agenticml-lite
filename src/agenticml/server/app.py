@@ -273,7 +273,7 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
         raise
 
 
-def serve(data=None, host="127.0.0.1", port=8080, public_url=None):
+def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None):
     """Run until interrupted, with an optional environment admin key."""
     server = make_server(data, host, port, public_url, os.environ.get("AGENTICML_SERVER_KEY"))
     previous_handler = None
@@ -300,6 +300,8 @@ def serve(data=None, host="127.0.0.1", port=8080, public_url=None):
             logger.warning(
                 "browsers reach the dashboard only through a Host it accepts; "
                 "set --public-url behind a proxy")
+        if on_ready is not None:
+            on_ready(server)
         server.serve_forever()
     finally:
         try:
