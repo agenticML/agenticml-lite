@@ -76,6 +76,7 @@ Update the status column in the PR that changes it. Values: `not started`,
 | 8 | By-reference artifacts | 2.0 | Cursor | S–M | to write | not started |
 | 9 | EFS benchmark and tuning | 2.0 | Cursor | S | to write | not started |
 | 10 | Server operator commands | 2.0 | Codex | S | to write | not started |
+| 10b † | Server setup command (`server up`) | 2.0 | – | M | to write | not started |
 
 - **7 † Lineage replication.** The client pushes a `git bundle` of each run's
   shadow commit (`lineage/<project-key>.git`, `refs/runs/<id>`), incremental
@@ -99,6 +100,22 @@ Update the status column in the PR that changes it. Values: `not started`,
   last sync per key) and `agenticml server verify` (re-hash objects and check
   `remote.json` sizes against the files). Done when both are tested against a
   store with deliberately corrupted files.
+
+- **10b † Server setup command.** One command, `agenticml server up`, replaces
+  the manual laptop setup (find the tailnet URL, create the first admin key,
+  run `server serve --public-url`, run `tailscale funnel --bg`). It checks
+  that Tailscale is installed, logged in, and allowed to use HTTPS and Funnel,
+  and prints the exact fix when one is missing (those approvals stay manual).
+  It reads the public URL from `tailscale status --json`, creates the first
+  admin key if none exists so the `/setup` link is never exposed publicly,
+  serves on loopback, and turns Funnel on while the server runs and off when it
+  stops. `--install` writes a launchd job (macOS) or systemd unit (Linux) so
+  it starts at boot. Security-sensitive because it exposes the server to the
+  internet and creates admin keys. Added Nov 6, 2026 and deferred: it comes
+  after the other 2.1 packages unless reprioritized. Done when a fresh machine
+  with Tailscale logged in reaches a working HTTPS server with one command,
+  each missing prerequisite gives a clear error, and Funnel is off after the
+  server stops.
 
 ### 2.2: teams
 
