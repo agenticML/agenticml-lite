@@ -120,3 +120,40 @@ From the numbers, recommend:
   recommended settings, and the command to reproduce on EFS.
 - A Backlog entry for the real-EFS run exists; roadmap status for package 9
   is `done` in the 2.1 PR with that caveat stated.
+
+## Addendum (Nov 6, 2026): tuning found by the benchmark
+
+The object phase showed that the global `objects_lock` in
+`server/ingest.py` `_object()` is held across the temp file's `fsync`, the
+rename and the directory fsync. With a modelled 20 ms fsync, 8 clients saw
+object PUT p50 384.96 ms against 51.79 ms for 1 client (7.4x). Separately,
+`Client._request` does not retry 429, so a one-shot `agenticml sync` from
+several machines behind one address can fail on the login throttle's brief
+429 burst (only `--follow` backs off). Both are fixed in this package:
+
+1. **Object writes** (`server/ingest.py` `_object()`, `server/app.py`):
+   `fchmod` and `fsync` the request's private temp file before taking any
+   lock. Replace the global lock with one lock per object prefix directory
+   (`objects/<hh>`, 256 locks, created lazily under a small dict lock like
+   `run_lock`) held only for: the unsafe-destination check, the
+   already-present check (`utime` on 200), `mkdir`, `os.replace` and the
+   directory fsync. A concurrent upload of the same digest still answers 200
+   for the second one and its temp file is removed as today. Keep the
+   `objects_lock` attribute only if other code uses it (check
+   `grep -rn objects_lock src`), else remove it.
+2. **Client 429 retry** (`client.py` `_request`): treat 429 like 503:
+   retry up to `max_retries`, sleeping `Retry-After` when present and valid
+   (capped at 60 s), else the normal backoff. `whoami`'s explicit 429 raise
+   then only happens after retries are exhausted. Remove the benchmark's
+   runtime patch of `Client._RETRY_STATUSES`.
+3. Re-run the 20 ms configuration for 1 and 8 clients and the local 8-client
+   one; update the `docs/SERVER.md` tables and text with before/after
+   numbers.
+
+Tests: two concurrent PUTs of distinct objects (different prefixes) overlap
+their fsyncs (patch `os.fsync` with an event-based barrier that only passes
+when both are inside fsync at once, with a timeout); two concurrent PUTs of
+the same digest give one 201 and one 200 and one object file; client retries
+429 honouring `Retry-After` (fake server or mocked session) and gives up
+after `max_retries`. Second read-only review by Codex, since the object write
+path is part of the security-sensitive ingest server.

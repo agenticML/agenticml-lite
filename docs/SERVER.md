@@ -327,6 +327,71 @@ sudo chown -R agenticml:agenticml /var/lib/agenticml-server
 sudo systemctl start agenticml-server
 ```
 
+## Network filesystems (EFS)
+
+Every append, atomic write, and object put on the server does `os.fsync` plus a directory fsync. That is the main extra cost when `<data>` is on EFS or another network filesystem. `server/tmp` and `store` must already be on the same filesystem (the server refuses to start otherwise). Run a single server process per data directory. NFSv4 emulates `flock` on `server.lock`; AWS documents NFSv4.1 (`nfsvers=4.1`) for EFS, and that is the recommended mount.
+
+These numbers were measured on local NVMe, then again with a modelled fsync delay injected **only in the benchmark's server process**. They are not measurements on real EFS. 5 ms and 20 ms are assumptions for typical EFS commit latency on small writes. Recommendations below are from **1 and 8 clients only**; larger N is unmeasured.
+
+The first published tables held a process-wide `objects_lock` across each object PUT's temp-file `fsync`, rename, and directory fsync. After those runs, object writes fsync the private temp file with no lock held, then take one lock per `objects/<hh>` prefix only for the unsafe-destination check, the already-present check, `mkdir`, `os.replace`, and the directory fsync. The 20 ms 1-client and 8-client configs and the local 8-client config were re-run after that change. Before/after rows below use the numbers already published here as **before**. The local 1-client and both 5 ms rows were not re-run (labelled pre-change). Every before/after row is a single run with unquantified noise. The before and after runs were not on guaranteed identical machine state.
+
+**Machine:** Intel Core i7-14700K (28 threads), 32 GiB RAM, NVMe SSD `CT1000P3PSSD8` (931.5 G, ROTA=0), ext4 on `/dev/nvme0n1p3`, Python 3.10.12, git 2.34.1.
+
+**Workload** (`scripts/bench_server.py` defaults): each client writes 4 live runs × 4000 steps × 8 metrics and 50 distinct 65536-byte `copy=True` artifacts (split across that client's runs), then 3 passes of sync (one full sync, then two incremental append+sync passes, back to back). Clients start together. Uploaded payload on the first pass is about 4.32 MB per client (about 1.04 MB of scalars plus 3.28 MB of objects).
+
+### Local disk
+
+| Clients | Initial wall | Throughput | Incremental p50 / p95 | Commit p50 / p95 | Object PUT p50 / p95 | Objects/s | Server CPU |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 (pre-change) | 1.629 s | 2.65 MB/s | 0.640 s / 0.694 s | 14.32 ms / 16.81 ms | 10.94 ms / 13.85 ms | 30.69 (50 objects) | 1.206 s |
+| 8, before | 5.691 s | 6.07 MB/s | 1.289 s / 1.402 s | 25.94 ms / 80.99 ms | 52.42 ms / 70.47 ms | 70.28 (400 objects) | 9.505 s |
+| 8, after | 4.836 s | 7.15 MB/s | 1.558 s / 1.969 s | 43.56 ms / 87.60 ms | 28.00 ms / 45.91 ms | 82.72 (400 objects) | 11.006 s |
+
+The 8-client local run after the lock change used 11.006 s of server CPU over an 8.407 s sync window (about 1.31 cores). The server is above one core because fsync and I/O release the GIL; the Python work itself is close to one core. Before the change it was 9.505 s of CPU over an 8.444 s window (about 1.13 cores).
+
+### Modelled fsync delay (not EFS)
+
+| Delay | Clients | Initial wall | Throughput | Incremental p50 / p95 | Commit p50 / p95 | Object PUT p50 / p95 | Objects/s | Server CPU |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 5 ms (pre-change) | 1 | 2.859 s | 1.51 MB/s | 1.138 s / 1.155 s | 26.11 ms / 30.57 ms | 22.11 ms / 24.49 ms | 17.49 (50 objects) | 1.377 s |
+| 5 ms (pre-change) | 8 | 9.343 s | 3.70 MB/s | 1.663 s / 1.927 s | 37.01 ms / 79.08 ms | 123.74 ms / 140.46 ms | 42.81 (400 objects) | 10.904 s |
+| 20 ms | 1, before | 6.186 s | 0.70 MB/s | 2.384 s / 2.399 s | 56.33 ms / 60.45 ms | 51.79 ms / 55.05 ms | 8.08 (50 objects) | 1.413 s |
+| 20 ms | 1, after | 6.053 s | 0.71 MB/s | 2.386 s / 2.414 s | 55.21 ms / 58.59 ms | 51.13 ms / 54.14 ms | 8.26 (50 objects) | 1.315 s |
+| 20 ms | 8, before | 23.143 s | 1.49 MB/s | 3.207 s / 3.398 s | 65.00 ms / 92.52 ms | 384.96 ms / 412.60 ms | 17.28 (400 objects) | 11.272 s |
+| 20 ms | 8, after | 6.731 s | 5.13 MB/s | 2.930 s / 3.239 s | 63.77 ms / 125.78 ms | 49.47 ms / 58.58 ms | 59.43 (400 objects) | 8.895 s |
+
+Per-run locks hold across that run's fsyncs. They did not serialize unrelated clients' scalar appends or commits: on the 20 ms model after the object-lock change, eight clients finished the incremental pass in 1.2× the 1-client time (2.930 s vs 2.386 s). Commit p50 for 8 clients was 63.77 ms versus 55.21 ms for 1 client (a 1-vs-8 comparison, not before/after).
+
+Object PUTs previously held the process-wide `objects_lock` across `os.fsync`, `os.replace`, and a directory fsync. On the 20 ms model, eight clients (400 distinct objects) only reached 17.28 objects/s vs 8.08 objects/s for one client (2.1×, not 8×), and object PUT p50 rose from 51.79 ms to 384.96 ms (7.4×). After per-prefix locks with the temp-file fsync outside the lock, eight-client object PUT p50 is 49.47 ms (vs 51.13 ms for one client) and objects/s is 59.43 vs 8.26 (7.2×). Initial wall dropped from 23.143 s to 6.731 s, in line with the 1-client 6.053 s. The 1-client 20 ms row is unchanged within noise. The 1-client objects/s figure is still diluted by scalar work on the same initial pass; the PUT latencies are the cleaner signal.
+
+The lock change also showed regressions (each a single run, noise unquantified): local 8-client incremental p50 1.289→1.558 s / p95 1.402→1.969 s, local commit p50 25.94→43.56 ms, 20 ms 8-client commit p95 92.52→125.78 ms, and local server CPU 9.505→11.006 s. A hypothesis is that object PUTs now finish sooner and compete with appends and commits on one GIL-bound process.
+
+Three repeat runs of the local 8-client config on the final code (same workload) gave: initial wall 3.514 / 4.975 / 3.688 s, incremental p50 1.571 / 1.520 / 1.637 s, commit p50 25.72 / 26.13 / 27.48 ms (p95 45.24 / 49.63 / 44.40 ms), object PUT p50 21.99 / 29.12 / 22.12 ms, server CPU 6.0–6.5 s. So the local commit p50 rise above was noise (it matches the pre-change 25.94 ms); the incremental p50 is about 0.25 s higher than the single pre-change run, which is within the spread seen for initial wall time but was not re-measured before the change.
+
+### Recommended settings
+
+These are from 1 and 8 clients only. Larger N is unmeasured.
+
+- **`sync --follow --interval`:** keep the default 30 s. The slowest incremental pass here was 3.239 s (8 clients, 20 ms modelled delay, after the object-lock change; 3.398 s before) for 4 live runs. Passes ran back to back; this was not a 30 s follow loop.
+- **Heartbeat (60 s) vs stale (600 s):** the 60 s heartbeat was not exercised. Passes were back to back. The slowest commit was 125.78 ms (8-client, 20 ms modelled, commit p95 after the change; 92.52 ms before). At this N a 60 s heartbeat would stay well under the 600 s stale threshold; that is inferred from commit latency, not measured in a follow loop.
+- **`APPEND_CHUNK` (8 MiB):** leave it. Each series file in this workload is 32 kB per pass (`4000 × 8` bytes), far below 8 MiB. The cost is fsync round-trips per request, not chunk size. Shrinking the chunk would add requests and fsyncs.
+- **EFS mount options (not measured here):** `nfsvers=4.1`, `hard`, `noresvport`. NFSv4 emulates `flock`; 4.1 is the version to use. General Purpose vs Elastic throughput was not measured.
+
+### Reproduce on real EFS
+
+Point `--data` at the EFS mount and omit `--fsync-delay-ms`:
+
+```bash
+python scripts/bench_server.py --data /mnt/efs/agenticml --clients 1
+python scripts/bench_server.py --data /mnt/efs/agenticml --clients 8
+```
+
+The script starts a server on `127.0.0.1:0`, creates one sync key per client, and deletes `bench-*` runs and keys from `--data` on the way out. On loopback it probe-binds `127.0.0.1`–`127.0.0.N` and gives each client its own source address so the failed-authentication throttle (keyed by client IP) does not 429 concurrent processes. If those addresses are missing (typical on macOS), it prints a warning, falls back to `127.0.0.1` for every client, and enables client retries: more than about 6 simultaneous requests from one address may get a short 429.
+
+Machines behind the same NAT or HTTP proxy share one throttle bucket, even if they are distinct hosts. A burst of simultaneous starts can see a brief 429; the client retries 429 up to `max_retries`, sleeping `Retry-After` when present (capped at 60 s). With `--follow`, a single request can now wait up to about 3 × 60 s on repeated 429s before follow's own backoff starts. This benchmark uses `max_retries=0` when it has distinct `127.0.0.x` addresses.
+
+`--quick` is a smoke size (under a minute). Replace the modelled tables above with real-EFS numbers when that run is done.
+
 ## Upgrades
 
 Back up the data directory first.

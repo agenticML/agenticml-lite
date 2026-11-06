@@ -74,7 +74,7 @@ Update the status column in the PR that changes it. Values: `not started`,
 | --- | --- | --- | --- | --- | --- | --- |
 | 7 † | Lineage replication | 2.0 | Codex | M | [plan](packages/7-lineage-replication.md) | done (2.1 PR) |
 | 8 | By-reference artifacts | 2.0 | Cursor | S–M | [plan](packages/8-byref-artifacts.md) | done (2.1 PR) |
-| 9 | EFS benchmark and tuning | 2.0 | Cursor | S | [plan](packages/9-efs-benchmark.md) | plan ready |
+| 9 | EFS benchmark and tuning | 2.0 | Cursor | S | [plan](packages/9-efs-benchmark.md) | done (2.1 PR; real-EFS run in Backlog) |
 | 10 | Server operator commands | 2.0 | Codex | S | [plan](packages/10-server-operator-commands.md) | plan ready |
 | 10b † | Server setup command (`server up`) | 2.0 | Cursor | M | [plan](packages/10b-server-up.md) | plan ready |
 
@@ -175,6 +175,21 @@ Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
+- **Run the server benchmark on real EFS** (package 9 caveat, Nov 6, 2026).
+  - Where: `scripts/bench_server.py`; `docs/SERVER.md`, section "Network
+    filesystems (EFS)".
+  - Problem: the published numbers are local NVMe plus an fsync delay
+    injected only into the benchmark's server process. No EFS or NFS mount
+    was available, so real EFS commit latency, metadata operations and flock
+    behaviour are unmeasured.
+  - Fix: mount EFS (`nfsvers=4.1,hard,noresvport`) as the server data
+    directory, run `python scripts/bench_server.py --data /mnt/efs/agenticml
+    --clients 1` and `--clients 8` without `--fsync-delay-ms`, and replace
+    the modelled tables; revisit `--follow --interval` and `APPEND_CHUNK` if
+    the numbers disagree.
+  - Done when: `docs/SERVER.md` shows real-EFS numbers for 1 and 8 clients,
+    labelled as such with mount details, and the recommendations are
+    confirmed or updated.
 - **Transient Git failures during a lineage receive become permanent skips**
   (found in package 7 review, Nov 6, 2026).
   - Where: `src/agenticml/server/lineage.py` `receive()`, the

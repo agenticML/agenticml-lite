@@ -172,7 +172,8 @@ class IngestServer(DashboardServer):
             logger.warning("git is not installed; lineage code diffs are disabled")
         self.run_locks = weakref.WeakValueDictionary()
         self.run_locks_lock = threading.Lock()
-        self.objects_lock = threading.Lock()
+        self.object_locks = weakref.WeakValueDictionary()
+        self.object_locks_lock = threading.Lock()
         self._server_lock = None
         self._closing_workers = set()
         super().__init__(
@@ -188,6 +189,15 @@ class IngestServer(DashboardServer):
             if lock is None:
                 lock = threading.Lock()
                 self.run_locks[run_id] = lock
+            return lock
+
+    def object_lock(self, sha):
+        prefix = sha[:2]
+        with self.object_locks_lock:
+            lock = self.object_locks.get(prefix)
+            if lock is None:
+                lock = threading.Lock()
+                self.object_locks[prefix] = lock
             return lock
 
     def server_close(self, *, drain=0.0):

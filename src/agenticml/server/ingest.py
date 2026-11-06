@@ -447,18 +447,24 @@ class IngestHandler(DashboardHandler):
     def _object(self, sha, tmp, actual):
         if sha != actual:
             _fail(422, "hash mismatch", sha256=actual)
-        with self.server.objects_lock:
+        with layout.open_nofollow(tmp, "r+b") as handle:
+            os.fchmod(handle.fileno(), self.server.store_file_mode)
+            os.fsync(handle.fileno())
+        with self.server.object_lock(sha):
             dest = layout.object_path(self.server.root, sha)
             if (dest.exists() or dest.is_symlink()) and not _regular(dest):
                 raise ValueError("unsafe object destination")
             if objects.has(self.server.root, sha):
                 os.utime(dest, None, follow_symlinks=False)
                 return {"sha256": sha, "created": False}, 200
-            with layout.open_nofollow(tmp, "r+b") as handle:
-                os.fchmod(handle.fileno(), self.server.store_file_mode)
-                os.fsync(handle.fileno())
-            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                dest.parent.mkdir(parents=True)
+                created_prefix = True
+            except FileExistsError:
+                created_prefix = False
             layout.object_path(self.server.root, sha)
+            if created_prefix:
+                layout.fsync_dir(dest.parent.parent)
             os.replace(tmp, dest)
             layout.fsync_dir(dest.parent)
             return {"sha256": sha, "created": True}, 201

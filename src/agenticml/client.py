@@ -14,7 +14,7 @@ from .auth import normalize_api_key, normalize_host
 _CONNECT_TIMEOUT = 10
 _MIB = 1024 * 1024
 _MISSING_CHUNK = 10_000
-_RETRY_STATUSES = frozenset({500, 502, 503, 504})
+_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 _USER_AGENT = f"agenticml-lite/{__version__}"
 
 
@@ -44,7 +44,7 @@ def _session():
     return session
 
 
-def _retry_after_seconds(response):
+def _retry_after_seconds(response, cap=30.0):
     raw = response.headers.get("Retry-After")
     if raw is None:
         return None
@@ -52,9 +52,9 @@ def _retry_after_seconds(response):
         value = float(raw)
     except (TypeError, ValueError):
         return None
-    if not math.isfinite(value):
+    if not math.isfinite(value) or value < 0:
         return None
-    return min(max(value, 0.0), 30.0)
+    return min(value, cap)
 
 
 def _json_object(response):
@@ -140,9 +140,12 @@ class Client:
             if response.status_code in _RETRY_STATUSES:
                 if attempt + 1 == attempts:
                     response.raise_for_status()
-                retry_after = (
-                    _retry_after_seconds(response) if response.status_code == 503 else None
-                )
+                if response.status_code == 429:
+                    retry_after = _retry_after_seconds(response, cap=60.0)
+                elif response.status_code == 503:
+                    retry_after = _retry_after_seconds(response)
+                else:
+                    retry_after = None
                 response.close()
                 self._backoff(attempt, retry_after)
                 continue
