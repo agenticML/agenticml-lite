@@ -314,7 +314,7 @@ def test_ownership_failure_does_not_stop_other_runs(remote, tmp_path, capsys):
     other = writer_at(tmp_path, run_id="other")
     assert command(remote, writer, writer.run_id, other.run_id, key=key) == 1
     out = capsys.readouterr().out
-    assert "run id run-1 belongs to key box on this server" in out
+    assert "run id run-1 belongs to user admin on this server" in out
     assert "other  demo/train  synced" in out
     assert (remote[0].root / "runs/other/meta.json").exists()
 
@@ -325,7 +325,7 @@ def test_ownership_recovery_checks_before_objects(remote, tmp_path):
     (writer.run_dir / "sync.json").unlink()
     key = foreign_key(remote[0], "second")
     with Client(remote[1].base_url, key) as client:
-        with pytest.raises(ValueError, match="belongs to key admin"):
+        with pytest.raises(sync.OwnershipError, match="belongs to user admin"):
             push((remote[0], client), writer)
 
 
@@ -596,7 +596,7 @@ def test_ownership_with_all_does_not_skip_idle_foreign_run(remote, tmp_path, cap
     push(remote, writer)
     key = foreign_key(remote[0], "second")
     assert command(remote, writer, "--all", key=key) == 1
-    assert "belongs to key box" in capsys.readouterr().out
+    assert "belongs to user admin" in capsys.readouterr().out
 
 
 def test_event_line_beyond_limit_fails_before_append(remote, tmp_path, monkeypatch):
@@ -684,7 +684,7 @@ def test_failed_ownership_recovery_does_not_save_wrong_owner(remote, tmp_path, c
     before = path.read_bytes()
     key = foreign_key(remote[0], "second")
     assert command(remote, writer, writer.run_id, key=key) == 1
-    assert "belongs to key admin" in capsys.readouterr().out
+    assert "belongs to user admin" in capsys.readouterr().out
     assert path.read_bytes() == before
     assert command(remote, writer, writer.run_id) == 0
     assert state(remote, writer)["owner"] == "box"

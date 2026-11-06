@@ -1675,7 +1675,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
             fields = ("run_id", "project", "name", "created_at", "finished_at", "tags", "group")
             runs = []
-            for meta in reader.list_runs(self.server.root):
+            for meta in reader.list_runs(self.server.root, include_owner=self.server.auth is not None):
                 if not isinstance(meta, dict):
                     continue
                 row = {k: meta.get(k) for k in fields}
@@ -1695,6 +1695,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 last_sync_at = meta.get("last_sync_at")
                 if last_sync_at is not None or self.server.auth is not None:
                     row["last_sync_at"] = last_sync_at
+                if self.server.auth is not None:
+                    row["owner"] = meta.get("_remote_owner")
                 runs.append(row)
             return self._json(runs)
         if path.startswith("/api/runs/"):
@@ -1719,6 +1721,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     last_sync_at = run.last_sync_at()
                     if last_sync_at is not None or self.server.auth is not None:
                         result["last_sync_at"] = last_sync_at
+                    if self.server.auth is not None:
+                        remote = reader.read_remote(run_path)
+                        result["owner"] = remote["owner"] if remote else None
                 elif route == "scalars":
                     limit = max(10, min(5000, int(arg("max_points", "1000"))))
                     start, end = arg("start"), arg("end")

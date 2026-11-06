@@ -29,6 +29,10 @@ class ClientError(ValueError):
     """Validation failure with a fixed message safe to return to clients."""
 
 
+class UserRequired(ClientError):
+    """Key creation needs an explicit user on a multi-user server."""
+
+
 class KeyNameTaken(ValueError):
     pass
 
@@ -319,7 +323,7 @@ class KeyStore:
                 elif len(user_records) == 1:
                     chosen, chosen_role = user_records[0].name, user_records[0].role
                 else:
-                    raise ClientError(
+                    raise UserRequired(
                         "--user is required when the server has more than one user")
             else:
                 if not isinstance(user, str):
@@ -351,11 +355,12 @@ class KeyStore:
         """Return file and env records belonging to ``name``."""
         return [record for record in self.list() if record.user == name]
 
-    def revoke(self, name, *, keep_admin=False):
+    def revoke(self, name, *, keep_admin=False, expected=None):
         """Delete a named file key, returning the removed record or None.
 
-        Names are run-owner identities: recreating a revoked name grants access
-        to that name's runs. The env key cannot be revoked here.
+        When expected is supplied, only remove that key's secret and user,
+        checked under the mutation lock so a reused name is never revoked.
+        The env key cannot be revoked here.
         """
         if name == "env":
             raise ValueError("the env key cannot be revoked")
@@ -365,7 +370,8 @@ class KeyStore:
             except (OSError, ValueError, TypeError, RecursionError) as exc:
                 _unavailable(exc)
             removed = next((record for record in records if record.name == name), None)
-            if removed is None:
+            if removed is None or (expected is not None and (
+                    removed.sha256 != expected.sha256 or removed.user != expected.user)):
                 return None
             admins = sum(record.scope == "admin" for record in records) + (self._env is not None)
             if keep_admin and removed.scope == "admin" and admins <= 1:

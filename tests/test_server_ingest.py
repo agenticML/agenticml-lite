@@ -902,7 +902,7 @@ def test_commit_validation_sizes_status_and_success(server):
     remote = json.loads(run_path(server, "remote.json").read_bytes())
     assert remote == {"owner": "admin", "owner_key": "one", "status": "running",
                       "fingerprint": "a" * 64, "last_sync_at": remote["last_sync_at"],
-                      "sizes": {"meta.json": size}}
+                      "last_sync_key": "one", "sizes": {"meta.json": size}}
     layout.parse_timestamp(remote["last_sync_at"])
 
 

@@ -455,8 +455,10 @@ def _hash_byref_source(path):
     return digest.hexdigest()
 
 
-def _sync_idle(reader, state, source_hash, key=None, features=(), artifacts=False):
-    return (state.get("protocol") == 2 and (key is None or state.get("owner") == key)
+def _sync_idle(reader, state, source_hash, key=None, features=(), artifacts=False, user=None):
+    same_owner = (state.get("owner_user") == user if user is not None
+                  else key is None or state.get("owner") == key)
+    return (state.get("protocol") == 2 and same_owner
             and state.get("complete")
             and state.get("source_hash") == source_hash
             and not _lineage_pending(reader, state, _local_lineage(reader, features, state))
@@ -728,7 +730,12 @@ def _push_byref(reader, client, state, candidates, result, save, sizes, overflow
 
 def _check_owner(reader, client, payload):
     owner = payload.get("owner")
-    if owner and owner != _identity(client)["key"]:
+    identity = _identity(client)
+    if identity.get("user") is not None and payload.get("owner_user") is not None:
+        if payload["owner_user"] != identity["user"]:
+            raise OwnershipError(
+                f"run id {reader.run_id} belongs to user {payload['owner_user']} on this server")
+    elif owner and owner != identity["key"]:
         raise OwnershipError(f"run id {reader.run_id} belongs to key {owner} on this server")
 
 
@@ -821,14 +828,30 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False, ar
         result.failed = result.permanent = True
         result.status = f"failed: {block}"
         return
+    owner_checked = False
     if not dry_run and state.get("owner"):
-        _check_owner(reader, client, state)
+        identity = _identity(client)
+        if identity.get("user") is not None and (
+                state["owner"] != identity["key"] or not state.get("owner_user")):
+            # Old caches lack owner_user. Ask the authoritative server before
+            # accepting a replacement key or refreshing the cached identity.
+            remote = client.run_state(reader.run_id)
+            if remote is not None:
+                _check_owner(reader, client, remote)
+                owner_checked = bool(remote.get("owner") or remote.get("owner_user"))
+        else:
+            _check_owner(reader, client, state)
+            owner_checked = True
     if (state.get("complete") and state.get("source_hash") == source_hash
             and effective in ("finished", "crashed")
             and not _lineage_pending(reader, state, lineage_commit)
             and not _byref_pending(reader, state, features, artifacts, events_bytes)):
         result.status = "up to date"
         result.complete = True
+        if owner_checked:
+            state["owner"] = _identity(client)["key"]
+            state["owner_user"] = _identity(client).get("user")
+            save()
         if prune and not dry_run and not state.get("pruned"):
             _prune_synced_run(reader, state, save, result)
         return
@@ -861,6 +884,7 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False, ar
     recovered = not state["files"]
     rewrites = _recover(reader, client, files, state) if recovered else set()
     state["owner"] = _identity(client)["key"]
+    state["owner_user"] = _identity(client).get("user")
     state["complete"] = False
     save()
     pending = False
@@ -1219,7 +1243,8 @@ def _order_runs_lineage(root, run_ids):
     return result
 
 
-def _selected_ids(root, host, explicit, include_all, prune=False, key=None, features=(), artifacts=False):
+def _selected_ids(root, host, explicit, include_all, prune=False, key=None, features=(), artifacts=False,
+                  user=None):
     selected = list(dict.fromkeys(explicit))
     if include_all:
         for meta in list_runs(root):
@@ -1230,8 +1255,8 @@ def _selected_ids(root, host, explicit, include_all, prune=False, key=None, feat
                 reader = RunReader(root, run_id)
                 state = _host_state(reader, host)
                 if _sync_idle(reader, state, _source_hash(reader), key=key, features=features,
-                              artifacts=artifacts):
-                    if not (prune and not state.get("pruned")):
+                              artifacts=artifacts, user=user):
+                    if not (prune and not state.get("pruned")) and (key is None or state.get("owner") == key):
                         continue
             except Exception:
                 pass  # Report a corrupt run individually below.
@@ -1305,7 +1330,7 @@ def _follow(args, root, host, api_key):
                     byref_warned = True
                 selected = [rid for rid in _selected_ids(
                     root, host, run_ids, include_all, prune=prune, key=identity["key"],
-                    features=identity.get("features", []), artifacts=artifacts,
+                    features=identity.get("features", []), artifacts=artifacts, user=identity.get("user"),
                 ) if rid not in permanent_ids]
                 failure_log.prune(selected)
                 for run_id in selected:
@@ -1458,7 +1483,8 @@ def cmd_sync(args):
                                      key=_identity(client)["key"] if client is not None else None,
                                      features=_identity(client).get("features", []) if client is not None else (
                                          ["lineage"] + (["byref"] if artifacts else [])),
-                                     artifacts=artifacts)
+                                     artifacts=artifacts,
+                                     user=_identity(client).get("user") if client is not None else None)
             failure_log.prune(selected)
             if not selected and args.all:
                 print("up to date", flush=True)

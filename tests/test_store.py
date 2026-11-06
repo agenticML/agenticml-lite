@@ -2865,7 +2865,8 @@ def test_remote_precommit_derives_status_from_meta(
         writer.finish(terminal, {})
     _write_remote(writer.run_dir, payload=payload)
     caplog.clear()
-    remote = {"status": None, "last_sync_at": None, "owner": payload.get("owner")}
+    remote = {"status": None, "last_sync_at": None, "owner": payload.get("owner"),
+              "owner_key": None, "last_sync_key": None}
     assert read_remote(writer.run_dir) == remote
     assert _eff(writer.run_dir) == expected
     listed = {item["run_id"]: item for item in list_runs(tmp_path)}
@@ -3054,7 +3055,8 @@ def test_run_reader_remote_and_last_sync_at(tmp_path):
     iso = _iso(_FIXED_NOW - 10)
     _write_remote(writer.run_dir, status="running", last_sync_at=iso, owner="gpu-box-1")
     remote = reader.remote()
-    assert remote == {"status": "running", "last_sync_at": iso, "owner": "gpu-box-1"}
+    assert remote == {"status": "running", "last_sync_at": iso, "owner": "gpu-box-1",
+                      "owner_key": None, "last_sync_key": None}
     assert reader.last_sync_at() == iso
 
     _write_remote(writer.run_dir, raw="{")

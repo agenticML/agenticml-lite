@@ -29,7 +29,7 @@ def make_run(data, rid, status="finished", owner="box", stamp=None):
     (directory / "scalars" / "0.bin").write_bytes(b"\0" * 16)
     sizes = {name: (directory / name).stat().st_size for name in (
         "meta.json", "events.jsonl", "media/index.json", "scalars/0.bin")}
-    remote = {"owner": owner}
+    remote = {"owner": "admin", "owner_key": owner}
     if status:
         remote.update(status=status, last_sync_at=stamp or layout.format_timestamp(), sizes=sizes)
     write_json(directory / "remote.json", remote)

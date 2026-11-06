@@ -547,7 +547,7 @@ _MIGRATE_FAILED = "could not migrate keys.json; fix the file and retry"
 
 def cmd_server_keys(args):
     from .server.keys import KeyStore, KeyStoreUnavailable
-    from .server.users import migrate
+    from .server.users import UserStore, migrate
 
     try:
         data, directory = _server_data_dir(args)
@@ -568,7 +568,14 @@ def cmd_server_keys(args):
             if not keys.revoke(args.name):
                 raise ValueError("unknown key name")
         else:
-            records = [record.to_public() for record in keys.list()]
+            user = args.user
+            if user is not None:
+                from .server.keys import validate_name
+                validate_name(user)
+                if UserStore(directory).get(user) is None:
+                    raise ValueError("unknown user")
+            records = [record.to_public() for record in keys.list()
+                       if user is None or record.user == user]
             if args.json:
                 print(json.dumps(records))
             else:
@@ -1232,6 +1239,7 @@ def main(argv=None):
             child.add_argument("--user", default=None)
         elif action == "list":
             child.add_argument("--json", action="store_true")
+            child.add_argument("--user", default=None)
         else:
             child.add_argument("name")
     p_users = server_sub.add_parser("users", help="Add, list, remove, or change users")

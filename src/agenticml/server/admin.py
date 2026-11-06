@@ -88,18 +88,37 @@ def status(data) -> dict:
         row.pop("created_by")
         row.update(runs=0, last_sync_at=None)
         keys.append(row)
-    by_name = {row["name"]: row for row in keys}
+    by_key = {(row["name"], row["user"]): row for row in keys}
     try:
         user_records = UserStore(data / "server")._read()
     except (OSError, ValueError, TypeError, RecursionError):
         user_records = []
         warnings.append("could not load server/users.json; user status is unknown")
-    users = [{"name": user.name, "role": user.role, "keys": 0, "runs": 0}
+    users = [{"name": user.name, "role": user.role, "keys": 0, "runs": 0, "last_sync_at": None}
              for user in user_records]
     by_user = {row["name"]: row for row in users}
     for record in records:
         if record.user in by_user:
             by_user[record.user]["keys"] += 1
+
+    def key_row(name, user):
+        pair = (name, user)
+        if pair not in by_key:
+            row = dict(name=name, user=user, scope=None, prefix=None, created_at=None,
+                       last_used_at=None, runs=0, last_sync_at=None)
+            if name == "env":
+                row["env"] = True
+            elif keys_loaded:
+                row["revoked"] = True
+            keys.append(row)
+            by_key[pair] = row
+        return by_key[pair]
+
+    def last_sync(row, stamp):
+        if stamp and (row["last_sync_at"] is None or
+                      layout.parse_timestamp(stamp) > layout.parse_timestamp(row["last_sync_at"])):
+            row["last_sync_at"] = stamp
+
     _safe_path(root, root / "runs")
     runs = list_runs(root)
     for meta in runs:
@@ -107,29 +126,20 @@ def status(data) -> dict:
         remote = read_remote(directory)
         effective = meta["effective_status"] if remote and remote["status"] else "unsynced"
         counts[effective] = counts.get(effective, 0) + 1
-        owner_user, owner_key = attribution(directory)
-        if owner_user is not None and owner_user in by_user:
+        owner_user, _ = attribution(directory)
+        if owner_user in by_user:
             by_user[owner_user]["runs"] += 1
         if remote is None:
             continue
-        owner = owner_key or remote["owner"]
-        if owner is None:
-            continue
-        if owner not in by_name:
-            row = dict(name=owner, scope=None, prefix=None, created_at=None,
-                       last_used_at=None, runs=0, last_sync_at=None)
-            if owner == "env":
-                row["env"] = True
-            elif keys_loaded:
-                row["revoked"] = True
-            keys.append(row)
-            by_name[owner] = row
-        row = by_name[owner]
-        row["runs"] += 1
+        owner = remote["owner"]
         stamp = remote["last_sync_at"]
-        if stamp and (row["last_sync_at"] is None or
-                      layout.parse_timestamp(stamp) > layout.parse_timestamp(row["last_sync_at"])):
-            row["last_sync_at"] = stamp
+        if owner_user in by_user:
+            last_sync(by_user[owner_user], stamp)
+        creator = remote["owner_key"]
+        if creator is not None and owner is not None:
+            key_row(creator, owner)["runs"] += 1
+            writer = remote["last_sync_key"] or creator
+            last_sync(key_row(writer, owner), stamp)
     sizes = {"objects_count": 0, "skipped": 0}
 
     def skipped(path, exc):
@@ -379,16 +389,16 @@ def format_status(report):
              f"Sizes: runs {_format_bytes(sizes['runs'])}, objects {_format_bytes(sizes['objects'])} "
              f"({sizes['objects_count']}), lineage {_format_bytes(sizes['lineage'])}, "
              f"total {_format_bytes(sizes['total'])}; skipped {sizes['skipped']}",
-             "KEY  SCOPE  PREFIX  RUNS  LAST SYNC  LAST USED  CREATED"]
+             "USER  ROLE  KEYS  RUNS  LAST SYNC"]
+    for row in report.get("users", []):
+        lines.append("  ".join(str(value or "-") for value in (
+            row["name"], row["role"], str(row["keys"]), str(row["runs"]), row["last_sync_at"])))
+    lines.append("KEY  SCOPE  USER  PREFIX  RUNS  LAST SYNC  LAST USED  CREATED")
     for row in report["keys"]:
         lines.append("  ".join(str(value or "-") for value in (
             row["name"] + (" (revoked)" if row.get("revoked") else ""),
-            "env" if row.get("env") else row["scope"], row["prefix"],
+            "env" if row.get("env") else row["scope"], row["user"], row["prefix"],
             str(row["runs"]), row["last_sync_at"], row["last_used_at"], row["created_at"])))
-    lines.append("USER  ROLE  KEYS  RUNS")
-    for row in report.get("users", []):
-        lines.append("  ".join(str(value or "-") for value in (
-            row["name"], row["role"], str(row["keys"]), str(row["runs"]))))
     lines.extend(f"warning: {warning}" for warning in report.get("warnings", []))
     return "\n".join(_text(line) for line in lines)
 

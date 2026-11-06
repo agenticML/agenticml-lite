@@ -692,7 +692,7 @@ def test_list_public_fields_runs_order_and_env(tmp_path):
         for name, owner in (("one", "z-box"), ("two", "z-box"), ("three", "a-box")):
             path = runs / name
             path.mkdir()
-            (path / "remote.json").write_text(json.dumps({"owner": owner}))
+            (path / "remote.json").write_text(json.dumps({"owner": "admin", "owner_key": owner}))
         (runs / "linked").symlink_to(runs / "one", target_is_directory=True)
         (runs / "bad").mkdir()
         (runs / "bad" / "remote.json").write_text("broken")
@@ -703,7 +703,7 @@ def test_list_public_fields_runs_order_and_env(tmp_path):
         rows = payload["keys"]
         assert [row["name"] for row in rows] == ["a-box", "z-box", "env"]
         fields = {"name", "scope", "user", "prefix", "created_at", "created_by", "last_used_at",
-                  "runs", "revocable"}
+                  "runs", "revocable", "active"}
         assert all(set(row) == fields for row in rows)
         assert [row["runs"] for row in rows] == [1, 2, 0]
         assert [row["revocable"] for row in rows] == [True, True, False]

@@ -541,7 +541,8 @@ def test_status_v1_and_v2_owner_key(tmp_path):
         "status": "finished", "last_sync_at": layout.format_timestamp(), "sizes": {}})
     report = admin.status(data)
     row = next(r for r in report["keys"] if r["name"] == "box")
-    assert row["runs"] == 1
+    # Before migration supplies owner_key, a name alone cannot identify a key.
+    assert row["runs"] == 0 and row["last_sync_at"] is None
     assert report["users"] == []
 
     data = tmp_path / "v2"

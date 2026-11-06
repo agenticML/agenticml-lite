@@ -4,13 +4,34 @@ from __future__ import annotations
 import json
 import logging
 import os
+from urllib.parse import parse_qs, urlsplit
 
 from agenticml.ui.server import _reject_nonfinite
-from .keys import ClientError, KeyNameTaken, KeyStoreUnavailable, LastAdminError, _NAME, validate_name
-from .users import attribution
+from .keys import ClientError, KeyNameTaken, KeyStoreUnavailable, LastAdminError, UserRequired, _NAME, validate_name
+from .users import UserNotFound, allowed, attribution, resolve
 
 logger = logging.getLogger("agenticml.server.keyspage")
 RUN_SCAN_MAX = 10000
+
+
+def can_see(principal, record) -> bool:
+    return allowed(principal, "all_keys") or (
+        allowed(principal, "own_keys") and record.user == principal.user)
+
+
+def can_create(principal, user, scope) -> str | None:
+    """Check role permissions; user existence/scope validity are store checks."""
+    if not allowed(principal, "own_keys"):
+        return "forbidden"
+    if user != principal.user and not allowed(principal, "all_keys"):
+        return "you can only create keys for yourself"
+    if scope == "admin" and not allowed(principal, "admin_keys"):
+        return "only admins can create admin keys"
+    return None
+
+
+def can_revoke(principal, record) -> bool:
+    return can_see(principal, record)
 
 
 def command_host(webauth, handler):
@@ -68,9 +89,9 @@ def _run_counts(root):
                 if not entry.is_dir(follow_symlinks=False):
                     continue
                 owner, owner_key = attribution(entry.path)
-                name = owner_key or owner
-                if name is not None:
-                    counts[name] = counts.get(name, 0) + 1
+                if owner_key is not None and owner is not None:
+                    pair = (owner_key, owner)
+                    counts[pair] = counts.get(pair, 0) + 1
     except FileNotFoundError:
         pass
     except OSError:
@@ -82,16 +103,31 @@ def handle(webauth, handler, path):
     from .webauth import LOGIN_BODY_MAX
 
     try:
+        principal = handler.principal
+        if not allowed(principal, "own_keys"):
+            handler.close_connection = True
+            handler._json({"error": "forbidden"}, 403)
+            return
         if handler.command in ("GET", "DELETE") and (
                 handler.headers.get_all("Content-Length") or handler.headers.get_all("Transfer-Encoding")):
             handler.close_connection = True
         if path == "/api/server/keys" and handler.command == "GET":
+            query = parse_qs(urlsplit(handler.path).query, keep_blank_values=True)
+            user = query.get("user", [None])[0]
+            if user is not None:
+                validate_name(user)
             records = sorted(webauth.keys.list(), key=lambda record: (
                 record.name == "env", record.created_at, record.name))
             counts = _run_counts(handler.server.root)
-            rows = [{**record.to_public(), "runs": None if counts is None else counts.get(record.name, 0),
-                     "revocable": record.name != "env"} for record in records]
-            handler._json({"keys": rows, **command_host(webauth, handler)})
+            rows = [{**record.to_public(), "runs": None if counts is None else counts.get((record.name, record.user), 0),
+                     "revocable": can_revoke(principal, record) and record.name != "env",
+                     "active": (resolved := resolve(webauth.keys, webauth.users, record)) is not None
+                     and allowed(resolved, "sync")
+                     and (record.scope != "admin" or allowed(resolved, "admin_keys"))}
+                    for record in records if can_see(principal, record)
+                    and (user is None or record.user == user)]
+            handler._json({"keys": rows, "user": principal.user, "role": principal.role,
+                           **command_host(webauth, handler)})
         elif path == "/api/server/keys" and handler.command == "POST":
             payload = read_json(handler, LOGIN_BODY_MAX)
             if payload is None:
@@ -100,14 +136,27 @@ def handle(webauth, handler, path):
             validate_name(name)
             if not isinstance(scope, str) or scope not in ("sync", "admin"):
                 raise ClientError("invalid key scope")
+            user = payload.get("user", principal.user)
+            error = can_create(principal, user, scope)
+            if error is not None:
+                handler._json({"error": error}, 403)
+                return
+            env_default = principal.user == "env" and "user" not in payload
+            if not env_default:
+                validate_name(user)
             try:
-                actor = handler.principal.user
+                actor = principal.user
                 # The env user is not stored; fall through to the default-user rule.
-                key_user = None if actor == "env" else actor
+                key_user = None if env_default else user
                 record, value = webauth.keys.create(
                     name, scope, created_by=actor, user=key_user)
             except KeyNameTaken:
-                handler._json({"error": "key name already exists"}, 409)
+                message = ("key name already exists" if allowed(principal, "all_keys")
+                           else "key name is not available")
+                handler._json({"error": message}, 409)
+                return
+            except UserNotFound:
+                handler._json({"error": "unknown user"}, 404)
                 return
             except (KeyStoreUnavailable, OSError):
                 handler._json({"error": "key store unavailable"}, 503)
@@ -123,11 +172,27 @@ def handle(webauth, handler, path):
             name = path[len("/api/server/keys/"):]
             if not _NAME.fullmatch(name) or name in (".", ".."):
                 raise ClientError("invalid or reserved key name")
+            # list() fails closed for authentication; a mutation must still
+            # distinguish an unreadable store from an unknown key.
+            try:
+                if name != "env":
+                    webauth.keys._read()
+            except (OSError, ValueError, TypeError, RecursionError):
+                handler._json({"error": "key store unavailable"}, 503)
+                return
+            record = next((record for record in webauth.keys.list() if record.name == name), None)
+            if (record is None or not can_see(principal, record)
+                    or resolve(webauth.keys, webauth.users, record) is None):
+                handler._json({"error": "not found"}, 404)
+                return
+            if not can_revoke(principal, record):
+                handler._json({"error": "forbidden"}, 403)
+                return
             if name == "env":
                 handler._json({"error": "environment key: remove AGENTICML_SERVER_KEY and restart"}, 409)
                 return
             try:
-                record = webauth.keys.revoke(name, keep_admin=True)
+                record = webauth.keys.revoke(name, keep_admin=True, expected=record)
             except LastAdminError as exc:
                 handler._json({"error": str(exc)}, 409)
                 return
@@ -138,7 +203,9 @@ def handle(webauth, handler, path):
                 handler._json({"error": "not found"}, 404)
                 return
             webauth.drop_sessions(name, record.sha256)
-            signed_out = handler.session["name"] == name and handler.session["sha256"] == record.sha256
+            session = getattr(handler, "session", None) or {}
+            signed_out = (session.get("name") == name
+                          and session.get("sha256") == record.sha256)
             headers = {"Set-Cookie": webauth._cookie("", max_age=0)} if signed_out else None
             handler._json({"revoked": name, "signed_out": signed_out}, headers=headers)
         else:
@@ -146,4 +213,7 @@ def handle(webauth, handler, path):
             handler._json({"error": "method not allowed"}, 405)
     except ValueError as exc:
         if not getattr(handler, "_started", False):
-            handler._error({"error": str(exc) if isinstance(exc, ClientError) else "invalid request"}, 400)
+            message = str(exc) if isinstance(exc, ClientError) else "invalid request"
+            if isinstance(exc, UserRequired):
+                message = "user is required when the server has more than one user"
+            handler._error({"error": message}, 400)

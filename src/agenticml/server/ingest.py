@@ -615,6 +615,7 @@ class IngestHandler(DashboardHandler):
             "owner": owner if isinstance(owner, str) else None,
             "status": status, "fingerprint": fingerprint,
             "last_sync_at": layout.format_timestamp(), "sizes": sizes,
+            "last_sync_key": self.principal.key,
         }
         if isinstance(owner_key, str):
             payload["owner_key"] = owner_key
