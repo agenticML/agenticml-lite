@@ -24,7 +24,7 @@ from agenticml.ui.server import (
     _STATIC,
     _reject_nonfinite,
 )
-from . import keyspage
+from . import audit, keyspage
 from .keys import ClientError, KeyStoreUnavailable, validate_name
 from .users import (
     InviteInvalid, Principal, ScryptUnavailable, UserNameTaken, UserStore,
@@ -442,6 +442,9 @@ class WebAuth:
             if path == "/api/server/keys" or (path or "").startswith("/api/server/keys/"):
                 keyspage.handle(self, handler, path)
                 return True
+            if path == "/api/server/audit":
+                audit.handle(self, handler)
+                return True
             if (path or "").startswith("/api/server/") and path != "/api/server/session":
                 handler.close_connection = True
                 handler._json({"error": "not found"}, 404)
@@ -470,6 +473,24 @@ class WebAuth:
             if not getattr(handler, "_started", False):
                 handler._error({"error": "not found"}, 404)
             return True
+
+    def _audit(self, handler, action, target, detail=None, *, actor=None, via=None):
+        try:
+            principal = getattr(handler, "principal", None)
+            handler.server.audit.record(
+                actor if actor is not None else principal.user,
+                via if via is not None else principal.via,
+                action, target, self.client_address(handler), {} if detail is None else detail)
+        except Exception:
+            logger.error("could not record audit event")
+
+    def _audit_login_failed(self, handler, name=None, *, method):
+        try:
+            validate_name(name)
+        except ClientError:
+            name = None
+        self._audit(handler, "login.failed", name, {"method": method},
+                    actor="anonymous", via=method)
 
     def _path(self, handler):
         try:
@@ -773,6 +794,12 @@ class WebAuth:
                     raise
                 self._setup_used = True
                 self.setup_token = None
+            self._audit(handler, "user.add", user.name,
+                        {"role": user.role, "identity": user.identity},
+                        actor=user.name, via="setup")
+            self._audit(handler, "user.password", user.name, {"method": "setup"},
+                        actor=user.name, via="setup")
+            self._audit(handler, "setup", user.name, actor=user.name, via="setup")
             self._between_verify_and_session(user)
             cookie, entry = self._session_cookie_for(
                 user.name, "setup", expected=(user.id, user.generation))
@@ -839,6 +866,7 @@ class WebAuth:
     def _login(self, handler):
         if not handler._csrf_ok():
             handler.close_connection = True
+            logger.info("login refused: cross-site")
             handler._error({"error": "cross-site request refused"}, 403)
             return
         address = self.client_address(handler)
@@ -867,15 +895,18 @@ class WebAuth:
             if record is None or principal is None:
                 logger.info("login failed")
                 outcome = "failed"
+                self._audit_login_failed(handler, method="key")
                 handler._json({"error": "invalid key"}, 401, self._headers())
                 return
             if record.scope != "admin":
                 logger.info("login failed")
+                self._audit_login_failed(handler, method="key")
                 handler._json(
                     {"error": "this is a sync key; sign in with an admin key"}, 403, self._headers())
                 return
             if principal.role != "admin":
                 logger.info("login failed")
+                self._audit_login_failed(handler, method="key")
                 handler._json(
                     {"error": "this key cannot sign in"}, 403, self._headers())
                 return
@@ -888,11 +919,13 @@ class WebAuth:
                 expected=expected)
             if entry is None:
                 outcome = "failed"
+                self._audit_login_failed(handler, method="key")
                 self._refuse_stale_credentials(handler)
                 return
             outcome = "success"
             self.keys.touch(record)
             self._attach(handler, entry, principal)
+            self._audit(handler, "login.ok", principal.user, {"method": "key"})
             handler._json(
                 {"ok": True, "user": principal.user, "role": principal.role},
                 headers=self._headers({"Set-Cookie": self._cookie(token)}),
@@ -929,6 +962,7 @@ class WebAuth:
             if user is None:
                 logger.info("login failed")
                 outcome = "failed"
+                self._audit_login_failed(handler, name, method="password")
                 handler._json(
                     {"error": "invalid user name or password"}, 401, self._headers())
                 return
@@ -937,10 +971,12 @@ class WebAuth:
                 user.name, "password", expected=(user.id, user.generation))
             if entry is None:
                 outcome = "failed"
+                self._audit_login_failed(handler, name, method="password")
                 self._refuse_stale_credentials(handler)
                 return
             outcome = "success"
             self._attach(handler, entry, Principal(user.name, user.role, "password"))
+            self._audit(handler, "login.ok", user.name, {"method": "password"})
             handler._json(
                 {"ok": True, "user": user.name, "role": user.role},
                 headers=self._headers({"Set-Cookie": self._cookie(token)}),
@@ -956,7 +992,11 @@ class WebAuth:
             handler.close_connection = True
             handler._error({"error": "cross-site request refused"}, 403)
             return
+        session = self._session(handler)
         self._delete_session(handler)
+        if session is not None:
+            self._audit(handler, "logout", session["user"],
+                        actor=session["user"], via=session["via"])
         handler._send(
             b"", "text/plain; charset=utf-8", 204,
             self._headers({"Set-Cookie": self._cookie("", max_age=0)}),
@@ -1057,6 +1097,7 @@ class WebAuth:
                 handler._json({"error": ScryptUnavailable().args[0]}, 503, self._headers())
                 return
             updated = self.users.set_password(user.name, new)
+            self._audit(handler, "user.password", updated.name, {"method": "account"})
             token, entry = self._create_session(
                 user=updated.name, via="password",
                 expected=(updated.id, updated.generation))
@@ -1144,6 +1185,8 @@ class WebAuth:
             except ScryptUnavailable as exc:
                 handler._json({"error": str(exc)}, 503, self._headers())
                 return
+            self._audit(handler, "user.password", user.name, {"method": "invite"},
+                        actor=user.name, via="invite")
             self._between_verify_and_session(user)
             cookie, entry = self._session_cookie_for(
                 user.name, "invite", expected=(user.id, user.generation))
@@ -1153,6 +1196,7 @@ class WebAuth:
                 return
             outcome = "success"
             self._attach(handler, entry, Principal(user.name, user.role, "invite"))
+            self._audit(handler, "login.ok", user.name, {"method": "invite"})
             handler._json(
                 {"ok": True, "user": user.name, "role": user.role},
                 headers=self._headers({"Set-Cookie": self._cookie(cookie)}),

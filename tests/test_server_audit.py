@@ -1,19 +1,31 @@
 """Audit append safety, backwards paging, and standalone CLI rendering."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import errno
+import fcntl
+import hashlib
+import io
 import json
 import logging
 import os
 import stat
 import threading
 from types import SimpleNamespace
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
 
+from agenticml import cli
 from agenticml.server import audit
-from agenticml.server.users import Principal
+from agenticml.server.app import prepare_data_dir
+from agenticml.server.keys import KeyStore
+from agenticml.server.users import Principal, UserStore
 from agenticml.store import layout
+from test_server_ingest import request
+from test_server_login_throttle import freeze_throttle
+from test_server_signin import PASSWORD, password_login, running
+from test_server_users import write_run, write_v1_keys
+from test_server_web import authed, call, cookie_parts, csrf, login
 
 
 def event(index, **fields):
@@ -455,3 +467,577 @@ def test_handle_unavailable_log(tmp_path):
     (tmp_path / "audit.jsonl").mkdir()
     assert call_handle(tmp_path).response == (
         {"error": "audit log unavailable"}, 503, {"Cache-Control": "no-store"})
+
+
+# Exercise hooks through the commands and HTTP endpoints that own the changes.
+@pytest.fixture
+def hook_env(monkeypatch):
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    monkeypatch.setattr(audit.getpass, "getuser", lambda: "operator")
+
+
+def hook_event(action, target, detail=None, *, actor="cli:operator", via="cli", client=None):
+    return {"actor": actor, "via": via, "action": action, "target": target,
+            "client": client, "detail": {} if detail is None else detail}
+
+
+def hook_rows(data):
+    path = data / "server" / "audit.jsonl"
+    return [json.loads(line) for line in path.read_bytes().splitlines()] if path.exists() else []
+
+
+@contextmanager
+def expect_events(data, *expected):
+    before = len(hook_rows(data))
+    yield
+    rows = hook_rows(data)[before:]
+    for row in rows:
+        assert audit._TIMESTAMP.fullmatch(row.pop("ts"))
+    assert rows == list(expected)
+
+
+def run_cli(data, capsys, *args, code=0):
+    assert cli.main(["server", *args, "--data", str(data)]) == code
+    return capsys.readouterr()
+
+
+def http_event(action, target, detail=None, *, actor="alice", via="password", client="127.0.0.1"):
+    return hook_event(action, target, detail, actor=actor, via=via, client=client)
+
+
+def test_cli_mutations_and_audit_command(tmp_path, capsys, monkeypatch, hook_env):
+    data = tmp_path / "data"
+    with expect_events(data, hook_event("user.add", "admin", {"role": "admin", "identity": None})):
+        run_cli(data, capsys, "users", "add", "admin", "--role", "admin", "--no-invite")
+    # add's invite is a second action, never a duplicate user.add.
+    output = run_cli(data, capsys, "users", "add", "alice", "--identity", "a@example.com")
+    expires = UserStore(data / "server").get("alice").invite["expires_at"]
+    assert [dict(row, ts=None) for row in hook_rows(data)[1:]] == [
+        dict(hook_event("user.add", "alice", {"role": "member", "identity": "a@example.com"}), ts=None),
+        dict(hook_event("user.invite", "alice", {"expires_at": expires}), ts=None)]
+    assert "/invite?token=" in output.out
+    with expect_events(data, hook_event("user.role", "alice", {"from": "member", "to": "viewer"})):
+        run_cli(data, capsys, "users", "set-role", "alice", "viewer")
+    with expect_events(data, hook_event("user.identity", "alice", {"identity": "new@example.com"})):
+        run_cli(data, capsys, "users", "set-identity", "alice", "new@example.com")
+    with expect_events(data, hook_event("user.identity", "alice", {"identity": None})):
+        run_cli(data, capsys, "users", "set-identity", "alice")
+    before = len(hook_rows(data))
+    run_cli(data, capsys, "users", "invite", "alice")
+    assert len(hook_rows(data)) == before + 1
+    invite = hook_rows(data)[-1]
+    assert {k: v for k, v in invite.items() if k != "ts"} == hook_event(
+        "user.invite", "alice", {"expires_at": UserStore(data / "server").get("alice").invite["expires_at"]})
+    monkeypatch.setattr("sys.stdin", io.StringIO(PASSWORD + "\n"))
+    with expect_events(data, hook_event("user.password", "alice", {"method": "cli"})):
+        run_cli(data, capsys, "users", "set-password", "alice", "--stdin")
+    for name in ("box", "box2", "discard"):
+        with expect_events(data, hook_event("key.create", name, {"user": "alice", "scope": "sync"})):
+            run_cli(data, capsys, "keys", "create", "--name", name, "--user", "alice")
+    with expect_events(data, hook_event("key.revoke", "discard", {"user": "alice", "scope": "sync"})):
+        run_cli(data, capsys, "keys", "revoke", "discard")
+    with expect_events(data,
+                       hook_event("key.revoke", "box", {"user": "alice", "scope": "sync"}),
+                       hook_event("key.revoke", "box2", {"user": "alice", "scope": "sync"}),
+                       hook_event("user.remove", "alice", {"keys_revoked": 2})):
+        run_cli(data, capsys, "users", "remove", "alice")
+    with expect_events(data):
+        run_cli(data, capsys, "users", "list")
+        run_cli(data, capsys, "keys", "list")
+        run_cli(data, capsys, "users", "remove", "admin", code=1)
+        run_cli(data, capsys, "keys", "revoke", "missing", code=1)
+        run_cli(data, capsys, "users", "add", "admin", "--no-invite", code=1)
+    rows = hook_rows(data)
+    with expect_events(data):
+        output = run_cli(data, capsys, "audit", "--limit", "2", "--json")
+        assert json.loads(output.out) == rows[-1:-3:-1]
+        output = run_cli(data, capsys, "audit", "--limit", "1")
+        assert output.out.splitlines()[0].split() == list(audit._COLUMNS)
+        assert "user.remove" in output.out
+
+
+@pytest.mark.parametrize("trigger", ["startup", "keys", "users", "up"])
+def test_migration_actor_once(tmp_path, capsys, monkeypatch, hook_env, trigger):
+    from agenticml.server import up
+
+    data = tmp_path / "data"
+    prepare_data_dir(data)
+    write_v1_keys(data / "server" / "keys.json", ["old"])
+    write_run(data / "store", "old-run", "old")
+    original_record = audit.AuditLog.record
+
+    def record_unlocked(log, *args, **kwargs):
+        # A separate fd must be able to acquire keys.lock during audit fsync.
+        with (data / "server" / "keys.lock").open("ab") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return original_record(log, *args, **kwargs)
+
+    monkeypatch.setattr(audit.AuditLog, "record", record_unlocked)
+    actor, via = ("server", "server") if trigger == "startup" else ("cli:operator", "cli")
+    if trigger == "up":
+        monkeypatch.setattr(up, "check_tailscale", lambda: "https://test.example")
+        monkeypatch.setattr(up, "install_unit", lambda *a, **kw: None)
+
+    def migrate_once():
+        if trigger == "startup":
+            with running(data):
+                pass
+        elif trigger == "up":
+            run_cli(data, capsys, "up", "--install")
+        else:
+            run_cli(data, capsys, trigger, "list")
+
+    with expect_events(data, hook_event("migration", "admin", {"keys": 1, "runs": 1}, actor=actor, via=via)):
+        migrate_once()
+    with expect_events(data):
+        migrate_once()
+
+
+def test_server_up_bootstrap_once(tmp_path, capsys, monkeypatch, hook_env):
+    from agenticml.server import up
+
+    data = tmp_path / "data"
+    monkeypatch.setattr(up, "check_tailscale", lambda: "https://test.example")
+    monkeypatch.setattr(up, "install_unit", lambda *a, **kw: None)
+    monkeypatch.setattr(up, "_stdout_is_tty", lambda: True)
+    output = run_cli(data, capsys, "up", "--install")
+    expires = UserStore(data / "server").get("admin").invite["expires_at"]
+    rows = hook_rows(data)
+    assert [{k: v for k, v in row.items() if k != "ts"} for row in rows] == [
+        hook_event("user.add", "admin", {"role": "admin", "identity": None}),
+        hook_event("user.invite", "admin", {"expires_at": expires})]
+    token = output.out.split("token=", 1)[1].split()[0]
+    assert token not in (data / "server" / "audit.jsonl").read_text()
+    with expect_events(data):
+        run_cli(data, capsys, "up", "--install")
+
+
+def test_setup_account_password_and_logout(tmp_path, hook_env):
+    data = tmp_path / "data"
+    with running(data) as server:
+        token = server.web.setup_token
+        with expect_events(data,
+                           http_event("user.add", "alice", {"role": "admin", "identity": None}, via="setup"),
+                           http_event("user.password", "alice", {"method": "setup"}, via="setup"),
+                           http_event("setup", "alice", via="setup")):
+            status, headers, _ = call(server, "/setup", "POST", json.dumps({
+                "token": token, "name": "alice", "password": PASSWORD}), csrf(server))
+            assert status == 201
+        cookie = headers["Set-Cookie"]
+        with expect_events(data):
+            assert call(server, "/setup", "POST", json.dumps({
+                "token": token, "name": "alice", "password": PASSWORD}), csrf(server))[0] == 404
+        with expect_events(data, http_event("user.password", "alice", {"method": "account"}, via="setup")):
+            status, headers, _, _ = authed(server, "/api/server/account/password", "POST", json.dumps({
+                "current": PASSWORD, "new": PASSWORD + "new"}), cookie=cookie)
+            assert status == 200
+        cookie = headers["Set-Cookie"]
+        with expect_events(data):
+            assert authed(server, "/api/server/account/password", "POST", json.dumps({
+                "current": "wrong-password", "new": PASSWORD}), cookie=cookie)[0] == 401
+        with expect_events(data, http_event("logout", "alice")):
+            assert authed(server, "/logout", "POST", cookie=cookie)[0] == 204
+        with expect_events(data):
+            assert authed(server, "/logout", "POST", cookie=cookie)[0] == 204
+        with expect_events(data, http_event("login.ok", "alice", {"method": "password"})):
+            assert password_login(server, "alice", PASSWORD + "new")[0] == 200
+        raw = (data / "server" / "audit.jsonl").read_text()
+        assert all(secret not in raw for secret in (
+            token, PASSWORD, PASSWORD + "new", cookie_parts(cookie)[1],
+            server.users.get("alice").password["hash"],
+            server.users.get("alice").password["salt"]))
+
+
+def test_invite_keys_and_secret_exclusion(tmp_path, capsys, monkeypatch, hook_env):
+    data = tmp_path / "data"
+    output = run_cli(data, capsys, "users", "add", "alice", "--role", "admin")
+    invite_token = parse_qs(urlsplit(output.out.splitlines()[0]).query)["token"][0]
+    users = UserStore(data / "server")
+    secrets = [invite_token, users.get("alice").invite["sha256"], PASSWORD]
+    monkeypatch.setattr("sys.stdin", io.StringIO(PASSWORD + "\n"))
+    run_cli(data, capsys, "users", "set-password", "alice", "--stdin")
+    secrets.extend(users.get("alice").password[k] for k in ("salt", "hash"))
+    output = run_cli(data, capsys, "keys", "create", "--name", "cli-key", "--scope", "admin")
+    cli_key = output.out.strip()
+    secrets.extend([cli_key, KeyStore(data / "server").list()[0].sha256])
+    output = run_cli(data, capsys, "users", "invite", "alice")
+    invite_token = parse_qs(urlsplit(output.out.splitlines()[0]).query)["token"][0]
+    secrets.extend([invite_token, users.get("alice").invite["sha256"]])
+    with running(data, trusted_proxies=("127.0.0.1",)) as server:
+        client = "203.0.113.7"
+        def expected(action, target="alice", detail=None, via="invite"):
+            return http_event(action, target, detail, via=via, client=client)
+        with expect_events(data,
+                           expected("user.password", detail={"method": "invite"}),
+                           expected("login.ok", detail={"method": "invite"})):
+            status, headers, _ = call(server, "/invite", "POST", json.dumps({
+                "token": invite_token, "password": PASSWORD}), csrf(server, **{"X-Forwarded-For": client}))
+            assert status == 200
+        secrets.extend(server.users.get("alice").password[k] for k in ("salt", "hash"))
+        cookie = headers["Set-Cookie"]
+        session_token = cookie_parts(cookie)[1]
+        secrets.extend([session_token, hashlib.sha256(session_token.encode()).hexdigest()])
+        with expect_events(data):
+            assert call(server, "/invite", "POST", json.dumps({
+                "token": invite_token, "password": PASSWORD}), csrf(server))[0] == 404
+        with expect_events(data, expected("key.create", "http-key", {"user": "alice", "scope": "sync"})):
+            status, _, body, _ = authed(server, "/api/server/keys", "POST", json.dumps({
+                "name": "http-key", "scope": "sync"}), extra={"X-Forwarded-For": client}, cookie=cookie)
+            assert status == 201
+        secrets.extend([json.loads(body)["key"], server.keys.list()[-1].sha256])
+        with expect_events(data, expected("key.revoke", "http-key", {"user": "alice", "scope": "sync"})):
+            assert authed(server, "/api/server/keys/http-key", "DELETE",
+                          extra=csrf(server, **{"X-Forwarded-For": client}), cookie=cookie)[0] == 200
+        with expect_events(data):
+            assert authed(server, "/api/server/keys/http-key", "DELETE", extra=csrf(server), cookie=cookie)[0] == 404
+        with expect_events(data, http_event("login.ok", "alice", {"method": "key"}, via="key")):
+            assert login(server, cli_key)[0] == 200
+        with expect_events(data, http_event("login.failed", "alice", {"method": "password"}, actor="anonymous")):
+            assert password_login(server, "alice", "wrong-password")[0] == 401
+        with expect_events(data, http_event("login.failed", None, {"method": "key"}, actor="anonymous", via="key")):
+            assert login(server, "bad-key")[0] == 401
+        secrets.extend(["wrong-password", "bad-key"])
+    raw = (data / "server" / "audit.jsonl").read_text()
+    assert all(secret and secret not in raw for secret in secrets)
+
+
+@pytest.mark.parametrize("role,status", [("member", 403), ("viewer", 403), ("admin", 200)])
+def test_audit_api_password_role_gate(tmp_path, capsys, hook_env, role, status):
+    data = tmp_path / "data"
+    run_cli(data, capsys, "users", "add", "alice", "--role", role, "--no-invite")
+    UserStore(data / "server").set_password("alice", PASSWORD)
+    with running(data) as server:
+        with expect_events(data, http_event("login.ok", "alice", {"method": "password"})):
+            code, _, headers = password_login(server, "alice", PASSWORD)
+            assert code == 200
+        with expect_events(data):
+            code, headers, body, _ = authed(server, "/api/server/audit?limit=1", cookie=headers["Set-Cookie"])
+            assert code == status
+            assert headers["Cache-Control"] == "no-store"
+            if status == 200:
+                assert json.loads(body) == {"events": hook_rows(data)[-1:], "skipped": 0}
+
+
+@pytest.mark.parametrize("status", ["finished", "crashed"])
+@pytest.mark.parametrize("env_key", [None, "env-secret-that-is-long-enough-1234"])
+def test_run_lifecycle_and_notes(tmp_path, capsys, monkeypatch, hook_env, env_key, status):
+    data = tmp_path / "data"
+    run_cli(data, capsys, "users", "add", "alice", "--no-invite")
+    users = UserStore(data / "server")
+    users.set_password("alice", PASSWORD)
+    secret = KeyStore(data / "server").create("box", user="alice")[1]
+    actor, key = ("alice", "box") if env_key is None else ("env", "env")
+    with running(data, env_key=env_key) as server:
+        original_record = server.audit.record
+
+        def record_unlocked(*args, **kwargs):
+            if args[2] in ("run.create", "run.finish"):
+                lock = server.run_lock(args[3])
+                assert lock.acquire(blocking=False), "audit wrote while holding run_lock"
+                lock.release()
+            return original_record(*args, **kwargs)
+
+        monkeypatch.setattr(server.audit, "record", record_unlocked)
+        server.test_key = secret if env_key is None else env_key
+        meta = {"run_id": "run-1", "status": "running", "project": "project"}
+        def put_meta():
+            return request(server, "/v2/runs/run-1/files/meta.json", "PUT", json.dumps(meta))[0]
+        def commit(state):
+            return request(server, "/v2/runs/run-1/commit", "POST", json.dumps({
+                "status": state, "fingerprint": "a" * 64, "sizes": {}}))[0]
+        with expect_events(data):
+            assert request(server, "/v2/runs/run-1/files/meta.json", "PUT", json.dumps({
+                "run_id": "run-1", "status": "invalid"}))[0] == 422
+        with expect_events(data, http_event("run.create", "run-1", {"project": "project", "key": key}, actor=actor, via="key")):
+            assert put_meta() == 200
+        with expect_events(data):
+            assert put_meta() == 200
+            assert commit("running") == 200
+            assert commit(status) == 409
+            meta["status"] = status
+            assert put_meta() == 200
+        with expect_events(data, http_event("run.finish", "run-1", {"status": status, "key": key}, actor=actor, via="key")):
+            assert commit(status) == 200
+        with expect_events(data):
+            assert commit(status) == 200
+        # A second terminal status is also a transition; retries are silent.
+        status = "crashed" if status == "finished" else "finished"
+        with expect_events(data):
+            meta["status"] = status
+            assert put_meta() == 200
+        with expect_events(data, http_event("run.finish", "run-1", {"status": status, "key": key}, actor=actor, via="key")):
+            assert commit(status) == 200
+        _, _, headers = password_login(server, "alice", PASSWORD)
+        cookie = headers["Set-Cookie"]
+        revision = hashlib.sha256(b"training note\n").hexdigest()
+        with expect_events(data, http_event("note.write", "run-1", {"revision": revision})):
+            code, _, body, _ = authed(server, "/api/runs/run-1/notes", "PUT", json.dumps({
+                "text": "training note\n", "revision": None}), cookie=cookie)
+            assert code == 200 and json.loads(body)["revision"] == revision
+        with expect_events(data):
+            assert authed(server, "/api/runs/run-1/notes", "PUT", json.dumps({
+                "text": "conflict", "revision": None}), cookie=cookie)[0] == 409
+    raw = (data / "server" / "audit.jsonl").read_text()
+    assert secret not in raw
+    if env_key is not None:
+        assert env_key not in raw
+
+
+def test_login_failures_only_401_403_and_no_throttled_duplicates(tmp_path, hook_env):
+    data = tmp_path / "data"
+    with running(data) as server:
+        server.users.add("alice", role="admin")
+        server.users.add("former", role="admin")
+        server.users.set_password("alice", PASSWORD)
+        admin_key = server.keys.create("admin-key", "admin", user="alice")[1]
+        sync_key = server.keys.create("sync-key", user="alice")[1]
+        former_key = server.keys.create("former-key", "admin", user="former")[1]
+        server.users.set_role("former", "member")
+        for name in ("alice", "unknown"):
+            with expect_events(data, http_event("login.failed", name, {"method": "password"}, actor="anonymous")):
+                assert password_login(server, name, "wrong-password")[0] == 401
+        for key, status in (("bad-key", 401), (sync_key, 403), (former_key, 403)):
+            with expect_events(data, http_event("login.failed", None, {"method": "key"}, actor="anonymous", via="key")):
+                assert login(server, key)[0] == status
+        # CSRF rejection happens before the throttle and must not write audit lines.
+        with expect_events(data):
+            assert call(server, "/login", "POST", json.dumps({"key": admin_key}),
+                        csrf(server, Origin="http://evil.example"))[0] == 403
+        freeze_throttle(server)
+        for _ in range(server.web.throttle.FREE_FAILURES):
+            with expect_events(data, http_event("login.failed", None, {"method": "key"}, actor="anonymous", via="key")):
+                assert login(server, "bad-key")[0] == 401
+        with expect_events(data):
+            assert login(server, "bad-key")[0] == 429
+        freeze_throttle(server)
+        with expect_events(data):
+            assert call(server, "/login", "POST", json.dumps({"user": 42}), csrf(server))[0] == 400
+        # A credential invalidated between verification and session creation is 401.
+        server.web._between_verify_and_session = lambda user: server.users.set_password("alice", PASSWORD)
+        with expect_events(data, http_event("login.failed", "alice", {"method": "password"}, actor="anonymous")):
+            assert password_login(server, "alice", PASSWORD)[0] == 401
+        with expect_events(data, http_event("login.failed", None, {"method": "key"}, actor="anonymous", via="key")):
+            assert login(server, admin_key)[0] == 401
+    raw = (data / "server" / "audit.jsonl").read_text()
+    assert all(secret not in raw for secret in (
+        "bad-key", "wrong-password", PASSWORD, admin_key, sync_key, former_key))
+
+
+@pytest.mark.parametrize("name", ["password typed here", "env", "..", "x" * 65])
+def test_failed_login_invalid_name_is_not_logged(tmp_path, hook_env, name):
+    data = tmp_path / "data"
+    with running(data) as server:
+        with expect_events(data, http_event("login.failed", None, {"method": "password"}, actor="anonymous")):
+            assert password_login(server, name, "wrong-password")[0] == 401
+    assert name not in (data / "server" / "audit.jsonl").read_text()
+
+
+def test_proxy_requests_do_not_log_logins_but_attribute_writes(tmp_path, hook_env):
+    data = tmp_path / "data"
+    with running(data, trusted_proxies=("127.0.0.1",), identity_header="oauth2-proxy") as server:
+        server.users.add("alice", role="member", identity="alice@example.com")
+        headers = {"X-Forwarded-Email": "alice@example.com", "X-Forwarded-For": "198.51.100.8"}
+        with expect_events(data):
+            for _ in range(2):
+                assert call(server, "/api/runs", headers=headers)[0] == 200
+                assert call(server, "/api/server/session", headers=headers)[0] == 200
+        detail = {"user": "alice", "scope": "sync"}
+        with expect_events(data, http_event("key.create", "box", detail, via="proxy", client="198.51.100.8")):
+            assert call(server, "/api/server/keys", "POST", json.dumps({"name": "box", "scope": "sync"}),
+                        csrf(server, **headers))[0] == 201
+        with expect_events(data, http_event("key.revoke", "box", detail, via="proxy", client="198.51.100.8")):
+            assert call(server, "/api/server/keys/box", "DELETE", headers=csrf(server, **headers))[0] == 200
+        with expect_events(data):
+            assert call(server, "/logout", "POST", headers=csrf(server, **headers))[0] == 204
+
+
+def test_http_mutation_succeeds_with_symlinked_audit_file(tmp_path, hook_env):
+    data = tmp_path / "data"
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"untouched")
+    with running(data) as server:
+        server.users.add("alice", role="admin")
+        server.users.set_password("alice", PASSWORD)
+        (data / "server" / "audit.jsonl").symlink_to(outside)
+        code, _, headers = password_login(server, "alice", PASSWORD)
+        assert code == 200
+        code, _, _, _ = authed(server, "/api/server/keys", "POST", json.dumps({
+            "name": "box", "scope": "sync"}), cookie=headers["Set-Cookie"])
+        assert code == 201
+        assert [key.name for key in server.keys.list()] == ["box"]
+        assert outside.read_bytes() == b"untouched"
+
+
+@pytest.mark.parametrize("via", ["cli", "key"])
+def test_first_key_also_attributes_bootstrap_user(tmp_path, capsys, hook_env, via):
+    data = tmp_path / "data"
+    if via == "cli":
+        with expect_events(data,
+                           hook_event("user.add", "admin", {"role": "admin", "identity": None}),
+                           hook_event("key.create", "box", {"user": "admin", "scope": "admin"})):
+            run_cli(data, capsys, "keys", "create", "--name", "box", "--scope", "admin")
+    else:
+        env_key = "env-key-secret-with-enough-characters"
+        with running(data, env_key=env_key) as server:
+            _, _, headers = login(server, env_key)
+            with expect_events(data,
+                               http_event("user.add", "admin", {"role": "admin", "identity": None}, actor="env", via="key"),
+                               http_event("key.create", "box", {"user": "admin", "scope": "admin"}, actor="env", via="key")):
+                assert authed(server, "/api/server/keys", "POST", json.dumps({
+                    "name": "box", "scope": "admin"}), cookie=headers["Set-Cookie"])[0] == 201
+
+
+@pytest.mark.parametrize("via", ["cli", "key"])
+def test_concurrent_first_keys_attribute_bootstrap_user_once(tmp_path, monkeypatch, hook_env, via):
+    data = tmp_path / "data"
+    barrier = threading.Barrier(2)
+    create = KeyStore.create
+
+    def concurrent_create(self, *args, **kwargs):
+        # Both callers reach create before either can bootstrap the admin.
+        barrier.wait(timeout=5)
+        return create(self, *args, **kwargs)
+
+    monkeypatch.setattr(KeyStore, "create", concurrent_create)
+    names = ["box-1", "box-2"]
+    if via == "cli":
+        def issue(name):
+            return cli.main(["server", "keys", "create", "--name", name,
+                             "--scope", "admin", "--data", str(data)])
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert list(pool.map(issue, names)) == [0, 0]
+        expected = hook_event
+    else:
+        with running(data, env_key="env-key-secret-with-enough-characters") as server:
+            _, _, headers = login(server, "env-key-secret-with-enough-characters")
+
+            def issue(name):
+                return authed(server, "/api/server/keys", "POST", json.dumps({
+                    "name": name, "scope": "admin"}), cookie=headers["Set-Cookie"])[0]
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                assert list(pool.map(issue, names)) == [201, 201]
+
+        def expected(action, target, detail):
+            return http_event(action, target, detail, actor="env", via="key")
+
+    rows = [{key: value for key, value in row.items() if key != "ts"}
+            for row in hook_rows(data) if row["action"] != "login.ok"]
+    assert sorted(rows, key=lambda row: (row["action"], row["target"])) == [
+        expected("key.create", name, {"user": "admin", "scope": "admin"}) for name in names
+    ] + [expected("user.add", "admin", {"role": "admin", "identity": None})]
+    assert [user.name for user in UserStore(data / "server").list()] == ["admin"]
+
+
+@pytest.mark.parametrize("project", [["project"], {"name": "project"}])
+def test_run_create_nonstring_project_is_null(tmp_path, hook_env, project):
+    data = tmp_path / "data"
+    with running(data) as server:
+        server.test_key = server.keys.create("box")[1]
+        with expect_events(data, http_event("run.create", "run-1", {"project": None, "key": "box"},
+                                           actor="admin", via="key")):
+            assert request(server, "/v2/runs/run-1/files/meta.json", "PUT", json.dumps({
+                "run_id": "run-1", "status": "running", "project": project}))[0] == 200
+
+
+def test_concurrent_run_create_and_finish_are_each_recorded_once(tmp_path, hook_env):
+    data = tmp_path / "data"
+    with running(data) as server:
+        server.test_key = server.keys.create("box")[1]
+
+        def race(path, method, body):
+            barrier = threading.Barrier(4)
+
+            def send(_):
+                barrier.wait(timeout=5)
+                return request(server, path, method, json.dumps(body))[0]
+
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                assert list(pool.map(send, range(4))) == [200] * 4
+
+        meta = {"run_id": "run-1", "status": "finished", "project": "project"}
+        with expect_events(data, http_event("run.create", "run-1", {"project": "project", "key": "box"},
+                                           actor="admin", via="key")):
+            race("/v2/runs/run-1/files/meta.json", "PUT", meta)
+        with expect_events(data, http_event("run.finish", "run-1", {"status": "finished", "key": "box"},
+                                           actor="admin", via="key")):
+            race("/v2/runs/run-1/commit", "POST", {
+                "status": "finished", "fingerprint": "a" * 64, "sizes": {}})
+
+
+@pytest.mark.parametrize("hook", ["webauth", "run.create", "run.finish", "key.create", "key.revoke", "user.add", "note.write"])
+@pytest.mark.parametrize("failure", ["arguments", "record"])
+def test_http_audit_helpers_catch_argument_and_record_failures(caplog, hook, failure):
+    from agenticml.server import ingest, keyspage, webauth
+    from agenticml.ui.server import DashboardHandler
+
+    def fail(*args, **kwargs):
+        raise ValueError("secret failure details")
+
+    writer = SimpleNamespace(record=fail if failure == "record" else lambda *a, **kw: None)
+    auth = SimpleNamespace(client_address=fail if failure == "arguments" else lambda h: "127.0.0.1")
+    handler = SimpleNamespace(
+        principal=Principal(user="alice", role="admin", via="key", key="box"),
+        server=SimpleNamespace(audit=writer, web=auth, auth=auth))
+    if hook == "webauth":
+        webauth.WebAuth._audit(auth, handler, "login.ok", "alice", {"method": "key"})
+    elif hook.startswith("run."):
+        ingest.IngestHandler._audit_run(handler, "run-1", (hook, {"project": "project", "status": "finished"}))
+    elif hook == "note.write":
+        DashboardHandler._audit_note(handler, "run-1", {"revision": "revision"})
+    else:
+        record = SimpleNamespace(name="box", user="alice", scope="sync")
+        keyspage._audit(auth, handler, hook, record)
+    assert "could not record audit event" in caplog.text
+    assert "secret failure details" not in caplog.text
+
+
+def test_migration_succeeds_once_when_audit_writer_raises(tmp_path, monkeypatch, caplog):
+    from agenticml.server.users import migrate
+
+    data = tmp_path / "data"
+    prepare_data_dir(data)
+    write_v1_keys(data / "server" / "keys.json", ["old"])
+    calls = []
+
+    def fail(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise RuntimeError("secret failure details")
+
+    monkeypatch.setattr(audit.AuditLog, "record", fail)
+    assert migrate(data)
+    assert UserStore(data / "server").get("admin").role == "admin"
+    assert migrate(data)
+    assert len(calls) == 1
+    assert "could not record audit event" in caplog.text
+    assert "secret failure details" not in caplog.text
+
+
+def test_http_mutations_succeed_when_audit_writer_raises(tmp_path, monkeypatch, hook_env, caplog):
+    data = tmp_path / "data"
+    with running(data) as server:
+        server.users.add("alice", role="admin")
+        server.users.set_password("alice", PASSWORD)
+        server.test_key = server.keys.create("sync", user="alice")[1]
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("secret failure details")
+
+        monkeypatch.setattr(server.audit, "record", fail)
+        assert password_login(server, "alice", "wrong-password")[0] == 401
+        code, _, headers = password_login(server, "alice", PASSWORD)
+        assert code == 200
+        cookie = headers["Set-Cookie"]
+        assert authed(server, "/api/server/keys", "POST", json.dumps({
+            "name": "box", "scope": "sync"}), cookie=cookie)[0] == 201
+        assert authed(server, "/api/server/keys/box", "DELETE", extra=csrf(server), cookie=cookie)[0] == 200
+        assert request(server, "/v2/runs/run-1/files/meta.json", "PUT", json.dumps({
+            "run_id": "run-1", "status": "finished", "project": "project"}))[0] == 200
+        assert request(server, "/v2/runs/run-1/commit", "POST", json.dumps({
+            "status": "finished", "fingerprint": "a" * 64, "sizes": {}}))[0] == 200
+        assert authed(server, "/api/runs/run-1/notes", "PUT", json.dumps({
+            "text": "note", "revision": None}), cookie=cookie)[0] == 200
+        assert authed(server, "/logout", "POST", cookie=cookie)[0] == 204
+    assert "could not record audit event" in caplog.text
+    assert "secret failure details" not in caplog.text

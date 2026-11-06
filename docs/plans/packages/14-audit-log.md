@@ -68,7 +68,7 @@ One JSON object per line, UTF-8, `\n`-terminated, keys in this order:
 | `key.revoke` | CLI, keys API, user removal (one line per key) | key | `{user, scope}` |
 | `setup` | `/setup` success | user | `{}` |
 | `login.ok` | `/login`, `/invite` redeem | user | `{method}` |
-| `login.failed` | `/login` 401/403 (not 429) | attempted user name or `null` | `{method}` |
+| `login.failed` | `/login` credential 401/403 (not CSRF or 429) | attempted user name or `null` | `{method}` |
 | `logout` | `/logout` with a session | user | `{}` |
 | `run.create` | first `meta.json` of a run | run id | `{project, key}` |
 | `run.finish` | `commit` that changes status to finished or crashed | run id | `{status, key}` |
@@ -132,3 +132,39 @@ file is unreadable; an absent file prints nothing and exits 0.
 - `PYTHONPATH=src /home/bharath/CAD-AI/agenticML/mlLinearTracking/testbed/.venv/bin/python
   -m pytest -q tests` from the worktree root.
 - Report any deviation from this plan instead of changing the approach.
+
+## Part B implementation notes
+
+- `IngestServer.audit` is the shared HTTP writer, including the future users
+  API in package 15. The audit route and CLI use the reader from part A.
+- `server/up.py` also records its admin bootstrap and invite, as required by
+  the Actions table. It creates no keys after package 13. The first-key
+  compatibility path in the CLI and keys API records its implicit admin
+  `user.add` as well as `key.create`. Accepted in review: `/setup` records
+  `user.add`, `user.password`, and `setup`; `server up` and the first-key
+  paths also record `user.add`.
+- First-key paths use `KeyStore.create`'s `created_users` out-parameter,
+  populated under `keys.lock`, to decide whether to record `user.add`.
+  Concurrent CLI or keys API creates record only one bootstrap admin event;
+  there is no pre-check outside the mutation lock.
+- Password-change `detail.method` values are `cli`, `setup`, `invite`, and
+  `account`. Login methods are `password`, `key`, and `invite`. Accepted in
+  review: `login.failed` uses the attempted method for `via`, with a password
+  attempt's user name as target only when it passes `validate_name`; otherwise
+  the target is null. Tests verify invalid-name text is absent from the log.
+  Throttled and CSRF-rejected requests produce no failed-login event.
+  CSRF rejection logs only `login refused: cross-site`
+  before the throttle, preventing unlimited fsynced audit writes.
+- `run.create` includes `detail.project` only as a string; a missing or
+  non-string project becomes null. Tests cover list and dict values.
+- Run creation and terminal-status transitions decide a pending event under
+  `run_lock`, then record it after releasing the lock. Migration records only
+  after releasing `keys.lock`. Retry and concurrent-request tests preserve
+  exactly-once events, and lock checks verify the writer runs unlocked.
+- HTTP audit helpers build event arguments and call the writer inside
+  `try/except Exception`, logging a fixed message without exception details.
+  Audit failures, including argument-construction failures, cannot change a
+  successful mutation's response. Migration has the same protection.
+- Secret-exclusion checks include failed-login key/password text, plus the
+  environment and sync keys used by run lifecycle tests.
+- User-management HTTP hooks and the Activity view remain package 15's work.

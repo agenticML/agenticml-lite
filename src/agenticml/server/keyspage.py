@@ -99,6 +99,19 @@ def _run_counts(root):
     return counts
 
 
+def _audit(webauth, handler, action, record):
+    try:
+        principal = handler.principal
+        target = record.user if action == "user.add" else record.name
+        detail = ({"role": "admin", "identity": None} if action == "user.add"
+                  else {"user": record.user, "scope": record.scope})
+        handler.server.audit.record(
+            principal.user, principal.via, action, target,
+            webauth.client_address(handler), detail)
+    except Exception:
+        logger.error("could not record audit event")
+
+
 def handle(webauth, handler, path):
     from .webauth import LOGIN_BODY_MAX
 
@@ -148,8 +161,10 @@ def handle(webauth, handler, path):
                 actor = principal.user
                 # The env user is not stored; fall through to the default-user rule.
                 key_user = None if env_default else user
+                created_users = []
                 record, value = webauth.keys.create(
-                    name, scope, created_by=actor, user=key_user)
+                    name, scope, created_by=actor, user=key_user,
+                    created_users=created_users)
             except KeyNameTaken:
                 message = ("key name already exists" if allowed(principal, "all_keys")
                            else "key name is not available")
@@ -162,6 +177,9 @@ def handle(webauth, handler, path):
                 handler._json({"error": "key store unavailable"}, 503)
                 return
             logger.info("created key %s scope %s", name, scope)
+            if created_users:
+                _audit(webauth, handler, "user.add", record)
+            _audit(webauth, handler, "key.create", record)
             handler._json({"key": value, "record": record.to_public(),
                            **command_host(webauth, handler)}, 201)
         elif path.startswith("/api/server/keys/") and handler.command == "DELETE":
@@ -203,6 +221,7 @@ def handle(webauth, handler, path):
                 handler._json({"error": "not found"}, 404)
                 return
             webauth.drop_sessions(name, record.sha256)
+            _audit(webauth, handler, "key.revoke", record)
             session = getattr(handler, "session", None) or {}
             signed_out = (session.get("name") == name
                           and session.get("sha256") == record.sha256)

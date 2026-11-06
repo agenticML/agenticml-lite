@@ -536,8 +536,12 @@ def test_env_admin_requires_user_in_api_and_cannot_delete_env(tmp_path):
 def test_commit_without_principal_key(tmp_path):
     (tmp_path / "meta.json").write_text(json.dumps({"status": "finished"}))
     written = {}
+    recorded = []
     handler = SimpleNamespace(
         principal=Principal("alice", "member", "proxy", key=None),
+        server=SimpleNamespace(
+            audit=SimpleNamespace(record=lambda *args: recorded.append(args)),
+            web=SimpleNamespace(client_address=lambda handler: "127.0.0.1")),
         _target=lambda directory, name: directory / name,
         _write_json=lambda directory, name, payload: written.update(payload))
     result = ingest.IngestHandler._commit(handler, tmp_path, json.dumps({
@@ -546,6 +550,10 @@ def test_commit_without_principal_key(tmp_path):
     assert result[1] == 200
     assert written["last_sync_key"] is None
     assert written["owner"] == "alice" and written["owner_key"] == "laptop"
+    assert recorded == []  # The caller records only after releasing run_lock.
+    ingest.IngestHandler._audit_run(handler, tmp_path.name, result[2])
+    assert recorded == [("alice", "proxy", "run.finish", tmp_path.name,
+                         "127.0.0.1", {"status": "finished", "key": None})]
 
 
 def test_runs_list_reads_remote_once_per_run(server, tmp_path, monkeypatch):

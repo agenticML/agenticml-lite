@@ -149,9 +149,13 @@ def _invite_is_live(user):
 
 def bootstrap_admin(data, public_url, *, install=False):
     """Create the first admin user with an invite if needed. Returns the data dir."""
+    from .audit import AuditLog, cli_actor
+
     data = resolve_data_dir(data)
     prepare_data_dir(data)
-    if not migrate(data):
+    actor = cli_actor()
+    log = AuditLog(data / "server")
+    if not migrate(data, actor=actor):
         raise UpError("could not migrate keys.json; fix the file and retry")
     env_key = os.environ.get("AGENTICML_SERVER_KEY")
     keys = KeyStore(data / "server", None if install else env_key)
@@ -177,7 +181,10 @@ def bootstrap_admin(data, public_url, *, install=False):
         users.add("admin", role="admin", created_by="server up")
     except UserNameTaken:
         raise UpError(_ADMIN_NAME_NOT_ADMIN) from None
+    log.record(actor, "cli", "user.add", "admin", detail={"role": "admin", "identity": None})
     token = users.create_invite("admin")
+    log.record(actor, "cli", "user.invite", "admin",
+               detail={"expires_at": users.get("admin").invite["expires_at"]})
     print(f"Open {public_url}/invite?token={token} to choose the admin "
           "password. The link works once, for 72 hours.", flush=True)
     if install and env_key:

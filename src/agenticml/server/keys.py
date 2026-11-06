@@ -291,8 +291,12 @@ class KeyStore:
                 file_lock.__exit__(None, None, None)
 
     def create(self, name, scope="sync", created_by="cli", *, user=None,
-               only_if_no_admin=False):
-        """Return (KeyRecord, secret); the secret is never persisted."""
+               only_if_no_admin=False, created_users=None):
+        """Return (KeyRecord, secret); the secret is never persisted.
+
+        If supplied, append the bootstrapped admin UserRecord to created_users
+        under the mutation lock, after successfully saving the key.
+        """
         from .users import UserNotFound, UserStore
 
         validate_name(name)
@@ -315,10 +319,12 @@ class KeyStore:
                 user_records = users_store._read()
             except (OSError, ValueError, TypeError, RecursionError) as exc:
                 _unavailable(exc, "could not load users.json")
+            bootstrap_user = None
             if user is None:
                 if not user_records:
                     admin = UserStore._new("admin", "admin", None, created_by)
                     users_store._write([admin])
+                    bootstrap_user = admin
                     chosen, chosen_role = admin.name, admin.role
                 elif len(user_records) == 1:
                     chosen, chosen_role = user_records[0].name, user_records[0].role
@@ -340,6 +346,8 @@ class KeyStore:
             if scope == "admin":
                 self._write_setup_closed()
             self._write(records + [record])
+            if created_users is not None and bootstrap_user is not None:
+                created_users.append(bootstrap_user)
             return record, key
 
     def list(self):

@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import ipaddress
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -28,6 +29,8 @@ from urllib.parse import parse_qs, unquote, urlsplit
 import webbrowser
 
 from agenticml.store import layout, notes, reader
+
+logger = logging.getLogger("agenticml.ui.server")
 
 _STATIC = Path(__file__).with_name("static")
 _FILES = {
@@ -1595,8 +1598,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             raise ValueError("short body")
         text, revision = _parse_note_body(body)
         saved = notes.write_note(self.server.root, run_id, text, revision)
+        self._audit_note(run_id, saved)
         saved["writable"] = _notes_writable(self)
         self._json(saved)
+
+    def _audit_note(self, run_id, saved):
+        try:
+            if getattr(self.server, "audit", None) is not None:
+                self.server.audit.record(
+                    self.principal.user, self.principal.via, "note.write", run_id,
+                    self.server.auth.client_address(self), {"revision": saved["revision"]})
+        except Exception:
+            logger.error("could not record audit event")
 
     def __getattr__(self, name):
         if name.startswith("do_"):

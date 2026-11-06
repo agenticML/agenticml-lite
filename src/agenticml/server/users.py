@@ -551,7 +551,7 @@ class UserStore:
             return updated
 
 
-def migrate(data_dir):
+def migrate(data_dir, *, actor="server"):
     """Upgrade a 2.0/2.1 data directory in place. Idempotent; users.json is the commit.
 
     Returns True when migration is complete or not needed, False when it did not
@@ -642,9 +642,21 @@ def migrate(data_dir):
         if need_admin:
             logger.info("migrated 2.0 keys to user admin (%d keys, %d runs)",
                         len(records), rewritten)
-        return True
     finally:
         lock.__exit__(None, None, None)
+    if need_admin:
+        _audit_migration(server_dir, actor, records, rewritten)
+    return True
+
+
+def _audit_migration(server_dir, actor, records, rewritten):
+    try:
+        from .audit import AuditLog
+        AuditLog(server_dir).record(
+            actor, "server" if actor == "server" else "cli", "migration",
+            "admin", detail={"keys": len(records), "runs": rewritten})
+    except Exception:
+        logger.error("could not record audit event")
 
 
 def _store_paths_safe(data):

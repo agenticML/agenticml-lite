@@ -127,7 +127,7 @@ and keeps a single v1 store; team state lives beside it in `<data>/server/`.
 | 11 † | Users, roles, migration, run ownership by user | 2.1 | Cursor | L | [plan](packages/11-users-and-roles.md) | done (2.2 PR) |
 | 12 † | Per-user key management and sync attribution | 11 | Codex | M | [plan](packages/12-per-user-keys.md) | done (2.2 PR) |
 | 13 † | Dashboard sign-in: passwords, invites, trusted identity proxy | 11 | Cursor | L | [plan](packages/13-sign-in.md) | done (2.2 PR) |
-| 14 | Audit log | 11–13 | Codex | S–M | [plan](packages/14-audit-log.md) | plan ready |
+| 14 | Audit log | 11–13 | Codex | S–M | [plan](packages/14-audit-log.md) | done (2.2 PR) |
 | 15 | Team admin page, account menu, end-to-end teams test | 11–14 | Cursor | M–L | [plan](packages/15-team-admin-page.md) | plan ready |
 
 - **11 Users and roles.** `users.json` with `admin`, `member` and `viewer`

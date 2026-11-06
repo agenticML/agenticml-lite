@@ -200,18 +200,21 @@ class IngestHandler(DashboardHandler):
                 payload, status = self._object(args[0], tmp, digest)
                 self._json(payload, status)
             else:
+                pending = None
                 with self.server.run_lock(run_id):
                     directory = self._run_dir(run_id)
                     remote = self._ownership(directory, principal, route == "atomic" and args[1] == "meta.json")
                     if route == "atomic":
-                        payload, status = self._atomic(run_id, args[1], body, record, principal, remote)
+                        payload, status, pending = self._atomic(run_id, args[1], body, record, principal, remote)
                     elif route == "append":
                         payload, status = self._append(directory, args[1], query, tmp, length, remote)
                     elif route == "lineage":
                         meta = _json_object(layout.read_file_nofollow(self._target(directory, "meta.json")))
                         payload, status = lineage.receive(self.server.root, run_id, meta, tmp)
                     else:
-                        payload, status = self._commit(directory, body, remote)
+                        payload, status, pending = self._commit(directory, body, remote)
+                if pending is not None:
+                    self._audit_run(run_id, pending)
                 self._json(payload, status)
         except (_RequestError, lineage.LineageError) as exc:
             # A rejected request may leave an announced body unread.
@@ -412,7 +415,23 @@ class IngestHandler(DashboardHandler):
                 self._write_json(directory, "remote.json", claimed)
         layout.atomic_write(path, body, fsync=True)
         layout.fsync_dir(path.parent)
-        return {"size": len(body)}, 200
+        pending = ("run.create", obj) if name == "meta.json" and not exists else None
+        return {"size": len(body)}, 200, pending
+
+    def _audit_run(self, run_id, pending):
+        try:
+            action, obj = pending
+            if action == "run.create":
+                project = obj.get("project")
+                detail = {"project": project if isinstance(project, str) else None,
+                          "key": self.principal.key}
+            else:
+                detail = {"status": obj["status"], "key": self.principal.key}
+            self.server.audit.record(
+                self.principal.user, self.principal.via, action, run_id,
+                self.server.web.client_address(self), detail)
+        except Exception:
+            logger.error("could not record audit event")
 
     def _write_json(self, directory, name, value):
         path = self._target(directory, name)
@@ -621,4 +640,7 @@ class IngestHandler(DashboardHandler):
         if isinstance(owner_key, str):
             payload["owner_key"] = owner_key
         self._write_json(directory, "remote.json", payload)
-        return {"complete": True, "fingerprint": fingerprint}, 200
+        pending = (("run.finish", obj)
+                   if status in ("finished", "crashed") and status != remote.get("status")
+                   else None)
+        return {"complete": True, "fingerprint": fingerprint}, 200, pending

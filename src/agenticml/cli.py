@@ -557,12 +557,15 @@ _MIGRATE_FAILED = "could not migrate keys.json; fix the file and retry"
 
 
 def cmd_server_keys(args):
+    from .server.audit import AuditLog, cli_actor
     from .server.keys import KeyStore, KeyStoreUnavailable
     from .server.users import UserStore, migrate
 
     try:
         data, directory = _server_data_dir(args)
-        if not migrate(data):
+        actor = cli_actor()
+        log = AuditLog(directory)
+        if not migrate(data, actor=actor):
             print(f"agenticml server: {_MIGRATE_FAILED}", file=sys.stderr)
             return 1
         keys = KeyStore(directory, env_key=None)
@@ -572,12 +575,22 @@ def cmd_server_keys(args):
             except ValueError as exc:
                 print(f"agenticml server: warning: {exc}; listing file keys only", file=sys.stderr)
         if args.keys_action == "create":
-            _, key = keys.create(args.name, args.scope, user=args.user)
+            created_users = []
+            record, key = keys.create(
+                args.name, args.scope, user=args.user, created_users=created_users)
+            if created_users:
+                log.record(actor, "cli", "user.add", record.user,
+                           detail={"role": "admin", "identity": None})
+            log.record(actor, "cli", "key.create", record.name,
+                       detail={"user": record.user, "scope": record.scope})
             print(key)
             print("shown once; store it now", file=sys.stderr)
         elif args.keys_action == "revoke":
-            if not keys.revoke(args.name):
+            record = keys.revoke(args.name)
+            if not record:
                 raise ValueError("unknown key name")
+            log.record(actor, "cli", "key.revoke", record.name,
+                       detail={"user": record.user, "scope": record.scope})
         else:
             user = args.user
             if user is not None:
@@ -634,34 +647,54 @@ def _read_cli_password(args):
 
 
 def cmd_server_users(args):
+    from .server.audit import AuditLog, cli_actor
     from .server.keys import KeyStore, KeyStoreUnavailable
     from .server.users import UserStore, migrate
 
     try:
         data, directory = _server_data_dir(args)
-        if not migrate(data):
+        actor = cli_actor()
+        log = AuditLog(directory)
+        if not migrate(data, actor=actor):
             print(f"agenticml server: {_MIGRATE_FAILED}", file=sys.stderr)
             return 1
         users = UserStore(directory)
         keys = KeyStore(directory)
         if args.users_action == "add":
-            users.add(args.name, role=args.role, identity=args.identity,
-                      reclaim_runs=args.reclaim_runs)
+            user = users.add(args.name, role=args.role, identity=args.identity,
+                             reclaim_runs=args.reclaim_runs)
+            log.record(actor, "cli", "user.add", user.name,
+                       detail={"role": user.role, "identity": user.identity})
             if not args.no_invite:
                 token = users.create_invite(args.name)
+                log.record(actor, "cli", "user.invite", args.name,
+                           detail={"expires_at": users.get(args.name).invite["expires_at"]})
                 _print_invite(token, _invite_base(args))
         elif args.users_action == "invite":
             token = users.create_invite(args.name)
+            log.record(actor, "cli", "user.invite", args.name,
+                       detail={"expires_at": users.get(args.name).invite["expires_at"]})
             _print_invite(token, _invite_base(args))
         elif args.users_action == "set-password":
             users.set_password(args.name, _read_cli_password(args))
+            log.record(actor, "cli", "user.password", args.name, detail={"method": "cli"})
         elif args.users_action == "remove":
+            removed_keys = keys.for_user(args.name)
             revoked = users.remove(args.name)
+            for record in removed_keys:
+                log.record(actor, "cli", "key.revoke", record.name,
+                           detail={"user": record.user, "scope": record.scope})
+            log.record(actor, "cli", "user.remove", args.name, detail={"keys_revoked": revoked})
             print(f"removed {args.name} ({revoked} keys)")
         elif args.users_action == "set-role":
+            previous = users.get(args.name)
             users.set_role(args.name, args.role)
+            log.record(actor, "cli", "user.role", args.name,
+                       detail={"from": previous.role, "to": args.role})
         elif args.users_action == "set-identity":
-            users.set_identity(args.name, args.identity)
+            user = users.set_identity(args.name, args.identity)
+            log.record(actor, "cli", "user.identity", args.name,
+                       detail={"identity": user.identity})
         else:
             rows = []
             for user in users.list():
@@ -683,6 +716,12 @@ def cmd_server_users(args):
         print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
         return 1
     return 0
+
+
+def cmd_server_audit(args):
+    from .server.audit import cli_main
+
+    return cli_main(args.data, args.limit, args.json)
 
 
 def _cmd_server_report(args, verify=False):
@@ -1258,6 +1297,11 @@ def main(argv=None):
 
     p_server = sub.add_parser("server", help="Serve and administer an on-prem store")
     server_sub = p_server.add_subparsers(dest="server_action", required=True)
+    p_audit = server_sub.add_parser("audit", help="Show recent audit events")
+    p_audit.add_argument("--data", default=None)
+    p_audit.add_argument("--limit", type=int, default=50)
+    p_audit.add_argument("--json", action="store_true")
+    p_audit.set_defaults(func=cmd_server_audit)
     p_serve = server_sub.add_parser("serve", help="Serve protocol v2 ingest")
     p_serve.add_argument("--data", default=None, help="Data directory (default: AGENTICML_SERVER_DATA or ~/.agenticml-server)")
     p_serve.add_argument("--host", default="127.0.0.1")
