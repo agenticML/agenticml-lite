@@ -77,47 +77,37 @@ def assert_dialog_fits(page, dialog):
     assert dialog.evaluate("node => node.scrollWidth <= node.clientWidth")
 
 
-def test_setup_shows_key_once_and_opens_dashboard(page, fresh_server):
+def test_setup_creates_admin_and_opens_dashboard(page, fresh_server):
     page.set_viewport_size({"width": 375, "height": 812})
     token = fresh_server["httpd"].web.setup_token
     page.goto(f"{fresh_server['url']}/setup?token={token}")
-    expect(page.get_by_role("heading", name="First admin key", exact=True)).to_be_visible()
+    expect(page.get_by_role("heading", name="Create admin account", exact=True)).to_be_visible()
     expect(page).to_have_url(f"{fresh_server['url']}/setup")
     assert token not in page.url
     assert_no_overflow(page)
-    page.get_by_role("button", name="Create admin key", exact=True).click()
-    expect(page.locator("#value")).to_have_text(re.compile(r"aml_[A-Za-z0-9_-]+"))
-    value = page.locator("#value").inner_text()
-    expect(page.locator("#command")).to_have_text(
-        f"agenticml login --host '{fresh_server['url']}' --key '{value}'")
-    expect(page.get_by_text("This key is shown once and cannot be recovered.", exact=True)).to_be_visible()
-    assert_no_overflow(page)
-    page.get_by_role("link", name="Open dashboard", exact=True).click()
-    expect(page.get_by_role("link", name="Keys", exact=True)).to_be_visible()
-    expect(page.get_by_text("Signed in as admin", exact=True)).to_be_attached()
-    assert_key_cleared(page, value)
+    page.locator("#password").fill("password1234")
+    page.locator("#password2").fill("password1234")
+    page.get_by_role("button", name="Create admin account", exact=True).click()
+    expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
     assert_no_overflow(page)
 
 
 @pytest.mark.parametrize("body", [
-    {"ok": True}, {"ok": True, "value": "aml_x", "host": 1},
-], ids=["missing-value", "non-string-host"])
+    {}, {"ok": 1},
+], ids=["missing-ok", "non-bool-ok"])
 def test_setup_bad_success_body_keeps_form_and_token_for_retry(page, fresh_server, body):
     token = fresh_server["httpd"].web.setup_token
     page.goto(f"{fresh_server['url']}/setup?token={token}")
+    page.locator("#password").fill("password1234")
+    page.locator("#password2").fill("password1234")
     page.route("**/setup", lambda route: route.fulfill(status=201, json=body))
-    page.get_by_role("button", name="Create admin key", exact=True).click()
+    page.get_by_role("button", name="Create admin account", exact=True).click()
     expect(page.locator("#error")).to_have_text("Setup failed (201)")
     expect(page.locator("#setup")).to_be_visible()
-    expect(page.locator("#result")).to_be_hidden()
-    expect(page.locator("#value")).to_have_text("")
-    expect(page.locator("#command")).to_have_text("")
     assert fresh_server["httpd"].web.setup_token == token
     page.unroute("**/setup")
-    page.get_by_role("button", name="Create admin key", exact=True).click()
-    expect(page.locator("#value")).to_have_text(re.compile(r"aml_[A-Za-z0-9_-]+"))
-    expect(page.locator("#setup")).to_have_count(0)
-    expect(page.locator("#result")).to_be_visible()
+    page.get_by_role("button", name="Create admin account", exact=True).click()
+    expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
 
 
 @pytest.mark.parametrize("status,body", [
@@ -127,42 +117,31 @@ def test_setup_bad_error_body_keeps_form_and_token_for_retry(page, fresh_server,
     page.allow_http_errors = True
     token = fresh_server["httpd"].web.setup_token
     page.goto(f"{fresh_server['url']}/setup?token={token}")
-    page.get_by_label("Key name", exact=True).fill("first-admin")
+    page.get_by_label("User name", exact=True).fill("first-admin")
+    page.locator("#password").fill("password1234")
+    page.locator("#password2").fill("password1234")
     page.route("**/setup", lambda route: route.fulfill(
         status=status, content_type="application/json", body=body))
-    page.get_by_role("button", name="Create admin key", exact=True).click()
+    page.get_by_role("button", name="Create admin account", exact=True).click()
     expect(page.locator("#error")).to_have_text(f"Setup failed ({status})")
     expect(page.locator("#setup")).to_be_visible()
-    expect(page.get_by_label("Key name", exact=True)).to_have_value("first-admin")
-    expect(page.get_by_role("button", name="Create admin key", exact=True)).to_be_enabled()
-    expect(page.locator("#result")).to_be_hidden()
-    expect(page.locator("#value")).to_have_text("")
-    expect(page.locator("#command")).to_have_text("")
+    expect(page.get_by_label("User name", exact=True)).to_have_value("first-admin")
+    expect(page.get_by_role("button", name="Create admin account", exact=True)).to_be_enabled()
     assert fresh_server["httpd"].web.setup_token == token
     page.unroute("**/setup")
-    page.get_by_role("button", name="Create admin key", exact=True).click()
-    expect(page.locator("#value")).to_have_text(re.compile(r"aml_[A-Za-z0-9_-]+"))
-    expect(page.locator("#setup")).to_have_count(0)
-    expect(page.locator("#result")).to_be_visible()
+    page.get_by_role("button", name="Create admin account", exact=True).click()
+    expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
 
 
 @pytest.mark.parametrize("fresh_server", [
     {"public_url": "http://ml.example.com/$(x);echo'quoted'"}, {"host": "::1"},
 ], ids=["public-url-metacharacters", "ipv6-bind"], indirect=True)
-@pytest.mark.parametrize("surface", ["setup", "dashboard"])
-def test_login_command_quotes_shell_arguments(page, fresh_server, surface):
+def test_login_command_quotes_shell_arguments(page, fresh_server):
     httpd = fresh_server["httpd"]
-    if surface == "setup":
-        page.goto(f"{fresh_server['url']}/setup?token={httpd.web.setup_token}")
-        page.get_by_role("button", name="Create admin key", exact=True).click()
-        expect(page.locator("#value")).to_have_text(re.compile(r"aml_[A-Za-z0-9_-]+"))
-        value = page.locator("#value").inner_text()
-        command = page.locator("#command").inner_text()
-    else:
-        _, admin = httpd.keys.create("admin", "admin")
-        open_keys(page, {**fresh_server, "admin": admin})
-        dialog, value = create_key(page, "worker")
-        command = dialog.locator(".key-command").inner_text()
+    _, admin = httpd.keys.create("admin", "admin")
+    open_keys(page, {**fresh_server, "admin": admin})
+    dialog, value = create_key(page, "worker")
+    command = dialog.locator(".key-command").inner_text()
     host = httpd.public_url or fresh_server["url"]
     quoted_host = "'" + host.replace("'", "'\\''") + "'"
     assert command == f"agenticml login --host {quoted_host} --key '{value}'"

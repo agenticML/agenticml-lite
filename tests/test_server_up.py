@@ -21,10 +21,11 @@ from agenticml import cli
 from agenticml.server import app
 from agenticml.server.keys import KeyStore
 from agenticml.server import up as up_mod
+from agenticml.server.users import UserStore
 from test_server_users import write_v1_keys
 from agenticml.server.up import (
-    UpError, _ENV_KEY_NOT_INHERITED, _INSTALL_NEEDS_PORT, _NO_ADMIN_TTY,
-    _NO_DNS, _NO_FUNNEL, _NO_HTTPS, _NOT_INSTALLED, _NOT_RUNNING,
+    UpError, _ADMIN_NAME_NOT_ADMIN, _ENV_KEY_NOT_INHERITED, _INSTALL_NEEDS_PORT,
+    _NO_ADMIN_TTY, _NO_DNS, _NO_FUNNEL, _NO_HTTPS, _NOT_INSTALLED, _NOT_RUNNING,
     _PORT_443_TAKEN, _SETUP_CLOSED, _SYSTEMD_CONTROL, _systemd_quote,
     write_launchd_plist,
 )
@@ -234,9 +235,9 @@ def test_happy_path_and_second_start(tmp_path, monkeypatch):
         text = "".join(lines)
         assert f"AgenticML is live at {PUBLIC_URL}" in text
         assert "/setup?token=" not in text
-        keys = [line.strip() for line in lines if line.startswith("aml_")]
-        assert len(keys) == 1
-        assert any("shown only once" in line for line in lines)
+        invite = [line.strip() for line in lines if "/invite?token=" in line]
+        assert len(invite) == 1
+        assert any("72 hours" in line for line in lines)
         conn = http.client.HTTPConnection(local.hostname, local.port, timeout=3)
         try:
             conn.request("GET", "/healthz")
@@ -252,23 +253,25 @@ def test_happy_path_and_second_start(tmp_path, monkeypatch):
         assert process.returncode == 0, output
         assert "stopped" in output
         assert "/setup?token=" not in output
-        assert output.count(keys[0]) == 1
+        assert output.count(invite[0]) == 1
     assert ["funnel", "status", "--json"] in invocations(log)
     assert funnel_toggles(log) == [
         ["funnel", "--bg", "--https=443", f"http://127.0.0.1:{local.port}"],
         ["funnel", "--https=443", "off"],
     ]
     assert all("reset" not in row for row in invocations(log))
-    first_keys = json.loads((data / "server" / "keys.json").read_text())
-    assert first_keys["keys"][0]["created_by"] == "server up"
+    users = json.loads((data / "server" / "users.json").read_text())
+    assert users["users"][0]["name"] == "admin" and users["users"][0]["role"] == "admin"
+    assert users["users"][0]["created_by"] == "server up"
+    assert users["users"][0]["invite"] is not None
     log.write_text("")
     with running_up(tmp_path, data) as (process, _local, lines):
-        assert not any(line.startswith("aml_") for line in lines)
+        assert not any("/invite?token=" in line for line in lines)
         process.send_signal(signal.SIGTERM)
         rest, _ = process.communicate(timeout=10)
         assert process.returncode == 0, rest
         assert "/setup?token=" not in "".join(lines) + rest
-    assert json.loads((data / "server" / "keys.json").read_text()) == first_keys
+    assert json.loads((data / "server" / "users.json").read_text()) == users
 
 
 def test_funnel_on_failure_still_turns_off(tmp_path, monkeypatch, capsys):
@@ -396,7 +399,7 @@ def test_env_key_skips_create(tmp_path, monkeypatch):
     assert not (data / "server" / "keys.json").exists()
 
 
-def test_admin_name_taken_uses_suffix(tmp_path, monkeypatch):
+def test_existing_admin_user_skips_bootstrap(tmp_path, monkeypatch):
     install_fake(tmp_path, monkeypatch)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     data = tmp_path / "data"
@@ -404,10 +407,19 @@ def test_admin_name_taken_uses_suffix(tmp_path, monkeypatch):
     KeyStore(data / "server").create("admin", "sync")
     assert run_up(data, "--install") == 0
     names = {record.name: record for record in KeyStore(data / "server").list()}
-    assert "admin" in names and names["admin"].scope == "sync"
-    extras = [name for name, record in names.items()
-              if name.startswith("admin-") and record.scope == "admin"]
-    assert len(extras) == 1 and len(extras[0]) == len("admin-") + 4
+    assert list(names) == ["admin"] and names["admin"].scope == "sync"
+    users = json.loads((data / "server" / "users.json").read_text())
+    assert users["users"][0]["name"] == "admin"
+
+
+def test_non_admin_named_admin_refused(tmp_path, monkeypatch, capsys):
+    install_fake(tmp_path, monkeypatch)
+    monkeypatch.setattr(up_mod, "_stdout_is_tty", lambda: True)
+    data = tmp_path / "data"
+    app.prepare_data_dir(data)
+    UserStore(data / "server").add("admin", role="member")
+    assert run_up(data, "--install") == 1
+    assert capsys.readouterr().err.splitlines()[0] == _ADMIN_NAME_NOT_ADMIN
 
 
 def test_systemd_quote_percent_dollar_newline_space():
@@ -458,10 +470,9 @@ def test_install_with_env_key_creates_file_admin(tmp_path, monkeypatch, capsys):
     assert run_up(data, "--install") == 0
     out = capsys.readouterr().out
     assert out.splitlines().count(_ENV_KEY_NOT_INHERITED) == 1
-    keys = [line.strip() for line in out.splitlines() if line.startswith("aml_")]
-    assert len(keys) == 1
-    names = {record.name: record for record in KeyStore(data / "server").list()}
-    assert "admin" in names and names["admin"].scope == "admin"
+    assert any("/invite?token=" in line for line in out.splitlines())
+    users = json.loads((data / "server" / "users.json").read_text())
+    assert users["users"][0]["name"] == "admin" and users["users"][0]["invite"] is not None
 
 
 def test_install_migrates_v1_admin_and_does_not_create(tmp_path, monkeypatch, capsys):
@@ -499,12 +510,12 @@ def test_setup_closed_refuses_bootstrap(tmp_path, monkeypatch, capsys):
     data = tmp_path / "data"
     app.prepare_data_dir(data)
     keys = KeyStore(data / "server")
-    keys.create("admin", "admin")
-    keys.revoke("admin")
+    (data / "server" / "setup-closed").write_bytes(b"")
     assert not KeyStore(data / "server").has_admin()
     assert run_up(data, "--install") == 1
     assert capsys.readouterr().err.splitlines()[0] == _SETUP_CLOSED
-    assert not any(record.scope == "admin" for record in KeyStore(data / "server").list())
+    assert not (data / "server" / "users.json").exists() or json.loads(
+        (data / "server" / "users.json").read_text()).get("users") in (None, [])
 
 
 def test_existing_other_443_refused(tmp_path, monkeypatch, capsys):

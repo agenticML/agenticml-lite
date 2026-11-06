@@ -142,8 +142,8 @@ def test_default_bind_cli_and_shutdown(tmp_path, monkeypatch, capsys):
     httpd.server_close()
     original = app.make_server
     seen = []
-    def construct(data, host, port, public_url, env_key):
-        httpd = original(data, host, port, public_url, env_key)
+    def construct(data, host, port, public_url, env_key, trusted_proxies=(), identity_header=None):
+        httpd = original(data, host, port, public_url, env_key, trusted_proxies, identity_header)
         seen.append(httpd)
         def run_once():
             def health():

@@ -126,7 +126,7 @@ and keeps a single v1 store; team state lives beside it in `<data>/server/`.
 | --- | --- | --- | --- | --- | --- | --- |
 | 11 † | Users, roles, migration, run ownership by user | 2.1 | Cursor | L | [plan](packages/11-users-and-roles.md) | done (2.2 PR) |
 | 12 † | Per-user key management and sync attribution | 11 | Codex | M | [plan](packages/12-per-user-keys.md) | in progress |
-| 13 † | Dashboard sign-in: passwords, invites, trusted identity proxy | 11 | Cursor | L | [plan](packages/13-sign-in.md) | in progress |
+| 13 † | Dashboard sign-in: passwords, invites, trusted identity proxy | 11 | Cursor | L | [plan](packages/13-sign-in.md) | done (2.2 PR) |
 | 14 | Audit log | 11–13 | Codex | S–M | [plan](packages/14-audit-log.md) | plan ready |
 | 15 | Team admin page, account menu, end-to-end teams test | 11–14 | Cursor | M–L | [plan](packages/15-team-admin-page.md) | plan ready |
 
@@ -175,21 +175,6 @@ Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
-- **Funnel visitors share one failed-login throttle bucket** (found in the
-  package 10b review, Nov 6, 2026).
-  - Where: `src/agenticml/server/webauth.py` `LoginThrottle`, keyed by
-    `client_address`; `agenticml server up` serves on loopback behind
-    Tailscale Funnel.
-  - Problem: every internet request through Funnel arrives from 127.0.0.1,
-    so anyone sending bad keys can delay the admin's sign-in and every sync
-    client's requests by up to 60 s at a time. Documented in
-    `docs/SERVER.md`; the same limitation applies behind any reverse proxy.
-  - Fix: in package 13 (trusted identity proxy), key the throttle by the
-    forwarded client address taken only from configured proxy connections;
-    for `server up`, treat the local Tailscale proxy as that configured
-    proxy.
-  - Done when: a test with two forwarded client addresses behind one proxy
-    shows failures from one do not delay the other.
 - **Dashboard "last admin key" rule ignores demoted users** (found in the
   package 11 review, Nov 6, 2026).
   - Where: `src/agenticml/server/keys.py` `KeyStore.revoke(keep_admin=True)`.

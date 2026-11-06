@@ -17,7 +17,7 @@ def test_serve_public_url(monkeypatch, env, flag, expected):
     else:
         monkeypatch.setenv("AGENTICML_SERVER_PUBLIC_URL", env)
     calls = []
-    monkeypatch.setattr(server, "serve", lambda *args: calls.append(args))
+    monkeypatch.setattr(server, "serve", lambda *args, **kwargs: calls.append(args))
     args = ["server", "serve", "--data", "/data", "--host", "0.0.0.0", "--port", "8123"]
     if flag is not None:
         args += ["--public-url", flag]

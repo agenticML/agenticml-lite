@@ -1,7 +1,8 @@
-"""Dashboard key login, in-memory sessions, and the request gate."""
+"""Dashboard login, in-memory sessions, identity proxy, and the request gate."""
 from __future__ import annotations
 
 from collections import OrderedDict
+from html import escape as html_escape
 from http.cookies import CookieError, SimpleCookie
 import hashlib
 import hmac
@@ -24,14 +25,82 @@ from agenticml.ui.server import (
     _reject_nonfinite,
 )
 from . import keyspage
-from .keys import ClientError, KeyNameTaken, KeyStoreUnavailable, SetupClosed, validate_name
-from .users import Principal, UserStore, resolve
+from .keys import ClientError, KeyStoreUnavailable, validate_name
+from .users import (
+    InviteInvalid, Principal, ScryptUnavailable, UserNameTaken, UserStore,
+    allowed, resolve, scrypt_available, validate_password,
+)
 
 logger = logging.getLogger("agenticml.server.webauth")
 SESSION_IDLE = 12 * 3600
 SESSION_MAX_AGE = 7 * 86400
 SESSION_CAP = 1000
 LOGIN_BODY_MAX = 4 * 1024
+IDENTITY_PRESETS = {
+    "alb": ("X-Amzn-Oidc-Identity", "exact"),
+    "tailscale": ("Tailscale-User-Login", "casefold"),
+    "oauth2-proxy": ("X-Forwarded-Email", "casefold"),
+}
+def _canonical_ip(value):
+    addr = ipaddress.ip_address(str(value).split("%")[0])
+    if addr.version == 6 and addr.ipv4_mapped is not None:
+        return addr.ipv4_mapped
+    return addr
+
+
+def _strip_forwarded_port(entry):
+    """Return the host from an X-Forwarded-For hop, dropping IPv4:port or [IPv6]:port."""
+    text = str(entry).strip()
+    if text.startswith("["):
+        end = text.find("]")
+        if end == -1:
+            return text
+        host, rest = text[1:end], text[end + 1:]
+        if rest and not (rest.startswith(":") and rest[1:].isdigit()):
+            return text
+        return host
+    if text.count(":") == 1:
+        host, port = text.rsplit(":", 1)
+        if port.isdigit():
+            return host
+    return text
+
+
+def _trusted_network(net):
+    if isinstance(net, ipaddress.IPv6Network):
+        mapped = net.network_address.ipv4_mapped
+        if mapped is not None and net.prefixlen >= 96:
+            net = ipaddress.ip_network((mapped, net.prefixlen - 96))
+    if net.prefixlen == 0:
+        raise ValueError("refusing to trust every address")
+    return net
+
+
+def parse_trusted_proxies(values):
+    """Parse CIDR/address strings (plain addresses are /32 or /128)."""
+    networks = []
+    for raw in values or ():
+        if isinstance(raw, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
+            net = raw
+        else:
+            text = str(raw).strip()
+            if not text:
+                continue
+            try:
+                net = (ipaddress.ip_network(text, strict=False) if "/" in text
+                       else ipaddress.ip_network(_canonical_ip(text)))
+            except ValueError as exc:
+                raise ValueError(f"invalid trusted proxy: {text}") from exc
+        networks.append(_trusted_network(net))
+    return tuple(networks)
+
+
+def parse_identity_header(value):
+    if value is None or value == "":
+        return None
+    if value not in IDENTITY_PRESETS:
+        raise ValueError("identity header must be alb, tailscale, or oauth2-proxy")
+    return value
 
 
 def _bucket(address):
@@ -52,20 +121,16 @@ def _bucket(address):
 
 
 class LoginThrottle:
-    """Failed-login delays keyed by client address. Responses never sleep.
+    """Failed-login delays keyed by a caller-supplied bucket. Responses never sleep.
 
-    Behind a reverse proxy every client has the proxy's address and shares
-    one bucket, so someone sending bad keys can delay the admin's sign-in
-    by up to 60 s at a time. The admin can still use the keys CLI. Package
-    13 (trusted identity proxy) is where to key the throttle by the
-    forwarded address, from configured proxy addresses only. Never trust
-    X-Forwarded-For here.
+    Dashboard and ingest pass ``WebAuth.client_address``: the TCP peer,
+    or the rightmost untrusted ``X-Forwarded-For`` hop when that peer is a
+    configured trusted proxy. Password attempts also use a ``user:<name>``
+    bucket. Never trust ``X-Forwarded-For`` from an untrusted peer.
 
     Spraying more than 1024 buckets (for example many /64s) can still
-    evict entries. That is an accepted stopgap until package 13.
-
-    About 6 truly simultaneous valid-key requests from one bucket can get
-    a short spurious 429 (clients retry 429). That is accepted.
+    evict entries. About 6 truly simultaneous valid-key requests from one
+    bucket can get a short spurious 429 (clients retry 429). Accepted.
     """
 
     FREE_FAILURES = 5
@@ -177,6 +242,7 @@ _LOGIN_STATIC = Path(__file__).with_name("static")
 _ASSETS = {
     "/static/login.js": (_LOGIN_STATIC / "login.js", "text/javascript; charset=utf-8"),
     "/static/setup.js": (_LOGIN_STATIC / "setup.js", "text/javascript; charset=utf-8"),
+    "/static/invite.js": (_LOGIN_STATIC / "invite.js", "text/javascript; charset=utf-8"),
     "/static/app.css": (_STATIC / "app.css", _FILES["app.css"]),
     "/static/InstrumentSans.woff2": (_STATIC / "InstrumentSans.woff2", _FILES["InstrumentSans.woff2"]),
     "/static/JetBrainsMono.woff2": (_STATIC / "JetBrainsMono.woff2", _FILES["JetBrainsMono.woff2"]),
@@ -184,15 +250,21 @@ _ASSETS = {
 
 
 class WebAuth:
-    """Owns /login, /logout, /api/server/session, and the session cookie gate."""
+    """Owns /login, /logout, /invite, /setup, sessions, and the request gate."""
 
     def __init__(self, keys, public_url=None, clock=time.time, throttle_clock=time.monotonic,
-                 users=None):
+                 users=None, trusted_proxies=(), identity_header=None):
         self.keys = keys
         self.users = users if users is not None else UserStore(keys.server_dir)
         self.public_url = public_url
         self.clock = clock
         self.throttle = LoginThrottle(clock=throttle_clock)
+        self.trusted_proxies = parse_trusted_proxies(trusted_proxies)
+        self.identity_header = parse_identity_header(identity_header)
+        if self.identity_header is not None and not self.trusted_proxies:
+            raise ValueError("identity header requires a trusted proxy")
+        self._identity_name, self._identity_match = (
+            IDENTITY_PRESETS[self.identity_header] if self.identity_header else (None, None))
         self._lock = threading.Lock()
         self._sessions = {}
         self.setup_token = None
@@ -202,26 +274,111 @@ class WebAuth:
     def arm_setup(self, base_url):
         if not self.keys.prepare_setup():
             return
+        if self._has_admin_user():
+            return
         self.setup_token = secrets.token_urlsafe(32)
         self._setup_used = False
         logger.warning(
-            "No admin key yet. Open %s/setup?token=%s to create one, or run: "
-            "agenticml server keys create --name admin --scope admin",
+            "No admin user yet. Open %s/setup?token=%s to create one, or run: "
+            "agenticml server users add admin --role admin",
             base_url.rstrip("/"), self.setup_token,
         )
 
+    def _has_admin_user(self):
+        return any(user.role == "admin" for user in self.users.list())
+
     def _setup_armed(self):
         """Caller holds _setup_lock; observing an admin permanently disarms setup."""
-        if self.keys.has_admin() or self.keys.setup_closed():
+        if self.keys.has_admin() or self.keys.setup_closed() or self._has_admin_user():
             self._setup_used = True
             self.setup_token = None
         return self.setup_token is not None and not self._setup_used
+
+    def _peer_ip(self, handler):
+        try:
+            return _canonical_ip(handler.client_address[0])
+        except (ValueError, TypeError, IndexError):
+            return None
+
+    def _ip_trusted(self, addr):
+        for network in self.trusted_proxies:
+            try:
+                if addr in network:
+                    return True
+            except TypeError:
+                continue
+        return False
+
+    def _peer_trusted(self, handler):
+        addr = self._peer_ip(handler)
+        return addr is not None and self._ip_trusted(addr)
+
+    def client_address(self, handler) -> str:
+        """TCP peer, or the forwarded client when the peer is a trusted proxy."""
+        peer = handler.client_address[0]
+        if not self.trusted_proxies or not self._peer_trusted(handler):
+            return peer
+        values = handler.headers.get_all("X-Forwarded-For") or []
+        if not values:
+            return peer
+        parts = [part.strip() for part in ",".join(values).split(",")]
+        for entry in reversed(parts):
+            try:
+                addr = _canonical_ip(_strip_forwarded_port(entry))
+            except (ValueError, TypeError):
+                return peer
+            if not self._ip_trusted(addr):
+                return str(addr)
+        return peer
+
+    def proxy_identity(self, handler):
+        """Identity header value when the peer is trusted; else None."""
+        if self._identity_name is None or not self._peer_trusted(handler):
+            return None
+        if (self.identity_header == "tailscale"
+                and handler.headers.get_all("Tailscale-Funnel-Request")):
+            return None
+        values = handler.headers.get_all(self._identity_name) or []
+        if len(values) != 1:
+            return None
+        value = values[0].strip()
+        if (not 1 <= len(value) <= 256
+                or any(ord(ch) < 32 or ord(ch) == 127 for ch in value)):
+            return None
+        return value
+
+    def _user_for_identity(self, identity):
+        matches = []
+        folded = identity.casefold()
+        exact = self._identity_match == "exact"
+        for user in self.users.list():
+            if user.identity is None:
+                continue
+            if exact:
+                if user.identity == identity:
+                    matches.append(user)
+            elif user.identity.casefold() == folded:
+                matches.append(user)
+            if len(matches) > 1:
+                return None
+        return matches[0] if len(matches) == 1 else None
 
     def _setup_matches(self, token):
         try:
             return hmac.compare_digest(token.encode("ascii"), self.setup_token.encode("ascii"))
         except UnicodeEncodeError:
             return False
+
+    def _rollback_setup(self, created):
+        if created is None:
+            return
+        self.users.discard(created.name, created.id)
+        try:
+            self.keys.clear_setup_closed()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("could not clear setup-closed after failed setup")
 
     def handle(self, handler) -> bool:
         """Answer login routes and rejected requests. False means continue."""
@@ -241,11 +398,17 @@ class WebAuth:
                     handler.close_connection = True
                     handler._json({"error": "method not allowed"}, 405)
                 return True
+            if path == "/invite":
+                if handler.command == "GET":
+                    self._invite_page(handler)
+                elif handler.command == "POST":
+                    self._invite(handler)
+                else:
+                    handler.close_connection = True
+                    handler._json({"error": "method not allowed"}, 405)
+                return True
             if handler.command == "GET" and path in _ASSETS:
                 self._asset(handler, path)
-                return True
-            if handler.command == "GET" and path == "/login":
-                self._login_page(handler)
                 return True
             if handler.command == "POST" and path == "/login":
                 self._login(handler)
@@ -253,12 +416,28 @@ class WebAuth:
             if handler.command == "POST" and path == "/logout":
                 self._logout(handler)
                 return True
+            principal, unknown = self._principal_for(handler)
+            if handler.command == "GET" and path == "/login":
+                if principal is not None:
+                    handler._send(b"", "text/plain; charset=utf-8", 303,
+                                  self._headers({"Location": "/"}))
+                elif unknown is not None:
+                    self._unknown_identity(handler, path, unknown)
+                else:
+                    self._login_page(handler)
+                return True
+            if principal is None:
+                if unknown is not None:
+                    self._unknown_identity(handler, path, unknown)
+                else:
+                    self._refuse(handler, path)
+                return True
+            self._bind(handler, principal)
             if handler.command == "GET" and path == "/api/server/session":
                 self._session_info(handler)
                 return True
-            session = self._session(handler)
-            if session is None or not self._attach(handler, session):
-                self._refuse(handler, path)
+            if handler.command == "POST" and path == "/api/server/account/password":
+                self._account_password(handler)
                 return True
             if path == "/api/server/keys" or (path or "").startswith("/api/server/keys/"):
                 keyspage.handle(self, handler, path)
@@ -326,6 +505,64 @@ class WebAuth:
         value = morsel.value
         return value or None
 
+    def _principal_for(self, handler):
+        """Return (principal, unknown_identity).
+
+        Matching proxy identity wins; else a valid session cookie; else an
+        unknown proxy identity is 403; else the 2.0 refusal.
+        """
+        identity = self.proxy_identity(handler)
+        if identity is not None:
+            user = self._user_for_identity(identity)
+            if user is not None:
+                return Principal(user.name, user.role, "proxy"), None
+        session = self._session(handler)
+        if session is not None:
+            principal = self._principal_from_session(session)
+            if principal is None:
+                self._delete_session(handler)
+            else:
+                return principal, None
+        if identity is not None:
+            return None, identity
+        return None, None
+
+    def _bind(self, handler, principal):
+        handler.principal = principal
+        if principal.via == "proxy":
+            handler.session = {"name": "", "sha256": "", "user": principal.user}
+            return
+        session = self._session(handler)
+        handler.session = session if session is not None else {
+            "name": principal.key or "", "sha256": "", "user": principal.user,
+        }
+
+    def _principal_from_session(self, session):
+        user_name = session.get("user")
+        via = session.get("via") or "key"
+        if user_name == "env":
+            record = self.keys.current(
+                session.get("key") or session.get("name"),
+                session.get("key_sha256") or session.get("sha256"))
+            principal = resolve(self.keys, self.users, record)
+            if principal is None or principal.user != "env":
+                return None
+            return Principal("env", "admin", "key", "env")
+        user = self.users.get(user_name)
+        if (user is None or user.id != session.get("id")
+                or user.generation != session.get("generation")):
+            return None
+        if via == "key":
+            record = self.keys.current(
+                session.get("key") or session.get("name"),
+                session.get("key_sha256") or session.get("sha256"))
+            principal = resolve(self.keys, self.users, record)
+            if (record is None or record.scope != "admin"
+                    or principal is None or principal.role != "admin"):
+                return None
+            return Principal(user.name, user.role, "key", record.name)
+        return Principal(user.name, user.role, via, None)
+
     def _session(self, handler):
         token = self._read_cookie(handler)
         if token is None:
@@ -342,10 +579,8 @@ class WebAuth:
             if now - entry["last_seen"] >= SESSION_IDLE or now - entry["created"] >= SESSION_MAX_AGE:
                 del self._sessions[digest]
                 return None
-            name, sha256 = entry["name"], entry["sha256"]
-        record = self.keys.current(name, sha256)
-        principal = resolve(self.keys, self.users, record)
-        if record is None or record.scope != "admin" or principal is None or principal.role != "admin":
+            snapshot = dict(entry)
+        if self._principal_from_session(snapshot) is None:
             with self._lock:
                 self._sessions.pop(digest, None)
             return None
@@ -360,36 +595,71 @@ class WebAuth:
     def _attach(self, handler, session, principal=None):
         """Set handler.session and handler.principal from a valid session.
 
-        Returns False when resolve() is None after _session() succeeded (the
-        key was revoked in between). Drops the session; the caller answers 401.
+        Returns False when the session is no longer valid. Drops it; caller 401s.
         """
         if principal is None:
-            record = self.keys.current(session["name"], session["sha256"])
-            principal = resolve(self.keys, self.users, record)
+            principal = self._principal_from_session(session)
         if principal is None:
             self._delete_session(handler)
             return False
         handler.session = session
-        handler.principal = Principal(
-            user=session.get("user") or principal.user,
-            role=principal.role,
-            via="key",
-            key=session["name"],
-        )
+        handler.principal = principal
         return True
 
-    def _create_session(self, record):
+    def _between_verify_and_session(self, user):
+        """Hook for tests: runs after credential verification, before minting a session."""
+
+    def _create_session(self, record=None, *, user=None, generation=None, via="key",
+                        key=None, key_sha256=None, expected=None):
+        user_id = None
+        if record is not None:
+            user = record.user if record.name != "env" else "env"
+            key = record.name
+            key_sha256 = record.sha256
+            via = "key"
+            found = None if user == "env" else self.users.get(user)
+            user_id = None if found is None else found.id
+            generation = 0 if found is None else found.generation
+        elif user == "env":
+            generation = 0 if generation is None else generation
+        else:
+            found = self.users.get(user)
+            if expected is not None:
+                exp_id, exp_gen = expected
+                if (found is None or found.id != exp_id
+                        or found.generation != exp_gen):
+                    return None, None
+            if found is None:
+                generation = 0 if generation is None else generation
+            else:
+                user_id = found.id
+                generation = found.generation
         token = secrets.token_urlsafe(32)
         digest = hashlib.sha256(token.encode("ascii")).hexdigest()
         now = self.clock()
-        entry = {"name": record.name, "sha256": record.sha256, "user": record.user,
-                 "created": now, "last_seen": now}
+        entry = {
+            "user": user, "id": user_id, "generation": generation, "via": via,
+            "key": key, "key_sha256": key_sha256,
+            "name": key or "", "sha256": key_sha256 or "",
+            "created": now, "last_seen": now,
+        }
         with self._lock:
             while len(self._sessions) >= SESSION_CAP:
-                oldest = min(self._sessions, key=lambda key: self._sessions[key]["last_seen"])
+                oldest = min(self._sessions, key=lambda item: self._sessions[item]["last_seen"])
                 del self._sessions[oldest]
             self._sessions[digest] = entry
         return token, entry
+
+    def _session_cookie_for(self, user, via, key=None, key_sha256=None, expected=None):
+        if user == "env":
+            return self._create_session(
+                user=user, generation=0, via=via, key=key, key_sha256=key_sha256)
+        return self._create_session(
+            user=user, via=via, key=key, key_sha256=key_sha256, expected=expected)
+
+    def _refuse_stale_credentials(self, handler):
+        logger.info("login failed")
+        handler._json({"error": "invalid user name or password"}, 401, self._headers())
 
     def _delete_session(self, handler):
         token = self._read_cookie(handler)
@@ -405,7 +675,9 @@ class WebAuth:
     def drop_sessions(self, name, sha256):
         with self._lock:
             for digest, entry in list(self._sessions.items()):
-                if entry["name"] == name and entry["sha256"] == sha256:
+                key_name = entry.get("key") or entry.get("name")
+                key_hash = entry.get("key_sha256") or entry.get("sha256")
+                if key_name == name and key_hash == sha256:
                     del self._sessions[digest]
 
     def _setup_page(self, handler):
@@ -420,46 +692,106 @@ class WebAuth:
             headers=self._headers({"Referrer-Policy": "no-referrer"}),
         )
 
+    def _throttle_or_refuse(self, handler, address):
+        retry_after, ticket = self.throttle.begin(address)
+        if ticket is None:
+            handler.close_connection = True
+            handler._json(
+                {"error": "too many failed logins; try again later"},
+                429, self._headers({"Retry-After": str(retry_after)}),
+            )
+            return None
+        return ticket
+
     def _setup(self, handler):
+        address = self.client_address(handler)
+        ticket = None
+        outcome = "ignored"
         try:
+            if not handler._csrf_ok():
+                handler.close_connection = True
+                handler._error({"error": "cross-site request refused"}, 403)
+                return
+            ticket = self._throttle_or_refuse(handler, address)
+            if ticket is None:
+                return
             payload = keyspage.read_json(handler, LOGIN_BODY_MAX)
             if payload is None:
                 return
             token, name = payload.get("token"), payload.get("name", "admin")
+            password = payload.get("password")
             if not isinstance(token, str) or not isinstance(name, str):
                 raise ClientError("invalid setup body")
+            if not isinstance(password, str):
+                raise ClientError("invalid setup body")
             validate_name(name)
+            validate_password(password)
+            if not scrypt_available():
+                handler._json({"error": ScryptUnavailable().args[0]}, 503, self._headers())
+                return
             with self._setup_lock:
                 if not self._setup_armed() or not self._setup_matches(token):
+                    outcome = "failed"
                     handler._json({"error": "not found"}, 404)
                     return
-                if any(record.name == name for record in self.keys.list()):
-                    handler._json({"error": "key name already exists"}, 409)
+                if self.users.get(name) is not None:
+                    handler._json({"error": "user name already exists"}, 409)
                     return
+                created = None
                 try:
-                    record, value = self.keys.create(
-                        name, "admin", created_by="setup", only_if_no_admin=True)
-                except SetupClosed:
-                    self._setup_used = True
-                    self.setup_token = None
-                    handler._json({"error": "not found"}, 404)
+                    created = self.users.add(name, role="admin", created_by="setup")
+                    user = self.users.set_password(name, password)
+                    self.keys._write_setup_closed()
+                except UserNameTaken:
+                    handler._json({"error": "user name already exists"}, 409)
                     return
-                except KeyNameTaken:
-                    handler._json({"error": "key name already exists"}, 409)
+                except ScryptUnavailable as exc:
+                    if created is not None:
+                        self._rollback_setup(created)
+                        handler._json(
+                            {"error": "setup failed; retry or use agenticml server users"},
+                            503, self._headers())
+                    else:
+                        handler._json({"error": str(exc)}, 503, self._headers())
                     return
                 except (KeyStoreUnavailable, OSError):
-                    handler._json({"error": "key store unavailable"}, 503)
+                    if created is not None:
+                        self._rollback_setup(created)
+                        handler._json(
+                            {"error": "setup failed; retry or use agenticml server users"},
+                            503, self._headers())
+                    else:
+                        handler._json({"error": "key store unavailable"}, 503)
                     return
+                except (ClientError, ValueError):
+                    if created is not None:
+                        self._rollback_setup(created)
+                        handler._json(
+                            {"error": "setup failed; retry or use agenticml server users"},
+                            503, self._headers())
+                        return
+                    raise
                 self._setup_used = True
-            cookie, entry = self._create_session(record)
-            self._attach(handler, entry, resolve(self.keys, self.users, record))
+                self.setup_token = None
+            self._between_verify_and_session(user)
+            cookie, entry = self._session_cookie_for(
+                user.name, "setup", expected=(user.id, user.generation))
+            if entry is None:
+                outcome = "failed"
+                self._refuse_stale_credentials(handler)
+                return
+            outcome = "success"
+            self._attach(handler, entry, Principal(user.name, user.role, "setup"))
             handler._json(
-                {"ok": True, "key": name, "value": value, **keyspage.command_host(self, handler)},
+                {"ok": True, "user": user.name, "role": user.role},
                 201, self._headers({"Set-Cookie": self._cookie(cookie)}),
             )
         except ValueError as exc:
             if not getattr(handler, "_started", False):
                 handler._error({"error": str(exc) if isinstance(exc, ClientError) else "invalid request"}, 400)
+        finally:
+            if ticket is not None:
+                self.throttle.finish(ticket, outcome)
 
     def _headers(self, extra=None):
         headers = {"Cache-Control": "no-store"}
@@ -472,18 +804,44 @@ class WebAuth:
         handler._send(file.read_bytes(), content_type, headers={"Cache-Control": "no-store"})
 
     def _login_page(self, handler):
-        if self._session(handler) is not None:
-            handler._send(b"", "text/plain; charset=utf-8", 303, self._headers({"Location": "/"}))
-            return
         body = (_LOGIN_STATIC / "login.html").read_bytes()
         handler._send(body, "text/html; charset=utf-8", headers=self._headers())
+
+    def _read_login_payload(self, handler):
+        length = handler._put_length(LOGIN_BODY_MAX)
+        if length is None:
+            return None
+        if length == 0:
+            body = handler._read_put_body(length)
+        else:
+            if not handler.server._admit_body(handler.connection, 2):
+                handler.close_connection = True
+                handler._send(
+                    b"", "application/json", 503,
+                    handler._with_cookie_vary(self._headers()),
+                )
+                return None
+            try:
+                body = handler._read_put_body(length)
+            finally:
+                handler.server._set_connection_state(handler.connection, "busy")
+        if len(body) != length:
+            handler.close_connection = True
+            raise ValueError("short body")
+        try:
+            payload = json.loads(body.decode("utf-8"), parse_constant=_reject_nonfinite)
+        except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+            raise ValueError("invalid login body") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("invalid login body")
+        return payload
 
     def _login(self, handler):
         if not handler._csrf_ok():
             handler.close_connection = True
             handler._error({"error": "cross-site request refused"}, 403)
             return
-        address = handler.client_address[0]
+        address = self.client_address(handler)
         retry_after, ticket = self.throttle.begin(address)
         if ticket is None:
             handler.close_connection = True
@@ -494,31 +852,15 @@ class WebAuth:
             return
         outcome = "ignored"
         try:
-            length = handler._put_length(LOGIN_BODY_MAX)
-            if length is None:
+            payload = self._read_login_payload(handler)
+            if payload is None:
                 return
-            if length == 0:
-                body = handler._read_put_body(length)
-            else:
-                if not handler.server._admit_body(handler.connection, 2):
-                    handler.close_connection = True
-                    handler._send(
-                        b"", "application/json", 503,
-                        handler._with_cookie_vary(self._headers()),
-                    )
-                    return
-                try:
-                    body = handler._read_put_body(length)
-                finally:
-                    handler.server._set_connection_state(handler.connection, "busy")
-            if len(body) != length:
-                handler.close_connection = True
-                raise ValueError("short body")
-            try:
-                payload = json.loads(body.decode("utf-8"), parse_constant=_reject_nonfinite)
-            except (UnicodeDecodeError, ValueError, RecursionError) as exc:
-                raise ValueError("invalid login body") from exc
-            if not isinstance(payload, dict) or not isinstance(payload.get("key"), str):
+            if isinstance(payload.get("user"), str) and isinstance(payload.get("password"), str):
+                address_ticket = ticket
+                ticket = None
+                self._login_password(handler, payload, address, address_ticket)
+                return
+            if not isinstance(payload.get("key"), str):
                 raise ValueError("invalid login body")
             record = self.keys.verify(payload["key"])
             principal = resolve(self.keys, self.users, record)
@@ -535,18 +877,79 @@ class WebAuth:
             if principal.role != "admin":
                 logger.info("login failed")
                 handler._json(
-                    {"error": "this key's user is not an admin"}, 403, self._headers())
+                    {"error": "this key cannot sign in"}, 403, self._headers())
+                return
+            self._between_verify_and_session(principal)
+            expected = (
+                None if principal.id is None
+                else (principal.id, principal.generation))
+            token, entry = self._session_cookie_for(
+                principal.user, "key", key=record.name, key_sha256=record.sha256,
+                expected=expected)
+            if entry is None:
+                outcome = "failed"
+                self._refuse_stale_credentials(handler)
                 return
             outcome = "success"
-            token, entry = self._create_session(record)
             self.keys.touch(record)
             self._attach(handler, entry, principal)
             handler._json(
-                {"ok": True, "key": record.name},
+                {"ok": True, "user": principal.user, "role": principal.role},
                 headers=self._headers({"Set-Cookie": self._cookie(token)}),
             )
         finally:
-            self.throttle.finish(ticket, outcome)
+            if ticket is not None:
+                self.throttle.finish(ticket, outcome)
+
+    def _login_password(self, handler, payload, address, address_ticket):
+        name, password = payload["user"], payload["password"]
+        user_ticket = None
+        outcome = "ignored"
+        try:
+            retry_after, user_ticket = self.throttle.begin("user:" + name)
+            if user_ticket is None:
+                self.throttle.finish(address_ticket, "ignored")
+                address_ticket = None
+                handler.close_connection = True
+                handler._json(
+                    {"error": "too many failed logins; try again later"},
+                    429, self._headers({"Retry-After": str(retry_after)}),
+                )
+                return
+            if not scrypt_available():
+                handler._json({"error": ScryptUnavailable().args[0]}, 503, self._headers())
+                return
+            try:
+                user = self.users.verify_password(name, password)
+            except ClientError:
+                logger.info("login failed")
+                outcome = "failed"
+                handler._json({"error": "invalid password"}, 400, self._headers())
+                return
+            if user is None:
+                logger.info("login failed")
+                outcome = "failed"
+                handler._json(
+                    {"error": "invalid user name or password"}, 401, self._headers())
+                return
+            self._between_verify_and_session(user)
+            token, entry = self._session_cookie_for(
+                user.name, "password", expected=(user.id, user.generation))
+            if entry is None:
+                outcome = "failed"
+                self._refuse_stale_credentials(handler)
+                return
+            outcome = "success"
+            self._attach(handler, entry, Principal(user.name, user.role, "password"))
+            handler._json(
+                {"ok": True, "user": user.name, "role": user.role},
+                headers=self._headers({"Set-Cookie": self._cookie(token)}),
+            )
+        finally:
+            if address_ticket is not None:
+                self.throttle.finish(address_ticket, outcome)
+            if user_ticket is not None:
+                self.throttle.finish(user_ticket, outcome)
 
     def _logout(self, handler):
         if not handler._csrf_ok():
@@ -559,23 +962,230 @@ class WebAuth:
             self._headers({"Set-Cookie": self._cookie("", max_age=0)}),
         )
 
+    def _session_payload(self, handler):
+        principal = handler.principal
+        user = None if principal.user == "env" else self.users.get(principal.user)
+        key = principal.key if principal.via == "key" else None
+        return {
+            "server": True,
+            "user": principal.user,
+            "role": principal.role,
+            "via": principal.via,
+            "key": key,
+            "scope": "admin" if principal.via == "key" else None,
+            "can": {
+                "notes": allowed(principal, "notes"),
+                "own_keys": allowed(principal, "own_keys"),
+                "all_keys": allowed(principal, "all_keys"),
+                "users": allowed(principal, "users"),
+                "audit": allowed(principal, "audit"),
+            },
+            "password_set": bool(user is not None and user.password is not None),
+            "identity_proxy": self.identity_header is not None,
+        }
+
     def _session_info(self, handler):
-        session = self._session(handler)
-        if session is None:
+        handler._json(self._session_payload(handler), headers=self._headers())
+
+    def _check_current_password(self, handler, user, current):
+        """Throttle the current-password check. False means a response was sent."""
+        address = self.client_address(handler)
+        address_ticket = self._throttle_or_refuse(handler, address)
+        if address_ticket is None:
+            return False
+        retry_after, user_ticket = self.throttle.begin("user:" + user.name)
+        if user_ticket is None:
+            self.throttle.finish(address_ticket, "ignored")
             handler.close_connection = True
-            handler._json({"error": "login required"}, 401, self._headers())
-            return
-        record = self.keys.current(session["name"], session["sha256"])
-        principal = resolve(self.keys, self.users, record)
-        if not self._attach(handler, session, principal):
+            handler._json(
+                {"error": "too many failed logins; try again later"},
+                429, self._headers({"Retry-After": str(retry_after)}),
+            )
+            return False
+        outcome = "ignored"
+        try:
+            if not isinstance(current, str):
+                outcome = "failed"
+                handler._json({"error": "invalid current password"}, 401, self._headers())
+                return False
+            try:
+                verified = self.users.verify_password(user.name, current)
+            except ClientError:
+                outcome = "failed"
+                handler._json({"error": "invalid password"}, 400, self._headers())
+                return False
+            if verified is None:
+                outcome = "failed"
+                handler._json({"error": "invalid current password"}, 401, self._headers())
+                return False
+            outcome = "success"
+            return True
+        finally:
+            self.throttle.finish(address_ticket, outcome)
+            self.throttle.finish(user_ticket, outcome)
+
+    def _account_password(self, handler):
+        principal = handler.principal
+        if principal.user == "env":
             handler.close_connection = True
-            handler._json({"error": "login required"}, 401, self._headers())
+            handler._json({"error": "environment user cannot set a password"}, 403, self._headers())
             return
-        handler._json(
-            {"server": True, "key": session["name"], "scope": "admin",
-             "user": handler.principal.user, "role": handler.principal.role},
-            headers=self._headers(),
+        try:
+            payload = keyspage.read_json(handler, LOGIN_BODY_MAX)
+            if payload is None:
+                return
+            new = payload.get("new")
+            current = payload.get("current")
+            if not isinstance(new, str):
+                raise ClientError("invalid password")
+            user = self.users.get(principal.user)
+            if user is None:
+                handler.close_connection = True
+                handler._json({"error": "login required"}, 401, self._headers())
+                return
+            if principal.via != "proxy":
+                session = handler.session or {}
+                if (user.id != session.get("id")
+                        or user.generation != session.get("generation")):
+                    handler.close_connection = True
+                    handler._json({"error": "login required"}, 401, self._headers())
+                    return
+            if user.password is not None:
+                if not self._check_current_password(handler, user, current):
+                    return
+            if not scrypt_available():
+                handler._json({"error": ScryptUnavailable().args[0]}, 503, self._headers())
+                return
+            updated = self.users.set_password(user.name, new)
+            token, entry = self._create_session(
+                user=updated.name, via="password",
+                expected=(updated.id, updated.generation))
+            if entry is None:
+                handler._json({"error": "invalid current password"}, 401, self._headers())
+                return
+            self._attach(handler, entry, Principal(updated.name, updated.role, "password"))
+            handler._json(
+                {"ok": True, "user": updated.name, "role": updated.role},
+                headers=self._headers({"Set-Cookie": self._cookie(token)}),
+            )
+        except ScryptUnavailable as exc:
+            if not getattr(handler, "_started", False):
+                handler._json({"error": str(exc)}, 503, self._headers())
+        except ValueError as exc:
+            if not getattr(handler, "_started", False):
+                handler._error(
+                    {"error": str(exc) if isinstance(exc, ClientError) else "invalid request"}, 400)
+
+    def _invite_pending(self, token):
+        from datetime import datetime, timezone
+
+        from agenticml.store import layout as store_layout
+
+        if not isinstance(token, str) or not token:
+            return False
+        try:
+            digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+        except UnicodeEncodeError:
+            return False
+        now = datetime.now(timezone.utc)
+        found = False
+        for user in self.users.list():
+            invite = user.invite
+            if not isinstance(invite, dict) or not isinstance(invite.get("sha256"), str):
+                continue
+            stored = invite["sha256"]
+            if len(stored) != len(digest) or not hmac.compare_digest(stored, digest):
+                continue
+            try:
+                expires = store_layout.parse_timestamp(invite.get("expires_at"))
+            except (TypeError, ValueError):
+                continue
+            if expires > now:
+                found = True
+        return found
+
+    def _invite_page(self, handler):
+        tokens = parse_qs(urlsplit(handler.path).query, keep_blank_values=True).get("token", [])
+        token = tokens[0] if len(tokens) == 1 else None
+        if not self._invite_pending(token):
+            handler._json({"error": "not found"}, 404)
+            return
+        handler._send(
+            (_LOGIN_STATIC / "invite.html").read_bytes(), "text/html; charset=utf-8",
+            headers=self._headers({"Referrer-Policy": "no-referrer"}),
         )
+
+    def _invite(self, handler):
+        if not handler._csrf_ok():
+            handler.close_connection = True
+            handler._error({"error": "cross-site request refused"}, 403)
+            return
+        address = self.client_address(handler)
+        ticket = self._throttle_or_refuse(handler, address)
+        if ticket is None:
+            return
+        outcome = "ignored"
+        try:
+            payload = keyspage.read_json(handler, LOGIN_BODY_MAX)
+            if payload is None:
+                return
+            token, password = payload.get("token"), payload.get("password")
+            if not isinstance(token, str) or not isinstance(password, str):
+                raise ClientError("invalid invite body")
+            if not scrypt_available():
+                handler._json({"error": ScryptUnavailable().args[0]}, 503, self._headers())
+                return
+            try:
+                user = self.users.redeem_invite(token, password)
+            except InviteInvalid:
+                outcome = "failed"
+                handler._json({"error": "not found"}, 404)
+                return
+            except ScryptUnavailable as exc:
+                handler._json({"error": str(exc)}, 503, self._headers())
+                return
+            self._between_verify_and_session(user)
+            cookie, entry = self._session_cookie_for(
+                user.name, "invite", expected=(user.id, user.generation))
+            if entry is None:
+                outcome = "failed"
+                self._refuse_stale_credentials(handler)
+                return
+            outcome = "success"
+            self._attach(handler, entry, Principal(user.name, user.role, "invite"))
+            handler._json(
+                {"ok": True, "user": user.name, "role": user.role},
+                headers=self._headers({"Set-Cookie": self._cookie(cookie)}),
+            )
+        except ValueError as exc:
+            if not getattr(handler, "_started", False):
+                handler._error(
+                    {"error": str(exc) if isinstance(exc, ClientError) else "invalid request"}, 400)
+        finally:
+            if ticket is not None:
+                self.throttle.finish(ticket, outcome)
+
+    def _unknown_identity(self, handler, path, identity):
+        handler.close_connection = True
+        if handler.command == "GET" and not (path or "").startswith("/api/"):
+            escaped = html_escape(identity, quote=True)
+            text = (
+                f"Signed in as {escaped} by your identity proxy, but no AgenticML user "
+                f"has that identity. Ask an admin to run "
+                f"<code>agenticml server users set-identity NAME {escaped}</code>."
+            )
+            body = (
+                "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"/>"
+                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>"
+                "<title>agenticml · No user for this identity</title>"
+                "<link rel=\"stylesheet\" href=\"/static/app.css\"/></head>"
+                "<body class=\"login-page\"><main class=\"login-card\">"
+                "<p class=\"eyebrow\">agenticml</p><h1>No user for this identity</h1>"
+                f"<p>{text}</p></main></body></html>"
+            ).encode("utf-8")
+            handler._send(body, "text/html; charset=utf-8", 403, self._headers())
+            return
+        handler._json({"error": "no user for this identity"}, 403, self._headers())
 
     def _refuse(self, handler, path):
         handler.close_connection = True

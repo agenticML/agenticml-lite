@@ -63,6 +63,8 @@ def test_userstore_crud_and_public(tmp_path):
     alice = users.add("alice", role="admin", identity="alice@example.com")
     bob = users.add("bob")
     assert bob.role == "member" and bob.identity is None and bob.generation == 0
+    assert alice.id != bob.id
+    assert len(alice.id) == 32 and all(ch in "0123456789abcdef" for ch in alice.id)
     assert alice.password is None and alice.invite is None
     public = alice.to_public()
     assert public["password_set"] is False and public["invite_pending"] is False
@@ -81,6 +83,12 @@ def test_userstore_crud_and_public(tmp_path):
         users.add("alice")
     with pytest.raises(IdentityTaken):
         users.add("carol", identity="alice@example.com")
+    with pytest.raises(IdentityTaken):
+        users.add("carol", identity="Alice@Example.com")
+    users.set_identity("bob", "Bob@Example.com")
+    with pytest.raises(IdentityTaken):
+        users.set_identity("alice", "bob@example.com")
+    users.set_identity("bob", None)
     users.add("carol", role="admin")
     assert users.remove("bob") == 0
     assert users.get("bob") is None
@@ -89,8 +97,20 @@ def test_userstore_crud_and_public(tmp_path):
     assert json.loads(path.read_text())["version"] == 1
 
 
+def test_discard_removes_only_matching_id(tmp_path):
+    users = UserStore(server_dir(tmp_path))
+    alice = users.add("alice", role="admin")
+    users.discard("alice", "0" * 32)
+    assert users.get("alice") is not None
+    users.discard("bob", alice.id)
+    assert users.get("alice") is not None
+    users.discard("alice", alice.id)
+    assert users.get("alice") is None
+
+
 @pytest.mark.parametrize("change", [
     "extra", "missing", "role", "duplicate_name", "duplicate_identity",
+    "duplicate_identity_case", "duplicate_id", "id_bad",
     "generation_bool", "generation_negative",
 ])
 def test_userstore_strict_parse_rejects(tmp_path, change):
@@ -108,6 +128,12 @@ def test_userstore_strict_parse_rejects(tmp_path, change):
         obj["users"][1]["name"] = "alice"
     elif change == "duplicate_identity":
         obj["users"][1]["identity"] = "a@x.com"
+    elif change == "duplicate_identity_case":
+        obj["users"][1]["identity"] = "A@X.COM"
+    elif change == "duplicate_id":
+        obj["users"][1]["id"] = obj["users"][0]["id"]
+    elif change == "id_bad":
+        obj["users"][0]["id"] = "A" * 32
     elif change == "generation_bool":
         obj["users"][0]["generation"] = True
     else:
@@ -145,7 +171,9 @@ def test_allowed_and_resolve(tmp_path):
     _, secret = keys.create("k", user="alice")
     record = keys.verify(secret)
     principal = resolve(keys, users, record)
-    assert principal == Principal("alice", "admin", "key", "k")
+    alice = users.get("alice")
+    assert principal == Principal(
+        "alice", "admin", "key", "k", alice.id, alice.generation)
     assert allowed(principal, "sync") and allowed(principal, "users")
     with pytest.raises(KeyError):
         allowed(principal, "unknown")
@@ -233,6 +261,8 @@ def test_migration_v1_keys_runs_and_idempotent(tmp_path, caplog):
     assert [u["name"] for u in users["users"]] == ["admin"]
     assert users["users"][0]["role"] == "admin"
     assert users["users"][0]["created_by"] == "migration"
+    admin_id = users["users"][0]["id"]
+    assert len(admin_id) == 32 and all(ch in "0123456789abcdef" for ch in admin_id)
     keys_obj = json.loads((data / "server" / "keys.json").read_text())
     assert keys_obj["version"] == 2
     assert {row["name"]: row["user"] for row in keys_obj["keys"]} == {
@@ -495,8 +525,8 @@ def test_keys_post_created_by_is_session_user(tmp_path, monkeypatch):
 def test_users_cli_and_keys_create_user(tmp_path, capsys, monkeypatch):
     monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
     data = ["--data", str(tmp_path)]
-    assert cli.main(["server", "users", "add", "alice", "--role", "admin", *data]) == 0
-    assert cli.main(["server", "users", "add", "bob", "--identity", "bob@x.com", *data]) == 0
+    assert cli.main(["server", "users", "add", "alice", "--role", "admin", "--no-invite", *data]) == 0
+    assert cli.main(["server", "users", "add", "bob", "--identity", "bob@x.com", "--no-invite", *data]) == 0
     assert cli.main(["server", "users", "list", "--json", *data]) == 0
     rows = json.loads(capsys.readouterr().out)
     by_name = {row["name"]: row for row in rows}
@@ -525,7 +555,7 @@ def test_users_cli_and_keys_create_user(tmp_path, capsys, monkeypatch):
     assert "last admin" in capsys.readouterr().err
     assert cli.main(["server", "keys", "create", "--name", "k2", *data]) == 0
     capsys.readouterr()
-    assert cli.main(["server", "users", "add", "carol", *data]) == 0
+    assert cli.main(["server", "users", "add", "carol", "--no-invite", *data]) == 0
     capsys.readouterr()
     assert cli.main(["server", "keys", "create", "--name", "k3", *data]) == 1
     assert "--user is required" in capsys.readouterr().err
@@ -570,6 +600,24 @@ def test_actions_cover_role_table():
         "read", "password", "notes", "sync", "own_keys",
         "admin_keys", "all_keys", "users", "audit",
     }
+
+
+def test_bootstrap_admin_non_admin_named_admin(tmp_path, monkeypatch):
+    monkeypatch.setattr(up_mod, "_stdout_is_tty", lambda: True)
+    data = tmp_path / "data"
+    prepare_data_dir(data)
+    UserStore(data / "server").add("admin", role="member")
+    with pytest.raises(UpError, match="not an admin"):
+        bootstrap_admin(data, "https://example.test")
+
+
+def test_bootstrap_admin_prints_invite_guidance_without_password(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(up_mod, "_stdout_is_tty", lambda: True)
+    data = tmp_path / "data"
+    prepare_data_dir(data)
+    UserStore(data / "server").add("admin", role="admin")
+    assert bootstrap_admin(data, "https://example.test") == data.resolve()
+    assert "run `agenticml server users invite admin`" in capsys.readouterr().out
 
 
 def test_bootstrap_admin_migrates_v1_admin_key(tmp_path, monkeypatch, capsys):
@@ -757,7 +805,7 @@ def test_login_demoted_admin_key_message(tmp_path, monkeypatch):
         httpd.users.set_role("alice", "member")
         status, payload, hdrs = login(httpd, secret)
         assert status == 403
-        assert payload == {"error": "this key's user is not an admin"}
+        assert payload == {"error": "this key cannot sign in"}
         assert "Set-Cookie" not in hdrs
 
 
