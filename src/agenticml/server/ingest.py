@@ -14,13 +14,15 @@ from urllib.parse import urlsplit
 
 from agenticml.store import layout, objects
 from agenticml.store.overview import Overview
+from agenticml.store.reader import parse_artifacts_json
 from agenticml.ui.server import DashboardHandler
+from . import lineage
 
 logger = logging.getLogger("agenticml.server.ingest")
 _CHUNK = 64 * 1024
 _STATE_BATCH = 64
 _ID = r"([A-Za-z0-9][A-Za-z0-9._-]{0,127})"
-_ATOMIC = re.compile(r"(?:meta\.json|scalars/index\.json|media/index\.json|scalars/(?:0|[1-9][0-9]{0,8})\.ovw)")
+_ATOMIC = re.compile(r"(?:meta\.json|artifacts\.json|scalars/index\.json|media/index\.json|scalars/(?:0|[1-9][0-9]{0,8})\.ovw)")
 _APPEND = re.compile(r"(?:events\.jsonl|scalars/_time\.bin|scalars/(?:0|[1-9][0-9]{0,8})\.bin)")
 _ROUTES = [
     ("GET", re.compile(r"/healthz"), "health"),
@@ -28,6 +30,8 @@ _ROUTES = [
     ("POST", re.compile(r"/v2/objects/missing"), "missing"),
     ("PUT", re.compile(r"/v2/objects/([0-9a-f]{64})"), "object"),
     ("GET", re.compile(r"/v2/runs/" + _ID + r"/state"), "state"),
+    ("GET", re.compile(r"/v2/runs/" + _ID + r"/lineage"), "lineage_state"),
+    ("PUT", re.compile(r"/v2/runs/" + _ID + r"/lineage"), "lineage"),
     ("PUT", re.compile(r"/v2/runs/" + _ID + r"/files/(.+)"), "atomic"),
     ("POST", re.compile(r"/v2/runs/" + _ID + r"/append/(.+)"), "append"),
     ("POST", re.compile(r"/v2/runs/" + _ID + r"/commit"), "commit"),
@@ -109,6 +113,7 @@ class IngestHandler(DashboardHandler):
     def _dispatch(self):
         self._started = False
         tmp = None
+        lineage_slot = False
         try:
             if self._dashboard_request():
                 if self.command == "GET":
@@ -117,7 +122,7 @@ class IngestHandler(DashboardHandler):
                     return DashboardHandler.do_PUT(self)
                 return DashboardHandler._method_not_allowed(self)
             route, args, query = self._route()
-            if route in ("health", "whoami", "state") and (
+            if route in ("health", "whoami", "state", "lineage_state") and (
                     self.headers.get_all("Content-Length") or self.headers.get_all("Transfer-Encoding")):
                 self.close_connection = True
             if route == "health":
@@ -126,9 +131,12 @@ class IngestHandler(DashboardHandler):
             record = self._authenticate()
             self.server.keys.touch(record)
             if route == "whoami":
-                self._json({"key": record.name, "scope": record.scope, "protocol": 2, "features": []})
+                self._json({"key": record.name, "scope": record.scope, "protocol": 2,
+                            "features": (["lineage"] if self.server.lineage_enabled else []) + ["byref"]})
                 return
-            if route in ("atomic", "append", "state", "commit"):
+            if route in ("lineage", "lineage_state") and not self.server.lineage_enabled:
+                _fail(404, "not found")
+            if route in ("atomic", "append", "state", "commit", "lineage", "lineage_state"):
                 run_id = args[0]
                 if not layout.valid_run_id(run_id):
                     _fail(404, "not found")
@@ -140,9 +148,16 @@ class IngestHandler(DashboardHandler):
             if route == "state":
                 self._json(self._state(run_id))
                 return
+            if route == "lineage_state":
+                with self.server.run_lock(run_id):
+                    directory = self._run_dir(run_id)
+                    self._ownership(directory, record, False)
+                    meta = _json_object(layout.read_file_nofollow(self._target(directory, "meta.json")))
+                    self._json(lineage.state(self.server.root, run_id, meta))
+                return
             limit = getattr(self.server.limits, route + "_body")
             length = self._body_length(limit)
-            if route in ("atomic", "append", "commit"):
+            if route in ("atomic", "append", "commit", "lineage"):
                 # Reject obvious conflicts without receiving a large upload.
                 # Ownership is checked authoritatively again under the lock.
                 self._ownership(self._run_dir(run_id), record,
@@ -151,7 +166,7 @@ class IngestHandler(DashboardHandler):
                 self.close_connection = True
                 raise _RequestError(503, {"error": "server busy"}, {"Retry-After": "5"})
             try:
-                if route in ("append", "object"):
+                if route in ("append", "object", "lineage"):
                     tmp = layout.unique_tmp(self.server.tmp_dir, ".body")
                     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
                     with os.fdopen(fd, "wb") as handle:
@@ -161,6 +176,10 @@ class IngestHandler(DashboardHandler):
                     body = self._read_body(length)
             finally:
                 self.server._set_connection_state(self.connection, "busy")
+            if route == "lineage":
+                lineage_slot = self.server.lineage_receives.acquire(blocking=False)
+                if not lineage_slot:
+                    raise _RequestError(503, {"error": "server busy"}, {"Retry-After": "5"})
             if route == "missing":
                 self._missing(body)
             elif route == "object":
@@ -174,14 +193,17 @@ class IngestHandler(DashboardHandler):
                         payload, status = self._atomic(run_id, args[1], body, record, remote)
                     elif route == "append":
                         payload, status = self._append(directory, args[1], query, tmp, length, remote)
+                    elif route == "lineage":
+                        meta = _json_object(layout.read_file_nofollow(self._target(directory, "meta.json")))
+                        payload, status = lineage.receive(self.server.root, run_id, meta, tmp)
                     else:
                         payload, status = self._commit(directory, body, remote)
                 self._json(payload, status)
-        except _RequestError as exc:
+        except (_RequestError, lineage.LineageError) as exc:
             # A rejected request may leave an announced body unread.
             if self.headers.get_all("Content-Length") or self.headers.get_all("Transfer-Encoding"):
                 self.close_connection = True
-            self._json(exc.payload, exc.status, exc.headers)
+            self._json(exc.payload, exc.status, getattr(exc, "headers", None))
         except (TimeoutError, socket.timeout):
             self.close_connection = True
             self._error({"error": "request body timeout"}, 408)
@@ -193,6 +215,8 @@ class IngestHandler(DashboardHandler):
                          exc_info=self.server.verbose)
             self._error({"error": "internal error"}, 500)
         finally:
+            if lineage_slot:
+                self.server.lineage_receives.release()
             if tmp is not None:
                 tmp.unlink(missing_ok=True)
 
@@ -214,13 +238,16 @@ class IngestHandler(DashboardHandler):
                 or any(part in (".", "..") for part in raw_path.split("/"))):
             _fail(404, "not found")
         parsed = urlsplit(target)
+        allowed = []
         for method, pattern, route in _ROUTES:
             match = pattern.fullmatch(parsed.path)
             if match is not None:
-                if self.command != method:
-                    self.close_connection = True
-                    raise _RequestError(405, {"error": "method not allowed"}, {"Allow": method})
-                return route, match.groups(), parsed.query
+                if self.command == method:
+                    return route, match.groups(), parsed.query
+                allowed.append(method)
+        if allowed:
+            self.close_connection = True
+            raise _RequestError(405, {"error": "method not allowed"}, {"Allow": ", ".join(allowed)})
         _fail(404, "not found")
 
     def _authenticate(self):
@@ -349,6 +376,9 @@ class IngestHandler(DashboardHandler):
                 Overview.from_bytes(body)
             except (ValueError, TypeError):
                 _fail(422, "invalid overview")
+        elif name == "artifacts.json":
+            if parse_artifacts_json(body) is None:
+                _fail(422, "invalid artifacts.json")
         else:
             obj = _json_object(body)
             if name == "meta.json" and (obj.get("run_id") != run_id or obj.get("status") not in _STATUSES):
@@ -376,7 +406,7 @@ class IngestHandler(DashboardHandler):
             directory = self._run_dir(run_id)
             if not _regular(directory / "meta.json"):
                 _fail(404, "unknown run")
-            names = ["meta.json", "events.jsonl", "scalars/index.json", "media/index.json", "scalars/_time.bin"]
+            names = ["meta.json", "artifacts.json", "events.jsonl", "scalars/index.json", "media/index.json", "scalars/_time.bin"]
             scalars = directory / "scalars"
             if scalars.is_dir():
                 names.extend("scalars/" + entry.name for entry in scalars.iterdir()
@@ -417,18 +447,24 @@ class IngestHandler(DashboardHandler):
     def _object(self, sha, tmp, actual):
         if sha != actual:
             _fail(422, "hash mismatch", sha256=actual)
-        with self.server.objects_lock:
+        with layout.open_nofollow(tmp, "r+b") as handle:
+            os.fchmod(handle.fileno(), self.server.store_file_mode)
+            os.fsync(handle.fileno())
+        with self.server.object_lock(sha):
             dest = layout.object_path(self.server.root, sha)
             if (dest.exists() or dest.is_symlink()) and not _regular(dest):
                 raise ValueError("unsafe object destination")
             if objects.has(self.server.root, sha):
                 os.utime(dest, None, follow_symlinks=False)
                 return {"sha256": sha, "created": False}, 200
-            with layout.open_nofollow(tmp, "r+b") as handle:
-                os.fchmod(handle.fileno(), self.server.store_file_mode)
-                os.fsync(handle.fileno())
-            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                dest.parent.mkdir(parents=True)
+                created_prefix = True
+            except FileExistsError:
+                created_prefix = False
             layout.object_path(self.server.root, sha)
+            if created_prefix:
+                layout.fsync_dir(dest.parent.parent)
             os.replace(tmp, dest)
             layout.fsync_dir(dest.parent)
             return {"sha256": sha, "created": True}, 201

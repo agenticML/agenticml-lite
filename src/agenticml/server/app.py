@@ -7,6 +7,7 @@ import logging
 import os
 from pathlib import Path
 import signal
+import shutil
 import socket
 import stat
 import threading
@@ -40,6 +41,7 @@ class Limits:
     atomic_body: int = ATOMIC_BODY_LIMIT
     append_body: int = APPEND_BODY_LIMIT
     object_body: int = OBJECT_BODY_LIMIT
+    lineage_body: int = 256 * 1024 * 1024
     missing_body: int = MISSING_BODY_LIMIT
     commit_body: int = COMMIT_BODY_LIMIT
     missing_hashes: int = MISSING_HASH_LIMIT
@@ -106,7 +108,10 @@ def acquire_server_lock(server_dir):
 def _clean_tmp(tmp_dir):
     for entry in tmp_dir.iterdir():
         if stat.S_ISDIR(entry.lstat().st_mode):
-            logger.warning("ignoring subdirectory in server/tmp: %s", entry)
+            if entry.name.startswith("lineage-"):
+                shutil.rmtree(entry)
+            else:
+                logger.warning("ignoring subdirectory in server/tmp: %s", entry)
         else:
             os.unlink(entry)
 
@@ -161,9 +166,14 @@ class IngestServer(DashboardServer):
         self.web = WebAuth(self.keys, public_url)
         self.store_file_mode = 0o666 & ~_read_umask()
         self.limits = Limits()
+        self.lineage_enabled = shutil.which("git") is not None
+        self.lineage_receives = threading.BoundedSemaphore(2)
+        if not self.lineage_enabled:
+            logger.warning("git is not installed; lineage code diffs are disabled")
         self.run_locks = weakref.WeakValueDictionary()
         self.run_locks_lock = threading.Lock()
-        self.objects_lock = threading.Lock()
+        self.object_locks = weakref.WeakValueDictionary()
+        self.object_locks_lock = threading.Lock()
         self._server_lock = None
         self._closing_workers = set()
         super().__init__(
@@ -179,6 +189,15 @@ class IngestServer(DashboardServer):
             if lock is None:
                 lock = threading.Lock()
                 self.run_locks[run_id] = lock
+            return lock
+
+    def object_lock(self, sha):
+        prefix = sha[:2]
+        with self.object_locks_lock:
+            lock = self.object_locks.get(prefix)
+            if lock is None:
+                lock = threading.Lock()
+                self.object_locks[prefix] = lock
             return lock
 
     def server_close(self, *, drain=0.0):
@@ -254,7 +273,7 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
         raise
 
 
-def serve(data=None, host="127.0.0.1", port=8080, public_url=None):
+def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None):
     """Run until interrupted, with an optional environment admin key."""
     server = make_server(data, host, port, public_url, os.environ.get("AGENTICML_SERVER_KEY"))
     previous_handler = None
@@ -281,6 +300,8 @@ def serve(data=None, host="127.0.0.1", port=8080, public_url=None):
             logger.warning(
                 "browsers reach the dashboard only through a Host it accepts; "
                 "set --public-url behind a proxy")
+        if on_ready is not None:
+            on_ready(server)
         server.serve_forever()
     finally:
         try:

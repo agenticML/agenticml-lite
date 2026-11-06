@@ -72,11 +72,11 @@ Update the status column in the PR that changes it. Values: `not started`,
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 7 † | Lineage replication | 2.0 | Codex | M | to write | not started |
-| 8 | By-reference artifacts | 2.0 | Cursor | S–M | to write | not started |
-| 9 | EFS benchmark and tuning | 2.0 | Cursor | S | to write | not started |
-| 10 | Server operator commands | 2.0 | Codex | S | to write | not started |
-| 10b † | Server setup command (`server up`) | 2.0 | – | M | to write | not started |
+| 7 † | Lineage replication | 2.0 | Codex | M | [plan](packages/7-lineage-replication.md) | done (2.1 PR) |
+| 8 | By-reference artifacts | 2.0 | Cursor | S–M | [plan](packages/8-byref-artifacts.md) | done (2.1 PR) |
+| 9 | EFS benchmark and tuning | 2.0 | Cursor | S | [plan](packages/9-efs-benchmark.md) | done (2.1 PR; real-EFS run in Backlog) |
+| 10 | Server operator commands | 2.0 | Codex | S | [plan](packages/10-server-operator-commands.md) | done (2.1 PR) |
+| 10b † | Server setup command (`server up`) | 2.0 | Cursor | M | [plan](packages/10b-server-up.md) | done (2.1 PR; real-tailnet check in Backlog) |
 
 - **7 † Lineage replication.** The client pushes a `git bundle` of each run's
   shadow commit (`lineage/<project-key>.git`, `refs/runs/<id>`), incremental
@@ -175,4 +175,60 @@ Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
-None open (Nov 5, 2026).
+- **Funnel visitors share one failed-login throttle bucket** (found in the
+  package 10b review, Nov 6, 2026).
+  - Where: `src/agenticml/server/webauth.py` `LoginThrottle`, keyed by
+    `client_address`; `agenticml server up` serves on loopback behind
+    Tailscale Funnel.
+  - Problem: every internet request through Funnel arrives from 127.0.0.1,
+    so anyone sending bad keys can delay the admin's sign-in and every sync
+    client's requests by up to 60 s at a time. Documented in
+    `docs/SERVER.md`; the same limitation applies behind any reverse proxy.
+  - Fix: in package 13 (trusted identity proxy), key the throttle by the
+    forwarded client address taken only from configured proxy connections;
+    for `server up`, treat the local Tailscale proxy as that configured
+    proxy.
+  - Done when: a test with two forwarded client addresses behind one proxy
+    shows failures from one do not delay the other.
+- **Check `agenticml server up` on a real tailnet** (package 10b caveat,
+  Nov 6, 2026).
+  - Where: `src/agenticml/server/up.py`; `docs/SERVER.md` quick start.
+  - Problem: the tests use a fake `tailscale` executable. The real CLI's
+    `status --json` and `funnel status --json` shapes, and the full path from
+    a fresh machine to a working public HTTPS server, were not exercised on a
+    real tailnet (doing so exposes the machine to the internet, so it was
+    left to the owner).
+  - Fix: on a machine with Tailscale logged in, HTTPS enabled and the
+    `funnel` node attribute, run `agenticml server up`, sign in at the
+    printed URL, sync one run from another machine, stop with Ctrl+C and
+    confirm `tailscale funnel status` is empty; also try each missing
+    prerequisite once.
+  - Done when: those steps pass, or any mismatch with the real CLI is fixed
+    with a test that reproduces it.
+- **Run the server benchmark on real EFS** (package 9 caveat, Nov 6, 2026).
+  - Where: `scripts/bench_server.py`; `docs/SERVER.md`, section "Network
+    filesystems (EFS)".
+  - Problem: the published numbers are local NVMe plus an fsync delay
+    injected only into the benchmark's server process. No EFS or NFS mount
+    was available, so real EFS commit latency, metadata operations and flock
+    behaviour are unmeasured.
+  - Fix: mount EFS (`nfsvers=4.1,hard,noresvport`) as the server data
+    directory, run `python scripts/bench_server.py --data /mnt/efs/agenticml
+    --clients 1` and `--clients 8` without `--fsync-delay-ms`, and replace
+    the modelled tables; revisit `--follow --interval` and `APPEND_CHUNK` if
+    the numbers disagree.
+  - Done when: `docs/SERVER.md` shows real-EFS numbers for 1 and 8 clients,
+    labelled as such with mount details, and the recommendations are
+    confirmed or updated.
+- **Transient Git failures during a lineage receive become permanent skips**
+  (found in package 7 review, Nov 6, 2026).
+  - Where: `src/agenticml/server/lineage.py` `receive()`, the
+    `CalledProcessError` mapping for `index-pack`, `rev-list` and `cat-file`.
+  - Problem: a full disk (ENOSPC) or similar environment error from those
+    commands answers 422 `invalid bundle`, which the client records as a
+    permanent lineage skip for that run.
+  - Fix: tell validation failures apart from environment failures (check
+    free space first, or inspect the exit status and errno-like stderr
+    under `LC_ALL=C`) and answer 503 for the latter.
+  - Done when: a test that makes `index-pack` fail with a simulated ENOSPC
+    gets 503 and the client retries without remembering a skip.

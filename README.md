@@ -236,7 +236,7 @@ sudo systemctl enable --now agenticml-server
 ```
 
 Put a TLS reverse proxy in front:
-- **Laptop or workstation:** `tailscale serve --bg 8080` and set `AGENTICML_SERVER_PUBLIC_URL=https://<machine>.<tailnet>.ts.net` (or pass `--public-url`).
+- **Laptop or workstation:** `agenticml server up` makes the server reachable from the public internet through Tailscale Funnel (anyone can reach the login page; only keys grant access). It takes port 443 of this machine's Tailscale serve config. After SIGKILL, a crash, or power loss, Funnel stays on. The next `server up` on the same port turns it back on and off again; a stale Funnel entry for a different port is refused ("Tailscale already serves port 443 on this machine: check `tailscale funnel status` and turn it off first") and must be turned off with `tailscale funnel --https=443 off` first. Funnel visitors all arrive from `127.0.0.1`, so they share one failed-login throttle bucket (someone sending bad keys can delay sign-in and syncs by up to 60 s; fixed by package 13 in 2.2). Manual steps: `tailscale serve --bg 8080` and set `AGENTICML_SERVER_PUBLIC_URL=https://<machine>.<tailnet>.ts.net`, or pass `--public-url`.
 - **Production:** Caddy or a load balancer. Set the public URL to the proxied HTTPS URL.
 
 ### First admin key

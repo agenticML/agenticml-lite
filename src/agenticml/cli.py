@@ -496,9 +496,37 @@ def cmd_server_serve(args):
     except KeyboardInterrupt:
         pass
     except (OSError, ValueError, OverflowError) as exc:
-        print(f"agenticml server: {str(exc).splitlines()[0]}", file=sys.stderr)
+        print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
         return 1
     print("stopped")
+    return 0
+
+
+def _parse_up_port(value):
+    try:
+        port = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("port must be 1..65535")
+    if port != 0 and not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be 1..65535")
+    return port
+
+
+def cmd_server_up(args):
+    from .server.up import UpError, up
+
+    try:
+        up(args.data, args.port, install=args.install, force=args.force)
+    except KeyboardInterrupt:
+        pass
+    except UpError as exc:
+        print((str(exc).splitlines() or [type(exc).__name__])[0], file=sys.stderr)
+        return 1
+    except (OSError, ValueError, OverflowError) as exc:
+        print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
+        return 1
+    if not args.install:
+        print("stopped")
     return 0
 
 
@@ -538,9 +566,35 @@ def cmd_server_keys(args):
         print("stopped")
         return 0
     except (OSError, ValueError, OverflowError, KeyStoreUnavailable) as exc:
-        print(f"agenticml server: {str(exc).splitlines()[0]}", file=sys.stderr)
+        print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
         return 1
     return 0
+
+
+def _cmd_server_report(args, verify=False):
+    from .server import admin
+
+    try:
+        report = admin.verify(args.data, progress=not args.json) if verify else admin.status(args.data)
+        if args.json:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            print(admin.format_verify(report) if verify else admin.format_status(report))
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+    except (OSError, ValueError, OverflowError) as exc:
+        print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
+        return 2
+    return int(not report["ok"]) if verify else 0
+
+
+def cmd_server_status(args):
+    return _cmd_server_report(args)
+
+
+def cmd_server_verify(args):
+    return _cmd_server_report(args, verify=True)
 
 
 def cmd_du(args):
@@ -1096,6 +1150,19 @@ def main(argv=None):
     p_serve.add_argument("--port", type=int, default=8080)
     p_serve.add_argument("--public-url", default=None, help="Public server URL (default: AGENTICML_SERVER_PUBLIC_URL)")
     p_serve.set_defaults(func=cmd_server_serve)
+    p_up = server_sub.add_parser("up", help="Serve on loopback through Tailscale Funnel")
+    p_up.add_argument("--data", default=None, help="Data directory (default: AGENTICML_SERVER_DATA or ~/.agenticml-server)")
+    p_up.add_argument("--port", type=_parse_up_port, default=8080)
+    p_up.add_argument("--install", action="store_true", help="Write a user service that runs server up, then exit")
+    p_up.add_argument("--force", action="store_true", help="Overwrite an existing user service file")
+    p_up.set_defaults(func=cmd_server_up)
+    for action, func, help_text in (
+            ("status", cmd_server_status, "Show runs, sizes, and key activity"),
+            ("verify", cmd_server_verify, "Check objects, run sizes, and lineage")):
+        child = server_sub.add_parser(action, help=help_text)
+        child.add_argument("--data", default=None)
+        child.add_argument("--json", action="store_true")
+        child.set_defaults(func=func)
     p_keys = server_sub.add_parser("keys", help="Create, list, or revoke API keys")
     keys_sub = p_keys.add_subparsers(dest="keys_action", required=True)
     for action in ("create", "list", "revoke"):
@@ -1120,6 +1187,7 @@ def main(argv=None):
     p_sync.add_argument("--follow", action="store_true", help="Keep syncing until stopped (implies --all)")
     p_sync.add_argument("--interval", type=float, metavar="SECONDS", help="Pause between --follow passes (default: 30)")
     p_sync.add_argument("--dry-run", action="store_true", help="Show counts without sending or saving")
+    p_sync.add_argument("--artifacts", action="store_true", help="Upload unchanged copy=False artifact files")
     p_sync.add_argument("--prune", action="store_true", help="Delete raw series (.bin) with valid overviews after sync")
     p_sync.add_argument("--reset", action="store_true", help="Forget this host's saved cursor for the given runs; the next sync resumes from the server")
     p_sync.add_argument("--insecure", action="store_true", help="Allow http:// to a non-local host")

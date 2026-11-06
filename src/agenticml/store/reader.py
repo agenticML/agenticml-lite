@@ -98,8 +98,47 @@ def run_references(root, run_id: str) -> dict[str, set[str]]:
     media_bytes = read_file_nofollow(media_path)
     if not isinstance(json.loads(media_bytes), dict):
         raise ValueError(f"expected object in {media_path}")
-    return references_from_bytes(media_bytes,
+    refs = references_from_bytes(media_bytes,
                                  read_file_nofollow(directory / EVENTS_NAME), run_id)
+    try:
+        rows = parse_artifacts_json(read_file_nofollow(directory / "artifacts.json"))
+    except FileNotFoundError:
+        return refs
+    if rows is None:
+        raise ValueError(f"invalid artifacts.json in run {run_id}")
+    for row in rows:
+        refs["artifacts"].add(row["sha256"])
+    return refs
+
+
+def parse_artifacts_json(body):
+    """Mapping rows from an ``artifacts.json`` body, or ``None`` if invalid."""
+    try:
+        obj = json.loads(body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else body)
+    except (TypeError, ValueError, RecursionError, UnicodeDecodeError):
+        return None
+    if not isinstance(obj, dict) or type(obj.get("version")) is not int or obj["version"] != 1:
+        return None
+    rows = obj.get("artifacts")
+    if not isinstance(rows, list) or len(rows) > 10_000:
+        return None
+    seen = set()
+    parsed = []
+    required = {"name", "version", "sha256", "size"}
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != required:
+            return None
+        name, version, sha, size = row["name"], row["version"], row["sha256"], row["size"]
+        if (not isinstance(name, str) or not name or len(name) > 1024
+                or type(version) is not int or version < 1 or not valid_sha(sha)
+                or type(size) is not int or size < 0):
+            return None
+        key = (name, version)
+        if key in seen:
+            return None
+        seen.add(key)
+        parsed.append({"name": name, "version": version, "sha256": sha, "size": size})
+    return parsed
 
 
 def references_from_bytes(media_bytes: bytes, events_bytes: bytes, run_id: str) -> dict[str, set[str]]:
@@ -659,8 +698,27 @@ class RunReader:
         return [merged[path] for path in order]
 
     def artifacts(self) -> list:
-        """Artifact events in append order, including ``version`` and ``sha256``."""
-        return [event for event in self.events() if event.get("kind") == "artifact"]
+        """Artifact events in append order, with ``artifacts.json`` filled in when valid."""
+        events = [event for event in self.events() if event.get("kind") == "artifact"]
+        try:
+            rows = parse_artifacts_json(read_file_nofollow(self._c(self.run_dir / "artifacts.json")))
+        except FileNotFoundError:
+            return events
+        except OSError:
+            return events
+        if not rows:
+            return events
+        mapping = {(row["name"], row["version"]): row for row in rows}
+        merged = []
+        for event in events:
+            row = mapping.get((event.get("name"), event.get("version")))
+            if row is not None and event.get("copy") is False:
+                event = dict(event)
+                event["sha256"] = row["sha256"]
+                event["size"] = row["size"]
+                event["byref"] = True
+            merged.append(event)
+        return merged
 
     def referenced_shas(self) -> set[str]:
         """All referenced objects; unreadable input raises rather than losing refs."""

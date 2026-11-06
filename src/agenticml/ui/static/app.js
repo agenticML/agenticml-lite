@@ -3092,6 +3092,13 @@ async function runPage(id, version) {
               .filter(Boolean)
               .join(" · "),
           }),
+          typeof artifact.sha256 === "string" && /^[0-9a-f]{64}$/.test(artifact.sha256)
+            ? el("a", {
+                href: objectURL(artifact.sha256, "application/octet-stream"),
+                download: (String(artifact.path || "").replace(/\\/g, "/").split("/").pop() || artifact.name || "artifact"),
+                text: "Download",
+              })
+            : null,
         ),
       ),
     );

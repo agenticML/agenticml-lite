@@ -104,7 +104,10 @@ def test_health_auth_scopes_and_revocation(server):
         assert status == 401 and obj == {"error": "unauthorized"}
         assert response_headers["WWW-Authenticate"] == "Bearer"
     assert raw(server, "GET", "/v2/whoami", [("Authorization", "bEaReR " + server.test_key)])[0] == 200
-    assert request(server, "/v2/whoami")[1] == {"key": "one", "scope": "sync", "protocol": 2, "features": []}
+    assert request(server, "/v2/whoami")[1] == {
+        "key": "one", "scope": "sync", "protocol": 2,
+        "features": (["lineage"] if server.lineage_enabled else []) + ["byref"],
+    }
     _, admin = server.keys.create("admin", "admin")
     assert request(server, "/v2/whoami", key=admin)[1]["scope"] == "admin"
     assert put_meta(server, "admin-run", key=admin)[0] == 200
@@ -118,7 +121,8 @@ def test_zero_keys_and_environment(tmp_path):
         assert raw(httpd, "GET", "/v2/whoami")[0] == 401
     with running(tmp_path / "env", "a" * 32) as httpd:
         assert raw(httpd, "GET", "/v2/whoami", [("Authorization", "Bearer " + "a" * 32)])[1] == {
-            "key": "env", "scope": "admin", "protocol": 2, "features": [],
+            "key": "env", "scope": "admin", "protocol": 2,
+            "features": (["lineage"] if httpd.lineage_enabled else []) + ["byref"],
         }
         assert not (httpd.data_dir / "server" / "keys.json").exists()
 
@@ -173,6 +177,24 @@ def test_lock_tmp_cleanup_and_permissions(tmp_path, caplog):
         httpd.server_close()
     with make_server(tmp_path, port=0):
         pass
+
+
+def test_startup_removes_abandoned_lineage_quarantines(tmp_path, caplog):
+    app.prepare_data_dir(tmp_path)
+    tmp = tmp_path / "server" / "tmp"
+    pack = tmp / "lineage-abandoned" / "pack"
+    pack.mkdir(parents=True)
+    (pack / "partial.pack").write_bytes(b"partial")
+    (tmp / "other").mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "safe").write_bytes(b"safe")
+    (tmp / "lineage-link").symlink_to(outside, target_is_directory=True)
+    with make_server(tmp_path, port=0):
+        assert sorted(p.name for p in tmp.iterdir()) == ["other"]
+        assert (outside / "safe").read_bytes() == b"safe"
+        assert "ignoring subdirectory in server/tmp: " + str(tmp / "other") in caplog.text
+        assert "ignoring subdirectory in server/tmp: " + str(tmp / "lineage-abandoned") not in caplog.text
 
 
 @pytest.mark.parametrize("reader", [False, True], ids=["no-reader", "with-reader"])
@@ -661,6 +683,14 @@ def test_append_directory_fsync_failure_rolls_back(server, monkeypatch):
     assert run_path(server, "scalars/0.bin").read_bytes() == b"12345678"
 
 
+def _wait_tmp_empty(tmp_dir, timeout=5):
+    deadline = time.monotonic() + timeout
+    while list(tmp_dir.iterdir()) and time.monotonic() < deadline:
+        time.sleep(.01)
+    leftover = list(tmp_dir.iterdir())
+    assert not leftover, leftover
+
+
 def test_objects_validation_upload_and_concurrency(server):
     data = b"object bytes"
     sha = hashlib.sha256(data).hexdigest()
@@ -682,7 +712,151 @@ def test_objects_validation_upload_and_concurrency(server):
     assert request(server, path, "PUT", data)[1] == {"sha256": sha, "created": False}
     assert stored.stat().st_mtime > 1
     assert request(server, missing, "POST", json.dumps({"objects": [sha]}).encode())[1] == {"missing": []}
-    assert not list(server.tmp_dir.iterdir())
+    _wait_tmp_empty(server.tmp_dir)
+
+
+def _is_object_prefix_dir(path):
+    path = Path(path)
+    return path.parent.name == layout.OBJECTS_DIRNAME and len(path.name) == 2
+
+
+def _payloads_same_prefix(n=2):
+    found = {}
+    for index in range(1, 10000):
+        data = b"same-pfx-" + str(index).encode()
+        prefix = hashlib.sha256(data).hexdigest()[:2]
+        found.setdefault(prefix, []).append(data)
+        if len(found[prefix]) == n:
+            return found[prefix]
+    raise AssertionError("could not find payloads with the same object prefix")
+
+
+def _payloads_distinct_prefixes(n=2):
+    found = []
+    seen = set()
+    for index in range(1, 1000):
+        data = b"obj-" + str(index).encode()
+        prefix = hashlib.sha256(data).hexdigest()[:2]
+        if prefix in seen:
+            continue
+        seen.add(prefix)
+        found.append(data)
+        if len(found) == n:
+            return found
+    raise AssertionError("could not find payloads with distinct object prefixes")
+
+
+def test_concurrent_puts_distinct_prefixes_overlap_fsync(server, monkeypatch):
+    first, second = _payloads_distinct_prefixes()
+    assert hashlib.sha256(first).hexdigest()[:2] != hashlib.sha256(second).hexdigest()[:2]
+    # keys.touch fsyncs on first use; consume that so the patched fsync is the
+    # object temp file (same pattern as test_append_write_failure_rolls_back).
+    assert request(server, "/v2/whoami")[0] == 200
+    arrived = threading.Event()
+    count_lock = threading.Lock()
+    inside = [0]
+    original = ingest.os.fsync
+
+    def gated(fd):
+        with count_lock:
+            inside[0] += 1
+            if inside[0] >= 2:
+                arrived.set()
+        if not arrived.wait(5):
+            raise TimeoutError("object fsyncs did not overlap")
+        return original(fd)
+
+    monkeypatch.setattr(ingest.os, "fsync", gated)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(
+            lambda data: request(server, "/v2/objects/" + hashlib.sha256(data).hexdigest(), "PUT", data),
+            (first, second),
+        ))
+    assert [result[0] for result in results] == [201, 201]
+    assert arrived.is_set()
+    for data in (first, second):
+        stored = layout.object_path(server.root, hashlib.sha256(data).hexdigest())
+        assert stored.read_bytes() == data
+
+
+def test_concurrent_puts_distinct_prefixes_overlap_dir_fsync(server, monkeypatch):
+    first, second = _payloads_distinct_prefixes()
+    assert hashlib.sha256(first).hexdigest()[:2] != hashlib.sha256(second).hexdigest()[:2]
+    arrived = threading.Event()
+    count_lock = threading.Lock()
+    inside = [0]
+    original = layout.fsync_dir
+
+    def gated(path):
+        if _is_object_prefix_dir(path):
+            with count_lock:
+                inside[0] += 1
+                if inside[0] >= 2:
+                    arrived.set()
+            if not arrived.wait(3):
+                raise TimeoutError("prefix directory fsyncs did not overlap")
+        return original(path)
+
+    monkeypatch.setattr(layout, "fsync_dir", gated)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(
+            lambda data: request(server, "/v2/objects/" + hashlib.sha256(data).hexdigest(), "PUT", data),
+            (first, second),
+        ))
+    assert [result[0] for result in results] == [201, 201]
+    assert arrived.is_set()
+    for data in (first, second):
+        stored = layout.object_path(server.root, hashlib.sha256(data).hexdigest())
+        assert stored.read_bytes() == data
+
+
+def test_concurrent_puts_same_prefix_serialize_dir_fsync(server, monkeypatch):
+    first, second = _payloads_same_prefix()
+    assert hashlib.sha256(first).hexdigest()[:2] == hashlib.sha256(second).hexdigest()[:2]
+    assert hashlib.sha256(first).hexdigest() != hashlib.sha256(second).hexdigest()
+    overlapped = threading.Event()
+    count_lock = threading.Lock()
+    inside = [0]
+    original = layout.fsync_dir
+
+    def gated(path):
+        if _is_object_prefix_dir(path):
+            with count_lock:
+                inside[0] += 1
+                if inside[0] > 1:
+                    overlapped.set()
+            try:
+                overlapped.wait(0.2)
+                return original(path)
+            finally:
+                with count_lock:
+                    inside[0] -= 1
+        return original(path)
+
+    monkeypatch.setattr(layout, "fsync_dir", gated)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(
+            lambda data: request(server, "/v2/objects/" + hashlib.sha256(data).hexdigest(), "PUT", data),
+            (first, second),
+        ))
+    assert sorted(result[0] for result in results) == [201, 201]
+    assert not overlapped.is_set()
+    for data in (first, second):
+        stored = layout.object_path(server.root, hashlib.sha256(data).hexdigest())
+        assert stored.read_bytes() == data
+
+
+def test_concurrent_puts_same_digest_one_created(server):
+    data = b"same-digest-object"
+    sha = hashlib.sha256(data).hexdigest()
+    path = "/v2/objects/" + sha
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: request(server, path, "PUT", data), range(2)))
+    assert sorted(result[0] for result in results) == [200, 201]
+    stored = layout.object_path(server.root, sha)
+    assert stored.is_file()
+    assert stored.read_bytes() == data
+    _wait_tmp_empty(server.tmp_dir)
 
 
 @pytest.mark.parametrize("kind", ["symlink", "directory"])
@@ -868,7 +1042,8 @@ def test_responses_sent_after_write_locks_released(server, monkeypatch):
     def checked(self, payload, status=200, headers=None):
         # Keep a strong reference to the per-run lock, which is weakly cached.
         assert not run_lock.locked()
-        assert not server.objects_lock.locked()
+        with server.object_locks_lock:
+            assert not any(lock.locked() for lock in server.object_locks.values())
         sent.append(status)
         return original(self, payload, status, headers)
 

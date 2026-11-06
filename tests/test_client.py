@@ -101,7 +101,8 @@ def fake_http(handler):
 def test_whoami_sync_and_admin_and_revoked(server):
     with client_for(server) as client:
         assert client.whoami() == {
-            "key": "one", "scope": "sync", "protocol": 2, "features": [],
+            "key": "one", "scope": "sync", "protocol": 2,
+            "features": (["lineage"] if server.lineage_enabled else []) + ["byref"],
         }
     _, admin = server.keys.create("boss", "admin")
     with client_for(server, admin) as client:
@@ -213,6 +214,26 @@ def test_put_object_retries_503_and_rewinds(monkeypatch):
     assert bodies == [payload, payload]
 
 
+def test_put_lineage_retries_503_and_rewinds():
+    bodies = []
+
+    def handler(request):
+        bodies.append(request.server.requests[-1][3])
+        assert request.path == "/v2/runs/run-1/lineage"
+        if len(bodies) == 1:
+            request._send(503, b'{"error":"busy"}', {"Retry-After": "0"})
+        else:
+            request._send(201, b'{"created":true,"commit":"accepted"}')
+
+    payload = b"full-bundle-body"
+    with fake_http(handler) as (_httpd, url):
+        with Client(base_url=url, api_key="secret-key") as client:
+            assert client.put_lineage("run-1", io.BytesIO(payload), len(payload)) == {
+                "created": True, "commit": "accepted",
+            }
+    assert bodies == [payload, payload]
+
+
 def test_connection_refused_retries_then_raises(monkeypatch):
     monkeypatch.setattr("agenticml.client.time.sleep", lambda _delay: None)
     sock = socket.socket()
@@ -278,6 +299,59 @@ def test_retry_after_capped_and_nan_falls_back(monkeypatch):
         with Client(base_url=url, api_key="secret-key") as client:
             assert client.whoami()["protocol"] == 2
     assert sleeps == [30.0, 1.0]
+
+
+def test_negative_retry_after_falls_back(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("agenticml.client.time.sleep", sleeps.append)
+
+    def handler(request):
+        if len(request.server.requests) == 1:
+            request._send(429, b'{"error":"slow down"}', {"Retry-After": "-1"})
+            return
+        request._send(200, b'{"protocol":2,"key":"one","scope":"sync","features":[]}')
+
+    with fake_http(handler) as (_httpd, url):
+        with Client(base_url=url, api_key="secret-key") as client:
+            assert client.whoami()["protocol"] == 2
+    assert sleeps == [0.5]
+
+
+def test_429_retries_honouring_retry_after(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("agenticml.client.time.sleep", sleeps.append)
+
+    def handler(request):
+        count = len(request.server.requests)
+        if count == 1:
+            request._send(429, b'{"error":"slow down"}', {"Retry-After": "1.5"})
+            return
+        if count == 2:
+            request._send(429, b'{"error":"slow down"}', {"Retry-After": "999"})
+            return
+        if count == 3:
+            request._send(429, b'{"error":"slow down"}', {"Retry-After": "nan"})
+            return
+        request._send(200, b'{"protocol":2,"key":"one","scope":"sync","features":[]}')
+
+    with fake_http(handler) as (_httpd, url):
+        with Client(base_url=url, api_key="secret-key") as client:
+            assert client.whoami()["protocol"] == 2
+    assert sleeps == [1.5, 60.0, 2.0]
+
+
+def test_persistent_429_retries_then_http_error(monkeypatch):
+    monkeypatch.setattr("agenticml.client.time.sleep", lambda _delay: None)
+
+    def handler(request):
+        request._send(429, b'{"error":"slow down"}', {"Retry-After": "0"})
+
+    with fake_http(handler) as (httpd, url):
+        with Client(base_url=url, api_key="secret-key", max_retries=2) as client:
+            with pytest.raises(requests.HTTPError) as caught:
+                client.whoami()
+            assert caught.value.response.status_code == 429
+        assert len(httpd.requests) == 3
 
 
 def test_chunked_encoding_error_is_retried(monkeypatch):
