@@ -17,10 +17,9 @@ re-encoding records.
 - **Protocol number**: `2`.
 - **Features**: Advertised by the server in `GET /v2/whoami`. The `lineage`
   feature enables shadow Git replication when Git is installed on the server.
-  A 2.0 server returns an empty list (`[]`). The token `byref` (by-reference
-  artifact uploads) remains
-  reserved. Clients must only enable features that the server explicitly
-  advertises.
+  The `byref` feature enables `sync --artifacts` uploads of unchanged
+  `copy=False` artifacts. A 2.0 server returns an empty list (`[]`). Clients
+  must only enable features that the server explicitly advertises.
 
 ## Authentication
 
@@ -63,6 +62,7 @@ File paths in URLs must match strict allow-lists before any filesystem access:
 
 - **Atomic files** (`PUT /v2/runs/{id}/files/{path}`):
   - `meta.json`
+  - `artifacts.json`
   - `scalars/index.json`
   - `media/index.json`
   - `scalars/<n>.ovw` where `<n>` is `0` or `[1-9][0-9]{0,8}` (decimal series ID)
@@ -127,7 +127,7 @@ client recovery.
 | Method and path | Request body | Success response | Error codes |
 | --- | --- | --- | --- |
 | `GET /healthz` | None | `200 {"ok": true}` | None |
-| `GET /v2/whoami` | None | `200 {"key": name, "scope": scope, "protocol": 2, "features": ["lineage"]}` | 401 |
+| `GET /v2/whoami` | None | `200 {"key": name, "scope": scope, "protocol": 2, "features": ["lineage", "byref"]}` | 401 |
 | `POST /v2/objects/missing` | `{"objects": [sha256, ...]}` | `200 {"missing": [sha256, ...]}` | 401, 411, 413, 422, 503 |
 | `PUT /v2/objects/{sha256}` | Raw bytes (`application/octet-stream`) | `201 {"sha256": sha256, "created": true}` or `200 {"sha256": sha256, "created": false}` | 401, 411, 413, 422, 503 |
 | `GET /v2/runs/{id}/state` | None | `200 {"owner": name, "files": {path: {"size": n, "sha256": h}}, "remote": {...}}` | 401, 404 |
@@ -159,14 +159,15 @@ Identify the calling API key and check server capabilities.
     "key": "gpu-box-1",
     "scope": "sync",
     "protocol": 2,
-    "features": ["lineage"]
+    "features": ["lineage", "byref"]
   }
   ```
 - **Errors**:
   - `401 Unauthorized`: `{"error": "unauthorized"}` with `WWW-Authenticate: Bearer`.
 
 The `lineage` feature is present only when Git was found at server startup;
-without Git, `features` is empty and the lineage endpoints return 404.
+without Git, lineage is omitted and the lineage endpoints return 404. The
+`byref` feature is always listed.
 
 ### `GET /v2/runs/{id}/lineage`
 
@@ -320,13 +321,16 @@ any valid key.
 Atomically write or replace an allow-listed atomic file.
 
 - **Request**: `PUT /v2/runs/{id}/files/{path}`
-  - `{path}` must match: `meta.json`, `scalars/index.json`, `media/index.json`,
-    or `scalars/<n>.ovw`.
+  - `{path}` must match: `meta.json`, `artifacts.json`, `scalars/index.json`,
+    `media/index.json`, or `scalars/<n>.ovw`.
   - Header: `Authorization: Bearer <key>`, `Content-Length: <size>`
   - Body: raw bytes up to 16 MiB.
 - **Validation**:
   - `meta.json`: JSON object where `run_id == "{id}"` and `status` is one of
     `"running"`, `"finished"`, or `"crashed"`.
+  - `artifacts.json`: JSON object `{"version": 1, "artifacts": [...]}` with at
+    most 10,000 unique `{name, version, sha256, size}` rows. See
+    [FORMAT.md](FORMAT.md#artifactsjson).
   - `scalars/index.json`, `media/index.json`: valid JSON object.
   - `<n>.ovw`: binary overview parseable by `Overview.from_bytes`.
 - **Response**: `200 OK`
@@ -341,7 +345,8 @@ Atomically write or replace an allow-listed atomic file.
   - `411 Length Required`: `{"error": "length required"}`
   - `413 Payload Too Large`: `{"error": "payload too large"}`
   - `422 Unprocessable Entity`: `{"error": "invalid meta.json"}`,
-    `{"error": "invalid overview"}`, or `{"error": "invalid JSON object"}`.
+    `{"error": "invalid artifacts.json"}`, `{"error": "invalid overview"}`,
+    or `{"error": "invalid JSON object"}`.
   - `503 Service Unavailable`: `{"error": "server busy"}` (`Retry-After: 5`)
 
 ### `POST /v2/runs/{id}/append/{path}?offset=N[&truncate=1]`
@@ -582,7 +587,14 @@ The client synchronizes one run at a time under an advisory flock on
    permanently skipped. Complete runs synced to 2.0 servers are backfilled
    when `lineage` becomes available. Dry runs count lineage as one file,
    assuming the server lists lineage, without querying the server.
-6. **Commit**: The client commits (`POST /v2/runs/{id}/commit`) on every sync
+6. **By-reference artifacts**: If the client passed `--artifacts` and the
+   server advertises `byref`, hash each `copy=False` artifact whose source
+   path, size, and mtime still match the event, upload missing objects, and
+   PUT `artifacts.json`. A changed or missing source is warned once and
+   remembered as a permanent `byref` skip. Without `--artifacts`, or when the
+   server omits `byref`, these artifacts are ignored. Dry runs count pending
+   candidates as objects without hashing or contacting the server.
+7. **Commit**: The client commits (`POST /v2/runs/{id}/commit`) on every sync
    that is not idle (an idle run is complete, its fingerprint unchanged, and
    finished or crashed). `complete: true` is saved only after a successful
    commit, so a failed commit is retried on the next sync without resending
@@ -637,6 +649,11 @@ The client maintains host-scoped sync state in `<root>/runs/<id>/sync.json`:
 - **Lineage**: `lineage` stores the accepted shadow commit. Permanent lineage
   skips use `{"kind": "lineage", "id": "<run-id>", "reason": "<error>"}` in
   `skipped`.
+- **By-reference artifacts**: `byref` maps `"<name>:v<version>"` to
+  `{path, size, mtime, sha256}` after a successful hash. Permanent skips use
+  `{"kind": "byref", "id": "<name>:v<version>", "reason": "..."}` in
+  `skipped`. The `artifacts.json` cursor lives under `files` like other
+  atomic files.
 - **Owner**: The key name (`owner`) is saved in the host entry only after
   cursor recovery confirms ownership.
 - **Update timing**: `sync.json` is atomically replaced and directory-fsynced
@@ -774,8 +791,5 @@ is committed at least every 60 s.
 
 ### 11. Out of scope in protocol 2.0
 
-- **By-reference artifacts**: Artifacts logged with `copy=False` are not
-  uploaded in protocol 2.0. They are ignored by the sync client and do not
-  block run completion.
 - **Notes**: `notes.md` is never synced. Local notes remain local; notes
-  edited in the server dashboard (a later package) stay on the server.
+  edited in the server dashboard stay on the server.

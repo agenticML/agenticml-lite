@@ -106,7 +106,7 @@ def test_health_auth_scopes_and_revocation(server):
     assert raw(server, "GET", "/v2/whoami", [("Authorization", "bEaReR " + server.test_key)])[0] == 200
     assert request(server, "/v2/whoami")[1] == {
         "key": "one", "scope": "sync", "protocol": 2,
-        "features": ["lineage"] if server.lineage_enabled else [],
+        "features": (["lineage"] if server.lineage_enabled else []) + ["byref"],
     }
     _, admin = server.keys.create("admin", "admin")
     assert request(server, "/v2/whoami", key=admin)[1]["scope"] == "admin"
@@ -121,7 +121,8 @@ def test_zero_keys_and_environment(tmp_path):
         assert raw(httpd, "GET", "/v2/whoami")[0] == 401
     with running(tmp_path / "env", "a" * 32) as httpd:
         assert raw(httpd, "GET", "/v2/whoami", [("Authorization", "Bearer " + "a" * 32)])[1] == {
-            "key": "env", "scope": "admin", "protocol": 2, "features": ["lineage"] if httpd.lineage_enabled else [],
+            "key": "env", "scope": "admin", "protocol": 2,
+            "features": (["lineage"] if httpd.lineage_enabled else []) + ["byref"],
         }
         assert not (httpd.data_dir / "server" / "keys.json").exists()
 

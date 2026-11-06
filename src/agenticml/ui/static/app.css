@@ -626,6 +626,9 @@ kbd {
   flex-wrap: wrap;
   min-width: 0;
 }
+[data-artifact] .mono {
+  overflow-wrap: anywhere;
+}
 .heading {
   justify-content: space-between;
   align-items: end;

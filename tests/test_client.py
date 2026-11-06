@@ -102,7 +102,7 @@ def test_whoami_sync_and_admin_and_revoked(server):
     with client_for(server) as client:
         assert client.whoami() == {
             "key": "one", "scope": "sync", "protocol": 2,
-            "features": ["lineage"] if server.lineage_enabled else [],
+            "features": (["lineage"] if server.lineage_enabled else []) + ["byref"],
         }
     _, admin = server.keys.create("boss", "admin")
     with client_for(server, admin) as client:

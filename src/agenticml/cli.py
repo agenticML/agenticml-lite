@@ -1120,6 +1120,7 @@ def main(argv=None):
     p_sync.add_argument("--follow", action="store_true", help="Keep syncing until stopped (implies --all)")
     p_sync.add_argument("--interval", type=float, metavar="SECONDS", help="Pause between --follow passes (default: 30)")
     p_sync.add_argument("--dry-run", action="store_true", help="Show counts without sending or saving")
+    p_sync.add_argument("--artifacts", action="store_true", help="Upload unchanged copy=False artifact files")
     p_sync.add_argument("--prune", action="store_true", help="Delete raw series (.bin) with valid overviews after sync")
     p_sync.add_argument("--reset", action="store_true", help="Forget this host's saved cursor for the given runs; the next sync resumes from the server")
     p_sync.add_argument("--insecure", action="store_true", help="Allow http:// to a non-local host")

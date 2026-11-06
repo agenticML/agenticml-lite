@@ -275,7 +275,7 @@ def test_feature_detection(tmp_path, monkeypatch, git_available, caplog):
     monkeypatch.setattr(app.shutil, "which", lambda name: real_git if git_available else None)
     with running(tmp_path / "server") as server:
         server.test_key = server.keys.create("box")[1]
-        assert request(server, "/v2/whoami")[1]["features"] == (["lineage"] if git_available else [])
+        assert request(server, "/v2/whoami")[1]["features"] == (["lineage", "byref"] if git_available else ["byref"])
         if not git_available:
             assert request(server, "/v2/runs/unknown/lineage")[0] == 404
             assert "git is not installed" in caplog.text

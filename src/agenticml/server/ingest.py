@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 from agenticml.store import layout, objects
 from agenticml.store.overview import Overview
+from agenticml.store.reader import parse_artifacts_json
 from agenticml.ui.server import DashboardHandler
 from . import lineage
 
@@ -21,7 +22,7 @@ logger = logging.getLogger("agenticml.server.ingest")
 _CHUNK = 64 * 1024
 _STATE_BATCH = 64
 _ID = r"([A-Za-z0-9][A-Za-z0-9._-]{0,127})"
-_ATOMIC = re.compile(r"(?:meta\.json|scalars/index\.json|media/index\.json|scalars/(?:0|[1-9][0-9]{0,8})\.ovw)")
+_ATOMIC = re.compile(r"(?:meta\.json|artifacts\.json|scalars/index\.json|media/index\.json|scalars/(?:0|[1-9][0-9]{0,8})\.ovw)")
 _APPEND = re.compile(r"(?:events\.jsonl|scalars/_time\.bin|scalars/(?:0|[1-9][0-9]{0,8})\.bin)")
 _ROUTES = [
     ("GET", re.compile(r"/healthz"), "health"),
@@ -131,7 +132,7 @@ class IngestHandler(DashboardHandler):
             self.server.keys.touch(record)
             if route == "whoami":
                 self._json({"key": record.name, "scope": record.scope, "protocol": 2,
-                            "features": ["lineage"] if self.server.lineage_enabled else []})
+                            "features": (["lineage"] if self.server.lineage_enabled else []) + ["byref"]})
                 return
             if route in ("lineage", "lineage_state") and not self.server.lineage_enabled:
                 _fail(404, "not found")
@@ -375,6 +376,9 @@ class IngestHandler(DashboardHandler):
                 Overview.from_bytes(body)
             except (ValueError, TypeError):
                 _fail(422, "invalid overview")
+        elif name == "artifacts.json":
+            if parse_artifacts_json(body) is None:
+                _fail(422, "invalid artifacts.json")
         else:
             obj = _json_object(body)
             if name == "meta.json" and (obj.get("run_id") != run_id or obj.get("status") not in _STATUSES):
@@ -402,7 +406,7 @@ class IngestHandler(DashboardHandler):
             directory = self._run_dir(run_id)
             if not _regular(directory / "meta.json"):
                 _fail(404, "unknown run")
-            names = ["meta.json", "events.jsonl", "scalars/index.json", "media/index.json", "scalars/_time.bin"]
+            names = ["meta.json", "artifacts.json", "events.jsonl", "scalars/index.json", "media/index.json", "scalars/_time.bin"]
             scalars = directory / "scalars"
             if scalars.is_dir():
                 names.extend("scalars/" + entry.name for entry in scalars.iterdir()

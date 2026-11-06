@@ -255,7 +255,9 @@ Runs uploaded with `sync --follow` commit heartbeats at least every 60 seconds w
 
 ## Sync features and limits
 
-The server supports metric, scalar, event, media, copied artifact, and lineage synchronization over [protocol v2](PROTOCOL.md). Install `git` on the server to enable lineage code diffs. Git is detected at startup; if missing, the server logs a warning and leaves the `lineage` feature off. The client sends incremental shadow-repository bundles, and server code diffs then match local diffs. No server worktree checkout is needed.
+The server supports metric, scalar, event, media, copied artifact, by-reference artifact, and lineage synchronization over [protocol v2](PROTOCOL.md). Install `git` on the server to enable lineage code diffs. Git is detected at startup; if missing, the server logs a warning and leaves the `lineage` feature off. The client sends incremental shadow-repository bundles, and server code diffs then match local diffs. No server worktree checkout is needed.
+
+`agenticml sync --artifacts` uploads `copy=False` artifacts whose source file is unchanged since it was logged, then records the mapping in server-only `artifacts.json`. A changed or missing source is skipped with one warning. Without `--artifacts`, those artifacts stay as metadata. The local dashboard never serves arbitrary local paths.
 
 Lineage validation supports data directory paths containing `:`. Repository
 initialization and ref publication failures (including stale Git lock files),
@@ -269,7 +271,6 @@ and warns about other subdirectories.
 The following limits remain:
 
 - **Run notes (`notes.md`)**: Notes remain local to the machine where they were written.
-- **By-reference artifacts**: Artifacts logged with `copy=False` are not uploaded to the server (scheduled for Release 2.1).
 - **Cross-key run collision**: A run ID is owned by the key that first created it. Pushing to an existing run ID using a different key fails with an error.
 
 ## Configuration reference

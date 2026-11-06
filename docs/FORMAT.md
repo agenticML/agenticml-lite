@@ -26,6 +26,7 @@ Nothing here is uploaded. Paths below are relative to a root resolved by
     events.jsonl
     notes.md
     remote.json                  server-only sync status; never written locally
+    artifacts.json               server-only by-reference artifact mapping; never written locally
     scalars/index.json
     scalars/<id>.bin             one file per series, <id> is a decimal int
     scalars/<id>.ovw             overview at finish, only if the series has > 65536 points
@@ -289,6 +290,26 @@ The dashboard is read-only except for notes. Writes use
 `X-AgenticML-Request: 1` header. Reads use `GET /api/runs/<run_id>/notes`
 and `GET /api/notes[?project=P]`. `agenticml ui --read-only` disables note
 editing.
+
+## `artifacts.json`
+
+Server-only, written by `agenticml sync --artifacts` when the server
+advertises `byref`. Local writers never create it. A local store does not
+contain this file. Readers treat a missing or invalid file as no mapping:
+`copy=False` artifact events stay unchanged. A valid file fills in `sha256`
+and `size` for matching `(name, version)` events and sets `byref: true`.
+Objects need not exist at PUT time; readers tolerate a missing blob.
+
+```json
+{"version": 1, "artifacts": [
+  {"name": "model", "version": 2, "sha256": "<64 hex>", "size": 1234}
+]}
+```
+
+`version` must be `1`. `artifacts` is a list of at most 10,000 objects, each
+with exactly `name` (non-empty string, ≤ 1,024 chars), `version` (int ≥ 1),
+`sha256` (64 lowercase hex), and `size` (int ≥ 0), with unique
+`(name, version)`.
 
 ## `remote.json`
 
@@ -598,6 +619,7 @@ new directory entry; the object then looks like the put never happened.
 Atomic (temp in the same directory, `flush`, `os.replace`):
 
 - `meta.json`
+- `artifacts.json` (server-only)
 - `scalars/index.json`
 - `media/index.json`
 - `scalars/<id>.ovw`

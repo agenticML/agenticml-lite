@@ -31,6 +31,7 @@ from .store.gc import prunable_series, prune_run, run_fingerprint
 from .store.layout import (
     RECORD_SIZE, _LOCK_UNSUPPORTED, _open_regular_fd, fsync_dir, open_nofollow,
     open_object, read_file_nofollow, resolve_root, try_lock_run, unlock_run,
+    valid_sha,
 )
 from .store.reader import RunReader, _effective_status, list_runs, references_from_bytes
 
@@ -41,7 +42,7 @@ HEARTBEAT = 60.0
 BACKOFF_MAX = 300.0
 FAILURE_REMINDER = 600.0
 _BACKOFF_EXP_CAP = 16
-_ATOMIC = re.compile(r"(?:meta\.json|scalars/index\.json|media/index\.json|scalars/(?:0|[1-9][0-9]{0,8})\.ovw)")
+_ATOMIC = re.compile(r"(?:meta\.json|artifacts\.json|scalars/index\.json|media/index\.json|scalars/(?:0|[1-9][0-9]{0,8})\.ovw)")
 _APPEND = re.compile(r"(?:events\.jsonl|scalars/_time\.bin|scalars/(?:0|[1-9][0-9]{0,8})\.bin)")
 _TRANSIENT_STATUS = frozenset({408, 429})
 _ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\].*?(?:\x07|\x1b\\)|[@-Z\\-_])")
@@ -165,7 +166,8 @@ def _release_lock(lock):
 
 
 def _skipped_ids(state):
-    return {entry["id"] for entry in state.get("skipped") or [] if entry.get("kind") != "lineage"}
+    return {entry["id"] for entry in state.get("skipped") or []
+            if entry.get("kind") not in ("lineage", "byref")}
 
 
 def _remember_skip(state, kind, ident, reason):
@@ -279,7 +281,7 @@ def _run_label(meta):
     return f"{project}/{name}"
 
 
-def sync_run(reader, host, client, result, *, dry_run=False, prune=False):
+def sync_run(reader, host, client, result, *, dry_run=False, prune=False, artifacts=False):
     meta = reader.meta()
     result.label = _run_label(meta)
     lock = None
@@ -290,7 +292,7 @@ def sync_run(reader, host, client, result, *, dry_run=False, prune=False):
             result.warnings.append("another sync is running for this run")
             return
     try:
-        _sync_locked(reader, host, client, result, dry_run=dry_run, prune=prune)
+        _sync_locked(reader, host, client, result, dry_run=dry_run, prune=prune, artifacts=artifacts)
     finally:
         _release_lock(lock)
 
@@ -358,11 +360,107 @@ def _lineage_pending(reader, state, commit):
         for entry in state.get("skipped") or [] if isinstance(entry, dict)))
 
 
-def _sync_idle(reader, state, source_hash, key=None, features=()):
+def _byref_key(name, version):
+    return f"{name}:v{version}"
+
+
+def _byref_candidates(events_bytes):
+    candidates = []
+    seen = set()
+    overflow = False
+    for line in events_bytes.split(b"\n"):
+        if b'"artifact"' not in line:
+            continue
+        try:
+            event = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(event, dict) or event.get("kind") != "artifact" or event.get("copy") is not False:
+            continue
+        name, version, path = event.get("name"), event.get("version"), event.get("path")
+        size, mtime = event.get("size"), event.get("mtime")
+        if not (isinstance(name, str) and type(version) is int and isinstance(path, str)
+                and type(size) is int and isinstance(mtime, (int, float)) and not isinstance(mtime, bool)
+                and os.path.isabs(path) and "\x00" not in path):
+            continue
+        key = (name, version)
+        if key in seen:
+            continue
+        seen.add(key)
+        if len(candidates) >= 10_000:
+            overflow = True
+            continue
+        candidates.append({"name": name, "version": version, "path": path, "size": size, "mtime": mtime})
+    return candidates, overflow
+
+
+def _byref_skipped(state, key):
+    return any(isinstance(entry, dict) and entry.get("kind") == "byref" and entry.get("id") == key
+               for entry in state.get("skipped") or [])
+
+
+def _byref_record(state, candidate):
+    cached = (state.get("byref") or {}).get(_byref_key(candidate["name"], candidate["version"]))
+    if not isinstance(cached, dict):
+        return None
+    if (cached.get("path") == candidate["path"] and cached.get("size") == candidate["size"]
+            and cached.get("mtime") == candidate["mtime"] and valid_sha(cached.get("sha256"))):
+        return cached
+    return None
+
+
+def _artifacts_payload(entries):
+    return json.dumps({"version": 1, "artifacts": entries}, separators=(",", ":")).encode()
+
+
+def _byref_planned(state, candidates):
+    entries, pending = [], False
+    for candidate in candidates:
+        key = _byref_key(candidate["name"], candidate["version"])
+        if _byref_skipped(state, key):
+            continue
+        cached = _byref_record(state, candidate)
+        if cached is None:
+            pending = True
+            continue
+        entries.append({"name": candidate["name"], "version": candidate["version"],
+                        "sha256": cached["sha256"], "size": candidate["size"]})
+    entries.sort(key=lambda item: (item["name"], item["version"]))
+    if entries:
+        digest = hashlib.sha256(_artifacts_payload(entries)).hexdigest()
+        if ((state.get("files") or {}).get("artifacts.json") or {}).get("sha256") != digest:
+            pending = True
+    return entries, pending
+
+
+def _byref_pending(reader, state, features, artifacts, events_bytes=None):
+    if not artifacts or "byref" not in features:
+        return False
+    if events_bytes is None:
+        try:
+            events_bytes = read_file_nofollow(reader.run_dir / "events.jsonl")
+        except OSError:
+            events_bytes = b""
+    return _byref_planned(state, _byref_candidates(events_bytes)[0])[1]
+
+
+def _hash_byref_source(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(65536)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sync_idle(reader, state, source_hash, key=None, features=(), artifacts=False):
     return (state.get("protocol") == 2 and (key is None or state.get("owner") == key)
             and state.get("complete")
             and state.get("source_hash") == source_hash
             and not _lineage_pending(reader, state, _local_lineage(reader, features, state))
+            and not _byref_pending(reader, state, features, artifacts)
             and _effective(reader, reader.meta()) in ("finished", "crashed"))
 
 
@@ -439,7 +537,7 @@ def _snapshot(reader, effective, result):
             candidates.extend(path.iterdir())
     for path in candidates:
         name = path.relative_to(reader.run_dir).as_posix()
-        if not (_ATOMIC.fullmatch(name) or _APPEND.fullmatch(name)):
+        if name == "artifacts.json" or not (_ATOMIC.fullmatch(name) or _APPEND.fullmatch(name)):
             continue
         try:
             with _open_local(path) as handle:
@@ -536,6 +634,98 @@ def _push_lineage(reader, client, state, commit, result, save):
         skip(reason)
 
 
+def _push_byref(reader, client, state, candidates, result, save, sizes, overflow=False):
+    if overflow and not _byref_skipped(state, "overflow"):
+        result.warnings.append("too many by-reference artifacts; extra entries skipped")
+        _remember_skip(state, "byref", "overflow", "too many artifacts")
+        save()
+    if not candidates:
+        return
+
+    def skip(candidate, reason, warning):
+        result.warnings.append(warning)
+        _remember_skip(state, "byref", _byref_key(candidate["name"], candidate["version"]), reason)
+        result.skipped += 1
+        save()
+
+    needed = []
+    for candidate in candidates:
+        key = _byref_key(candidate["name"], candidate["version"])
+        if _byref_skipped(state, key):
+            continue
+        cached = _byref_record(state, candidate)
+        if cached is not None:
+            needed.append((candidate, cached["sha256"]))
+            continue
+        path = candidate["path"]
+        try:
+            info = os.stat(path)
+            if (not stat.S_ISREG(info.st_mode) or info.st_size != candidate["size"]
+                    or info.st_mtime != candidate["mtime"]):
+                raise OSError("source changed or missing")
+            sha = _hash_byref_source(path)
+            again = os.stat(path)
+            if (not stat.S_ISREG(again.st_mode) or again.st_size != candidate["size"]
+                    or again.st_mtime != candidate["mtime"]):
+                raise OSError("source changed or missing")
+        except (OSError, ValueError):
+            skip(candidate, "source changed or missing", f"artifact {key}: source changed or missing")
+            continue
+        needed.append((candidate, sha))
+
+    shas = list(dict.fromkeys(sha for _, sha in needed))
+    missing = set(client.missing(shas) if shas else ())
+    byref = state.get("byref")
+    if not isinstance(byref, dict):
+        byref = {}
+        state["byref"] = byref
+    for candidate, sha in needed:
+        key = _byref_key(candidate["name"], candidate["version"])
+        if sha in missing:
+            try:
+                handle = open(candidate["path"], "rb")
+            except (OSError, ValueError):
+                skip(candidate, "source changed or missing", f"artifact {key}: source changed or missing")
+                continue
+            try:
+                with handle:
+                    client.put_object(sha, handle, candidate["size"])
+            except HTTPError as exc:
+                response = exc.response
+                if response is not None and response.status_code == 422 and _error_detail(response) == "hash mismatch":
+                    skip(candidate, "source changed or missing",
+                         f"artifact {key}: source changed or missing")
+                    continue
+                if response is not None and response.status_code == 413:
+                    skip(candidate, "too large", f"artifact {key}: too large")
+                    continue
+                raise
+            result.objects += 1
+            result.bytes += candidate["size"]
+            missing.discard(sha)
+        byref[key] = {"path": candidate["path"], "size": candidate["size"],
+                      "mtime": candidate["mtime"], "sha256": sha}
+        save()
+
+    entries = _byref_planned(state, candidates)[0]
+    if not entries:
+        return
+    body = _artifacts_payload(entries)
+    digest = hashlib.sha256(body).hexdigest()
+    sizes["artifacts.json"] = len(body)
+    if state["files"].get("artifacts.json", {}).get("sha256") == digest:
+        return
+    try:
+        client.put_file(reader.run_id, "artifacts.json", body)
+    except Conflict as exc:
+        _check_owner(reader, client, exc.payload)
+        raise
+    state["files"]["artifacts.json"] = {"size": len(body), "sha256": digest}
+    result.files += 1
+    result.bytes += len(body)
+    save()
+
+
 def _check_owner(reader, client, payload):
     owner = payload.get("owner")
     if owner and owner != _identity(client)["key"]:
@@ -598,7 +788,7 @@ def _fingerprint_link_error(exc):
             or (isinstance(exc, ValueError) and str(exc).startswith("path escapes store root:")))
 
 
-def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False):
+def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False, artifacts=False):
     fingerprint_available = True
     try:
         source_hash = _source_hash(reader)
@@ -615,8 +805,12 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False):
         source_hash = hashlib.sha256(json.dumps({name: {k: v for k, v in item.items() if k != "data"}
                                                 for name, item in files.items()}, sort_keys=True).encode()).hexdigest()
     state = _host_state(reader, host)
-    features = ("lineage",) if dry_run else _identity(client).get("features", [])
+    features = (["lineage"] + (["byref"] if artifacts else [])) if dry_run else list(
+        _identity(client).get("features") or [])
     lineage_commit = _local_lineage(reader, features, state)
+    events_bytes = files.get("events.jsonl", {}).get("data", b"")
+    byref_candidates, byref_overflow = (
+        _byref_candidates(events_bytes) if artifacts and "byref" in features else ([], False))
 
     def save():
         if not dry_run:
@@ -631,7 +825,8 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False):
         _check_owner(reader, client, state)
     if (state.get("complete") and state.get("source_hash") == source_hash
             and effective in ("finished", "crashed")
-            and not _lineage_pending(reader, state, lineage_commit)):
+            and not _lineage_pending(reader, state, lineage_commit)
+            and not _byref_pending(reader, state, features, artifacts, events_bytes)):
         result.status = "up to date"
         result.complete = True
         if prune and not dry_run and not state.get("pruned"):
@@ -654,6 +849,12 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False):
         result.objects = len(set(hashes) - _skipped_ids(state))
         if _lineage_pending(reader, state, lineage_commit):
             result.files += 1
+        if _byref_planned(state, byref_candidates)[1]:
+            result.files += 1
+        for candidate in byref_candidates:
+            key = _byref_key(candidate["name"], candidate["version"])
+            if not _byref_skipped(state, key) and _byref_record(state, candidate) is None:
+                result.objects += 1
         result.status = "dry-run (would send; objects unchecked)"
         return
 
@@ -799,6 +1000,9 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False):
             for name in atomic_names:
                 atomic(name)
             _push_lineage(reader, client, state, lineage_commit, result, save)
+            if byref_candidates or byref_overflow:
+                _push_byref(reader, client, state, byref_candidates, result, save, sizes,
+                            overflow=byref_overflow)
             # Every non-idle pass commits, even when a previous pass sent all
             # bytes and then failed to commit. Completion requires this success.
             try:
@@ -815,6 +1019,10 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False):
                                 append_file(name)
                             else:
                                 atomic(name)
+                    if "artifacts.json" in names and (byref_candidates or byref_overflow):
+                        state["files"].pop("artifacts.json", None)
+                        _push_byref(reader, client, state, byref_candidates, result, save, sizes,
+                                    overflow=byref_overflow)
                 elif "status" in exc.payload and "meta.json" in files:
                     atomic("meta.json", force=True)
                 else:
@@ -835,7 +1043,8 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False):
     state["source_hash"] = source_hash
     state["complete"] = bool(fingerprint_available and effective in ("finished", "crashed")
                              and _source_hash(reader) == source_hash and not pending
-                             and not _lineage_pending(reader, state, lineage_commit))
+                             and not _lineage_pending(reader, state, lineage_commit)
+                             and not _byref_pending(reader, state, features, artifacts, events_bytes))
     save()
     result.complete = state["complete"]
     result.status = "synced" if result.complete else "partial" if effective in ("finished", "crashed") else "partial (running)"
@@ -1010,7 +1219,7 @@ def _order_runs_lineage(root, run_ids):
     return result
 
 
-def _selected_ids(root, host, explicit, include_all, prune=False, key=None, features=()):
+def _selected_ids(root, host, explicit, include_all, prune=False, key=None, features=(), artifacts=False):
     selected = list(dict.fromkeys(explicit))
     if include_all:
         for meta in list_runs(root):
@@ -1020,7 +1229,8 @@ def _selected_ids(root, host, explicit, include_all, prune=False, key=None, feat
             try:
                 reader = RunReader(root, run_id)
                 state = _host_state(reader, host)
-                if _sync_idle(reader, state, _source_hash(reader), key=key, features=features):
+                if _sync_idle(reader, state, _source_hash(reader), key=key, features=features,
+                              artifacts=artifacts):
                     if not (prune and not state.get("pruned")):
                         continue
             except Exception:
@@ -1034,6 +1244,7 @@ def _follow(args, root, host, api_key):
 
     interval = args.interval if args.interval is not None else FOLLOW_INTERVAL
     prune = getattr(args, "prune", False)
+    artifacts = getattr(args, "artifacts", False)
     run_ids = list(args.run_ids)
     include_all = bool(args.all) or not run_ids
     stop = threading.Event()
@@ -1046,6 +1257,7 @@ def _follow(args, root, host, api_key):
     permanent_ids = set()
     consecutive = 0
     active = None
+    byref_warned = False
     try:
         if threading.current_thread() is threading.main_thread():
             def handle(signum, _frame):
@@ -1087,9 +1299,13 @@ def _follow(args, root, host, api_key):
                     print(f"agenticml sync: {_short_error(exc)}", file=sys.stderr)
                     return 1
             if identity is not None:
+                if artifacts and "byref" not in (identity.get("features") or []) and not byref_warned:
+                    print("server does not support --artifacts; skipping by-reference artifacts",
+                          file=sys.stderr)
+                    byref_warned = True
                 selected = [rid for rid in _selected_ids(
                     root, host, run_ids, include_all, prune=prune, key=identity["key"],
-                    features=identity.get("features", []),
+                    features=identity.get("features", []), artifacts=artifacts,
                 ) if rid not in permanent_ids]
                 failure_log.prune(selected)
                 for run_id in selected:
@@ -1104,7 +1320,7 @@ def _follow(args, root, host, api_key):
                                 saw_running = True
                         except Exception:
                             pass
-                        sync_run(reader, host, client, active, prune=prune)
+                        sync_run(reader, host, client, active, prune=prune, artifacts=artifacts)
                     except SyncStopped:
                         raise
                     except Exception as exc:
@@ -1233,11 +1449,16 @@ def cmd_sync(args):
             client = Client(base_url=host, api_key=api_key, insecure=args.insecure)
             _identity(client)
         prune = getattr(args, "prune", False)
+        artifacts = getattr(args, "artifacts", False)
+        if client is not None and artifacts and "byref" not in (_identity(client).get("features") or []):
+            print("server does not support --artifacts; skipping by-reference artifacts", file=sys.stderr)
         while True:
             failures = 0
             selected = _selected_ids(root, host, args.run_ids, args.all, prune=prune,
                                      key=_identity(client)["key"] if client is not None else None,
-                                     features=_identity(client).get("features", []) if client is not None else ("lineage",))
+                                     features=_identity(client).get("features", []) if client is not None else (
+                                         ["lineage"] + (["byref"] if artifacts else [])),
+                                     artifacts=artifacts)
             failure_log.prune(selected)
             if not selected and args.all:
                 print("up to date", flush=True)
@@ -1252,6 +1473,7 @@ def cmd_sync(args):
                         active,
                         dry_run=args.dry_run,
                         prune=prune,
+                        artifacts=artifacts,
                     )
                 except Exception as exc:
                     active.failed = True

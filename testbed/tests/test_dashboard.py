@@ -256,6 +256,45 @@ def test_selection_bar_and_compare_navigation(page, ui_server, width):
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
 
 
+def test_artifact_download_link_and_mobile_overflow(page, ui_server):
+    long_name = "W" * 160
+    run_id = ui_server.runs["explicit-baseline"]
+
+    def attach_long_artifact(route):
+        path = route.request.url.split("?")[0].rstrip("/")
+        if not path.endswith("/api/runs/" + run_id):
+            route.continue_()
+            return
+        response = route.fetch()
+        data = response.json()
+        if isinstance(data, dict) and isinstance(data.get("artifacts"), list):
+            data = dict(data)
+            data["artifacts"] = list(data["artifacts"]) + [{
+                "name": long_name, "version": 1, "type": "model", "size": 4,
+                "path": "/tmp/" + long_name, "sha256": "b" * 64, "copy": True,
+            }]
+        headers = {key: value for key, value in response.headers.items()
+                   if key.lower() != "content-length"}
+        route.fulfill(status=response.status, headers=headers, json=data)
+
+    page.route("**/api/runs/**", attach_long_artifact)
+    open_run(page, ui_server)
+    artifacts = page.locator('[data-card="Artifacts"]')
+    copied = artifacts.locator("[data-artifact]").filter(has_text="checkpoint:v2")
+    referenced = artifacts.locator("[data-artifact]").filter(has_text="checkpoint:v1")
+    download = copied.get_by_role("link", name="Download")
+    expect(download).to_have_count(1)
+    expect(download).to_have_attribute("download", "model.json")
+    expect(download).to_have_attribute(
+        "href", re.compile(r"/api/objects/[0-9a-f]{64}\?type=application(%2F|/)octet-stream"))
+    expect(referenced.get_by_role("link", name="Download")).to_have_count(0)
+    expect(artifacts).to_contain_text(long_name)
+    page.set_viewport_size({"width": 375, "height": 812})
+    overflow = page.evaluate(
+        "Math.max(document.documentElement.scrollWidth-document.documentElement.clientWidth, document.body.scrollWidth-document.body.clientWidth)")
+    assert overflow <= 0, f"artifact download link overflows horizontally by {overflow}px"
+
+
 def test_run_facts_parameters_environment_artifacts_and_media(page, ui_server):
     open_run(page, ui_server)
     expect(page.locator(".detail > .inline .chip").first).to_have_text("done")
