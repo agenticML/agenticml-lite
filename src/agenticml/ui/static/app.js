@@ -295,6 +295,14 @@ applyTheme();
 // Where this dashboard is served from: always a local store.
 document.querySelector("#host").textContent = `local · ${location.host}`;
 let serverMode = false;
+let serverSession = null;
+function viaLabel(via) {
+  return via === "proxy"
+    ? "Signed in through your identity proxy"
+    : via === "key"
+      ? "admin key"
+      : via || "—";
+}
 fetch("/api/server/session", { credentials: "same-origin" })
   .then(async (response) => {
     let data = null;
@@ -308,13 +316,18 @@ fetch("/api/server/session", { credentials: "same-origin" })
     }
     if (!response.ok || !data) return;
     serverMode = true;
-    document.querySelector("#nav-keys").hidden = false;
+    serverSession = data;
+    document.querySelector("#nav-keys").hidden = !data.can?.own_keys;
+    document.querySelector("#nav-team").hidden = !data.can?.users;
     const box = document.querySelector("#session");
     const label = document.querySelector("#session-label");
-    label.textContent = `Signed in as ${data.key}`;
+    label.textContent = `Signed in as ${data.user} · ${data.role}`;
     box.title = label.textContent;
     box.hidden = false;
-    document.querySelector("#sign-out").onclick = async () => {
+    document.querySelector("#account").hidden = false;
+    const signOut = document.querySelector("#sign-out");
+    signOut.hidden = data.via === "proxy";
+    signOut.onclick = async () => {
       await fetch("/logout", {
         method: "POST",
         credentials: "same-origin",
@@ -322,6 +335,7 @@ fetch("/api/server/session", { credentials: "same-origin" })
       });
       location.assign("/login");
     };
+    document.querySelector("#account").onclick = () => openAccountDialog();
   })
   .catch(() => {});
 document.querySelector("#close-lightbox").onclick = () =>
@@ -352,6 +366,94 @@ function trapTab(host, event) {
     event.preventDefault();
     (event.shiftKey ? targets.at(-1) : targets[0])?.focus();
   }
+}
+function openAccountDialog() {
+  const session = serverSession;
+  if (!session) return;
+  const previous = document.activeElement;
+  const host = el("dialog", { class: "key-dialog", "aria-label": "Account" });
+  const error = el("p", { class: "error", role: "alert", hidden: true });
+  const status = el("p", { class: "muted", role: "status", hidden: true });
+  const current = session.password_set
+    ? el("input", {
+        id: "account-current", class: "field", type: "password",
+        autocomplete: "current-password", required: true,
+      })
+    : null;
+  const next = el("input", {
+    id: "account-new", class: "field", type: "password",
+    minLength: 12, maxLength: 1024, autocomplete: "new-password", required: true,
+  });
+  const confirm = el("input", {
+    id: "account-confirm", class: "field", type: "password",
+    minLength: 12, maxLength: 1024, autocomplete: "new-password", required: true,
+  });
+  const save = el("button", { type: "submit", class: "btn btn-primary", text: "Change password" });
+  const form = el("form", { class: "stack" },
+    current
+      ? el("label", { class: "field-label", htmlFor: current.id, text: "Current password" })
+      : null,
+    current,
+    el("label", { class: "field-label", htmlFor: next.id, text: "New password" }), next,
+    el("label", { class: "field-label", htmlFor: confirm.id, text: "Confirm password" }), confirm,
+    save);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    error.hidden = true;
+    status.hidden = true;
+    if (next.value !== confirm.value) {
+      error.textContent = "Passwords do not match";
+      error.hidden = false;
+      return;
+    }
+    save.disabled = true;
+    try {
+      const response = await fetch("/api/server/account/password", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "X-AgenticML-Request": "1", "Content-Type": "application/json" },
+        body: JSON.stringify(current
+          ? { current: current.value, new: next.value }
+          : { new: next.value }),
+      });
+      const data = await response.json().catch(() => null);
+      if (response.status === 401 && data?.error === "login required") {
+        location.assign("/login");
+        return;
+      }
+      if (!response.ok) throw new Error(
+        (typeof data?.error === "string" && data.error) || `Password change failed (${response.status})`);
+      if (serverSession) serverSession.password_set = true;
+      status.textContent = "Password updated";
+      status.hidden = false;
+      form.reset();
+    } catch (reason) {
+      error.textContent = reason.message;
+      error.hidden = false;
+    } finally {
+      save.disabled = false;
+    }
+  });
+  host.append(
+    el("div", { class: "heading" },
+      el("h2", { text: "Account" }),
+      button("Close", () => host.close(), "secondary")),
+    el("dl", { class: "kv-list identity" },
+      el("div", {}, el("dt", { text: "User" }), el("dd", { text: session.user })),
+      el("div", {}, el("dt", { text: "Role" }), el("dd", { text: session.role })),
+      el("div", {}, el("dt", { text: "Sign-in" }), el("dd", { text: viaLabel(session.via) }))),
+    form, error, status,
+  );
+  host.addEventListener("keydown", (event) => {
+    if (event.key === "Tab") trapTab(host, event);
+  });
+  host.addEventListener("close", () => {
+    host.remove();
+    previous?.isConnected && previous.focus();
+  }, { once: true });
+  document.body.append(host);
+  host.showModal();
+  (current || next).focus();
 }
 // Focus hosts own their keyboard handler so nested focus views close independently.
 function focus(title, subtitle, className = "", onClose = () => {}) {
@@ -860,6 +962,9 @@ async function home(version) {
             onclick: (event) => event.stopPropagation(),
           }),
           el("span", { class: "run-id", text: shortRunId(run.run_id) }),
+          serverMode && run.owner
+            ? el("span", { class: "run-owner", text: run.owner, title: `Owner ${run.owner}` })
+            : null,
         ),
         el("div", {
           class: "run-varied",
@@ -2831,6 +2936,7 @@ function identity(run) {
     {
       "Run id": run.run_id,
       Project: run.project || "No project",
+      ...(serverMode && run.owner ? { Owner: run.owner } : {}),
       Started: date(run.created_at),
       Finished: date(run.finished_at),
       Host: run.hostname || "—",
@@ -2984,6 +3090,9 @@ async function runPage(id, version) {
     title.replaceChildren(
       el("h1", { class: "mono", text: run.name || id }),
       statusChip(run.status, run),
+      serverMode && run.owner
+        ? el("span", { class: "muted run-owner", text: run.owner, title: `Owner ${run.owner}` })
+        : null,
       ...(run.tags || []).map((tag) => chip(tag)),
       parent
         ? el(
@@ -3645,7 +3754,19 @@ async function keysPage(version) {
   };
   cleanup = dispose;
   const content = el("div", { class: "table-scroll" });
-  const columns = ["Name", "Scope", "Prefix", "Created", "Created by", "Last used", "Runs", "Revoke"];
+  const allKeys = Boolean(serverSession?.can?.all_keys);
+  const columns = [
+    ...(allKeys ? ["User"] : []),
+    "Name", "Scope", "Prefix", "Created", "Created by", "Last used", "Runs", "Revoke",
+  ];
+  const usersByName = new Map();
+  const userFilter = allKeys
+    ? el("select", { class: "field", "aria-label": "Filter by user" },
+        el("option", { value: "", text: "All users" }))
+    : null;
+  if (userFilter) userFilter.addEventListener("change", () => refresh().catch((reason) => {
+    if (epoch === version) showError(content, reason);
+  }));
 
   async function request(url, method, body) {
     const response = await fetch(url, {
@@ -3757,12 +3878,33 @@ async function keysPage(version) {
       id: "key-name", class: "field", required: true, maxLength: 64,
       pattern: "[A-Za-z0-9._\\-]{1,64}", autocomplete: "off",
     });
+    const adminOption = el("option", { value: "admin", text: "admin" });
     const scope = el("select", { id: "key-scope", class: "field" },
       el("option", { value: "sync", text: "sync" }),
-      el("option", { value: "admin", text: "admin" }));
+      allKeys ? adminOption : null);
+    const userSelect = allKeys
+      ? el("select", { id: "key-user", class: "field", required: true },
+          ...[...usersByName.values()].map((user) => el("option", {
+            value: user.name, text: `${user.name} · ${user.role}`,
+          })))
+      : null;
+    if (userSelect && serverSession?.user && usersByName.has(serverSession.user))
+      userSelect.value = serverSession.user;
+    const syncAdminOption = () => {
+      if (!allKeys || !userSelect) return;
+      const selected = usersByName.get(userSelect.value);
+      adminOption.disabled = !selected || selected.role !== "admin";
+      if (adminOption.disabled && scope.value === "admin") scope.value = "sync";
+    };
+    if (userSelect) userSelect.addEventListener("change", syncAdminOption);
+    syncAdminOption();
     const create = el("button", { type: "submit", class: "btn btn-primary", text: "Create" });
     const form = el("form", { class: "stack" },
       el("label", { class: "field-label", htmlFor: name.id, text: "Name" }), name,
+      userSelect
+        ? el("label", { class: "field-label", htmlFor: userSelect.id, text: "User" })
+        : null,
+      userSelect,
       el("label", { class: "field-label", htmlFor: scope.id, text: "Scope" }), scope, create);
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -3771,7 +3913,9 @@ async function keysPage(version) {
       error.hidden = true;
       create.disabled = true;
       try {
-        const data = await request("/api/server/keys", "POST", { name: name.value, scope: scope.value });
+        const payload = { name: name.value, scope: scope.value };
+        if (userSelect) payload.user = userSelect.value;
+        const data = await request("/api/server/keys", "POST", payload);
         if (epoch !== version || !host.open) {
           data.key = null;
           if (epoch === version) await refresh();
@@ -3825,9 +3969,32 @@ async function keysPage(version) {
     body.querySelector("button").focus();
   }
 
+  function keyInactiveReason(key) {
+    if (key.active) return "";
+    const user = usersByName.get(key.user);
+    if (!user) return "user is missing";
+    if (user.role === "viewer") return "role viewer cannot sync";
+    if (key.scope === "admin" && user.role !== "admin") return "only admins can use admin keys";
+    return "cannot sync with this key";
+  }
+
   async function refresh() {
     const sequence = ++refreshSequence;
-    const response = await fetch("/api/server/keys", { signal, credentials: "same-origin" });
+    if (allKeys && usersByName.size === 0) {
+      const usersResponse = await fetch("/api/server/users", { signal, credentials: "same-origin" });
+      if (epoch !== version || sequence !== refreshSequence || disposed) return;
+      if (usersResponse.ok) {
+        const usersData = await usersResponse.json().catch(() => null);
+        if (Array.isArray(usersData?.users)) {
+          usersByName.clear();
+          for (const user of usersData.users) {
+            if (user && typeof user.name === "string") usersByName.set(user.name, user);
+          }
+        }
+      }
+    }
+    const query = userFilter?.value ? `?user=${encodeURIComponent(userFilter.value)}` : "";
+    const response = await fetch("/api/server/keys" + query, { signal, credentials: "same-origin" });
     if (epoch !== version || sequence !== refreshSequence || disposed) return;
     if (response.status === 404) {
       dispose();
@@ -3849,10 +4016,29 @@ async function keysPage(version) {
       ["name", "scope", "prefix", "created_at", "created_by"].some((field) => typeof key[field] !== "string") ||
       (key.last_used_at !== null && typeof key.last_used_at !== "string") ||
       (key.runs !== null && (!Number.isInteger(key.runs) || key.runs < 0)) ||
-      typeof key.revocable !== "boolean"))
+      typeof key.revocable !== "boolean" ||
+      (key.user != null && typeof key.user !== "string") ||
+      (key.active != null && typeof key.active !== "boolean")))
       throw new Error(`Could not load keys (${response.status})`);
+    if (userFilter) {
+      const selected = userFilter.value;
+      const names = [...usersByName.keys()];
+      for (const key of data.keys) if (key.user && !names.includes(key.user)) names.push(key.user);
+      names.sort();
+      userFilter.replaceChildren(
+        el("option", { value: "", text: "All users" }),
+        ...names.map((name) => el("option", { value: name, text: name })));
+      userFilter.value = names.includes(selected) || selected === "" ? selected : "";
+    }
     const rows = data.keys.map((key) => {
-      const values = [key.name, key.scope, `${key.prefix}…`, date(key.created_at),
+      const nameCell = el("span", { class: "inline" },
+        el("span", { class: "key-name", text: key.name }),
+        key.active === false
+          ? el("span", { class: "chip warn", text: "inactive", title: keyInactiveReason(key) })
+          : null);
+      const values = [
+        ...(allKeys ? [key.user || "–"] : []),
+        nameCell, key.scope, `${key.prefix}…`, date(key.created_at),
         key.created_by, key.last_used_at == null ? "never" : date(key.last_used_at),
         key.runs == null ? "–" : String(key.runs),
         key.revocable ? button("Revoke", () => revokeKey(key), "secondary") : "–"];
@@ -3867,8 +4053,492 @@ async function keysPage(version) {
 
   const newKeyButton = button("New key", newKey, "primary");
   app.replaceChildren(el("div", { class: "workspace stack" },
-    el("div", { class: "heading" }, el("h1", { text: "Keys" }), newKeyButton),
+    el("div", { class: "heading" },
+      el("h1", { text: "Keys" }),
+      userFilter
+        ? el("div", { class: "runs-filter" },
+            el("span", { class: "field-label", text: "User" }), userFilter)
+        : null,
+      newKeyButton),
     content));
+  try {
+    await refresh();
+  } catch (reason) {
+    dispose();
+    if (epoch === version) cleanup = () => {};
+    throw reason;
+  }
+}
+
+async function teamPage(version) {
+  const signal = controller.signal;
+  let activeDialog;
+  let refreshSequence = 0;
+  let activitySequence = 0;
+  let disposed = false;
+  const closeDialog = () => {
+    const current = activeDialog;
+    if (!current) return;
+    current.wipe();
+    current.host.close();
+  };
+  const restorePage = (event) => {
+    if (event.persisted) closeDialog();
+  };
+  window.addEventListener("pagehide", closeDialog);
+  window.addEventListener("pageshow", restorePage);
+  const dispose = () => {
+    disposed = true;
+    window.removeEventListener("pagehide", closeDialog);
+    window.removeEventListener("pageshow", restorePage);
+    closeDialog();
+  };
+  cleanup = dispose;
+  const content = el("div", { class: "table-scroll" });
+  const activity = el("div", { class: "table-scroll" });
+  const activityStatus = el("div");
+  const columns = ["Name", "Role", "Identity", "Sign-in", "Keys", "Runs", "Actions"];
+  const activityColumns = ["Time", "Actor", "Action", "Target", "Client"];
+  let oldestTs = null;
+  let loadingOlder = false;
+
+  async function request(url, method, body) {
+    const response = await fetch(url, {
+      method,
+      signal,
+      credentials: "same-origin",
+      headers: { "X-AgenticML-Request": "1", "Content-Type": "application/json" },
+      body: body == null ? undefined : JSON.stringify(body),
+    });
+    if (epoch !== version) throw new DOMException("Route changed", "AbortError");
+    if (response.status === 401) {
+      dispose();
+      location.assign("/login");
+      throw new DOMException("Redirecting to login", "AbortError");
+    }
+    const data = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(
+      (typeof data?.error === "string" && data.error) || `Team request failed (${response.status})`);
+    if (data === null || typeof data !== "object" || Array.isArray(data))
+      throw new Error(`Team request failed (${response.status})`);
+    return data;
+  }
+
+  function dialog(title) {
+    let copyTimer;
+    const copies = [];
+    const previous = document.activeElement;
+    const host = el("dialog", { class: "key-dialog", "aria-label": title });
+    const body = el("div", { class: "stack" });
+    const error = el("p", { class: "error", role: "alert", hidden: true });
+    const status = el("span", { class: "key-copy-status", role: "status", "aria-live": "polite" });
+    function wipe() {
+      clearTimeout(copyTimer);
+      const selection = window.getSelection();
+      for (let index = 0; index < (selection?.rangeCount || 0); index++) {
+        if (selection.getRangeAt(index).intersectsNode(host)) {
+          selection.removeAllRanges();
+          break;
+        }
+      }
+      host.querySelectorAll("code").forEach((node) => { node.textContent = ""; });
+      copies.length = 0;
+      host.replaceChildren();
+      if (activeDialog?.host === host) activeDialog = null;
+    }
+    function copyCode(label, code) {
+      const copy = button(label, async () => {
+        try {
+          await navigator.clipboard.writeText(code.textContent);
+          if (!code.isConnected) return;
+          copy.textContent = "Copied";
+        } catch {
+          if (!code.isConnected) return;
+          const range = document.createRange();
+          range.selectNodeContents(code);
+          const selection = window.getSelection();
+          selection.removeAllRanges();
+          selection.addRange(range);
+          copy.textContent = /Mac|iPhone|iPad/.test(navigator.platform)
+            ? "Press ⌘C to copy" : "Press Ctrl+C to copy";
+        }
+        status.textContent = copy.textContent;
+        clearTimeout(copyTimer);
+        copyTimer = setTimeout(() => {
+          copies.forEach(([node, text]) => { node.textContent = text; });
+          status.textContent = "";
+        }, 2000);
+      }, "secondary");
+      copies.push([copy, label]);
+      return copy;
+    }
+    host.append(
+      el("div", { class: "heading" },
+        el("h2", { text: title }),
+        button("Close", () => host.close(), "secondary")),
+      body, error, status,
+    );
+    host.addEventListener("keydown", (event) => {
+      if (event.key === "Tab") trapTab(host, event);
+    });
+    host.addEventListener("close", async () => {
+      wipe();
+      host.remove();
+      if (epoch === version && !disposed) {
+        try {
+          await refresh();
+        } catch (reason) {
+          if (epoch === version) showError(content, reason);
+        }
+        if (epoch === version && !activeDialog)
+          (previous?.isConnected ? previous : addUserButton).focus();
+      }
+    }, { once: true });
+    activeDialog = { host, wipe };
+    app.append(host);
+    return { host, body, error, copyCode, wipe };
+  }
+
+  function failure(error, reason) {
+    if (reason.name === "AbortError") return;
+    error.textContent = reason.message;
+    error.hidden = false;
+  }
+
+  function showInvite(host, body, copyCode, data) {
+    const value = el("code", { class: "key-value", text: data.invite_url });
+    body.replaceChildren(
+      el("p", { text: "This invite link is shown once. They choose their own password." }),
+      value, copyCode("Copy invite link", value),
+      el("p", {
+        class: "muted",
+        text: data.expires_at ? `Expires ${date(data.expires_at)}` : "",
+      }),
+    );
+    body.querySelector("button")?.focus();
+  }
+
+  function presentInvite(data, host, body, copyCode) {
+    if (epoch !== version) return;
+    if (host && host.open && host.isConnected) {
+      showInvite(host, body, copyCode, data);
+      return;
+    }
+    const shown = dialog("Invite link");
+    showInvite(shown.host, shown.body, shown.copyCode, data);
+    shown.host.showModal();
+  }
+
+  function addUser() {
+    const { host, body, error, copyCode } = dialog("Add user");
+    const name = el("input", {
+      id: "user-name", class: "field", required: true, maxLength: 64,
+      pattern: "[A-Za-z0-9._\\-]{1,64}", autocomplete: "off",
+    });
+    const role = el("select", { id: "user-role", class: "field" },
+      el("option", { value: "viewer", text: "viewer" }),
+      el("option", { value: "member", text: "member" }),
+      el("option", { value: "admin", text: "admin" }));
+    role.value = "member";
+    const identity = el("input", {
+      id: "user-identity", class: "field", maxLength: 256, autocomplete: "off",
+    });
+    const create = el("button", { type: "submit", class: "btn btn-primary", text: "Add user" });
+    const form = el("form", { class: "stack" },
+      el("label", { class: "field-label", htmlFor: name.id, text: "Name" }), name,
+      el("label", { class: "field-label", htmlFor: role.id, text: "Role" }), role,
+      el("label", { class: "field-label", htmlFor: identity.id, text: "Identity" }), identity,
+      create);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      name.setCustomValidity(["env", ".", ".."].includes(name.value) ? "Invalid or reserved user name" : "");
+      if (!form.reportValidity()) return;
+      error.hidden = true;
+      create.disabled = true;
+      try {
+        const payload = { name: name.value, role: role.value };
+        if (identity.value) payload.identity = identity.value;
+        const data = await request("/api/server/users", "POST", payload);
+        if (epoch !== version) return;
+        presentInvite(data, host, body, copyCode);
+      } catch (reason) {
+        if (epoch === version && host.open) failure(error, reason);
+        if (reason.name !== "AbortError") create.disabled = false;
+      }
+    });
+    name.addEventListener("input", () => name.setCustomValidity(""));
+    body.append(form);
+    host.showModal();
+    name.focus();
+  }
+
+  function confirmAction(title, text, actionLabel, onConfirm) {
+    const { host, body, error } = dialog(title);
+    const confirm = button(actionLabel, async () => {
+      error.hidden = true;
+      confirm.disabled = true;
+      try {
+        await onConfirm();
+        if (epoch !== version) return;
+        if (host.open) host.close();
+        else await refresh();
+      } catch (reason) {
+        if (epoch === version && host.open) failure(error, reason);
+        if (reason.name !== "AbortError") confirm.disabled = false;
+      }
+    }, "primary");
+    body.append(
+      el("p", { text }),
+      el("div", { class: "inline" }, button("Cancel", () => host.close(), "secondary"), confirm));
+    host.showModal();
+    body.querySelector("button").focus();
+  }
+
+  function removeUser(user) {
+    const keys = user.keys == null ? "unknown number of" : String(user.keys);
+    confirmAction(
+      `Remove ${user.name}?`,
+      `Remove ${user.name}? ${keys} key${user.keys === 1 ? "" : "s"} will be revoked.`,
+      "Remove",
+      async () => {
+        await request(`/api/server/users/${encodeURIComponent(user.name)}`, "DELETE");
+      });
+  }
+
+  async function patchUser(user, payload, { reload = true } = {}) {
+    const data = await request(
+      `/api/server/users/${encodeURIComponent(user.name)}`, "PATCH", payload);
+    if (data.signed_out) {
+      location.assign("/login");
+      return data;
+    }
+    if (data.user && typeof data.user === "object" && !Array.isArray(data.user))
+      Object.assign(user, data.user);
+    if (reload) await refresh();
+    return data;
+  }
+
+  function roleSelect(user) {
+    const select = el("select", {
+      class: "field", "aria-label": `Role for ${user.name}`,
+    },
+      el("option", { value: "viewer", text: "viewer" }),
+      el("option", { value: "member", text: "member" }),
+      el("option", { value: "admin", text: "admin" }));
+    select.value = user.role;
+    select.addEventListener("change", async () => {
+      const next = select.value;
+      if (next === user.role) return;
+      const self = user.name === serverSession?.user;
+      if (self) {
+        const { host, body, error } = dialog("Change your role?");
+        const confirm = button("Change role", async () => {
+          error.hidden = true;
+          confirm.disabled = true;
+          try {
+            await patchUser(user, { role: next });
+          } catch (reason) {
+            select.value = user.role;
+            if (epoch === version && host.open) failure(error, reason);
+            if (reason.name !== "AbortError") confirm.disabled = false;
+          }
+        }, "primary");
+        body.append(
+          el("p", { text: "Changing your own role signs you out if it succeeds." }),
+          el("div", { class: "inline" },
+            button("Cancel", () => {
+              select.value = user.role;
+              host.close();
+            }, "secondary"),
+            confirm));
+        host.addEventListener("close", () => {
+          if (select.value !== user.role && select.isConnected) select.value = user.role;
+        }, { once: true });
+        host.showModal();
+        body.querySelector("button").focus();
+        return;
+      }
+      try {
+        await patchUser(user, { role: next });
+      } catch (reason) {
+        select.value = user.role;
+        if (epoch === version) showError(content, reason);
+      }
+    });
+    return select;
+  }
+
+  function identityField(user) {
+    const input = el("input", {
+      class: "field", value: user.identity || "", maxLength: 256, autocomplete: "off",
+      "aria-label": `Identity for ${user.name}`,
+    });
+    input.addEventListener("change", async () => {
+      const value = input.value.trim() === "" ? null : input.value;
+      if (value === user.identity) return;
+      try {
+        await patchUser(user, { identity: value }, { reload: false });
+        if (input.isConnected) input.value = user.identity || "";
+      } catch (reason) {
+        input.value = user.identity || "";
+        if (epoch === version) showError(content, reason);
+      }
+    });
+    return input;
+  }
+
+  function signInLabel(user) {
+    return user.password_set ? "password" : user.invite_pending ? "invite pending" : "—";
+  }
+
+  async function refresh() {
+    const sequence = ++refreshSequence;
+    const response = await fetch("/api/server/users", { signal, credentials: "same-origin" });
+    if (epoch !== version || sequence !== refreshSequence || disposed) return;
+    if (response.status === 404) {
+      dispose();
+      cleanup = () => {};
+      await home(version);
+      return;
+    }
+    if (response.status === 401) {
+      dispose();
+      location.assign("/login");
+      return;
+    }
+    const data = await response.json().catch(() => null);
+    if (epoch !== version || sequence !== refreshSequence || disposed) return;
+    if (!response.ok) throw new Error(
+      (typeof data?.error === "string" && data.error) || `Could not load users (${response.status})`);
+    if (!Array.isArray(data?.users) || data.users.some((user) =>
+      user === null || typeof user !== "object" || Array.isArray(user) ||
+      typeof user.name !== "string" || typeof user.role !== "string"))
+      throw new Error(`Could not load users (${response.status})`);
+    const rows = data.users.map((user) => {
+      const values = [
+        user.name,
+        roleSelect(user),
+        identityField(user),
+        signInLabel(user),
+        user.keys == null ? "–" : String(user.keys),
+        user.runs == null ? "–" : String(user.runs),
+        el("div", { class: "team-actions" },
+          user.name === data.me ? null : button("Invite link", () => inviteUser(user), "secondary"),
+          button("Remove", () => removeUser(user), "secondary")),
+      ];
+      return el("tr", { role: "row" }, ...values.map((value, index) =>
+        el("td", { role: "cell", "data-label": columns[index] }, value == null ? "–" : value)));
+    });
+    content.replaceChildren(el("table", { class: "keys-table", role: "table", "aria-label": "Users" },
+      el("thead", { role: "rowgroup" }, el("tr", { role: "row" },
+        ...columns.map((text) => el("th", { role: "columnheader", scope: "col", text })))),
+      el("tbody", { role: "rowgroup" }, ...rows)));
+    await refreshActivity(true);
+  }
+
+  function renderActivity(events, append) {
+    const rows = events.map((event) => {
+      const values = [
+        date(event.ts), event.actor || "—", event.action || "—",
+        event.target == null || event.target === "" ? "—" : String(event.target),
+        event.client == null || event.client === "" ? "—" : String(event.client),
+      ];
+      return el("tr", { role: "row" }, ...values.map((value, index) =>
+        el("td", { role: "cell", "data-label": activityColumns[index] }, value)));
+    });
+    if (!append) {
+      activity.replaceChildren(el("table", { class: "keys-table", role: "table", "aria-label": "Activity" },
+        el("thead", { role: "rowgroup" }, el("tr", { role: "row" },
+          ...activityColumns.map((text) => el("th", { role: "columnheader", scope: "col", text })))),
+        el("tbody", { role: "rowgroup" })));
+    }
+    const tbody = activity.querySelector("tbody");
+    if (!tbody) return;
+    tbody.append(...rows);
+    if (events.length) oldestTs = events[events.length - 1].ts;
+  }
+
+  async function refreshActivity(reset) {
+    const limit = 200;
+    if (reset) activitySequence += 1;
+    const sequence = activitySequence;
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (!reset && oldestTs) query.set("before", oldestTs);
+    const response = await fetch(`/api/server/audit?${query}`, { signal, credentials: "same-origin" });
+    if (epoch !== version || disposed || sequence !== activitySequence) return false;
+    if (response.status === 401) {
+      dispose();
+      location.assign("/login");
+      throw new DOMException("Redirecting to login", "AbortError");
+    }
+    if (!response.ok) {
+      showError(activityStatus, new Error(
+        `Could not load activity (${response.status})`));
+      return false;
+    }
+    const data = await response.json().catch(() => null);
+    if (epoch !== version || disposed || sequence !== activitySequence) return false;
+    if (!Array.isArray(data?.events)) {
+      showError(activityStatus, new Error(`Could not load activity (${response.status})`));
+      return false;
+    }
+    activityStatus.replaceChildren();
+    if (reset) oldestTs = null;
+    renderActivity(data.events, !reset);
+    loadOlder.disabled = data.events.length < limit;
+    return true;
+  }
+
+  const loadOlder = button("Load older", async () => {
+    if (loadingOlder || !oldestTs) return;
+    const started = activitySequence;
+    loadingOlder = true;
+    loadOlder.disabled = true;
+    try {
+      const success = await refreshActivity(false);
+      if (!success && epoch === version && activitySequence === started)
+        loadOlder.disabled = false;
+    } catch (reason) {
+      if (reason.name === "AbortError") return;
+      if (epoch === version && activitySequence === started) {
+        showError(activityStatus, reason);
+        loadOlder.disabled = false;
+      }
+    } finally {
+      loadingOlder = false;
+    }
+  }, "secondary");
+
+  function inviteUser(user) {
+    const { host, body, error, copyCode } = dialog(`Invite ${user.name}?`);
+    const confirm = button("Create invite link", async () => {
+      error.hidden = true;
+      confirm.disabled = true;
+      try {
+        const data = await request(
+          `/api/server/users/${encodeURIComponent(user.name)}/invite`, "POST", {});
+        if (epoch !== version) return;
+        presentInvite(data, host, body, copyCode);
+      } catch (reason) {
+        if (epoch === version && host.open) failure(error, reason);
+        if (reason.name !== "AbortError") confirm.disabled = false;
+      }
+    }, "primary");
+    body.append(
+      el("p", { text: "This signs them out and clears their password." }),
+      el("div", { class: "inline" }, button("Cancel", () => host.close(), "secondary"), confirm));
+    host.showModal();
+    body.querySelector("button").focus();
+  }
+
+  const addUserButton = button("Add user", addUser, "primary");
+  app.replaceChildren(el("div", { class: "workspace stack" },
+    el("div", { class: "heading" }, el("h1", { text: "Team" }), addUserButton),
+    content,
+    el("div", { class: "stack" },
+      el("div", { class: "heading" }, el("h2", { text: "Activity" })),
+      activity,
+      el("div", { class: "activity-toolbar" }, loadOlder, activityStatus))));
   try {
     await refresh();
   } catch (reason) {
@@ -3889,6 +4559,7 @@ async function route() {
   try {
     const hash = location.hash.slice(1) || "/";
     if (hash === "/keys") await keysPage(version);
+    else if (hash === "/team") await teamPage(version);
     else if (hash.startsWith("/run/"))
       await runPage(decodeURIComponent(hash.slice(5)), version);
     else if (hash.startsWith("/compare")) {

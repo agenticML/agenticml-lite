@@ -24,7 +24,7 @@ from agenticml.ui.server import (
     _STATIC,
     _reject_nonfinite,
 )
-from . import keyspage
+from . import audit, keyspage, userspage
 from .keys import ClientError, KeyStoreUnavailable, validate_name
 from .users import (
     InviteInvalid, Principal, ScryptUnavailable, UserNameTaken, UserStore,
@@ -441,6 +441,12 @@ class WebAuth:
                 return True
             if path == "/api/server/keys" or (path or "").startswith("/api/server/keys/"):
                 keyspage.handle(self, handler, path)
+                return True
+            if path == "/api/server/users" or (path or "").startswith("/api/server/users/"):
+                userspage.handle(self, handler, path)
+                return True
+            if path == "/api/server/audit":
+                audit.handle(self, handler)
                 return True
             if (path or "").startswith("/api/server/") and path != "/api/server/session":
                 handler.close_connection = True

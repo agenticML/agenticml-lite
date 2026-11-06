@@ -17,6 +17,7 @@ import weakref
 
 from agenticml.store import layout
 from agenticml.ui.server import DashboardServer, _browser_host, _loopback_bind
+from .audit import AuditLog
 from .keys import KeyStore, env_key_looks_weak, validate_env_key
 from .users import UserStore, migrate
 from .webauth import IDENTITY_PRESETS, WebAuth
@@ -165,6 +166,7 @@ class IngestServer(DashboardServer):
         self.tmp_dir = self.data_dir / "server" / "tmp"
         self.keys = KeyStore(self.data_dir / "server", env_key)
         self.users = UserStore(self.data_dir / "server")
+        self.audit = AuditLog(self.data_dir / "server")
         self.public_url = public_url
         self.web = WebAuth(
             self.keys, public_url, users=self.users,
