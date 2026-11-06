@@ -1,4 +1,4 @@
-"""Per-user keys and attribution; real sign-in for non-admins is package 13."""
+"""Per-user keys and attribution through real dashboard sign-in."""
 from contextlib import contextmanager
 import json
 import threading
@@ -14,7 +14,7 @@ from agenticml.store import layout
 from agenticml.store import reader
 from agenticml.store.reader import RunReader, read_remote
 from agenticml.ui import server as ui_server
-from test_server_keys_web import api, call, login, running, server  # noqa: F401 (fixture)
+from test_server_keys_web import api, call, csrf, login, running, server  # noqa: F401 (fixture)
 from test_sync import command, push, state, writer_at
 
 
@@ -39,26 +39,15 @@ def test_permission_helpers(role, own, scope):
         assert error is None
 
 
-def principal_session(server, monkeypatch, user, role):
-    """Create a session using package 11's existing _create_session(record).
-
-    Its _session gate admits only admin keys until package 13. For this one
-    token, bypass that gate in the test; leave _attach to resolve the live
-    member/viewer principal from the real key and user. No production auth
-    code changes. Package 15 repeats these cases through real sign-in.
-    """
+def principal_session(server, user, role):
+    """Create a user and sign in with a password through the HTTP endpoint."""
+    password = "password1234"
     server.web.users.add(user, role=role)
-    record, _ = server.keys.create(user + "-session", user=user)
-    token, entry = server.web._create_session(record)
-    original = server.web._session
-
-    def lookup(handler):
-        if server.web._read_cookie(handler) == token:
-            return entry
-        return original(handler)
-
-    monkeypatch.setattr(server.web, "_session", lookup)
-    return server.web._cookie(token).split(";", 1)[0]
+    server.web.users.set_password(user, password)
+    status, headers, body = call(
+        server, "/login", "POST", json.dumps({"user": user, "password": password}), csrf(server))
+    assert status == 200 and json.loads(body) == {"ok": True, "user": user, "role": role}
+    return headers["Set-Cookie"].split(";", 1)[0]
 
 
 def test_admin_keys_for_users(server):
@@ -82,8 +71,9 @@ def test_admin_keys_for_users(server):
         assert api(server, "/api/server/keys" + query)[0] == 400
 
 
-def test_member_keys(server, monkeypatch):
-    cookie = principal_session(server, monkeypatch, "alice", "member")
+def test_member_keys(server):
+    cookie = principal_session(server, "alice", "member")
+    server.keys.create("alice-session", user="alice")
     status, _, body = api(server, cookie=cookie)
     assert status == 200 and body["user"] == "alice" and body["role"] == "member"
     assert [r["name"] for r in body["keys"]] == ["alice-session"]
@@ -99,9 +89,13 @@ def test_member_keys(server, monkeypatch):
         assert status == 403 and body == {"error": message}
     assert api(server, "/api/server/keys/admin", "DELETE", cookie=cookie)[0] == 404
     assert api(server, "/api/server/keys/laptop", "DELETE", cookie=cookie)[0] == 200
-    status, _, body = api(server, "/api/server/keys/alice-session", "DELETE", cookie=cookie)
-    assert status == 200 and body["signed_out"] is True
+    status, headers, body = api(server, "/api/server/keys/alice-session", "DELETE", cookie=cookie)
+    assert status == 200 and body == {"revoked": "alice-session", "signed_out": False}
+    assert "Set-Cookie" not in headers
     assert server.keys.for_user("alice") == []
+    status, _, body = api(server, "/api/server/session", cookie=cookie)
+    assert status == 200 and body["user"] == "alice" and body["role"] == "member"
+    assert body["via"] == "password" and body["key"] is None
 
 
 @pytest.mark.parametrize("method,path,payload", [
@@ -109,8 +103,8 @@ def test_member_keys(server, monkeypatch):
     ("POST", "/api/server/keys", {"name": "no", "scope": "sync"}),
     ("DELETE", "/api/server/keys/admin", None),
 ])
-def test_viewer_forbidden(server, monkeypatch, method, path, payload):
-    cookie = principal_session(server, monkeypatch, "reader", "viewer")
+def test_viewer_forbidden(server, method, path, payload):
+    cookie = principal_session(server, "reader", "viewer")
     status, _, body = api(server, path, method, payload=payload, cookie=cookie)
     assert status == 403 and body == {"error": "forbidden"}
 
@@ -275,7 +269,7 @@ def test_status_owner_key_fallback_and_unknown_writer(server):
 
 
 def test_member_cannot_revoke_reused_key_name(server, monkeypatch):
-    cookie = principal_session(server, monkeypatch, "alice", "member")
+    cookie = principal_session(server, "alice", "member")
     server.keys.create("laptop", user="alice")
     original = server.keys.revoke
 
@@ -307,8 +301,8 @@ def test_revoke_uses_principal_without_cookie_session(server, monkeypatch):
     assert status == 200 and body == {"revoked": "laptop", "signed_out": False}
 
 
-def test_reused_key_name_counts_are_per_user(server, monkeypatch):
-    cookie = principal_session(server, monkeypatch, "alice", "member")
+def test_reused_key_name_counts_are_per_user(server):
+    cookie = principal_session(server, "alice", "member")
     server.web.users.add("bob")
     server.keys.create("laptop", user="bob")
     # Two former owners of this name must remain separate revoked rows.
@@ -517,8 +511,8 @@ def test_key_api_user_required_message_uses_error_type(server, monkeypatch, erro
 
 
 @pytest.mark.parametrize("own", [True, False])
-def test_member_key_name_unavailable(server, monkeypatch, own):
-    cookie = principal_session(server, monkeypatch, "alice", "member")
+def test_member_key_name_unavailable(server, own):
+    cookie = principal_session(server, "alice", "member")
     server.keys.create("taken", user="alice" if own else "admin")
     status, _, body = api(server, method="POST", cookie=cookie,
                           payload={"name": "taken", "scope": "sync"})
