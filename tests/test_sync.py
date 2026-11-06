@@ -17,6 +17,7 @@ from agenticml import cli
 from agenticml.client import Client, Conflict
 from agenticml.server.app import make_server
 from agenticml.server.keys import KeyStore
+from test_server_ingest import foreign_key
 from agenticml.store import RunReader, RunWriter
 from agenticml.store.gc import run_fingerprint, usage
 from agenticml.store.layout import object_path
@@ -309,7 +310,7 @@ def test_v1_entry_replaced_and_other_host_preserved(remote, tmp_path):
 def test_ownership_failure_does_not_stop_other_runs(remote, tmp_path, capsys):
     writer = writer_at(tmp_path)
     push(remote, writer)
-    _, key = remote[0].keys.create("second")
+    key = foreign_key(remote[0], "second")
     other = writer_at(tmp_path, run_id="other")
     assert command(remote, writer, writer.run_id, other.run_id, key=key) == 1
     out = capsys.readouterr().out
@@ -322,9 +323,9 @@ def test_ownership_recovery_checks_before_objects(remote, tmp_path):
     writer = writer_at(tmp_path)
     push(remote, writer)
     (writer.run_dir / "sync.json").unlink()
-    _, key = remote[0].keys.create("second")
+    key = foreign_key(remote[0], "second")
     with Client(remote[1].base_url, key) as client:
-        with pytest.raises(ValueError, match="belongs to key box"):
+        with pytest.raises(ValueError, match="belongs to key admin"):
             push((remote[0], client), writer)
 
 
@@ -593,7 +594,7 @@ def test_whoami_once_across_multiple_runs_and_watch(remote, tmp_path, monkeypatc
 def test_ownership_with_all_does_not_skip_idle_foreign_run(remote, tmp_path, capsys):
     writer = writer_at(tmp_path)
     push(remote, writer)
-    _, key = remote[0].keys.create("second")
+    key = foreign_key(remote[0], "second")
     assert command(remote, writer, "--all", key=key) == 1
     assert "belongs to key box" in capsys.readouterr().out
 
@@ -681,9 +682,9 @@ def test_failed_ownership_recovery_does_not_save_wrong_owner(remote, tmp_path, c
     assert command(remote, writer, "--reset", writer.run_id) == 0
     path = writer.run_dir / "sync.json"
     before = path.read_bytes()
-    _, key = remote[0].keys.create("second")
+    key = foreign_key(remote[0], "second")
     assert command(remote, writer, writer.run_id, key=key) == 1
-    assert "belongs to key box" in capsys.readouterr().out
+    assert "belongs to key admin" in capsys.readouterr().out
     assert path.read_bytes() == before
     assert command(remote, writer, writer.run_id) == 0
     assert state(remote, writer)["owner"] == "box"

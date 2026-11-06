@@ -1,7 +1,6 @@
 """API keys shared by the running server, CLI, and future key-management UI."""
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import hmac
@@ -17,6 +16,7 @@ import threading
 import time
 
 from agenticml.store import layout
+from . import storeio
 
 logger = logging.getLogger("agenticml.server.keys")
 _NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
@@ -76,10 +76,62 @@ class KeyRecord:
     created_at: str
     created_by: str
     last_used_at: str | None
+    user: str = ""
 
     def to_public(self):
         """Metadata safe for API and CLI output; never includes the hash."""
         return {k: v for k, v in asdict(self).items() if k != "sha256"}
+
+
+_V2_FIELDS = set(KeyRecord.__dataclass_fields__)
+_V1_FIELDS = _V2_FIELDS - {"user"}
+_V1_MESSAGE = (
+    "keys.json is version 1; restore users.json or move users.json away to migrate again"
+)
+
+
+def _parse_keys_object(obj, versions):
+    if not isinstance(obj, dict) or type(obj.get("version")) is not int:
+        raise ValueError("invalid keys.json version")
+    version = obj["version"]
+    if version == 1 and 1 not in versions:
+        raise ValueError(_V1_MESSAGE)
+    if version not in versions:
+        raise ValueError("invalid keys.json version")
+    if not isinstance(obj.get("keys"), list):
+        raise ValueError("invalid keys.json records")
+    records = []
+    names = set()
+    expected = _V1_FIELDS if version == 1 else _V2_FIELDS
+    for row in obj["keys"]:
+        if not isinstance(row, dict) or set(row) != expected:
+            raise ValueError("invalid key record fields")
+        if any(not isinstance(row[k], str) for k in expected - {"last_used_at"}):
+            raise ValueError("invalid key record types")
+        if (not _NAME.fullmatch(row["name"]) or row["name"] == "env"
+                or row["name"] in names or row["scope"] not in ("sync", "admin")
+                or not layout.valid_sha(row["sha256"])
+                or len(row["prefix"]) != 8):
+            raise ValueError("invalid key record")
+        if version == 2 and (not _NAME.fullmatch(row["user"]) or row["user"] in ("env", ".", "..")):
+            raise ValueError("invalid key record")
+        try:
+            layout.parse_timestamp(row["created_at"])
+            if row["last_used_at"] is not None:
+                layout.parse_timestamp(row["last_used_at"])
+        except ArithmeticError as exc:
+            raise ValueError("invalid key record") from exc
+        names.add(row["name"])
+        if version == 1:
+            row = {**row, "user": ""}
+        records.append(KeyRecord(**row))
+    return records
+
+
+def _unavailable(exc, default="could not load keys.json"):
+    if isinstance(exc, ValueError) and str(exc) == _V1_MESSAGE:
+        raise KeyStoreUnavailable(_V1_MESSAGE) from exc
+    raise KeyStoreUnavailable(default) from exc
 
 
 class KeyStore:
@@ -102,13 +154,20 @@ class KeyStore:
         self._touch_error_at = None
         if env_key is not None:
             self._env = KeyRecord("env", "admin", self._hash(env_key), "env",
-                                  layout.format_timestamp(), "env", None)
+                                  layout.format_timestamp(), "env", None, user="env")
 
     @staticmethod
     def _hash(value):
         return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
     def _read(self):
+        return self._load(versions=(2,))
+
+    def _read_v1_or_v2(self):
+        """Accept version 1 or 2. Used only by migrate() and admin.status."""
+        return self._load(versions=(1, 2))
+
+    def _load(self, versions):
         try:
             info = os.stat(self.path, follow_symlinks=False)
         except FileNotFoundError:
@@ -116,32 +175,7 @@ class KeyStore:
         if not stat.S_ISREG(info.st_mode):
             raise ValueError("keys.json is not a regular file")
         obj = json.loads(layout.read_file_nofollow(self.path).decode("utf-8"))
-        if not isinstance(obj, dict) or type(obj.get("version")) is not int or obj["version"] != 1:
-            raise ValueError("invalid keys.json version")
-        if not isinstance(obj.get("keys"), list):
-            raise ValueError("invalid keys.json records")
-        records = []
-        names = set()
-        fields = set(KeyRecord.__dataclass_fields__)
-        for row in obj["keys"]:
-            if not isinstance(row, dict) or set(row) != fields:
-                raise ValueError("invalid key record fields")
-            if any(not isinstance(row[k], str) for k in fields - {"last_used_at"}):
-                raise ValueError("invalid key record types")
-            if (not _NAME.fullmatch(row["name"]) or row["name"] == "env"
-                    or row["name"] in names or row["scope"] not in ("sync", "admin")
-                    or not layout.valid_sha(row["sha256"])
-                    or len(row["prefix"]) != 8):
-                raise ValueError("invalid key record")
-            try:
-                layout.parse_timestamp(row["created_at"])
-                if row["last_used_at"] is not None:
-                    layout.parse_timestamp(row["last_used_at"])
-            except ArithmeticError as exc:
-                raise ValueError("invalid key record") from exc
-            names.add(row["name"])
-            records.append(KeyRecord(**row))
-        return records
+        return _parse_keys_object(obj, versions)
 
     def _maybe_reload(self):
         """Caller holds the cache lock. One error is logged per file change."""
@@ -156,44 +190,25 @@ class KeyStore:
             return
         try:
             self._records = self._read()
-        except (OSError, ValueError, TypeError, RecursionError):
+        except (OSError, ValueError, TypeError, RecursionError) as exc:
             self._records = []
-            logger.error("could not load keys.json; file keys disabled until it changes")
+            if isinstance(exc, ValueError) and str(exc) == _V1_MESSAGE:
+                logger.error("could not load keys.json; %s", exc)
+            else:
+                logger.error("could not load keys.json; file keys disabled until it changes")
         self._signature = signature
 
-    @contextmanager
     def _file_lock(self):
-        try:
-            import fcntl
-        except ImportError as exc:
-            raise ValueError("the server needs POSIX fcntl") from exc
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
-        fd = os.open(self.server_dir / "keys.lock", flags, 0o600)
-        try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise OSError("keys.lock is not a regular file")
-            handle = os.fdopen(fd, "ab")
-        except BaseException:
-            os.close(fd)
-            raise
-        with handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            yield
+        return storeio.exclusive_lock(self.server_dir)
 
     def _write(self, records):
-        tmp = layout.unique_tmp(self.server_dir, ".keys")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
         try:
-            fd = os.open(tmp, flags, 0o600)
-            with os.fdopen(fd, "wb") as handle:
-                data = {"version": 1, "keys": [asdict(record) for record in records]}
-                handle.write(json.dumps(data, indent=2).encode("utf-8") + b"\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp, self.path)
-            layout.fsync_dir(self.server_dir)
+            storeio.write_json(
+                self.server_dir, self.path,
+                {"version": 2, "keys": [asdict(record) for record in records]},
+                ".keys",
+            )
         finally:
-            tmp.unlink(missing_ok=True)
             self._signature = _UNSET
 
     def _write_setup_closed(self):
@@ -271,8 +286,11 @@ class KeyStore:
             finally:
                 file_lock.__exit__(None, None, None)
 
-    def create(self, name, scope="sync", created_by="cli", *, only_if_no_admin=False):
+    def create(self, name, scope="sync", created_by="cli", *, user=None,
+               only_if_no_admin=False):
         """Return (KeyRecord, secret); the secret is never persisted."""
+        from .users import UserNotFound, UserStore
+
         validate_name(name)
         if scope not in ("sync", "admin"):
             raise ClientError("invalid key scope")
@@ -282,15 +300,39 @@ class KeyStore:
             try:
                 records = self._read()
             except (OSError, ValueError, TypeError, RecursionError) as exc:
-                raise KeyStoreUnavailable("could not load keys.json") from exc
+                _unavailable(exc)
             if only_if_no_admin and (self.setup_closed() or self._env is not None
                                      or any(record.scope == "admin" for record in records)):
                 raise SetupClosed("setup closed")
             if any(record.name == name for record in records):
                 raise KeyNameTaken("key name already exists")
+            users_store = UserStore(self.server_dir)
+            try:
+                user_records = users_store._read()
+            except (OSError, ValueError, TypeError, RecursionError) as exc:
+                _unavailable(exc, "could not load users.json")
+            if user is None:
+                if not user_records:
+                    admin = UserStore._new("admin", "admin", None, created_by)
+                    users_store._write([admin])
+                    chosen, chosen_role = admin.name, admin.role
+                elif len(user_records) == 1:
+                    chosen, chosen_role = user_records[0].name, user_records[0].role
+                else:
+                    raise ClientError(
+                        "--user is required when the server has more than one user")
+            else:
+                if not isinstance(user, str):
+                    raise ClientError("invalid user")
+                found = next((item for item in user_records if item.name == user), None)
+                if found is None:
+                    raise UserNotFound("unknown user")
+                chosen, chosen_role = found.name, found.role
+            if scope == "admin" and chosen_role != "admin":
+                raise ClientError("admin keys need an admin user")
             key = "aml_" + secrets.token_urlsafe(32)
             record = KeyRecord(name, scope, self._hash(key), key[:8],
-                               layout.format_timestamp(), created_by, None)
+                               layout.format_timestamp(), created_by, None, user=chosen)
             if scope == "admin":
                 self._write_setup_closed()
             self._write(records + [record])
@@ -305,6 +347,10 @@ class KeyStore:
             self._maybe_reload()
             return self._records[:] + ([self._env] if self._env is not None else [])
 
+    def for_user(self, name):
+        """Return file and env records belonging to ``name``."""
+        return [record for record in self.list() if record.user == name]
+
     def revoke(self, name, *, keep_admin=False):
         """Delete a named file key, returning the removed record or None.
 
@@ -317,7 +363,7 @@ class KeyStore:
             try:
                 records = self._read()
             except (OSError, ValueError, TypeError, RecursionError) as exc:
-                raise KeyStoreUnavailable("could not load keys.json") from exc
+                _unavailable(exc)
             removed = next((record for record in records if record.name == name), None)
             if removed is None:
                 return None

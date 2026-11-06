@@ -266,7 +266,8 @@ def test_session_endpoint_and_local_ui(server, tmp_path):
     assert json.loads(body) == {"error": "login required"}
     status, _, body, _ = authed(server, "/api/server/session")
     assert status == 200
-    assert json.loads(body) == {"server": True, "key": "admin", "scope": "admin"}
+    assert json.loads(body) == {
+        "server": True, "key": "admin", "scope": "admin", "user": "admin", "role": "admin"}
 
     httpd = ui_server.make_server(tmp_path, "127.0.0.1", 0)
     thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
@@ -382,7 +383,8 @@ def test_env_key_signs_in(tmp_path, monkeypatch):
         assert payload == {"ok": True, "key": "env"}
         status, _, body, _ = authed(httpd, "/api/server/session", cookie=hdrs["Set-Cookie"])
         assert status == 200
-        assert json.loads(body) == {"server": True, "key": "env", "scope": "admin"}
+        assert json.loads(body) == {
+            "server": True, "key": "env", "scope": "admin", "user": "env", "role": "admin"}
 
 
 def test_current_matches_name_and_hash(server):

@@ -530,17 +530,30 @@ def cmd_server_up(args):
     return 0
 
 
-def cmd_server_keys(args):
+def _server_data_dir(args):
     from .server.app import resolve_data_dir
+
+    data = resolve_data_dir(args.data)
+    data.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory = data / "server"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("server directory is a symlink or not a directory")
+    return data, directory
+
+
+_MIGRATE_FAILED = "could not migrate keys.json; fix the file and retry"
+
+
+def cmd_server_keys(args):
     from .server.keys import KeyStore, KeyStoreUnavailable
+    from .server.users import migrate
 
     try:
-        data = resolve_data_dir(args.data)
-        data.mkdir(mode=0o700, parents=True, exist_ok=True)
-        directory = data / "server"
-        directory.mkdir(mode=0o700, exist_ok=True)
-        if directory.is_symlink() or not directory.is_dir():
-            raise ValueError("server directory is a symlink or not a directory")
+        data, directory = _server_data_dir(args)
+        if not migrate(data):
+            print(f"agenticml server: {_MIGRATE_FAILED}", file=sys.stderr)
+            return 1
         keys = KeyStore(directory, env_key=None)
         if args.keys_action == "list":
             try:
@@ -548,7 +561,7 @@ def cmd_server_keys(args):
             except ValueError as exc:
                 print(f"agenticml server: warning: {exc}; listing file keys only", file=sys.stderr)
         if args.keys_action == "create":
-            _, key = keys.create(args.name, args.scope)
+            _, key = keys.create(args.name, args.scope, user=args.user)
             print(key)
             print("shown once; store it now", file=sys.stderr)
         elif args.keys_action == "revoke":
@@ -559,9 +572,53 @@ def cmd_server_keys(args):
             if args.json:
                 print(json.dumps(records))
             else:
-                fields = ("name", "scope", "prefix", "created_at", "created_by", "last_used_at")
+                fields = ("name", "scope", "user", "prefix", "created_at", "created_by", "last_used_at")
                 _print_table([list(fields)] + [[str(record[field] or "-") for field in fields]
                                               for record in records])
+    except KeyboardInterrupt:
+        print("stopped")
+        return 0
+    except (OSError, ValueError, OverflowError, KeyStoreUnavailable) as exc:
+        print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_server_users(args):
+    from .server.keys import KeyStore, KeyStoreUnavailable
+    from .server.users import UserStore, migrate
+
+    try:
+        data, directory = _server_data_dir(args)
+        if not migrate(data):
+            print(f"agenticml server: {_MIGRATE_FAILED}", file=sys.stderr)
+            return 1
+        users = UserStore(directory)
+        keys = KeyStore(directory)
+        if args.users_action == "add":
+            users.add(args.name, role=args.role, identity=args.identity,
+                      reclaim_runs=args.reclaim_runs)
+        elif args.users_action == "remove":
+            revoked = users.remove(args.name)
+            print(f"removed {args.name} ({revoked} keys)")
+        elif args.users_action == "set-role":
+            users.set_role(args.name, args.role)
+        elif args.users_action == "set-identity":
+            users.set_identity(args.name, args.identity)
+        else:
+            rows = []
+            for user in users.list():
+                public = user.to_public()
+                public["keys"] = len(keys.for_user(user.name))
+                rows.append(public)
+            if args.json:
+                print(json.dumps(rows))
+            else:
+                fields = ("name", "role", "identity", "keys", "created_at", "created_by")
+                _print_table([list(fields)] + [
+                    [str(row[field] if row[field] not in (None, "") else "-") for field in fields]
+                    for row in rows
+                ])
     except KeyboardInterrupt:
         print("stopped")
         return 0
@@ -1172,10 +1229,38 @@ def main(argv=None):
         if action == "create":
             child.add_argument("--name", required=True)
             child.add_argument("--scope", choices=("sync", "admin"), default="sync")
+            child.add_argument("--user", default=None)
         elif action == "list":
             child.add_argument("--json", action="store_true")
         else:
             child.add_argument("name")
+    p_users = server_sub.add_parser("users", help="Add, list, remove, or change users")
+    users_sub = p_users.add_subparsers(dest="users_action", required=True)
+    p_users_add = users_sub.add_parser("add")
+    p_users_add.add_argument("name")
+    p_users_add.add_argument("--role", choices=("viewer", "member", "admin"), default="member")
+    p_users_add.add_argument("--identity", default=None)
+    p_users_add.add_argument("--reclaim-runs", action="store_true")
+    p_users_add.add_argument("--data", default=None)
+    p_users_add.set_defaults(func=cmd_server_users)
+    p_users_list = users_sub.add_parser("list")
+    p_users_list.add_argument("--json", action="store_true")
+    p_users_list.add_argument("--data", default=None)
+    p_users_list.set_defaults(func=cmd_server_users)
+    p_users_remove = users_sub.add_parser("remove")
+    p_users_remove.add_argument("name")
+    p_users_remove.add_argument("--data", default=None)
+    p_users_remove.set_defaults(func=cmd_server_users)
+    p_users_role = users_sub.add_parser("set-role")
+    p_users_role.add_argument("name")
+    p_users_role.add_argument("role", choices=("viewer", "member", "admin"))
+    p_users_role.add_argument("--data", default=None)
+    p_users_role.set_defaults(func=cmd_server_users)
+    p_users_identity = users_sub.add_parser("set-identity")
+    p_users_identity.add_argument("name")
+    p_users_identity.add_argument("identity", nargs="?", default=None)
+    p_users_identity.add_argument("--data", default=None)
+    p_users_identity.set_defaults(func=cmd_server_users)
 
     p_sync = sub.add_parser("sync", help="Incrementally upload local runs to a server")
     p_sync.add_argument("run_ids", nargs="*", metavar="RUN_ID")

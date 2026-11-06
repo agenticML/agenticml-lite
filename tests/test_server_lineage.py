@@ -16,7 +16,7 @@ from agenticml.server import app
 from agenticml.server import lineage as server_lineage
 from agenticml.store import RunReader, RunWriter
 from agenticml.ui.server import _lineage_changes
-from test_server_ingest import running, request, raw, auth
+from test_server_ingest import running, request, raw, auth, foreign_key
 from test_sync import remote, push, state
 from test_server_web import authed
 
@@ -230,7 +230,7 @@ def test_limits_ownership_and_missing_lineage(remote, snapshots, tmp_path):
     server.limits.lineage_body = 10
     assert raw(server, "PUT", path, auth(server) + [("Content-Length", "11")])[0] == 413
     assert raw(server, "PUT", path, auth(server))[0] == 411
-    other_key = server.keys.create("other")[1]
+    other_key = foreign_key(server)
     for method in ("GET", "PUT"):
         assert request(server, path, method, b"x" if method == "PUT" else None, key=other_key)[0] == 409
         assert request(server, "/v2/runs/unknown/lineage", method, b"x" if method == "PUT" else None)[0] == 404

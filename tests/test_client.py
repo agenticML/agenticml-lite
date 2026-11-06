@@ -101,7 +101,7 @@ def fake_http(handler):
 def test_whoami_sync_and_admin_and_revoked(server):
     with client_for(server) as client:
         assert client.whoami() == {
-            "key": "one", "scope": "sync", "protocol": 2,
+            "key": "one", "scope": "sync", "user": "admin", "role": "admin", "protocol": 2,
             "features": (["lineage"] if server.lineage_enabled else []) + ["byref"],
         }
     _, admin = server.keys.create("boss", "admin")
@@ -164,6 +164,7 @@ def test_round_trip_missing_object_file_append_state_commit(server):
         assert client.append("run-1", "events.jsonl", 0, events) == len(events)
         state = client.run_state("run-1")
         assert state["owner"] == "one"
+        assert state["owner_user"] == "admin"
         assert "meta.json" in state["files"]
         assert "events.jsonl" in state["files"]
         fingerprint = "a" * 64

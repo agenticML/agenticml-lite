@@ -18,6 +18,7 @@ import weakref
 from agenticml.store import layout
 from agenticml.ui.server import DashboardServer, _browser_host, _loopback_bind
 from .keys import KeyStore, env_key_looks_weak, validate_env_key
+from .users import UserStore, migrate
 from .webauth import WebAuth
 
 logger = logging.getLogger("agenticml.server")
@@ -162,8 +163,9 @@ class IngestServer(DashboardServer):
         self.data_dir = Path(data)
         self.tmp_dir = self.data_dir / "server" / "tmp"
         self.keys = KeyStore(self.data_dir / "server", env_key)
+        self.users = UserStore(self.data_dir / "server")
         self.public_url = public_url
-        self.web = WebAuth(self.keys, public_url)
+        self.web = WebAuth(self.keys, public_url, users=self.users)
         self.store_file_mode = 0o666 & ~_read_umask()
         self.limits = Limits()
         self.lineage_enabled = shutil.which("git") is not None
@@ -264,6 +266,7 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
     handle = acquire_server_lock(data / "server")
     try:
         _clean_tmp(data / "server" / "tmp")
+        migrate(data)
         cls = IPv6IngestServer if ":" in host else IngestServer
         server = cls(data, host, port, public_url, env_key)
         server._server_lock = handle

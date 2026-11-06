@@ -78,7 +78,8 @@ def test_clean_reports_and_key_metadata(store, capsys):
     assert row["name"] == "box" and row["scope"] == "sync" and row["runs"] == 2
     stamps = [json.loads(p.read_bytes())["last_sync_at"] for p in (data / "store" / "runs").glob("*/remote.json")]
     assert row["last_sync_at"] == max(stamps)
-    assert set(row) == {"name", "scope", "prefix", "created_at", "last_used_at", "runs", "last_sync_at"}
+    assert set(row) == {"name", "scope", "user", "prefix", "created_at", "last_used_at",
+                        "runs", "last_sync_at"}
     record = KeyStore(data / "server").list()[0]
     for action in ("status", "verify"):
         code, text, err = command(data, action, capsys, as_json=False)

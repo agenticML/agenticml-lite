@@ -15,6 +15,7 @@ import threading
 
 from .app import prepare_data_dir, resolve_data_dir, serve
 from .keys import KeyNameTaken, KeyStore, SetupClosed
+from .users import migrate
 
 _MAC_TAILSCALE = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 _UNIT_NAME = "agenticml-server-up"
@@ -134,6 +135,8 @@ def bootstrap_admin(data, public_url, *, install=False):
     """Create the first admin key if needed; print it once. Returns the data dir."""
     data = resolve_data_dir(data)
     prepare_data_dir(data)
+    if not migrate(data):
+        raise UpError("could not migrate keys.json; fix the file and retry")
     env_key = os.environ.get("AGENTICML_SERVER_KEY")
     keys = KeyStore(data / "server", None if install else env_key)
     if keys.has_admin():

@@ -25,6 +25,7 @@ from agenticml.ui.server import (
 )
 from . import keyspage
 from .keys import ClientError, KeyNameTaken, KeyStoreUnavailable, SetupClosed, validate_name
+from .users import Principal, UserStore, resolve
 
 logger = logging.getLogger("agenticml.server.webauth")
 SESSION_IDLE = 12 * 3600
@@ -185,8 +186,10 @@ _ASSETS = {
 class WebAuth:
     """Owns /login, /logout, /api/server/session, and the session cookie gate."""
 
-    def __init__(self, keys, public_url=None, clock=time.time, throttle_clock=time.monotonic):
+    def __init__(self, keys, public_url=None, clock=time.time, throttle_clock=time.monotonic,
+                 users=None):
         self.keys = keys
+        self.users = users if users is not None else UserStore(keys.server_dir)
         self.public_url = public_url
         self.clock = clock
         self.throttle = LoginThrottle(clock=throttle_clock)
@@ -254,10 +257,9 @@ class WebAuth:
                 self._session_info(handler)
                 return True
             session = self._session(handler)
-            if session is None:
+            if session is None or not self._attach(handler, session):
                 self._refuse(handler, path)
                 return True
-            handler.session = session
             if path == "/api/server/keys" or (path or "").startswith("/api/server/keys/"):
                 keyspage.handle(self, handler, path)
                 return True
@@ -342,7 +344,8 @@ class WebAuth:
                 return None
             name, sha256 = entry["name"], entry["sha256"]
         record = self.keys.current(name, sha256)
-        if record is None or record.scope != "admin":
+        principal = resolve(self.keys, self.users, record)
+        if record is None or record.scope != "admin" or principal is None or principal.role != "admin":
             with self._lock:
                 self._sessions.pop(digest, None)
             return None
@@ -354,11 +357,33 @@ class WebAuth:
                 current["last_seen"] = self.clock()
             return current
 
+    def _attach(self, handler, session, principal=None):
+        """Set handler.session and handler.principal from a valid session.
+
+        Returns False when resolve() is None after _session() succeeded (the
+        key was revoked in between). Drops the session; the caller answers 401.
+        """
+        if principal is None:
+            record = self.keys.current(session["name"], session["sha256"])
+            principal = resolve(self.keys, self.users, record)
+        if principal is None:
+            self._delete_session(handler)
+            return False
+        handler.session = session
+        handler.principal = Principal(
+            user=session.get("user") or principal.user,
+            role=principal.role,
+            via="key",
+            key=session["name"],
+        )
+        return True
+
     def _create_session(self, record):
         token = secrets.token_urlsafe(32)
         digest = hashlib.sha256(token.encode("ascii")).hexdigest()
         now = self.clock()
-        entry = {"name": record.name, "sha256": record.sha256, "created": now, "last_seen": now}
+        entry = {"name": record.name, "sha256": record.sha256, "user": record.user,
+                 "created": now, "last_seen": now}
         with self._lock:
             while len(self._sessions) >= SESSION_CAP:
                 oldest = min(self._sessions, key=lambda key: self._sessions[key]["last_seen"])
@@ -427,7 +452,7 @@ class WebAuth:
                     return
                 self._setup_used = True
             cookie, entry = self._create_session(record)
-            handler.session = entry
+            self._attach(handler, entry, resolve(self.keys, self.users, record))
             handler._json(
                 {"ok": True, "key": name, "value": value, **keyspage.command_host(self, handler)},
                 201, self._headers({"Set-Cookie": self._cookie(cookie)}),
@@ -496,7 +521,8 @@ class WebAuth:
             if not isinstance(payload, dict) or not isinstance(payload.get("key"), str):
                 raise ValueError("invalid login body")
             record = self.keys.verify(payload["key"])
-            if record is None:
+            principal = resolve(self.keys, self.users, record)
+            if record is None or principal is None:
                 logger.info("login failed")
                 outcome = "failed"
                 handler._json({"error": "invalid key"}, 401, self._headers())
@@ -506,10 +532,15 @@ class WebAuth:
                 handler._json(
                     {"error": "this is a sync key; sign in with an admin key"}, 403, self._headers())
                 return
+            if principal.role != "admin":
+                logger.info("login failed")
+                handler._json(
+                    {"error": "this key's user is not an admin"}, 403, self._headers())
+                return
             outcome = "success"
             token, entry = self._create_session(record)
             self.keys.touch(record)
-            handler.session = entry
+            self._attach(handler, entry, principal)
             handler._json(
                 {"ok": True, "key": record.name},
                 headers=self._headers({"Set-Cookie": self._cookie(token)}),
@@ -534,9 +565,15 @@ class WebAuth:
             handler.close_connection = True
             handler._json({"error": "login required"}, 401, self._headers())
             return
-        handler.session = session
+        record = self.keys.current(session["name"], session["sha256"])
+        principal = resolve(self.keys, self.users, record)
+        if not self._attach(handler, session, principal):
+            handler.close_connection = True
+            handler._json({"error": "login required"}, 401, self._headers())
+            return
         handler._json(
-            {"server": True, "key": session["name"], "scope": "admin"},
+            {"server": True, "key": session["name"], "scope": "admin",
+             "user": handler.principal.user, "role": handler.principal.role},
             headers=self._headers(),
         )
 

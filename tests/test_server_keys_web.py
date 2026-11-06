@@ -341,6 +341,7 @@ def test_keys_lock_fifo_fails_promptly(tmp_path, caplog, operation, reader):
             assert results[0].web.setup_token is None
             assert [record.getMessage() for record in caplog.records
                     if record.levelno == logging.ERROR] == [
+                "could not lock keys store; migration skipped",
                 "could not lock keys store; setup disabled until the "
                 "file is fixed and the server restarts"]
             assert not any("/setup?token=" in record.getMessage() for record in caplog.records)
@@ -701,7 +702,8 @@ def test_list_public_fields_runs_order_and_env(tmp_path):
         assert payload["host_source"] == "request"
         rows = payload["keys"]
         assert [row["name"] for row in rows] == ["a-box", "z-box", "env"]
-        fields = {"name", "scope", "prefix", "created_at", "created_by", "last_used_at", "runs", "revocable"}
+        fields = {"name", "scope", "user", "prefix", "created_at", "created_by", "last_used_at",
+                  "runs", "revocable"}
         assert all(set(row) == fields for row in rows)
         assert [row["runs"] for row in rows] == [1, 2, 0]
         assert [row["revocable"] for row in rows] == [True, True, False]
@@ -1097,4 +1099,5 @@ def test_api_key_cli_login_and_sync(server, tmp_path, monkeypatch):
         assert remote.series(name) == source.series(name)
     assert (remote.run_dir / "events.jsonl").read_bytes() == (source.run_dir / "events.jsonl").read_bytes()
     assert (remote.run_dir / "media/index.json").read_bytes() == (source.run_dir / "media/index.json").read_bytes()
-    assert json.loads((remote.run_dir / "remote.json").read_bytes())["owner"] == "box"
+    remote_obj = json.loads((remote.run_dir / "remote.json").read_bytes())
+    assert remote_obj["owner"] == "admin" and remote_obj["owner_key"] == "box"

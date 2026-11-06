@@ -8,8 +8,8 @@ read it at the start of a session (see [AGENTS.md](../../AGENTS.md)). Detailed
 plans live next to it:
 
 - Release 2.0: [on-prem-server-plan.md](on-prem-server-plan.md)
-- Releases 2.1 and 2.2: sketched below; each gets its own plan document before
-  work starts.
+- Release 2.1: sketched below, with package plans in `packages/`.
+- Release 2.2: [on-prem-teams-plan.md](on-prem-teams-plan.md)
 
 ## Product direction
 
@@ -122,13 +122,13 @@ Update the status column in the PR that changes it. Values: `not started`,
 Design constraints carried from 2.0: the server stays standard-library only
 and keeps a single v1 store; team state lives beside it in `<data>/server/`.
 
-| # | Package | Depends on | Size | Plan | Status |
-| --- | --- | --- | --- | --- | --- |
-| 11 † | Users and roles | 2.0 | M | to write | not started |
-| 12 † | Per-user keys and run ownership | 11 | M | to write | not started |
-| 13 † | Dashboard sign-in through a trusted identity proxy | 11 | M | to write | not started |
-| 14 | Audit log | 11 | S | to write | not started |
-| 15 | Team admin page in the dashboard | 11–14 | M | to write | not started |
+| # | Package | Depends on | Coder | Size | Plan | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| 11 † | Users, roles, migration, run ownership by user | 2.1 | Cursor | L | [plan](packages/11-users-and-roles.md) | done (2.2 PR) |
+| 12 † | Per-user key management and sync attribution | 11 | Codex | M | [plan](packages/12-per-user-keys.md) | in progress |
+| 13 † | Dashboard sign-in: passwords, invites, trusted identity proxy | 11 | Cursor | L | [plan](packages/13-sign-in.md) | in progress |
+| 14 | Audit log | 11–13 | Codex | S–M | [plan](packages/14-audit-log.md) | plan ready |
+| 15 | Team admin page, account menu, end-to-end teams test | 11–14 | Cursor | M–L | [plan](packages/15-team-admin-page.md) | plan ready |
 
 - **11 Users and roles.** `users.json` with `admin`, `member` and `viewer`
   roles. `agenticml server users add|list|remove|set-role`. Admin manages users
@@ -152,14 +152,12 @@ and keeps a single v1 store; team state lives beside it in `<data>/server/`.
 - **15 Admin page.** Manage users, roles and keys from the dashboard (admin
   only), with the same CSRF and session rules as notes.
 
-Admin login is redesigned in 2.2 (decided Nov 3, 2026). 2.0 signs in with an
-admin API key as a stopgap. Package 13 replaces that for people; options to
-settle in the 2.2 plan: identity proxy only, built-in username and password
-(scrypt, stdlib), or both. Keys stay for machines.
-
-Before 2.2 starts: decide whether viewers see every project or project-level
-access is needed. Project-level access changes the store reader and is the
-largest open design question for teams.
+Decided Nov 6, 2026 (recommended options, taken for the owner; details in
+the [2.2 plan](on-prem-teams-plan.md#decisions-made-for-the-owner-nov-6-2026)):
+viewers see every project (no project-level access in 2.2), and people sign
+in with a password (scrypt, set from a one-time invite link) or through a
+trusted identity proxy; admin-key login stays as a fallback and keys stay
+for machines.
 
 ### Later (unscheduled)
 
@@ -168,6 +166,8 @@ largest open design question for teams.
 - S3 object backend for `objects/`.
 - Server-side `gc`, retention and per-user quotas.
 - Two-way notes sync between machines and the server.
+- Project-level access (viewers or members limited to some projects).
+  Changes the store reader; deferred from 2.2.
 
 ## Backlog
 
@@ -190,6 +190,27 @@ priority.
     proxy.
   - Done when: a test with two forwarded client addresses behind one proxy
     shows failures from one do not delay the other.
+- **Dashboard "last admin key" rule ignores demoted users** (found in the
+  package 11 review, Nov 6, 2026).
+  - Where: `src/agenticml/server/keys.py` `KeyStore.revoke(keep_admin=True)`.
+  - Problem: the rule counts admin-scope keys, including keys whose user was
+    demoted and can no longer sign in, so the dashboard can revoke the only
+    usable admin key. The CLI still recovers.
+  - Fix: count only admin-scope keys whose user has role `admin` (plus the
+    env key); in 2.2 admins also sign in with passwords, so consider dropping
+    the rule for users who have one.
+  - Done when: a test with one demoted admin key and one live admin key
+    refuses to revoke the live one from the dashboard.
+- **Compatibility owner rule can mislead a 2.0/2.1 client** (package 11
+  review, Nov 6, 2026).
+  - Where: `src/agenticml/server/ingest.py` `compat_owner`.
+  - Problem: old clients compare `owner` with their key name; another user
+    whose user name equals the client's key name looks like the client's own
+    run. The server's 409 stays authoritative, so there is no access, only a
+    confusing client message.
+  - Fix: once every client is 2.2, compare `owner_user` with `whoami.user` in
+    `sync.py` and drop the rule.
+  - Done when: `sync.py` uses `owner_user` and a test covers the collision.
 - **Check `agenticml server up` on a real tailnet** (package 10b caveat,
   Nov 6, 2026).
   - Where: `src/agenticml/server/up.py`; `docs/SERVER.md` quick start.

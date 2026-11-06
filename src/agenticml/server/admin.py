@@ -20,6 +20,7 @@ from agenticml.store.reader import list_runs, read_remote, run_references
 from .app import resolve_data_dir
 from .keys import KeyStore
 from .lineage import _git
+from .users import UserStore, attribution
 
 _STATUSES = ("running", "finished", "crashed", "stale", "unsynced")
 _OBJECT_TMP = re.compile(r"\.(?:tmp|[0-9a-f]{64})\.\d+\.\d+\.[0-9a-f]{8}\.tmp\Z")
@@ -73,12 +74,14 @@ def status(data) -> dict:
     counts = dict.fromkeys(_STATUSES, 0)
     keys = []
     warnings = []
+    keys_loaded = True
     try:
         # Use the authoritative read path: list() deliberately swallows corrupt
         # files for authentication, but an operator needs to see that failure.
-        records = KeyStore(data / "server")._read()
+        records = KeyStore(data / "server")._read_v1_or_v2()
     except (OSError, ValueError, TypeError, RecursionError):
         records = []
+        keys_loaded = False
         warnings.append("could not load server/keys.json; key revocation status is unknown")
     for record in records:
         row = record.to_public()
@@ -86,21 +89,38 @@ def status(data) -> dict:
         row.update(runs=0, last_sync_at=None)
         keys.append(row)
     by_name = {row["name"]: row for row in keys}
+    try:
+        user_records = UserStore(data / "server")._read()
+    except (OSError, ValueError, TypeError, RecursionError):
+        user_records = []
+        warnings.append("could not load server/users.json; user status is unknown")
+    users = [{"name": user.name, "role": user.role, "keys": 0, "runs": 0}
+             for user in user_records]
+    by_user = {row["name"]: row for row in users}
+    for record in records:
+        if record.user in by_user:
+            by_user[record.user]["keys"] += 1
     _safe_path(root, root / "runs")
     runs = list_runs(root)
     for meta in runs:
-        remote = read_remote(root / "runs" / meta["run_id"])
+        directory = root / "runs" / meta["run_id"]
+        remote = read_remote(directory)
         effective = meta["effective_status"] if remote and remote["status"] else "unsynced"
         counts[effective] = counts.get(effective, 0) + 1
-        if not remote or remote["owner"] is None:
+        owner_user, owner_key = attribution(directory)
+        if owner_user is not None and owner_user in by_user:
+            by_user[owner_user]["runs"] += 1
+        if remote is None:
             continue
-        owner = remote["owner"]
+        owner = owner_key or remote["owner"]
+        if owner is None:
+            continue
         if owner not in by_name:
             row = dict(name=owner, scope=None, prefix=None, created_at=None,
                        last_used_at=None, runs=0, last_sync_at=None)
             if owner == "env":
                 row["env"] = True
-            elif not warnings:
+            elif keys_loaded:
                 row["revoked"] = True
             keys.append(row)
             by_name[owner] = row
@@ -126,7 +146,7 @@ def status(data) -> dict:
                 sizes["objects_count"] += 1
     sizes["total"] = sum(sizes[name] for name in ("runs", "objects", "lineage"))
     return {"data": str(data), "runs": {"total": len(runs), "by_status": counts},
-            "sizes": sizes, "keys": keys, "warnings": warnings}
+            "sizes": sizes, "keys": keys, "users": users, "warnings": warnings}
 
 
 def verify(data, *, progress=False) -> dict:
@@ -365,6 +385,10 @@ def format_status(report):
             row["name"] + (" (revoked)" if row.get("revoked") else ""),
             "env" if row.get("env") else row["scope"], row["prefix"],
             str(row["runs"]), row["last_sync_at"], row["last_used_at"], row["created_at"])))
+    lines.append("USER  ROLE  KEYS  RUNS")
+    for row in report.get("users", []):
+        lines.append("  ".join(str(value or "-") for value in (
+            row["name"], row["role"], str(row["keys"]), str(row["runs"]))))
     lines.extend(f"warning: {warning}" for warning in report.get("warnings", []))
     return "\n".join(_text(line) for line in lines)
 

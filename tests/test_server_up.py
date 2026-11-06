@@ -21,6 +21,7 @@ from agenticml import cli
 from agenticml.server import app
 from agenticml.server.keys import KeyStore
 from agenticml.server import up as up_mod
+from test_server_users import write_v1_keys
 from agenticml.server.up import (
     UpError, _ENV_KEY_NOT_INHERITED, _INSTALL_NEEDS_PORT, _NO_ADMIN_TTY,
     _NO_DNS, _NO_FUNNEL, _NO_HTTPS, _NOT_INSTALLED, _NOT_RUNNING,
@@ -461,6 +462,22 @@ def test_install_with_env_key_creates_file_admin(tmp_path, monkeypatch, capsys):
     assert len(keys) == 1
     names = {record.name: record for record in KeyStore(data / "server").list()}
     assert "admin" in names and names["admin"].scope == "admin"
+
+
+def test_install_migrates_v1_admin_and_does_not_create(tmp_path, monkeypatch, capsys):
+    install_fake(tmp_path, monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    data = tmp_path / "data"
+    app.prepare_data_dir(data)
+    write_v1_keys(data / "server" / "keys.json", ["admin"], scopes=["admin"])
+    assert run_up(data, "--install") == 0
+    out = capsys.readouterr().out
+    assert not any(line.startswith("aml_") for line in out.splitlines())
+    keys = KeyStore(data / "server")
+    assert [record.name for record in keys.list()] == ["admin"]
+    assert keys.list()[0].scope == "admin" and keys.list()[0].user == "admin"
+    users = json.loads((data / "server" / "users.json").read_text())
+    assert [row["name"] for row in users["users"]] == ["admin"]
 
 
 def test_install_env_key_silent_when_file_admin_exists(tmp_path, monkeypatch, capsys):

@@ -5,9 +5,9 @@ import json
 import logging
 import os
 
-from agenticml.store.reader import read_remote
 from agenticml.ui.server import _reject_nonfinite
 from .keys import ClientError, KeyNameTaken, KeyStoreUnavailable, LastAdminError, _NAME, validate_name
+from .users import attribution
 
 logger = logging.getLogger("agenticml.server.keyspage")
 RUN_SCAN_MAX = 10000
@@ -67,9 +67,9 @@ def _run_counts(root):
                     return None
                 if not entry.is_dir(follow_symlinks=False):
                     continue
-                remote = read_remote(entry.path)
-                if remote is not None and remote["owner"] is not None:
-                    name = remote["owner"]
+                owner, owner_key = attribution(entry.path)
+                name = owner_key or owner
+                if name is not None:
                     counts[name] = counts.get(name, 0) + 1
     except FileNotFoundError:
         pass
@@ -101,7 +101,11 @@ def handle(webauth, handler, path):
             if not isinstance(scope, str) or scope not in ("sync", "admin"):
                 raise ClientError("invalid key scope")
             try:
-                record, value = webauth.keys.create(name, scope, created_by=handler.session["name"])
+                actor = handler.principal.user
+                # The env user is not stored; fall through to the default-user rule.
+                key_user = None if actor == "env" else actor
+                record, value = webauth.keys.create(
+                    name, scope, created_by=actor, user=key_user)
             except KeyNameTaken:
                 handler._json({"error": "key name already exists"}, 409)
                 return
