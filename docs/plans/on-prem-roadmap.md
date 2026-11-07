@@ -10,18 +10,24 @@ plans live next to it:
 - Release 2.0: [on-prem-server-plan.md](on-prem-server-plan.md)
 - Release 2.1: sketched below, with package plans in `packages/`.
 - Release 2.2: [on-prem-teams-plan.md](on-prem-teams-plan.md)
+- Release 3.0: [on-prem-3.0-plan.md](on-prem-3.0-plan.md)
 
 ## Product direction
 
-- AgenticML runs entirely on the customer's own machines. There is no vendor
-  backend.
+- One server codebase, two ways to run it (changed Nov 7, 2026, for 3.0):
+  - **Self-hosted:** customers run the open-source server on their own
+    machines, with nothing sent to us.
+  - **Hosted:** we run the same server on AWS on one hostname; each customer
+    is a workspace, like agenticml-server. We hold their data, including
+    code diffs. It replaces agenticml-server.
 - Everything is open source under MIT in `agenticML/agenticml-lite`, including
-  the server and the team features. If there is revenue, it comes from support
-  or managed installs, not closed code.
+  the server and the team features. Revenue comes from the hosted service,
+  support and managed installs, not closed code.
 - The local workflow (training plus `agenticml ui`) is never broken to make
-  the server work.
-- Storage stays a plain v1 store on disk until a release needs more than one
-  server process.
+  the server work. The SDK and the local v1 store do not change.
+- From 3.0, server state lives in a database (SQLite self-hosted, Postgres
+  hosted); run files stay v1 files and metrics stay out of the database
+  except for one summary row per run and metric.
 
 ## Releases
 
@@ -30,6 +36,7 @@ plans live next to it:
 | **2.0** | Self-hosted server, single user | Test CI, server ingest, protocol v2 sync, shared dashboard with key login and key issuing, `sync --follow`, systemd units and server guide (PyPI only; no container image) | Release checklist in the 2.0 plan, section 8 |
 | **2.1** | Full fidelity | Lineage code diffs on the server, by-reference artifacts, EFS performance check, operator tooling | A run synced to the server is indistinguishable from the local one in the dashboard, apart from notes |
 | **2.2** | Teams | Users and roles, per-user keys, dashboard sign-in through a trusted identity proxy, audit log | Two users with different roles share one server, each with the access their role allows, and every write is attributed |
+| **3.0** | Database storage, workspaces and hosted service | Server state in SQLite or Postgres, workspaces with accounts and memberships on one hostname, Firebase sign-in and self-serve sign-up with free limits, many server processes, S3 objects, metric summaries, AWS deployment, agenticml-server retired | Exit criteria 1–6 in the [3.0 plan](on-prem-3.0-plan.md) |
 | Later | Scale and lifecycle | Unscheduled; see below | – |
 
 Decision (Nov 5, 2026): the server ships only as the `agenticml-lite`
@@ -37,6 +44,10 @@ package on PyPI and runs as `agenticml server serve`, typically under
 systemd behind a TLS proxy. The Docker image, compose file, ECS/Terraform
 example and image workflow added in package 6 were removed
 ([plan](packages/remove-docker-deployment.md)).
+
+Amended (Nov 7, 2026, decision D6 in the 3.0 plan):
+customers still install from PyPI. Our hosted service is built from a
+Dockerfile in `deploy/aws/` into our private ECR; no image is published.
 
 ## Status
 
@@ -159,6 +170,60 @@ in with a password (scrypt, set from a one-time invite link) or through a
 trusted identity proxy; admin-key login stays as a fallback and keys stay
 for machines.
 
+### 3.0: database storage, workspaces and hosted service
+
+Approved by the owner on Nov 7, 2026: the [3.0 plan](on-prem-3.0-plan.md)
+and decisions D1–D9. Each package plan is written before its package
+starts. Order:
+16 → 17 → 18, then 18b and 21 in parallel, then 18c → 19 → 20; 22 and 23
+after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
+
+| # | Package | Depends on | Coder | Size | Plan | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| 16 † | Database layer, SQLite backend, migrations; users, keys, sessions, throttle, audit in tables | 2.2 | Codex | L | – | not started |
+| 17 † | Runs, sync state and notes in the database; append crash safety; run list from the database | 16 | Cursor | L | – | not started |
+| 18 † | Workspaces and accounts: memberships, workspace-bound keys, `/w/<slug>` routes, switcher, server-admin commands, isolation suite | 17 | Codex | L | – | not started |
+| 18b † | Firebase sign-in for the hosted service | 18 | Cursor | M | – | not started |
+| 18c † | Self-serve sign-up and usage limits (free plan: storage, uploads, requests, people) | 18b | Codex | M | – | not started |
+| 19 † | Postgres backend, row-level security, CI on both backends | 18 | Cursor | M | – | not started |
+| 20 † | Many server processes: database locks, shared throttle and sessions | 19 | Cursor | M | – | not started |
+| 21 | S3 object backend | 18 | Codex | M | – | not started |
+| 22 | Metric summaries; sort and filter runs by metric | 17, 18 | Cursor | M | – | not started |
+| 23 | Operator commands: 2.x conversion, `server backup`, `status`/`verify` on the database | 18 | Codex | S–M | – | not started |
+| 24 | AWS hosted deployment (Dockerfile, Terraform, deploy workflow, runbook, real-EFS benchmark) | 18c, 19, 20, 21 | Codex; owner runs it | M | – | not started |
+| 25 | Docs, threat model, version 3.0.0 | 16–24 | Codex; prose Antigravity | M | – | not started |
+| 26 | Retire agenticml-server | 24 live | Owner | S | – | not started |
+
+- **16–17** move everything the server keeps outside run files into tables
+  behind one repository layer, with SQLite (standard library) as the
+  self-hosted backend. The database records how many bytes of each run file
+  are committed; an append truncates any crash tail, writes, fsyncs and
+  commits in one transaction.
+- **18** adds workspaces with agenticml-server's model and membership
+  checks: one global account per person, roles `owner`, `admin`, `member`,
+  `viewer` per workspace, keys bound to one workspace,
+  dashboard URLs `/w/<slug>/...` (the workspace always comes from the URL
+  or the key, never from a "current workspace"), and a switcher.
+  Self-hosted starts with one `default` workspace. Per-workspace files and
+  object dedupe; a test for every route that a non-member cannot see or
+  detect another workspace.
+- **18b** signs people in to the hosted service with Firebase, as
+  agenticml-server does. Firebase proves who someone is; 18's membership
+  check still decides which workspaces they can open. Self-hosted keeps
+  2.2 sign-in.
+- **18c** opens the hosted service to self-serve sign-up (owner's choice,
+  Nov 7, 2026): a verified email gets one free workspace with limits on
+  storage, uploads per day, requests per minute and people. Server admins
+  see usage and raise a workspace's limits by hand until billing exists.
+  Self-hosted servers keep sign-up off and have no limits by default.
+- **19–21** make the hosted mode: Postgres with row-level security as a
+  second guard, more than one server process, and objects in S3.
+- **22** stores last/min/max/count per run and metric at ingest, so the
+  runs list sorts and filters by metric without reading files.
+- **24** stands the service up in our AWS account (about $120/month for all
+  workspaces together; see the plan). **26** shuts down agenticml-server,
+  which has no customers, after 24 is live.
+
 ### Maintenance fixes
 
 - Empty object and lineage upload framing: [plan](packages/fix-empty-uploads.md),
@@ -169,13 +234,20 @@ for machines.
 
 ### Later (unscheduled)
 
-- More than one server process (high availability). Needs a shared metadata
-  store or an object store; the single-writer lock stays until then.
-- S3 object backend for `objects/`.
+- (More than one server process and the S3 object backend moved to 3.0.)
+- Billing and paid plans; email delivery for invites (after 3.0).
+- Enterprise SSO per workspace (after 3.0).
+- Abuse controls if needed: Firebase App Check, disposable-email
+  blocklist, removal of long-inactive free workspaces.
+- Run files on S3 instead of EFS, if the 3.0 EFS numbers call for it.
+- agenticml-server features not ported in 3.0 (decision D3): experiments and
+  hypotheses, architectures / model design, AI threads, datasets, cost and
+  budget, cloud connections.
 - Server-side `gc`, retention and per-user quotas.
 - Two-way notes sync between machines and the server.
 - Project-level access (viewers or members limited to some projects).
-  Changes the store reader; deferred from 2.2.
+  Deferred from 2.2; 3.0 workspaces cover the common case (separate teams
+  get separate workspaces).
 
 ## Backlog
 
@@ -225,3 +297,4 @@ priority.
   - Done when: `docs/SERVER.md` shows real-EFS numbers for 1 and 8 clients,
     labelled as such with mount details, and the recommendations are
     confirmed or updated.
+  - Scheduled: done as part of 3.0 package 24, on the hosted stack's EFS.
