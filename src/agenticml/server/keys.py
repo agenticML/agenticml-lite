@@ -381,9 +381,26 @@ class KeyStore:
             if removed is None or (expected is not None and (
                     removed.sha256 != expected.sha256 or removed.user != expected.user)):
                 return None
-            admins = sum(record.scope == "admin" for record in records) + (self._env is not None)
-            if keep_admin and removed.scope == "admin" and admins <= 1:
-                raise LastAdminError("last admin key; create another admin key first, or use the CLI")
+            if keep_admin and removed.scope == "admin":
+                from .users import UserStore
+                try:
+                    user_records = UserStore(self.server_dir)._read()
+                except (OSError, ValueError, TypeError, RecursionError) as exc:
+                    _unavailable(exc, "could not load users.json")
+                # Missing or empty users.json cannot prove any file key is
+                # still a usable admin; fail closed instead of revoking.
+                if not user_records:
+                    raise KeyStoreUnavailable("could not load users.json")
+                admin_users = {user.name for user in user_records if user.role == "admin"}
+                usable = removed.user in admin_users
+                admins = (
+                    sum(record.scope == "admin" and record.user in admin_users
+                        for record in records)
+                    + (self._env is not None)
+                )
+                if usable and admins <= 1:
+                    raise LastAdminError(
+                        "last admin key; create another admin key first, or use the CLI")
             remaining = [record for record in records if record.name != name]
             self._write(remaining)
             return removed

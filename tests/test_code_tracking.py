@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -14,6 +15,7 @@ from agenticml.code_tracking import (
     DEFAULT_MAX_FILE_BYTES,
     DEFAULT_MAX_TOTAL_BYTES,
     RuntimeFileCollector,
+    _is_store_artifact,
     compute_snapshot_hash,
     default_run_name,
     find_repo_root,
@@ -335,3 +337,287 @@ def test_runtime_collector_excludes_agenticml_package(tmp_path, monkeypatch):
     finally:
         sys.modules.pop(loaded.__name__, None)
         _agenticml_package_dir.cache_clear()
+
+
+def _code_event_paths(events_path: Path) -> list[str]:
+    paths = []
+    for line in events_path.read_text(encoding="utf-8").splitlines():
+        if not line:
+            continue
+        event = json.loads(line)
+        if event.get("kind") != "code":
+            continue
+        for entry in event.get("manifest") or []:
+            if isinstance(entry, dict) and isinstance(entry.get("path"), str):
+                paths.append(entry["path"])
+    return paths
+
+
+def _under_store(relative: str, project: Path, store: Path) -> bool:
+    try:
+        (project / relative).resolve().relative_to(store.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _store_artifact_path(relative: str) -> bool:
+    root = Path("/agenticml-store")
+    return _is_store_artifact(root / relative, root)
+
+
+def test_runtime_collector_excludes_store_artifacts_not_project_at_store_root(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n")
+    train = tmp_path / "train.py"
+    train.write_text("print('train')\n")
+    settings = tmp_path / "settings.yaml"
+    settings.write_text("epochs: 1\n")
+    run_id = "20240101T120000-abcd1234"
+    events = tmp_path / "runs" / run_id / "events.jsonl"
+    events.parent.mkdir(parents=True)
+    events.write_text("{}\n")
+    shard = tmp_path / "objects" / "ab" / ("a" * 64)
+    shard.parent.mkdir(parents=True)
+    shard.write_bytes(b"blob")
+    object_tmp = tmp_path / "objects" / ".tmp.1.2.abcd1234.tmp"
+    object_tmp.write_text("tmp\n")
+    lineage_head = tmp_path / "lineage" / "demo-abcd1234.git" / "HEAD"
+    lineage_head.parent.mkdir(parents=True)
+    lineage_head.write_text("ref: refs/heads/main\n")
+    lineage_lock = tmp_path / "lineage" / "demo-abcd1234.git.lock"
+    lineage_lock.write_text("lock\n")
+    lineage_agent_lock = tmp_path / "lineage" / "agenticml.lock"
+    lineage_agent_lock.write_text("lock\n")
+    worktree_file = tmp_path / "worktrees" / "demo-abcd1234" / run_id / "checked_out.py"
+    worktree_file.parent.mkdir(parents=True)
+    worktree_file.write_text("x = 1\n")
+    usage = tmp_path / "usage.json"
+    usage.write_text("{}\n")
+    tmp = tmp_path / ".usage.json.1.2.abcd1234.tmp"
+    tmp.write_text("tmp\n")
+
+    collector = RuntimeFileCollector(entrypoint=train, store_root=tmp_path)
+    settings.read_text()
+    events.read_text()
+    shard.read_bytes()
+    object_tmp.read_text()
+    lineage_head.read_text()
+    lineage_lock.read_text()
+    lineage_agent_lock.read_text()
+    worktree_file.read_text()
+    usage.read_text()
+    tmp.read_text()
+    _manifest, files = collector.close()
+    paths = {item.relative_path for item in files}
+    assert "train.py" in paths
+    assert "settings.yaml" in paths
+    assert "usage.json" not in paths
+    assert tmp.name not in paths
+    assert f"runs/{run_id}/events.jsonl" not in paths
+    assert f"objects/ab/{'a' * 64}" not in paths
+    assert "objects/.tmp.1.2.abcd1234.tmp" not in paths
+    assert "lineage/demo-abcd1234.git/HEAD" not in paths
+    assert "lineage/demo-abcd1234.git.lock" not in paths
+    assert "lineage/agenticml.lock" not in paths
+    assert f"worktrees/demo-abcd1234/{run_id}/checked_out.py" not in paths
+    assert not any(_store_artifact_path(path) for path in paths)
+
+
+def test_runtime_collector_tracks_project_files_sharing_store_dir_names(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n")
+    train = tmp_path / "train.py"
+    train.write_text("print('train')\n")
+    app = tmp_path / "server" / "app.py"
+    app.parent.mkdir()
+    app.write_text("APP = 1\n")
+    config = tmp_path / "runs" / "config.yaml"
+    config.parent.mkdir()
+    config.write_text("epochs: 1\n")
+    readme = tmp_path / "objects" / "readme.txt"
+    readme.parent.mkdir()
+    readme.write_text("notes\n")
+    run_id = "20240101T120000-abcd1234"
+    events = tmp_path / "runs" / run_id / "events.jsonl"
+    events.parent.mkdir()
+    events.write_text("{}\n")
+
+    loaded = types.ModuleType("project_server_app")
+    loaded.__file__ = str(app)
+    sys.modules[loaded.__name__] = loaded
+    try:
+        collector = RuntimeFileCollector(entrypoint=train, store_root=tmp_path)
+        app.read_text()
+        config.read_text()
+        readme.read_text()
+        events.read_text()
+        _manifest, files = collector.close()
+    finally:
+        sys.modules.pop(loaded.__name__, None)
+
+    paths = {item.relative_path: item.source for item in files}
+    assert "train.py" in paths
+    assert paths["server/app.py"] in {"runtime_import", "runtime_read"}
+    assert paths["runs/config.yaml"] == "runtime_read"
+    assert paths["objects/readme.txt"] == "runtime_read"
+    assert f"runs/{run_id}/events.jsonl" not in paths
+
+
+def test_runtime_collector_keeps_project_when_store_is_ancestor(tmp_path):
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "pyproject.toml").write_text("[project]\nname = 'demo'\n")
+    train = project / "train.py"
+    train.write_text("print('train')\n")
+    lib = project / "lib.py"
+    lib.write_text("x = 1\n")
+
+    collector = RuntimeFileCollector(entrypoint=train, store_root=tmp_path)
+    lib.read_text()
+    _manifest, files = collector.close()
+    paths = {item.relative_path for item in files}
+    assert "train.py" in paths
+    assert "lib.py" in paths
+
+
+def test_run_does_not_track_store_files_inside_project(tmp_path, monkeypatch):
+    from agenticml.run import Run
+    from agenticml.store.reader import RunReader
+
+    (tmp_path / ".git").mkdir()
+    train = tmp_path / "train.py"
+    train.write_text("print('train')\n")
+    settings = tmp_path / "settings.yaml"
+    settings.write_text("epochs: 1\n")
+    store = tmp_path / "agenticml"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", [str(train)])
+
+    with Run(
+        "p", "n", capture_env=False, system_metrics=False, auto_track=False, lineage=False,
+    ) as run:
+        settings.read_text()
+        run.log({"loss": 0.1})
+
+    assert run.root == store.resolve()
+    reader = RunReader(run.root, run.run_id)
+    manifest_paths = [entry["path"] for entry in reader.code_manifest()]
+    event_paths = _code_event_paths(run.root / "runs" / run.run_id / "events.jsonl")
+    assert "train.py" in manifest_paths
+    assert "settings.yaml" in manifest_paths
+    assert not any(_under_store(path, tmp_path, store) for path in manifest_paths)
+    assert not any(_under_store(path, tmp_path, store) for path in event_paths)
+
+
+def test_run_tracks_project_files_when_store_is_outside(tmp_path, monkeypatch):
+    from agenticml.run import Run
+    from agenticml.store.reader import RunReader
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".git").mkdir()
+    train = project / "train.py"
+    train.write_text("print('train')\n")
+    settings = project / "settings.yaml"
+    settings.write_text("epochs: 1\n")
+    store = tmp_path / "store"
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(sys, "argv", [str(train)])
+
+    with Run(
+        "p", "n", dir=store, capture_env=False, system_metrics=False,
+        auto_track=False, lineage=False,
+    ) as run:
+        settings.read_text()
+        run.log({"loss": 0.1})
+
+    assert run.root == store.resolve()
+    reader = RunReader(run.root, run.run_id)
+    manifest_paths = [entry["path"] for entry in reader.code_manifest()]
+    event_paths = _code_event_paths(run.root / "runs" / run.run_id / "events.jsonl")
+    assert "train.py" in manifest_paths
+    assert "settings.yaml" in manifest_paths
+    assert not any(_under_store(path, project, store) for path in manifest_paths)
+    assert not any(_under_store(path, project, store) for path in event_paths)
+
+
+def test_run_tracks_project_files_when_store_is_project_root(tmp_path, monkeypatch):
+    from agenticml.run import Run
+    from agenticml.store.reader import RunReader
+
+    (tmp_path / ".git").mkdir()
+    train = tmp_path / "train.py"
+    train.write_text("print('train')\n")
+    settings = tmp_path / "settings.yaml"
+    settings.write_text("epochs: 1\n")
+    app = tmp_path / "server" / "app.py"
+    app.parent.mkdir()
+    app.write_text("APP = 1\n")
+    config = tmp_path / "runs" / "config.yaml"
+    config.parent.mkdir()
+    config.write_text("epochs: 1\n")
+    readme = tmp_path / "objects" / "readme.txt"
+    readme.parent.mkdir()
+    readme.write_text("notes\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", [str(train)])
+
+    loaded = types.ModuleType("project_server_app_run")
+    loaded.__file__ = str(app)
+    sys.modules[loaded.__name__] = loaded
+    try:
+        with Run(
+            "p", "n", dir=".", capture_env=False, system_metrics=False,
+            auto_track=False, lineage=False,
+        ) as run:
+            settings.read_text()
+            app.read_text()
+            config.read_text()
+            readme.read_text()
+            run.log({"loss": 0.1})
+            (run.root / "runs" / run.run_id / "events.jsonl").read_text()
+    finally:
+        sys.modules.pop(loaded.__name__, None)
+
+    assert run.root == tmp_path.resolve()
+    reader = RunReader(run.root, run.run_id)
+    manifest_paths = [entry["path"] for entry in reader.code_manifest()]
+    event_paths = _code_event_paths(run.root / "runs" / run.run_id / "events.jsonl")
+    assert "train.py" in manifest_paths
+    assert "settings.yaml" in manifest_paths
+    assert "server/app.py" in manifest_paths
+    assert "runs/config.yaml" in manifest_paths
+    assert "objects/readme.txt" in manifest_paths
+    assert f"runs/{run.run_id}/events.jsonl" not in manifest_paths
+    assert not any(_store_artifact_path(path) for path in manifest_paths)
+    assert not any(_store_artifact_path(path) for path in event_paths)
+
+
+def test_run_tracks_project_files_when_store_is_parent(tmp_path, monkeypatch):
+    from agenticml.run import Run
+    from agenticml.store.reader import RunReader
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / ".git").mkdir()
+    train = project / "train.py"
+    train.write_text("print('train')\n")
+    settings = project / "settings.yaml"
+    settings.write_text("epochs: 1\n")
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(sys, "argv", [str(train)])
+
+    with Run(
+        "p", "n", dir=tmp_path, capture_env=False, system_metrics=False,
+        auto_track=False, lineage=False,
+    ) as run:
+        settings.read_text()
+        run.log({"loss": 0.1})
+
+    assert run.root == tmp_path.resolve()
+    reader = RunReader(run.root, run.run_id)
+    manifest_paths = [entry["path"] for entry in reader.code_manifest()]
+    event_paths = _code_event_paths(run.root / "runs" / run.run_id / "events.jsonl")
+    assert "train.py" in manifest_paths
+    assert "settings.yaml" in manifest_paths
+    assert not any(_store_artifact_path(path) for path in manifest_paths)
+    assert not any(_store_artifact_path(path) for path in event_paths)

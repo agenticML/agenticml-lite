@@ -20,6 +20,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from .ignore import IgnoreMatcher
+from .store.layout import valid_run_id
 
 logger = logging.getLogger("agenticml.code")
 
@@ -60,6 +61,15 @@ IGNORE_FILE_NAMES = (".gitignore", ".agenticmlignore")
 # don't sneak into the snapshot.
 DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MB per file
 DEFAULT_MAX_TOTAL_BYTES = 100 * 1024 * 1024  # 100 MB total
+
+# Store-owned artifacts excluded from runtime tracking. Match on-disk shapes
+# rather than bare directory names so a project package named server/, or a
+# file such as runs/config.yaml, is still tracked when the store is the
+# project root. Server state lives beside the store in <data>/server/, not
+# inside it. Top-level state is usage.json and layout.unique_tmp names.
+_STORE_ROOT_FILES = frozenset({"usage.json"})
+_STORE_TMP_RE = re.compile(r"^\..+\.\d+\.\d+\.[0-9a-f]{8}\.tmp$")
+_OBJECT_SHARD_RE = re.compile(r"^[0-9a-f]{2}$")
 
 
 @dataclass
@@ -164,6 +174,7 @@ class RuntimeFileCollector:
         *,
         source_roots: list[str | os.PathLike[str]] | None = None,
         extra_files: list[str | os.PathLike[str]] | None = None,
+        store_root: str | os.PathLike[str] | None = None,
         max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
         max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
     ):
@@ -181,6 +192,9 @@ class RuntimeFileCollector:
         self._matchers = {
             root: IgnoreMatcher.from_files(root, list(IGNORE_FILE_NAMES)) for root in roots
         }
+        self._store_root = (
+            Path(store_root).expanduser().resolve() if store_root is not None else None
+        )
         self.max_file_bytes = max_file_bytes
         self.max_total_bytes = max_total_bytes
         self._files: dict[Path, TrackedFile] = {}
@@ -240,6 +254,17 @@ class RuntimeFileCollector:
         # imports and reads are not project code. track_files() uses
         # explicit=True and is still recorded.
         if not explicit and _is_under_agenticml_package(path):
+            return
+        # Exclude the store's own artifacts, not every file under the store
+        # root: the store may be the project root or an ancestor of it.
+        # Never apply this to the entrypoint.
+        if (
+            source != "entrypoint"
+            and path != self.entry_path
+            and not explicit
+            and self._store_root is not None
+            and _is_store_artifact(path, self._store_root)
+        ):
             return
         relative_path = _normalize_manifest_path(manifest_path) if manifest_path else None
         if relative_path is not None:
@@ -380,6 +405,48 @@ def _is_relative_to(path: Path, other: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _is_store_artifact(path: Path, store_root: Path) -> bool:
+    """True when already-resolved ``path`` is a store-owned artifact.
+
+    Matches real store shapes, not bare directory names:
+
+    - ``runs/<id>/...`` where ``layout.valid_run_id(id)``
+    - ``objects/<2 lowercase hex>/...`` and ``objects/.tmp.*``
+    - ``lineage/<name>.git`` (and everything under it) plus lock siblings
+      ``*.git.lock`` and ``agenticml.lock`` directly under ``lineage/``
+    - ``worktrees/<key>/<valid run id>/...``
+
+    Top-level ``usage.json`` and ``layout.unique_tmp`` names are also
+    excluded. Server state lives beside the store in ``<data>/server/``,
+    not inside it. ``path`` and ``store_root`` must already be resolved.
+    """
+    try:
+        relative = path.relative_to(store_root)
+    except ValueError:
+        return False
+    parts = relative.parts
+    if not parts:
+        return False
+    top = parts[0]
+    if top == "runs":
+        return len(parts) >= 3 and valid_run_id(parts[1])
+    if top == "objects":
+        if len(parts) >= 3 and _OBJECT_SHARD_RE.fullmatch(parts[1]) is not None:
+            return True
+        return len(parts) == 2 and parts[1].startswith(".tmp.")
+    if top == "lineage":
+        if len(parts) >= 2 and parts[1].endswith(".git"):
+            return True
+        return len(parts) == 2 and (
+            parts[1].endswith(".git.lock") or parts[1] == "agenticml.lock"
+        )
+    if top == "worktrees":
+        return len(parts) >= 4 and valid_run_id(parts[2])
+    return len(parts) == 1 and (
+        parts[0] in _STORE_ROOT_FILES or _STORE_TMP_RE.fullmatch(parts[0]) is not None
+    )
 
 
 @lru_cache(maxsize=1)

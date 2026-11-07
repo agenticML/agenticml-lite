@@ -163,6 +163,9 @@ for machines.
 
 - Empty object and lineage upload framing: [plan](packages/fix-empty-uploads.md),
   found in the 2.2 compatibility check; status: done (2.2 PR).
+- Version 2.2.0, transient Git failures answer 503, runs no longer track
+  their own store files, and the dashboard last-admin-key rule counts only
+  usable keys: [plan](packages/backlog-2.2-fixes.md); status: done (2.2 PR).
 
 ### Later (unscheduled)
 
@@ -180,39 +183,18 @@ Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
-- **Runs track their own store files when the store is under the project
-  root** (found in the 2.2 compatibility check, Nov 7, 2026).
-  - Where: `src/agenticml/code_tracking.py` runtime-read tracking (`source:
-    "runtime_read"` entries in `events.jsonl`).
-  - Problem: when `AGENTICML_DIR` lies inside the detected project root (for
-    example a project that is not a git repository, whose root falls back to a
-    parent such as `/tmp`), each run records its own `run.lock` and
-    `events.jsonl` as code it read, adding noise and empty objects.
-  - Fix: exclude the AgenticML run store (and its lock files) from
-    runtime-read tracking.
-  - Done when: a run whose store is under the project root records no file
-    from that store.
-- **Dashboard "last admin key" rule ignores demoted users** (found in the
-  package 11 review, Nov 6, 2026).
-  - Where: `src/agenticml/server/keys.py` `KeyStore.revoke(keep_admin=True)`.
-  - Problem: the rule counts admin-scope keys, including keys whose user was
-    demoted and can no longer sign in, so the dashboard can revoke the only
-    usable admin key. The CLI still recovers.
-  - Fix: count only admin-scope keys whose user has role `admin` (plus the
-    env key); in 2.2 admins also sign in with passwords, so consider dropping
-    the rule for users who have one.
-  - Done when: a test with one demoted admin key and one live admin key
-    refuses to revoke the live one from the dashboard.
 - **Compatibility owner rule can mislead a 2.0/2.1 client** (package 11
-  review, Nov 6, 2026).
+  review, Nov 6, 2026). Blocked until no 2.0/2.1 sync clients remain.
   - Where: `src/agenticml/server/ingest.py` `compat_owner`.
   - Problem: old clients compare `owner` with their key name; another user
     whose user name equals the client's key name looks like the client's own
     run. The server's 409 stays authoritative, so there is no access, only a
     confusing client message.
-  - Fix: once every client is 2.2, compare `owner_user` with `whoami.user` in
-    `sync.py` and drop the rule.
-  - Done when: `sync.py` uses `owner_user` and a test covers the collision.
+  - Fix: the client half is done (package 12: 2.2 clients compare
+    `owner_user` with `whoami.user`). In a later release, once 2.0/2.1
+    clients are unsupported, return the real owner user in `owner` and drop
+    the rule.
+  - Done when: `compat_owner` is gone and a test covers the collision.
 - **Check `agenticml server up` on a real tailnet** (package 10b caveat,
   Nov 6, 2026).
   - Where: `src/agenticml/server/up.py`; `docs/SERVER.md` quick start.
@@ -243,15 +225,3 @@ priority.
   - Done when: `docs/SERVER.md` shows real-EFS numbers for 1 and 8 clients,
     labelled as such with mount details, and the recommendations are
     confirmed or updated.
-- **Transient Git failures during a lineage receive become permanent skips**
-  (found in package 7 review, Nov 6, 2026).
-  - Where: `src/agenticml/server/lineage.py` `receive()`, the
-    `CalledProcessError` mapping for `index-pack`, `rev-list` and `cat-file`.
-  - Problem: a full disk (ENOSPC) or similar environment error from those
-    commands answers 422 `invalid bundle`, which the client records as a
-    permanent lineage skip for that run.
-  - Fix: tell validation failures apart from environment failures (check
-    free space first, or inspect the exit status and errno-like stderr
-    under `LC_ALL=C`) and answer 503 for the latter.
-  - Done when: a test that makes `index-pack` fail with a simulated ENOSPC
-    gets 503 and the client retries without remembering a skip.

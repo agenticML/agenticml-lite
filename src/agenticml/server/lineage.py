@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -15,6 +16,11 @@ _CONFIG = ["-c", "core.hooksPath=/dev/null", "-c", "transfer.fsckObjects=true",
            "-c", "gc.auto=0", "-c", "core.fsmonitor=false",
            "-c", "protocol.allow=never", "-c", "protocol.file.allow=always"]
 _HEADER_LIMIT = 1024 * 1024
+_ENVIRONMENT_ERRORS = (
+    "No space left on device", "Disk quota exceeded", "Read-only file system",
+    "Cannot allocate memory",
+    "Too many open files", "Resource temporarily unavailable", "Input/output error",
+)
 
 
 class LineageError(ValueError):
@@ -34,6 +40,31 @@ def _info(meta):
 
 def _git(repo, args, *, timeout=60, **kwargs):
     return lineage._git([*_CONFIG, *args], repo=repo, timeout=timeout, **kwargs)
+
+
+def _environment_failure(message, repo, bundle_size):
+    lines = message.splitlines()
+    # fsck echoes sender-controlled object text, including forged fatal lines.
+    if any("fsck error" in line or line.startswith("error: object ") for line in lines):
+        return False
+    # Missing-prerequisite comments are sender-controlled, even after "error:".
+    lines = [line for line in lines
+             if line.startswith(("fatal:", "error:"))
+             and re.match(r"error: (?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64}) ", line) is None]
+    if any(re.fullmatch(r"fatal: Out of memory, malloc failed \(tried to allocate [0-9]+ bytes\)", line)
+           for line in lines):
+        return True
+    errors = {pattern for line in lines
+              for pattern in _ENVIRONMENT_ERRORS if line.endswith(": " + pattern)}
+    if errors - {"No space left on device", "Disk quota exceeded"}:
+        return True
+    if errors:
+        try:
+            return shutil.disk_usage(repo).free < 2 * bundle_size + 64 * 1024 * 1024
+        except OSError:
+            # Without a space reading, do not trust an upload's ENOSPC claim.
+            return False
+    return False
 
 
 def _commit(repo, run_id, *, timeout=60):
@@ -92,7 +123,8 @@ def receive(root, run_id, meta, path):
     try:
         offset = _header(path, run_id, expected)
         repo = lineage._repo_path(root, info["project_key"])
-        timeout = 60 + path.stat().st_size / (4 * 1024 * 1024)
+        bundle_size = path.stat().st_size
+        timeout = 60 + bundle_size / (4 * 1024 * 1024)
         repo.mkdir(parents=True, exist_ok=True)
         with lineage._locked(root, repo):
             if (repo / "HEAD").exists():
@@ -101,6 +133,11 @@ def receive(root, run_id, meta, path):
                     return {"commit": current, "created": False}, 200
                 if current is not None:
                     raise LineageError("lineage ref differs", 409, commit=current)
+            # prepare_data_dir requires store and server/tmp on one device, so
+            # the repo and upload quarantine share this filesystem's free space.
+            if shutil.disk_usage(repo).free < 2 * bundle_size + 64 * 1024 * 1024:
+                logger.warning("not enough free space for lineage receive")
+                raise LineageError("lineage busy", 503)
             try:
                 lineage._init_repo(repo, timeout=timeout)
             except subprocess.CalledProcessError as exc:
@@ -109,8 +146,11 @@ def receive(root, run_id, meta, path):
             if verified.returncode:
                 message = verified.stderr.decode(errors="replace")
                 logger.warning("bundle verification: %s", message.splitlines()[0][:240] if message else "failed")
-                missing = "Repository lacks these prerequisite commits" in message
-                raise LineageError("missing prerequisite" if missing else "invalid bundle")
+                if "Repository lacks these prerequisite commits" in message:
+                    raise LineageError("missing prerequisite")
+                if _environment_failure(message, repo, bundle_size):
+                    raise LineageError("lineage busy", 503)
+                raise LineageError("invalid bundle")
             with tempfile.TemporaryDirectory(prefix="lineage-", dir=path.parent) as directory:
                 quarantine = Path(directory)
                 (quarantine / "info").mkdir()
@@ -159,7 +199,7 @@ def receive(root, run_id, meta, path):
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
         message = (getattr(exc, "stderr", None) or b"").decode(errors="replace")
         logger.warning("bundle receive: %s", message.splitlines()[0][:240] if message else type(exc).__name__)
-        if isinstance(exc, (subprocess.TimeoutExpired, OSError)):
+        if isinstance(exc, (subprocess.TimeoutExpired, OSError)) or _environment_failure(message, repo, bundle_size):
             raise LineageError("lineage busy", 503) from exc
         raise LineageError("invalid bundle") from exc
     return {"commit": expected, "created": True}, 201
