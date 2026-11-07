@@ -227,7 +227,7 @@ Run directly (a venv anywhere the user owns is fine, e.g. `python3 -m venv ~/age
 Or run as a systemd service: see [deploy/systemd/README.md](deploy/systemd/README.md) and [deploy/systemd/agenticml-server.service](deploy/systemd/agenticml-server.service).
 ```bash
 sudo useradd --system --home /var/lib/agenticml-server --shell /usr/sbin/nologin agenticml
-sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.0.0/deploy/systemd/agenticml-server.service
+sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.2.0/deploy/systemd/agenticml-server.service
 ```
 Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`). Edit `AGENTICML_SERVER_PUBLIC_URL` in the unit (or `sudo systemctl edit agenticml-server`), then `daemon-reload` and `enable --now`:
 ```bash
@@ -421,9 +421,9 @@ Bump the version in `pyproject.toml` and `src/agenticml/__init__.py`, then push 
 
 ```bash
 # bump version in pyproject.toml and src/agenticml/__init__.py
-git commit -am "release: v2.0.0"
-git tag v2.0.0
-git push origin v2.0.0
+git commit -am "release: v2.2.0"
+git tag v2.2.0
+git push origin v2.2.0
 ```
 
 ## License

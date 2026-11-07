@@ -69,7 +69,7 @@ A production system unit example is provided in [deploy/systemd/agenticml-server
 sudo python3 -m venv /opt/agenticml
 sudo /opt/agenticml/bin/python -m pip install agenticml-lite
 sudo useradd --system --home /var/lib/agenticml-server --shell /usr/sbin/nologin agenticml
-sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.0.0/deploy/systemd/agenticml-server.service
+sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.2.0/deploy/systemd/agenticml-server.service
 ```
 
 Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`). Edit `AGENTICML_SERVER_PUBLIC_URL` in the unit (or `sudo systemctl edit agenticml-server`), then `daemon-reload` and `enable --now`:
@@ -358,7 +358,7 @@ To run `agenticml sync --follow` as a background user daemon on Linux, install t
 
 ```bash
 mkdir -p ~/.config/systemd/user
-curl -fsSL -o ~/.config/systemd/user/agenticml-sync.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.0.0/deploy/systemd/agenticml-sync.service
+curl -fsSL -o ~/.config/systemd/user/agenticml-sync.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.2.0/deploy/systemd/agenticml-sync.service
 ```
 
 Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`).

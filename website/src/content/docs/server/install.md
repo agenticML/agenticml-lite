@@ -60,7 +60,7 @@ For production deployments on Linux, run the server as a systemd system service 
    sudo python3 -m venv /opt/agenticml
    sudo /opt/agenticml/bin/python -m pip install agenticml-lite
    sudo useradd --system --home /var/lib/agenticml-server --shell /usr/sbin/nologin agenticml
-   sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.0.0/deploy/systemd/agenticml-server.service
+   sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.2.0/deploy/systemd/agenticml-server.service
    ```
    Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`).
 2. Edit `AGENTICML_SERVER_PUBLIC_URL` in the unit (or `sudo systemctl edit agenticml-server`), then `daemon-reload` and `enable --now`. Adjust `ExecStart` if the venv lives elsewhere.
