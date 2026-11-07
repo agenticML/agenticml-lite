@@ -128,7 +128,7 @@ and keeps a single v1 store; team state lives beside it in `<data>/server/`.
 | 12 † | Per-user key management and sync attribution | 11 | Codex | M | [plan](packages/12-per-user-keys.md) | done (2.2 PR) |
 | 13 † | Dashboard sign-in: passwords, invites, trusted identity proxy | 11 | Cursor | L | [plan](packages/13-sign-in.md) | done (2.2 PR) |
 | 14 | Audit log | 11–13 | Codex | S–M | [plan](packages/14-audit-log.md) | done (2.2 PR) |
-| 15 | Team admin page, account menu, end-to-end teams test | 11–14 | Cursor | M–L | [plan](packages/15-team-admin-page.md) | in progress |
+| 15 | Team admin page, account menu, end-to-end teams test | 11–14 | Cursor | M–L | [plan](packages/15-team-admin-page.md) | done (2.2 PR) |
 
 - **11 Users and roles.** `users.json` with `admin`, `member` and `viewer`
   roles. `agenticml server users add|list|remove|set-role`. Admin manages users
@@ -175,6 +175,18 @@ Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
+- **Runs track their own store files when the store is under the project
+  root** (found in the 2.2 compatibility check, Nov 7, 2026).
+  - Where: `src/agenticml/code_tracking.py` runtime-read tracking (`source:
+    "runtime_read"` entries in `events.jsonl`).
+  - Problem: when `AGENTICML_DIR` lies inside the detected project root (for
+    example a project that is not a git repository, whose root falls back to a
+    parent such as `/tmp`), each run records its own `run.lock` and
+    `events.jsonl` as code it read, adding noise and empty objects.
+  - Fix: exclude the AgenticML run store (and its lock files) from
+    runtime-read tracking.
+  - Done when: a run whose store is under the project root records no file
+    from that store.
 - **Dashboard "last admin key" rule ignores demoted users** (found in the
   package 11 review, Nov 6, 2026).
   - Where: `src/agenticml/server/keys.py` `KeyStore.revoke(keep_admin=True)`.

@@ -4433,7 +4433,13 @@ async function teamPage(version) {
       el("thead", { role: "rowgroup" }, el("tr", { role: "row" },
         ...columns.map((text) => el("th", { role: "columnheader", scope: "col", text })))),
       el("tbody", { role: "rowgroup" }, ...rows)));
-    await refreshActivity(true);
+    try {
+      await refreshActivity(true);
+    } catch (reason) {
+      if (reason.name === "AbortError") return;
+      if (epoch === version && sequence === refreshSequence)
+        showError(activityStatus, reason);
+    }
   }
 
   function renderActivity(events, append) {

@@ -117,3 +117,20 @@ admin with the CLI functions):
 - From `testbed/`: the `ui` suite (`-m ui`) with this worktree's `src` on
   the path.
 - Report any deviation from this plan instead of changing the approach.
+
+## As built
+
+Deviations from this plan:
+
+- No UI change for notes: the dashboard has no notes editor, so the viewer
+  rule is enforced by the note PUT API (403).
+- Run `owner` is shown in the run identity line (list card, run-page
+  header, and identity facts), not as a separate runs-table column.
+- `POST /api/server/users/<name>/invite` refuses a self re-invite with 409
+  (`you cannot re-invite yourself; change your password from the Account
+  menu`).
+- Step 7 asserts the exact ordered `(action, actor, target)` list after
+  dropping CLI setup lines (`actor` starting with `cli:`) and `login.ok`.
+  `login.ok` is checked separately for each sign-in. Steal attempts and
+  403s add no extra lines. Sync of a finished run also records
+  `run.finish` after each `run.create`.

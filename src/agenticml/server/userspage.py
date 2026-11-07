@@ -7,7 +7,7 @@ import os
 from .keys import ClientError, KeyStoreUnavailable, LastAdminError, _NAME, validate_name
 from .keyspage import RUN_SCAN_MAX, command_host, read_json
 from .users import (
-    IdentityTaken, UserNameTaken, UserNotFound, allowed, attribution,
+    IdentityTaken, ROLES, UserNameTaken, UserNotFound, allowed, attribution,
 )
 
 logger = logging.getLogger("agenticml.server.userspage")
@@ -71,10 +71,14 @@ def handle(webauth, handler, path):
                 handler.headers.get_all("Content-Length") or handler.headers.get_all("Transfer-Encoding")):
             handler.close_connection = True
         if path == "/api/server/users" and handler.command == "GET":
-            records = sorted(webauth.users.list(), key=lambda record: (record.created_at, record.name))
-            key_counts = {}
-            for key in webauth.keys.list():
-                key_counts[key.user] = key_counts.get(key.user, 0) + 1
+            try:
+                records = sorted(webauth.users.list(), key=lambda record: (record.created_at, record.name))
+                key_counts = {}
+                for key in webauth.keys.list():
+                    key_counts[key.user] = key_counts.get(key.user, 0) + 1
+            except (KeyStoreUnavailable, OSError):
+                handler._json({"error": "key store unavailable"}, 503)
+                return
             run_counts = _user_run_counts(handler.server.root)
             handler._json({
                 "users": [_public_row(record, key_counts, run_counts) for record in records],
@@ -101,11 +105,11 @@ def handle(webauth, handler, path):
                 return
             try:
                 token = webauth.users.create_invite(record.name)
+                updated = webauth.users.get(record.name)
             except (KeyStoreUnavailable, OSError):
                 webauth.users.discard(record.name, record.id)
                 handler._json({"error": "key store unavailable"}, 503)
                 return
-            updated = webauth.users.get(record.name)
             expires_at = updated.invite["expires_at"] if updated is not None and updated.invite else None
             logger.info("created user %s role %s", name, role)
             _audit(handler, principal, "user.add", name,
@@ -134,16 +138,20 @@ def handle(webauth, handler, path):
                     return
                 try:
                     token = webauth.users.create_invite(name)
+                    expires_at = None
+                    try:
+                        updated = webauth.users.get(name)
+                        expires_at = updated.invite["expires_at"] if updated is not None and updated.invite else None
+                    finally:
+                        # The invite is already persisted, even if its read-back fails.
+                        _audit(handler, principal, "user.invite", name, {"expires_at": expires_at})
                 except UserNotFound:
                     handler._json({"error": "not found"}, 404)
                     return
                 except (KeyStoreUnavailable, OSError):
                     handler._json({"error": "key store unavailable"}, 503)
                     return
-                updated = webauth.users.get(name)
-                expires_at = updated.invite["expires_at"] if updated is not None and updated.invite else None
                 logger.info("created invite for %s", name)
-                _audit(handler, principal, "user.invite", name, {"expires_at": expires_at})
                 handler._json({
                     "invite_url": _invite_url(webauth, handler, token),
                     "expires_at": expires_at,
@@ -158,13 +166,22 @@ def handle(webauth, handler, path):
                     return
                 if "role" not in payload and "identity" not in payload:
                     raise ClientError("invalid request")
-                found = webauth.users.get(name)
-                if found is None:
-                    handler._json({"error": "not found"}, 404)
-                    return
                 signed_out = False
-                updated = found
                 try:
+                    found = webauth.users.get(name)
+                    if found is None:
+                        handler._json({"error": "not found"}, 404)
+                        return
+                    if "role" in payload:
+                        role = payload.get("role")
+                        if role not in ROLES:
+                            raise ClientError("invalid role")
+                        if found.role == "admin" and role != "admin":
+                            if not any(item.role == "admin" and item.name != name
+                                       for item in webauth.users.list()):
+                                handler._json({"error": "last admin"}, 409)
+                                return
+                    updated = found
                     if "identity" in payload:
                         updated = webauth.users.set_identity(name, payload.get("identity"))
                         _audit(handler, principal, "user.identity", name,
@@ -204,8 +221,8 @@ def handle(webauth, handler, path):
                 if found is None:
                     handler._json({"error": "not found"}, 404)
                     return
-                revoked = [record for record in webauth.keys.list() if record.user == name]
                 try:
+                    revoked = [record for record in webauth.keys.list() if record.user == name]
                     keys_revoked = webauth.users.remove(name)
                 except UserNotFound:
                     handler._json({"error": "not found"}, 404)

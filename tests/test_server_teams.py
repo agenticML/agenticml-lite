@@ -1,8 +1,6 @@
 """Release 2.2 exit criteria: two users with different roles share one server.
 
-HTTP only, except creating the first admin with the CLI. Package 14 part B
-audit hooks are still missing in this worktree, so the audit-line assertions
-are a strict xfail until that merge.
+HTTP only, except creating the first admin with the CLI.
 """
 from contextlib import contextmanager
 import io
@@ -126,6 +124,10 @@ def teams(tmp_path_factory):
                 httpd, "/api/server/keys", "POST",
                 {"name": "bob-laptop", "scope": "sync"}, bob_cookie)
             assert status == 201 and bob_key["record"]["user"] == "bob"
+            status, _, bob_ci_key = api(
+                httpd, "/api/server/keys", "POST",
+                {"name": "bob-ci", "scope": "sync", "user": "bob"}, admin_cookie)
+            assert status == 201 and bob_ci_key["record"]["user"] == "bob"
             bob_admin_status, _, bob_admin_body = api(
                 httpd, "/api/server/keys", "POST",
                 {"name": "bad-admin", "scope": "admin"}, bob_cookie)
@@ -201,31 +203,43 @@ def test_two_users_share_one_server(teams):
     assert json.loads(bob_note_body)["text"] == "hello from bob"
 
 
-def _has_subsequence(have, need):
-    it = iter(have)
-    return all(item in it for item in need)
-
-
-@pytest.mark.xfail(strict=True, reason="audit hooks land with package 14 part B merge")
 def test_audit_lines_for_team_writes(teams):
     path = teams["data"] / "server" / "audit.jsonl"
     events = [json.loads(line) for line in path.read_text().splitlines() if line]
-    actions = [event["action"] for event in events]
-    assert _has_subsequence(actions, [
-        "user.add", "user.invite", "user.add", "user.invite",
-        "user.password", "user.password",
-        "key.create", "key.create",
-        "run.create", "run.create",
-        "note.write",
-    ])
-    added = [event for event in events if event["action"] == "user.add"]
-    assert [event["target"] for event in added[:2]] == ["bob", "vera"]
-    assert added[0]["actor"] == "admin" and added[1]["actor"] == "admin"
-    logins = {event["actor"] for event in events if event["action"] == "login.ok"}
-    assert {"admin", "bob", "vera"} <= logins
-    note = next(event for event in events if event["action"] == "note.write")
-    assert note["actor"] == "bob" and note["target"] == "admin-run"
-    creates = [event for event in events if event["action"] == "key.create"]
-    assert {event["target"] for event in creates} >= {"admin-laptop", "bob-laptop"}
-    runs = [event for event in events if event["action"] == "run.create"]
-    assert {event["target"] for event in runs} >= {"admin-run", "bob-run"}
+    writes = [
+        (event["action"], event["actor"], event["target"])
+        for event in events
+        if not event["actor"].startswith("cli:") and event["action"] != "login.ok"
+    ]
+    assert writes == [
+        ("user.add", "admin", "bob"),
+        ("user.invite", "admin", "bob"),
+        ("user.add", "admin", "vera"),
+        ("user.invite", "admin", "vera"),
+        ("user.password", "bob", "bob"),
+        ("user.password", "vera", "vera"),
+        ("key.create", "admin", "admin-laptop"),
+        ("key.create", "bob", "bob-laptop"),
+        ("key.create", "admin", "bob-ci"),
+        ("run.create", "admin", "admin-run"),
+        ("run.finish", "admin", "admin-run"),
+        ("run.create", "bob", "bob-run"),
+        ("run.finish", "bob", "bob-run"),
+        ("note.write", "bob", "admin-run"),
+    ]
+    logins = [
+        (event["actor"], event["target"], event["detail"].get("method"))
+        for event in events if event["action"] == "login.ok"
+    ]
+    assert logins == [
+        ("admin", "admin", "password"),
+        ("bob", "bob", "invite"),
+        ("vera", "vera", "invite"),
+    ]
+    assert not any(event["action"] == "login.failed" for event in events)
+    assert not any(event["action"] == "key.revoke" for event in events)
+    assert [event["target"] for event in events if event["action"] == "key.create"] == [
+        "admin-laptop", "bob-laptop", "bob-ci"]
+    bob_ci_event, = [event for event in events
+                     if event["action"] == "key.create" and event["target"] == "bob-ci"]
+    assert bob_ci_event["detail"]["user"] == "bob"

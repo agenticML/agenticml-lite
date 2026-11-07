@@ -145,6 +145,22 @@ def test_patch_own_role_signs_out_when_another_admin_remains(server):
     assert api(server)[0] == 401
 
 
+def test_patch_role_errors_do_not_change_identity(server):
+    api(server, method="POST", payload={"name": "bob", "role": "member"})
+    status, _, body = api(server, "/api/server/users/admin", "PATCH", {
+        "role": "member", "identity": "admin@x.com",
+    })
+    assert status == 409 and body == {"error": "last admin"}
+    admin = server.users.get("admin")
+    assert admin.role == "admin" and admin.identity is None
+    status, _, body = api(server, "/api/server/users/bob", "PATCH", {
+        "role": "owner", "identity": "bob@x.com",
+    })
+    assert status == 400 and body == {"error": "invalid role"}
+    bob = server.users.get("bob")
+    assert bob.role == "member" and bob.identity is None
+
+
 def test_patch_identity_error_does_not_change_role(server):
     api(server, method="POST", payload={"name": "bob", "role": "member"})
     api(server, method="POST", payload={"name": "cara", "role": "member", "identity": "taken@x.com"})
@@ -237,12 +253,92 @@ def test_add_rolls_back_if_invite_fails(server, monkeypatch):
     assert server.users.get("bob") is None
 
 
+@pytest.mark.parametrize("exc", [KeyStoreUnavailable, OSError])
+def test_add_rolls_back_if_get_after_invite_fails(server, monkeypatch, exc):
+    original = server.users.get
+
+    def boom(name):
+        if name == "bob":
+            raise exc("private failure")
+        return original(name)
+
+    monkeypatch.setattr(server.users, "get", boom)
+    status, _, body = api(server, method="POST", payload={"name": "bob", "role": "member"})
+    assert status == 503 and body == {"error": "key store unavailable"}
+    monkeypatch.setattr(server.users, "get", original)
+    assert server.users.get("bob") is None
+
+
+@pytest.mark.parametrize("exc", [KeyStoreUnavailable, OSError])
+def test_reinvite_get_failure_is_503_and_audited(server, monkeypatch, exc):
+    server.users.add("bob", role="member")
+    server.users.set_password("bob", "password1234")
+    original = server.users.get
+    before = original("bob")
+    events = audit_events(server)
+
+    def boom(name):
+        if name == "bob":
+            raise exc("private failure")
+        return original(name)
+
+    monkeypatch.setattr(server.users, "get", boom)
+    status, _, body = api(server, "/api/server/users/bob/invite", "POST", {})
+    assert status == 503 and body == {"error": "key store unavailable"}
+    bob = original("bob")
+    assert bob.invite is not None and bob.password is None
+    assert bob.generation == before.generation + 1
+    added = audit_events(server)[len(events):]
+    assert [(event["action"], event["actor"], event["target"]) for event in added] == [
+        ("user.invite", "admin", "bob")]
+    assert added[0]["detail"] == {"expires_at": None}
+
+
+@pytest.mark.parametrize("exc", [KeyStoreUnavailable, OSError])
+def test_reinvite_create_failure_is_503_without_audit(server, monkeypatch, exc):
+    server.users.add("bob", role="member")
+    before = server.users.get("bob")
+    events = audit_events(server)
+
+    def boom(name):
+        raise exc("private failure")
+
+    monkeypatch.setattr(server.users, "create_invite", boom)
+    status, _, body = api(server, "/api/server/users/bob/invite", "POST", {})
+    assert status == 503 and body == {"error": "key store unavailable"}
+    assert server.users.get("bob") == before
+    assert audit_events(server) == events
+
+
+@pytest.mark.parametrize("exc", [KeyStoreUnavailable, OSError])
+def test_patch_get_failure_is_503_before_mutation(server, monkeypatch, exc):
+    server.users.add("bob", role="member")
+    original = server.users.get
+    before = original("bob")
+    events = audit_events(server)
+
+    def boom(name):
+        if name == "bob":
+            raise exc("private failure")
+        return original(name)
+
+    monkeypatch.setattr(server.users, "get", boom)
+    status, _, body = api(server, "/api/server/users/bob", "PATCH", {
+        "role": "viewer", "identity": "bob@example.com",
+    })
+    assert status == 503 and body == {"error": "key store unavailable"}
+    assert original("bob") == before
+    assert audit_events(server) == events
+
+
 @pytest.mark.parametrize("store,attr,method,path,payload", [
     ("users", "list", "GET", "/api/server/users", None),
     ("keys", "list", "GET", "/api/server/users", None),
+    ("keys", "list", "DELETE", "/api/server/users/bob", None),
     ("users", "get", "PATCH", "/api/server/users/bob", {"role": "viewer"}),
     ("users", "get", "DELETE", "/api/server/users/bob", None),
     ("users", "get", "POST", "/api/server/users/bob/invite", {}),
+    ("users", "list", "PATCH", "/api/server/users/admin", {"role": "member"}),
 ])
 def test_list_get_unavailable_is_503(server, monkeypatch, store, attr, method, path, payload):
     server.users.add("bob", role="member")
@@ -252,6 +348,33 @@ def test_list_get_unavailable_is_503(server, monkeypatch, store, attr, method, p
 
     monkeypatch.setattr(getattr(server, store), attr, boom)
     status, _, body = api(server, path, method, payload)
+    assert status == 503 and body == {"error": "key store unavailable"}
+
+
+@pytest.mark.parametrize("store,attr,method,path,payload", [
+    ("users", "list", "GET", "/api/server/users", None),
+    ("keys", "list", "GET", "/api/server/users", None),
+    ("keys", "list", "DELETE", "/api/server/users/bob", None),
+    ("users", "list", "PATCH", "/api/server/users/admin", {"role": "member"}),
+])
+def test_list_oserror_is_503(server, monkeypatch, store, attr, method, path, payload):
+    server.users.add("bob", role="member")
+    cookie = server.cookie
+    if store == "keys":
+        # Key sessions call keys.list() during auth; a password session does not.
+        server.users.set_password("admin", "password1234")
+        status, hdrs, _ = call(
+            server, "/login", "POST",
+            json.dumps({"user": "admin", "password": "password1234"}).encode(),
+            csrf(server))
+        assert status == 200
+        cookie = hdrs["Set-Cookie"].split(";", 1)[0]
+
+    def boom(*args, **kwargs):
+        raise OSError("private failure")
+
+    monkeypatch.setattr(getattr(server, store), attr, boom)
+    status, _, body = api(server, path, method, payload, cookie=cookie)
     assert status == 503 and body == {"error": "key store unavailable"}
 
 
