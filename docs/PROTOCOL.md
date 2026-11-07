@@ -268,6 +268,7 @@ Query which content-addressed objects are missing on the server.
 ### `PUT /v2/objects/{sha256}`
 
 Upload a single content-addressed object.
+Clients must send `Content-Length` without chunked encoding, including `Content-Length: 0` for an empty object.
 
 - **Request**: `PUT /v2/objects/{sha256}`
   - `{sha256}` must be a 64-character lowercase hexadecimal string.

@@ -159,6 +159,11 @@ in with a password (scrypt, set from a one-time invite link) or through a
 trusted identity proxy; admin-key login stays as a fallback and keys stay
 for machines.
 
+### Maintenance fixes
+
+- Empty object and lineage upload framing: [plan](packages/fix-empty-uploads.md),
+  found in the 2.2 compatibility check; status: done (2.2 PR).
+
 ### Later (unscheduled)
 
 - More than one server process (high availability). Needs a shared metadata

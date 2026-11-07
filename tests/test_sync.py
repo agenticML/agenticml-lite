@@ -120,6 +120,29 @@ def test_finished_round_trip(remote, tmp_path, status, capsys):
         "task": "classify", "task_source": "explicit", "arch": "linear"}
 
 
+@pytest.mark.parametrize("kind", ["code", "artifact"])
+def test_sync_empty_object(remote, tmp_path, kind):
+    writer = writer_at(tmp_path, status=None)
+    try:
+        if kind == "code":
+            writer.add_code([], [("empty.py", b"")])
+        else:
+            artifact = tmp_path / "empty.bin"
+            artifact.write_bytes(b"")
+            writer.add_artifact(artifact, "empty", "model", {}, copy=True)
+        writer.finish("finished")
+    finally:
+        writer.close()
+
+    sha = hashlib.sha256(b"").hexdigest()
+    assert sha in set().union(*run_references(writer.root, writer.run_id).values())
+    assert not object_path(remote[0].root, sha).exists()
+    assert command(remote, writer, writer.run_id) == 0
+    assert object_path(remote[0].root, sha).read_bytes() == b""
+    assert state(remote, writer)["complete"] is True
+    assert identical(remote, writer)["status"] == "finished"
+
+
 def test_dead_process_only_changes_status(remote, tmp_path):
     writer = writer_at(tmp_path, status=None)
     writer.close()
