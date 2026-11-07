@@ -95,6 +95,15 @@ def run_path(server, name=""):
     return server.root / "runs" / "run-1" / name
 
 
+def foreign_key(server, name="other", user="bob", role="member"):
+    from agenticml.server.users import UserStore
+
+    store = UserStore(server.data_dir / "server")
+    if store.get(user) is None:
+        store.add(user, role=role)
+    return server.keys.create(name, user=user)[1]
+
+
 def test_health_auth_scopes_and_revocation(server):
     assert raw(server, "GET", "/healthz")[0:2] == (200, {"ok": True})
     for headers in ([], [("Authorization", "Basic abc")], [("Authorization", "Bearer bad")],
@@ -105,7 +114,7 @@ def test_health_auth_scopes_and_revocation(server):
         assert response_headers["WWW-Authenticate"] == "Bearer"
     assert raw(server, "GET", "/v2/whoami", [("Authorization", "bEaReR " + server.test_key)])[0] == 200
     assert request(server, "/v2/whoami")[1] == {
-        "key": "one", "scope": "sync", "protocol": 2,
+        "key": "one", "scope": "sync", "user": "admin", "role": "admin", "protocol": 2,
         "features": (["lineage"] if server.lineage_enabled else []) + ["byref"],
     }
     _, admin = server.keys.create("admin", "admin")
@@ -121,7 +130,7 @@ def test_zero_keys_and_environment(tmp_path):
         assert raw(httpd, "GET", "/v2/whoami")[0] == 401
     with running(tmp_path / "env", "a" * 32) as httpd:
         assert raw(httpd, "GET", "/v2/whoami", [("Authorization", "Bearer " + "a" * 32)])[1] == {
-            "key": "env", "scope": "admin", "protocol": 2,
+            "key": "env", "scope": "admin", "user": "env", "role": "admin", "protocol": 2,
             "features": (["lineage"] if httpd.lineage_enabled else []) + ["byref"],
         }
         assert not (httpd.data_dir / "server" / "keys.json").exists()
@@ -133,8 +142,8 @@ def test_default_bind_cli_and_shutdown(tmp_path, monkeypatch, capsys):
     httpd.server_close()
     original = app.make_server
     seen = []
-    def construct(data, host, port, public_url, env_key):
-        httpd = original(data, host, port, public_url, env_key)
+    def construct(data, host, port, public_url, env_key, trusted_proxies=(), identity_header=None):
+        httpd = original(data, host, port, public_url, env_key, trusted_proxies, identity_header)
         seen.append(httpd)
         def run_once():
             def health():
@@ -552,15 +561,15 @@ def test_meta_validation_creation_and_ownership(server):
     for path, method in (("files/scalars/index.json", "PUT"), ("append/events.jsonl?offset=0", "POST"), ("commit", "POST")):
         assert request(server, "/v2/runs/unknown/" + path, method, b"{}")[0:2] == (404, {"error": "unknown run"})
     assert put_meta(server)[0] == 200
-    assert json.loads(run_path(server, "remote.json").read_text()) == {"owner": "one"}
-    _, second = server.keys.create("two")
+    assert json.loads(run_path(server, "remote.json").read_text()) == {"owner": "admin", "owner_key": "one"}
+    second = foreign_key(server, "two")
     for path, method, body in (("files/meta.json", "PUT", b"{}"), ("files/scalars/index.json", "PUT", b"{}"),
                                ("append/events.jsonl?offset=0", "POST", b"{}\n"), ("commit", "POST", b"{}")):
         assert request(server, "/v2/runs/run-1/" + path, method, body, second)[0:2] == (
-            409, {"error": "run owned by another key", "owner": "one"})
+            409, {"error": "run owned by another user", "owner": "admin", "owner_user": "admin"})
     assert not run_path(server, "events.jsonl").exists()
     server.keys.revoke("one")
-    _, server.test_key = server.keys.create("one")
+    _, server.test_key = server.keys.create("one", user="admin")
     assert put_meta(server)[0] == 200
 
 
@@ -572,7 +581,7 @@ def test_claim_unowned_run(server, remote):
     if remote is not None:
         (directory / "remote.json").write_bytes(remote)
     assert put_meta(server)[0] == 200
-    assert json.loads((directory / "remote.json").read_bytes()) == {"owner": "one"}
+    assert json.loads((directory / "remote.json").read_bytes()) == {"owner": "admin", "owner_key": "one"}
 
 
 def test_atomic_validation_and_state(server):
@@ -590,8 +599,10 @@ def test_atomic_validation_and_state(server):
     linked.symlink_to(run_path(server, "scalars/0.bin"))
     _, other = server.keys.create("reader")
     status, state, _ = request(server, "/v2/runs/run-1/state", key=other)
-    assert status == 200 and state["owner"] == "one"
-    assert state["remote"] == {"owner": "one"}
+    assert status == 200 and state["owner"] == "reader"
+    assert state["owner_user"] == "admin"
+    assert state["remote"]["owner"] == "reader"
+    assert state["remote"]["owner_user"] == "admin"
     assert "scalars/1.bin" not in state["files"]
     for name, info in state["files"].items():
         data = run_path(server, name).read_bytes()
@@ -889,8 +900,9 @@ def test_commit_validation_sizes_status_and_success(server):
         409, {"error": "status does not match meta.json", "status": "running"})
     assert commit(server, sizes={"meta.json": size})[1] == {"complete": True, "fingerprint": "a" * 64}
     remote = json.loads(run_path(server, "remote.json").read_bytes())
-    assert remote == {"owner": "one", "status": "running", "fingerprint": "a" * 64,
-                      "last_sync_at": remote["last_sync_at"], "sizes": {"meta.json": size}}
+    assert remote == {"owner": "admin", "owner_key": "one", "status": "running",
+                      "fingerprint": "a" * 64, "last_sync_at": remote["last_sync_at"],
+                      "last_sync_key": "one", "sizes": {"meta.json": size}}
     layout.parse_timestamp(remote["last_sync_at"])
 
 
@@ -988,7 +1000,7 @@ def test_state_hashes_snapshot_without_blocking_writes(server, monkeypatch, chan
             release.set()
         status, payload, _ = state.result(timeout=5)
     assert status == 200
-    assert payload["remote"] == old_remote
+    assert payload["remote"] == {**old_remote, "owner": "one", "owner_user": "admin"}
     assert payload["files"] == {name: {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
                                 for name, data in before.items()}
 
@@ -1109,7 +1121,8 @@ def test_claim_keeps_existing_remote_metadata(server):
               "fingerprint": "a" * 64, "last_sync_at": layout.format_timestamp(), "extra": {"x": 1}}
     run_path(server, "remote.json").write_text(json.dumps(remote))
     assert put_meta(server)[0] == 200
-    assert json.loads(run_path(server, "remote.json").read_bytes()) == {**remote, "owner": "one"}
+    assert json.loads(run_path(server, "remote.json").read_bytes()) == {
+        **remote, "owner": "admin", "owner_key": "one"}
 
 
 @pytest.mark.parametrize("owner", [None, "other"])
@@ -1119,7 +1132,7 @@ def test_new_run_discards_leftover_remote_metadata(server, owner):
               "fingerprint": "a" * 64, "last_sync_at": layout.format_timestamp()}
     run_path(server, "remote.json").write_text(json.dumps(remote))
     assert put_meta(server)[0] == 200
-    assert json.loads(run_path(server, "remote.json").read_bytes()) == {"owner": "one"}
+    assert json.loads(run_path(server, "remote.json").read_bytes()) == {"owner": "admin", "owner_key": "one"}
 
 
 @pytest.mark.parametrize("path", ["/healthz", "/v2/whoami", "/v2/runs/run-1/state"])
@@ -1237,12 +1250,13 @@ def test_umask_falls_back_when_proc_unavailable(monkeypatch, status):
     (False, "commit", "POST", 1024 * 1024),
 ])
 def test_ownership_rejected_without_receiving_body(server, route, method, length, exists):
-    _, other_key = server.keys.create("other")
+    other_key = foreign_key(server)
     if exists:
         put_meta(server)
     headers = [("Authorization", "Bearer " + other_key), ("Content-Length", str(length))]
     status, payload, headers = raw(server, method, "/v2/runs/run-1/" + route, headers)
-    assert (status, payload) == ((409, {"error": "run owned by another key", "owner": "one"}) if exists
+    assert (status, payload) == ((409, {"error": "run owned by another user",
+                                        "owner": "admin", "owner_user": "admin"}) if exists
                                  else (404, {"error": "unknown run"}))
     assert headers["Connection"] == "close"
     assert not list(server.tmp_dir.iterdir())
@@ -1265,5 +1279,5 @@ def test_ownership_rechecked_after_body(server, monkeypatch, route, method, body
 
     monkeypatch.setattr(ingest.IngestHandler, "_read_body", change_owner)
     assert request(server, "/v2/runs/run-1/" + route, method, body)[0:2] == (
-        409, {"error": "run owned by another key", "owner": "other"})
+        409, {"error": "run owned by another user", "owner": "other", "owner_user": "other"})
     assert not run_path(server, "events.jsonl").exists()

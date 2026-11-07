@@ -73,7 +73,7 @@ On Linux machines, run `sync --follow` as a user-level systemd service:
 
 ```bash
 mkdir -p ~/.config/systemd/user
-curl -fsSL -o ~/.config/systemd/user/agenticml-sync.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.0.0/deploy/systemd/agenticml-sync.service
+curl -fsSL -o ~/.config/systemd/user/agenticml-sync.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.2.0/deploy/systemd/agenticml-sync.service
 ```
 
 Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`).

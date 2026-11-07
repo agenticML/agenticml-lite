@@ -350,6 +350,8 @@ def cmd_whoami(args):
             f"{host}  key={key_prefix(key)}  name={_clean_detail(info.get('key', '?'))}  "
             f"scope={_clean_detail(info.get('scope', '?'))}  source={source}  valid"
         )
+        if isinstance(info.get("user"), str) and isinstance(info.get("role"), str):
+            print(f"user: {_clean_detail(info['user'])} ({_clean_detail(info['role'])})")
         return 0
     except KeyboardInterrupt:
         return 130

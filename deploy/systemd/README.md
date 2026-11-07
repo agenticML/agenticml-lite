@@ -5,7 +5,7 @@
 The unit files are not included in the PyPI wheel. Fetch the sync user unit:
 
     mkdir -p ~/.config/systemd/user
-    curl -fsSL -o ~/.config/systemd/user/agenticml-sync.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.0.0/deploy/systemd/agenticml-sync.service
+    curl -fsSL -o ~/.config/systemd/user/agenticml-sync.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.2.0/deploy/systemd/agenticml-sync.service
 
 Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`).
 
@@ -30,7 +30,7 @@ Install the package into a venv and create the service user:
     sudo python3 -m venv /opt/agenticml
     sudo /opt/agenticml/bin/python -m pip install agenticml-lite
     sudo useradd --system --home /var/lib/agenticml-server --shell /usr/sbin/nologin agenticml
-    sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.0.0/deploy/systemd/agenticml-server.service
+    sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.2.0/deploy/systemd/agenticml-server.service
 
 Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`).
 

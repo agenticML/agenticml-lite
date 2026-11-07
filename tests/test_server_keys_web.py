@@ -20,6 +20,7 @@ from agenticml.server.app import make_server, prepare_data_dir
 from agenticml.server.keys import (
     KeyNameTaken, KeyStore, KeyStoreUnavailable, LastAdminError, SetupClosed, validate_name,
 )
+from agenticml.server.users import UserNameTaken
 from agenticml.server.webauth import WebAuth
 from agenticml.store import RunReader, RunWriter
 from agenticml.ui import server as ui_server
@@ -75,9 +76,14 @@ def api(server, path="/api/server/keys", method="GET", payload=None, cookie=None
     return status, hdrs, json.loads(body)
 
 
+SETUP_PASSWORD = "password1234"
+
+
 def setup(server, payload=None, headers=None):
     if payload is None:
-        payload = {"token": server.web.setup_token}
+        payload = {"token": server.web.setup_token, "password": SETUP_PASSWORD}
+    elif isinstance(payload, dict) and "password" not in payload:
+        payload = {**payload, "password": SETUP_PASSWORD}
     status, hdrs, body = call(server, "/setup", "POST", json.dumps(payload),
                               csrf(server) if headers is None else headers)
     return status, hdrs, json.loads(body)
@@ -103,8 +109,8 @@ def test_setup_startup_page_and_single_use(tmp_path, caplog):
         assert len(warnings) == 1 and warnings[0].levelno == logging.WARNING
         startup_warning = warnings[0]
         assert startup_warning.getMessage() == (
-            f"No admin key yet. Open https://ml.example.com/setup?token={token} "
-            "to create one, or run: agenticml server keys create --name admin --scope admin")
+            f"No admin user yet. Open https://ml.example.com/setup?token={token} "
+            "to create one, or run: agenticml server users add admin --role admin")
         httpd.verbose = True
         for query in ("", "?token=wrong", f"?token={token}&token={token}", "?token=%C3%A4"):
             status, _, body = call(httpd, "/setup" + query)
@@ -118,19 +124,17 @@ def test_setup_startup_page_and_single_use(tmp_path, caplog):
         assert status == 200 and b'history.replaceState(null, "", "/setup")' in script
         assert b"innerHTML" not in script
         status, hdrs, payload = setup(httpd)
-        assert status == 201 and payload["ok"] and payload["key"] == "admin"
-        assert payload["host"] == "https://ml.example.com/" and payload["host_source"] == "public_url"
+        assert status == 201 and payload == {"ok": True, "user": "admin", "role": "admin"}
         assert hdrs["Cache-Control"] == "no-store"
         assert "Secure" in hdrs["Set-Cookie"] and hdrs["Set-Cookie"].startswith("__Host-")
-        assert httpd.keys.verify(payload["value"]).scope == "admin"
+        admin = httpd.users.get("admin")
+        assert admin is not None and admin.role == "admin" and admin.password is not None
         cookie = hdrs["Set-Cookie"].split(";", 1)[0]
         assert call(httpd, "/api/server/session", headers={"Cookie": cookie})[0] == 200
-        assert setup(httpd)[0] == 404
+        assert setup(httpd, {"token": token})[0] == 404
         assert call(httpd, "/setup?token=" + token)[0] == 404
-        secrets = (token, payload["value"], httpd.keys.verify(payload["value"]).sha256)
-        assert all(secret not in record.getMessage()
-                   for record in caplog.records if record is not startup_warning
-                   for secret in secrets)
+        assert all(token not in record.getMessage()
+                   for record in caplog.records if record is not startup_warning)
 
 
 @pytest.mark.parametrize("failure,expected,message", [
@@ -142,8 +146,7 @@ def test_setup_startup_page_and_single_use(tmp_path, caplog):
 def test_setup_validation_does_not_consume(tmp_path, failure, expected, message):
     with running(tmp_path / "data") as httpd:
         token = httpd.web.setup_token
-        httpd.keys.create("taken")
-        payload = {"token": token}
+        payload = {"token": token, "password": SETUP_PASSWORD}
         headers = csrf(httpd)
         if failure == "csrf":
             del headers["Origin"]
@@ -156,6 +159,7 @@ def test_setup_validation_does_not_consume(tmp_path, failure, expected, message)
         elif failure == "name":
             payload["name"] = ".."
         elif failure == "taken":
+            httpd.users.add("taken")
             payload["name"] = "taken"
         elif failure == "non-object":
             payload = []
@@ -178,7 +182,7 @@ def test_setup_concurrent(tmp_path):
             return setup(httpd)[0]
         with ThreadPoolExecutor(max_workers=2) as pool:
             assert sorted(pool.map(submit, range(2))) == [201, 404]
-        assert len(httpd.keys.list()) == 1
+        assert [user.name for user in httpd.users.list()] == ["admin"]
 
 
 @pytest.mark.parametrize("first_method", ["GET", "POST"])
@@ -226,19 +230,15 @@ def test_setup_closed_marker_survives_cli_revoke_without_setup_hit(tmp_path, mon
 
 def test_setup_restart_clears_stale_marker(tmp_path):
     data = tmp_path / "data"
-    with running(data) as httpd:
-        httpd.keys.create("admin", "admin")
-        marker = httpd.keys.server_dir / "setup-closed"
-        assert marker.is_file()
-        httpd.keys.revoke("admin")
-        assert not httpd.keys.has_admin()
-        assert marker.is_file()
+    prepare_data_dir(data)
+    marker = data / "server" / "setup-closed"
+    marker.write_bytes(b"")
     with running(data) as httpd:
         token = httpd.web.setup_token
         assert token is not None
         assert not (httpd.keys.server_dir / "setup-closed").exists()
         status, _, payload = setup(httpd)
-        assert status == 201 and payload["ok"] and payload["key"] == "admin"
+        assert status == 201 and payload == {"ok": True, "user": "admin", "role": "admin"}
 
 
 def test_setup_closed_marker_mode_and_no_follow(tmp_path):
@@ -266,12 +266,13 @@ def test_setup_marker_write_failure_keeps_token(tmp_path, monkeypatch):
         with monkeypatch.context() as patch:
             patch.setattr(httpd.keys, "_write_setup_closed", fail)
             status, _, body = setup(httpd, {"token": token})
-            assert status == 503 and body == {"error": "key store unavailable"}
+            assert status == 503 and body == {
+                "error": "setup failed; retry or use agenticml server users"}
         assert (httpd.keys.path.read_bytes() if httpd.keys.path.exists() else None) == before
         assert not httpd.keys.has_admin()
-        assert not httpd.web._setup_used
+        assert httpd.users.get("admin") is None
         status, _, payload = setup(httpd, {"token": token})
-        assert status == 201 and payload["ok"] and payload["key"] == "admin"
+        assert status == 201 and payload == {"ok": True, "user": "admin", "role": "admin"}
 
 
 def test_sync_create_writes_no_marker(tmp_path):
@@ -341,6 +342,7 @@ def test_keys_lock_fifo_fails_promptly(tmp_path, caplog, operation, reader):
             assert results[0].web.setup_token is None
             assert [record.getMessage() for record in caplog.records
                     if record.levelno == logging.ERROR] == [
+                "could not lock keys store; migration skipped",
                 "could not lock keys store; setup disabled until the "
                 "file is fixed and the server restarts"]
             assert not any("/setup?token=" in record.getMessage() for record in caplog.records)
@@ -621,12 +623,12 @@ def test_setup_create_store_error_keeps_token(tmp_path, monkeypatch, error):
             raise error("private failure")
 
         with monkeypatch.context() as patch:
-            patch.setattr(httpd.keys, "create", failed)
+            patch.setattr(httpd.users, "add", failed)
             status, _, body = setup(httpd, {"token": token})
             assert status == 503 and body == {"error": "key store unavailable"}
             assert not httpd.web._setup_used
         status, _, payload = setup(httpd, {"token": token})
-        assert status == 201 and payload["ok"] and payload["key"] == "admin"
+        assert status == 201 and payload == {"ok": True, "user": "admin", "role": "admin"}
 
 
 def test_setup_create_name_taken_keeps_token(tmp_path, monkeypatch):
@@ -634,24 +636,25 @@ def test_setup_create_name_taken_keeps_token(tmp_path, monkeypatch):
         token = httpd.web.setup_token
 
         def failed(*_args, **_kwargs):
-            raise KeyNameTaken("key name already exists")
+            raise UserNameTaken("user name already exists")
 
         with monkeypatch.context() as patch:
-            patch.setattr(httpd.keys, "create", failed)
+            patch.setattr(httpd.users, "add", failed)
             status, _, body = setup(httpd, {"token": token, "name": "admin"})
-            assert status == 409 and body == {"error": "key name already exists"}
+            assert status == 409 and body == {"error": "user name already exists"}
             assert not httpd.web._setup_used
         status, _, payload = setup(httpd, {"token": token, "name": "operator"})
-        assert status == 201 and payload["ok"] and payload["key"] == "operator"
+        assert status == 201 and payload == {"ok": True, "user": "operator", "role": "admin"}
 
 
 def test_setup_create_value_error_is_private(tmp_path, monkeypatch):
     with running(tmp_path / "data") as httpd:
         def failed(*args, **kwargs):
             raise ValueError("secret detail aml_x")
-        monkeypatch.setattr(httpd.keys, "_write", failed)
+        monkeypatch.setattr(httpd.users, "_write", failed)
         status, _, body = call(httpd, "/setup", "POST",
-                               json.dumps({"token": httpd.web.setup_token}), csrf(httpd))
+                               json.dumps({"token": httpd.web.setup_token,
+                                           "password": SETUP_PASSWORD}), csrf(httpd))
         assert status == 400
         assert b"secret detail aml_x" not in body
         assert json.loads(body) == {"error": "invalid request"}
@@ -691,7 +694,7 @@ def test_list_public_fields_runs_order_and_env(tmp_path):
         for name, owner in (("one", "z-box"), ("two", "z-box"), ("three", "a-box")):
             path = runs / name
             path.mkdir()
-            (path / "remote.json").write_text(json.dumps({"owner": owner}))
+            (path / "remote.json").write_text(json.dumps({"owner": "admin", "owner_key": owner}))
         (runs / "linked").symlink_to(runs / "one", target_is_directory=True)
         (runs / "bad").mkdir()
         (runs / "bad" / "remote.json").write_text("broken")
@@ -701,7 +704,8 @@ def test_list_public_fields_runs_order_and_env(tmp_path):
         assert payload["host_source"] == "request"
         rows = payload["keys"]
         assert [row["name"] for row in rows] == ["a-box", "z-box", "env"]
-        fields = {"name", "scope", "prefix", "created_at", "created_by", "last_used_at", "runs", "revocable"}
+        fields = {"name", "scope", "user", "prefix", "created_at", "created_by", "last_used_at",
+                  "runs", "revocable", "active"}
         assert all(set(row) == fields for row in rows)
         assert [row["runs"] for row in rows] == [1, 2, 0]
         assert [row["revocable"] for row in rows] == [True, True, False]
@@ -1097,4 +1101,5 @@ def test_api_key_cli_login_and_sync(server, tmp_path, monkeypatch):
         assert remote.series(name) == source.series(name)
     assert (remote.run_dir / "events.jsonl").read_bytes() == (source.run_dir / "events.jsonl").read_bytes()
     assert (remote.run_dir / "media/index.json").read_bytes() == (source.run_dir / "media/index.json").read_bytes()
-    assert json.loads((remote.run_dir / "remote.json").read_bytes())["owner"] == "box"
+    remote_obj = json.loads((remote.run_dir / "remote.json").read_bytes())
+    assert remote_obj["owner"] == "admin" and remote_obj["owner_key"] == "box"

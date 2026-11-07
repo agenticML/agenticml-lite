@@ -8,8 +8,8 @@ read it at the start of a session (see [AGENTS.md](../../AGENTS.md)). Detailed
 plans live next to it:
 
 - Release 2.0: [on-prem-server-plan.md](on-prem-server-plan.md)
-- Releases 2.1 and 2.2: sketched below; each gets its own plan document before
-  work starts.
+- Release 2.1: sketched below, with package plans in `packages/`.
+- Release 2.2: [on-prem-teams-plan.md](on-prem-teams-plan.md)
 
 ## Product direction
 
@@ -122,13 +122,13 @@ Update the status column in the PR that changes it. Values: `not started`,
 Design constraints carried from 2.0: the server stays standard-library only
 and keeps a single v1 store; team state lives beside it in `<data>/server/`.
 
-| # | Package | Depends on | Size | Plan | Status |
-| --- | --- | --- | --- | --- | --- |
-| 11 † | Users and roles | 2.0 | M | to write | not started |
-| 12 † | Per-user keys and run ownership | 11 | M | to write | not started |
-| 13 † | Dashboard sign-in through a trusted identity proxy | 11 | M | to write | not started |
-| 14 | Audit log | 11 | S | to write | not started |
-| 15 | Team admin page in the dashboard | 11–14 | M | to write | not started |
+| # | Package | Depends on | Coder | Size | Plan | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| 11 † | Users, roles, migration, run ownership by user | 2.1 | Cursor | L | [plan](packages/11-users-and-roles.md) | done (2.2 PR) |
+| 12 † | Per-user key management and sync attribution | 11 | Codex | M | [plan](packages/12-per-user-keys.md) | done (2.2 PR) |
+| 13 † | Dashboard sign-in: passwords, invites, trusted identity proxy | 11 | Cursor | L | [plan](packages/13-sign-in.md) | done (2.2 PR) |
+| 14 | Audit log | 11–13 | Codex | S–M | [plan](packages/14-audit-log.md) | done (2.2 PR) |
+| 15 | Team admin page, account menu, end-to-end teams test | 11–14 | Cursor | M–L | [plan](packages/15-team-admin-page.md) | done (2.2 PR) |
 
 - **11 Users and roles.** `users.json` with `admin`, `member` and `viewer`
   roles. `agenticml server users add|list|remove|set-role`. Admin manages users
@@ -152,14 +152,20 @@ and keeps a single v1 store; team state lives beside it in `<data>/server/`.
 - **15 Admin page.** Manage users, roles and keys from the dashboard (admin
   only), with the same CSRF and session rules as notes.
 
-Admin login is redesigned in 2.2 (decided Nov 3, 2026). 2.0 signs in with an
-admin API key as a stopgap. Package 13 replaces that for people; options to
-settle in the 2.2 plan: identity proxy only, built-in username and password
-(scrypt, stdlib), or both. Keys stay for machines.
+Decided Nov 6, 2026 (recommended options, taken for the owner; details in
+the [2.2 plan](on-prem-teams-plan.md#decisions-made-for-the-owner-nov-6-2026)):
+viewers see every project (no project-level access in 2.2), and people sign
+in with a password (scrypt, set from a one-time invite link) or through a
+trusted identity proxy; admin-key login stays as a fallback and keys stay
+for machines.
 
-Before 2.2 starts: decide whether viewers see every project or project-level
-access is needed. Project-level access changes the store reader and is the
-largest open design question for teams.
+### Maintenance fixes
+
+- Empty object and lineage upload framing: [plan](packages/fix-empty-uploads.md),
+  found in the 2.2 compatibility check; status: done (2.2 PR).
+- Version 2.2.0, transient Git failures answer 503, runs no longer track
+  their own store files, and the dashboard last-admin-key rule counts only
+  usable keys: [plan](packages/backlog-2.2-fixes.md); status: done (2.2 PR).
 
 ### Later (unscheduled)
 
@@ -168,6 +174,8 @@ largest open design question for teams.
 - S3 object backend for `objects/`.
 - Server-side `gc`, retention and per-user quotas.
 - Two-way notes sync between machines and the server.
+- Project-level access (viewers or members limited to some projects).
+  Changes the store reader; deferred from 2.2.
 
 ## Backlog
 
@@ -175,21 +183,18 @@ Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
-- **Funnel visitors share one failed-login throttle bucket** (found in the
-  package 10b review, Nov 6, 2026).
-  - Where: `src/agenticml/server/webauth.py` `LoginThrottle`, keyed by
-    `client_address`; `agenticml server up` serves on loopback behind
-    Tailscale Funnel.
-  - Problem: every internet request through Funnel arrives from 127.0.0.1,
-    so anyone sending bad keys can delay the admin's sign-in and every sync
-    client's requests by up to 60 s at a time. Documented in
-    `docs/SERVER.md`; the same limitation applies behind any reverse proxy.
-  - Fix: in package 13 (trusted identity proxy), key the throttle by the
-    forwarded client address taken only from configured proxy connections;
-    for `server up`, treat the local Tailscale proxy as that configured
-    proxy.
-  - Done when: a test with two forwarded client addresses behind one proxy
-    shows failures from one do not delay the other.
+- **Compatibility owner rule can mislead a 2.0/2.1 client** (package 11
+  review, Nov 6, 2026). Blocked until no 2.0/2.1 sync clients remain.
+  - Where: `src/agenticml/server/ingest.py` `compat_owner`.
+  - Problem: old clients compare `owner` with their key name; another user
+    whose user name equals the client's key name looks like the client's own
+    run. The server's 409 stays authoritative, so there is no access, only a
+    confusing client message.
+  - Fix: the client half is done (package 12: 2.2 clients compare
+    `owner_user` with `whoami.user`). In a later release, once 2.0/2.1
+    clients are unsupported, return the real owner user in `owner` and drop
+    the rule.
+  - Done when: `compat_owner` is gone and a test covers the collision.
 - **Check `agenticml server up` on a real tailnet** (package 10b caveat,
   Nov 6, 2026).
   - Where: `src/agenticml/server/up.py`; `docs/SERVER.md` quick start.
@@ -220,15 +225,3 @@ priority.
   - Done when: `docs/SERVER.md` shows real-EFS numbers for 1 and 8 clients,
     labelled as such with mount details, and the recommendations are
     confirmed or updated.
-- **Transient Git failures during a lineage receive become permanent skips**
-  (found in package 7 review, Nov 6, 2026).
-  - Where: `src/agenticml/server/lineage.py` `receive()`, the
-    `CalledProcessError` mapping for `index-pack`, `rev-list` and `cat-file`.
-  - Problem: a full disk (ENOSPC) or similar environment error from those
-    commands answers 422 `invalid bundle`, which the client records as a
-    permanent lineage skip for that run.
-  - Fix: tell validation failures apart from environment failures (check
-    free space first, or inspect the exit status and errno-like stderr
-    under `LC_ALL=C`) and answer 503 for the latter.
-  - Done when: a test that makes `index-pack` fail with a simulated ENOSPC
-    gets 503 and the client retries without remembering a skip.

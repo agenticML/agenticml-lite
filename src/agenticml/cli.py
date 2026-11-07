@@ -487,12 +487,23 @@ def cmd_ui(args):
 
 def cmd_server_serve(args):
     from .server import serve
+    from .server.webauth import parse_identity_header, parse_trusted_proxies
 
     public_url = args.public_url
     if public_url is None:
         public_url = os.environ.get("AGENTICML_SERVER_PUBLIC_URL") or None
+    if args.trusted_proxy is None:
+        raw = os.environ.get("AGENTICML_SERVER_TRUSTED_PROXIES", "")
+        proxies = [part.strip() for part in raw.split(",") if part.strip()]
+    else:
+        proxies = args.trusted_proxy
+    identity = args.identity_header
+    if identity is None:
+        identity = os.environ.get("AGENTICML_SERVER_IDENTITY_HEADER") or None
     try:
-        serve(args.data, args.host, args.port, public_url)
+        serve(args.data, args.host, args.port, public_url,
+              trusted_proxies=parse_trusted_proxies(proxies),
+              identity_header=parse_identity_header(identity))
     except KeyboardInterrupt:
         pass
     except (OSError, ValueError, OverflowError) as exc:
@@ -530,17 +541,33 @@ def cmd_server_up(args):
     return 0
 
 
-def cmd_server_keys(args):
+def _server_data_dir(args):
     from .server.app import resolve_data_dir
+
+    data = resolve_data_dir(args.data)
+    data.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory = data / "server"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("server directory is a symlink or not a directory")
+    return data, directory
+
+
+_MIGRATE_FAILED = "could not migrate keys.json; fix the file and retry"
+
+
+def cmd_server_keys(args):
+    from .server.audit import AuditLog, cli_actor
     from .server.keys import KeyStore, KeyStoreUnavailable
+    from .server.users import UserStore, migrate
 
     try:
-        data = resolve_data_dir(args.data)
-        data.mkdir(mode=0o700, parents=True, exist_ok=True)
-        directory = data / "server"
-        directory.mkdir(mode=0o700, exist_ok=True)
-        if directory.is_symlink() or not directory.is_dir():
-            raise ValueError("server directory is a symlink or not a directory")
+        data, directory = _server_data_dir(args)
+        actor = cli_actor()
+        log = AuditLog(directory)
+        if not migrate(data, actor=actor):
+            print(f"agenticml server: {_MIGRATE_FAILED}", file=sys.stderr)
+            return 1
         keys = KeyStore(directory, env_key=None)
         if args.keys_action == "list":
             try:
@@ -548,18 +575,35 @@ def cmd_server_keys(args):
             except ValueError as exc:
                 print(f"agenticml server: warning: {exc}; listing file keys only", file=sys.stderr)
         if args.keys_action == "create":
-            _, key = keys.create(args.name, args.scope)
+            created_users = []
+            record, key = keys.create(
+                args.name, args.scope, user=args.user, created_users=created_users)
+            if created_users:
+                log.record(actor, "cli", "user.add", record.user,
+                           detail={"role": "admin", "identity": None})
+            log.record(actor, "cli", "key.create", record.name,
+                       detail={"user": record.user, "scope": record.scope})
             print(key)
             print("shown once; store it now", file=sys.stderr)
         elif args.keys_action == "revoke":
-            if not keys.revoke(args.name):
+            record = keys.revoke(args.name)
+            if not record:
                 raise ValueError("unknown key name")
+            log.record(actor, "cli", "key.revoke", record.name,
+                       detail={"user": record.user, "scope": record.scope})
         else:
-            records = [record.to_public() for record in keys.list()]
+            user = args.user
+            if user is not None:
+                from .server.keys import validate_name
+                validate_name(user)
+                if UserStore(directory).get(user) is None:
+                    raise ValueError("unknown user")
+            records = [record.to_public() for record in keys.list()
+                       if user is None or record.user == user]
             if args.json:
                 print(json.dumps(records))
             else:
-                fields = ("name", "scope", "prefix", "created_at", "created_by", "last_used_at")
+                fields = ("name", "scope", "user", "prefix", "created_at", "created_by", "last_used_at")
                 _print_table([list(fields)] + [[str(record[field] or "-") for field in fields]
                                               for record in records])
     except KeyboardInterrupt:
@@ -569,6 +613,115 @@ def cmd_server_keys(args):
         print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
         return 1
     return 0
+
+
+def _invite_base(args):
+    url = getattr(args, "public_url", None) or os.environ.get("AGENTICML_SERVER_PUBLIC_URL")
+    if isinstance(url, str) and url.strip():
+        return url.strip().rstrip("/")
+    return None
+
+
+def _print_invite(token, base):
+    if base:
+        print(f"{base}/invite?token={token}")
+    else:
+        print(f"/invite?token={token}")
+        print("open it on your server's address")
+
+
+def _read_cli_password(args):
+    if getattr(args, "stdin", False):
+        raw = sys.stdin.readline()
+        if raw.endswith("\n"):
+            raw = raw[:-1]
+        if raw.endswith("\r"):
+            raw = raw[:-1]
+        return raw
+    import getpass
+    first = getpass.getpass("Password: ")
+    second = getpass.getpass("Confirm: ")
+    if first != second:
+        raise ValueError("passwords do not match")
+    return first
+
+
+def cmd_server_users(args):
+    from .server.audit import AuditLog, cli_actor
+    from .server.keys import KeyStore, KeyStoreUnavailable
+    from .server.users import UserStore, migrate
+
+    try:
+        data, directory = _server_data_dir(args)
+        actor = cli_actor()
+        log = AuditLog(directory)
+        if not migrate(data, actor=actor):
+            print(f"agenticml server: {_MIGRATE_FAILED}", file=sys.stderr)
+            return 1
+        users = UserStore(directory)
+        keys = KeyStore(directory)
+        if args.users_action == "add":
+            user = users.add(args.name, role=args.role, identity=args.identity,
+                             reclaim_runs=args.reclaim_runs)
+            log.record(actor, "cli", "user.add", user.name,
+                       detail={"role": user.role, "identity": user.identity})
+            if not args.no_invite:
+                token = users.create_invite(args.name)
+                log.record(actor, "cli", "user.invite", args.name,
+                           detail={"expires_at": users.get(args.name).invite["expires_at"]})
+                _print_invite(token, _invite_base(args))
+        elif args.users_action == "invite":
+            token = users.create_invite(args.name)
+            log.record(actor, "cli", "user.invite", args.name,
+                       detail={"expires_at": users.get(args.name).invite["expires_at"]})
+            _print_invite(token, _invite_base(args))
+        elif args.users_action == "set-password":
+            users.set_password(args.name, _read_cli_password(args))
+            log.record(actor, "cli", "user.password", args.name, detail={"method": "cli"})
+        elif args.users_action == "remove":
+            removed_keys = keys.for_user(args.name)
+            revoked = users.remove(args.name)
+            for record in removed_keys:
+                log.record(actor, "cli", "key.revoke", record.name,
+                           detail={"user": record.user, "scope": record.scope})
+            log.record(actor, "cli", "user.remove", args.name, detail={"keys_revoked": revoked})
+            print(f"removed {args.name} ({revoked} keys)")
+        elif args.users_action == "set-role":
+            previous = users.get(args.name)
+            users.set_role(args.name, args.role)
+            log.record(actor, "cli", "user.role", args.name,
+                       detail={"from": previous.role, "to": args.role})
+        elif args.users_action == "set-identity":
+            user = users.set_identity(args.name, args.identity)
+            log.record(actor, "cli", "user.identity", args.name,
+                       detail={"identity": user.identity})
+        else:
+            rows = []
+            for user in users.list():
+                public = user.to_public()
+                public["keys"] = len(keys.for_user(user.name))
+                rows.append(public)
+            if args.json:
+                print(json.dumps(rows))
+            else:
+                fields = ("name", "role", "identity", "keys", "created_at", "created_by")
+                _print_table([list(fields)] + [
+                    [str(row[field] if row[field] not in (None, "") else "-") for field in fields]
+                    for row in rows
+                ])
+    except KeyboardInterrupt:
+        print("stopped")
+        return 0
+    except (OSError, ValueError, OverflowError, KeyStoreUnavailable) as exc:
+        print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_server_audit(args):
+    from .server.audit import cli_main
+
+    return cli_main(args.data, args.limit, args.json)
 
 
 def _cmd_server_report(args, verify=False):
@@ -1144,11 +1297,20 @@ def main(argv=None):
 
     p_server = sub.add_parser("server", help="Serve and administer an on-prem store")
     server_sub = p_server.add_subparsers(dest="server_action", required=True)
+    p_audit = server_sub.add_parser("audit", help="Show recent audit events")
+    p_audit.add_argument("--data", default=None)
+    p_audit.add_argument("--limit", type=int, default=50)
+    p_audit.add_argument("--json", action="store_true")
+    p_audit.set_defaults(func=cmd_server_audit)
     p_serve = server_sub.add_parser("serve", help="Serve protocol v2 ingest")
     p_serve.add_argument("--data", default=None, help="Data directory (default: AGENTICML_SERVER_DATA or ~/.agenticml-server)")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8080)
     p_serve.add_argument("--public-url", default=None, help="Public server URL (default: AGENTICML_SERVER_PUBLIC_URL)")
+    p_serve.add_argument("--trusted-proxy", action="append", default=None, metavar="CIDR",
+                        help="Trust this proxy CIDR for X-Forwarded-For and identity headers (repeatable)")
+    p_serve.add_argument("--identity-header", choices=("alb", "tailscale", "oauth2-proxy"),
+                        default=None, help="Honour this proxy identity header (requires --trusted-proxy)")
     p_serve.set_defaults(func=cmd_server_serve)
     p_up = server_sub.add_parser("up", help="Serve on loopback through Tailscale Funnel")
     p_up.add_argument("--data", default=None, help="Data directory (default: AGENTICML_SERVER_DATA or ~/.agenticml-server)")
@@ -1172,10 +1334,51 @@ def main(argv=None):
         if action == "create":
             child.add_argument("--name", required=True)
             child.add_argument("--scope", choices=("sync", "admin"), default="sync")
+            child.add_argument("--user", default=None)
         elif action == "list":
             child.add_argument("--json", action="store_true")
+            child.add_argument("--user", default=None)
         else:
             child.add_argument("name")
+    p_users = server_sub.add_parser("users", help="Add, list, remove, or change users")
+    users_sub = p_users.add_subparsers(dest="users_action", required=True)
+    p_users_add = users_sub.add_parser("add")
+    p_users_add.add_argument("name")
+    p_users_add.add_argument("--role", choices=("viewer", "member", "admin"), default="member")
+    p_users_add.add_argument("--identity", default=None)
+    p_users_add.add_argument("--reclaim-runs", action="store_true")
+    p_users_add.add_argument("--no-invite", action="store_true")
+    p_users_add.add_argument("--public-url", default=None)
+    p_users_add.add_argument("--data", default=None)
+    p_users_add.set_defaults(func=cmd_server_users)
+    p_users_invite = users_sub.add_parser("invite")
+    p_users_invite.add_argument("name")
+    p_users_invite.add_argument("--public-url", default=None)
+    p_users_invite.add_argument("--data", default=None)
+    p_users_invite.set_defaults(func=cmd_server_users)
+    p_users_password = users_sub.add_parser("set-password")
+    p_users_password.add_argument("name")
+    p_users_password.add_argument("--stdin", action="store_true")
+    p_users_password.add_argument("--data", default=None)
+    p_users_password.set_defaults(func=cmd_server_users)
+    p_users_list = users_sub.add_parser("list")
+    p_users_list.add_argument("--json", action="store_true")
+    p_users_list.add_argument("--data", default=None)
+    p_users_list.set_defaults(func=cmd_server_users)
+    p_users_remove = users_sub.add_parser("remove")
+    p_users_remove.add_argument("name")
+    p_users_remove.add_argument("--data", default=None)
+    p_users_remove.set_defaults(func=cmd_server_users)
+    p_users_role = users_sub.add_parser("set-role")
+    p_users_role.add_argument("name")
+    p_users_role.add_argument("role", choices=("viewer", "member", "admin"))
+    p_users_role.add_argument("--data", default=None)
+    p_users_role.set_defaults(func=cmd_server_users)
+    p_users_identity = users_sub.add_parser("set-identity")
+    p_users_identity.add_argument("name")
+    p_users_identity.add_argument("identity", nargs="?", default=None)
+    p_users_identity.add_argument("--data", default=None)
+    p_users_identity.set_defaults(func=cmd_server_users)
 
     p_sync = sub.add_parser("sync", help="Incrementally upload local runs to a server")
     p_sync.add_argument("run_ids", nargs="*", metavar="RUN_ID")

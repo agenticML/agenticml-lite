@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import ipaddress
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -28,6 +29,8 @@ from urllib.parse import parse_qs, unquote, urlsplit
 import webbrowser
 
 from agenticml.store import layout, notes, reader
+
+logger = logging.getLogger("agenticml.ui.server")
 
 _STATIC = Path(__file__).with_name("static")
 _FILES = {
@@ -1169,6 +1172,17 @@ def _media_type(value):
     return value.split(";", 1)[0].strip().lower()
 
 
+def _notes_writable(handler):
+    """Local mode follows read_only; server mode follows the principal's notes action."""
+    if getattr(handler.server, "auth", None) is None:
+        return not handler.server.read_only
+    principal = getattr(handler, "principal", None)
+    if principal is None:
+        return False
+    from agenticml.server.users import allowed
+    return allowed(principal, "notes")
+
+
 def _note_run_id(raw_path):
     """Run id when ``raw_path`` is exactly ``/api/runs/<id>/notes``."""
     try:
@@ -1400,7 +1414,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._put()
         except notes.NoteConflict as exc:
             note = dict(exc.note)
-            note["writable"] = True
+            note["writable"] = _notes_writable(self)
             self._error({"error": "conflict", "note": note}, 409)
         except notes.NoteTooLarge:
             self._error({"error": "note too large"}, 413)
@@ -1545,6 +1559,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             self._error({"error": "read-only"}, 403)
             return
+        if getattr(self.server, "auth", None) is not None and not _notes_writable(self):
+            self.close_connection = True
+            self._error({"error": "read-only"}, 403)
+            return
         if not self._csrf_ok():
             self.close_connection = True
             self._error({"error": "cross-site request refused"}, 403)
@@ -1580,8 +1598,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             raise ValueError("short body")
         text, revision = _parse_note_body(body)
         saved = notes.write_note(self.server.root, run_id, text, revision)
-        saved["writable"] = True
+        self._audit_note(run_id, saved)
+        saved["writable"] = _notes_writable(self)
         self._json(saved)
+
+    def _audit_note(self, run_id, saved):
+        try:
+            if getattr(self.server, "audit", None) is not None:
+                self.server.audit.record(
+                    self.principal.user, self.principal.via, "note.write", run_id,
+                    self.server.auth.client_address(self), {"revision": saved["revision"]})
+        except Exception:
+            logger.error("could not record audit event")
 
     def __getattr__(self, name):
         if name.startswith("do_"):
@@ -1668,14 +1696,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             else:
                 project = None
             listed = notes.list_notes(self.server.root, project)
-            listed["writable"] = not self.server.read_only
+            listed["writable"] = _notes_writable(self)
             return self._json(listed)
         if path == "/api/runs":
             from ..lineage import run_task
 
             fields = ("run_id", "project", "name", "created_at", "finished_at", "tags", "group")
             runs = []
-            for meta in reader.list_runs(self.server.root):
+            for meta in reader.list_runs(self.server.root, include_owner=self.server.auth is not None):
                 if not isinstance(meta, dict):
                     continue
                 row = {k: meta.get(k) for k in fields}
@@ -1695,6 +1723,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 last_sync_at = meta.get("last_sync_at")
                 if last_sync_at is not None or self.server.auth is not None:
                     row["last_sync_at"] = last_sync_at
+                if self.server.auth is not None:
+                    row["owner"] = meta.get("_remote_owner")
                 runs.append(row)
             return self._json(runs)
         if path.startswith("/api/runs/"):
@@ -1710,7 +1740,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 raise FileNotFoundError()
             if route == "notes":
                 note = notes.read_note(self.server.root, run_id)
-                note["writable"] = not self.server.read_only
+                note["writable"] = _notes_writable(self)
                 return self._json(note)
             with self.server.run_reader(run_id) as run:
                 if route == "":
@@ -1719,6 +1749,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     last_sync_at = run.last_sync_at()
                     if last_sync_at is not None or self.server.auth is not None:
                         result["last_sync_at"] = last_sync_at
+                    if self.server.auth is not None:
+                        remote = reader.read_remote(run_path)
+                        result["owner"] = remote["owner"] if remote else None
                 elif route == "scalars":
                     limit = max(10, min(5000, int(arg("max_points", "1000"))))
                     start, end = arg("start"), arg("end")

@@ -251,8 +251,10 @@ def read_remote(run_path) -> dict | None:
     owner = data.get("owner")
     if not isinstance(owner, str):
         owner = None
+    attribution = {name: data.get(name) if isinstance(data.get(name), str) else None
+                   for name in ("owner_key", "last_sync_key")}
     if "status" not in data:
-        return {"status": None, "last_sync_at": None, "owner": owner}
+        return {"status": None, "last_sync_at": None, "owner": owner, **attribution}
     status = data.get("status")
     if not isinstance(status, str) or status not in _REMOTE_STATUSES:
         _warn_remote_once(directory, "invalid remote.json status %r in %s", status, directory)
@@ -265,7 +267,7 @@ def read_remote(run_path) -> dict | None:
             last_sync_at = None
     else:
         last_sync_at = None
-    return {"status": status, "last_sync_at": last_sync_at, "owner": owner}
+    return {"status": status, "last_sync_at": last_sync_at, "owner": owner, **attribution}
 
 
 def _remote_status(remote: dict, now: float) -> str:
@@ -287,7 +289,7 @@ def _remote_status(remote: dict, now: float) -> str:
     return "stale"
 
 
-def list_runs(root) -> list[dict]:
+def list_runs(root, *, include_owner=False) -> list[dict]:
     """One dict per run, newest ``created_at`` first.
 
     Only ``meta.json`` is parsed for identity. Directories whose names are
@@ -296,7 +298,8 @@ def list_runs(root) -> list[dict]:
     once. A valid ``remote.json`` takes precedence for ``effective_status``
     and may add ``last_sync_at``. Otherwise running runs need both a free
     lock and an old heartbeat to be crashed. An unknown lock with an old
-    heartbeat indicates a stale run.
+    heartbeat indicates a stale run. ``include_owner`` carries the normalized
+    remote owner in ``_remote_owner`` for server dashboard list responses.
     """
     root_path = Path(root).expanduser().resolve()
     runs_root = str(root_path / "runs")
@@ -338,6 +341,8 @@ def list_runs(root) -> list[dict]:
                     )
                 meta["run_id"] = dir_run_id
             remote = read_remote(entry_path)
+            if include_owner:
+                meta["_remote_owner"] = remote["owner"] if remote else None
             meta["effective_status"] = _status_from(meta, entry_path, now, remote)
             if remote is not None and remote["last_sync_at"] is not None:
                 meta["last_sync_at"] = remote["last_sync_at"]

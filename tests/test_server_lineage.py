@@ -16,7 +16,7 @@ from agenticml.server import app
 from agenticml.server import lineage as server_lineage
 from agenticml.store import RunReader, RunWriter
 from agenticml.ui.server import _lineage_changes
-from test_server_ingest import running, request, raw, auth
+from test_server_ingest import running, request, raw, auth, foreign_key
 from test_sync import remote, push, state
 from test_server_web import authed
 
@@ -153,6 +153,47 @@ def test_ref_conflict_is_immutable(remote, snapshots, tmp_path):
     assert_tmp_clean(server)
 
 
+@pytest.mark.parametrize("comment", ["x: Input/output error", "x: No space left on device"])
+@pytest.mark.parametrize("echo_comment", [False, True])
+def test_malicious_prerequisite_comment_stays_missing(remote, snapshots, tmp_path, monkeypatch, comment, echo_comment):
+    server, client = remote
+    parent, child = snapshots
+    meta(client, child)
+    data = bundle(child, tmp_path, [info(parent)["commit"]])
+    prerequisite = b"-" + info(parent)["commit"].encode() + b" "
+    lines = data.split(b"\n", 2)
+    assert lines[1].startswith(prerequisite)
+    lines[1] = prerequisite + comment.encode()
+    data = b"\n".join(lines)
+    git = server_lineage._git
+    verified = []
+    def capture(repo, args, **kwargs):
+        result = git(repo, args, **kwargs)
+        if args[0] == "bundle":
+            if echo_comment:
+                # Some Git versions omit the comment. Exercise the reported
+                # stderr form too, after real verification of the hostile header.
+                result.stderr += f"error: {info(parent)['commit']} {comment}\n".encode()
+            verified.append(result.stderr)
+        return result
+    def classify(*args):
+        pytest.fail("missing prerequisites must bypass environment classification")
+    monkeypatch.setattr(server_lineage, "_git", capture)
+    monkeypatch.setattr(server_lineage, "_environment_failure", classify)
+    with pytest.raises(requests.HTTPError) as exc:
+        upload(client, child, data)
+    assert exc.value.response.status_code == 422
+    assert exc.value.response.json() == {"error": "missing prerequisite"}
+    assert len(verified) == 1
+    assert b"Repository lacks these prerequisite commits" in verified[0]
+    assert f"error: {info(parent)['commit']} ".encode() in verified[0]
+    if echo_comment:
+        assert f"error: {info(parent)['commit']} {comment}".encode() in verified[0]
+    assert refs(server, child) == b""
+    assert objects(server, child) == []
+    assert_tmp_clean(server)
+
+
 def test_missing_prerequisite_and_full_retry(remote, snapshots, tmp_path, monkeypatch):
     server, client = remote
     parent, child = snapshots
@@ -230,7 +271,7 @@ def test_limits_ownership_and_missing_lineage(remote, snapshots, tmp_path):
     server.limits.lineage_body = 10
     assert raw(server, "PUT", path, auth(server) + [("Content-Length", "11")])[0] == 413
     assert raw(server, "PUT", path, auth(server))[0] == 411
-    other_key = server.keys.create("other")[1]
+    other_key = foreign_key(server)
     for method in ("GET", "PUT"):
         assert request(server, path, method, b"x" if method == "PUT" else None, key=other_key)[0] == 409
         assert request(server, "/v2/runs/unknown/lineage", method, b"x" if method == "PUT" else None)[0] == 404
@@ -473,7 +514,225 @@ def test_server_commit_peels_tags(remote, snapshots):
     assert upload(client, parent, b"# v2 git bundle\n" + commit.encode() + b" refs/runs/parent\n\nPACK")["created"] is False
 
 
-@pytest.mark.parametrize("failure", ["timeout", "oserror", "ref", "ref_timeout", "rename"])
+@pytest.mark.parametrize("command", ["bundle", "index-pack", "rev-list", "cat-file"])
+@pytest.mark.parametrize("message", [
+    "fatal: write error: No space left on device",
+    "error: write error: Disk quota exceeded",
+    "fatal: write error: Read-only file system",
+    "fatal: mmap failed: Cannot allocate memory",
+    "fatal: Out of memory, malloc failed (tried to allocate 4096 bytes)",
+    "fatal: unable to create temporary file '/tmp/git_XXXXXX': Too many open files",
+    "fatal: unable to create thread: Resource temporarily unavailable",
+    "fatal: write error: Input/output error",
+])
+def test_receive_git_environment_failures_are_retryable(remote, snapshots, tmp_path, monkeypatch, command, message):
+    server, client = remote
+    parent, _ = snapshots
+    meta(client, parent)
+    data = bundle(parent, tmp_path)
+    git = server_lineage._git
+    usage = shutil.disk_usage(tmp_path)
+    failed = False
+    space_checks = []
+    def disk_usage(repo):
+        space_checks.append(repo)
+        return usage._replace(free=0 if failed else 2 * len(data) + 64 * 1024 * 1024)
+    def fail(repo, args, **kwargs):
+        nonlocal failed
+        if args[0] == command:
+            failed = True
+            stderr = message.encode()
+            if command == "bundle":
+                assert kwargs["check"] is False
+                return subprocess.CompletedProcess(["git", *args], 1, stdout=b"", stderr=stderr)
+            raise subprocess.CalledProcessError(128, ["git", *args], stderr=stderr)
+        return git(repo, args, **kwargs)
+    monkeypatch.setattr(server_lineage.shutil, "disk_usage", disk_usage)
+    monkeypatch.setattr(server_lineage, "_git", fail)
+    with pytest.raises(requests.HTTPError) as exc:
+        upload(client, parent, data)
+    assert exc.value.response.status_code == 503
+    assert exc.value.response.json() == {"error": "lineage busy"}
+    assert exc.value.response.headers["Retry-After"] == "5"
+    assert refs(server, parent) == b""
+    assert objects(server, parent) == []
+    assert client.lineage_state("parent")["commit"] is None
+    repo = lineage._repo_path(server.root, info(parent)["project_key"])
+    assert space_checks == [repo] * (2 if message.endswith(("No space left on device", "Disk quota exceeded")) else 1)
+    assert_tmp_clean(server)
+
+
+@pytest.mark.parametrize("oid_length", [40, 64])
+@pytest.mark.parametrize("comment", ["x: Input/output error", "x: No space left on device"])
+def test_environment_failure_ignores_oid_comment(tmp_path, monkeypatch, oid_length, comment):
+    def disk_usage(repo):
+        pytest.fail("sender-controlled OID comments must not trigger space checks")
+    monkeypatch.setattr(server_lineage.shutil, "disk_usage", disk_usage)
+    message = f"error: {'a' * oid_length} {comment}"
+    assert not server_lineage._environment_failure(message, tmp_path, 1024)
+    assert server_lineage._environment_failure(message + "\nfatal: write error: Input/output error", tmp_path, 1024)
+
+
+@pytest.mark.parametrize("diagnostic", [
+    "fatal: fsck error in packed object",
+    "error: object " + "a" * 40 + ": gitmodulesPath: disallowed submodule path: -",
+])
+def test_environment_failure_ignores_fsck_diagnostics(tmp_path, monkeypatch, diagnostic):
+    def disk_usage(repo):
+        pytest.fail("fsck diagnostics must bypass environment checks")
+    monkeypatch.setattr(server_lineage.shutil, "disk_usage", disk_usage)
+    message = ("fatal: Out of memory, malloc failed (tried to allocate 5 bytes)\n"
+               "fatal: write error: No space left on device\n" + diagnostic)
+    assert not server_lineage._environment_failure(message, tmp_path, 1024)
+
+
+def test_forged_gitmodules_fatal_line_stays_invalid(remote, snapshots, tmp_path, monkeypatch):
+    server, client = remote
+    parent, child = snapshots
+    assert push(remote, parent).complete
+    repo = lineage._repo_path(child.root, info(child)["project_key"])
+    def git(*args, **kwargs):
+        return lineage._git(list(args), repo=repo, **kwargs).stdout.strip().decode()
+    forged = "fatal: Out of memory, malloc failed (tried to allocate 5 bytes)"
+    # Git config decodes the escaped newlines before fsck reports the path.
+    content = ('[submodule "evil"]\n\tpath = "-\\n' + forged + '\\n"\n\turl = ./evil\n').encode()
+    blob = git("hash-object", "-w", "--stdin", input=content)
+    tree = git("mktree", input=f"100644 blob {blob}\t.gitmodules\n".encode())
+    commit = git("commit-tree", tree, "-m", "forged fsck diagnostic")
+    git("update-ref", "refs/runs/child", commit)
+    path = tmp_path / "forged-gitmodules.bundle"
+    git("bundle", "create", str(path), "refs/runs/child")
+    meta(client, child, {**info(child), "commit": commit})
+    before, before_objects = refs(server, parent), objects(server, parent)
+    real_git = server_lineage._git
+    diagnostics = []
+    def capture(repo, args, **kwargs):
+        try:
+            return real_git(repo, args, **kwargs)
+        except subprocess.CalledProcessError as exc:
+            if args[0] == "index-pack":
+                diagnostics.append(exc.stderr.decode(errors="replace"))
+            raise
+    monkeypatch.setattr(server_lineage, "_git", capture)
+    with pytest.raises(requests.HTTPError) as exc:
+        upload(client, child, path.read_bytes())
+    assert exc.value.response.status_code == 422
+    assert exc.value.response.json() == {"error": "invalid bundle"}
+    assert len(diagnostics) == 1
+    assert "gitmodulesPath: disallowed submodule path" in diagnostics[0]
+    assert forged in diagnostics[0].splitlines()
+    assert "fsck error" in diagnostics[0]
+    assert refs(server, parent) == before
+    assert objects(server, parent) == before_objects
+    assert client.lineage_state("child")["commit"] is None
+    assert_tmp_clean(server)
+
+
+@pytest.mark.parametrize("command", ["bundle", "index-pack"])
+@pytest.mark.parametrize("message", [
+    "fatal: bad submodule name 'No space left on device'",
+    "fatal: bad submodule name 'path: No space left on device'",
+    'error: invalid path "path: Input/output error"',
+    "warning: write error: Read-only file system",
+    "fatal: write error: Input/output error (in object)",
+    "fatal: write error: No space left on device",
+    "error: write error: Disk quota exceeded",
+    "fatal: unable to create temporary object directory",
+    "fatal: Out of memory",
+    "fatal: bad object: Out of memory, malloc failed (tried to allocate 4096 bytes)",
+])
+def test_receive_untrusted_or_unconfirmed_errors_stay_invalid(remote, snapshots, tmp_path, monkeypatch, command, message):
+    server, client = remote
+    parent, _ = snapshots
+    meta(client, parent)
+    data = bundle(parent, tmp_path)
+    git = server_lineage._git
+    usage = shutil.disk_usage(tmp_path)
+    failed = False
+    def disk_usage(repo):
+        # Quoted names stay invalid even if free space drops after the pre-check.
+        low = failed and message.endswith(("'", '"'))
+        return usage._replace(free=0 if low else 2 * len(data) + 64 * 1024 * 1024)
+    def fail(repo, args, **kwargs):
+        nonlocal failed
+        if args[0] == command:
+            failed = True
+            stderr = message.encode()
+            if command == "bundle":
+                return subprocess.CompletedProcess(["git", *args], 1, stdout=b"", stderr=stderr)
+            raise subprocess.CalledProcessError(128, ["git", *args], stderr=stderr)
+        return git(repo, args, **kwargs)
+    monkeypatch.setattr(server_lineage.shutil, "disk_usage", disk_usage)
+    monkeypatch.setattr(server_lineage, "_git", fail)
+    with pytest.raises(requests.HTTPError) as exc:
+        upload(client, parent, data)
+    assert failed
+    assert exc.value.response.status_code == 422
+    assert exc.value.response.json() == {"error": "invalid bundle"}
+    assert refs(server, parent) == b""
+    assert objects(server, parent) == []
+    assert_tmp_clean(server)
+
+
+def test_corrupt_pack_remains_invalid_bundle(remote, snapshots, tmp_path, monkeypatch):
+    server, client = remote
+    parent, _ = snapshots
+    meta(client, parent)
+    data = bundle(parent, tmp_path)
+    data = data[:-1] + bytes([data[-1] ^ 1])
+    git = server_lineage._git
+    checked = []
+    def capture(repo, args, **kwargs):
+        if args[0] == "index-pack":
+            checked.append(args)
+        return git(repo, args, **kwargs)
+    monkeypatch.setattr(server_lineage, "_git", capture)
+    with pytest.raises(requests.HTTPError) as exc:
+        upload(client, parent, data)
+    assert exc.value.response.status_code == 422
+    assert exc.value.response.json() == {"error": "invalid bundle"}
+    assert len(checked) == 1
+    assert refs(server, parent) == b""
+    assert objects(server, parent) == []
+    assert_tmp_clean(server)
+
+
+@pytest.mark.parametrize("extra_free", [-1, 0])
+def test_receive_free_space_threshold(remote, snapshots, tmp_path, monkeypatch, caplog, extra_free):
+    server, client = remote
+    parent, _ = snapshots
+    meta(client, parent)
+    data = bundle(parent, tmp_path)
+    repo = lineage._repo_path(server.root, info(parent)["project_key"])
+    usage = shutil.disk_usage(tmp_path)
+    checked = []
+    def disk_usage(path):
+        assert path == repo
+        checked.append(path)
+        return usage._replace(free=2 * len(data) + 64 * 1024 * 1024 + extra_free)
+    git = server_lineage._git
+    def capture(repo, args, **kwargs):
+        if extra_free < 0 and args[0] == "index-pack":
+            pytest.fail("low-space receive attempted unpacking")
+        return git(repo, args, **kwargs)
+    monkeypatch.setattr(server_lineage.shutil, "disk_usage", disk_usage)
+    monkeypatch.setattr(server_lineage, "_git", capture)
+    if extra_free < 0:
+        with pytest.raises(requests.HTTPError) as exc:
+            upload(client, parent, data)
+        assert exc.value.response.status_code == 503
+        assert exc.value.response.json() == {"error": "lineage busy"}
+        assert exc.value.response.headers["Retry-After"] == "5"
+        assert "not enough free space for lineage receive" in caplog.text
+        assert refs(server, parent) == b""
+        assert objects(server, parent) == []
+    else:
+        assert upload(client, parent, data)["created"]
+    assert checked == [repo]
+    assert_tmp_clean(server)
+
+
+@pytest.mark.parametrize("failure", ["timeout", "oserror", "ref", "ref_timeout", "rename", "enospc"])
 def test_receive_failures_preserve_objects_and_retry(remote, snapshots, tmp_path, monkeypatch, failure):
     server, client = remote
     parent, child = snapshots
@@ -483,9 +742,17 @@ def test_receive_failures_preserve_objects_and_retry(remote, snapshots, tmp_path
     git = server_lineage._git
     rename = type(tmp_path).rename
     timeouts = []
+    disk_full = False
+    usage = shutil.disk_usage(tmp_path)
+    def disk_usage(repo):
+        return usage._replace(free=0 if disk_full else 2 * len(data) + 64 * 1024 * 1024)
     def fail_git(repo, args, **kwargs):
+        nonlocal disk_full
         if args[0] in ("bundle", "index-pack", "rev-list", "cat-file", "update-ref"):
             timeouts.append(kwargs.get("timeout"))
+        if failure == "enospc" and args[0] == "index-pack":
+            disk_full = True
+            raise subprocess.CalledProcessError(128, ["git", *args], stderr=b"fatal: write error: No space left on device")
         if failure == "ref_timeout" and args[0] == "update-ref" and "-d" not in args:
             git(repo, args, **kwargs)
             raise subprocess.TimeoutExpired("git", kwargs["timeout"])
@@ -503,6 +770,8 @@ def test_receive_failures_preserve_objects_and_retry(remote, snapshots, tmp_path
         return rename(source, target)
     with monkeypatch.context() as patch:
         patch.setattr(server_lineage, "_git", fail_git)
+        if failure == "enospc":
+            patch.setattr(server_lineage.shutil, "disk_usage", disk_usage)
         if failure == "rename":
             patch.setattr(type(tmp_path), "rename", fail_rename)
         with pytest.raises(requests.HTTPError) as exc:

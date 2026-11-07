@@ -20,6 +20,7 @@ from agenticml.store.reader import list_runs, read_remote, run_references
 from .app import resolve_data_dir
 from .keys import KeyStore
 from .lineage import _git
+from .users import UserStore, attribution
 
 _STATUSES = ("running", "finished", "crashed", "stale", "unsynced")
 _OBJECT_TMP = re.compile(r"\.(?:tmp|[0-9a-f]{64})\.\d+\.\d+\.[0-9a-f]{8}\.tmp\Z")
@@ -73,43 +74,72 @@ def status(data) -> dict:
     counts = dict.fromkeys(_STATUSES, 0)
     keys = []
     warnings = []
+    keys_loaded = True
     try:
         # Use the authoritative read path: list() deliberately swallows corrupt
         # files for authentication, but an operator needs to see that failure.
-        records = KeyStore(data / "server")._read()
+        records = KeyStore(data / "server")._read_v1_or_v2()
     except (OSError, ValueError, TypeError, RecursionError):
         records = []
+        keys_loaded = False
         warnings.append("could not load server/keys.json; key revocation status is unknown")
     for record in records:
         row = record.to_public()
         row.pop("created_by")
         row.update(runs=0, last_sync_at=None)
         keys.append(row)
-    by_name = {row["name"]: row for row in keys}
-    _safe_path(root, root / "runs")
-    runs = list_runs(root)
-    for meta in runs:
-        remote = read_remote(root / "runs" / meta["run_id"])
-        effective = meta["effective_status"] if remote and remote["status"] else "unsynced"
-        counts[effective] = counts.get(effective, 0) + 1
-        if not remote or remote["owner"] is None:
-            continue
-        owner = remote["owner"]
-        if owner not in by_name:
-            row = dict(name=owner, scope=None, prefix=None, created_at=None,
+    by_key = {(row["name"], row["user"]): row for row in keys}
+    try:
+        user_records = UserStore(data / "server")._read()
+    except (OSError, ValueError, TypeError, RecursionError):
+        user_records = []
+        warnings.append("could not load server/users.json; user status is unknown")
+    users = [{"name": user.name, "role": user.role, "keys": 0, "runs": 0, "last_sync_at": None}
+             for user in user_records]
+    by_user = {row["name"]: row for row in users}
+    for record in records:
+        if record.user in by_user:
+            by_user[record.user]["keys"] += 1
+
+    def key_row(name, user):
+        pair = (name, user)
+        if pair not in by_key:
+            row = dict(name=name, user=user, scope=None, prefix=None, created_at=None,
                        last_used_at=None, runs=0, last_sync_at=None)
-            if owner == "env":
+            if name == "env":
                 row["env"] = True
-            elif not warnings:
+            elif keys_loaded:
                 row["revoked"] = True
             keys.append(row)
-            by_name[owner] = row
-        row = by_name[owner]
-        row["runs"] += 1
-        stamp = remote["last_sync_at"]
+            by_key[pair] = row
+        return by_key[pair]
+
+    def last_sync(row, stamp):
         if stamp and (row["last_sync_at"] is None or
                       layout.parse_timestamp(stamp) > layout.parse_timestamp(row["last_sync_at"])):
             row["last_sync_at"] = stamp
+
+    _safe_path(root, root / "runs")
+    runs = list_runs(root)
+    for meta in runs:
+        directory = root / "runs" / meta["run_id"]
+        remote = read_remote(directory)
+        effective = meta["effective_status"] if remote and remote["status"] else "unsynced"
+        counts[effective] = counts.get(effective, 0) + 1
+        owner_user, _ = attribution(directory)
+        if owner_user in by_user:
+            by_user[owner_user]["runs"] += 1
+        if remote is None:
+            continue
+        owner = remote["owner"]
+        stamp = remote["last_sync_at"]
+        if owner_user in by_user:
+            last_sync(by_user[owner_user], stamp)
+        creator = remote["owner_key"]
+        if creator is not None and owner is not None:
+            key_row(creator, owner)["runs"] += 1
+            writer = remote["last_sync_key"] or creator
+            last_sync(key_row(writer, owner), stamp)
     sizes = {"objects_count": 0, "skipped": 0}
 
     def skipped(path, exc):
@@ -126,7 +156,7 @@ def status(data) -> dict:
                 sizes["objects_count"] += 1
     sizes["total"] = sum(sizes[name] for name in ("runs", "objects", "lineage"))
     return {"data": str(data), "runs": {"total": len(runs), "by_status": counts},
-            "sizes": sizes, "keys": keys, "warnings": warnings}
+            "sizes": sizes, "keys": keys, "users": users, "warnings": warnings}
 
 
 def verify(data, *, progress=False) -> dict:
@@ -359,11 +389,15 @@ def format_status(report):
              f"Sizes: runs {_format_bytes(sizes['runs'])}, objects {_format_bytes(sizes['objects'])} "
              f"({sizes['objects_count']}), lineage {_format_bytes(sizes['lineage'])}, "
              f"total {_format_bytes(sizes['total'])}; skipped {sizes['skipped']}",
-             "KEY  SCOPE  PREFIX  RUNS  LAST SYNC  LAST USED  CREATED"]
+             "USER  ROLE  KEYS  RUNS  LAST SYNC"]
+    for row in report.get("users", []):
+        lines.append("  ".join(str(value or "-") for value in (
+            row["name"], row["role"], str(row["keys"]), str(row["runs"]), row["last_sync_at"])))
+    lines.append("KEY  SCOPE  USER  PREFIX  RUNS  LAST SYNC  LAST USED  CREATED")
     for row in report["keys"]:
         lines.append("  ".join(str(value or "-") for value in (
             row["name"] + (" (revoked)" if row.get("revoked") else ""),
-            "env" if row.get("env") else row["scope"], row["prefix"],
+            "env" if row.get("env") else row["scope"], row["user"], row["prefix"],
             str(row["runs"]), row["last_sync_at"], row["last_used_at"], row["created_at"])))
     lines.extend(f"warning: {warning}" for warning in report.get("warnings", []))
     return "\n".join(_text(line) for line in lines)

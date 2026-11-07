@@ -17,6 +17,7 @@ from agenticml import cli
 from agenticml.client import Client, Conflict
 from agenticml.server.app import make_server
 from agenticml.server.keys import KeyStore
+from test_server_ingest import foreign_key
 from agenticml.store import RunReader, RunWriter
 from agenticml.store.gc import run_fingerprint, usage
 from agenticml.store.layout import object_path
@@ -117,6 +118,29 @@ def test_finished_round_trip(remote, tmp_path, status, capsys):
     meta = json.loads((remote[0].root / "runs" / writer.run_id / "meta.json").read_bytes())
     assert {name: meta[name] for name in ("task", "task_source", "arch")} == {
         "task": "classify", "task_source": "explicit", "arch": "linear"}
+
+
+@pytest.mark.parametrize("kind", ["code", "artifact"])
+def test_sync_empty_object(remote, tmp_path, kind):
+    writer = writer_at(tmp_path, status=None)
+    try:
+        if kind == "code":
+            writer.add_code([], [("empty.py", b"")])
+        else:
+            artifact = tmp_path / "empty.bin"
+            artifact.write_bytes(b"")
+            writer.add_artifact(artifact, "empty", "model", {}, copy=True)
+        writer.finish("finished")
+    finally:
+        writer.close()
+
+    sha = hashlib.sha256(b"").hexdigest()
+    assert sha in set().union(*run_references(writer.root, writer.run_id).values())
+    assert not object_path(remote[0].root, sha).exists()
+    assert command(remote, writer, writer.run_id) == 0
+    assert object_path(remote[0].root, sha).read_bytes() == b""
+    assert state(remote, writer)["complete"] is True
+    assert identical(remote, writer)["status"] == "finished"
 
 
 def test_dead_process_only_changes_status(remote, tmp_path):
@@ -309,11 +333,11 @@ def test_v1_entry_replaced_and_other_host_preserved(remote, tmp_path):
 def test_ownership_failure_does_not_stop_other_runs(remote, tmp_path, capsys):
     writer = writer_at(tmp_path)
     push(remote, writer)
-    _, key = remote[0].keys.create("second")
+    key = foreign_key(remote[0], "second")
     other = writer_at(tmp_path, run_id="other")
     assert command(remote, writer, writer.run_id, other.run_id, key=key) == 1
     out = capsys.readouterr().out
-    assert "run id run-1 belongs to key box on this server" in out
+    assert "run id run-1 belongs to user admin on this server" in out
     assert "other  demo/train  synced" in out
     assert (remote[0].root / "runs/other/meta.json").exists()
 
@@ -322,9 +346,9 @@ def test_ownership_recovery_checks_before_objects(remote, tmp_path):
     writer = writer_at(tmp_path)
     push(remote, writer)
     (writer.run_dir / "sync.json").unlink()
-    _, key = remote[0].keys.create("second")
+    key = foreign_key(remote[0], "second")
     with Client(remote[1].base_url, key) as client:
-        with pytest.raises(ValueError, match="belongs to key box"):
+        with pytest.raises(sync.OwnershipError, match="belongs to user admin"):
             push((remote[0], client), writer)
 
 
@@ -593,9 +617,9 @@ def test_whoami_once_across_multiple_runs_and_watch(remote, tmp_path, monkeypatc
 def test_ownership_with_all_does_not_skip_idle_foreign_run(remote, tmp_path, capsys):
     writer = writer_at(tmp_path)
     push(remote, writer)
-    _, key = remote[0].keys.create("second")
+    key = foreign_key(remote[0], "second")
     assert command(remote, writer, "--all", key=key) == 1
-    assert "belongs to key box" in capsys.readouterr().out
+    assert "belongs to user admin" in capsys.readouterr().out
 
 
 def test_event_line_beyond_limit_fails_before_append(remote, tmp_path, monkeypatch):
@@ -681,9 +705,9 @@ def test_failed_ownership_recovery_does_not_save_wrong_owner(remote, tmp_path, c
     assert command(remote, writer, "--reset", writer.run_id) == 0
     path = writer.run_dir / "sync.json"
     before = path.read_bytes()
-    _, key = remote[0].keys.create("second")
+    key = foreign_key(remote[0], "second")
     assert command(remote, writer, writer.run_id, key=key) == 1
-    assert "belongs to key box" in capsys.readouterr().out
+    assert "belongs to user admin" in capsys.readouterr().out
     assert path.read_bytes() == before
     assert command(remote, writer, writer.run_id) == 0
     assert state(remote, writer)["owner"] == "box"

@@ -17,8 +17,11 @@ import weakref
 
 from agenticml.store import layout
 from agenticml.ui.server import DashboardServer, _browser_host, _loopback_bind
+from .audit import AuditLog
 from .keys import KeyStore, env_key_looks_weak, validate_env_key
-from .webauth import WebAuth
+from .users import UserStore, migrate
+from .audit import AuditLog
+from .webauth import IDENTITY_PRESETS, WebAuth
 
 logger = logging.getLogger("agenticml.server")
 ATOMIC_BODY_LIMIT = 16 * 1024 * 1024
@@ -156,14 +159,19 @@ class IngestServer(DashboardServer):
     # The writer lock must outlive every handler, including during shutdown.
     daemon_threads = False
 
-    def __init__(self, data, host, port, public_url=None, env_key=None):
+    def __init__(self, data, host, port, public_url=None, env_key=None,
+                 trusted_proxies=(), identity_header=None):
         from .ingest import IngestHandler
 
         self.data_dir = Path(data)
         self.tmp_dir = self.data_dir / "server" / "tmp"
         self.keys = KeyStore(self.data_dir / "server", env_key)
+        self.users = UserStore(self.data_dir / "server")
+        self.audit = AuditLog(self.data_dir / "server")
         self.public_url = public_url
-        self.web = WebAuth(self.keys, public_url)
+        self.web = WebAuth(
+            self.keys, public_url, users=self.users,
+            trusted_proxies=trusted_proxies, identity_header=identity_header)
         self.store_file_mode = 0o666 & ~_read_umask()
         self.limits = Limits()
         self.lineage_enabled = shutil.which("git") is not None
@@ -182,6 +190,10 @@ class IngestServer(DashboardServer):
         )
         base = public_url or f"http://{_browser_host(self.server_address[0])}:{self.server_address[1]}"
         self.web.arm_setup(base)
+        if self.web.trusted_proxies or self.web.identity_header:
+            header = IDENTITY_PRESETS[self.web.identity_header][0] if self.web.identity_header else "none"
+            ranges = ", ".join(str(network) for network in self.web.trusted_proxies) or "none"
+            logger.info("identity header %s; trusted proxies %s", header, ranges)
 
     def run_lock(self, run_id):
         with self.run_locks_lock:
@@ -251,7 +263,8 @@ class IPv6IngestServer(IngestServer):
     address_family = socket.AF_INET6
 
 
-def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None):
+def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None,
+                trusted_proxies=(), identity_header=None):
     """Prepare and lock the data directory; port=0 chooses a free port."""
     validate_env_key(env_key)
     if env_key is not None and env_key_looks_weak(env_key):
@@ -264,8 +277,9 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
     handle = acquire_server_lock(data / "server")
     try:
         _clean_tmp(data / "server" / "tmp")
+        migrate(data, actor="server")
         cls = IPv6IngestServer if ":" in host else IngestServer
-        server = cls(data, host, port, public_url, env_key)
+        server = cls(data, host, port, public_url, env_key, trusted_proxies, identity_header)
         server._server_lock = handle
         return server
     except BaseException:
@@ -273,9 +287,12 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
         raise
 
 
-def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None):
+def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None,
+          trusted_proxies=(), identity_header=None):
     """Run until interrupted, with an optional environment admin key."""
-    server = make_server(data, host, port, public_url, os.environ.get("AGENTICML_SERVER_KEY"))
+    server = make_server(
+        data, host, port, public_url, os.environ.get("AGENTICML_SERVER_KEY"),
+        trusted_proxies, identity_header)
     previous_handler = None
     stopping = False
 

@@ -101,7 +101,7 @@ def fake_http(handler):
 def test_whoami_sync_and_admin_and_revoked(server):
     with client_for(server) as client:
         assert client.whoami() == {
-            "key": "one", "scope": "sync", "protocol": 2,
+            "key": "one", "scope": "sync", "user": "admin", "role": "admin", "protocol": 2,
             "features": (["lineage"] if server.lineage_enabled else []) + ["byref"],
         }
     _, admin = server.keys.create("boss", "admin")
@@ -164,6 +164,7 @@ def test_round_trip_missing_object_file_append_state_commit(server):
         assert client.append("run-1", "events.jsonl", 0, events) == len(events)
         state = client.run_state("run-1")
         assert state["owner"] == "one"
+        assert state["owner_user"] == "admin"
         assert "meta.json" in state["files"]
         assert "events.jsonl" in state["files"]
         fingerprint = "a" * 64
@@ -195,18 +196,45 @@ def test_missing_splits_25000_hashes_into_three_requests(server):
         assert [len(chunk) for chunk in seen] == [10000, 10000, 5000]
 
 
-def test_put_object_retries_503_and_rewinds(monkeypatch):
+@pytest.mark.parametrize("kind", ["object", "lineage"])
+@pytest.mark.parametrize("payload", [b"", b"upload body"])
+def test_upload_content_length_without_transfer_encoding(tmp_path, kind, payload):
+    def handler(request):
+        request._send(201, b'{"created":true}')
+
+    path = tmp_path / "upload.bin"
+    path.write_bytes(payload)
+    sha = hashlib.sha256(payload).hexdigest()
+    with fake_http(handler) as (httpd, url):
+        with Client(base_url=url, api_key="secret-key") as client, path.open("rb") as handle:
+            if kind == "object":
+                assert client.put_object(sha, handle, len(payload)) is True
+                expected_path = f"/v2/objects/{sha}"
+            else:
+                assert client.put_lineage("run-1", handle, len(payload)) == {"created": True}
+                expected_path = "/v2/runs/run-1/lineage"
+        assert len(httpd.requests) == 1
+        method, request_path, headers, body = httpd.requests[0]
+        assert (method, request_path, body) == ("PUT", expected_path, payload)
+        assert headers.get_all("Content-Length") == [str(len(payload))]
+        assert "Transfer-Encoding" not in headers
+        assert headers["Content-Type"] == "application/octet-stream"
+
+
+@pytest.mark.parametrize("payload", [b"", b"full-object-body"])
+def test_put_object_retries_503_and_rewinds(monkeypatch, payload):
     monkeypatch.setattr("agenticml.client.time.sleep", lambda _delay: None)
     bodies = []
 
     def handler(request):
         bodies.append(request.server.requests[-1][3])
+        assert request.headers["Content-Length"] == str(len(payload))
+        assert "Transfer-Encoding" not in request.headers
         if len(bodies) == 1:
             request._send(503, b'{"error":"busy"}', {"Retry-After": "0"})
             return
         request._send(201, b'{"created":true}')
 
-    payload = b"full-object-body"
     sha = hashlib.sha256(payload).hexdigest()
     with fake_http(handler) as (_httpd, url):
         with Client(base_url=url, api_key="secret-key") as client:
@@ -214,18 +242,20 @@ def test_put_object_retries_503_and_rewinds(monkeypatch):
     assert bodies == [payload, payload]
 
 
-def test_put_lineage_retries_503_and_rewinds():
+@pytest.mark.parametrize("payload", [b"", b"full-bundle-body"])
+def test_put_lineage_retries_503_and_rewinds(payload):
     bodies = []
 
     def handler(request):
         bodies.append(request.server.requests[-1][3])
         assert request.path == "/v2/runs/run-1/lineage"
+        assert request.headers["Content-Length"] == str(len(payload))
+        assert "Transfer-Encoding" not in request.headers
         if len(bodies) == 1:
             request._send(503, b'{"error":"busy"}', {"Retry-After": "0"})
         else:
             request._send(201, b'{"created":true,"commit":"accepted"}')
 
-    payload = b"full-bundle-body"
     with fake_http(handler) as (_httpd, url):
         with Client(base_url=url, api_key="secret-key") as client:
             assert client.put_lineage("run-1", io.BytesIO(payload), len(payload)) == {

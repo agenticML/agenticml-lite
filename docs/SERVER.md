@@ -37,7 +37,7 @@ On a Mac or Linux machine with Tailscale already installed and logged in:
 agenticml server up
 ```
 
-`server up` makes the server reachable from the public internet through Tailscale Funnel: anyone can reach the login page; only keys grant access. It takes port 443 of this machine's Tailscale serve config. This checks that Tailscale is running and that HTTPS certificates and Funnel are already allowed in the admin console (those approvals stay manual), creates the first admin key if none exists, serves on loopback, and turns Funnel on until the server stops. `Ctrl+C`, SIGTERM, or SIGHUP (closing the terminal) turns Funnel off. After SIGKILL, a crash, or power loss, Funnel stays on. The next `server up` on the same port turns it back on and off again; a stale Funnel entry for a different port is refused ("Tailscale already serves port 443 on this machine: check `tailscale funnel status` and turn it off first") and must be turned off with `tailscale funnel --https=443 off` first. All Funnel visitors reach the server from `127.0.0.1`, so they share one failed-login throttle bucket — someone sending bad keys can delay sign-in and syncs by up to 60 s (fixed by package 13 in 2.2).
+`server up` makes the server reachable from the public internet through Tailscale Funnel: anyone can reach the login page; credentials grant access. It takes port 443 of this machine's Tailscale serve config. This checks that Tailscale is running and that HTTPS certificates and Funnel are already allowed in the admin console (those approvals stay manual), creates the first admin user with a 72-hour invite link if no admin exists, serves on loopback, and turns Funnel on until the server stops. `Ctrl+C`, SIGTERM, or SIGHUP (closing the terminal) turns Funnel off. After SIGKILL, a crash, or power loss, Funnel stays on. The next `server up` on the same port turns it back on and off again; a stale Funnel entry for a different port is refused ("Tailscale already serves port 443 on this machine: check `tailscale funnel status` and turn it off first") and must be turned off with `tailscale funnel --https=443 off` first. `server up` trusts its local Tailscale proxy on loopback (`127.0.0.1`, `::1`), and failed-login throttling uses the real client address from `X-Forwarded-For` (rightmost untrusted hop) plus a per-user-name bucket, so Funnel visitors do not share one bucket.
 
 To start at login (systemd user unit on Linux, launchd agent on macOS):
 
@@ -69,7 +69,7 @@ A production system unit example is provided in [deploy/systemd/agenticml-server
 sudo python3 -m venv /opt/agenticml
 sudo /opt/agenticml/bin/python -m pip install agenticml-lite
 sudo useradd --system --home /var/lib/agenticml-server --shell /usr/sbin/nologin agenticml
-sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.0.0/deploy/systemd/agenticml-server.service
+sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.2.0/deploy/systemd/agenticml-server.service
 ```
 
 Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`). Edit `AGENTICML_SERVER_PUBLIC_URL` in the unit (or `sudo systemctl edit agenticml-server`), then `daemon-reload` and `enable --now`:
@@ -95,30 +95,87 @@ sudo systemctl stop agenticml-server
 
 All API and dashboard requests (except `GET /healthz`) require authentication.
 
+### Users and roles
+
+AgenticML supports multiple users with role-based access. Every user has one of three roles:
+
+| Action | `viewer` | `member` | `admin` |
+| --- | --- | --- | --- |
+| Read dashboard (every project) | yes | yes | yes |
+| Change own password | yes | yes | yes |
+| Edit run notes | – | yes | yes |
+| Sync (`/v2` writes) with own keys | – | yes | yes |
+| Issue / revoke own sync keys | – | yes | yes |
+| Hold admin-scope keys, sign in with a key | – | – | yes |
+| See / revoke everyone's keys, issue keys for anyone | – | – | yes |
+| Manage users, change roles, create invite links | – | – | yes |
+| Read the audit log | – | – | yes |
+
+- **Project visibility**: Viewers and members see every project on the server. Access is server-wide; there is no per-project access control.
+- **Ownership**: Keys belong to users, and runs belong to users. Any key belonging to a person can write to runs owned by that person and nobody else's (including admins).
+- **Viewer keys**: A key belonging to a user with role `viewer` can only call `GET /v2/whoami`. Every other `/v2` endpoint returns `403 Forbidden` (`{"error": "role viewer cannot sync"}`). Viewers read through the web dashboard, not through sync keys.
+
+#### Managing users with the CLI
+
+Manage users with `agenticml server users`:
+
+```bash
+# Add a user (prints a one-time invite link; role defaults to member)
+agenticml server users add NAME [--role viewer|member|admin] [--identity ID] [--no-invite] [--reclaim-runs] [--public-url URL] [--data DIR]
+
+# List all users
+agenticml server users list [--json] [--data DIR]
+
+# Remove a user and revoke their keys (their runs keep their owner)
+agenticml server users remove NAME [--data DIR]
+
+# Change a user's role
+agenticml server users set-role NAME ROLE [--data DIR]
+
+# Set or clear a user's proxy identity (omit ID to clear)
+agenticml server users set-identity NAME [ID] [--data DIR]
+
+# Create a fresh 72-hour invite link
+agenticml server users invite NAME [--public-url URL] [--data DIR]
+
+# Set a password directly via CLI
+agenticml server users set-password NAME [--stdin] [--data DIR]
+```
+
+User management rules:
+- **Last admin guard**: The last admin user cannot be removed or demoted.
+- **Reclaiming runs**: Re-adding a user name that still owns runs requires `--reclaim-runs` to prevent accidentally inheriting previous runs.
+- **Invites**: `users add` (unless `--no-invite`) and `users invite` print a one-time invite link: `<public-url>/invite?token=...`. The link is valid for 72 hours. The person chooses a password between 12 and 1024 characters there. Re-inviting a user clears their password and immediately signs them out everywhere.
+
 ### Key scopes
 
-Keys are issued with one of two scopes:
+Keys belong to users and are issued with one of two scopes:
 
 | Scope | Allowed operations | Intended use |
 | --- | --- | --- |
-| `sync` | Call `/v2` endpoints (push runs, upload objects, read run state). Cannot sign in to the web dashboard. | Training machines and unattended worker nodes. |
-| `admin` | Everything `sync` can do, plus sign in to the web dashboard, issue keys, and revoke keys. | Human operators and administrators. |
+| `sync` | Call `/v2` endpoints (push runs, upload objects, read run state) for runs owned by the key's user. Cannot sign in to the web dashboard. | Training machines and unattended worker nodes. |
+| `admin` | Everything `sync` can do (for the admin's own runs), plus sign in to the web dashboard, issue keys, and revoke keys. Requires an admin user. | Human operators and administrators. |
 
-### Bootstrap: First admin key
+### Bootstrap: First admin user
 
-When a server starts with no keys in `<data>/server/keys.json` and `AGENTICML_SERVER_KEY` is unset, it generates a single-use bootstrap setup token in memory and logs:
+When a server starts with no admin user, no admin key, and `AGENTICML_SERVER_KEY` is unset, it generates a single-use setup token in memory and logs:
 
 ```
-No admin key yet. Open <public-url or http://host:port>/setup?token=<token> to create one, or run: agenticml server keys create --name admin --scope admin
+No admin user yet. Open <public-url or http://host:port>/setup?token=<token> to create one, or run: agenticml server users add admin --role admin
 ```
 
 To retrieve the setup link:
 - Terminal: Check the standard output from `agenticml server serve`.
 - systemd: Run `sudo journalctl -u agenticml-server`.
 
-Open the `/setup?token=<token>` link in a browser. It prompts for a key name, generates an admin key, displays it once, and signs the browser in.
+Open the `/setup?token=<token>` link in a browser. It prompts for a user name (default `admin`) and a password (entered twice), creates the first admin user with that password, and signs the browser in.
 
-The setup token is stored only in memory and becomes invalid once used or after a server restart. After an admin key exists, `/setup` returns 404.
+`agenticml server up` handles bootstrap automatically: if no admin exists, it creates user `admin` (role `admin`) and prints an invite link instead of an admin key:
+```
+Open <public_url>/invite?token=<token> to choose the admin password. The link works once, for 72 hours.
+```
+
+The setup token is stored only in memory and becomes invalid once used, after a server restart, or once an admin user exists. After an admin user exists, `/setup` returns 404.
 
 ### Environment admin key
 
@@ -131,35 +188,37 @@ export AGENTICML_SERVER_KEY=$(python3 -c 'import secrets; print(secrets.token_ur
 Under systemd, configure `AGENTICML_SERVER_KEY` in the unit's environment file (e.g. `/etc/agenticml-server.env`, owned by root with mode `0600`).
 
 Rules for `AGENTICML_SERVER_KEY`:
-- Named `env` on the server.
-- Stored only in memory; never written to `keys.json`.
+- Acts as a built-in admin user named `env`.
+- Stored only in memory; never written to `keys.json` or `users.json`.
 - Cannot be revoked from the Keys web page. To revoke it, remove the environment variable and restart the server.
 - Must consist of 32 to 256 allowed ASCII characters (`[A-Za-z0-9._~+/=-]`). The server warns at startup if the key has low entropy.
 
 ### Managing keys in the dashboard
 
-Administrators can manage keys from the web dashboard:
+Keys in the dashboard are managed per user:
+- Members see only their own keys. They can create and revoke `sync` keys for their own machines.
+- Admins see everyone's keys, can filter by user, revoke any key, and issue keys for any user.
+- Admins have access to a **Team** page in the dashboard to view users, roles, pending invite links, and activity.
 
-1. Sign in to the dashboard at your server's public URL using an `admin` key.
-2. Navigate to **Keys** in the sidebar.
-3. Click **New key**, enter a descriptive name (e.g. `gpu-cluster-1`), and select the scope (`sync` is default).
-4. The key is displayed once with a copy button and a pre-formatted `agenticml login` command. Store the key immediately; the server stores only its SHA-256 digest and cannot recover it.
-5. The Keys table shows each key's name, scope, prefix, creation date, creator, last used timestamp, and count of owned runs.
-6. Click **Revoke** next to a key to revoke it. Revocation takes effect immediately without a server restart. The last admin key cannot be revoked from the page (the error says to create another admin key first, or use the CLI). Revoking the key your own session uses signs you out.
+To create a key in the dashboard:
+1. Navigate to **Keys** in the sidebar.
+2. Click **New key**, enter a descriptive name (e.g. `gpu-cluster-1`), and select the scope (`sync` is default).
+3. The key is displayed once with a copy button and a pre-formatted `agenticml login` command. Store the key immediately; the server stores only its SHA-256 digest and cannot recover it.
+4. Click **Revoke** next to a key to revoke it. Revocation takes effect immediately without a server restart. The last admin key cannot be revoked from the page. Revoking the key your own session uses signs you out.
 
 ### Managing keys with the CLI
 
 The server CLI can create, list, and revoke keys on the server host while the server is running.
 
 ```bash
-# Create a sync key (scope defaults to sync)
-agenticml server keys create --name worker-1 --scope sync --data DIR
+# Create a sync key (--user is required when more than one user exists)
+agenticml server keys create --name worker-1 --scope sync [--user USER] --data DIR
 
-# Create an admin key
-agenticml server keys create --name operator-2 --scope admin --data DIR
+# Create an admin key (requires an admin user)
+agenticml server keys create --name operator-2 --scope admin [--user USER] --data DIR
 
-# List all keys
-agenticml server keys list --data DIR
+# List keys (optionally filter by user)
+agenticml server keys list [--user USER] --data DIR
 
 # Revoke a key
 agenticml server keys revoke worker-1 --data DIR
@@ -177,14 +236,65 @@ sudo -u agenticml /opt/agenticml/bin/agenticml server keys revoke worker-1 --dat
 
 ### Dashboard login and sessions
 
-Signing in to the dashboard requires an `admin` key:
+Users sign in to the dashboard using one of three methods:
 
-- Browsers send `POST /login` with JSON `{"key": "aml_..."}`. A `sync` key is rejected with HTTP `403`.
+1. **User name and password**: Enter user name and password at `/login`.
+2. **Trusted identity proxy**: Automatic sign-in using proxy headers from an upstream proxy (see below).
+3. **Admin key fallback**: Administrators can sign in using an `admin`-scope key. `sync` keys never sign in (rejected with HTTP 403).
+
+Session management:
 - On success, the server sets a session cookie with `HttpOnly`, `SameSite=Strict`, and `Path=/`. When `--public-url` is HTTPS, the cookie is named `__Host-aml_session` and includes `Secure`; otherwise it is named `aml_session`.
-- Sessions live in memory: 12-hour idle timeout, 7-day absolute lifetime. Sessions terminate if their key is revoked or if the server restarts.
-- Failed login attempts are throttled by client IP address.
+- Sessions live in memory: 12-hour idle timeout, 7-day maximum lifetime.
+- Sessions are bound to the user's account ID and generation counter. Changing a password, re-inviting, or removing a user ends their sessions everywhere.
+- Failed login attempts are throttled using the real client IP address from `X-Forwarded-For` (rightmost untrusted hop) on trusted-proxy connections, plus a per-user-name bucket (`user:<name>`).
 - CSRF protection requires requests to include the `X-AgenticML-Request` header and an `Origin` matching `--public-url`.
 - The dashboard rejects requests whose `Host` header does not match the host in `--public-url` or a loopback address (`localhost`, `127.0.0.1`, `::1`). When binding off loopback, always configure `--public-url`.
+
+### Trusted identity proxy
+
+The server supports single sign-on using identity headers passed by a reverse proxy:
+
+```bash
+agenticml server serve --trusted-proxy CIDR [--trusted-proxy CIDR ...] --identity-header alb|tailscale|oauth2-proxy
+```
+
+Flags can also be configured with environment variables:
+- `AGENTICML_SERVER_TRUSTED_PROXIES`: comma-separated CIDR strings (e.g. `127.0.0.1,::1,10.0.0.0/16`). Plain IP addresses imply `/32` or `/128`.
+- `AGENTICML_SERVER_IDENTITY_HEADER`: preset name (`alb`, `tailscale`, or `oauth2-proxy`).
+
+#### Header presets
+
+| Preset | Header | Matching rule |
+| --- | --- | --- |
+| `alb` | `X-Amzn-Oidc-Identity` | Exact match against user `identity`. |
+| `tailscale` | `Tailscale-User-Login` | Case-insensitive match against user `identity`. |
+| `oauth2-proxy` | `X-Forwarded-Email` | Case-insensitive match against user `identity`. |
+
+#### Proxy rules and security
+
+- **Trusted proxy requirement**: Identity headers and `X-Forwarded-For` client addresses are honoured only on connections from configured `--trusted-proxy` addresses. Requests from untrusted peers have identity headers ignored and use the direct TCP peer address.
+- **Refused catch-alls**: Addresses `0.0.0.0/0` and `::/0` are refused at startup ("refusing to trust every address").
+- **Header requires proxy**: Passing `--identity-header` without at least one `--trusted-proxy` is a startup error.
+- **Tailscale Funnel visitors**: Requests carrying the `Tailscale-Funnel-Request` header never get an identity.
+- **Unknown identity**: An unknown identity returns an HTTP 403 page ("Signed in as X by your identity proxy, but no AgenticML user has that identity. Ask an admin to run `agenticml server users set-identity NAME X`.") or JSON `{"error": "no user for this identity"}` on API routes.
+- **Assigning identities**: Set each person's identity with `agenticml server users set-identity NAME ID`.
+
+#### Proxy service examples
+
+Example flags to pass in systemd `ExecStart`:
+
+- **AWS Application Load Balancer (ALB)** in VPC subnet `10.0.0.0/16`:
+  ```bash
+  --trusted-proxy 10.0.0.0/16 --identity-header alb
+  ```
+- **Tailscale Serve** on the same host:
+  ```bash
+  --trusted-proxy 127.0.0.1 --trusted-proxy ::1 --identity-header tailscale
+  ```
+- **oauth2-proxy** on the same host:
+  ```bash
+  --trusted-proxy 127.0.0.1 --identity-header oauth2-proxy
+  ```
 
 ## Client setup
 
@@ -248,7 +358,7 @@ To run `agenticml sync --follow` as a background user daemon on Linux, install t
 
 ```bash
 mkdir -p ~/.config/systemd/user
-curl -fsSL -o ~/.config/systemd/user/agenticml-sync.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.0.0/deploy/systemd/agenticml-sync.service
+curl -fsSL -o ~/.config/systemd/user/agenticml-sync.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.2.0/deploy/systemd/agenticml-sync.service
 ```
 
 Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`).
@@ -292,7 +402,61 @@ and warns about other subdirectories.
 The following limits remain:
 
 - **Run notes (`notes.md`)**: Notes remain local to the machine where they were written.
-- **Cross-key run collision**: A run ID is owned by the key that first created it. Pushing to an existing run ID using a different key fails with an error.
+- **Run ownership**: Runs belong to users. Any key belonging to the owning user can update that user's runs. Pushing to an existing run ID using a key belonging to another user fails with HTTP 409 Conflict ("run owned by another user").
+
+## Audit log
+
+The server maintains an append-only audit trail at `<data>/server/audit.jsonl`. Every write operation writes one JSON line with the following fields:
+
+```json
+{"ts": "2026-11-06T18:00:00.000000Z", "actor": "alice", "via": "password", "action": "key.create", "target": "laptop", "client": "198.51.100.23", "detail": {"scope": "sync", "user": "alice"}}
+```
+
+- `ts`: UTC timestamp in ISO 8601 with microsecond precision.
+- `actor`: User name of the authenticated principal; `cli:<user>` for CLI operations; `server` during initial startup migration; `anonymous` for failed logins.
+- `via`: Authentication mechanism: `password`, `key`, `proxy`, `setup`, `invite`, `cli`, or `server`.
+- `action`: Name of the event (see table below).
+- `target`: Subject of the action (user name, key name, or run ID).
+- `client`: Client IP address from `X-Forwarded-For` or TCP connection; `null` for CLI commands.
+- `detail`: Action-specific attributes (role, scopes, migration counts).
+
+### Audit actions
+
+| Action | Description |
+| --- | --- |
+| `user.add` | User created. |
+| `user.remove` | User removed and their keys revoked. |
+| `user.role` | User role changed. |
+| `user.identity` | User proxy identity assigned or cleared. |
+| `user.invite` | Invite link generated. |
+| `user.password` | User password set or changed. |
+| `key.create` | API key created. |
+| `key.revoke` | API key revoked. |
+| `setup` | Initial admin user created via `/setup`. |
+| `login.ok` | Successful sign-in with a password, an invite link, or an admin key. |
+| `login.failed` | Failed login attempt (401 or 403). |
+| `logout` | Session signed out. |
+| `run.create` | Initial run creation (first `meta.json`). |
+| `run.finish` | Run status transitioned to `finished` or `crashed`. |
+| `note.write` | Run note modified in the server dashboard. |
+| `migration` | In-place migration of 2.0/2.1 data on first startup. |
+
+- **No secrets logged**: Key values, key hashes, passwords, password hashes, invite tokens, and session cookies are never written to the audit log.
+- **Viewing the log**: Administrators can view audit entries using the CLI or through the dashboard Activity section:
+  ```bash
+  agenticml server audit [--limit N] [--json] [--data DIR]
+  ```
+- **Log rotation**: The server has no built-in rotation. Because `audit.jsonl` is reopened for each write under an advisory file lock, system utilities like `logrotate` with `create` mode work cleanly:
+  ```
+  /var/lib/agenticml-server/server/audit.jsonl {
+      weekly
+      rotate 12
+      compress
+      missingok
+      notifempty
+      create 0600 agenticml agenticml
+  }
+  ```
 
 ## Configuration reference
 
@@ -304,6 +468,8 @@ The following limits remain:
 | `--host HOST` | | `127.0.0.1` | Host interface to bind. |
 | `--port PORT` | | `8080` | TCP port to listen on. |
 | `--public-url URL` | `AGENTICML_SERVER_PUBLIC_URL` | unset | Canonical public URL (e.g. `https://aml.example.com`). Required behind reverse proxies for Host header checks, Origin checks, and `__Host-` cookies. Empty string is treated as unset. |
+| `--trusted-proxy CIDR` | `AGENTICML_SERVER_TRUSTED_PROXIES` | unset | Trust this proxy CIDR for `X-Forwarded-For` and identity headers (repeatable; comma-separated in env). Refuses `0.0.0.0/0` and `::/0`. |
+| `--identity-header PRESET` | `AGENTICML_SERVER_IDENTITY_HEADER` | unset | Honour proxy identity header (`alb`, `tailscale`, or `oauth2-proxy`). Requires `--trusted-proxy`. |
 | | `AGENTICML_SERVER_KEY` | unset | Static admin API key named `env`. Stored only in memory. |
 | | `AGENTICML_REMOTE_STALE_SECONDS` | `600` | Inactivity threshold before an active run is marked `stale`. |
 
@@ -323,15 +489,17 @@ The server data directory contains two subdirectories:
 │   │       └── remote.json
 │   └── objects/           # Content-addressed blobs (code, media, copied artifacts)
 └── server/                # Server metadata and runtime locks
+    ├── audit.jsonl        # Append-only audit log (mode 0600)
     ├── keys.json          # Key metadata and SHA-256 digests (mode 0600)
-    ├── keys.lock          # Lock for atomic key modifications
+    ├── keys.lock          # Lock for atomic key and user modifications
     ├── server.lock        # Exclusive single-writer lock for server process
-    └── tmp/               # Ingest staging directory (must be on same filesystem as store/)
+    ├── tmp/               # Ingest staging directory (must be on same filesystem as store/)
+    └── users.json         # User records, password scrypt hashes, and invites (mode 0600)
 ```
 
 ### Performing backups
 
-Stop the service cleanly before backing up the data directory to release `server.lock` and flush pending writes:
+Stop the service cleanly before backing up the data directory to release `server.lock` and flush pending writes. Back up `<data>/server/users.json`, `<data>/server/keys.json`, and `<data>/server/audit.jsonl` along with the store:
 ```bash
 sudo systemctl stop agenticml-server
 sudo tar czf agenticml-backup.tgz -C /var/lib/agenticml-server .
@@ -463,6 +631,21 @@ One server process per data directory; downgrades are not supported. Read releas
    ```
 
 Because the server holds an exclusive lock on `<data>/server/server.lock`, only one server process may access the data directory at a time.
+
+### Upgrading from 2.0 or 2.1 to 2.2
+
+When starting a 2.2 server against an existing 2.0 or 2.1 data directory, the server migrates the data in place automatically on first start:
+
+- A single user named `admin` with role `admin` is created in `users.json`.
+- All existing keys in `keys.json` are upgraded to version 2 format and assigned to user `admin`.
+- Existing runs have their `owner` in `remote.json` rewritten to `admin`, with the previous key name retained as `owner_key`.
+- No manual migration steps are needed.
+- After starting the server, set a password for the `admin` user using an invite link or the CLI:
+  ```bash
+  agenticml server users invite admin
+  # or: agenticml server users set-password admin
+  ```
+- Existing 2.0 and 2.1 sync clients continue working seamlessly against a 2.2 server.
 
 ## Troubleshooting
 

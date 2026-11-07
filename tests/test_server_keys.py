@@ -218,7 +218,8 @@ def test_cli_works_with_server_lock(tmp_path, capsys, monkeypatch):
         assert "sha256" not in row and digest not in output.out and secret not in output.out
         assert cli.main(["server", "keys", "list", *data]) == 0
         text = capsys.readouterr().out
-        assert all(label in text for label in ("name", "scope", "prefix", "created_at", "created_by", "last_used_at"))
+        assert all(label in text for label in (
+            "name", "scope", "user", "prefix", "created_at", "created_by", "last_used_at"))
         assert digest not in text and secret not in text
         assert cli.main(["server", "keys", "revoke", "one", *data]) == 0
         assert server.keys.verify(secret) is None

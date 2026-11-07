@@ -29,7 +29,7 @@ def make_run(data, rid, status="finished", owner="box", stamp=None):
     (directory / "scalars" / "0.bin").write_bytes(b"\0" * 16)
     sizes = {name: (directory / name).stat().st_size for name in (
         "meta.json", "events.jsonl", "media/index.json", "scalars/0.bin")}
-    remote = {"owner": owner}
+    remote = {"owner": "admin", "owner_key": owner}
     if status:
         remote.update(status=status, last_sync_at=stamp or layout.format_timestamp(), sizes=sizes)
     write_json(directory / "remote.json", remote)
@@ -78,7 +78,8 @@ def test_clean_reports_and_key_metadata(store, capsys):
     assert row["name"] == "box" and row["scope"] == "sync" and row["runs"] == 2
     stamps = [json.loads(p.read_bytes())["last_sync_at"] for p in (data / "store" / "runs").glob("*/remote.json")]
     assert row["last_sync_at"] == max(stamps)
-    assert set(row) == {"name", "scope", "prefix", "created_at", "last_used_at", "runs", "last_sync_at"}
+    assert set(row) == {"name", "scope", "user", "prefix", "created_at", "last_used_at",
+                        "runs", "last_sync_at"}
     record = KeyStore(data / "server").list()[0]
     for action in ("status", "verify"):
         code, text, err = command(data, action, capsys, as_json=False)

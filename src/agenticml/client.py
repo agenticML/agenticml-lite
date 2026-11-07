@@ -194,15 +194,16 @@ class Client:
 
     def put_object(self, sha256, handle, size) -> bool:
         try:
-            start = handle.tell()
+            start = 0 if size == 0 else handle.tell()
         except (AttributeError, OSError):
             start = 0
         read_timeout = max(self.timeout, 60 + size / _MIB)
         response = self._request(
             "PUT", f"{self.base_url}/v2/objects/{sha256}",
-            data=handle,
+            # An empty stream makes requests add Transfer-Encoding: chunked.
+            data=b"" if size == 0 else handle,
             timeout=(_CONNECT_TIMEOUT, read_timeout),
-            rewind=(handle, start),
+            rewind=None if size == 0 else (handle, start),
             headers={
                 "Content-Type": "application/octet-stream",
                 "Content-Length": str(size),
@@ -230,9 +231,10 @@ class Client:
 
     def put_lineage(self, run_id, handle, size) -> dict:
         response = self._conflict_or_http(self._request(
-            "PUT", f"{self.base_url}/v2/runs/{run_id}/lineage", data=handle,
+            "PUT", f"{self.base_url}/v2/runs/{run_id}/lineage",
+            data=b"" if size == 0 else handle,
             timeout=(_CONNECT_TIMEOUT, max(self.timeout, 60 + size / _MIB)),
-            rewind=(handle, handle.tell()),
+            rewind=None if size == 0 else (handle, handle.tell()),
             headers={"Content-Type": "application/octet-stream", "Content-Length": str(size)},
         ))
         return response.json()

@@ -17,6 +17,7 @@ from agenticml.store.overview import Overview
 from agenticml.store.reader import parse_artifacts_json
 from agenticml.ui.server import DashboardHandler
 from . import lineage
+from .users import allowed, resolve
 
 logger = logging.getLogger("agenticml.server.ingest")
 _CHUNK = 64 * 1024
@@ -48,6 +49,13 @@ class _RequestError(Exception):
 
 def _fail(http_status, error, **extra):
     raise _RequestError(http_status, {"error": error, **extra})
+
+
+def compat_owner(principal, owner_user):
+    """Compatibility rule for /v2 owner fields (state, remote, and 409 payloads)."""
+    real = owner_user if isinstance(owner_user, str) else None
+    shown = principal.key if real is not None and real == principal.user and principal.key else real
+    return {"owner": shown, "owner_user": real}
 
 
 def _regular(path):
@@ -128,12 +136,18 @@ class IngestHandler(DashboardHandler):
             if route == "health":
                 self._json({"ok": True})
                 return
-            record = self._authenticate()
+            record, principal = self._authenticate()
+            self.principal = principal
             self.server.keys.touch(record)
             if route == "whoami":
-                self._json({"key": record.name, "scope": record.scope, "protocol": 2,
+                self._json({"key": record.name, "scope": record.scope, "user": principal.user,
+                            "role": principal.role, "protocol": 2,
                             "features": (["lineage"] if self.server.lineage_enabled else []) + ["byref"]})
                 return
+            if not allowed(principal, "sync"):
+                if self.headers.get_all("Content-Length") or self.headers.get_all("Transfer-Encoding"):
+                    self.close_connection = True
+                _fail(403, f"role {principal.role} cannot sync")
             if route in ("lineage", "lineage_state") and not self.server.lineage_enabled:
                 _fail(404, "not found")
             if route in ("atomic", "append", "state", "commit", "lineage", "lineage_state"):
@@ -146,12 +160,12 @@ class IngestHandler(DashboardHandler):
                     _fail(404, "not found")
                 self._run_dir(run_id)
             if route == "state":
-                self._json(self._state(run_id))
+                self._json(self._state(run_id, principal))
                 return
             if route == "lineage_state":
                 with self.server.run_lock(run_id):
                     directory = self._run_dir(run_id)
-                    self._ownership(directory, record, False)
+                    self._ownership(directory, principal, False)
                     meta = _json_object(layout.read_file_nofollow(self._target(directory, "meta.json")))
                     self._json(lineage.state(self.server.root, run_id, meta))
                 return
@@ -160,7 +174,7 @@ class IngestHandler(DashboardHandler):
             if route in ("atomic", "append", "commit", "lineage"):
                 # Reject obvious conflicts without receiving a large upload.
                 # Ownership is checked authoritatively again under the lock.
-                self._ownership(self._run_dir(run_id), record,
+                self._ownership(self._run_dir(run_id), principal,
                                 route == "atomic" and args[1] == "meta.json")
             if not self.server._admit_body(self.connection, self.server.limits.concurrent_bodies):
                 self.close_connection = True
@@ -186,18 +200,21 @@ class IngestHandler(DashboardHandler):
                 payload, status = self._object(args[0], tmp, digest)
                 self._json(payload, status)
             else:
+                pending = None
                 with self.server.run_lock(run_id):
                     directory = self._run_dir(run_id)
-                    remote = self._ownership(directory, record, route == "atomic" and args[1] == "meta.json")
+                    remote = self._ownership(directory, principal, route == "atomic" and args[1] == "meta.json")
                     if route == "atomic":
-                        payload, status = self._atomic(run_id, args[1], body, record, remote)
+                        payload, status, pending = self._atomic(run_id, args[1], body, record, principal, remote)
                     elif route == "append":
                         payload, status = self._append(directory, args[1], query, tmp, length, remote)
                     elif route == "lineage":
                         meta = _json_object(layout.read_file_nofollow(self._target(directory, "meta.json")))
                         payload, status = lineage.receive(self.server.root, run_id, meta, tmp)
                     else:
-                        payload, status = self._commit(directory, body, remote)
+                        payload, status, pending = self._commit(directory, body, remote)
+                if pending is not None:
+                    self._audit_run(run_id, pending)
                 self._json(payload, status)
         except (_RequestError, lineage.LineageError) as exc:
             # A rejected request may leave an announced body unread.
@@ -254,7 +271,8 @@ class IngestHandler(DashboardHandler):
         values = self.headers.get_all("Authorization") or []
         ticket = None
         if values:
-            retry_after, ticket = self.server.web.throttle.begin(self.client_address[0])
+            retry_after, ticket = self.server.web.throttle.begin(
+                self.server.web.client_address(self))
             if ticket is None:
                 self.close_connection = True
                 raise _RequestError(
@@ -269,9 +287,13 @@ class IngestHandler(DashboardHandler):
                 if match is not None:
                     outcome = "failed"
                 raise _RequestError(401, {"error": "unauthorized"}, {"WWW-Authenticate": "Bearer"})
+            principal = resolve(self.server.keys, self.server.users, record)
+            if principal is None:
+                raise _RequestError(401, {"error": "unauthorized"}, {"WWW-Authenticate": "Bearer"})
             # Bearer success is ignored: a sync client on the same NAT must not
-            # reset an attacker's count every pass.
-            return record
+            # reset an attacker's count every pass. A missing user is not a
+            # failed bearer value, so it does not count toward the throttle.
+            return record, principal
         finally:
             if ticket is not None:
                 self.server.web.throttle.finish(ticket, outcome)
@@ -360,17 +382,17 @@ class IngestHandler(DashboardHandler):
         except (OSError, ValueError, RecursionError):
             return {}
 
-    def _ownership(self, directory, record, meta_write):
+    def _ownership(self, directory, principal, meta_write):
         exists = _regular(directory / "meta.json")
         remote = self._remote(directory)
         owner = remote.get("owner")
         if not exists and not meta_write:
             _fail(404, "unknown run")
-        if exists and isinstance(owner, str) and owner != record.name:
-            _fail(409, "run owned by another key", owner=owner)
+        if exists and isinstance(owner, str) and owner != principal.user:
+            _fail(409, "run owned by another user", **compat_owner(principal, owner))
         return remote
 
-    def _atomic(self, run_id, name, body, record, remote):
+    def _atomic(self, run_id, name, body, record, principal, remote):
         if name.endswith(".ovw"):
             try:
                 Overview.from_bytes(body)
@@ -388,18 +410,35 @@ class IngestHandler(DashboardHandler):
         if name == "meta.json":
             exists = _regular(directory / "meta.json")
             if not exists or not isinstance(remote.get("owner"), str):
-                claimed = {**remote, "owner": record.name} if exists else {"owner": record.name}
+                claimed = ({**remote, "owner": principal.user, "owner_key": record.name}
+                           if exists else {"owner": principal.user, "owner_key": record.name})
                 self._write_json(directory, "remote.json", claimed)
         layout.atomic_write(path, body, fsync=True)
         layout.fsync_dir(path.parent)
-        return {"size": len(body)}, 200
+        pending = ("run.create", obj) if name == "meta.json" and not exists else None
+        return {"size": len(body)}, 200, pending
+
+    def _audit_run(self, run_id, pending):
+        try:
+            action, obj = pending
+            if action == "run.create":
+                project = obj.get("project")
+                detail = {"project": project if isinstance(project, str) else None,
+                          "key": self.principal.key}
+            else:
+                detail = {"status": obj["status"], "key": self.principal.key}
+            self.server.audit.record(
+                self.principal.user, self.principal.via, action, run_id,
+                self.server.web.client_address(self), detail)
+        except Exception:
+            logger.error("could not record audit event")
 
     def _write_json(self, directory, name, value):
         path = self._target(directory, name)
         layout.atomic_write(path, json.dumps(value).encode("utf-8"), fsync=True)
         layout.fsync_dir(directory)
 
-    def _state(self, run_id):
+    def _state(self, run_id, principal):
         # Bound open inodes per batch; files may describe different instants.
         # Appends preserve prefixes; atomic writes/truncates replace inodes.
         with self.server.run_lock(run_id):
@@ -435,7 +474,12 @@ class IngestHandler(DashboardHandler):
                 files.update({name: {"size": size, "sha256": _hash_prefix(handle, size)}
                               for name, (handle, size) in snapshots.items()})
         owner = remote.get("owner")
-        return {"owner": owner if isinstance(owner, str) else None, "files": files, "remote": remote}
+        fields = compat_owner(principal, owner)
+        shown_remote = {**remote, **fields}
+        if owner != principal.user:
+            shown_remote.pop("owner_key", None)
+            shown_remote.pop("last_sync_key", None)
+        return {**fields, "files": files, "remote": shown_remote}
 
     def _missing(self, body):
         hashes = _json_object(body).get("objects")
@@ -586,9 +630,17 @@ class IngestHandler(DashboardHandler):
         if actual != sizes:
             _fail(409, "size mismatch", sizes=actual)
         owner = remote.get("owner")
-        self._write_json(directory, "remote.json", {
+        owner_key = remote.get("owner_key")
+        payload = {
             "owner": owner if isinstance(owner, str) else None,
             "status": status, "fingerprint": fingerprint,
             "last_sync_at": layout.format_timestamp(), "sizes": sizes,
-        })
-        return {"complete": True, "fingerprint": fingerprint}, 200
+            "last_sync_key": self.principal.key,
+        }
+        if isinstance(owner_key, str):
+            payload["owner_key"] = owner_key
+        self._write_json(directory, "remote.json", payload)
+        pending = (("run.finish", obj)
+                   if status in ("finished", "crashed") and status != remote.get("status")
+                   else None)
+        return {"complete": True, "fingerprint": fingerprint}, 200, pending

@@ -1,6 +1,7 @@
 """Laptop setup: Tailscale checks, first admin key, Funnel, optional user service."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -13,8 +14,10 @@ import subprocess
 import sys
 import threading
 
+from agenticml.store import layout
 from .app import prepare_data_dir, resolve_data_dir, serve
-from .keys import KeyNameTaken, KeyStore, SetupClosed
+from .keys import KeyStore
+from .users import UserNameTaken, UserStore, migrate
 
 _MAC_TAILSCALE = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 _UNIT_NAME = "agenticml-server-up"
@@ -30,8 +33,11 @@ _NO_FUNNEL = ('this machine may not use Funnel: add the "funnel" node attribute 
               "in the tailnet policy (https://tailscale.com/kb/1223/funnel)")
 _NOT_RUNNING = 'Tailscale is not running or not logged in: run "tailscale up"'
 _INSTALL_PLATFORMS = "--install is supported on Linux (systemd) and macOS"
-_NO_ADMIN_TTY = ("no admin key: run `agenticml server up` once in a terminal, or "
-                 "`agenticml server keys create NAME --scope admin`")
+_NO_ADMIN_TTY = ("no admin: run `agenticml server up` once in a terminal, or "
+                 "`agenticml server users add admin --role admin`")
+_ADMIN_NAME_NOT_ADMIN = (
+    "user admin exists but is not an admin: promote it with "
+    "`agenticml server users set-role admin admin` or remove it")
 _SETUP_CLOSED = ("setup is closed for this data directory: create an admin key with "
                  "`agenticml server keys create NAME --scope admin`")
 _PORT_443_TAKEN = ("Tailscale already serves port 443 on this machine: "
@@ -130,28 +136,57 @@ def check_tailscale():
     return "https://" + dns.rstrip(".")
 
 
+def _invite_is_live(user):
+    invite = getattr(user, "invite", None)
+    if not isinstance(invite, dict):
+        return False
+    try:
+        expires = layout.parse_timestamp(invite.get("expires_at"))
+    except (TypeError, ValueError, ArithmeticError):
+        return False
+    return expires > datetime.now(timezone.utc)
+
+
 def bootstrap_admin(data, public_url, *, install=False):
-    """Create the first admin key if needed; print it once. Returns the data dir."""
+    """Create the first admin user with an invite if needed. Returns the data dir."""
+    from .audit import AuditLog, cli_actor
+
     data = resolve_data_dir(data)
     prepare_data_dir(data)
+    actor = cli_actor()
+    log = AuditLog(data / "server")
+    if not migrate(data, actor=actor):
+        raise UpError("could not migrate keys.json; fix the file and retry")
     env_key = os.environ.get("AGENTICML_SERVER_KEY")
     keys = KeyStore(data / "server", None if install else env_key)
-    if keys.has_admin():
+    users = UserStore(data / "server")
+    named = users.get("admin")
+    has_admin_user = any(user.role == "admin" for user in users.list())
+    if named is not None and named.role != "admin" and not keys.has_admin() and not has_admin_user:
+        raise UpError(_ADMIN_NAME_NOT_ADMIN)
+    if keys.has_admin() or has_admin_user:
+        admin_user = named if named is not None and named.role == "admin" else None
+        if admin_user is None:
+            admin_user = next((user for user in users.list() if user.role == "admin"), None)
+        if (admin_user is not None and admin_user.password is None
+                and not _invite_is_live(admin_user)):
+            print("no admin password yet: run `agenticml server users invite "
+                  f"{admin_user.name}`", flush=True)
         return data
+    if keys.setup_closed():
+        raise UpError(_SETUP_CLOSED)
     if not _stdout_is_tty():
         raise UpError(_NO_ADMIN_TTY)
     try:
-        try:
-            _, key = keys.create("admin", scope="admin", created_by="server up",
-                                 only_if_no_admin=True)
-        except KeyNameTaken:
-            _, key = keys.create("admin-" + secrets.token_hex(2), scope="admin",
-                                 created_by="server up", only_if_no_admin=True)
-    except SetupClosed:
-        raise UpError(_SETUP_CLOSED) from None
-    print(key, flush=True)
-    print(f"Sign in at {public_url}/login with this admin key. It is shown only once.",
-          flush=True)
+        users.add("admin", role="admin", created_by="server up")
+    except UserNameTaken:
+        raise UpError(_ADMIN_NAME_NOT_ADMIN) from None
+    log.record(actor, "cli", "user.add", "admin", detail={"role": "admin", "identity": None})
+    token = users.create_invite("admin")
+    log.record(actor, "cli", "user.invite", "admin",
+               detail={"expires_at": users.get("admin").invite["expires_at"]})
+    print(f"Open {public_url}/invite?token={token} to choose the admin "
+          "password. The link works once, for 72 hours.", flush=True)
     if install and env_key:
         print(_ENV_KEY_NOT_INHERITED, flush=True)
     return data
@@ -393,7 +428,8 @@ def up(data=None, port=8080, *, install=False, force=False):
         print(f"AgenticML is live at {public_url}", flush=True)
 
     try:
-        serve(data, "127.0.0.1", port, public_url, on_ready)
+        serve(data, "127.0.0.1", port, public_url, on_ready,
+              trusted_proxies=("127.0.0.1", "::1"))
     finally:
         try:
             if funnel_attempted:
