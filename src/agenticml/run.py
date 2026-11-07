@@ -394,6 +394,7 @@ class Run(metaclass=_RunType):
             self._runtime_collector = RuntimeFileCollector(
                 source_roots=source_roots or [],
                 extra_files=extra_files or [],
+                store_root=self.root,
                 max_file_bytes=resolved_max_file_bytes,
                 max_total_bytes=resolved_max_total_bytes,
             )

@@ -190,7 +190,7 @@ agenticml sync --all --prune
 ## Upload
 
 ```bash
-agenticml login --host https://api.agenticml.xyz
+agenticml login --host https://aml.example.com
 agenticml whoami
 agenticml logout
 agenticml sync RUN_ID [RUN_ID ...]
@@ -199,13 +199,155 @@ agenticml sync --all --watch 30 --dry-run
 agenticml sync RUN_ID --reset
 ```
 
-`login` checks the key (skip with `--no-verify`) and writes `~/.config/agenticml/credentials.json` at mode `0600`. The directory is `AGENTICML_CONFIG_DIR`, else `$XDG_CONFIG_HOME/agenticml`, else `~/.config/agenticml`. The default host is `https://api.agenticml.xyz`. Use the `agenticml login` prompt to enter the key, or `AGENTICML_API_KEY` for sync. Avoid command-line `--key` / `--api-key`: their values are visible in `ps`. `login` also accepts stdin. `sync` takes the key from `--api-key`, then `AGENTICML_API_KEY`, then the file. `whoami` uses `AGENTICML_API_KEY`, then the file. `whoami --offline` skips the server check. `logout` removes the saved key for one host. On `login`, `whoami`, and `sync`, `--insecure` allows `http://` to a non-local host; localhost does not need it.
+`login` checks the key (skip with `--no-verify`) and writes `~/.config/agenticml/credentials.json` at mode `0600`. The directory is `AGENTICML_CONFIG_DIR`, else `$XDG_CONFIG_HOME/agenticml`, else `~/.config/agenticml`. `AGENTICML_HOST` has no default; `login` requires `--host` unless a default host is already saved. Use the `agenticml login` prompt to enter the key, or `AGENTICML_API_KEY` for sync. Avoid command-line `--key` / `--api-key`: their values are visible in `ps`. `login` also accepts stdin. `sync` sends runs to an `agenticml server` over [protocol v2](docs/PROTOCOL.md). `sync` takes the key from `--api-key`, then `AGENTICML_API_KEY`, then the file. `whoami` uses `AGENTICML_API_KEY`, then the file. `whoami --offline` skips the server check. `logout` removes the saved key for one host. On `login`, `whoami`, and `sync`, `--insecure` allows `http://` to a non-local host; localhost does not need it.
 
-Sync is incremental and resumable. A cursor in `runs/<id>/sync.json` stores scalar byte offsets and which code, media, and artifacts were sent. An interrupted sync retries at most the in-flight batch. `--all` selects runs that are incomplete or changed. `--watch N` repeats every N seconds until every selected run has synced, failed permanently, or gone stale. `--dry-run` prints counts without sending or saving state. `--reset` clears the saved remote id for explicit run ids on this host, and it rejects `--all`.
+Sync copies each run's store files byte for byte (`meta.json`, `events.jsonl`, scalars, overviews, indexes) plus the objects they reference (code, media, copied artifacts) to an `agenticml server` over [protocol v2](docs/PROTOCOL.md). A per-file cursor in `runs/<id>/sync.json` tracks accepted bytes, so an interrupted sync resumes from the last accepted request. `--all` selects runs that are incomplete or changed. `--watch N` repeats every N seconds until every selected run has synced, failed permanently, or gone stale. `--dry-run` prints counts without sending or saving state. `--reset` forgets this host's cursor for explicit run ids and the next sync resumes from the server's copy (rejects `--all`).
 
-Uploaded: project, name, config, tags, notes, group, job type, env, git, the parent's remote id, finite scalar points, code files, media, artifacts, and the summary plus status at finalize. `copy=True` artifacts come from the object store. By-reference artifacts are read from the logged path when it is still a regular file with the same size and mtime.
+Not uploaded in 2.0: notes (`notes.md`), by-reference (`copy=False`) artifacts, and lineage code diffs. A run id already owned by another key on the server fails with an error naming that key. See [docs/PROTOCOL.md](docs/PROTOCOL.md) for protocol details.
 
-Server-side gaps: `created_at` and `finished_at` are stamped by the server at sync time. Config keys cannot be deleted remotely, and `group` / `job_type` cannot be cleared (a null is omitted and the stored value stays).
+## On-prem server
+
+The server runs as a single process backed by a single data directory, serving the shared web dashboard and the sync API. It runs on your own machines; there is no vendor backend. See [docs/SERVER.md](docs/SERVER.md) for the full reference, and [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) and [SECURITY.md](SECURITY.md) for security.
+
+### Start the server
+
+Install `agenticml-lite` into a virtual environment on a POSIX host (Python 3.10+):
+
+```bash
+sudo python3 -m venv /opt/agenticml
+sudo /opt/agenticml/bin/python -m pip install agenticml-lite
+```
+
+Run directly (a venv anywhere the user owns is fine, e.g. `python3 -m venv ~/agenticml-venv`):
+```bash
+/opt/agenticml/bin/agenticml server serve --data DIR --host 127.0.0.1 --port 8080 --public-url https://...
+```
+`--data` falls back to `AGENTICML_SERVER_DATA`, then `~/.agenticml-server`. `--public-url` falls back to `AGENTICML_SERVER_PUBLIC_URL`.
+
+Or run as a systemd service: see [deploy/systemd/README.md](deploy/systemd/README.md) and [deploy/systemd/agenticml-server.service](deploy/systemd/agenticml-server.service).
+```bash
+sudo useradd --system --home /var/lib/agenticml-server --shell /usr/sbin/nologin agenticml
+sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.2.0/deploy/systemd/agenticml-server.service
+```
+Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`). Edit `AGENTICML_SERVER_PUBLIC_URL` in the unit (or `sudo systemctl edit agenticml-server`), then `daemon-reload` and `enable --now`:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now agenticml-server
+```
+
+Put a TLS reverse proxy in front:
+- **Laptop or workstation:** `agenticml server up` makes the server reachable from the public internet through Tailscale Funnel (anyone can reach the login page; only keys grant access). It takes port 443 of this machine's Tailscale serve config. After SIGKILL, a crash, or power loss, Funnel stays on. The next `server up` on the same port turns it back on and off again; a stale Funnel entry for a different port is refused ("Tailscale already serves port 443 on this machine: check `tailscale funnel status` and turn it off first") and must be turned off with `tailscale funnel --https=443 off` first. Funnel visitors all arrive from `127.0.0.1`, so they share one failed-login throttle bucket (someone sending bad keys can delay sign-in and syncs by up to 60 s; fixed by package 13 in 2.2). Manual steps: `tailscale serve --bg 8080` and set `AGENTICML_SERVER_PUBLIC_URL=https://<machine>.<tailnet>.ts.net`, or pass `--public-url`.
+- **Production:** Caddy or a load balancer. Set the public URL to the proxied HTTPS URL.
+
+### First admin key
+
+When starting with an empty data directory, read the setup link from the server's terminal output, or from the journal under systemd:
+```bash
+sudo journalctl -u agenticml-server
+```
+Look for:
+```
+No admin key yet. Open <url>/setup?token=<token> to create one, or run: agenticml server keys create --name admin --scope admin
+```
+Open the `/setup?token=<token>` URL in a browser, name the key, and save it. It is shown once.
+
+CLI alternative (runs on the server host while the server is up):
+```bash
+agenticml server keys create --name admin --scope admin --data DIR
+# or under systemd:
+sudo -u agenticml /opt/agenticml/bin/agenticml server keys create --name admin --scope admin --data /var/lib/agenticml-server
+```
+
+Or set an environment variable by exporting `AGENTICML_SERVER_KEY` before `agenticml server serve`:
+```bash
+export AGENTICML_SERVER_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+```
+Under systemd, set it in `/etc/agenticml-server.env` (root-owned, mode 0600).
+It is the admin key named `env`, and it can't be revoked from the Keys page.
+
+### Sign in
+
+Open the server's public URL in a browser and sign in with the admin key.
+
+### Issue a sync key per training machine
+
+On the **Keys** page, click **New key**, name it (e.g. `gpu-box-1`), and keep the default scope `sync`. Copy the shown `agenticml login` command.
+
+CLI alternative:
+```bash
+agenticml server keys create --name gpu-box-1 --data DIR
+# or under systemd:
+sudo -u agenticml /opt/agenticml/bin/agenticml server keys create --name gpu-box-1 --data /var/lib/agenticml-server
+```
+The plaintext key is printed once.
+
+### Set up each training machine
+
+On each training machine (Python 3.10+):
+```bash
+pip install agenticml-lite
+agenticml login --host https://...
+```
+Paste the key at the prompt; do not pass `--key` on the command line (visible in `ps`).
+
+Verify authentication:
+```bash
+agenticml whoami
+```
+
+Sync runs once, or follow continuously:
+```bash
+agenticml sync --all       # sync all incomplete or changed runs once
+agenticml sync --follow    # keep syncing active and new runs
+```
+`--follow` picks up new runs, heartbeats running runs at least every 60 s, and backs off up to 5 min while the server is down. If the key is rejected, `sync` exits 3.
+
+For a user systemd unit, see [deploy/systemd/README.md](deploy/systemd/README.md).
+
+### Watch runs
+
+Watch runs in the shared dashboard at the public URL. Run statuses: `running`, `finished`, `crashed`, or `stale` (when no commit arrives for `AGENTICML_REMOTE_STALE_SECONDS`, default 600).
+
+Not uploaded in 2.0: notes, `copy=False` artifacts, lineage code diffs. Each run is owned by the key that created it.
+
+### Revoke a key
+
+From the dashboard: **Keys** page → **Revoke**.
+
+CLI alternative:
+```bash
+agenticml server keys revoke NAME --data DIR
+# or under systemd:
+sudo -u agenticml /opt/agenticml/bin/agenticml server keys revoke NAME --data /var/lib/agenticml-server
+```
+Revocation takes effect without a restart, and that machine's sync stops on its next request with exit 3. The last admin key cannot be revoked from the page; use the CLI.
+
+### Back up
+
+Stop the service cleanly before copying the data directory:
+```bash
+sudo systemctl stop agenticml-server
+sudo tar czf agenticml-backup.tgz -C /var/lib/agenticml-server .
+sudo systemctl start agenticml-server
+```
+
+Restore: stop the service, extract the backup into the data directory, set ownership, and start the service:
+```bash
+sudo systemctl stop agenticml-server
+sudo tar xzf agenticml-backup.tgz -C /var/lib/agenticml-server
+sudo chown -R agenticml:agenticml /var/lib/agenticml-server
+sudo systemctl start agenticml-server
+```
+
+### Upgrade
+
+Back up first.
+
+One server per data directory; downgrades aren't supported. Upgrade the package in the venv and restart the service:
+```bash
+sudo /opt/agenticml/bin/pip install -U agenticml-lite
+sudo systemctl restart agenticml-server
+```
 
 ## Configuration
 
@@ -213,7 +355,7 @@ Server-side gaps: `created_at` and `finished_at` are stamped by the server at sy
 | --- | --- | --- |
 | `AGENTICML_DIR` | `~/.agenticml` | Store root. `init(dir=)` and `--dir` win. |
 | `AGENTICML_MODE` | `local` | `local`, `offline` (alias of `local`), or `disabled`. Other values warn and use `local`. |
-| `AGENTICML_HOST` | `https://api.agenticml.xyz` | Server for `login`, `whoami`, and `sync`. |
+| `AGENTICML_HOST` | unset | Server for `login`, `whoami`, and `sync`. |
 | `AGENTICML_API_KEY` | unset | Key for `sync` and `whoami`. `login` ignores it. |
 | `AGENTICML_CONFIG_DIR` | `~/.config/agenticml` | Credential directory. Wins over `XDG_CONFIG_HOME`. |
 | `AGENTICML_MAX_BYTES` | 5 GiB | Warn when the local store is larger than this. Nothing is deleted automatically. |
@@ -272,16 +414,16 @@ python scripts/bench.py --quick
 
 ## Releasing
 
-GitHub Actions publishes to PyPI with Trusted Publishing (no API tokens).
+Bump the version in `pyproject.toml` and `src/agenticml/__init__.py`, then push a `v*` tag.
 
 - **TestPyPI dry run:** run the "Publish to TestPyPI" workflow by hand from the Actions tab. Re-running with a version that is already there is a no-op.
-- **PyPI:** push a `v*` tag. The workflow fails if the tag does not match the version in `pyproject.toml` and `src/agenticml/__init__.py`.
+- **PyPI:** `publish.yml` publishes to PyPI with Trusted Publishing (no API tokens) when the tag matches the package version.
 
 ```bash
 # bump version in pyproject.toml and src/agenticml/__init__.py
-git commit -am "release: v0.1.0"
-git tag v0.1.0
-git push origin v0.1.0
+git commit -am "release: v2.2.0"
+git tag v2.2.0
+git push origin v2.2.0
 ```
 
 ## License

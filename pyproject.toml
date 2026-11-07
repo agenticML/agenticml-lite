@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agenticml-lite"
-version = "1.0.0"
+version = "2.2.0"
 description = "Lean, local-first experiment tracker for AgenticML. Installs as `agenticml-lite`, imports as `agenticml`."
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Gaurav Singh", email = "gaurav.singh@agenticml.xyz" }]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 keywords = ["mlops", "experiment-tracking", "machine-learning", "agentic"]
 dependencies = [
   "requests>=2.31",
@@ -20,7 +20,6 @@ classifiers = [
   "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
@@ -66,3 +65,4 @@ testpaths = ["tests"]
 
 [tool.setuptools.package-data]
 "agenticml.ui" = ["static/*"]
+"agenticml.server" = ["static/*"]

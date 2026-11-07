@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>agenticml · Choose a password</title>
+    <link rel="stylesheet" href="/static/app.css" />
+    <script type="module" src="/static/invite.js"></script>
+  </head>
+  <body class="login-page">
+    <main class="login-card">
+      <p class="eyebrow">agenticml</p>
+      <h1>Choose a password</h1>
+      <form id="invite" autocomplete="off">
+        <label class="field-label" for="password">Password</label>
+        <input id="password" class="field" type="password" name="password"
+               minlength="12" maxlength="1024" autocomplete="new-password" required />
+        <label class="field-label" for="password2">Confirm password</label>
+        <input id="password2" class="field" type="password" name="password2"
+               minlength="12" maxlength="1024" autocomplete="new-password" required />
+        <button class="btn btn-primary" type="submit">Save password</button>
+      </form>
+      <p id="error" class="error" role="alert" hidden></p>
+    </main>
+  </body>
+</html>

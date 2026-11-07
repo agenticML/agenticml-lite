@@ -51,14 +51,13 @@ assert "Run" in ns and "log" in ns
 def test_client_constructs(monkeypatch):
     monkeypatch.delenv("AGENTICML_HOST", raising=False)
     monkeypatch.delenv("AGENTICML_API_KEY", raising=False)
-    c = agenticml.Client(api_key="test")
-    assert c.api_key == "test"
-    assert c.base_url == "https://api.agenticml.xyz"
+    with pytest.raises(ValueError, match="no server host"):
+        agenticml.Client(api_key="test")
 
 
 def test_client_strips_trailing_slash():
-    c = agenticml.Client(base_url="https://api.agenticml.xyz/")
-    assert c.base_url == "https://api.agenticml.xyz"
+    c = agenticml.Client(base_url="https://example.com/")
+    assert c.base_url == "https://example.com"
 
 
 def test_client_reads_env(monkeypatch):

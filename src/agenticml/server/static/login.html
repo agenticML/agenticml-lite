@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>agenticml · Sign in</title>
+    <link rel="stylesheet" href="/static/app.css" />
+    <script type="module" src="/static/login.js"></script>
+  </head>
+  <body class="login-page">
+    <main class="login-card">
+      <p class="eyebrow">agenticml</p>
+      <h1>Sign in</h1>
+      <form id="password-login" autocomplete="off">
+        <label class="field-label" for="user">User name</label>
+        <input id="user" class="field" name="user" autocomplete="username" required />
+        <label class="field-label" for="password">Password</label>
+        <input
+          id="password"
+          class="field"
+          type="password"
+          name="password"
+          autocomplete="current-password"
+          required
+        />
+        <button class="btn btn-primary" type="submit">Sign in</button>
+      </form>
+      <p>
+        <button id="use-key" class="btn btn-ghost" type="button">Sign in with an admin key</button>
+      </p>
+      <form id="login" autocomplete="off" hidden>
+        <label class="field-label" for="key">Admin API key</label>
+        <input
+          id="key"
+          class="field"
+          type="password"
+          name="key"
+          autocomplete="off"
+          required
+        />
+        <button class="btn btn-primary" type="submit">Sign in</button>
+      </form>
+      <p id="error" class="error" role="alert" hidden></p>
+    </main>
+  </body>
+</html>

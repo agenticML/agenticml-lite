@@ -543,6 +543,54 @@ kbd {
   font: var(--fs-sm) var(--font-mono);
   color: var(--text-3);
 }
+.topbar-session {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  min-width: 0;
+  flex: none;
+}
+.topbar-session-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 28ch;
+  font: var(--fs-sm) var(--font-mono);
+  color: var(--text-3);
+}
+.login-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--s-5);
+}
+.login-card {
+  width: min(100%, 360px);
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-4);
+  overflow-wrap: anywhere;
+}
+.login-card h1 {
+  margin: 0;
+  font: 600 var(--fs-2xl) / 1.2 var(--font-sans-stack);
+}
+.login-card form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  min-width: 0;
+}
+.login-card .field {
+  width: 100%;
+  min-width: 0;
+}
+.login-card .error[hidden] {
+  display: none;
+}
 #theme {
   flex: none;
   font-family: var(--font-mono-stack);
@@ -578,6 +626,9 @@ kbd {
   gap: 10px;
   flex-wrap: wrap;
   min-width: 0;
+}
+[data-artifact] .mono {
+  overflow-wrap: anywhere;
 }
 .heading {
   justify-content: space-between;
@@ -760,6 +811,14 @@ kbd {
 .run-id {
   font: var(--fs-xs) var(--font-mono);
   color: var(--text-3);
+  white-space: nowrap;
+}
+.run-owner {
+  font: var(--fs-xs) var(--font-mono);
+  color: var(--text-3);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 .run-status {
@@ -2857,6 +2916,9 @@ pre,
   .topbar-host {
     display: none;
   }
+  .topbar-session-label {
+    display: none;
+  }
 }
 @media (max-width: 760px) {
   .selection-hint {
@@ -3106,4 +3168,117 @@ pre,
 .section-head > * {
   min-width: 0;
   overflow-wrap: anywhere;
+}
+
+/* Keys use the shared table and modal surfaces, with secrets wrapping in place. */
+.key-dialog {
+  width: min(560px, calc(100vw - 32px));
+  padding: var(--s-5);
+  overflow-wrap: anywhere;
+}
+.key-dialog > .heading {
+  margin-bottom: var(--s-4);
+}
+.key-dialog h2,
+.key-dialog p {
+  margin: 0;
+}
+.key-dialog .field {
+  width: 100%;
+  min-width: 0;
+}
+.key-dialog code {
+  display: block;
+  min-width: 0;
+  white-space: pre-wrap;
+  font: var(--fs-sm) / 1.6 var(--font-mono-stack);
+}
+.key-copy-status {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+.key-dialog .error:not([hidden]) {
+  margin-top: var(--s-4);
+}
+@media (max-width: 599px) {
+  .keys-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+  .keys-table,
+  .keys-table tbody,
+  .keys-table tr {
+    display: block;
+  }
+  .keys-table tr {
+    margin-bottom: var(--s-4);
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+  }
+  .keys-table td {
+    display: grid;
+    grid-template-columns: 80px minmax(0, 1fr);
+    gap: var(--s-3);
+    min-width: 0;
+  }
+  .keys-table td::before {
+    content: attr(data-label);
+    font-family: var(--font-sans-stack);
+    color: var(--text-3);
+  }
+  .keys-table td:last-child {
+    border-bottom: 0;
+  }
+}
+.keys-table .field {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+.keys-table .inline {
+  flex-wrap: wrap;
+}
+.team-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+  min-width: 0;
+}
+.activity-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s-3);
+}
+@media (max-width: 760px) {
+  .topbar:has(#session:not([hidden])) {
+    height: auto;
+    min-height: var(--topbar-h);
+    flex-wrap: wrap;
+    gap: var(--s-2);
+    row-gap: var(--s-2);
+    padding-top: var(--s-2);
+    padding-bottom: var(--s-2);
+  }
+  .topbar:has(#session:not([hidden])) .topbar-host {
+    display: none;
+  }
+  .topbar:has(#session:not([hidden])) .breadcrumb {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    flex: 1 1 8rem;
+  }
+  .topbar:has(#session:not([hidden])) .topbar-session {
+    flex: 0 1 auto;
+  }
+  .topbar:has(#session:not([hidden])) .btn {
+    flex: none;
+  }
 }

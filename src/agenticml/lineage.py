@@ -80,14 +80,18 @@ def _repo_path(root, key):
     return layout.contained(root, Path(root) / "lineage" / f"{key}.git")
 
 
-def _env(repo=None, worktree=None, index=None):
+def _env(repo=None, worktree=None, index=None, extra_env=None):
     # Inherited Git overrides (including config injection) cannot select the
     # user's index, hooks, repository, or global filters.
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env.update(GIT_OPTIONAL_LOCKS="0", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                GIT_AUTHOR_NAME="agenticml", GIT_AUTHOR_EMAIL="agenticml@localhost",
                GIT_COMMITTER_NAME="agenticml", GIT_COMMITTER_EMAIL="agenticml@localhost",
-               GIT_TERMINAL_PROMPT="0")
+               GIT_TERMINAL_PROMPT="0", LC_ALL="C", LANGUAGE="")
+    if extra_env:
+        if set(extra_env) - {"GIT_OBJECT_DIRECTORY"}:
+            raise ValueError("unsupported Git environment override")
+        env.update(extra_env)
     if repo is not None:
         env["GIT_DIR"] = str(repo)
     if worktree is not None:
@@ -97,9 +101,11 @@ def _env(repo=None, worktree=None, index=None):
     return env
 
 
-def _git(args, *, repo=None, worktree=None, index=None, timeout=30, input=None, check=True):
-    return subprocess.run(["git", *args], env=_env(repo, worktree, index),
+def _git(args, *, repo=None, worktree=None, index=None, timeout=30, input=None, stdin=None, check=True,
+         extra_env=None):
+    return subprocess.run(["git", *args], env=_env(repo, worktree, index, extra_env),
                           cwd=worktree or repo, input=input, capture_output=True,
+                          stdin=stdin if stdin is not None else subprocess.DEVNULL if input is None else None,
                           check=check, timeout=timeout)
 
 
@@ -129,6 +135,11 @@ def _locked(root, repo, *, deadline=None):
         yield
 
 
+def _init_repo(repo, *, timeout=30):
+    if not (repo / "HEAD").exists():
+        _git(["init", "--bare", "--template=", str(repo)], timeout=timeout)
+
+
 def shadow_repo(root, project, *, timeout=30, deadline=None) -> Path:
     """Initialize a bare repository lazily, entirely under the store root."""
     deadline = deadline if deadline is not None else time.monotonic() + timeout
@@ -136,8 +147,8 @@ def shadow_repo(root, project, *, timeout=30, deadline=None) -> Path:
     repo = _repo_path(root, project_key(project))
     repo.mkdir(parents=True, exist_ok=True)
     with _locked(root, repo, deadline=deadline):
-        if not layout.contained(root, repo / "HEAD").exists():
-            _git(["init", "--bare", "--template=", str(repo)], timeout=_remaining(deadline))
+        layout.contained(root, repo / "HEAD")
+        _init_repo(repo, timeout=_remaining(deadline))
         exclude = layout.contained(root, repo / "info" / "exclude")
         exclude.parent.mkdir(parents=True, exist_ok=True)
         patterns = ([f"{name}/" for name in sorted(SKIP_DIR_NAMES)]
@@ -376,6 +387,47 @@ def run_commit(root, run_id):
     root = layout.resolve_root(root)
     _, _, repo = _run_repo(root, run_id)
     return _resolve_commit(repo, run_id)
+
+
+def replication_info(meta):
+    info = meta.get("lineage")
+    if (isinstance(info, dict) and isinstance(meta.get("project"), str)
+            and isinstance(info.get("project_key"), str)
+            and _KEY_RE.fullmatch(info["project_key"])
+            and info["project_key"] == project_key(meta["project"])
+            and isinstance(info.get("commit"), str)
+            and re.fullmatch(r"[0-9a-f]{40}", info["commit"])):
+        return info
+    return None
+
+
+def bundle_for_run(root, run_id, have_commits, dest):
+    """Bundle a run ref, excluding advertised tips that exist locally."""
+    root = layout.resolve_root(root)
+    meta = RunReader(root, run_id).meta()
+    info = replication_info(meta)
+    if info is None:
+        raise ValueError("run has no lineage")
+    repo = _repo_path(root, info["project_key"])
+    with _locked(root, repo):
+        if _resolve_commit(repo, run_id) != info["commit"]:
+            raise ValueError("local lineage ref differs")
+        tips = list(dict.fromkeys(c for c in have_commits
+                                 if isinstance(c, str) and re.fullmatch(r"[0-9a-f]{40}", c)))
+        exclusions = []
+        if tips:
+            checked = _git(["cat-file", "--batch-check"], repo=repo,
+                           input=("\n".join(tips) + "\n").encode()).stdout.splitlines()
+            exclusions = [b"^" + tip.encode() for tip, line in zip(tips, checked)
+                          if line.split()[1:2] == [b"commit"]]
+        args = ["bundle", "create", str(Path(dest).resolve()), _ref(run_id), "--stdin"]
+        result = _git(args, repo=repo, check=False,
+                      input=b"\n".join(exclusions) + (b"\n" if exclusions else b""))
+        # A descendant tip may include this commit without its run ref existing.
+        if result.returncode and exclusions:
+            _git(args, repo=repo, input=b"")
+        else:
+            result.check_returncode()
 
 
 def checkout(root, run_id, dest=None) -> Path:

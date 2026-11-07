@@ -17,7 +17,7 @@ import os
 import stat
 from pathlib import Path
 
-from .layout import contained, object_path, unique_tmp
+from .layout import contained, object_path, open_nofollow, unique_tmp
 
 # One pass over a multi-GB checkpoint. Big enough that syscall overhead is
 # noise, small enough that a copy does not pin the file in memory.
@@ -58,8 +58,10 @@ def put_bytes(root, data: bytes) -> str:
         return sha
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = unique_tmp(dest.parent, f".{sha}")
+    created = False
     try:
-        with tmp.open("wb") as handle:
+        with tmp.open("xb") as handle:
+            created = True
             handle.write(blob)
             handle.flush()
             os.fsync(handle.fileno())
@@ -67,7 +69,8 @@ def put_bytes(root, data: bytes) -> str:
             os.replace(tmp, dest)
         return sha
     finally:
-        tmp.unlink(missing_ok=True)
+        if created:
+            tmp.unlink(missing_ok=True)
 
 
 def put_file(root, path) -> tuple[str, int]:
@@ -84,8 +87,12 @@ def put_file(root, path) -> tuple[str, int]:
     tmp = unique_tmp(objects, ".tmp")
     digest = hashlib.sha256()
     size = 0
+    created = False
     try:
-        with src.open("rb") as src_handle, tmp.open("wb") as dst_handle:
+        # realpath does not raise on a symlink loop; open_nofollow then does.
+        # Path.resolve() raises RuntimeError("Symlink loop") on Python 3.9–3.12.
+        with open_nofollow(Path(os.path.realpath(src))) as src_handle, tmp.open("xb") as dst_handle:
+            created = True
             while True:
                 chunk = src_handle.read(_CHUNK)
                 if not chunk:
@@ -102,7 +109,8 @@ def put_file(root, path) -> tuple[str, int]:
             os.replace(tmp, dest)
         return sha, size
     finally:
-        tmp.unlink(missing_ok=True)
+        if created:
+            tmp.unlink(missing_ok=True)
 
 
 def has(root, sha: str) -> bool:

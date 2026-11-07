@@ -13,6 +13,7 @@ import socket
 import struct
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -35,8 +36,16 @@ from agenticml.store import (
     valid_run_id,
     valid_sha,
 )
-from agenticml.store.layout import RunLockedError
-from agenticml.store.reader import STALE_AFTER_SECONDS
+from agenticml.store.layout import REMOTE_NAME, RunLockedError, read_file_nofollow
+from agenticml.store.reader import (
+    REMOTE_STALE_ENV,
+    REMOTE_STALE_SECONDS,
+    STALE_AFTER_SECONDS,
+    _effective_status,
+    _remote_status,
+    read_remote,
+    remote_stale_seconds,
+)
 
 _RUN_ID_RE = re.compile(r"^\d{8}T\d{6}-[0-9a-f]{8}$")
 # finish persists <id>.ovw only strictly above OVERVIEW_MIN_POINTS.
@@ -749,6 +758,392 @@ def test_list_runs_order_skip_and_liveness(tmp_path):
     assert list_runs(tmp_path / "does-not-exist") == []
 
 
+def _call_with_timeout(call):
+    results = []
+    errors = []
+
+    def worker():
+        try:
+            results.append(call())
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(timeout=5)
+    assert not thread.is_alive(), "reader blocked on a FIFO"
+    if errors:
+        raise errors[0]
+    return results[0]
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+def test_read_file_nofollow_refuses_fifo(tmp_path):
+    path = tmp_path / "fifo"
+    os.mkfifo(path)
+    with pytest.raises(OSError) as exc_info:
+        _call_with_timeout(lambda: read_file_nofollow(path))
+    assert exc_info.value.errno == errno.EINVAL
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+@pytest.mark.parametrize("mode", ["rb", "ab"])
+def test_open_nofollow_refuses_fifo(tmp_path, mode):
+    from agenticml.store.layout import open_nofollow
+
+    writer = RunWriter.create(tmp_path, meta={})
+    writer.close()
+    path = writer.run_dir / "events.jsonl"
+    path.unlink()
+    os.mkfifo(path)
+
+    def open_fifo():
+        with open_nofollow(path, mode):
+            pass
+
+    with pytest.raises(OSError) as exc_info:
+        _call_with_timeout(open_fifo)
+    expected = (errno.EINVAL,) if mode == "rb" else (errno.ENXIO, errno.EINVAL)
+    assert exc_info.value.errno in expected
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+def test_reader_events_fifo_falls_back(tmp_path):
+    writer = RunWriter.create(tmp_path, meta={})
+    writer.set_config({"before": True})
+    writer.close()
+    path = writer.run_dir / "events.jsonl"
+    path.unlink()
+    os.mkfifo(path)
+
+    reader = RunReader(tmp_path, writer.run_id)
+    assert _call_with_timeout(reader.events) == []
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+def test_writer_events_refuses_fifo(tmp_path):
+    writer = RunWriter.create(tmp_path, meta={})
+    path = writer.run_dir / "events.jsonl"
+    path.unlink()
+    os.mkfifo(path)
+
+    def append_event():
+        try:
+            writer.set_config({"after": True})
+        finally:
+            writer.close()
+
+    with pytest.raises(OSError) as exc_info:
+        _call_with_timeout(append_event)
+    assert exc_info.value.errno in (errno.ENXIO, errno.EINVAL)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+def test_resume_heal_events_refuses_fifo(tmp_path):
+    writer = RunWriter.create(tmp_path)
+    writer.close()
+    path = writer.run_dir / "events.jsonl"
+    path.unlink()
+    os.mkfifo(path)
+
+    with pytest.raises(OSError) as exc_info:
+        _call_with_timeout(lambda: RunWriter.resume(tmp_path, writer.run_id, must=True))
+    assert exc_info.value.errno == errno.EINVAL
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+def test_create_events_refuses_fifo_before_open(tmp_path, monkeypatch):
+    path = tmp_path / "runs" / "fifo-create" / "events.jsonl"
+    real_open = os.open
+    swapped = []
+
+    def swap_before_open(candidate, flags, *args, **kwargs):
+        if Path(candidate) == path and not swapped:
+            os.mkfifo(path)
+            swapped.append(path)
+        return real_open(candidate, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swap_before_open)
+    with pytest.raises(OSError) as exc_info:
+        _call_with_timeout(lambda: RunWriter.create(tmp_path, run_id="fifo-create"))
+    assert exc_info.value.errno in (errno.ENXIO, errno.EINVAL)
+    assert swapped == [path]
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+@pytest.mark.parametrize("filename", [
+    "scalars/0.bin", "scalars/_time.bin", "scalars/index.json", "media/index.json",
+])
+def test_finish_skips_fifo_output(tmp_path, filename):
+    writer = RunWriter.create(tmp_path)
+    writer.write_scalars([(0, {"loss": 1.0})])
+    path = writer.run_dir / filename
+    path.unlink()
+    os.mkfifo(path)
+
+    def finish():
+        try:
+            return writer.finish("finished")
+        finally:
+            writer.close()
+
+    assert _call_with_timeout(finish) is None
+    assert RunReader(tmp_path, writer.run_id).meta()["status"] == "finished"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_finish_skips_symlink_output(tmp_path):
+    writer = RunWriter.create(tmp_path)
+    writer.write_scalars([(0, {"loss": 1.0})])
+    path = writer.run_dir / "scalars/0.bin"
+    path.unlink()
+    path.symlink_to(tmp_path / "outside")
+
+    def finish():
+        try:
+            return writer.finish("finished")
+        finally:
+            writer.close()
+
+    assert _call_with_timeout(finish) is None
+    assert RunReader(tmp_path, writer.run_id).meta()["status"] == "finished"
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+@pytest.mark.parametrize("filename,entry", [
+    ("meta.json", "resume"), ("meta.json", "amend"),
+    ("meta.json", "amend-unlocked"),
+    ("scalars/index.json", "resume"), ("scalars/index.json", "amend"),
+    ("media/index.json", "resume"), ("media/index.json", "amend"),
+])
+def test_reopen_json_refuses_fifo_after_check(tmp_path, monkeypatch, filename, entry):
+    writer = RunWriter.create(tmp_path)
+    writer.close()
+    path = writer.run_dir / filename
+    real_is_file = Path.is_file
+    checks = []
+    # Resume checks the scalar index once in _reject_pruned before _load_series.
+    swap_on = 2 if filename == "scalars/index.json" and entry == "resume" else 1
+
+    def swap_after_check(candidate):
+        result = real_is_file(candidate)
+        if candidate == path:
+            checks.append(result)
+            if len(checks) == swap_on:
+                assert result
+                path.unlink()
+                os.mkfifo(path)
+        return result
+
+    monkeypatch.setattr(Path, "is_file", swap_after_check)
+    if entry == "amend-unlocked":
+        real_acquire = RunWriter._acquire_run_lock
+
+        def acquire_unlocked(candidate, **kwargs):
+            real_acquire(candidate, **kwargs)
+            candidate._run_lock.locking_supported = False
+
+        monkeypatch.setattr(RunWriter, "_acquire_run_lock", acquire_unlocked)
+
+    def reopen():
+        if entry == "resume":
+            reopened = RunWriter.resume(tmp_path, writer.run_id, must=True)
+        else:
+            reopened = RunWriter.amend(tmp_path, writer.run_id)
+        reopened.close()
+
+    with pytest.raises(OSError) as exc_info:
+        _call_with_timeout(reopen)
+    assert exc_info.value.errno == errno.EINVAL
+    assert len(checks) >= swap_on
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+def test_sync_load_state_refuses_fifo(tmp_path):
+    import agenticml.sync as sync_mod
+
+    writer = RunWriter.create(tmp_path)
+    writer.close()
+    reader = RunReader(tmp_path, writer.run_id)
+    assert sync_mod._load_state(reader) == {"version": 1, "hosts": {}}
+    os.mkfifo(writer.run_dir / "sync.json")
+
+    with pytest.raises(OSError) as exc_info:
+        _call_with_timeout(lambda: sync_mod._load_state(reader))
+    assert exc_info.value.errno == errno.EINVAL
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+def test_sync_lock_refuses_fifo(tmp_path):
+    import agenticml.sync as sync_mod
+
+    writer = RunWriter.create(tmp_path)
+    writer.close()
+    os.mkfifo(writer.run_dir / "sync.lock")
+
+    with pytest.raises(OSError) as exc_info:
+        _call_with_timeout(lambda: sync_mod._acquire_lock(writer.run_dir))
+    assert exc_info.value.errno in (errno.ENXIO, errno.EINVAL)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+@pytest.mark.parametrize("operation", ["atomic", "put-bytes", "put-file"])
+def test_temp_write_refuses_existing_fifo(tmp_path, monkeypatch, operation):
+    import agenticml.store.layout as layout_mod
+    import agenticml.store.objects as objects_mod
+
+    writer = RunWriter.create(tmp_path)
+    writer.close()
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"source")
+    planted = []
+
+    def planted_temp(directory, prefix):
+        path = directory / ".planted.tmp"
+        os.mkfifo(path)
+        planted.append(path)
+        return path
+
+    if operation == "atomic":
+        monkeypatch.setattr(layout_mod, "unique_tmp", planted_temp)
+        call = lambda: layout_mod.atomic_write(writer.run_dir / "meta.json", b"{}")
+    else:
+        monkeypatch.setattr(objects_mod, "unique_tmp", planted_temp)
+        if operation == "put-bytes":
+            call = lambda: put_bytes(tmp_path, b"source")
+        else:
+            call = lambda: put_file(tmp_path, source)
+    with pytest.raises(FileExistsError):
+        _call_with_timeout(call)
+    assert len(planted) == 1
+    assert planted[0].exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+def test_put_file_refuses_fifo_source(tmp_path):
+    sha = put_bytes(tmp_path, b"source")
+    path = object_path(tmp_path, sha)
+    path.unlink()
+    os.mkfifo(path)
+
+    with pytest.raises(OSError) as exc_info:
+        _call_with_timeout(lambda: put_file(tmp_path, path))
+    assert exc_info.value.errno == errno.EINVAL
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_put_file_accepts_regular_symlink_source(tmp_path):
+    path = tmp_path / "source.bin"
+    path.write_bytes(b"source")
+    link = tmp_path / "source-link.bin"
+    link.symlink_to(path)
+    assert put_file(tmp_path, link) == (hashlib.sha256(b"source").hexdigest(), 6)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_put_file_refuses_symlink_loop(tmp_path):
+    a = tmp_path / "loop-a"
+    b = tmp_path / "loop-b"
+    a.symlink_to(b)
+    b.symlink_to(a)
+    with pytest.raises(OSError):
+        put_file(tmp_path, a)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+def test_reader_scalar_refuses_fifo_swapped_after_stat(tmp_path, monkeypatch):
+    import agenticml.store.reader as reader_mod
+
+    writer = RunWriter.create(tmp_path, meta={})
+    writer.write_scalars([(0, {"loss": 1.0})])
+    writer.close()
+    path = writer.run_dir / "scalars" / "0.bin"
+    real_file_size = reader_mod._file_size
+
+    def swap_after_stat(candidate):
+        size = real_file_size(candidate)
+        if candidate == path:
+            assert size > 0
+            path.unlink()
+            os.mkfifo(path)
+        return size
+
+    monkeypatch.setattr(reader_mod, "_file_size", swap_after_stat)
+    reader = RunReader(tmp_path, writer.run_id)
+    with pytest.raises(OSError) as exc_info:
+        _call_with_timeout(lambda: reader.read_records("loss"))
+    assert exc_info.value.errno == errno.EINVAL
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+def test_open_object_refuses_fifo(tmp_path):
+    writer = RunWriter.create(tmp_path, meta={})
+    sha = writer.add_media("frame", 0, b"fifo object", "image/png", None)
+    writer.close()
+    path = object_path(tmp_path, sha)
+    path.unlink()
+    os.mkfifo(path)
+
+    with pytest.raises(FileNotFoundError):
+        _call_with_timeout(lambda: open_object(tmp_path, sha))
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+def test_run_lock_refuses_fifo(tmp_path):
+    from agenticml.store.layout import is_run_locked, try_lock_run
+
+    writer = RunWriter.create(tmp_path, meta={})
+    writer.close()
+    path = writer.run_dir / "run.lock"
+    path.unlink()
+    os.mkfifo(path)
+
+    with pytest.raises(OSError) as exc_info:
+        _call_with_timeout(lambda: try_lock_run(writer.run_dir))
+    assert exc_info.value.errno in (errno.ENXIO, errno.EINVAL)
+    assert _call_with_timeout(lambda: is_run_locked(writer.run_dir)) is None
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+def test_open_local_refuses_fifo_swapped_after_lstat(tmp_path, monkeypatch):
+    import agenticml.sync as sync_mod
+
+    writer = RunWriter.create(tmp_path, meta={})
+    writer.close()
+    path = writer.run_dir / "events.jsonl"
+    real_open = sync_mod.open_nofollow
+
+    def swap_before_open(candidate):
+        assert candidate == path
+        path.unlink()
+        os.mkfifo(path)
+        return real_open(candidate)
+
+    monkeypatch.setattr(sync_mod, "open_nofollow", swap_before_open)
+    with pytest.raises(OSError) as exc_info:
+        _call_with_timeout(lambda: sync_mod._open_local(path))
+    assert exc_info.value.errno == errno.EINVAL
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires os.mkfifo")
+@pytest.mark.parametrize("filename", ["meta.json", REMOTE_NAME])
+def test_list_runs_fifo_falls_back(tmp_path, filename):
+    writer = RunWriter.create(tmp_path, run_id="fifo-run", meta={})
+    writer.finish("finished", {})
+    expected = list_runs(tmp_path)
+    path = writer.run_dir / filename
+    path.unlink(missing_ok=True)
+    os.mkfifo(path)
+
+    listed = _call_with_timeout(lambda: list_runs(tmp_path))
+    if filename == "meta.json":
+        assert listed == []
+    else:
+        assert listed == expected
+        assert listed[0]["effective_status"] == "finished"
+        assert "last_sync_at" not in listed[0]
+
+
 def test_list_runs_thousand_is_fast(tmp_path):
     for i in range(1000):
         RunWriter.create(tmp_path, meta={"project": "p", "name": str(i)})
@@ -957,16 +1352,18 @@ def test_finish_fsyncs_scalar_and_media_dirs(tmp_path, monkeypatch):
 
 
 def test_event_heal_does_not_reread_on_append(tmp_path, monkeypatch):
+    import agenticml.store.writer as writer_mod
+
     writer = RunWriter.create(tmp_path, meta={})
     reads = {"n": 0}
-    real = Path.read_bytes
+    real = writer_mod.read_file_nofollow
 
-    def counting(self, *args, **kwargs):
-        if self.name == "events.jsonl":
+    def counting(path):
+        if path.name == "events.jsonl":
             reads["n"] += 1
-        return real(self, *args, **kwargs)
+        return real(path)
 
-    monkeypatch.setattr(Path, "read_bytes", counting)
+    monkeypatch.setattr(writer_mod, "read_file_nofollow", counting)
     writer.set_config({"a": 1})
     writer.set_config({"a": 2})
     writer.finish("finished", {})
@@ -2329,3 +2726,439 @@ def test_amend_missing_and_pruned(tmp_path):
     assert meta["notes"] == "after"
     assert meta["status"] == "finished"
     assert ovw.read_bytes() == blob
+
+
+_FIXED_NOW = int(datetime(2026, 11, 3, 12, 0, 0, tzinfo=timezone.utc).timestamp())
+
+
+@pytest.fixture(autouse=True)
+def clear_remote_stale_env(monkeypatch):
+    monkeypatch.delenv(REMOTE_STALE_ENV, raising=False)
+
+
+def _iso(unix_ts, *, z=True):
+    dt = datetime.fromtimestamp(unix_ts, tz=timezone.utc)
+    if z:
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return dt.replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _write_remote(run_dir, payload=None, raw=None, **fields):
+    path = Path(run_dir) / REMOTE_NAME
+    if raw is not None:
+        if isinstance(raw, bytes):
+            path.write_bytes(raw)
+        else:
+            path.write_text(raw, encoding="utf-8")
+        return path
+    body = {
+        "owner": "gpu-box-1",
+        "status": "running",
+        "fingerprint": "abc",
+        "last_sync_at": _iso(_FIXED_NOW),
+        "sizes": {"events.jsonl": 1},
+    }
+    if payload is not None:
+        body = payload
+    else:
+        body.update(fields)
+    path.write_text(json.dumps(body), encoding="utf-8")
+    return path
+
+
+def _eff(run_dir, now=_FIXED_NOW, meta=None):
+    run_dir = Path(run_dir)
+    if meta is None:
+        meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
+    return _effective_status(meta, str(run_dir / "meta.json"), str(run_dir), now)
+
+
+def _eff_without_remote(run_dir, now=_FIXED_NOW):
+    path = Path(run_dir) / REMOTE_NAME
+    hidden = Path(run_dir) / ".away-remote"
+    path.rename(hidden)
+    try:
+        return _eff(run_dir, now)
+    finally:
+        hidden.rename(path)
+
+
+def test_remote_missing_uses_lock_logic(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger="agenticml.store.reader")
+    writer = RunWriter.create(tmp_path, run_id="local-only", meta={})
+    writer.close()
+    caplog.clear()
+    assert read_remote(writer.run_dir) is None
+    assert _eff(writer.run_dir, time.time()) == "running"
+    listed = {item["run_id"]: item for item in list_runs(tmp_path)}
+    assert listed["local-only"]["effective_status"] == "running"
+    assert "last_sync_at" not in listed["local-only"]
+    assert not any("remote.json" in rec.getMessage() for rec in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["", "{", b"\xff\xfe", "[]", '"running"', "1"],
+    ids=["empty", "invalid-json", "invalid-utf8", "array", "string", "number"],
+)
+def test_remote_invalid_payload_falls_back(tmp_path, caplog, raw):
+    caplog.set_level(logging.WARNING, logger="agenticml.store.reader")
+    writer = RunWriter.create(tmp_path, run_id="bad-payload", meta={})
+    writer.finish("finished", {})
+    without = _eff(writer.run_dir)
+    assert without == "finished"
+    _write_remote(writer.run_dir, raw=raw)
+    caplog.clear()
+    assert _eff(writer.run_dir) == "finished"
+    assert _eff(writer.run_dir) == without
+    assert _eff(writer.run_dir) == _eff_without_remote(writer.run_dir)
+    assert read_remote(writer.run_dir) is None
+    assert len([rec for rec in caplog.records if "remote.json" in rec.getMessage()]) == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"status": 1},
+        {"status": None},
+        {"status": ["running"]},
+        {"status": "paused"},
+        {"status": "stale"},
+    ],
+    ids=["int", "null", "array", "paused", "stale"],
+)
+def test_remote_invalid_status_falls_back(tmp_path, caplog, payload):
+    caplog.set_level(logging.WARNING, logger="agenticml.store.reader")
+    writer = RunWriter.create(tmp_path, run_id="bad-status", meta={})
+    writer.finish("finished", {})
+    without = _eff(writer.run_dir)
+    assert without == "finished"
+    _write_remote(writer.run_dir, payload=payload)
+    caplog.clear()
+    assert _eff(writer.run_dir) == "finished"
+    assert _eff(writer.run_dir) == without
+    assert _eff(writer.run_dir) == _eff_without_remote(writer.run_dir)
+    assert read_remote(writer.run_dir) is None
+    assert len([rec for rec in caplog.records if "remote.json" in rec.getMessage()]) == 1
+
+
+@pytest.mark.parametrize(
+    "terminal,payload,expected",
+    [
+        (None, {"owner": "one"}, "stale"),
+        ("finished", {"owner": "one"}, "finished"),
+        ("crashed", {"owner": "one"}, "crashed"),
+        (None, {}, "stale"),
+        ("finished", {}, "finished"),
+    ],
+    ids=["running", "finished", "crashed", "running-empty", "finished-empty"],
+)
+def test_remote_precommit_derives_status_from_meta(
+    tmp_path, caplog, terminal, payload, expected
+):
+    caplog.set_level(logging.WARNING, logger="agenticml.store.reader")
+    writer = RunWriter.create(tmp_path, run_id="precommit", meta={})
+    if terminal is None:
+        writer.close()
+        (writer.run_dir / "run.lock").unlink(missing_ok=True)
+    else:
+        writer.finish(terminal, {})
+    _write_remote(writer.run_dir, payload=payload)
+    caplog.clear()
+    remote = {"status": None, "last_sync_at": None, "owner": payload.get("owner"),
+              "owner_key": None, "last_sync_key": None}
+    assert read_remote(writer.run_dir) == remote
+    assert _eff(writer.run_dir) == expected
+    listed = {item["run_id"]: item for item in list_runs(tmp_path)}
+    assert listed["precommit"]["effective_status"] == expected
+    assert "last_sync_at" not in listed["precommit"]
+    reader = RunReader(tmp_path, "precommit")
+    assert reader.remote() == remote
+    assert reader.last_sync_at() is None
+    assert not any("remote.json" in rec.getMessage() for rec in caplog.records)
+    if terminal is None:
+        assert _eff_without_remote(writer.run_dir) == "crashed"
+
+
+def test_remote_directory_falls_back(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger="agenticml.store.reader")
+    writer = RunWriter.create(tmp_path, run_id="dir-remote", meta={})
+    writer.finish("finished", {})
+    without = _eff(writer.run_dir)
+    assert without == "finished"
+    (writer.run_dir / REMOTE_NAME).mkdir()
+    caplog.clear()
+    assert _eff(writer.run_dir) == "finished"
+    assert _eff(writer.run_dir) == without
+    assert _eff(writer.run_dir) == _eff_without_remote(writer.run_dir)
+    assert read_remote(writer.run_dir) is None
+    assert len([rec for rec in caplog.records if "remote.json" in rec.getMessage()]) == 1
+
+
+@pytest.mark.parametrize("status", ["finished", "crashed"])
+@pytest.mark.parametrize(
+    "last_sync_at",
+    ["2026-11-03T12:00:00Z", None, 123, "not-a-time", "omit"],
+    ids=["valid", "null", "int", "garbage", "missing"],
+)
+def test_remote_terminal_status_as_is(tmp_path, status, last_sync_at):
+    writer = RunWriter.create(tmp_path, run_id=f"{status}-run", meta={})
+    writer.finish("finished", {})
+    if last_sync_at == "omit":
+        payload = {"status": status, "owner": "gpu-box-1"}
+    else:
+        payload = {"status": status, "owner": "gpu-box-1", "last_sync_at": last_sync_at}
+    _write_remote(writer.run_dir, payload=payload)
+    remote = read_remote(writer.run_dir)
+    assert remote is not None
+    assert _remote_status(remote, _FIXED_NOW) == status
+    assert _eff(writer.run_dir) == status
+
+
+def test_remote_running_within_and_beyond_window(tmp_path):
+    writer = RunWriter.create(tmp_path, run_id="window-run", meta={})
+    writer.close()
+    _write_remote(writer.run_dir, status="running", last_sync_at=_iso(_FIXED_NOW - 10))
+    assert _eff(writer.run_dir) == "running"
+    assert _remote_status(read_remote(writer.run_dir), _FIXED_NOW) == "running"
+
+    _write_remote(writer.run_dir, status="running", last_sync_at=_iso(_FIXED_NOW - 600))
+    assert _eff(writer.run_dir) == "stale"
+    assert _remote_status(read_remote(writer.run_dir), _FIXED_NOW) == "stale"
+
+    _write_remote(writer.run_dir, status="running", last_sync_at=_iso(_FIXED_NOW - 601))
+    assert _eff(writer.run_dir) == "stale"
+
+
+@pytest.mark.parametrize(
+    "last_sync_at",
+    [
+        "omit",
+        None,
+        1,
+        "not-a-time",
+        "0001-01-01T00:00:00+05:00",
+        "9999-12-31T23:59:59-05:00",
+    ],
+    ids=["missing", "null", "int", "unparseable", "year-1-offset", "year-9999-offset"],
+)
+def test_remote_running_bad_timestamp_is_stale(tmp_path, last_sync_at):
+    writer = RunWriter.create(tmp_path, run_id="bad-ts", meta={})
+    writer.close()
+    if last_sync_at == "omit":
+        payload = {"status": "running", "owner": "gpu-box-1"}
+    else:
+        payload = {"status": "running", "owner": "gpu-box-1", "last_sync_at": last_sync_at}
+    _write_remote(writer.run_dir, payload=payload)
+    remote = read_remote(writer.run_dir)
+    assert remote is not None
+    assert remote["last_sync_at"] is None
+    assert _remote_status(remote, _FIXED_NOW) == "stale"
+    assert _eff(writer.run_dir) == "stale"
+
+
+@pytest.mark.parametrize(
+    "last_sync_at",
+    ["0001-01-01T00:00:00+05:00", "9999-12-31T23:59:59-05:00"],
+    ids=["year-1-offset", "year-9999-offset"],
+)
+def test_list_runs_overflow_timestamp_does_not_raise(tmp_path, last_sync_at):
+    writer = RunWriter.create(tmp_path, run_id="overflow-ts", meta={})
+    writer.close()
+    _write_remote(writer.run_dir, status="running", last_sync_at=last_sync_at)
+    listed = list_runs(tmp_path)
+    assert listed[0]["effective_status"] == "stale"
+    assert "last_sync_at" not in listed[0]
+
+
+def test_remote_running_future_timestamp(tmp_path):
+    writer = RunWriter.create(tmp_path, run_id="future-ts", meta={})
+    writer.close()
+    _write_remote(writer.run_dir, status="running", last_sync_at=_iso(_FIXED_NOW + 60))
+    assert _eff(writer.run_dir) == "running"
+    assert _remote_status(read_remote(writer.run_dir), _FIXED_NOW) == "running"
+    _write_remote(writer.run_dir, status="running", last_sync_at=_iso(_FIXED_NOW + 61))
+    assert _eff(writer.run_dir) == "stale"
+    assert _remote_status(read_remote(writer.run_dir), _FIXED_NOW) == "stale"
+
+
+def test_remote_running_naive_timestamp_is_utc(tmp_path):
+    writer = RunWriter.create(tmp_path, run_id="naive-ts", meta={})
+    writer.close()
+    _write_remote(writer.run_dir, status="running", last_sync_at=_iso(_FIXED_NOW - 10, z=False))
+    assert _eff(writer.run_dir) == "running"
+    remote = read_remote(writer.run_dir)
+    assert remote is not None
+    assert "Z" not in remote["last_sync_at"]
+    assert _remote_status(remote, _FIXED_NOW) == "running"
+
+
+def test_remote_overrides_meta_status(tmp_path):
+    done = RunWriter.create(tmp_path, run_id="meta-finished", meta={})
+    done.finish("finished", {})
+    _write_remote(done.run_dir, status="running", last_sync_at=_iso(_FIXED_NOW - 5))
+    assert json.loads((done.run_dir / "meta.json").read_text(encoding="utf-8"))["status"] == "finished"
+    assert _eff(done.run_dir) == "running"
+
+    live = RunWriter.create(tmp_path, run_id="meta-running", meta={})
+    live.close()
+    assert json.loads((live.run_dir / "meta.json").read_text(encoding="utf-8"))["status"] == "running"
+    _write_remote(live.run_dir, status="finished", last_sync_at=_iso(_FIXED_NOW - 5))
+    assert _eff(live.run_dir) == "finished"
+
+
+def test_remote_stale_seconds_env(tmp_path, monkeypatch, caplog):
+    import agenticml.store.reader as reader
+
+    caplog.set_level(logging.WARNING, logger="agenticml.store.reader")
+    monkeypatch.setattr(reader, "_REMOTE_STALE_WARNED", set())
+    caplog.clear()
+    assert remote_stale_seconds() == REMOTE_STALE_SECONDS
+    assert not any(REMOTE_STALE_ENV in rec.getMessage() for rec in caplog.records)
+
+    monkeypatch.setenv(REMOTE_STALE_ENV, "30")
+    assert remote_stale_seconds() == 30
+    writer = RunWriter.create(tmp_path, run_id="custom-window", meta={})
+    writer.close()
+    _write_remote(writer.run_dir, status="running", last_sync_at=_iso(_FIXED_NOW - 45))
+    assert _eff(writer.run_dir) == "stale"
+    _write_remote(writer.run_dir, status="running", last_sync_at=_iso(_FIXED_NOW - 15))
+    assert _eff(writer.run_dir) == "running"
+
+    monkeypatch.setenv(REMOTE_STALE_ENV, "1.5")
+    assert remote_stale_seconds() == 1.5
+
+    monkeypatch.setenv(REMOTE_STALE_ENV, "2")
+    assert remote_stale_seconds() == 2
+    _write_remote(writer.run_dir, status="running", last_sync_at=_iso(_FIXED_NOW - 1))
+    assert _eff(writer.run_dir) == "running"
+    _write_remote(writer.run_dir, status="running", last_sync_at=_iso(_FIXED_NOW - 2))
+    assert _eff(writer.run_dir) == "stale"
+
+    monkeypatch.setattr(reader, "_REMOTE_STALE_WARNED", set())
+    caplog.clear()
+    for bad in ("", "abc", "0", "-5", "nan", "inf"):
+        monkeypatch.setenv(REMOTE_STALE_ENV, bad)
+        assert remote_stale_seconds() == REMOTE_STALE_SECONDS
+        assert remote_stale_seconds() == REMOTE_STALE_SECONDS
+    messages = [rec.getMessage() for rec in caplog.records if REMOTE_STALE_ENV in rec.getMessage()]
+    assert len(messages) == 6
+
+
+def test_run_reader_remote_and_last_sync_at(tmp_path):
+    writer = RunWriter.create(tmp_path, run_id="reader-remote", meta={})
+    writer.close()
+    reader = RunReader(tmp_path, "reader-remote")
+    assert reader.remote() is None
+    assert reader.last_sync_at() is None
+
+    iso = _iso(_FIXED_NOW - 10)
+    _write_remote(writer.run_dir, status="running", last_sync_at=iso, owner="gpu-box-1")
+    remote = reader.remote()
+    assert remote == {"status": "running", "last_sync_at": iso, "owner": "gpu-box-1",
+                      "owner_key": None, "last_sync_key": None}
+    assert reader.last_sync_at() == iso
+
+    _write_remote(writer.run_dir, raw="{")
+    assert reader.remote() is None
+    assert reader.last_sync_at() is None
+
+    _write_remote(writer.run_dir, status="running", last_sync_at="bogus", owner="gpu-box-1")
+    remote = reader.remote()
+    assert remote["status"] == "running"
+    assert remote["last_sync_at"] is None
+    assert reader.last_sync_at() is None
+
+
+def test_list_runs_remote_status_and_last_sync_at(tmp_path):
+    now = time.time()
+    fresh_iso = _iso(now - 120)
+    stale_iso = _iso(now - 3600)
+
+    fresh = RunWriter.create(tmp_path, run_id="remote-fresh", meta={})
+    fresh.close()
+    _write_remote(fresh.run_dir, status="running", last_sync_at=fresh_iso)
+
+    stale = RunWriter.create(tmp_path, run_id="remote-stale", meta={})
+    stale.close()
+    _write_remote(stale.run_dir, status="running", last_sync_at=stale_iso)
+
+    done = RunWriter.create(tmp_path, run_id="remote-finished", meta={})
+    done.finish("finished", {})
+    _write_remote(done.run_dir, status="finished", last_sync_at=fresh_iso)
+
+    crashed = RunWriter.create(tmp_path, run_id="remote-crashed", meta={})
+    crashed.finish("crashed", {})
+    _write_remote(crashed.run_dir, status="crashed", last_sync_at=fresh_iso)
+
+    invalid = RunWriter.create(tmp_path, run_id="remote-invalid", meta={})
+    invalid.finish("finished", {})
+    _write_remote(invalid.run_dir, raw="{")
+
+    local = RunWriter.create(tmp_path, run_id="local-run", meta={})
+    local.close()
+
+    bad_ts = RunWriter.create(tmp_path, run_id="bad-ts-run", meta={})
+    bad_ts.finish("finished", {})
+    _write_remote(bad_ts.run_dir, payload={"status": "finished", "last_sync_at": "nope"})
+
+    by_id = {item["run_id"]: item for item in list_runs(tmp_path)}
+    assert by_id["remote-fresh"]["effective_status"] == "running"
+    assert by_id["remote-fresh"]["last_sync_at"] == fresh_iso
+    assert by_id["remote-stale"]["effective_status"] == "stale"
+    assert by_id["remote-stale"]["last_sync_at"] == stale_iso
+    assert by_id["remote-finished"]["effective_status"] == "finished"
+    assert by_id["remote-crashed"]["effective_status"] == "crashed"
+    assert by_id["remote-invalid"]["effective_status"] == "finished"
+    assert "last_sync_at" not in by_id["remote-invalid"]
+    assert "last_sync_at" not in by_id["local-run"]
+    assert "last_sync_at" not in by_id["bad-ts-run"]
+
+    disk = json.loads((fresh.run_dir / "meta.json").read_text(encoding="utf-8"))
+    assert "effective_status" not in disk
+    assert "last_sync_at" not in disk
+    meta = RunReader(tmp_path, "remote-fresh").meta()
+    assert "effective_status" not in meta
+    assert "last_sync_at" not in meta
+
+
+def test_remote_corrupt_warns_once(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger="agenticml.store.reader")
+    writer = RunWriter.create(tmp_path, run_id="corrupt-remote", meta={})
+    writer.close()
+    _write_remote(writer.run_dir, raw="{")
+    caplog.clear()
+    list_runs(tmp_path)
+    list_runs(tmp_path)
+    list_runs(tmp_path)
+    messages = [rec.getMessage() for rec in caplog.records if "remote.json" in rec.getMessage()]
+    assert len(messages) == 1
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_remote_symlink_falls_back_without_reading_target(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger="agenticml.store.reader")
+    writer = RunWriter.create(tmp_path, run_id="sym-remote", meta={})
+    writer.close()
+    without = _eff(writer.run_dir)
+    secret = tmp_path / "secret-remote.json"
+    secret.write_text(
+        json.dumps({"status": "finished", "last_sync_at": _iso(_FIXED_NOW), "owner": "attacker"}),
+        encoding="utf-8",
+    )
+    (writer.run_dir / REMOTE_NAME).symlink_to(secret)
+    caplog.clear()
+    assert _eff(writer.run_dir) == without
+    assert _eff(writer.run_dir) == _eff_without_remote(writer.run_dir)
+    assert read_remote(writer.run_dir) is None
+    assert RunReader(tmp_path, "sym-remote").remote() is None
+    assert any("symlinked remote.json" in rec.getMessage() for rec in caplog.records)
+
+
+def test_writer_never_creates_remote_json(tmp_path):
+    writer = RunWriter.create(tmp_path, run_id="no-remote", meta={})
+    assert not (writer.run_dir / REMOTE_NAME).exists()
+    writer.write_scalars([(0, {"loss": 1.0})])
+    assert not (writer.run_dir / REMOTE_NAME).exists()
+    writer.finish("finished", {})
+    assert not (writer.run_dir / REMOTE_NAME).exists()

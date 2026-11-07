@@ -25,6 +25,8 @@ Nothing here is uploaded. Paths below are relative to a root resolved by
     run.lock                     writer/GC/prune lifetime flock
     events.jsonl
     notes.md
+    remote.json                  server-only sync status; never written locally
+    artifacts.json               server-only by-reference artifact mapping; never written locally
     scalars/index.json
     scalars/<id>.bin             one file per series, <id> is a decimal int
     scalars/<id>.ovw             overview at finish, only if the series has > 65536 points
@@ -288,6 +290,69 @@ The dashboard is read-only except for notes. Writes use
 `X-AgenticML-Request: 1` header. Reads use `GET /api/runs/<run_id>/notes`
 and `GET /api/notes[?project=P]`. `agenticml ui --read-only` disables note
 editing.
+
+## `artifacts.json`
+
+Server-only, written by `agenticml sync --artifacts` when the server
+advertises `byref`. Local writers never create it. A local store does not
+contain this file. Readers treat a missing or invalid file as no mapping:
+`copy=False` artifact events stay unchanged. A valid file fills in `sha256`
+and `size` for matching `(name, version)` events and sets `byref: true`.
+Objects need not exist at PUT time; readers tolerate a missing blob.
+
+```json
+{"version": 1, "artifacts": [
+  {"name": "model", "version": 2, "sha256": "<64 hex>", "size": 1234}
+]}
+```
+
+`version` must be `1`. `artifacts` is a list of at most 10,000 objects, each
+with exactly `name` (non-empty string, ≤ 1,024 chars), `version` (int ≥ 1),
+`sha256` (64 lowercase hex), and `size` (int ≥ 0), with unique
+`(name, version)`.
+
+## `remote.json`
+
+Server-only. `agenticml server` writes it atomically on each sync commit.
+Local writers and `agenticml sync` never create or upload it. A local store
+does not contain this file. Before the first commit the file is
+`{"owner": "<key>"}` with no `status`; readers treat that as valid and show
+`stale` when `meta.json` is `running`, or the `meta.json` status as is
+otherwise.
+
+```json
+{"owner": "gpu-box-1", "status": "running", "fingerprint": "...",
+ "last_sync_at": "2026-11-03T12:00:00Z", "sizes": {"events.jsonl": 1234}}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `owner` | Name of the sync key that created the run and owns it. |
+| `status` | `running`, `finished`, or `crashed` as committed by the client. |
+| `fingerprint` | Run fingerprint at commit. |
+| `last_sync_at` | UTC timestamp of the last successful commit. |
+| `sizes` | File sizes the server checked at commit. |
+
+Readers use `status`, `last_sync_at`, and `owner`. Other fields are ignored.
+When the file is present and valid it takes precedence over lock-based
+liveness, and over `meta.json` status once it has a `status`.
+
+| `remote.json` status | Shown as |
+| --- | --- |
+| `finished`, `crashed` | as is |
+| `running`, last sync within `AGENTICML_REMOTE_STALE_SECONDS` (default 600) | `running` |
+| `running`, older | `stale` |
+| no `status` key (pre-commit) | `stale` if `meta.json` is `running`, else `meta.json` status as is |
+| file missing or invalid | today's lock-based logic |
+
+`running` with a missing, non-string, or unparseable `last_sync_at` is
+`stale`. A timestamp up to 60 seconds in the future still counts as
+`running`; further ahead is `stale`. Naive timestamps without `Z` are
+parsed as UTC. An invalid file (not UTF-8, not a JSON object, a `status`
+key that is present but unknown or not a valid string, a symlink, or a
+directory) is ignored and the lock-based rules apply. `list_runs` copies a
+valid `last_sync_at` onto the returned dict; it does not add the key when
+the timestamp is missing or invalid.
 
 ## Scalars
 
@@ -554,6 +619,7 @@ new directory entry; the object then looks like the put never happened.
 Atomic (temp in the same directory, `flush`, `os.replace`):
 
 - `meta.json`
+- `artifacts.json` (server-only)
 - `scalars/index.json`
 - `media/index.json`
 - `scalars/<id>.ovw`
@@ -662,15 +728,19 @@ raises `NotADirectoryError`.
 
 ## How to read
 
-`list_runs(root)` reads only each run's `meta.json`. It skips names that fail
-`valid_run_id`, entries that are not real directories (symlinks are not
-followed), symlinked `meta.json` files (a symlink at `meta.json` is refused
-and skipped), and meta that is missing or not a JSON object (or fails to parse,
-such as exceeding integer digit limits or recursion depth). The `run_id` comes
+`list_runs(root)` reads each run's `meta.json`, and `remote.json` when
+that file is present. It skips names that fail `valid_run_id`, entries
+that are not real directories (symlinks are not followed), symlinked
+`meta.json` files (a symlink at `meta.json` is refused and skipped), and
+meta that is missing or not a JSON object (or fails to parse, such as
+exceeding integer digit limits or recursion depth). The `run_id` comes
 from the directory name (if `meta.json` contains a mismatched `run_id`, a
-warning is logged and the directory name is used). Results are sorted
-by `created_at` descending, then `run_id` descending. Runs with a missing
+warning is logged and the directory name is used). Results are sorted by
+`created_at` descending, then `run_id` descending. Runs with a missing
 `created_at` sort last.
+
+A valid [`remote.json`](#remotejson) takes precedence over lock-based
+liveness.
 
 The writer refreshes the mtime of `run.lock` on create/resume and every flush
 interval, even without metrics or system sampling. For stored

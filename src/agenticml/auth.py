@@ -4,6 +4,7 @@ from __future__ import annotations
 import getpass
 import json
 import os
+import re
 import secrets
 import stat
 import sys
@@ -13,8 +14,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
-DEFAULT_HOST = "https://api.agenticml.xyz"
 _LOCAL_HTTP = frozenset({"localhost", "127.0.0.1", "::1"})
+_ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\].*?(?:\x07|\x1b\\)|[@-Z\\-_])")
 
 
 def normalize_host(host: str, *, insecure: bool = False) -> str:
@@ -191,7 +192,7 @@ def _resolve(host=None, api_key=None, *, insecure=False, use_env=True):
     elif file_host:
         raw_host, host_source = file_host, "file"
     else:
-        raw_host, host_source = DEFAULT_HOST, "default"
+        raise ValueError("no server host; run `agenticml login --host URL`")
     resolved_host = normalize_host(raw_host, insecure=insecure)
     if api_key is not None:
         key, source = api_key, "flag"
@@ -220,6 +221,15 @@ def key_prefix(key: str) -> str:
     return key[:min(8, max(0, len(key) - 1))] + "…"
 
 
+def _clean_detail(text) -> str:
+    """Strip control characters from a server-supplied label before printing."""
+    if not isinstance(text, str):
+        text = "?"
+    text = _ANSI_RE.sub("", text)
+    text = "".join(ch for ch in text if ord(ch) >= 0x20 and ord(ch) != 0x7f)
+    return text[:200] or "?"
+
+
 def _exposes_header(exc: BaseException) -> bool:
     if isinstance(exc, requests.RequestException):
         return True
@@ -241,8 +251,9 @@ def _report(command, exc):
 
 
 def cmd_login(args):
-    from .client import Client
+    from .client import Client, ProtocolError
 
+    info = None
     try:
         # Login does not adopt AGENTICML_API_KEY. A flag key still warns in resolve
         # when the host is taken from the credentials file.
@@ -254,21 +265,42 @@ def cmd_login(args):
         if not args.no_verify:
             client = Client(base_url=host, api_key=key, insecure=args.insecure)
             try:
-                valid = client.check_auth()
+                info = client.whoami()
             finally:
                 client.close()
-            if not valid:
-                print("agenticml login: invalid API key", file=sys.stderr)
-                return 1
         data = read_credentials()
         data["hosts"][host] = {"api_key": key}
         data["default_host"] = host
         write_credentials(data)
     except KeyboardInterrupt:
         return 130
+    except ProtocolError:
+        print(
+            f"agenticml login: {host} is not an agenticml server "
+            f"with protocol 2 (agenticml server 2.0 or newer)",
+            file=sys.stderr,
+        )
+        return 1
+    except requests.HTTPError as exc:
+        if getattr(exc.response, "status_code", None) == 401:
+            print("agenticml login: invalid API key", file=sys.stderr)
+            return 1
+        return _report("login", exc)
     except Exception as exc:
         return _report("login", exc)
-    print(f"Logged in to {host} with key {key_prefix(key)}")
+    if info is None:
+        print(f"Logged in to {host} with key {key_prefix(key)}")
+        return 0
+    print(
+        f"Logged in to {host} as {_clean_detail(info.get('key', '?'))} "
+        f"(scope {_clean_detail(info.get('scope', '?'))}) "
+        f"with key {key_prefix(key)}"
+    )
+    if info.get("scope") == "admin":
+        print(
+            "warning: this is an admin key; training machines should use a sync key",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -277,7 +309,14 @@ def cmd_logout(args):
         data = read_credentials()
         # Logout defaults to the saved default, regardless of an env host override.
         # insecure=True: removing a saved http host must not require the flag again.
-        host = normalize_host(args.host or data.get("default_host") or DEFAULT_HOST, insecure=True)
+        raw_host = args.host or data.get("default_host")
+        if not raw_host:
+            print(
+                "agenticml logout: no host given and no default host saved",
+                file=sys.stderr,
+            )
+            return 1
+        host = normalize_host(raw_host, insecure=True)
         data["hosts"].pop(host, None)
         if data.get("default_host") == host:
             data.pop("default_host", None)
@@ -291,7 +330,7 @@ def cmd_logout(args):
 
 
 def cmd_whoami(args):
-    from .client import Client
+    from .client import Client, ProtocolError
 
     try:
         host, key, source = _resolve(args.host, insecure=args.insecure)
@@ -299,16 +338,34 @@ def cmd_whoami(args):
             print(f"{host}: not logged in", file=sys.stderr)
             return 1
         key = normalize_api_key(key)
-        validity = "unchecked (offline)"
-        if not args.offline:
-            client = Client(base_url=host, api_key=key, insecure=args.insecure)
-            try:
-                validity = "valid" if client.check_auth() else "invalid API key"
-            finally:
-                client.close()
-        print(f"{host}  key={key_prefix(key)}  source={source}  {validity}")
-        return 1 if validity == "invalid API key" else 0
+        if args.offline:
+            print(f"{host}  key={key_prefix(key)}  source={source}  unchecked (offline)")
+            return 0
+        client = Client(base_url=host, api_key=key, insecure=args.insecure)
+        try:
+            info = client.whoami()
+        finally:
+            client.close()
+        print(
+            f"{host}  key={key_prefix(key)}  name={_clean_detail(info.get('key', '?'))}  "
+            f"scope={_clean_detail(info.get('scope', '?'))}  source={source}  valid"
+        )
+        if isinstance(info.get("user"), str) and isinstance(info.get("role"), str):
+            print(f"user: {_clean_detail(info['user'])} ({_clean_detail(info['role'])})")
+        return 0
     except KeyboardInterrupt:
         return 130
+    except ProtocolError:
+        print(
+            f"agenticml whoami: {host} is not an agenticml server "
+            f"with protocol 2 (agenticml server 2.0 or newer)",
+            file=sys.stderr,
+        )
+        return 1
+    except requests.HTTPError as exc:
+        if getattr(exc.response, "status_code", None) == 401:
+            print("invalid API key", file=sys.stderr)
+            return 1
+        return _report("whoami", exc)
     except Exception as exc:
         return _report("whoami", exc)

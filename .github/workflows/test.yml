@@ -1,0 +1,76 @@
+name: Tests
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  unit:
+    name: Unit tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Run unit tests
+        run: python -m pytest -q tests
+
+      - name: Run server smoke test
+        if: matrix.python == '3.12'
+        run: PYTHON=python bash scripts/server_smoke.sh
+
+  testbed:
+    name: Testbed and dashboard UI
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m venv testbed/.venv
+          testbed/.venv/bin/python -m pip install --upgrade pip
+          testbed/.venv/bin/python -m pip install -e '.[dev]' playwright==1.62.0 -e './testbed[test]'
+
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-1.62.0-${{ runner.os }}
+
+      - name: Install Chromium
+        run: testbed/.venv/bin/python -m playwright install --with-deps chromium
+
+      - name: Check Chromium launches
+        run: testbed/.venv/bin/python -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); p.chromium.launch().close(); p.stop()"
+
+      - name: Run testbed tests
+        working-directory: testbed
+        run: .venv/bin/python -m pytest -q -rs

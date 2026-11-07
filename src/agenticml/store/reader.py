@@ -17,7 +17,9 @@ so the next call only reads bytes that arrived since. A step range on a
 monotonic series is a binary search over the fixed-width records; the reader
 stats the file size before it trusts ``monotonic``, because the writer
 clears that flag before appending an out-of-order record. A non-monotonic
-series is scanned.
+series is scanned. A server store may include ``remote.json``; when that
+file is present and valid it supplies the run's effective status and last
+sync time.
 
 ``RunReader`` is thread-safe. Several threads may call ``series`` on one
 reader while a writer appends; one lock covers the overview cache and the
@@ -44,6 +46,7 @@ from .layout import (
     META_NAME,
     RECORD_SIZE,
     RECORD_STRUCT,
+    REMOTE_NAME,
     SCALARS_DIRNAME,
     TIME_BIN_NAME,
     contained,
@@ -51,6 +54,7 @@ from .layout import (
     is_run_locked,
     load_events,
     open_nofollow,
+    parse_timestamp,
     read_file_nofollow,
     run_dir,
     valid_run_id,
@@ -62,9 +66,15 @@ logger = logging.getLogger("agenticml.store.reader")
 
 # A free lock alone cannot establish death across NFS clients.
 STALE_AFTER_SECONDS = 120
+REMOTE_STALE_SECONDS = 600
+REMOTE_STALE_ENV = "AGENTICML_REMOTE_STALE_SECONDS"
+_REMOTE_STATUSES = frozenset({"running", "finished", "crashed"})
+_REMOTE_FUTURE_SKEW_SECONDS = 60
 
 _DONE = frozenset({"finished", "crashed"})
 _MISMATCH_WARNED: set[str] = set()
+_REMOTE_WARNED: set[str] = set()
+_REMOTE_STALE_WARNED: set[str] = set()
 
 
 def run_references(root, run_id: str) -> dict[str, set[str]]:
@@ -85,7 +95,57 @@ def run_references(root, run_id: str) -> dict[str, set[str]]:
     read_json(directory / META_NAME)
     media_path = directory / "media" / INDEX_NAME
     contained(root, media_path.parent)
-    media = read_json(media_path)
+    media_bytes = read_file_nofollow(media_path)
+    if not isinstance(json.loads(media_bytes), dict):
+        raise ValueError(f"expected object in {media_path}")
+    refs = references_from_bytes(media_bytes,
+                                 read_file_nofollow(directory / EVENTS_NAME), run_id)
+    try:
+        rows = parse_artifacts_json(read_file_nofollow(directory / "artifacts.json"))
+    except FileNotFoundError:
+        return refs
+    if rows is None:
+        raise ValueError(f"invalid artifacts.json in run {run_id}")
+    for row in rows:
+        refs["artifacts"].add(row["sha256"])
+    return refs
+
+
+def parse_artifacts_json(body):
+    """Mapping rows from an ``artifacts.json`` body, or ``None`` if invalid."""
+    try:
+        obj = json.loads(body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else body)
+    except (TypeError, ValueError, RecursionError, UnicodeDecodeError):
+        return None
+    if not isinstance(obj, dict) or type(obj.get("version")) is not int or obj["version"] != 1:
+        return None
+    rows = obj.get("artifacts")
+    if not isinstance(rows, list) or len(rows) > 10_000:
+        return None
+    seen = set()
+    parsed = []
+    required = {"name", "version", "sha256", "size"}
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != required:
+            return None
+        name, version, sha, size = row["name"], row["version"], row["sha256"], row["size"]
+        if (not isinstance(name, str) or not name or len(name) > 1024
+                or type(version) is not int or version < 1 or not valid_sha(sha)
+                or type(size) is not int or size < 0):
+            return None
+        key = (name, version)
+        if key in seen:
+            return None
+        seen.add(key)
+        parsed.append({"name": name, "version": version, "sha256": sha, "size": size})
+    return parsed
+
+
+def references_from_bytes(media_bytes: bytes, events_bytes: bytes, run_id: str) -> dict[str, set[str]]:
+    """Collect references from exactly the snapshots being replicated."""
+    media = json.loads(media_bytes)
+    if not isinstance(media, dict):
+        raise ValueError(f"expected object in media index for run {run_id}")
     refs = {"media": set(), "artifacts": set(), "code": set()}
 
     def add(kind, row):
@@ -102,7 +162,7 @@ def run_references(root, run_id: str) -> dict[str, set[str]]:
             raise ValueError(f"invalid media rows in run {run_id}")
         for row in rows:
             add("media", row)
-    for line in read_file_nofollow(directory / EVENTS_NAME).split(b"\n"):
+    for line in events_bytes.split(b"\n"):
         if not line.strip():
             continue
         event = json.loads(line)
@@ -119,14 +179,127 @@ def run_references(root, run_id: str) -> dict[str, set[str]]:
     return refs
 
 
-def list_runs(root) -> list[dict]:
+def remote_stale_seconds() -> float:
+    """Stale window for a remote ``running`` status, in seconds.
+
+    ``AGENTICML_REMOTE_STALE_SECONDS`` is read on every call. A missing or
+    invalid value (empty, non-numeric, non-positive, non-finite) yields
+    ``REMOTE_STALE_SECONDS``. Each distinct bad value is logged once.
+    """
+    raw = os.environ.get(REMOTE_STALE_ENV)
+    if raw is None:
+        return REMOTE_STALE_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        _warn_stale_env(raw)
+        return REMOTE_STALE_SECONDS
+    if not math.isfinite(value) or value <= 0:
+        _warn_stale_env(raw)
+        return REMOTE_STALE_SECONDS
+    return value
+
+
+def _warn_stale_env(raw: str) -> None:
+    if raw in _REMOTE_STALE_WARNED:
+        return
+    _REMOTE_STALE_WARNED.add(raw)
+    logger.warning(
+        "invalid %s %r; using default %s",
+        REMOTE_STALE_ENV,
+        raw,
+        REMOTE_STALE_SECONDS,
+    )
+
+
+def _warn_remote_once(run_path, message, *args) -> None:
+    key = str(run_path)
+    if key in _REMOTE_WARNED:
+        return
+    _REMOTE_WARNED.add(key)
+    logger.warning(message, *args)
+
+
+def read_remote(run_path) -> dict | None:
+    """Normalised ``remote.json``, or None if the file is missing or invalid.
+
+    A JSON object with no ``status`` key is the pre-commit form: returned
+    with ``status`` and ``last_sync_at`` set to None, and no warning.
+    """
+    directory = Path(run_path)
+    path = directory / REMOTE_NAME
+    try:
+        raw = read_file_nofollow(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if is_symlink_error(exc) or os.path.islink(path):
+            _warn_remote_once(directory, "refusing symlinked remote.json in %s", directory)
+        else:
+            _warn_remote_once(
+                directory, "could not read remote.json in %s: %s", directory, exc
+            )
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        _warn_remote_once(directory, "invalid remote.json in %s", directory)
+        return None
+    if not isinstance(data, dict):
+        _warn_remote_once(directory, "invalid remote.json in %s", directory)
+        return None
+    owner = data.get("owner")
+    if not isinstance(owner, str):
+        owner = None
+    attribution = {name: data.get(name) if isinstance(data.get(name), str) else None
+                   for name in ("owner_key", "last_sync_key")}
+    if "status" not in data:
+        return {"status": None, "last_sync_at": None, "owner": owner, **attribution}
+    status = data.get("status")
+    if not isinstance(status, str) or status not in _REMOTE_STATUSES:
+        _warn_remote_once(directory, "invalid remote.json status %r in %s", status, directory)
+        return None
+    last_sync_at = data.get("last_sync_at")
+    if isinstance(last_sync_at, str):
+        try:
+            parse_timestamp(last_sync_at)
+        except (TypeError, ValueError, OverflowError):
+            last_sync_at = None
+    else:
+        last_sync_at = None
+    return {"status": status, "last_sync_at": last_sync_at, "owner": owner, **attribution}
+
+
+def _remote_status(remote: dict, now: float) -> str:
+    """Effective status from a normalised ``remote.json`` dict."""
+    status = remote["status"]
+    if status != "running":
+        return status
+    last_sync_at = remote.get("last_sync_at")
+    if last_sync_at is None:
+        return "stale"
+    try:
+        age = now - parse_timestamp(last_sync_at).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return "stale"
+    if age < -_REMOTE_FUTURE_SKEW_SECONDS:
+        return "stale"
+    if age < remote_stale_seconds():
+        return "running"
+    return "stale"
+
+
+def list_runs(root, *, include_owner=False) -> list[dict]:
     """One dict per run, newest ``created_at`` first.
 
-    Only ``meta.json`` is parsed. Directories whose names are not run ids,
-    and runs whose meta is missing, corrupt, or symlinked, are skipped.
-    ``run_id`` is set to the directory name; mismatches are logged once.
-    Running runs need both a free lock and an old heartbeat to be crashed.
-    An unknown lock with an old heartbeat indicates a stale run.
+    Only ``meta.json`` is parsed for identity. Directories whose names are
+    not run ids, and runs whose meta is missing, corrupt, or symlinked, are
+    skipped. ``run_id`` is set to the directory name; mismatches are logged
+    once. A valid ``remote.json`` takes precedence for ``effective_status``
+    and may add ``last_sync_at``. Otherwise running runs need both a free
+    lock and an old heartbeat to be crashed. An unknown lock with an old
+    heartbeat indicates a stale run. ``include_owner`` carries the normalized
+    remote owner in ``_remote_owner`` for server dashboard list responses.
     """
     root_path = Path(root).expanduser().resolve()
     runs_root = str(root_path / "runs")
@@ -167,7 +340,12 @@ def list_runs(root) -> list[dict]:
                         meta_run_id,
                     )
                 meta["run_id"] = dir_run_id
-            meta["effective_status"] = _effective_status(meta, meta_path, entry_path, now)
+            remote = read_remote(entry_path)
+            if include_owner:
+                meta["_remote_owner"] = remote["owner"] if remote else None
+            meta["effective_status"] = _status_from(meta, entry_path, now, remote)
+            if remote is not None and remote["last_sync_at"] is not None:
+                meta["last_sync_at"] = remote["last_sync_at"]
             found.append(meta)
     found.sort(key=_run_sort_key, reverse=True)
     return found
@@ -184,6 +362,17 @@ def _run_sort_key(meta: dict) -> tuple:
 
 
 def _effective_status(meta: dict, meta_path: str, run_path: str, now: float, *, lock=None) -> str:
+    return _status_from(meta, run_path, now, read_remote(run_path), lock=lock)
+
+
+def _status_from(meta: dict, run_path: str, now: float, remote, lock=None) -> str:
+    if remote is not None:
+        if remote["status"] is None:
+            status = meta.get("status")
+            if not isinstance(status, str):
+                status = ""
+            return "stale" if status == "running" else status
+        return _remote_status(remote, now)
     status = meta.get("status")
     if not isinstance(status, str):
         status = ""
@@ -396,7 +585,10 @@ def read_last_step(root, run_id: str) -> int | None:
 
 
 class RunReader:
-    """Read one run. Thread-safe. Raises ``ValueError`` for a bad id and ``FileNotFoundError`` if it is missing."""
+    """Read one run. Thread-safe. Raises ``ValueError`` for a bad id and ``FileNotFoundError`` if it is missing.
+
+    ``remote()`` reads server-only ``remote.json`` when that file is present.
+    """
 
     def __init__(self, root, run_id: str) -> None:
         if not valid_run_id(run_id):
@@ -435,6 +627,18 @@ class RunReader:
             _ensure_contained(self.root, path)
             self._path_cache[key] = path
             return path
+
+    def remote(self) -> dict | None:
+        """Normalised ``remote.json``, or None if missing or invalid. Re-read on each call."""
+        self._c(self.run_dir / REMOTE_NAME)
+        return read_remote(self.run_dir)
+
+    def last_sync_at(self) -> str | None:
+        """``last_sync_at`` from ``remote.json``, or None."""
+        remote = self.remote()
+        if remote is None:
+            return None
+        return remote["last_sync_at"]
 
     def meta(self) -> dict:
         """Current ``meta.json``. Re-read on each call so status changes show up."""
@@ -499,8 +703,27 @@ class RunReader:
         return [merged[path] for path in order]
 
     def artifacts(self) -> list:
-        """Artifact events in append order, including ``version`` and ``sha256``."""
-        return [event for event in self.events() if event.get("kind") == "artifact"]
+        """Artifact events in append order, with ``artifacts.json`` filled in when valid."""
+        events = [event for event in self.events() if event.get("kind") == "artifact"]
+        try:
+            rows = parse_artifacts_json(read_file_nofollow(self._c(self.run_dir / "artifacts.json")))
+        except FileNotFoundError:
+            return events
+        except OSError:
+            return events
+        if not rows:
+            return events
+        mapping = {(row["name"], row["version"]): row for row in rows}
+        merged = []
+        for event in events:
+            row = mapping.get((event.get("name"), event.get("version")))
+            if row is not None and event.get("copy") is False:
+                event = dict(event)
+                event["sha256"] = row["sha256"]
+                event["size"] = row["size"]
+                event["byref"] = True
+            merged.append(event)
+        return merged
 
     def referenced_shas(self) -> set[str]:
         """All referenced objects; unreadable input raises rather than losing refs."""

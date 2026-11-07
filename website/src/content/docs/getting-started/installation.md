@@ -5,7 +5,7 @@ sidebar:
   order: 1
 ---
 
-Install the package as `agenticml-lite` and import it as `agenticml`. It needs Python 3.9 or newer.
+Install the package as `agenticml-lite` and import it as `agenticml`. It needs Python 3.10 or newer.
 
 ```bash
 pip install agenticml-lite

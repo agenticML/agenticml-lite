@@ -193,8 +193,9 @@ agenticml lineage diff RUN_ID [OTHER_RUN_ID]   # numstat vs other or parent
 agenticml lineage ls [--project P] [--task T]  # run parent tree
 agenticml du                              # store disk usage
 agenticml gc --dry-run                    # preview cleanup; nothing is deleted
-agenticml login / whoami / logout         # credentials for upload
-agenticml sync RUN_ID [--dry-run]         # upload (needs login)
+agenticml login --host URL / whoami / logout  # credentials (login needs --host of your own agenticml server)
+agenticml sync RUN_ID [--dry-run] [--artifacts]  # send runs to the server (needs login)
+agenticml sync --follow [--interval S]        # keep syncing until stopped (implies --all)
 ```
 
 `lineage ls` groups output by project, then `[task]` (`[no task]` for none).
@@ -225,7 +226,7 @@ Format details are in [FORMAT.md](FORMAT.md). To reset after testing, `rm -rf "$
 - **`log` does nothing**: check `AGENTICML_MODE`. `disabled` silences everything.
 - **`Image` fails with numpy or PIL input**: `pip install "agenticml-lite[media]"`.
 - **No system metrics**: `pip install "agenticml-lite[system]"` (CPU/memory), `[gpu]` for NVIDIA.
-- **A run shows `running` after a crash**: it is marked `crashed` once its lock is released. `agenticml sync` finalizes it, or finalize it directly with `agenticml finish RUN_ID --status crashed`.
+- **A run shows `running` after a crash**: locally it is marked `crashed` once its lock is released; `agenticml sync` uploads it to the server marked crashed, or finalize it directly with `agenticml finish RUN_ID --status crashed`.
 - **Multi-GPU**: only rank 0 logs. Launch as `torchrun ... -m agenticml run -- train.py`.
 - **Quick end-to-end sample**: `python examples/train_toy.py --explicit`.
 

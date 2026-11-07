@@ -1,247 +1,470 @@
-"""HTTP-level tests for Client. Uses `responses` to mock the server."""
-
+"""HTTP-level tests for the protocol v2 Client."""
 from __future__ import annotations
 
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import hashlib
+import io
 import json
+import socket
+import threading
+import time
 
 import pytest
 import requests
-import responses
-from urllib3.exceptions import ConnectTimeoutError, MaxRetryError, ProtocolError
 
-from agenticml.client import Client
+from agenticml.client import Client, Conflict, ProtocolError, SyncStopped
+from agenticml.server.app import make_server
+from agenticml.server.keys import KeyStore
 
 
-BASE = "https://api.test.local"
+@contextmanager
+def running(data, env_key=None):
+    httpd = make_server(data, port=0, env_key=env_key)
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
+    thread.start()
+    try:
+        yield httpd
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()
 
 
 @pytest.fixture
-def client():
-    return Client(base_url=BASE, timeout=2, max_retries=2, api_key="kkk")
+def server(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    with running(tmp_path / "data") as httpd:
+        _, httpd.test_key = httpd.keys.create("one")
+        yield httpd
 
 
-@responses.activate
-def test_init_run_returns_id(client):
-    responses.add(
-        responses.POST, f"{BASE}/init",
-        json={"run_id": "abc123"}, status=200,
-    )
-    rid = client.init_run({"project": "p", "name": "n"})
-    assert rid == "abc123"
-
-    sent = responses.calls[0].request
-    assert sent.headers["x-api-key"] == "kkk"
+def origin(httpd):
+    host, port = httpd.server_address[:2]
+    return f"http://{host}:{port}"
 
 
-@responses.activate
-def test_log_batch_skips_empty(client):
-    # Should NOT make any HTTP call when items is empty.
-    client.log_batch([])
-    assert len(responses.calls) == 0
+def client_for(server, key=None, **kwargs):
+    return Client(base_url=origin(server), api_key=server.test_key if key is None else key, **kwargs)
 
 
-@responses.activate
-def test_log_batch_posts_items(client):
-    responses.add(responses.POST, f"{BASE}/log/batch", status=200)
-    client.log_batch([{"run_id": "r1", "step": 1, "metrics": {"loss": 0.1}}])
-    assert len(responses.calls) == 1
-    assert b'"items"' in responses.calls[0].request.body
+class _FakeHandler(BaseHTTPRequestHandler):
+    def log_message(self, *_args):
+        return
+
+    def _read_body(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(length)
+
+    def _send(self, status, body=b"", headers=None):
+        self.send_response(status)
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        self.server.requests.append(("GET", self.path, self.headers, b""))
+        self._dispatch()
+
+    def do_POST(self):
+        body = self._read_body()
+        self.server.requests.append(("POST", self.path, self.headers, body))
+        self._dispatch()
+
+    def do_PUT(self):
+        body = self._read_body()
+        self.server.requests.append(("PUT", self.path, self.headers, body))
+        self._dispatch()
+
+    def _dispatch(self):
+        self.server.handler(self)
 
 
-@responses.activate
-def test_artifacts_exists_short_circuits_on_empty(client):
-    assert client.artifacts_exists([]) == []
-    assert len(responses.calls) == 0
+@contextmanager
+def fake_http(handler):
+    httpd = HTTPServer(("127.0.0.1", 0), _FakeHandler)
+    httpd.handler = handler
+    httpd.requests = []
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
+    thread.start()
+    try:
+        yield httpd, f"http://127.0.0.1:{httpd.server_address[1]}"
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()
 
 
-@responses.activate
-def test_artifacts_exists_returns_list(client):
-    responses.add(
-        responses.POST, f"{BASE}/artifacts/exists",
-        json={"existing": ["sha1", "sha2"]}, status=200,
-    )
-    out = client.artifacts_exists(["sha1", "sha2", "sha3"])
-    assert out == ["sha1", "sha2"]
+def test_whoami_sync_and_admin_and_revoked(server):
+    with client_for(server) as client:
+        assert client.whoami() == {
+            "key": "one", "scope": "sync", "user": "admin", "role": "admin", "protocol": 2,
+            "features": (["lineage"] if server.lineage_enabled else []) + ["byref"],
+        }
+    _, admin = server.keys.create("boss", "admin")
+    with client_for(server, admin) as client:
+        assert client.whoami()["scope"] == "admin"
+    with client_for(server, "wrong-key") as client:
+        with pytest.raises(requests.HTTPError) as caught:
+            client.whoami()
+        assert caught.value.response.status_code == 401
+        assert "wrong-key" not in str(caught.value)
+    KeyStore(server.data_dir / "server").revoke("one")
+    with client_for(server) as client:
+        with pytest.raises(requests.HTTPError) as caught:
+            client.whoami()
+        assert caught.value.response.status_code == 401
+        assert server.test_key not in str(caught.value)
+        assert server.test_key not in repr(client)
 
 
-@responses.activate
-def test_finalize_posts_summary(client):
-    responses.add(responses.POST, f"{BASE}/runs/r1/finalize", status=200)
-    client.finalize("r1", {"final": 1.0}, status="finished")
-    body = json.loads(responses.calls[0].request.body)
-    assert body == {"summary": {"final": 1.0}, "status": "finished"}
+@pytest.mark.parametrize("status,body", [
+    (404, b'{"error":"not found"}'),
+    (200, b"not json"),
+    (200, b'{"protocol": 1}'),
+])
+def test_whoami_protocol_error(status, body):
+    def handler(request):
+        request._send(status, body, {"Content-Type": "application/json"})
+
+    with fake_http(handler) as (_httpd, url):
+        with Client(base_url=url, api_key="secret-key") as client:
+            with pytest.raises(ProtocolError, match="is not an agenticml server with protocol 2") as caught:
+                client.whoami()
+            assert "secret-key" not in str(caught.value)
 
 
-@responses.activate
-def test_idempotent_post_retries_status(client):
+@pytest.mark.parametrize("status", [408, 429, 501, 520])
+def test_whoami_unreachable_http_error(status):
+    def handler(request):
+        request._send(status, b'{"error":"busy"}', {"Content-Type": "application/json"})
+
+    with fake_http(handler) as (_httpd, url):
+        with Client(base_url=url, api_key="secret-key", max_retries=0) as client:
+            with pytest.raises(requests.HTTPError) as caught:
+                client.whoami()
+            assert caught.value.response.status_code == status
+            assert "secret-key" not in str(caught.value)
+
+
+def test_round_trip_missing_object_file_append_state_commit(server):
+    data = b"object bytes"
+    sha = hashlib.sha256(data).hexdigest()
+    meta = json.dumps({"run_id": "run-1", "status": "running"}).encode()
+    events = b'{"t":1}\n'
+    with client_for(server) as client:
+        assert client.missing([sha]) == [sha]
+        assert client.put_object(sha, io.BytesIO(data), len(data)) is True
+        assert client.put_object(sha, io.BytesIO(data), len(data)) is False
+        assert client.missing([sha]) == []
+        assert client.put_file("run-1", "meta.json", meta) == {"size": len(meta)}
+        assert client.append("run-1", "events.jsonl", 0, events) == len(events)
+        state = client.run_state("run-1")
+        assert state["owner"] == "one"
+        assert state["owner_user"] == "admin"
+        assert "meta.json" in state["files"]
+        assert "events.jsonl" in state["files"]
+        fingerprint = "a" * 64
+        assert client.commit("run-1", "running", fingerprint, {
+            "meta.json": len(meta), "events.jsonl": len(events),
+        }) == {"complete": True, "fingerprint": fingerprint}
+        with pytest.raises(Conflict) as caught:
+            client.commit("run-1", "running", fingerprint, {
+                "meta.json": 0, "events.jsonl": 2,
+            })
+        assert "sizes" in caught.value.payload
+        assert server.test_key not in str(caught.value)
+        assert client.run_state("missing-run") is None
+
+
+def test_missing_splits_25000_hashes_into_three_requests(server):
+    hashes = [f"{index:064x}" for index in range(25000)]
+    with client_for(server) as client:
+        seen = []
+        original = client.session.request
+
+        def wrapped(method, url, **kwargs):
+            if method == "POST" and url.endswith("/v2/objects/missing"):
+                seen.append(kwargs["json"]["objects"])
+            return original(method, url, **kwargs)
+
+        client.session.request = wrapped
+        assert client.missing(hashes) == hashes
+        assert [len(chunk) for chunk in seen] == [10000, 10000, 5000]
+
+
+@pytest.mark.parametrize("kind", ["object", "lineage"])
+@pytest.mark.parametrize("payload", [b"", b"upload body"])
+def test_upload_content_length_without_transfer_encoding(tmp_path, kind, payload):
+    def handler(request):
+        request._send(201, b'{"created":true}')
+
+    path = tmp_path / "upload.bin"
+    path.write_bytes(payload)
+    sha = hashlib.sha256(payload).hexdigest()
+    with fake_http(handler) as (httpd, url):
+        with Client(base_url=url, api_key="secret-key") as client, path.open("rb") as handle:
+            if kind == "object":
+                assert client.put_object(sha, handle, len(payload)) is True
+                expected_path = f"/v2/objects/{sha}"
+            else:
+                assert client.put_lineage("run-1", handle, len(payload)) == {"created": True}
+                expected_path = "/v2/runs/run-1/lineage"
+        assert len(httpd.requests) == 1
+        method, request_path, headers, body = httpd.requests[0]
+        assert (method, request_path, body) == ("PUT", expected_path, payload)
+        assert headers.get_all("Content-Length") == [str(len(payload))]
+        assert "Transfer-Encoding" not in headers
+        assert headers["Content-Type"] == "application/octet-stream"
+
+
+@pytest.mark.parametrize("payload", [b"", b"full-object-body"])
+def test_put_object_retries_503_and_rewinds(monkeypatch, payload):
+    monkeypatch.setattr("agenticml.client.time.sleep", lambda _delay: None)
+    bodies = []
+
+    def handler(request):
+        bodies.append(request.server.requests[-1][3])
+        assert request.headers["Content-Length"] == str(len(payload))
+        assert "Transfer-Encoding" not in request.headers
+        if len(bodies) == 1:
+            request._send(503, b'{"error":"busy"}', {"Retry-After": "0"})
+            return
+        request._send(201, b'{"created":true}')
+
+    sha = hashlib.sha256(payload).hexdigest()
+    with fake_http(handler) as (_httpd, url):
+        with Client(base_url=url, api_key="secret-key") as client:
+            assert client.put_object(sha, io.BytesIO(payload), len(payload)) is True
+    assert bodies == [payload, payload]
+
+
+@pytest.mark.parametrize("payload", [b"", b"full-bundle-body"])
+def test_put_lineage_retries_503_and_rewinds(payload):
+    bodies = []
+
+    def handler(request):
+        bodies.append(request.server.requests[-1][3])
+        assert request.path == "/v2/runs/run-1/lineage"
+        assert request.headers["Content-Length"] == str(len(payload))
+        assert "Transfer-Encoding" not in request.headers
+        if len(bodies) == 1:
+            request._send(503, b'{"error":"busy"}', {"Retry-After": "0"})
+        else:
+            request._send(201, b'{"created":true,"commit":"accepted"}')
+
+    with fake_http(handler) as (_httpd, url):
+        with Client(base_url=url, api_key="secret-key") as client:
+            assert client.put_lineage("run-1", io.BytesIO(payload), len(payload)) == {
+                "created": True, "commit": "accepted",
+            }
+    assert bodies == [payload, payload]
+
+
+def test_connection_refused_retries_then_raises(monkeypatch):
+    monkeypatch.setattr("agenticml.client.time.sleep", lambda _delay: None)
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    with Client(base_url=f"http://127.0.0.1:{port}", api_key="secret-key", max_retries=2) as client:
+        seen = []
+        original = client.session.request
+
+        def wrapped(*args, **kwargs):
+            seen.append(1)
+            return original(*args, **kwargs)
+
+        client.session.request = wrapped
+        with pytest.raises(requests.ConnectionError) as caught:
+            client.whoami()
+        assert len(seen) == 3
+        assert "secret-key" not in str(caught.value)
+
+
+def test_4xx_is_not_retried():
+    def handler(request):
+        request._send(400, b'{"error":"bad request"}')
+
+    with fake_http(handler) as (httpd, url):
+        with Client(base_url=url, api_key="secret-key") as client:
+            with pytest.raises(requests.HTTPError) as caught:
+                client.missing(["a" * 64])
+            assert caught.value.response.status_code == 400
+        assert len(httpd.requests) == 1
+
+
+def test_persistent_503_retries_then_http_error(monkeypatch):
+    monkeypatch.setattr("agenticml.client.time.sleep", lambda _delay: None)
+
+    def handler(request):
+        request._send(503, b'{"error":"busy"}')
+
+    with fake_http(handler) as (httpd, url):
+        with Client(base_url=url, api_key="secret-key", max_retries=2) as client:
+            with pytest.raises(requests.HTTPError) as caught:
+                client.whoami()
+            assert caught.value.response.status_code == 503
+        assert len(httpd.requests) == 3
+
+
+def test_retry_after_capped_and_nan_falls_back(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("agenticml.client.time.sleep", sleeps.append)
+
+    def handler(request):
+        count = len(request.server.requests)
+        if count == 1:
+            request._send(503, b'{"error":"busy"}', {"Retry-After": "999"})
+            return
+        if count == 2:
+            request._send(503, b'{"error":"busy"}', {"Retry-After": "nan"})
+            return
+        request._send(200, b'{"protocol":2,"key":"one","scope":"sync","features":[]}')
+
+    with fake_http(handler) as (_httpd, url):
+        with Client(base_url=url, api_key="secret-key") as client:
+            assert client.whoami()["protocol"] == 2
+    assert sleeps == [30.0, 1.0]
+
+
+def test_negative_retry_after_falls_back(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("agenticml.client.time.sleep", sleeps.append)
+
+    def handler(request):
+        if len(request.server.requests) == 1:
+            request._send(429, b'{"error":"slow down"}', {"Retry-After": "-1"})
+            return
+        request._send(200, b'{"protocol":2,"key":"one","scope":"sync","features":[]}')
+
+    with fake_http(handler) as (_httpd, url):
+        with Client(base_url=url, api_key="secret-key") as client:
+            assert client.whoami()["protocol"] == 2
+    assert sleeps == [0.5]
+
+
+def test_429_retries_honouring_retry_after(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("agenticml.client.time.sleep", sleeps.append)
+
+    def handler(request):
+        count = len(request.server.requests)
+        if count == 1:
+            request._send(429, b'{"error":"slow down"}', {"Retry-After": "1.5"})
+            return
+        if count == 2:
+            request._send(429, b'{"error":"slow down"}', {"Retry-After": "999"})
+            return
+        if count == 3:
+            request._send(429, b'{"error":"slow down"}', {"Retry-After": "nan"})
+            return
+        request._send(200, b'{"protocol":2,"key":"one","scope":"sync","features":[]}')
+
+    with fake_http(handler) as (_httpd, url):
+        with Client(base_url=url, api_key="secret-key") as client:
+            assert client.whoami()["protocol"] == 2
+    assert sleeps == [1.5, 60.0, 2.0]
+
+
+def test_persistent_429_retries_then_http_error(monkeypatch):
+    monkeypatch.setattr("agenticml.client.time.sleep", lambda _delay: None)
+
+    def handler(request):
+        request._send(429, b'{"error":"slow down"}', {"Retry-After": "0"})
+
+    with fake_http(handler) as (httpd, url):
+        with Client(base_url=url, api_key="secret-key", max_retries=2) as client:
+            with pytest.raises(requests.HTTPError) as caught:
+                client.whoami()
+            assert caught.value.response.status_code == 429
+        assert len(httpd.requests) == 3
+
+
+def test_chunked_encoding_error_is_retried(monkeypatch):
+    monkeypatch.setattr("agenticml.client.time.sleep", lambda _delay: None)
     seen = []
 
-    def fail(request):
-        seen.append(request.url)
-        return 503, {}, "{}"
+    def handler(request):
+        request._send(200, b'{"protocol":2,"key":"one","scope":"sync","features":[]}')
 
-    responses.add_callback(responses.POST, f"{BASE}/log/batch", callback=fail)
-    with pytest.raises(requests.HTTPError):
-        client.log_batch([{"run_id": "r", "step": 1, "metrics": {"loss": 1.0}}])
-    # max_retries=2 => 1 original + 2 retries.
+    with fake_http(handler) as (_httpd, url):
+        with Client(base_url=url, api_key="secret-key", max_retries=2) as client:
+            original = client.session.request
+
+            def wrapped(*args, **kwargs):
+                seen.append(1)
+                if len(seen) < 3:
+                    raise requests.exceptions.ChunkedEncodingError("truncated")
+                return original(*args, **kwargs)
+
+            client.session.request = wrapped
+            assert client.whoami()["protocol"] == 2
     assert len(seen) == 3
 
 
-@responses.activate
-def test_5xx_then_success(client):
-    responses.add(responses.POST, f"{BASE}/log/batch", status=503)
-    responses.add(responses.POST, f"{BASE}/log/batch", status=200)
-    client.log_batch([{"run_id": "r", "step": 1, "metrics": {"loss": 0.1}}])
-    assert len(responses.calls) == 2
+def test_redirect_refuses_to_follow_or_send_key():
+    stolen = []
+
+    def sink(request):
+        stolen.append(dict(request.headers))
+        request._send(200, b'{"ok":true}')
+
+    def bounce(location):
+        def handler(request):
+            request._send(302, b"", {"Location": location})
+        return handler
+
+    with fake_http(sink) as (_sink, sink_url):
+        with fake_http(bounce(sink_url + "/steal")) as (_httpd, url):
+            with Client(base_url=url, api_key="secret-key") as client:
+                with pytest.raises(ValueError, match="server redirected; refusing to send the API key") as caught:
+                    client.whoami()
+                assert "steal" not in str(caught.value)
+                assert "secret-key" not in str(caught.value)
+                assert "secret-key" not in repr(client)
+    assert stolen == []
 
 
-def test_env_var_overrides_default(monkeypatch):
+def test_key_not_in_repr_or_exceptions(server):
+    secret = "super-secret-api-key"
+    with Client(base_url=origin(server), api_key=secret) as client:
+        assert secret not in repr(client)
+        with pytest.raises(requests.HTTPError) as caught:
+            client.whoami()
+        text = str(caught.value) + repr(caught.value)
+        assert secret not in text
+        assert secret not in repr(client)
+
+
+def test_no_host_raises(monkeypatch):
+    monkeypatch.delenv("AGENTICML_HOST", raising=False)
+    with pytest.raises(ValueError, match="no server host"):
+        Client(api_key="test")
+
+
+def test_env_and_explicit_host(monkeypatch):
     monkeypatch.setenv("AGENTICML_HOST", "https://override.example")
     monkeypatch.setenv("AGENTICML_API_KEY", "envkey")
-    c = Client()
-    assert c.base_url == "https://override.example"
-    assert c.api_key == "envkey"
+    with Client() as client:
+        assert client.base_url == "https://override.example"
+        assert client.api_key == "envkey"
+    with Client(base_url="https://explicit.example") as client:
+        assert client.base_url == "https://explicit.example"
 
 
-def test_explicit_args_beat_env(monkeypatch):
-    monkeypatch.setenv("AGENTICML_HOST", "https://env.example")
-    c = Client(base_url="https://explicit.example")
-    assert c.base_url == "https://explicit.example"
-
-
-@responses.activate
-def test_upload_code_empty_skips_requests(client):
-    assert client.upload_code("r1", []) == {"status": "ok", "registered": []}
-    assert not responses.calls
-
-
-@pytest.mark.parametrize("existing", [[], ["sha1"], ["sha1", "sha2"]])
-@responses.activate
-def test_upload_code_presigns_only_missing_and_registers_all(client, existing):
-    files = [
-        {"path": "train.py", "sha256": "sha1", "content": b"print(1)", "content_type": "text/x-python"},
-        {"path": "config.yaml", "sha256": "sha2", "content": b"lr: 0.1", "content_type": "text/yaml", "source": "extra"},
-    ]
-    missing = [item for item in files if item["sha256"] not in existing]
-    responses.add(responses.POST, f"{BASE}/artifacts/exists", json={"existing": existing})
-    responses.add(
-        responses.POST, f"{BASE}/runs/r1/artifacts/presign-upload",
-        json={"uploads": [
-            {"path": item["path"], "url": f"https://bucket.test/{item['path']}",
-             "headers": {"Content-Type": item["content_type"]}}
-            for item in missing
-        ]},
-    )
-    for item in missing:
-        responses.add(responses.PUT, f"https://bucket.test/{item['path']}", status=200)
-    responses.add(responses.POST, f"{BASE}/runs/r1/artifacts/register", json={"status": "ok"})
-
-    assert client.upload_code("r1", files) == {"status": "ok"}
-    presigned = json.loads(responses.calls[1].request.body)["files"]
-    assert {item["path"] for item in presigned} == {item["path"] for item in missing}
-    registered = json.loads(responses.calls[-1].request.body)["files"]
-    assert {item["path"] for item in registered} == {item["path"] for item in files}
-    assert registered[1]["source"] == "extra"
-    for call, item in zip(responses.calls[2:-1], missing):
-        assert call.request.body == item["content"]
-        assert call.request.headers["Content-Type"] == item["content_type"]
-        assert "x-api-key" not in call.request.headers
-    assert all("stored" not in item for item in files)
-
-
-@responses.activate
-def test_upload_code_recovers_missing_deduplicated_content(client):
-    files = [
-        {"path": "train.py", "sha256": "sha1", "content": b"print(1)", "content_type": "text/x-python"},
-        {"path": "config.yaml", "sha256": "sha2", "content": b"lr: 0.1", "content_type": "text/yaml"},
-    ]
-    responses.add(responses.POST, f"{BASE}/artifacts/exists", json={"existing": ["sha1", "sha2"]})
-    responses.add(responses.POST, f"{BASE}/runs/r1/artifacts/presign-upload", json={"uploads": []})
-    responses.add(
-        responses.POST, f"{BASE}/runs/r1/artifacts/register",
-        json={"detail": {"missing": ["train.py"]}}, status=409,
-    )
-    responses.add(
-        responses.POST, f"{BASE}/runs/r1/artifacts/presign-upload",
-        json={"uploads": [{"path": "train.py", "url": "https://bucket.test/recover"}]},
-    )
-    responses.add(responses.PUT, "https://bucket.test/recover", status=200)
-    responses.add(responses.POST, f"{BASE}/runs/r1/artifacts/register", json={"status": "ok"})
-
-    assert client.upload_code("r1", files) == {"status": "ok"}
-    assert json.loads(responses.calls[1].request.body) == {"files": []}
-    recovery = json.loads(responses.calls[3].request.body)["files"]
-    assert [item["path"] for item in recovery] == ["train.py"]
-    assert responses.calls[4].request.body == b"print(1)"
-    assert "x-api-key" not in responses.calls[4].request.headers
-    assert responses.calls[2].request.body == responses.calls[-1].request.body
-
-
-@responses.activate
-def test_upload_code_continues_when_dedup_query_fails(client):
-    responses.add(responses.POST, f"{BASE}/artifacts/exists", status=400)
-    responses.add(
-        responses.POST, f"{BASE}/runs/r1/artifacts/presign-upload",
-        json={"uploads": [{"path": "train.py", "url": "https://bucket.test/train.py"}]},
-    )
-    responses.add(responses.PUT, "https://bucket.test/train.py", status=200)
-    responses.add(responses.POST, f"{BASE}/runs/r1/artifacts/register", json={"status": "ok"})
-    client.upload_code("r1", [
-        {"path": "train.py", "sha256": "sha1", "content": b"print(1)", "content_type": "text/x-python", "stored": True},
-    ])
-    assert json.loads(responses.calls[1].request.body)["files"][0]["path"] == "train.py"
-    assert responses.calls[2].request.body == b"print(1)"
-
-
-@pytest.mark.parametrize("dedup", [False, True])
-@responses.activate
-def test_log_artifact_presigns_and_registers_version(client, tmp_path, dedup):
-    artifact = tmp_path / "model.bin"
-    content = b"model weights"
-    artifact.write_bytes(content)
-    sha = hashlib.sha256(content).hexdigest()
-    responses.add(
-        responses.POST, f"{BASE}/runs/r1/artifacts/presign-upload",
-        json={"uploads": [] if dedup else [{"path": artifact.name, "url": "https://bucket.test/model"}]},
-    )
-    if not dedup:
-        responses.add(responses.PUT, "https://bucket.test/model", status=200)
-    responses.add(
-        responses.POST, f"{BASE}/runs/r1/artifacts/register-version",
-        json={"id": "a1", "version": 2},
-    )
-    result = client.log_artifact("r1", "model", "checkpoint", {"epoch": 3}, artifact, "application/octet-stream")
-    assert result == {"id": "a1", "version": 2}
-    descriptor = json.loads(responses.calls[0].request.body)["files"][0]
-    assert descriptor == {
-        "path": "model.bin", "sha256": sha, "size_bytes": len(content),
-        "content_type": "application/octet-stream", "source": "user",
-    }
-    registered = json.loads(responses.calls[-1].request.body)
-    assert registered == {
-        "name": "model", "type": "checkpoint", "metadata": {"epoch": 3},
-        "sha256": sha, "size_bytes": len(content), "content_type": "application/octet-stream",
-        "filename": "model.bin",
-    }
-    if not dedup:
-        uploaded = responses.calls[1].request
-        assert uploaded.body == content
-        assert uploaded.headers["Content-Length"] == str(len(content))
-        assert "x-api-key" not in uploaded.headers
-
-
-@responses.activate
-def test_log_media_posts_file_and_fields(client, tmp_path):
-    media = tmp_path / "plot.png"
-    media.write_bytes(b"image bytes")
-    responses.add(responses.POST, f"{BASE}/runs/r1/log_media", json={"id": "m1"})
-    assert client.log_media("r1", "preview", 7, "image", "caption", media, "image/png") == {"id": "m1"}
-    sent = responses.calls[0].request
-    assert sent.headers["Content-Type"].startswith("multipart/form-data;")
-    for field in (b"preview", b"7", b"image", b"caption", b"plot.png", b"image bytes"):
-        assert field in sent.body
-    assert sent.headers["x-api-key"] == "kkk"
+def test_empty_env_key_treated_as_unset(monkeypatch):
+    monkeypatch.setenv("AGENTICML_HOST", "https://example.com")
+    monkeypatch.setenv("AGENTICML_API_KEY", "")
+    with Client() as client:
+        assert client.api_key is None
+        assert "Authorization" not in client.session.headers
+    monkeypatch.setenv("AGENTICML_HOST", "")
+    with pytest.raises(ValueError, match="no server host"):
+        Client()
 
 
 def test_host_is_normalised_and_remote_http_needs_insecure():
@@ -254,195 +477,35 @@ def test_host_is_normalised_and_remote_http_needs_insecure():
         Client(base_url="ftp://example.com")
 
 
-def test_connect_retry_ignores_read_and_status(client):
-    retry = client._once.get_adapter("https://").max_retries
-    assert (retry.connect, retry.read, retry.status, retry.other) == (2, 0, 0, 0)
-    full = client.session.get_adapter("https://").max_retries
-    assert full.read == 2 and 503 in full.status_forcelist
-    nxt = retry.increment("POST", f"{BASE}/init", error=ConnectTimeoutError("timeout"))
-    assert nxt.connect == 1
-    with pytest.raises(MaxRetryError):
-        retry.increment("POST", f"{BASE}/init", error=ProtocolError("reset"))
-    with pytest.raises(MaxRetryError):
-        retry.increment("POST", f"{BASE}/init", error=RuntimeError("other"))
+def test_stop_event_blocks_request_and_wakes_backoff():
+    sent = []
 
+    def handler(request):
+        sent.append(request.path)
+        request._send(200, b'{"protocol":2,"key":"one","scope":"sync","features":[]}')
 
-def test_init_timeout_is_at_least_30s(client, monkeypatch):
-    captured = {}
+    stop = threading.Event()
+    stop.set()
+    with fake_http(handler) as (_httpd, url):
+        with Client(base_url=url, api_key="secret-key", stop=stop) as client:
+            with pytest.raises(SyncStopped):
+                client.whoami()
+    assert sent == []
 
-    class Response:
-        status_code = 200
+    stop = threading.Event()
+    box = []
+    with Client(base_url="http://127.0.0.1:1", api_key="secret-key", stop=stop) as client:
+        def run():
+            try:
+                client._backoff(0, retry_after=30)
+            except SyncStopped as exc:
+                box.append(exc)
 
-        def json(self):
-            return {"run_id": "abc"}
-
-        def raise_for_status(self):
-            return None
-
-    def fake_request(_method, _url, **kwargs):
-        captured.update(kwargs)
-        return Response()
-
-    monkeypatch.setattr(client._once, "request", fake_request)
-    assert client.init_run({"project": "p", "name": "n"}) == "abc"
-    assert captured["timeout"] == 30
-    assert captured["allow_redirects"] is False
-
-
-@responses.activate
-def test_redirect_with_api_key_is_refused(client):
-    responses.add(
-        responses.POST, f"{BASE}/init", status=302,
-        headers={"Location": "https://evil.example/steal"},
-    )
-    with pytest.raises(ValueError, match="server redirected; refusing to send the API key") as exc:
-        client.init_run({"project": "p", "name": "n"})
-    assert "evil.example" not in str(exc.value)
-    assert len(responses.calls) == 1
-
-    responses.add(
-        responses.GET, f"{BASE}/runs", status=302,
-        headers={"Location": "https://evil.example/runs"},
-    )
-    with pytest.raises(ValueError, match="server redirected; refusing to send the API key"):
-        client.check_auth()
-    assert len(responses.calls) == 2
-
-
-@responses.activate
-@pytest.mark.parametrize("kind", ["init", "finalize", "media", "version"])
-def test_non_idempotent_post_does_not_retry_status(client, tmp_path, kind):
-    seen = []
-
-    def fail(request):
-        seen.append(request.url)
-        return 503, {}, "{}"
-
-    if kind == "init":
-        responses.add_callback(responses.POST, f"{BASE}/init", callback=fail)
-        with pytest.raises(requests.HTTPError):
-            client.init_run({"project": "p", "name": "n"})
-    elif kind == "finalize":
-        responses.add_callback(responses.POST, f"{BASE}/runs/r/finalize", callback=fail)
-        with pytest.raises(requests.HTTPError):
-            client.finalize("r", {"a": 1})
-    elif kind == "media":
-        media = tmp_path / "plot.png"
-        media.write_bytes(b"image")
-        responses.add_callback(responses.POST, f"{BASE}/runs/r/log_media", callback=fail)
-        with pytest.raises(requests.HTTPError):
-            client.log_media("r", "preview", 1, "image", "", media, "image/png")
-    else:
-        artifact = tmp_path / "model.bin"
-        artifact.write_bytes(b"weights")
-        responses.add(responses.POST, f"{BASE}/runs/r/artifacts/presign-upload", json={"uploads": []})
-        responses.add_callback(
-            responses.POST, f"{BASE}/runs/r/artifacts/register-version", callback=fail,
-        )
-        with pytest.raises(requests.HTTPError):
-            client.log_artifact("r", "model", "file", {}, artifact, "application/octet-stream")
-    assert len(seen) == 1
-
-
-@responses.activate
-def test_code_presign_and_register_retry_status(client):
-    seen = {"exists": 0, "presign": 0, "register": 0}
-
-    def count(key, succeed_on):
-        def callback(request):
-            seen[key] += 1
-            if seen[key] < succeed_on:
-                return 503, {}, "{}"
-            if key == "exists":
-                return 200, {}, json.dumps({"existing": []})
-            if key == "presign":
-                return 200, {}, json.dumps({"uploads": []})
-            return 200, {}, json.dumps({"status": "ok"})
-        return callback
-
-    responses.add_callback(responses.POST, f"{BASE}/artifacts/exists", callback=count("exists", 3))
-    responses.add_callback(
-        responses.POST, f"{BASE}/runs/r/artifacts/presign-upload", callback=count("presign", 3),
-    )
-    responses.add_callback(
-        responses.POST, f"{BASE}/runs/r/artifacts/register", callback=count("register", 3),
-    )
-    assert client.upload_code("r", [{
-        "path": "train.py", "sha256": "sha1", "content": b"print(1)", "content_type": "text/x-python",
-    }]) == {"status": "ok"}
-    assert seen == {"exists": 3, "presign": 3, "register": 3}
-
-
-def test_retry_after_ignored_and_bounded_backoff(client):
-    once_retry = client._once.get_adapter("https://").max_retries
-    session_retry = client.session.get_adapter("https://").max_retries
-    for r in (once_retry, session_retry):
-        assert r.respect_retry_after_header is False
-        assert r.backoff_max == 30.0
-        assert r.backoff_factor == 0.5
-
-
-@responses.activate
-def test_log_media_accepts_file_object_and_bytes(client, tmp_path):
-    media_file = tmp_path / "plot.png"
-    content = b"png binary data"
-    media_file.write_bytes(content)
-
-    responses.add(responses.POST, f"{BASE}/runs/r1/log_media", json={"id": "m1"})
-    with open(media_file, "rb") as fh:
-        res = client.log_media("r1", "preview", 5, "image", "caption1", fh, "image/png", filename="plot.png")
-    assert res == {"id": "m1"}
-    assert content in responses.calls[0].request.body
-
-    responses.add(responses.POST, f"{BASE}/runs/r1/log_media", json={"id": "m2"})
-    res2 = client.log_media("r1", "preview", 6, "image", "caption2", content, "image/png")
-    assert res2 == {"id": "m2"}
-    assert content in responses.calls[1].request.body
-
-
-@responses.activate
-def test_log_artifact_accepts_file_object_and_bytes(client, tmp_path):
-    content = b"artifact weights binary"
-    sha = hashlib.sha256(content).hexdigest()
-    file_path = tmp_path / "model.bin"
-    file_path.write_bytes(content)
-
-    # 1. Binary file object
-    responses.add(
-        responses.POST, f"{BASE}/runs/r1/artifacts/presign-upload",
-        json={"uploads": [{"path": "model.bin", "url": "https://bucket.test/model"}]},
-    )
-    responses.add(responses.PUT, "https://bucket.test/model", status=200)
-    responses.add(
-        responses.POST, f"{BASE}/runs/r1/artifacts/register-version",
-        json={"id": "a1", "version": 1},
-    )
-
-    with open(file_path, "rb") as fh:
-        res1 = client.log_artifact("r1", "model", "checkpoint", {}, fh, "application/octet-stream", filename="model.bin")
-    assert res1 == {"id": "a1", "version": 1}
-    uploaded = responses.calls[1].request
-    assert uploaded.body == content
-    registered = json.loads(responses.calls[2].request.body)
-    assert registered["sha256"] == sha
-    assert registered["size_bytes"] == len(content)
-
-    # 2. Bytes directly
-    responses.add(
-        responses.POST, f"{BASE}/runs/r1/artifacts/presign-upload",
-        json={"uploads": [{"path": "model_bytes", "url": "https://bucket.test/bytes"}]},
-    )
-    responses.add(responses.PUT, "https://bucket.test/bytes", status=200)
-    responses.add(
-        responses.POST, f"{BASE}/runs/r1/artifacts/register-version",
-        json={"id": "a2", "version": 2},
-    )
-
-    res2 = client.log_artifact("r1", "model_bytes", "checkpoint", {}, content, "application/octet-stream")
-    assert res2 == {"id": "a2", "version": 2}
-    uploaded2 = responses.calls[4].request
-    assert uploaded2.body == content
-    registered2 = json.loads(responses.calls[5].request.body)
-    assert registered2["sha256"] == sha
-    assert registered2["size_bytes"] == len(content)
-
+        thread = threading.Thread(target=run)
+        thread.start()
+        time.sleep(0.05)
+        stop.set()
+        thread.join(1)
+        assert not thread.is_alive()
+        assert box
+        assert "secret-key" not in str(box[0])

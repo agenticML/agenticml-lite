@@ -22,7 +22,7 @@ from agenticml.store import (
 )
 
 
-def _mark_synced(run_dir: Path, host="https://api.agenticml.com", complete=True):
+def _mark_synced(run_dir: Path, host="https://example.com", complete=True):
     sync_file = run_dir / "sync.json"
     sync_data = {
         "version": 1,
