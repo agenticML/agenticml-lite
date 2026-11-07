@@ -1,4 +1,4 @@
-"""Dashboard login, in-memory sessions, identity proxy, and the request gate."""
+"""Dashboard login, persistent sessions, identity proxy, and the request gate."""
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -25,6 +25,7 @@ from agenticml.ui.server import (
     _reject_nonfinite,
 )
 from . import audit, keyspage, userspage
+from .db import DatabaseError
 from .keys import ClientError, KeyStoreUnavailable, validate_name
 from .users import (
     InviteInvalid, Principal, ScryptUnavailable, UserNameTaken, UserStore,
@@ -120,6 +121,91 @@ def _bucket(address):
     return str(addr)
 
 
+class MemoryBuckets:
+    def __init__(self):
+        self.entries = OrderedDict()
+
+    def transaction(self, expiry, now, released_ticket=None, outcome=None):
+        from contextlib import nullcontext
+        return nullcontext()
+
+
+class DbBuckets(MemoryBuckets):
+    def __init__(self, db):
+        super().__init__()
+        from .db.repos import ThrottleRepo
+        self.repo = ThrottleRepo(db)
+
+    def transaction(self, expiry, now, released_ticket=None, outcome=None):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def manage():
+            # Single server process; tickets are process-local, counts durable.
+            # Unsaved failure counts stay in memory and are merged (max) with
+            # the database until a save succeeds, so a persistence failure
+            # never lowers the effective delay.
+            original = OrderedDict((k, (v[0], v[1], dict(v[2])))
+                                   for k, v in self.entries.items())
+            applied = False
+            persisted = False
+            try:
+                rows = self.repo.load()
+                holds = {k: dict(v[2]) for k, v in original.items() if v[2]}
+                unsaved = {k: (v[0], v[1]) for k, v in original.items() if v[0]}
+                self.entries.clear()
+                previous = {bucket: (failures, last) for bucket, failures, last in rows}
+                merged = {}
+                for bucket, failures, last in rows:
+                    mem = unsaved.pop(bucket, None)
+                    if mem is not None:
+                        failures, last = max(failures, mem[0]), max(last, mem[1])
+                    merged[bucket] = (failures, last)
+                merged.update(unsaved)
+                for bucket, (failures, last) in merged.items():
+                    if bucket in holds or now - last < expiry:
+                        self.entries[bucket] = (failures, last, holds.pop(bucket, {}))
+                for bucket, pending in holds.items():
+                    self.entries[bucket] = (0, 0, pending)
+                yield
+                applied = True
+                self.repo.save(self.entries, previous)
+                persisted = True
+            except BaseException:
+                if not applied or released_ticket is None:
+                    # Load failed, or begin() could not persist: the caller
+                    # never received a ticket, so drop the unissued hold.
+                    self.entries.clear()
+                    self.entries.update(original)
+                    if (not applied and outcome == "failed"
+                            and isinstance(released_ticket, tuple) and released_ticket):
+                        # finish("failed") never ran; count it in memory so
+                        # the next begin still delays. Unsaved, merged by max.
+                        address = released_ticket[0]
+                        entry = self.entries.get(address)
+                        if entry is not None and released_ticket in entry[2]:
+                            failures, _, holds = entry
+                            self.entries[address] = (
+                                failures + 1, now, dict(holds))
+                        elif entry is None:
+                            self.entries[address] = (1, now, {})
+                raise
+            finally:
+                # A finishing attempt releases its ticket even if its failure
+                # count could not be committed. Never leave an orphaned hold.
+                if isinstance(released_ticket, tuple) and released_ticket:
+                    entry = self.entries.get(released_ticket[0])
+                    if entry is not None:
+                        entry[2].pop(released_ticket, None)
+                for bucket in list(self.entries):
+                    failures, _, holds = self.entries[bucket]
+                    if holds:
+                        continue
+                    if persisted or not failures:
+                        del self.entries[bucket]
+        return manage()
+
+
 class LoginThrottle:
     """Failed-login delays keyed by a caller-supplied bucket. Responses never sleep.
 
@@ -138,14 +224,15 @@ class LoginThrottle:
     EXPIRE_AFTER = 15 * 60
     MAX_ENTRIES = 1024
 
-    def __init__(self, clock=time.monotonic):
+    def __init__(self, clock=time.monotonic, store=None):
         self._clock = clock
         self._lock = threading.Lock()
         self._tickets = itertools.count()
         # address -> (failures, last_failure, holds). holds maps each pending
         # ticket to its own deadline. While every bucket holds a ticket, the
         # table can exceed MAX_ENTRIES, bounded by in-flight connections.
-        self._entries = OrderedDict()
+        self._store = store if store is not None else MemoryBuckets()
+        self._entries = self._store.entries
 
     def _delay(self, n):
         if n < self.FREE_FAILURES:
@@ -160,7 +247,7 @@ class LoginThrottle:
         """Reserve a slot. Returns (retry_after, ticket); ticket is None if refused."""
         address = _bucket(address)
         now = self._clock()
-        with self._lock:
+        with self._lock, self._store.transaction(self.EXPIRE_AFTER, now):
             entry = self._live(address, now)
             if entry is None:
                 failures, last_failure, holds = 0, 0, {}
@@ -184,7 +271,8 @@ class LoginThrottle:
         if ticket is None:
             return
         now = self._clock()
-        with self._lock:
+        with self._lock, self._store.transaction(
+                self.EXPIRE_AFTER, now, released_ticket=ticket, outcome=outcome):
             try:
                 address = ticket[0]
             except (TypeError, IndexError):
@@ -252,13 +340,13 @@ _ASSETS = {
 class WebAuth:
     """Owns /login, /logout, /invite, /setup, sessions, and the request gate."""
 
-    def __init__(self, keys, public_url=None, clock=time.time, throttle_clock=time.monotonic,
+    def __init__(self, keys, public_url=None, clock=time.time, throttle_clock=time.time,
                  users=None, trusted_proxies=(), identity_header=None):
         self.keys = keys
-        self.users = users if users is not None else UserStore(keys.server_dir)
+        self.users = users if users is not None else UserStore(keys.server_dir, db=keys.db)
         self.public_url = public_url
         self.clock = clock
-        self.throttle = LoginThrottle(clock=throttle_clock)
+        self.throttle = LoginThrottle(clock=throttle_clock, store=DbBuckets(keys.db))
         self.trusted_proxies = parse_trusted_proxies(trusted_proxies)
         self.identity_header = parse_identity_header(identity_header)
         if self.identity_header is not None and not self.trusted_proxies:
@@ -266,7 +354,8 @@ class WebAuth:
         self._identity_name, self._identity_match = (
             IDENTITY_PRESETS[self.identity_header] if self.identity_header else (None, None))
         self._lock = threading.Lock()
-        self._sessions = {}
+        from .db.repos import SessionRepo
+        self.sessions = SessionRepo(keys.db)
         self.setup_token = None
         self._setup_used = False
         self._setup_lock = threading.Lock()
@@ -464,7 +553,7 @@ class WebAuth:
                 except OSError:
                     handler.close_connection = True
             return True
-        except KeyStoreUnavailable:
+        except (KeyStoreUnavailable, DatabaseError):
             if not getattr(handler, "_started", False):
                 handler._error({"error": "key store unavailable"}, 503)
             return True
@@ -596,24 +685,25 @@ class WebAuth:
         except UnicodeEncodeError:
             return None
         with self._lock:
-            entry = self._sessions.get(digest)
+            entry = self.sessions.get(digest)
             if entry is None:
                 return None
             now = self.clock()
             if now - entry["last_seen"] >= SESSION_IDLE or now - entry["created"] >= SESSION_MAX_AGE:
-                del self._sessions[digest]
+                self.sessions.delete(digest)
                 return None
             snapshot = dict(entry)
         if self._principal_from_session(snapshot) is None:
             with self._lock:
-                self._sessions.pop(digest, None)
+                self.sessions.delete(digest)
             return None
         with self._lock:
-            current = self._sessions.get(digest)
+            current = self.sessions.get(digest)
             if current is None:
                 return None
             if self.clock() - current["last_seen"] >= 60:
-                current["last_seen"] = self.clock()
+                self.sessions.touch(digest, self.clock())
+                current = self.sessions.get(digest)
             return current
 
     def _attach(self, handler, session, principal=None):
@@ -668,10 +758,8 @@ class WebAuth:
             "created": now, "last_seen": now,
         }
         with self._lock:
-            while len(self._sessions) >= SESSION_CAP:
-                oldest = min(self._sessions, key=lambda item: self._sessions[item]["last_seen"])
-                del self._sessions[oldest]
-            self._sessions[digest] = entry
+            self.sessions.prune(now, SESSION_IDLE, SESSION_MAX_AGE)
+            self.sessions.create(digest, entry, SESSION_CAP)
         return token, entry
 
     def _session_cookie_for(self, user, via, key=None, key_sha256=None, expected=None):
@@ -694,15 +782,10 @@ class WebAuth:
         except UnicodeEncodeError:
             return
         with self._lock:
-            self._sessions.pop(digest, None)
+            self.sessions.delete(digest)
 
     def drop_sessions(self, name, sha256):
-        with self._lock:
-            for digest, entry in list(self._sessions.items()):
-                key_name = entry.get("key") or entry.get("name")
-                key_hash = entry.get("key_sha256") or entry.get("sha256")
-                if key_name == name and key_hash == sha256:
-                    del self._sessions[digest]
+        self.sessions.delete_for_key(name, sha256)
 
     def _setup_page(self, handler):
         tokens = parse_qs(urlsplit(handler.path).query, keep_blank_values=True).get("token", [])

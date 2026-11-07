@@ -60,6 +60,16 @@ def kinds(report, field="problems"):
     return {row["kind"] for row in report[field]}
 
 
+def test_status_warns_on_unimported_2x_without_database(tmp_path):
+    from test_server_users import write_v1_keys
+    data = tmp_path / "data"
+    app.prepare_data_dir(data)
+    write_v1_keys(data / "server" / "keys.json", ["old"])
+    report = admin.status(data)
+    assert any("2.x" in warning and "keys.json" in warning for warning in report["warnings"])
+    assert not (data / "server" / "agenticml.db").exists()
+
+
 def test_clean_reports_and_key_metadata(store, capsys):
     data, sha = store
     code, report, err = command(data, "verify", capsys)
@@ -294,7 +304,7 @@ def test_read_only_and_default_data(store, monkeypatch, capsys):
         pytest.fail("attempt to prepare or lock data")
 
     monkeypatch.setattr(app, "prepare_data_dir", forbidden)
-    monkeypatch.setattr(KeyStore, "_file_lock", forbidden)
+    db = KeyStore(data / "server").db  # Keep the pool open during the snapshot.
     before = {p.relative_to(data): (p.lstat().st_mtime_ns, p.read_bytes() if p.is_file() else None)
               for p in data.rglob("*")}
     for action in ("status", "verify"):
@@ -389,25 +399,25 @@ def test_environment_owner_is_not_revoked(store, capsys, monkeypatch):
     assert "env  env  " in admin.format_status(report)
 
 
-@pytest.mark.parametrize("damage", ["corrupt", "invalid_records", "symlink", "broken_symlink"])
+@pytest.mark.parametrize('damage', ['corrupt','invalid_records','symlink','broken_symlink'])
 def test_status_warns_if_keys_cannot_be_loaded(store, capsys, tmp_path, damage):
+    from agenticml.server.db import DatabaseError
     data, _ = store
-    path = data / "server" / "keys.json"
-    original = path.read_bytes()
+    db = KeyStore(data / 'server').db
+    db.close()
+    path = data / 'server' / 'agenticml.db'
     path.unlink()
-    if damage.endswith("symlink"):
-        target = tmp_path / "keys.json"
-        if damage == "symlink":
-            target.write_bytes(original)
+    if damage.endswith('symlink'):
+        target = tmp_path / 'outside.db'
+        if damage == 'symlink': target.write_bytes(b'private')
         path.symlink_to(target)
     else:
-        path.write_bytes(b"{" if damage == "corrupt" else b'{"version":1,"keys":[{}]}')
-    code, report, err = command(data, "status", capsys)
+        path.write_bytes(b'private corrupt contents')
+    code, report, err = command(data, 'status', capsys)
     assert code == 0 and not err
-    assert report["warnings"] == [
-        "could not load server/keys.json; key revocation status is unknown"]
-    assert not any(row.get("revoked") for row in report["keys"])
-    assert "warning: could not load server/keys.json" in admin.format_status(report)
+    assert report['warnings'] == ['could not load server database; key and user status is unknown']
+    assert not any(row.get('revoked') for row in report['keys'])
+    assert 'private' not in admin.format_status(report)
 
 
 @pytest.mark.parametrize("action", ["status", "verify"])

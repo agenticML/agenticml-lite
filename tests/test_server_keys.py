@@ -1,4 +1,7 @@
 """Key persistence, hot reload, and operator CLI checks."""
+from server_db_helpers import key_object, user_object
+from agenticml.server.users import UserStore
+from agenticml.server.db import DatabaseError
 import hashlib
 import json
 import re
@@ -31,10 +34,10 @@ def test_create_and_public_record(keys):
     assert record.created_by == "cli"
     layout.parse_timestamp(record.created_at)
     assert record.last_used_at is None
-    raw = keys.path.read_text()
+    raw = json.dumps(key_object(keys))
     assert key not in raw
     assert record.sha256 in raw
-    assert stat.S_IMODE(keys.path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(keys.db.path.stat().st_mode) == 0o600
     assert "sha256" not in record.to_public()
     assert record.sha256 not in repr(record)
     assert keys.list() == [record]
@@ -77,7 +80,7 @@ def test_env_key(keys):
     assert store.has_admin()
     store.touch(store.verify(key))
     assert store.verify(key).last_used_at
-    assert "env" not in store.path.read_text()
+    assert "env" not in json.dumps(key_object(store))
 
 
 @pytest.mark.parametrize("value", ["", "a" * 31, "a" * 257, "a" * 32 + "\n", " " * 32, "ä" * 32])
@@ -89,72 +92,99 @@ def test_bad_env_key(tmp_path, value, monkeypatch, capsys):
     assert "AGENTICML_SERVER_KEY" in capsys.readouterr().err
 
 
-def test_reload_and_corruption(keys, caplog):
+def test_reload_and_corruption(keys, monkeypatch):
     other = KeyStore(keys.server_dir)
-    _, first = other.create("first")
-    assert keys.verify(first).name == "first"
-    good = keys.path.read_bytes()
-    keys.path.write_bytes(b"not JSON")
-    for _ in range(3):
-        assert keys.verify(first) is None
-    assert sum("file keys disabled" in r.message for r in caplog.records) == 1
-    keys.path.write_bytes(good)
-    assert keys.verify(first).name == "first"
-    assert other.revoke("first")
-    assert keys.verify(first) is None
-    keys.path.unlink()
-    assert keys.list() == []
+    _, secret = other.create("first")
+    assert keys.verify(secret).name == "first"
+    with monkeypatch.context() as patch:
+        def fail(*args):
+            raise DatabaseError("private database failure")
+        patch.setattr(keys.repo, 'by_digest', fail)
+        with pytest.raises(key_module.KeyStoreUnavailable):
+            keys.verify(secret)
+    assert keys.verify(secret).name == "first"
+    other.revoke('first')
+    assert keys.verify(secret) is None
 
 
 @pytest.mark.parametrize("change", ["version", "keys", "name", "duplicate", "hash", "scope", "timestamp", "type"])
 def test_invalid_records_fail_closed(keys, change):
-    _, secret = keys.create("one")
-    obj = json.loads(keys.path.read_text())
-    if change == "version":
-        obj["version"] = True
-    elif change == "keys":
-        obj["keys"] = {}
-    elif change == "duplicate":
-        obj["keys"] *= 2
+    keys.create('one')
+    obj = key_object(keys)
+    if change == 'version': obj['version'] = True
+    elif change == 'keys': obj['keys'] = {}
+    elif change == 'duplicate': obj['keys'] *= 2
     else:
-        field, value = {"name": ("name", "env"), "hash": ("sha256", "z" * 64),
-                        "scope": ("scope", "viewer"), "timestamp": ("last_used_at", "bad"),
-                        "type": ("created_by", 5)}[change]
-        obj["keys"][0][field] = value
-    keys.path.write_text(json.dumps(obj))
-    assert keys.verify(secret) is None
+        field, value = {'name': ('name', 'env'), 'hash': ('sha256', 'z'*64),
+                        'scope': ('scope', 'viewer'), 'timestamp': ('last_used_at', 'bad'),
+                        'type': ('created_by', 5)}[change]
+        obj['keys'][0][field] = value
+    legacy = keys.server_dir / 'legacy'
+    legacy.mkdir()
+    (legacy / 'users.json').write_text(json.dumps(user_object(UserStore(keys.server_dir))))
+    (legacy / 'keys.json').write_text(json.dumps(obj))
+    with pytest.raises(DatabaseError, match='could not import keys.json'):
+        KeyStore(legacy)
 
 
 def test_symlink_unreadable_and_env_survives(keys, monkeypatch):
-    _, secret = keys.create("one")
-    original = keys.path.with_name("original")
-    keys.path.rename(original)
-    keys.path.symlink_to(original)
-    store = KeyStore(keys.server_dir, "a" * 32)
-    assert store.verify(secret) is None
-    assert store.verify("a" * 32).name == "env"
-    keys.path.unlink()
-    original.rename(keys.path)
-    def denied(path):
-        raise PermissionError("denied")
-    monkeypatch.setattr(layout, "read_file_nofollow", denied)
-    assert store.verify(secret) is None
+    _, secret = keys.create('one')
+    legacy = keys.server_dir / 'legacy'
+    legacy.mkdir()
+    outside = keys.server_dir / 'original'
+    outside.write_text(json.dumps(key_object(keys)))
+    (legacy / 'keys.json').symlink_to(outside)
+    before = outside.read_bytes()
+    with pytest.raises(DatabaseError, match='could not import keys.json'):
+        KeyStore(legacy, 'a'*32)
+    assert outside.read_bytes() == before
+    store = KeyStore(keys.server_dir, 'a'*32)
+    store.touch(store.verify('a'*32))
+    assert store.verify('a'*32).name == 'env'
+    assert store.verify(secret).name == 'one'
 
 
 def test_verify_compares_every_record(keys, monkeypatch):
-    _, first = keys.create("one")
-    keys.create("two")
+    record, secret = keys.create('one')
+    keys.create('two')
     calls = []
     compare = key_module.hmac.compare_digest
     def counted(a, b):
         calls.append(b)
-        return compare(a, b)
-    monkeypatch.setattr(key_module.hmac, "compare_digest", counted)
-    assert keys.verify(first).name == "one"
-    assert len(calls) == 2
+        return compare(a,b)
+    monkeypatch.setattr(key_module.hmac, 'compare_digest', counted)
+    assert keys.verify(secret).name == 'one'
+    assert calls == [record.sha256]
     calls.clear()
-    assert keys.verify("wrong") is None
-    assert len(calls) == 2
+    assert keys.verify('wrong') is None
+    assert calls == []
+
+
+def test_touch_skips_write_within_a_minute(keys, monkeypatch):
+    from test_server_ingest import request, running
+    _, secret = keys.create("one")
+    now = 1_700_000_000.0
+    monkeypatch.setattr(key_module.time, "time", lambda: now)
+    keys.touch(keys.verify(secret))
+    writes = []
+    real = keys.db.transaction
+
+    def wrapped(write=False):
+        if write:
+            writes.append(True)
+        return real(write=write)
+
+    monkeypatch.setattr(keys.db, "transaction", wrapped)
+    keys.touch(keys.verify(secret))
+    assert writes == []
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    with running(keys.server_dir.parent) as server:
+        _, live = server.keys.create("box", "sync")
+        assert request(server, "/v2/whoami", key=live)[0] == 200
+        touches = []
+        monkeypatch.setattr(server.keys.repo, "touch", lambda *a, **k: touches.append(True))
+        assert request(server, "/v2/whoami", key=live)[0] == 200
+        assert touches == []
 
 
 def test_touch_throttles_and_does_not_resurrect(keys, monkeypatch):
@@ -165,12 +195,12 @@ def test_touch_throttles_and_does_not_resurrect(keys, monkeypatch):
     monkeypatch.setattr(key_module.time, "time", lambda: clock[0])
     keys.touch(record)
     first = keys.verify(secret)
-    inode = keys.path.stat().st_ino
+    last_used = keys.list()[0].last_used_at
     keys.touch(record)
-    assert keys.path.stat().st_ino == inode
+    assert keys.list()[0].last_used_at == last_used
     clock[0] += 61
     keys.touch(record)
-    assert keys.path.stat().st_ino != inode
+    assert keys.list()[0].last_used_at != last_used
     assert first.last_used_at is not None
     other = KeyStore(keys.server_dir)
     other.revoke("one")
@@ -184,9 +214,9 @@ def test_touch_throttles_and_does_not_resurrect(keys, monkeypatch):
 
 def test_touch_errors_are_advisory(keys, monkeypatch, caplog):
     record, _ = keys.create("one")
-    def failed(records):
+    def failed(*args):
         raise OSError("failed")
-    monkeypatch.setattr(keys, "_write", failed)
+    monkeypatch.setattr(keys.repo, "touch", failed)
     keys.touch(record)
     assert "could not update key last_used_at" in caplog.text
 

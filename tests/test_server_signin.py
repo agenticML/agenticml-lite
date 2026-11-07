@@ -1,4 +1,6 @@
 """Password login, invites, identity proxy, and forwarded-address throttle."""
+from server_db_helpers import user_object
+from agenticml.server.users import UserStore
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -57,8 +59,8 @@ def session_cookie(hdrs):
 # --- 1. Password set/verify ---
 
 def test_password_set_verify_wrong_and_unknown_calls_scrypt(tmp_path, monkeypatch):
-    users = UserStore(tmp_path / "server")
     (tmp_path / "server").mkdir()
+    users = UserStore(tmp_path / "server")
     users.add("alice", role="admin")
     users.set_password("alice", PASSWORD)
     record = users.get("alice").password
@@ -88,6 +90,27 @@ def test_password_set_verify_wrong_and_unknown_calls_scrypt(tmp_path, monkeypatc
     users.set_password("alice", "  leading spaces ok")
     assert users.verify_password("alice", "  leading spaces ok") is not None
     assert users.verify_password("alice", "leading spaces ok") is None
+
+
+def test_check_password_rejects_expensive_scrypt(tmp_path, monkeypatch):
+    from agenticml.server.users import _password_record
+    (tmp_path / "server").mkdir()
+    users = UserStore(tmp_path / "server")
+    users.add("alice", role="admin")
+    users.set_password("alice", PASSWORD)
+    hostile = dict(_password_record(PASSWORD), n=2 ** 20)
+    with users.db.transaction(write=True) as tx:
+        tx.execute("UPDATE users SET password=? WHERE name=?", (json.dumps(hostile), "alice"))
+    calls = []
+    real = hashlib.scrypt
+
+    def wrapped(*args, **kwargs):
+        calls.append(kwargs.get("n"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(hashlib, "scrypt", wrapped)
+    assert users.verify_password("alice", PASSWORD) is None
+    assert calls and all(n is None or n <= SCRYPT_N for n in calls)
 
 
 # --- 2. Viewer/member notes gate ---
@@ -230,11 +253,10 @@ def test_invite_cli_get_post_and_reuse(tmp_path, monkeypatch, capsys):
 
         stale = httpd.users.create_invite("bob")
         expired = layout.format_timestamp(datetime.now(timezone.utc) - timedelta(hours=1))
-        obj = json.loads(httpd.users.path.read_text())
-        for row in obj["users"]:
-            if row["name"] == "bob":
-                row["invite"]["expires_at"] = expired
-        httpd.users.path.write_text(json.dumps(obj))
+        from dataclasses import replace
+        user = httpd.users.get('bob')
+        with httpd.users.db.transaction(write=True) as tx:
+            httpd.users.repo.save(tx, replace(user, invite={**user.invite, 'expires_at':expired}))
         assert call(httpd, "/invite?token=" + stale)[0] == 404
 
 
@@ -262,7 +284,7 @@ def test_setup_creates_admin_user_and_closes(tmp_path, monkeypatch):
         assert status == 201 and payload == {"ok": True, "user": "root", "role": "admin"}
         user = httpd.users.get("root")
         assert user.role == "admin" and user.password is not None
-        assert (httpd.keys.server_dir / "setup-closed").exists()
+        assert httpd.keys.setup_closed()
         assert httpd.keys.list() == []
         cookie = session_cookie(hdrs)
         status, _, body, _ = authed(httpd, "/api/server/session", cookie=cookie)
@@ -473,7 +495,7 @@ def test_server_up_prints_invite_and_trusts_loopback(tmp_path, monkeypatch, caps
     out = capsys.readouterr().out
     assert "Open https://machine.tailnet.ts.net/invite?token=" in out
     assert "72 hours" in out
-    users = json.loads((data / "server" / "users.json").read_text())
+    users = user_object(UserStore(data / "server"))
     assert users["users"][0]["name"] == "admin"
     assert users["users"][0]["invite"] is not None
     # Second call is a no-op.
@@ -750,8 +772,8 @@ def test_account_password_current_uses_login_throttle(tmp_path, monkeypatch):
 
 def test_scrypt_lone_surrogate_is_invalid_password_and_failed_login(tmp_path, monkeypatch):
     monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
-    users = UserStore(tmp_path / "server")
     (tmp_path / "server").mkdir()
+    users = UserStore(tmp_path / "server")
     users.add("alice", role="member")
     users.set_password("alice", PASSWORD)
     with pytest.raises(ClientError, match="invalid password"):
@@ -838,7 +860,7 @@ def test_setup_rollback_keeps_replaced_same_name_user(tmp_path, monkeypatch):
         leftover = httpd.users.get("root")
         assert leftover is not None
         assert leftover.id == created_id["replacement"] != created_id["id"]
-        assert not (httpd.keys.server_dir / "setup-closed").exists()
+        assert not httpd.keys.setup_closed()
 
 
 def test_setup_failure_after_closed_marker_rolls_back(tmp_path, monkeypatch):
@@ -860,7 +882,7 @@ def test_setup_failure_after_closed_marker_rolls_back(tmp_path, monkeypatch):
         assert json.loads(body) == {
             "error": "setup failed; retry or use agenticml server users"}
         assert httpd.users.get("root") is None
-        assert not (httpd.keys.server_dir / "setup-closed").exists()
+        assert not httpd.keys.setup_closed()
         assert httpd.web.setup_token == token
         monkeypatch.setattr(httpd.keys, "_write_setup_closed", real_write)
         status, _, body = call(
@@ -868,7 +890,7 @@ def test_setup_failure_after_closed_marker_rolls_back(tmp_path, monkeypatch):
             json.dumps({"token": token, "name": "root", "password": PASSWORD}).encode(),
             csrf(httpd))
         assert status == 201 and json.loads(body)["user"] == "root"
-        assert (httpd.keys.server_dir / "setup-closed").exists()
+        assert httpd.keys.setup_closed()
 
 
 def test_hostile_identity_escaped_in_403_page(tmp_path, monkeypatch):
@@ -987,11 +1009,10 @@ def test_expired_invite_post_counts_against_address_throttle(tmp_path, monkeypat
         httpd.users.add("bob", role="member")
         token = httpd.users.create_invite("bob")
         expired = layout.format_timestamp(datetime.now(timezone.utc) - timedelta(hours=1))
-        obj = json.loads(httpd.users.path.read_text())
-        for row in obj["users"]:
-            if row["name"] == "bob":
-                row["invite"]["expires_at"] = expired
-        httpd.users.path.write_text(json.dumps(obj))
+        from dataclasses import replace
+        user = httpd.users.get('bob')
+        with httpd.users.db.transaction(write=True) as tx:
+            httpd.users.repo.save(tx, replace(user, invite={**user.invite, 'expires_at':expired}))
         body = json.dumps({"token": token, "password": PASSWORD}).encode()
         for _ in range(LoginThrottle.FREE_FAILURES):
             status, _, payload = call(httpd, "/invite", "POST", body, csrf(httpd))

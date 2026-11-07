@@ -180,9 +180,9 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 16 † | Database layer, SQLite backend, migrations; users, keys, sessions, throttle, audit in tables | 2.2 | Codex | L | – | not started |
-| 17 † | Runs, sync state and notes in the database; append crash safety; run list from the database | 16 | Cursor | L | – | not started |
-| 18 † | Workspaces and accounts: memberships, workspace-bound keys, `/w/<slug>` routes, switcher, server-admin commands, isolation suite | 17 | Codex | L | – | not started |
+| 16 † | Database layer, SQLite backend, migrations; users, keys, sessions, throttle, audit in tables | 2.2 | Codex | L | [plan](packages/16-database-layer.md) | done (3.0 PR) |
+| 17 † | Runs, sync state and notes in the database; append crash safety; run list from the database | 16 | Cursor | L | [plan](packages/17-runs-in-database.md) | plan ready |
+| 18 † | Workspaces and accounts: memberships, workspace-bound keys, `/w/<slug>` routes, switcher, server-admin commands, isolation suite | 17 | Codex (server), Cursor (dashboard) | L | [plan](packages/18-workspaces.md) | plan ready |
 | 18b † | Firebase sign-in for the hosted service | 18 | Cursor | M | – | not started |
 | 18c † | Self-serve sign-up and usage limits (free plan: storage, uploads, requests, people) | 18b | Codex | M | – | not started |
 | 19 † | Postgres backend, row-level security, CI on both backends | 18 | Cursor | M | – | not started |

@@ -1,4 +1,5 @@
 """Per-user keys and attribution through real dashboard sign-in."""
+from agenticml.server.db import DatabaseError
 from contextlib import contextmanager
 import json
 import threading
@@ -134,12 +135,12 @@ def test_last_admin_key_counts_usable_admins_only(server):
     users.add("former", role="admin")
     server.keys.create("old-admin", scope="admin", user="former")
     users.set_role("former", "member")
-    before = server.keys.path.read_bytes()
+    before = server.keys.list()
     status, _, payload = api(server, "/api/server/keys/admin", "DELETE")
     assert status == 409 and payload == {
         "error": "last admin key; create another admin key first, or use the CLI",
     }
-    assert server.keys.path.read_bytes() == before
+    assert server.keys.list() == before
     status, _, payload = api(server, "/api/server/keys/old-admin", "DELETE")
     assert status == 200 and payload == {"revoked": "old-admin", "signed_out": False}
     users.add("other", role="admin")
@@ -149,38 +150,23 @@ def test_last_admin_key_counts_usable_admins_only(server):
     assert api(server, "/api/server/keys/admin", "DELETE")[0] == 200
 
 
-@pytest.mark.parametrize("break_users", ["missing", "empty"])
-def test_keep_admin_revoke_fails_closed_without_users_json(server, break_users):
-    before = server.keys.path.read_bytes()
-    path = server.web.users.path
-    if break_users == "missing":
-        path.unlink()
-    else:
-        path.write_text('{"version": 1, "users": []}')
-    with pytest.raises(keys.KeyStoreUnavailable, match="could not load users.json"):
-        server.keys.revoke("admin", keep_admin=True)
-    assert server.keys.path.read_bytes() == before
+@pytest.mark.parametrize('break_users', ['missing', 'empty'])
+def test_keep_admin_revoke_fails_closed_without_users_json(server, monkeypatch, break_users):
+    before = server.keys.list()
+    def fail(*args): raise DatabaseError('private failure')
+    monkeypatch.setattr(server.keys.repo.users, 'list', fail)
+    with pytest.raises(keys.KeyStoreUnavailable): server.keys.revoke('admin', keep_admin=True)
+    assert server.keys.list() == before
 
 
-@pytest.mark.parametrize("break_users", ["corrupt", "unreadable"])
+@pytest.mark.parametrize('break_users', ['corrupt', 'unreadable'])
 def test_unreadable_users_json_dashboard_revoke_503(server, monkeypatch, break_users):
-    before = server.keys.path.read_bytes()
-    admin = server.web.users.get("admin")
-    path = server.web.users.path
-    if break_users == "corrupt":
-        path.write_text("private corrupt contents")
-    else:
-        path.chmod(0o000)
-    # Session auth reloads users.json and would 401; pin get() so the
-    # dashboard request still reaches KeyStore.revoke.
-    monkeypatch.setattr(server.web.users, "get", lambda name: admin if name == "admin" else None)
-    try:
-        status, _, body = api(server, "/api/server/keys/admin", "DELETE")
-    finally:
-        if break_users == "unreadable":
-            path.chmod(0o600)
-    assert status == 503 and body == {"error": "key store unavailable"}
-    assert server.keys.path.read_bytes() == before
+    before = server.keys.list()
+    def fail(*args): raise DatabaseError('private failure')
+    monkeypatch.setattr(server.keys.repo.users, 'list', fail)
+    status, _, body = api(server, '/api/server/keys/admin', 'DELETE')
+    assert status == 503 and body == {'error':'key store unavailable'}
+    assert server.keys.list() == before
 
 
 def test_sync_attribution(server, tmp_path, monkeypatch):

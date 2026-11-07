@@ -17,6 +17,8 @@ from agenticml.store.overview import Overview
 from agenticml.store.reader import parse_artifacts_json
 from agenticml.ui.server import DashboardHandler
 from . import lineage
+from .db import DatabaseError
+from .keys import KeyStoreUnavailable
 from .users import allowed, resolve
 
 logger = logging.getLogger("agenticml.server.ingest")
@@ -226,6 +228,9 @@ class IngestHandler(DashboardHandler):
             self._error({"error": "request body timeout"}, 408)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             self.close_connection = True
+        except (DatabaseError, KeyStoreUnavailable):
+            self.close_connection = True
+            self._error({"error": "key store unavailable"}, 503)
         except Exception as exc:
             self.close_connection = True
             logger.error("ingest request failed: %s: %s", type(exc).__name__, exc,

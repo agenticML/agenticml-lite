@@ -71,9 +71,35 @@ def whoami(server, key=None, headers=None, source=None):
         conn.close()
 
 
-def test_throttle_free_failures_backoff_and_cap():
+@pytest.fixture(params=['memory', 'database'])
+def throttle_factory(request, tmp_path):
+    from agenticml.server.db import connect
+    from agenticml.server.webauth import DbBuckets
+    databases = []
+    def factory(**kwargs):
+        if request.param == 'database':
+            db = connect('sqlite:///' + str(tmp_path / f'throttle-{len(databases)}.db'))
+            databases.append(db)
+            kwargs['store'] = DbBuckets(db)
+        return LoginThrottle(**kwargs)
+    yield factory
+    for db in databases:
+        db.close()
+
+
+def bucket_entries(throttle):
+    from collections import OrderedDict
+    if not hasattr(throttle._store, 'repo'):
+        return throttle._entries
+    entries = OrderedDict((bucket, (failures,last,{}))
+                          for bucket, failures,last in throttle._store.repo.load())
+    entries.update(throttle._entries)
+    return entries
+
+
+def test_throttle_free_failures_backoff_and_cap(throttle_factory):
     now = [0.0]
-    throttle = LoginThrottle(clock=lambda: now[0])
+    throttle = throttle_factory(clock=lambda: now[0])
     for _ in range(LoginThrottle.FREE_FAILURES):
         retry, ticket = throttle.begin("a")
         assert retry == 0
@@ -92,9 +118,9 @@ def test_throttle_free_failures_backoff_and_cap():
     assert delays[6:] == [60, 60]
 
 
-def test_throttle_expires_success_clears_and_evicts_oldest():
+def test_throttle_expires_success_clears_and_evicts_oldest(throttle_factory):
     now = [0.0]
-    throttle = LoginThrottle(clock=lambda: now[0])
+    throttle = throttle_factory(clock=lambda: now[0])
     for _ in range(4):
         record_failed(throttle)
     retry, ticket = throttle.begin("a")
@@ -120,7 +146,7 @@ def test_throttle_expires_success_clears_and_evicts_oldest():
     assert retry == 1
 
     now[0] = 0.0
-    throttle = LoginThrottle(clock=lambda: now[0])
+    throttle = throttle_factory(clock=lambda: now[0])
     for index in range(LoginThrottle.MAX_ENTRIES):
         for _ in range(LoginThrottle.FREE_FAILURES):
             record_failed(throttle, f"addr-{index}")
@@ -147,9 +173,9 @@ def test_throttle_expires_success_clears_and_evicts_oldest():
     throttle.finish(ticket, "ignored")
 
 
-def test_throttle_buckets_mapped_ipv4_ipv6_slash64_and_scope():
+def test_throttle_buckets_mapped_ipv4_ipv6_slash64_and_scope(throttle_factory):
     now = [0.0]
-    throttle = LoginThrottle(clock=lambda: now[0])
+    throttle = throttle_factory(clock=lambda: now[0])
     for _ in range(LoginThrottle.FREE_FAILURES):
         record_failed(throttle, "::ffff:127.0.0.1")
     retry, ticket = throttle.begin("127.0.0.1")
@@ -159,7 +185,7 @@ def test_throttle_buckets_mapped_ipv4_ipv6_slash64_and_scope():
     assert ticket is None
     assert retry == 1
 
-    throttle = LoginThrottle(clock=lambda: now[0])
+    throttle = throttle_factory(clock=lambda: now[0])
     for _ in range(LoginThrottle.FREE_FAILURES):
         record_failed(throttle, "2001:db8:1:2::1")
     retry, ticket = throttle.begin("2001:db8:1:2::ffff")
@@ -170,7 +196,7 @@ def test_throttle_buckets_mapped_ipv4_ipv6_slash64_and_scope():
     assert ticket is not None
     throttle.finish(ticket, "ignored")
 
-    throttle = LoginThrottle(clock=lambda: now[0])
+    throttle = throttle_factory(clock=lambda: now[0])
     for _ in range(LoginThrottle.FREE_FAILURES):
         record_failed(throttle, "fe80::1%eth0")
     retry, ticket = throttle.begin("fe80::1")
@@ -181,9 +207,9 @@ def test_throttle_buckets_mapped_ipv4_ipv6_slash64_and_scope():
     assert retry == 1
 
 
-def test_ignored_with_other_attempt_pending():
+def test_ignored_with_other_attempt_pending(throttle_factory):
     now = [0.0]
-    throttle = LoginThrottle(clock=lambda: now[0])
+    throttle = throttle_factory(clock=lambda: now[0])
     for _ in range(4):
         record_failed(throttle)
     now[0] = 100.0
@@ -199,9 +225,9 @@ def test_ignored_with_other_attempt_pending():
     throttle.finish(guess, "failed")
 
 
-def test_success_with_other_attempt_pending():
+def test_success_with_other_attempt_pending(throttle_factory):
     now = [0.0]
-    throttle = LoginThrottle(clock=lambda: now[0])
+    throttle = throttle_factory(clock=lambda: now[0])
     for _ in range(4):
         record_failed(throttle)
     now[0] = 100.0
@@ -210,7 +236,7 @@ def test_success_with_other_attempt_pending():
     _, pending = throttle.begin("a")
     assert pending is not None
     throttle.finish(success, "success")
-    assert throttle._entries["a"][2]
+    assert bucket_entries(throttle)["a"][2]
     retry, extra = throttle.begin("a")
     assert extra is not None
     throttle.finish(extra, "ignored")
@@ -222,9 +248,9 @@ def test_success_with_other_attempt_pending():
     assert retry >= 1
 
 
-def test_holds_never_expire_or_evict():
+def test_holds_never_expire_or_evict(throttle_factory):
     now = [0.0]
-    throttle = LoginThrottle(clock=lambda: now[0])
+    throttle = throttle_factory(clock=lambda: now[0])
     for _ in range(4):
         record_failed(throttle, "held")
     _, held = throttle.begin("held")
@@ -238,7 +264,7 @@ def test_holds_never_expire_or_evict():
     assert ticket is None
 
     now[0] = 0.0
-    throttle = LoginThrottle(clock=lambda: now[0])
+    throttle = throttle_factory(clock=lambda: now[0])
     _, held = throttle.begin("held")
     for index in range(LoginThrottle.MAX_ENTRIES):
         for _ in range(LoginThrottle.FREE_FAILURES):
@@ -250,24 +276,24 @@ def test_holds_never_expire_or_evict():
     assert ticket is None
 
 
-def test_drop_at_zero_and_unknown_ticket():
-    throttle = LoginThrottle(clock=lambda: 0.0)
+def test_drop_at_zero_and_unknown_ticket(throttle_factory):
+    throttle = throttle_factory(clock=lambda: 0.0)
     throttle.finish(None, "failed")
     throttle.finish(("missing", 0), "failed")
-    assert throttle._entries == {}
+    assert bucket_entries(throttle) == {}
     _, ticket = throttle.begin("a")
     throttle.finish(("a", -1), "failed")
     throttle.finish(ticket, "ignored")
-    assert throttle._entries == {}
+    assert bucket_entries(throttle) == {}
     _, ticket = throttle.begin("a")
     throttle.finish(ticket, "success")
-    assert throttle._entries == {}
+    assert bucket_entries(throttle) == {}
     _, ticket = throttle.begin("a")
     throttle.finish(ticket, "failed")
-    assert list(throttle._entries) == ["a"]
+    assert list(bucket_entries(throttle)) == ["a"]
     _, ticket = throttle.begin("a")
     throttle.finish(ticket, "success")
-    assert throttle._entries == {}
+    assert bucket_entries(throttle) == {}
 
 
 def test_http_throttle_refuses_even_a_good_key_other_address_signs_in(server):

@@ -204,8 +204,8 @@ def test_two_users_share_one_server(teams):
 
 
 def test_audit_lines_for_team_writes(teams):
-    path = teams["data"] / "server" / "audit.jsonl"
-    events = [json.loads(line) for line in path.read_text().splitlines() if line]
+    from server_db_helpers import audit_rows
+    events = audit_rows(teams['data'] / 'server')
     writes = [
         (event["action"], event["actor"], event["target"])
         for event in events
@@ -243,3 +243,10 @@ def test_audit_lines_for_team_writes(teams):
     bob_ci_event, = [event for event in events
                      if event["action"] == "key.create" and event["target"] == "bob-ci"]
     assert bob_ci_event["detail"]["user"] == "bob"
+
+
+def test_team_flow_writes_only_database(teams):
+    directory = teams['data'] / 'server'
+    assert all(path.name.startswith('agenticml.db')
+               or path.name in {'server.lock', 'tmp'} or path.name.endswith('.2x')
+               for path in directory.iterdir())

@@ -487,6 +487,7 @@ def cmd_ui(args):
 
 def cmd_server_serve(args):
     from .server import serve
+    from .server.db.errors import DatabaseError
     from .server.webauth import parse_identity_header, parse_trusted_proxies
 
     public_url = args.public_url
@@ -503,10 +504,11 @@ def cmd_server_serve(args):
     try:
         serve(args.data, args.host, args.port, public_url,
               trusted_proxies=parse_trusted_proxies(proxies),
-              identity_header=parse_identity_header(identity))
+              identity_header=parse_identity_header(identity),
+              **({"database": args.database} if args.database is not None else {}))
     except KeyboardInterrupt:
         pass
-    except (OSError, ValueError, OverflowError) as exc:
+    except (OSError, ValueError, OverflowError, DatabaseError) as exc:
         print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
         return 1
     print("stopped")
@@ -524,16 +526,18 @@ def _parse_up_port(value):
 
 
 def cmd_server_up(args):
+    from .server.db.errors import DatabaseError
     from .server.up import UpError, up
 
     try:
-        up(args.data, args.port, install=args.install, force=args.force)
+        up(args.data, args.port, install=args.install, force=args.force,
+           **({"database": args.database} if args.database is not None else {}))
     except KeyboardInterrupt:
         pass
     except UpError as exc:
         print((str(exc).splitlines() or [type(exc).__name__])[0], file=sys.stderr)
         return 1
-    except (OSError, ValueError, OverflowError) as exc:
+    except (OSError, ValueError, OverflowError, DatabaseError) as exc:
         print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
         return 1
     if not args.install:
@@ -559,19 +563,18 @@ _MIGRATE_FAILED = "could not migrate keys.json; fix the file and retry"
 def cmd_server_keys(args):
     from .server.audit import AuditLog, cli_actor
     from .server.keys import KeyStore, KeyStoreUnavailable
-    from .server.users import UserStore, migrate
+    from .server.users import UserStore
+    from .server.db import DatabaseError, for_server_dir
 
     try:
         data, directory = _server_data_dir(args)
         actor = cli_actor()
-        log = AuditLog(directory)
-        if not migrate(data, actor=actor):
-            print(f"agenticml server: {_MIGRATE_FAILED}", file=sys.stderr)
-            return 1
-        keys = KeyStore(directory, env_key=None)
+        db = for_server_dir(directory, args.database, actor=actor)
+        log = AuditLog(directory, db=db)
+        keys = KeyStore(directory, env_key=None, db=db)
         if args.keys_action == "list":
             try:
-                keys = KeyStore(directory, os.environ.get("AGENTICML_SERVER_KEY"))
+                keys = KeyStore(directory, os.environ.get("AGENTICML_SERVER_KEY"), db=db)
             except ValueError as exc:
                 print(f"agenticml server: warning: {exc}; listing file keys only", file=sys.stderr)
         if args.keys_action == "create":
@@ -596,7 +599,7 @@ def cmd_server_keys(args):
             if user is not None:
                 from .server.keys import validate_name
                 validate_name(user)
-                if UserStore(directory).get(user) is None:
+                if UserStore(directory, db=db).get(user) is None:
                     raise ValueError("unknown user")
             records = [record.to_public() for record in keys.list()
                        if user is None or record.user == user]
@@ -609,7 +612,7 @@ def cmd_server_keys(args):
     except KeyboardInterrupt:
         print("stopped")
         return 0
-    except (OSError, ValueError, OverflowError, KeyStoreUnavailable) as exc:
+    except (OSError, ValueError, OverflowError, KeyStoreUnavailable, DatabaseError) as exc:
         print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
         return 1
     return 0
@@ -649,17 +652,16 @@ def _read_cli_password(args):
 def cmd_server_users(args):
     from .server.audit import AuditLog, cli_actor
     from .server.keys import KeyStore, KeyStoreUnavailable
-    from .server.users import UserStore, migrate
+    from .server.users import UserStore
+    from .server.db import DatabaseError, for_server_dir
 
     try:
         data, directory = _server_data_dir(args)
         actor = cli_actor()
-        log = AuditLog(directory)
-        if not migrate(data, actor=actor):
-            print(f"agenticml server: {_MIGRATE_FAILED}", file=sys.stderr)
-            return 1
-        users = UserStore(directory)
-        keys = KeyStore(directory)
+        db = for_server_dir(directory, args.database, actor=actor)
+        log = AuditLog(directory, db=db)
+        users = UserStore(directory, db=db)
+        keys = KeyStore(directory, db=db)
         if args.users_action == "add":
             user = users.add(args.name, role=args.role, identity=args.identity,
                              reclaim_runs=args.reclaim_runs)
@@ -712,7 +714,7 @@ def cmd_server_users(args):
     except KeyboardInterrupt:
         print("stopped")
         return 0
-    except (OSError, ValueError, OverflowError, KeyStoreUnavailable) as exc:
+    except (OSError, ValueError, OverflowError, KeyStoreUnavailable, DatabaseError) as exc:
         print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
         return 1
     return 0
@@ -721,14 +723,16 @@ def cmd_server_users(args):
 def cmd_server_audit(args):
     from .server.audit import cli_main
 
-    return cli_main(args.data, args.limit, args.json)
+    return cli_main(args.data, args.limit, args.json, database=args.database)
 
 
 def _cmd_server_report(args, verify=False):
     from .server import admin
+    from .server.db.errors import DatabaseError
 
     try:
-        report = admin.verify(args.data, progress=not args.json) if verify else admin.status(args.data)
+        report = (admin.verify(args.data, progress=not args.json, database=args.database) if verify
+                  else admin.status(args.data, database=args.database))
         if args.json:
             print(json.dumps(report, indent=2, sort_keys=True))
         else:
@@ -736,6 +740,9 @@ def _cmd_server_report(args, verify=False):
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return 130
+    except DatabaseError as exc:
+        print(f"agenticml server: {exc}", file=sys.stderr)
+        return 1
     except (OSError, ValueError, OverflowError) as exc:
         print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
         return 2
@@ -1299,11 +1306,13 @@ def main(argv=None):
     server_sub = p_server.add_subparsers(dest="server_action", required=True)
     p_audit = server_sub.add_parser("audit", help="Show recent audit events")
     p_audit.add_argument("--data", default=None)
+    p_audit.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
     p_audit.add_argument("--limit", type=int, default=50)
     p_audit.add_argument("--json", action="store_true")
     p_audit.set_defaults(func=cmd_server_audit)
     p_serve = server_sub.add_parser("serve", help="Serve protocol v2 ingest")
     p_serve.add_argument("--data", default=None, help="Data directory (default: AGENTICML_SERVER_DATA or ~/.agenticml-server)")
+    p_serve.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8080)
     p_serve.add_argument("--public-url", default=None, help="Public server URL (default: AGENTICML_SERVER_PUBLIC_URL)")
@@ -1314,6 +1323,7 @@ def main(argv=None):
     p_serve.set_defaults(func=cmd_server_serve)
     p_up = server_sub.add_parser("up", help="Serve on loopback through Tailscale Funnel")
     p_up.add_argument("--data", default=None, help="Data directory (default: AGENTICML_SERVER_DATA or ~/.agenticml-server)")
+    p_up.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
     p_up.add_argument("--port", type=_parse_up_port, default=8080)
     p_up.add_argument("--install", action="store_true", help="Write a user service that runs server up, then exit")
     p_up.add_argument("--force", action="store_true", help="Overwrite an existing user service file")
@@ -1323,6 +1333,7 @@ def main(argv=None):
             ("verify", cmd_server_verify, "Check objects, run sizes, and lineage")):
         child = server_sub.add_parser(action, help=help_text)
         child.add_argument("--data", default=None)
+        child.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
         child.add_argument("--json", action="store_true")
         child.set_defaults(func=func)
     p_keys = server_sub.add_parser("keys", help="Create, list, or revoke API keys")
@@ -1330,6 +1341,7 @@ def main(argv=None):
     for action in ("create", "list", "revoke"):
         child = keys_sub.add_parser(action)
         child.add_argument("--data", default=None)
+        child.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
         child.set_defaults(func=cmd_server_keys)
         if action == "create":
             child.add_argument("--name", required=True)
@@ -1350,34 +1362,41 @@ def main(argv=None):
     p_users_add.add_argument("--no-invite", action="store_true")
     p_users_add.add_argument("--public-url", default=None)
     p_users_add.add_argument("--data", default=None)
+    p_users_add.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
     p_users_add.set_defaults(func=cmd_server_users)
     p_users_invite = users_sub.add_parser("invite")
     p_users_invite.add_argument("name")
     p_users_invite.add_argument("--public-url", default=None)
     p_users_invite.add_argument("--data", default=None)
+    p_users_invite.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
     p_users_invite.set_defaults(func=cmd_server_users)
     p_users_password = users_sub.add_parser("set-password")
     p_users_password.add_argument("name")
     p_users_password.add_argument("--stdin", action="store_true")
     p_users_password.add_argument("--data", default=None)
+    p_users_password.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
     p_users_password.set_defaults(func=cmd_server_users)
     p_users_list = users_sub.add_parser("list")
     p_users_list.add_argument("--json", action="store_true")
     p_users_list.add_argument("--data", default=None)
+    p_users_list.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
     p_users_list.set_defaults(func=cmd_server_users)
     p_users_remove = users_sub.add_parser("remove")
     p_users_remove.add_argument("name")
     p_users_remove.add_argument("--data", default=None)
+    p_users_remove.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
     p_users_remove.set_defaults(func=cmd_server_users)
     p_users_role = users_sub.add_parser("set-role")
     p_users_role.add_argument("name")
     p_users_role.add_argument("role", choices=("viewer", "member", "admin"))
     p_users_role.add_argument("--data", default=None)
+    p_users_role.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
     p_users_role.set_defaults(func=cmd_server_users)
     p_users_identity = users_sub.add_parser("set-identity")
     p_users_identity.add_argument("name")
     p_users_identity.add_argument("identity", nargs="?", default=None)
     p_users_identity.add_argument("--data", default=None)
+    p_users_identity.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
     p_users_identity.set_defaults(func=cmd_server_users)
 
     p_sync = sub.add_parser("sync", help="Incrementally upload local runs to a server")

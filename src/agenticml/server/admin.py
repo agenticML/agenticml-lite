@@ -18,7 +18,8 @@ from agenticml.store import layout
 from agenticml.store.gc import _format_bytes
 from agenticml.store.reader import list_runs, read_remote, run_references
 from .app import resolve_data_dir
-from .keys import KeyStore
+from .keys import KeyStore, KeyStoreUnavailable
+from .db import DatabaseError, DatabaseUrlError, SchemaTooNew, for_server_dir
 from .lineage import _git
 from .users import UserStore, attribution
 
@@ -69,31 +70,40 @@ def _walk(path, on_error, *, missing_ok=True, descend=None):
         yield from _walk(child, on_error, missing_ok=False, descend=descend)
 
 
-def status(data) -> dict:
+def status(data, *, database=None) -> dict:
     data, root = _data_root(data)
     counts = dict.fromkeys(_STATUSES, 0)
     keys = []
     warnings = []
     keys_loaded = True
     try:
-        # Use the authoritative read path: list() deliberately swallows corrupt
-        # files for authentication, but an operator needs to see that failure.
-        records = KeyStore(data / "server")._read_v1_or_v2()
-    except (OSError, ValueError, TypeError, RecursionError):
-        records = []
+        db = for_server_dir(data / 'server', database, create=False)
+        records = KeyStore(data / 'server', db=db).list() if db is not None else []
+        user_records = UserStore(data / 'server', db=db).list() if db is not None else []
+        if db is None:
+            for name in ('users.json', 'keys.json'):
+                try:
+                    (data / 'server' / name).lstat()
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    continue
+                warnings.append(
+                    'found 2.x users.json/keys.json with no database; '
+                    'start the server to import them')
+                break
+    except (SchemaTooNew, DatabaseUrlError):
+        raise
+    except (DatabaseError, KeyStoreUnavailable):
+        records, user_records = [], []
         keys_loaded = False
-        warnings.append("could not load server/keys.json; key revocation status is unknown")
+        warnings.append('could not load server database; key and user status is unknown')
     for record in records:
         row = record.to_public()
-        row.pop("created_by")
+        row.pop('created_by')
         row.update(runs=0, last_sync_at=None)
         keys.append(row)
-    by_key = {(row["name"], row["user"]): row for row in keys}
-    try:
-        user_records = UserStore(data / "server")._read()
-    except (OSError, ValueError, TypeError, RecursionError):
-        user_records = []
-        warnings.append("could not load server/users.json; user status is unknown")
+    by_key = {(row['name'], row['user']): row for row in keys}
     users = [{"name": user.name, "role": user.role, "keys": 0, "runs": 0, "last_sync_at": None}
              for user in user_records]
     by_user = {row["name"]: row for row in users}
@@ -159,8 +169,9 @@ def status(data) -> dict:
             "sizes": sizes, "keys": keys, "users": users, "warnings": warnings}
 
 
-def verify(data, *, progress=False) -> dict:
+def verify(data, *, progress=False, database=None) -> dict:
     data, root = _data_root(data)
+    for_server_dir(data / 'server', database, create=False)
     report = {"ok": True, "checked": {"objects": 0, "runs": 0}, "problems": [], "warnings": []}
 
     def add(kind, path, detail, *, warning=False):

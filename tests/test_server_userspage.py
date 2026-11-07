@@ -20,10 +20,8 @@ def api(server, path="/api/server/users", method="GET", payload=None, cookie=Non
 
 
 def audit_events(server):
-    path = server.data_dir / "server" / "audit.jsonl"
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in path.read_text().splitlines() if line]
+    from server_db_helpers import audit_rows
+    return audit_rows(server.data_dir / 'server')
 
 
 @pytest.mark.parametrize("role", ["member", "viewer"])

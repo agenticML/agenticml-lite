@@ -1,5 +1,7 @@
 """Users, roles, migration, ownership-by-user, and the users CLI."""
 from __future__ import annotations
+from server_db_helpers import key_object, user_object
+from agenticml.server.db import DatabaseError
 
 import hashlib
 import json
@@ -92,9 +94,7 @@ def test_userstore_crud_and_public(tmp_path):
     users.add("carol", role="admin")
     assert users.remove("bob") == 0
     assert users.get("bob") is None
-    path = users.path
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    assert json.loads(path.read_text())["version"] == 1
+    assert stat.S_IMODE(users.db.path.stat().st_mode) == 0o600
 
 
 def test_discard_removes_only_matching_id(tmp_path):
@@ -117,7 +117,7 @@ def test_userstore_strict_parse_rejects(tmp_path, change):
     users = UserStore(server_dir(tmp_path))
     users.add("alice", role="admin", identity="a@x.com")
     users.add("bob", role="admin", identity="b@x.com")
-    obj = json.loads(users.path.read_text())
+    obj = user_object(users)
     if change == "extra":
         obj["users"][0]["extra"] = 1
     elif change == "missing":
@@ -138,21 +138,22 @@ def test_userstore_strict_parse_rejects(tmp_path, change):
         obj["users"][0]["generation"] = True
     else:
         obj["users"][0]["generation"] = -1
-    users.path.write_text(json.dumps(obj))
-    with pytest.raises(ValueError):
-        users._read()
-    assert users.list() == []
+    legacy = tmp_path / 'legacy'
+    legacy.mkdir()
+    (legacy / 'users.json').write_text(json.dumps(obj))
+    with pytest.raises(DatabaseError, match='could not import users.json'):
+        UserStore(legacy)
 
 
 def test_userstore_corrupt_fails_closed_once_per_change(tmp_path, caplog):
-    users = UserStore(server_dir(tmp_path))
-    users.add("alice", role="admin")
-    users.path.write_bytes(b"not JSON")
+    directory = server_dir(tmp_path)
+    path = directory / 'users.json'
+    path.write_bytes(b'not JSON')
     for _ in range(3):
-        assert users.list() == []
-    assert sum("file users disabled" in r.message for r in caplog.records) == 1
-    users.path.write_text(json.dumps({"version": 1, "users": []}))
-    assert users.list() == []
+        with pytest.raises(DatabaseError, match='could not import users.json'):
+            UserStore(directory)
+    path.write_text(json.dumps({'version':1, 'users':[]}))
+    assert UserStore(directory).list() == []
 
 
 @pytest.mark.parametrize("value", ["", " x", "x ", "a" * 257, "a\nb", "a\x00b"])
@@ -256,15 +257,15 @@ def test_migration_v1_keys_runs_and_idempotent(tmp_path, caplog):
     bad.mkdir(parents=True)
     (bad / "remote.json").write_text("broken")
     assert migrate(data) is True
-    users = json.loads((data / "server" / "users.json").read_text())
-    assert users["version"] == 1
+    users = user_object(UserStore(data / "server"))
+    assert (data / "server" / "users.json.2x").is_file()
     assert [u["name"] for u in users["users"]] == ["admin"]
     assert users["users"][0]["role"] == "admin"
     assert users["users"][0]["created_by"] == "migration"
     admin_id = users["users"][0]["id"]
     assert len(admin_id) == 32 and all(ch in "0123456789abcdef" for ch in admin_id)
-    keys_obj = json.loads((data / "server" / "keys.json").read_text())
-    assert keys_obj["version"] == 2
+    keys_obj = key_object(KeyStore(data / "server"))
+    assert json.loads((data / "server" / "keys.json.2x").read_text())["version"] == 2
     assert {row["name"]: row["user"] for row in keys_obj["keys"]} == {
         "alpha": "admin", "beta": "admin"}
     assert json.loads((root / "runs" / "run-a" / "remote.json").read_text()) == {
@@ -287,24 +288,26 @@ def test_migration_v1_keys_runs_and_idempotent(tmp_path, caplog):
 
 
 def test_migration_crash_and_empty(tmp_path):
-    data = tmp_path / "data"
+    data = tmp_path / 'data'
     prepare_data_dir(data)
-    write_v1_keys(data / "server" / "keys.json", ["alpha"])
-    write_run(data / "store", "run-a", "alpha")
-    assert migrate(data) is True
-    (data / "server" / "users.json").unlink()
-    assert migrate(data) is True
-    users = json.loads((data / "server" / "users.json").read_text())
-    assert [u["name"] for u in users["users"]] == ["admin"]
-    keys_obj = json.loads((data / "server" / "keys.json").read_text())
-    assert keys_obj["version"] == 2 and keys_obj["keys"][0]["user"] == "admin"
-
-    empty = tmp_path / "empty"
+    write_v1_keys(data / 'server' / 'keys.json', ['alpha'])
+    write_run(data / 'store', 'run-a', 'alpha')
+    # Model a crash after legacy conversion, before the DB import commit.
+    from agenticml.server.db.legacy2x import migrate as convert
+    from agenticml.server.db import connect, default_url
+    db = connect(default_url(data))
+    assert convert(data, db=db)
+    (data / 'server' / 'users.json').unlink()
+    db.close()
+    assert migrate(data)
+    assert UserStore(data / 'server').get('admin').role == 'admin'
+    assert KeyStore(data / 'server').list()[0].user == 'admin'
+    empty = tmp_path / 'empty'
     prepare_data_dir(empty)
-    assert migrate(empty) is True
-    assert json.loads((empty / "server" / "users.json").read_text()) == {
-        "version": 1, "users": []}
-    assert not (empty / "server" / "keys.json").exists()
+    assert migrate(empty)
+    assert UserStore(empty / 'server').list() == []
+    assert not (empty / 'server' / 'users.json').exists()
+    assert not (empty / 'server' / 'keys.json').exists()
 
 
 def test_migrate_empty_v1_keys_rewrites_to_v2(tmp_path, capsys):
@@ -314,10 +317,10 @@ def test_migrate_empty_v1_keys_rewrites_to_v2(tmp_path, capsys):
     assert json.loads((data / "server" / "keys.json").read_text()) == {
         "version": 1, "keys": []}
     assert migrate(data) is True
-    keys_obj = json.loads((data / "server" / "keys.json").read_text())
-    assert keys_obj == {"version": 2, "keys": []}
-    assert json.loads((data / "server" / "users.json").read_text()) == {
-        "version": 1, "users": []}
+    keys_obj = key_object(KeyStore(data / "server"))
+    assert json.loads((data / "server" / "keys.json.2x").read_text()) == {"version":2,"keys":[]}
+    assert KeyStore(data / "server").list() == []
+    assert UserStore(data / 'server').list() == []
     assert cli.main(["server", "keys", "create", "--name", "first",
                      "--data", str(data)]) == 0
     out = capsys.readouterr().out.strip()
@@ -348,13 +351,10 @@ def test_migrate_logs_skipped_remote_summary(tmp_path, caplog):
 
 def test_v1_keys_with_users_json_fails_closed(tmp_path, caplog):
     directory = server_dir(tmp_path)
-    UserStore(directory)._write([])
-    write_v1_keys(directory / "keys.json", ["alpha"])
-    keys = KeyStore(directory)
-    assert keys.list() == []
-    assert any("keys.json is version 1" in r.message for r in caplog.records)
-    with pytest.raises(KeyStoreUnavailable, match="keys.json is version 1"):
-        keys.create("x")
+    (directory / 'users.json').write_text(json.dumps({'version':1, 'users':[]}))
+    write_v1_keys(directory / 'keys.json', ['alpha'])
+    with pytest.raises(DatabaseError, match='could not import keys.json'):
+        KeyStore(directory)
 
 
 # --- 6. make_server and CLI migrate ---
@@ -367,9 +367,9 @@ def test_make_server_and_cli_keys_list_migrate(tmp_path, capsys, monkeypatch):
     write_run(data / "store", "run-a", "alpha")
     httpd = make_server(data, port=0)
     try:
-        users = json.loads((data / "server" / "users.json").read_text())
+        users = user_object(UserStore(data / "server"))
         assert [u["name"] for u in users["users"]] == ["admin"]
-        assert json.loads((data / "server" / "keys.json").read_text())["version"] == 2
+        assert json.loads((data / "server" / "keys.json.2x").read_text())["version"] == 2
     finally:
         httpd.server_close()
 
@@ -378,8 +378,8 @@ def test_make_server_and_cli_keys_list_migrate(tmp_path, capsys, monkeypatch):
     write_v1_keys(other / "server" / "keys.json", ["alpha"])
     assert cli.main(["server", "keys", "list", "--data", str(other), "--json"]) == 0
     capsys.readouterr()
-    assert json.loads((other / "server" / "users.json").read_text())["users"][0]["name"] == "admin"
-    assert json.loads((other / "server" / "keys.json").read_text())["version"] == 2
+    assert user_object(UserStore(other / "server"))["users"][0]["name"] == "admin"
+    assert json.loads((other / "server" / "keys.json.2x").read_text())["version"] == 2
 
 
 # --- 7–8. Ingest roles, ownership, compatibility ---
@@ -570,10 +570,13 @@ def test_status_v1_and_v2_owner_key(tmp_path):
     write_run(data / "store", "run-a", "box", extra={
         "status": "finished", "last_sync_at": layout.format_timestamp(), "sizes": {}})
     report = admin.status(data)
-    row = next(r for r in report["keys"] if r["name"] == "box")
-    # Before migration supplies owner_key, a name alone cannot identify a key.
-    assert row["runs"] == 0 and row["last_sync_at"] is None
-    assert report["users"] == []
+    assert report['keys'] == report['users'] == []
+    assert not (data / 'server' / 'agenticml.db').exists()
+    assert migrate(data)
+    report = admin.status(data)
+    row = next(r for r in report['keys'] if r['name'] == 'box')
+    assert row['runs'] == 1 and row['last_sync_at'] is not None
+    assert report['users'][0]['name'] == 'admin'
 
     data = tmp_path / "v2"
     prepare_data_dir(data)
@@ -630,7 +633,7 @@ def test_bootstrap_admin_migrates_v1_admin_key(tmp_path, monkeypatch, capsys):
     keys = KeyStore(data / "server")
     assert [record.name for record in keys.list()] == ["admin"]
     assert keys.list()[0].scope == "admin" and keys.list()[0].user == "admin"
-    users = json.loads((data / "server" / "users.json").read_text())
+    users = user_object(UserStore(data / "server"))
     assert [row["name"] for row in users["users"]] == ["admin"]
     assert not any(line.startswith("aml_") for line in capsys.readouterr().out.splitlines())
 
@@ -640,7 +643,7 @@ def test_bootstrap_admin_raises_when_migrate_fails(tmp_path):
     prepare_data_dir(data)
     write_v1_keys(data / "server" / "keys.json", ["admin"], scopes=["admin"])
     (data / "server" / "keys.lock").mkdir()
-    with pytest.raises(UpError, match="could not migrate keys.json; fix the file and retry"):
+    with pytest.raises(DatabaseError, match="could not import keys.json"):
         bootstrap_admin(data, "https://example.test")
     assert not (data / "server" / "users.json").exists()
 
@@ -654,11 +657,11 @@ def test_migrate_lock_failure_logs_and_cli_aborts(tmp_path, caplog, capsys):
     assert "could not lock keys store" in caplog.text
     assert not (data / "server" / "users.json").exists()
     assert cli.main(["server", "users", "add", "alice", "--data", str(data)]) == 1
-    assert "could not migrate keys.json; fix the file and retry" in capsys.readouterr().err
+    assert "could not import keys.json" in capsys.readouterr().err
     assert not (data / "server" / "users.json").exists()
     capsys.readouterr()
     assert cli.main(["server", "keys", "list", "--data", str(data)]) == 1
-    assert "could not migrate keys.json; fix the file and retry" in capsys.readouterr().err
+    assert "could not import keys.json" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("target", ["users.json", "keys.json"])
@@ -679,7 +682,7 @@ def test_migrate_lstat_permission_error(tmp_path, monkeypatch, caplog, target):
 
     monkeypatch.setattr(os, "lstat", boom)
     assert migrate(data) is False
-    assert f"could not stat {target}; migration skipped" in caplog.text
+    assert "could not import legacy server state" in caplog.text
     if target == "users.json":
         assert json.loads((data / "server" / "keys.json").read_text())["version"] == 1
     else:
@@ -692,14 +695,14 @@ def test_migrate_unreadable_keys_logs_and_cli_aborts(tmp_path, caplog, capsys):
     prepare_data_dir(data)
     (data / "server" / "keys.json").write_text("{")
     assert migrate(data) is False
-    assert "could not read keys.json" in caplog.text
+    assert "could not import legacy server state" in caplog.text
     assert not (data / "server" / "users.json").exists()
     assert cli.main(["server", "users", "add", "alice", "--data", str(data)]) == 1
-    assert "could not migrate keys.json; fix the file and retry" in capsys.readouterr().err
+    assert "could not import keys.json" in capsys.readouterr().err
     assert not (data / "server" / "users.json").exists()
     capsys.readouterr()
     assert cli.main(["server", "keys", "list", "--json", "--data", str(data)]) == 1
-    assert "could not migrate keys.json; fix the file and retry" in capsys.readouterr().err
+    assert "could not import keys.json" in capsys.readouterr().err
 
 
 def test_migrate_aborts_on_remote_write_failure(tmp_path, monkeypatch, caplog):
@@ -734,6 +737,31 @@ def test_migrate_refuses_symlinked_runs_dir(tmp_path, caplog):
     assert (outside / "runs" / "run-out" / "remote.json").read_bytes() == before
     assert json.loads((data / "server" / "keys.json").read_text())["version"] == 1
     assert not (data / "server" / "users.json").exists()
+
+
+def test_add_scans_runs_before_write_lock(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    prepare_data_dir(data)
+    users = UserStore(data / "server")
+    order = []
+
+    def scan(*args, **kwargs):
+        order.append("scan")
+        from agenticml.server.users import _name_owns_runs as real
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr("agenticml.server.db.repos._name_owns_runs", scan)
+    real_tx = users.db.transaction
+
+    def wrapped(write=False):
+        if write:
+            order.append("write")
+        return real_tx(write=write)
+
+    monkeypatch.setattr(users.db, "transaction", wrapped)
+    users.add("alice", role="admin")
+    assert "scan" in order and "write" in order
+    assert order.index("scan") < order.index("write")
 
 
 def test_add_refuses_name_that_owns_runs(tmp_path, capsys):
@@ -811,18 +839,21 @@ def test_login_demoted_admin_key_message(tmp_path, monkeypatch):
 
 
 def test_migrate_refuses_v2_non_admin_users(tmp_path, caplog):
-    data = tmp_path / "data"
+    source = tmp_path / 'source'
+    source.mkdir()
+    keys = KeyStore(source)
+    keys.create('k1')
+    UserStore(source).add('bob')
+    keys.create('k2', user='bob')
+    data = tmp_path / 'data'
     prepare_data_dir(data)
-    keys = KeyStore(data / "server")
-    keys.create("k1")
-    UserStore(data / "server").add("bob")
-    keys.create("k2", user="bob")
-    (data / "server" / "users.json").unlink()
-    before = (data / "server" / "keys.json").read_bytes()
-    assert migrate(data) is False
-    assert "non-admin users" in caplog.text
-    assert not (data / "server" / "users.json").exists()
-    assert (data / "server" / "keys.json").read_bytes() == before
+    path = data / 'server' / 'keys.json'
+    path.write_text(json.dumps(key_object(keys)))
+    before = path.read_bytes()
+    assert not migrate(data)
+    assert 'non-admin users' in caplog.text
+    assert not (data / 'server' / 'users.json').exists()
+    assert path.read_bytes() == before
 
 
 def test_promote_viewer_restores_writes(tmp_path, monkeypatch):
@@ -879,8 +910,8 @@ def test_migrate_interrupted_partial_remote_rewrite(tmp_path):
         "owner": "admin", "owner_key": "alpha"}
     assert json.loads((data / "store" / "runs" / "run-b" / "remote.json").read_text()) == {
         "owner": "admin", "owner_key": "beta"}
-    keys_obj = json.loads((data / "server" / "keys.json").read_text())
-    assert keys_obj["version"] == 2
+    keys_obj = key_object(KeyStore(data / "server"))
+    assert json.loads((data / "server" / "keys.json.2x").read_text())["version"] == 2
     assert {row["name"]: row["user"] for row in keys_obj["keys"]} == {
         "alpha": "admin", "beta": "admin"}
 

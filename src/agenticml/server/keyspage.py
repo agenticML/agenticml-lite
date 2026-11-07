@@ -190,14 +190,6 @@ def handle(webauth, handler, path):
             name = path[len("/api/server/keys/"):]
             if not _NAME.fullmatch(name) or name in (".", ".."):
                 raise ClientError("invalid or reserved key name")
-            # list() fails closed for authentication; a mutation must still
-            # distinguish an unreadable store from an unknown key.
-            try:
-                if name != "env":
-                    webauth.keys._read()
-            except (OSError, ValueError, TypeError, RecursionError):
-                handler._json({"error": "key store unavailable"}, 503)
-                return
             record = next((record for record in webauth.keys.list() if record.name == name), None)
             if (record is None or not can_see(principal, record)
                     or resolve(webauth.keys, webauth.users, record) is None):

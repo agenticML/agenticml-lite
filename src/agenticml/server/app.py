@@ -17,9 +17,9 @@ import weakref
 
 from agenticml.store import layout
 from agenticml.ui.server import DashboardServer, _browser_host, _loopback_bind
-from .audit import AuditLog
 from .keys import KeyStore, env_key_looks_weak, validate_env_key
-from .users import UserStore, migrate
+from .users import UserStore
+from .db import for_server_dir
 from .audit import AuditLog
 from .webauth import IDENTITY_PRESETS, WebAuth
 
@@ -160,14 +160,15 @@ class IngestServer(DashboardServer):
     daemon_threads = False
 
     def __init__(self, data, host, port, public_url=None, env_key=None,
-                 trusted_proxies=(), identity_header=None):
+                 trusted_proxies=(), identity_header=None, db=None):
         from .ingest import IngestHandler
 
         self.data_dir = Path(data)
         self.tmp_dir = self.data_dir / "server" / "tmp"
-        self.keys = KeyStore(self.data_dir / "server", env_key)
-        self.users = UserStore(self.data_dir / "server")
-        self.audit = AuditLog(self.data_dir / "server")
+        self.db = db
+        self.keys = KeyStore(self.data_dir / "server", env_key, db=db)
+        self.users = UserStore(self.data_dir / "server", db=db)
+        self.audit = AuditLog(self.data_dir / "server", db=db)
         self.public_url = public_url
         self.web = WebAuth(
             self.keys, public_url, users=self.users,
@@ -254,6 +255,8 @@ class IngestServer(DashboardServer):
         self._closing_workers.clear()
         # If joining workers is interrupted, keep the lock: those workers can
         # still be applying writes while the caller handles the interruption.
+        if self.db is not None:
+            self.db.close()
         if self._server_lock is not None:
             self._server_lock.close()
             self._server_lock = None
@@ -264,7 +267,7 @@ class IPv6IngestServer(IngestServer):
 
 
 def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None,
-                trusted_proxies=(), identity_header=None):
+                trusted_proxies=(), identity_header=None, database=None):
     """Prepare and lock the data directory; port=0 chooses a free port."""
     validate_env_key(env_key)
     if env_key is not None and env_key_looks_weak(env_key):
@@ -275,24 +278,28 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
     data = resolve_data_dir(data)
     prepare_data_dir(data)
     handle = acquire_server_lock(data / "server")
+    db = None
     try:
+        db = for_server_dir(data / "server", database)
         _clean_tmp(data / "server" / "tmp")
-        migrate(data, actor="server")
         cls = IPv6IngestServer if ":" in host else IngestServer
-        server = cls(data, host, port, public_url, env_key, trusted_proxies, identity_header)
+        server = cls(data, host, port, public_url, env_key, trusted_proxies, identity_header, db=db)
         server._server_lock = handle
         return server
     except BaseException:
+        if db is not None:
+            db.close()
         handle.close()
         raise
 
 
 def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None,
-          trusted_proxies=(), identity_header=None):
+          trusted_proxies=(), identity_header=None, database=None):
     """Run until interrupted, with an optional environment admin key."""
     server = make_server(
         data, host, port, public_url, os.environ.get("AGENTICML_SERVER_KEY"),
-        trusted_proxies, identity_header)
+        trusted_proxies, identity_header,
+        **({"database": database} if database is not None else {}))
     previous_handler = None
     stopping = False
 

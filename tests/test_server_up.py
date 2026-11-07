@@ -1,4 +1,6 @@
 """agenticml server up: Tailscale checks, key bootstrap, Funnel, --install."""
+from server_db_helpers import user_object
+from agenticml.server.users import UserStore
 from contextlib import contextmanager
 import http.client
 import json
@@ -24,10 +26,10 @@ from agenticml.server import up as up_mod
 from agenticml.server.users import UserStore
 from test_server_users import write_v1_keys
 from agenticml.server.up import (
-    UpError, _ADMIN_NAME_NOT_ADMIN, _ENV_KEY_NOT_INHERITED, _INSTALL_NEEDS_PORT,
-    _NO_ADMIN_TTY, _NO_DNS, _NO_FUNNEL, _NO_HTTPS, _NOT_INSTALLED, _NOT_RUNNING,
-    _PORT_443_TAKEN, _SETUP_CLOSED, _SYSTEMD_CONTROL, _systemd_quote,
-    write_launchd_plist,
+    UpError, _ADMIN_NAME_NOT_ADMIN, _ENV_KEY_NOT_INHERITED, _INSTALL_ENV_DATABASE,
+    _INSTALL_NEEDS_PORT, _NO_ADMIN_TTY, _NO_DNS, _NO_FUNNEL, _NO_HTTPS,
+    _NOT_INSTALLED, _NOT_RUNNING, _PORT_443_TAKEN, _SETUP_CLOSED, _SYSTEMD_CONTROL,
+    _systemd_quote, write_launchd_plist,
 )
 
 pytest.importorskip("fcntl")
@@ -260,7 +262,7 @@ def test_happy_path_and_second_start(tmp_path, monkeypatch):
         ["funnel", "--https=443", "off"],
     ]
     assert all("reset" not in row for row in invocations(log))
-    users = json.loads((data / "server" / "users.json").read_text())
+    users = user_object(UserStore(data / "server"))
     assert users["users"][0]["name"] == "admin" and users["users"][0]["role"] == "admin"
     assert users["users"][0]["created_by"] == "server up"
     assert users["users"][0]["invite"] is not None
@@ -271,7 +273,7 @@ def test_happy_path_and_second_start(tmp_path, monkeypatch):
         rest, _ = process.communicate(timeout=10)
         assert process.returncode == 0, rest
         assert "/setup?token=" not in "".join(lines) + rest
-    assert json.loads((data / "server" / "users.json").read_text()) == users
+    assert user_object(UserStore(data / "server")) == users
 
 
 def test_funnel_on_failure_still_turns_off(tmp_path, monkeypatch, capsys):
@@ -341,6 +343,7 @@ def test_install_linux_quotes_spaces_and_does_not_serve(tmp_path, monkeypatch, c
     assert "RestartSec=30" in text
     assert "WantedBy=default.target" in text
     assert "RestartPreventExitStatus" not in text
+    assert "--database" not in text
     assert stat.S_IMODE(unit.stat().st_mode) == 0o644
     foreign = tmp_path / "other" / ".config/systemd/user/agenticml-server-up.service"
     monkeypatch.setenv("HOME", str(tmp_path / "other"))
@@ -351,6 +354,25 @@ def test_install_linux_quotes_spaces_and_does_not_serve(tmp_path, monkeypatch, c
     assert foreign.read_text() == "[Unit]\nDescription=nope\n"
     assert run_up(data, "--install", "--force") == 0
     assert "# Managed by agenticml server up" in foreign.read_text()
+
+
+def test_install_omits_environment_database_url(tmp_path, monkeypatch, capsys):
+    install_fake(tmp_path, monkeypatch)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    env_path = tmp_path / "secret-password" / "state.db"
+    env_path.parent.mkdir()
+    monkeypatch.setenv("AGENTICML_SERVER_DATABASE_URL", "sqlite:///" + str(env_path))
+    data = tmp_path / "data"
+    assert run_up(data, "--install") == 0
+    text = (home / ".config/systemd/user/agenticml-server-up.service").read_text()
+    captured = capsys.readouterr()
+    assert "--database" not in text
+    assert "secret-password" not in text
+    assert "secret-password" not in captured.out
+    assert _INSTALL_ENV_DATABASE in captured.out
+    assert captured.out.count(_INSTALL_ENV_DATABASE) == 1
 
 
 def test_launchd_writer(tmp_path, monkeypatch, capsys):
@@ -408,7 +430,7 @@ def test_existing_admin_user_skips_bootstrap(tmp_path, monkeypatch):
     assert run_up(data, "--install") == 0
     names = {record.name: record for record in KeyStore(data / "server").list()}
     assert list(names) == ["admin"] and names["admin"].scope == "sync"
-    users = json.loads((data / "server" / "users.json").read_text())
+    users = user_object(UserStore(data / "server"))
     assert users["users"][0]["name"] == "admin"
 
 
@@ -471,7 +493,7 @@ def test_install_with_env_key_creates_file_admin(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert out.splitlines().count(_ENV_KEY_NOT_INHERITED) == 1
     assert any("/invite?token=" in line for line in out.splitlines())
-    users = json.loads((data / "server" / "users.json").read_text())
+    users = user_object(UserStore(data / "server"))
     assert users["users"][0]["name"] == "admin" and users["users"][0]["invite"] is not None
 
 
@@ -487,7 +509,7 @@ def test_install_migrates_v1_admin_and_does_not_create(tmp_path, monkeypatch, ca
     keys = KeyStore(data / "server")
     assert [record.name for record in keys.list()] == ["admin"]
     assert keys.list()[0].scope == "admin" and keys.list()[0].user == "admin"
-    users = json.loads((data / "server" / "users.json").read_text())
+    users = user_object(UserStore(data / "server"))
     assert [row["name"] for row in users["users"]] == ["admin"]
 
 
@@ -510,7 +532,7 @@ def test_setup_closed_refuses_bootstrap(tmp_path, monkeypatch, capsys):
     data = tmp_path / "data"
     app.prepare_data_dir(data)
     keys = KeyStore(data / "server")
-    (data / "server" / "setup-closed").write_bytes(b"")
+    KeyStore(data / "server")._write_setup_closed()
     assert not KeyStore(data / "server").has_admin()
     assert run_up(data, "--install") == 1
     assert capsys.readouterr().err.splitlines()[0] == _SETUP_CLOSED

@@ -1,4 +1,7 @@
 """Audit append safety, backwards paging, and standalone CLI rendering."""
+from server_db_helpers import audit_rows, audit_text
+from agenticml.server.db import DatabaseError, for_server_dir
+from agenticml.server.db.repos import AuditRepo
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import errno
@@ -47,31 +50,25 @@ def patch_os(monkeypatch, **overrides):
 
 def test_record_format_truncation_and_key_order(tmp_path, monkeypatch):
     stamp = layout.format_timestamp()
-    monkeypatch.setattr(audit.layout, "format_timestamp", lambda: stamp)
-    detail = {"identity": "é" * 300, "nested": [{"project": "x" * 300}],
-              "count": 3, "missing": None, "control": "a\n\r\t\x00b"}
-    audit.AuditLog(tmp_path).record("alice", "password", "key.create", "t" * 300,
-                                    "203.0.113.7", detail)
-    path = tmp_path / "audit.jsonl"
-    raw = path.read_bytes()
-    assert raw.endswith(b"\n") and raw.count(b"\n") == 1
-    assert raw.isascii() and b"\\u00e9" in raw and b"\\u0000" in raw
-    row = json.loads(raw)
-    assert list(row) == ["ts", "actor", "via", "action", "target", "client", "detail"]
-    assert row == {"ts": stamp, "actor": "alice", "via": "password",
-                   "action": "key.create", "target": "t" * 256,
-                   "client": "203.0.113.7", "detail": {
-                       **detail, "identity": "é" * 256,
-                       "nested": [{"project": "x" * 256}]}}
-    assert len(detail["identity"]) == 300
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    monkeypatch.setattr(audit.layout, 'format_timestamp', lambda: stamp)
+    detail = {'identity':'é'*300, 'nested':[{'project':'x'*300}], 'count':3,
+              'missing':None, 'control':'a\n\r\t\x00b'}
+    log = audit.AuditLog(tmp_path)
+    log.record('alice','password','key.create','t'*300,'203.0.113.7',detail)
+    rows, skipped = audit.tail(tmp_path)
+    assert skipped == 0 and len(rows) == 1
+    assert rows[0] == {'ts':stamp,'actor':'alice','via':'password','action':'key.create',
+                       'target':'t'*256,'client':'203.0.113.7',
+                       'detail':{**detail,'identity':'é'*256,'nested':[{'project':'x'*256}]}}
+    assert len(detail['identity']) == 300
+    assert stat.S_IMODE(log.db.path.stat().st_mode) == 0o600
 
 
 @pytest.mark.parametrize("field", ["actor", "via", "action", "client"])
 def test_record_truncates_all_top_level_strings(tmp_path, field):
     fields = {"actor": "alice", "via": "cli", "action": "key.create", field: "é" * 300}
     audit.AuditLog(tmp_path).record(**fields)
-    assert json.loads((tmp_path / "audit.jsonl").read_bytes())[field] == "é" * 256
+    assert audit.tail(tmp_path)[0][0][field] == "é" * 256
 
 
 def test_cli_actor_fallback(monkeypatch):
@@ -86,41 +83,31 @@ def test_cli_actor_fallback(monkeypatch):
 
 
 def test_symlink_is_not_followed_and_record_does_not_raise(tmp_path, caplog):
-    outside = tmp_path / "outside"
-    outside.write_bytes(b"unchanged")
-    (tmp_path / "audit.jsonl").symlink_to(outside)
-    with caplog.at_level(logging.ERROR, logger=audit.logger.name):
-        assert audit.AuditLog(tmp_path).record("alice", "cli", "key.create") is None
-    assert outside.read_bytes() == b"unchanged"
-    assert "could not write audit.jsonl" in caplog.text
-    with pytest.raises(OSError):
-        audit.tail(tmp_path)
+    outside = tmp_path / 'outside'
+    outside.write_bytes(b'unchanged')
+    (tmp_path / 'audit.jsonl').symlink_to(outside)
+    log = audit.AuditLog(tmp_path)
+    log.record('alice','cli','key.create')
+    assert outside.read_bytes() == b'unchanged'
+    assert 'skipped 1 malformed or unreadable legacy audit line(s)' in caplog.text
+    assert audit.tail(tmp_path)[0][0]['actor'] == 'alice'
 
 
-@pytest.mark.parametrize("kind", ["fifo", "directory"])
+@pytest.mark.parametrize('kind',['fifo','directory'])
 def test_nonregular_file_is_refused(tmp_path, kind, caplog):
-    path = tmp_path / "audit.jsonl"
-    if kind == "fifo":
-        os.mkfifo(path)
-    else:
-        path.mkdir()
+    path = tmp_path / 'audit.jsonl'
+    os.mkfifo(path) if kind == 'fifo' else path.mkdir()
     errors = []
-
     def check():
         try:
-            audit.AuditLog(tmp_path).record("alice", "cli", "key.create")
-            with pytest.raises((ValueError, OSError)):
-                audit.tail(tmp_path)
-        except BaseException as exc:
-            errors.append(exc)
-
+            audit.AuditLog(tmp_path).record('alice','cli','key.create')
+            assert audit.tail(tmp_path)[0][0]['actor'] == 'alice'
+        except BaseException as exc: errors.append(exc)
     worker = threading.Thread(target=check, daemon=True)
-    worker.start()
-    worker.join(timeout=5)
-    assert not worker.is_alive(), "audit access blocked on a nonregular file"
-    if errors:
-        raise errors[0]
-    assert "could not write audit.jsonl" in caplog.text
+    worker.start(); worker.join(timeout=5)
+    assert not worker.is_alive()
+    if errors: raise errors[0]
+    assert 'skipped 1 malformed or unreadable legacy audit line(s)' in caplog.text
 
 
 def test_eight_concurrent_writers_produce_whole_lines(tmp_path):
@@ -136,113 +123,77 @@ def test_eight_concurrent_writers_produce_whole_lines(tmp_path):
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(write, range(8)))
-    lines = (tmp_path / "audit.jsonl").read_bytes().splitlines()
-    assert len(lines) == 160
-    rows = [json.loads(line) for line in lines]
+    rows = audit.tail(tmp_path, limit=1000)[0]
+    assert len(rows) == 160
     assert {(row["detail"]["worker"], row["detail"]["index"]) for row in rows} == {
         (worker, index) for worker in range(8) for index in range(20)}
     assert all(row["actor"] == f"user{row['detail']['worker']}" for row in rows)
 
 
 def test_partial_writes_are_completed_and_synced(tmp_path, monkeypatch):
-    original_write, original_fsync = os.write, os.fsync
-    writes, synced = [], []
-
-    def short_write(fd, data):
-        writes.append(len(data))
-        return original_write(fd, data[:7])
-
-    def fsync(fd):
-        synced.append(fd)
-        return original_fsync(fd)
-
-    patch_os(monkeypatch, write=short_write, fsync=fsync)
-    audit.AuditLog(tmp_path).record("alice", "cli", "key.create")
-    assert len(writes) > 1 and len(synced) == 1
-    assert json.loads((tmp_path / "audit.jsonl").read_bytes())["actor"] == "alice"
+    log = audit.AuditLog(tmp_path)
+    log.record('alice','cli','key.create')
+    log.db.close()
+    assert audit.tail(tmp_path)[0][0]['actor'] == 'alice'
+    with for_server_dir(tmp_path).transaction() as tx:
+        assert tx.fetchone('PRAGMA synchronous')[0] == 2
 
 
 def test_each_record_reopens_after_rotation(tmp_path):
-    log = audit.AuditLog(tmp_path)
-    log.record("alice", "cli", "key.create")
-    rotated = tmp_path / "audit.jsonl.1"
-    log.path.rename(rotated)
-    log.record("bob", "cli", "key.revoke")
-    assert json.loads(rotated.read_bytes())["actor"] == "alice"
-    assert json.loads(log.path.read_bytes())["actor"] == "bob"
+    first = audit.AuditLog(tmp_path)
+    first.record('alice','cli','key.create')
+    second = audit.AuditLog(tmp_path)
+    second.record('bob','cli','key.revoke')
+    first.record('carol','cli','key.create')
+    assert [r['actor'] for r in audit.tail(tmp_path)[0]] == ['carol','bob','alice']
 
 
 def test_write_failures_log_at_most_once_per_minute(tmp_path, monkeypatch, caplog):
-    clock = iter([0, 1, 59.999, 60, 119.999, 120])
-    monkeypatch.setattr(audit, "time", SimpleNamespace(monotonic=lambda: next(clock)))
-    log = audit.AuditLog(tmp_path / "missing")
-    for _ in range(6):
-        log.record("alice", "cli", "key.create")
-    messages = [record.getMessage() for record in caplog.records
-                if record.name == audit.logger.name]
-    assert messages == [f"could not write audit.jsonl (FileNotFoundError, errno={errno.ENOENT})"] * 3
+    log = audit.AuditLog(tmp_path)
+    clock = iter([0,1,59.999,60,119.999,120])
+    monkeypatch.setattr(audit, 'time', SimpleNamespace(monotonic=lambda:next(clock)))
+    def fail(*args): raise DatabaseError('secret exception details')
+    monkeypatch.setattr(log.repo, 'insert', fail)
+    for _ in range(6): log.record('alice','cli','key.create')
+    messages = [r.getMessage() for r in caplog.records if r.name == audit.logger.name]
+    assert messages == ['could not write audit event (DatabaseError, errno=None)']*3
     assert str(tmp_path) not in caplog.text
 
 
-@pytest.mark.parametrize("failure", ["serialize", "write", "fsync"])
+@pytest.mark.parametrize('failure',['serialize','write','fsync'])
 def test_record_failure_does_not_escape(tmp_path, monkeypatch, failure, caplog):
-    def fail(*args):
-        raise OSError(errno.ENOSPC, "secret exception details", "/secret/path")
-
-    if failure == "write":
-        patch_os(monkeypatch, write=lambda *args: 0)
-    elif failure == "fsync":
-        patch_os(monkeypatch, fsync=fail)
-    detail = {"invalid": object()} if failure == "serialize" else None
-    assert audit.AuditLog(tmp_path).record("alice", "cli", "key.create", detail=detail) is None
-    assert "could not write audit.jsonl" in caplog.text
-    assert "secret exception details" not in caplog.text
-    assert "/secret/path" not in caplog.text
-    expected = {"serialize": "TypeError, errno=None", "write": "OSError, errno=None",
-                "fsync": f"OSError, errno={errno.ENOSPC}"}[failure]
-    assert f"({expected})" in caplog.text
+    log = audit.AuditLog(tmp_path)
+    def fail(*args): raise OSError(errno.ENOSPC,'secret exception details','/secret/path')
+    if failure != 'serialize': monkeypatch.setattr(log.repo, 'insert', fail)
+    detail = {'invalid':object()} if failure == 'serialize' else None
+    assert log.record('alice','cli','key.create',detail=detail) is None
+    assert 'could not write audit event' in caplog.text
+    assert 'secret exception details' not in caplog.text and '/secret/path' not in caplog.text
 
 
-@pytest.mark.parametrize("failure", ["write", "zero_write", "fsync"])
+@pytest.mark.parametrize('failure',['write','zero_write','fsync'])
 def test_record_rolls_back_failed_append(tmp_path, monkeypatch, failure):
-    rows = [event(0)]
-    path = write_events(tmp_path, rows)
-    original = path.read_bytes()
-    writes = 0
-
-    def failing_write(fd, data):
-        nonlocal writes
-        writes += 1
-        if writes == 1:
-            return os.write(fd, data[:7])
-        if failure == "zero_write":
-            return 0
-        raise OSError(errno.ENOSPC, "disk full")
-
-    def failing_fsync(fd):
-        raise OSError(errno.EIO, "sync failed")
-
+    log = audit.AuditLog(tmp_path)
+    log.repo.insert(event(0))
+    original = log.repo.insert
+    def fail(row):
+        with log.db.transaction(write=True) as tx:
+            original(row, tx)
+            raise DatabaseError('disk full')
     with monkeypatch.context() as patch:
-        if failure == "fsync":
-            patch_os(patch, fsync=failing_fsync)
-        else:
-            patch_os(patch, write=failing_write)
-        audit.AuditLog(tmp_path).record("bob", "cli", "key.revoke")
-    assert path.read_bytes() == original
-    audit.AuditLog(tmp_path).record("carol", "cli", "key.create")
-    events, skipped = audit.tail(tmp_path)
-    assert [row["actor"] for row in events] == ["carol", "alice"]
-    assert skipped == 0
+        patch.setattr(log.repo,'insert',fail)
+        log.record('bob','cli','key.revoke')
+    assert audit.tail(tmp_path) == ([event(0)],0)
+    log.record('carol','cli','key.create')
+    assert [r['actor'] for r in audit.tail(tmp_path)[0]] == ['carol','alice']
 
 
 def test_rollback_failure_remains_best_effort(tmp_path, monkeypatch, caplog):
-    def fail(*args):
-        raise OSError(errno.EIO, "private failure")
-
-    patch_os(monkeypatch, fsync=fail, ftruncate=fail)
-    assert audit.AuditLog(tmp_path).record("alice", "cli", "key.create") is None
-    assert f"(OSError, errno={errno.EIO})" in caplog.text
-    assert "private failure" not in caplog.text
+    log = audit.AuditLog(tmp_path)
+    def fail(*args): raise DatabaseError('private failure')
+    monkeypatch.setattr(log.repo,'insert',fail)
+    assert log.record('alice','cli','key.create') is None
+    assert '(DatabaseError, errno=None)' in caplog.text and 'private failure' not in caplog.text
 
 
 def test_tail_newest_first_limit_and_strict_cursor(tmp_path):
@@ -255,20 +206,24 @@ def test_tail_newest_first_limit_and_strict_cursor(tmp_path):
 
 
 @pytest.mark.parametrize("suffix", [b'{"ts":', json.dumps(event(9)).encode()])
-def test_tail_counts_torn_last_line(tmp_path, suffix):
+def test_tail_counts_torn_last_line(tmp_path, suffix, caplog):
     rows = [event(0), event(1)]
     write_events(tmp_path, rows, suffix)
-    assert audit.tail(tmp_path, limit=1) == ([rows[1]], 1)
-    assert audit.tail(tmp_path) == (list(reversed(rows)), 1)
+    assert audit.tail(tmp_path, limit=1) == ([rows[1]], 0)
+    assert audit.tail(tmp_path) == (list(reversed(rows)), 0)
+
+    assert "skipped 1 malformed or unreadable legacy audit line(s)" in caplog.text
 
 
-def test_tail_counts_malformed_lines_and_crosses_chunk_boundaries(tmp_path):
+def test_tail_counts_malformed_lines_and_crosses_chunk_boundaries(tmp_path, caplog):
     rows = [event(0), event(1, detail={"values": ["é" * 256] * 100}), event(2)]
     path = write_events(tmp_path, rows)
     with path.open("ab") as file:
         file.write(b'bad\n\xff\n[]\n{}\n\n')
     assert path.stat().st_size > 2 * 64 * 1024
-    assert audit.tail(tmp_path) == (list(reversed(rows)), 5)
+    assert audit.tail(tmp_path) == (list(reversed(rows)), 0)
+
+    assert "skipped 5 malformed or unreadable legacy audit line(s)" in caplog.text
 
 
 def test_tail_returns_large_detail_string_across_chunks(tmp_path):
@@ -283,11 +238,11 @@ def test_tail_line_size_boundary(tmp_path, extra):
     overhead = len(json.dumps(row).encode())
     row["detail"] = "x" * (1024 * 1024 - overhead + extra)
     write_events(tmp_path, [row])
-    assert audit.tail(tmp_path) == (([row], 0) if extra == 0 else ([], 1))
+    assert audit.tail(tmp_path) == (([row], 0) if extra == 0 else ([], 0))
 
 
 @pytest.mark.parametrize("placement", ["only", "first", "middle", "last", "torn"])
-def test_tail_skips_oversized_line_once_and_resumes(tmp_path, placement):
+def test_tail_skips_oversized_line_once_and_resumes(tmp_path, placement, caplog):
     garbage = b"x" * (2 * 1024 * 1024)
     rows = [event(0), event(1)]
     encoded = [(json.dumps(row) + "\n").encode() for row in rows]
@@ -299,7 +254,9 @@ def test_tail_skips_oversized_line_once_and_resumes(tmp_path, placement):
         "torn": b"".join(encoded) + garbage,
     }[placement]
     (tmp_path / "audit.jsonl").write_bytes(content)
-    assert audit.tail(tmp_path) == ([] if placement == "only" else list(reversed(rows)), 1)
+    assert audit.tail(tmp_path) == ([] if placement == "only" else list(reversed(rows)), 0)
+
+    assert "skipped 1 malformed or unreadable legacy audit line(s)" in caplog.text
 
 
 def test_tail_caps_limit_and_stops_after_page(tmp_path):
@@ -354,7 +311,7 @@ def test_cli_absent_log_and_unreadable_log(tmp_path, capsys, monkeypatch):
     def denied(*args, **kwargs):
         raise PermissionError("audit permission denied")
 
-    monkeypatch.setattr(audit, "tail", denied)
+    monkeypatch.setattr(AuditRepo, "tail", denied)
     assert audit.cli_main(str(tmp_path), 50, True) == 1
     output = capsys.readouterr()
     assert not output.out
@@ -406,6 +363,8 @@ class StubHandler:
 
 def call_handle(tmp_path, **kwargs):
     handler = StubHandler(**kwargs)
+    log = audit.AuditLog(tmp_path)
+    handler.server = SimpleNamespace(audit=log)
     webauth = SimpleNamespace(keys=SimpleNamespace(server_dir=tmp_path))
     audit.handle(webauth, handler)
     return handler
@@ -456,17 +415,17 @@ def test_handle_returns_events_skips_and_no_store(tmp_path):
     rows = [event(0), event(1), event(2)]
     write_events(tmp_path, rows, suffix=b"torn")
     assert call_handle(tmp_path).response == (
-        {"events": list(reversed(rows)), "skipped": 1}, 200, {"Cache-Control": "no-store"})
+        {"events": list(reversed(rows)), "skipped": 0}, 200, {"Cache-Control": "no-store"})
     stamp = layout.format_timestamp(layout.parse_timestamp(rows[2]["ts"]))
     query = urlencode({"limit": "01", "before": stamp})
     assert call_handle(tmp_path, query=query).response == (
-        {"events": [rows[1]], "skipped": 1}, 200, {"Cache-Control": "no-store"})
+        {"events": [rows[1]], "skipped": 0}, 200, {"Cache-Control": "no-store"})
 
 
-def test_handle_unavailable_log(tmp_path):
-    (tmp_path / "audit.jsonl").mkdir()
-    assert call_handle(tmp_path).response == (
-        {"error": "audit log unavailable"}, 503, {"Cache-Control": "no-store"})
+def test_handle_unavailable_log(tmp_path, monkeypatch):
+    def fail(*args, **kwargs): raise DatabaseError('private failure')
+    monkeypatch.setattr(AuditRepo,'tail',fail)
+    assert call_handle(tmp_path).response == ({'error':'audit log unavailable'},503,{'Cache-Control':'no-store'})
 
 
 # Exercise hooks through the commands and HTTP endpoints that own the changes.
@@ -482,8 +441,7 @@ def hook_event(action, target, detail=None, *, actor="cli:operator", via="cli", 
 
 
 def hook_rows(data):
-    path = data / "server" / "audit.jsonl"
-    return [json.loads(line) for line in path.read_bytes().splitlines()] if path.exists() else []
+    return audit_rows(data / 'server')
 
 
 @contextmanager
@@ -607,7 +565,7 @@ def test_server_up_bootstrap_once(tmp_path, capsys, monkeypatch, hook_env):
         hook_event("user.add", "admin", {"role": "admin", "identity": None}),
         hook_event("user.invite", "admin", {"expires_at": expires})]
     token = output.out.split("token=", 1)[1].split()[0]
-    assert token not in (data / "server" / "audit.jsonl").read_text()
+    assert token not in audit_text(data / 'server')
     with expect_events(data):
         run_cli(data, capsys, "up", "--install")
 
@@ -641,7 +599,7 @@ def test_setup_account_password_and_logout(tmp_path, hook_env):
             assert authed(server, "/logout", "POST", cookie=cookie)[0] == 204
         with expect_events(data, http_event("login.ok", "alice", {"method": "password"})):
             assert password_login(server, "alice", PASSWORD + "new")[0] == 200
-        raw = (data / "server" / "audit.jsonl").read_text()
+        raw = audit_text(data / 'server')
         assert all(secret not in raw for secret in (
             token, PASSWORD, PASSWORD + "new", cookie_parts(cookie)[1],
             server.users.get("alice").password["hash"],
@@ -697,7 +655,7 @@ def test_invite_keys_and_secret_exclusion(tmp_path, capsys, monkeypatch, hook_en
         with expect_events(data, http_event("login.failed", None, {"method": "key"}, actor="anonymous", via="key")):
             assert login(server, "bad-key")[0] == 401
         secrets.extend(["wrong-password", "bad-key"])
-    raw = (data / "server" / "audit.jsonl").read_text()
+    raw = audit_text(data / 'server')
     assert all(secret and secret not in raw for secret in secrets)
 
 
@@ -777,7 +735,7 @@ def test_run_lifecycle_and_notes(tmp_path, capsys, monkeypatch, hook_env, env_ke
         with expect_events(data):
             assert authed(server, "/api/runs/run-1/notes", "PUT", json.dumps({
                 "text": "conflict", "revision": None}), cookie=cookie)[0] == 409
-    raw = (data / "server" / "audit.jsonl").read_text()
+    raw = audit_text(data / 'server')
     assert secret not in raw
     if env_key is not None:
         assert env_key not in raw
@@ -818,7 +776,7 @@ def test_login_failures_only_401_403_and_no_throttled_duplicates(tmp_path, hook_
             assert password_login(server, "alice", PASSWORD)[0] == 401
         with expect_events(data, http_event("login.failed", None, {"method": "key"}, actor="anonymous", via="key")):
             assert login(server, admin_key)[0] == 401
-    raw = (data / "server" / "audit.jsonl").read_text()
+    raw = audit_text(data / 'server')
     assert all(secret not in raw for secret in (
         "bad-key", "wrong-password", PASSWORD, admin_key, sync_key, former_key))
 
@@ -829,7 +787,7 @@ def test_failed_login_invalid_name_is_not_logged(tmp_path, hook_env, name):
     with running(data) as server:
         with expect_events(data, http_event("login.failed", None, {"method": "password"}, actor="anonymous")):
             assert password_login(server, name, "wrong-password")[0] == 401
-    assert name not in (data / "server" / "audit.jsonl").read_text()
+    assert name not in audit_text(data / 'server')
 
 
 def test_proxy_requests_do_not_log_logins_but_attribute_writes(tmp_path, hook_env):

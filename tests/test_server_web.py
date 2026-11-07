@@ -210,13 +210,13 @@ def test_sessions_expiry_cap_revoke_logout(server, monkeypatch):
     name, token, _ = cookie_parts(cookie)
     assert authed(server, "/api/runs", cookie=cookie)[0] == 200
     digest = hashlib.sha256(token.encode("ascii")).hexdigest()
-    first_seen = server.web._sessions[digest]["last_seen"]
+    first_seen = server.web.sessions.list()[digest]["last_seen"]
     clock[0] += 30
     assert authed(server, "/api/runs", cookie=cookie)[0] == 200
-    assert server.web._sessions[digest]["last_seen"] == first_seen
+    assert server.web.sessions.list()[digest]["last_seen"] == first_seen
     clock[0] += 31
     assert authed(server, "/api/runs", cookie=cookie)[0] == 200
-    assert server.web._sessions[digest]["last_seen"] == clock[0]
+    assert server.web.sessions.list()[digest]["last_seen"] == clock[0]
 
     clock[0] += 100
     status, _, body, _ = authed(server, "/api/runs", cookie=cookie)
@@ -226,7 +226,7 @@ def test_sessions_expiry_cap_revoke_logout(server, monkeypatch):
     monkeypatch.setattr(webauth_mod, "SESSION_MAX_AGE", 50)
     status, _, hdrs = login(server)
     cookie = hdrs["Set-Cookie"]
-    created = server.web._sessions[hashlib.sha256(
+    created = server.web.sessions.list()[hashlib.sha256(
         cookie_parts(cookie)[1].encode("ascii")).hexdigest()]["created"]
     clock[0] = created + 51
     status, hdrs, _ = authed(server, "/", cookie=cookie)[:3]
@@ -237,7 +237,7 @@ def test_sessions_expiry_cap_revoke_logout(server, monkeypatch):
     for _ in range(3):
         _, _, hdrs = login(server)
         cookies.append(hdrs["Set-Cookie"])
-    assert len(server.web._sessions) == 2
+    assert len(server.web.sessions.list()) == 2
     assert authed(server, "/api/runs", cookie=cookies[0])[0] == 401
     assert authed(server, "/api/runs", cookie=cookies[2])[0] == 200
 

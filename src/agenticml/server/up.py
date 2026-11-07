@@ -17,7 +17,7 @@ import threading
 from agenticml.store import layout
 from .app import prepare_data_dir, resolve_data_dir, serve
 from .keys import KeyStore
-from .users import UserNameTaken, UserStore, migrate
+from .users import UserNameTaken, UserStore
 
 _MAC_TAILSCALE = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 _UNIT_NAME = "agenticml-server-up"
@@ -44,6 +44,9 @@ _PORT_443_TAKEN = ("Tailscale already serves port 443 on this machine: "
                    "check `tailscale funnel status` and turn it off first")
 _ENV_KEY_NOT_INHERITED = ("Created a file admin key because the installed service "
                           "does not inherit AGENTICML_SERVER_KEY.")
+_INSTALL_ENV_DATABASE = (
+    "the installed service uses the default database unless "
+    "AGENTICML_SERVER_DATABASE_URL is set in its environment")
 _INSTALL_NEEDS_PORT = "--install needs a fixed --port (1..65535)"
 _SYSTEMD_CONTROL = "systemd unit path contains a control character"
 _FUNNEL_STATUS_WARN = "warning: could not read Tailscale Funnel status; continuing"
@@ -147,19 +150,19 @@ def _invite_is_live(user):
     return expires > datetime.now(timezone.utc)
 
 
-def bootstrap_admin(data, public_url, *, install=False):
+def bootstrap_admin(data, public_url, *, install=False, database=None):
     """Create the first admin user with an invite if needed. Returns the data dir."""
     from .audit import AuditLog, cli_actor
 
     data = resolve_data_dir(data)
     prepare_data_dir(data)
     actor = cli_actor()
-    log = AuditLog(data / "server")
-    if not migrate(data, actor=actor):
-        raise UpError("could not migrate keys.json; fix the file and retry")
+    from .db import for_server_dir
+    db = for_server_dir(data / 'server', database, actor=actor)
+    log = AuditLog(data / 'server', db=db)
     env_key = os.environ.get("AGENTICML_SERVER_KEY")
-    keys = KeyStore(data / "server", None if install else env_key)
-    users = UserStore(data / "server")
+    keys = KeyStore(data / "server", None if install else env_key, db=db)
+    users = UserStore(data / "server", db=db)
     named = users.get("admin")
     has_admin_user = any(user.role == "admin" for user in users.list())
     if named is not None and named.role != "admin" and not keys.has_admin() and not has_admin_user:
@@ -344,13 +347,17 @@ def launchd_plist_path(home=None):
     return Path(home or Path.home()) / "Library/LaunchAgents" / f"{_LAUNCHD_LABEL}.plist"
 
 
-def write_systemd_unit(data, port, *, home=None, force=False):
+def write_systemd_unit(data, port, *, home=None, force=False, database=None):
     path = systemd_unit_path(home)
     _refuse_overwrite(path, _ours_systemd, force)
     exec_start = " ".join([
         _systemd_quote(sys.executable), "-m", "agenticml", "server", "up",
         "--data", _systemd_quote(data), "--port", str(port),
     ])
+    if database is not None:
+        # Package 19 URLs can hold passwords; callers pass only an explicit
+        # --database, never AGENTICML_SERVER_DATABASE_URL.
+        exec_start += ' --database ' + _systemd_quote(database)
     body = (
         f"{_UNIT_MARKER}\n"
         "[Unit]\n"
@@ -371,7 +378,7 @@ def write_systemd_unit(data, port, *, home=None, force=False):
     return path
 
 
-def write_launchd_plist(data, port, *, home=None, force=False):
+def write_launchd_plist(data, port, *, home=None, force=False, database=None):
     home = Path(home or Path.home())
     path = launchd_plist_path(home)
     _refuse_overwrite(path, _ours_plist, force)
@@ -389,26 +396,38 @@ def write_launchd_plist(data, port, *, home=None, force=False):
         "StandardOutPath": log_path,
         "StandardErrorPath": log_path,
     }
+    if database is not None:
+        # Package 19 URLs can hold passwords; callers pass only an explicit
+        # --database, never AGENTICML_SERVER_DATABASE_URL.
+        payload['ProgramArguments'].extend(['--database', database])
     _atomic_write(path, plistlib.dumps(payload))
     print(f"launchctl load -w {path}")
     return path
 
 
-def install_unit(data, port, *, force=False):
+def install_unit(data, port, *, force=False, database=None):
     if sys.platform.startswith("linux"):
-        return write_systemd_unit(data, port, force=force)
+        return write_systemd_unit(data, port, force=force, database=database)
     if sys.platform == "darwin":
-        return write_launchd_plist(data, port, force=force)
+        return write_launchd_plist(data, port, force=force, database=database)
     raise UpError(_INSTALL_PLATFORMS)
 
 
-def up(data=None, port=8080, *, install=False, force=False):
+def up(data=None, port=8080, *, install=False, force=False, database=None):
     if install and port == 0:
         raise UpError(_INSTALL_NEEDS_PORT)
     public_url = check_tailscale()
-    data = bootstrap_admin(data, public_url, install=install)
+    explicit_database = database
+    database = database if database is not None else os.environ.get('AGENTICML_SERVER_DATABASE_URL')
+    data = bootstrap_admin(data, public_url, install=install,
+                           **({"database": database} if database is not None else {}))
     if install:
-        install_unit(data, port, force=force)
+        # Package 19 URLs can hold passwords; write --database into the unit
+        # only when the operator passed it explicitly, never AGENTICML_SERVER_DATABASE_URL.
+        install_unit(data, port, force=force,
+                     **({'database': explicit_database} if explicit_database is not None else {}))
+        if explicit_database is None and database is not None:
+            print(_INSTALL_ENV_DATABASE)
         return
     funnel_attempted = False
     previous_hup = None
@@ -429,7 +448,8 @@ def up(data=None, port=8080, *, install=False, force=False):
 
     try:
         serve(data, "127.0.0.1", port, public_url, on_ready,
-              trusted_proxies=("127.0.0.1", "::1"))
+              trusted_proxies=("127.0.0.1", "::1"),
+              **({"database": database} if database is not None else {}))
     finally:
         try:
             if funnel_attempted:
