@@ -674,29 +674,31 @@ class RunRepo:
 
     @contextmanager
     def file_guard(self, run_id, path):
-        """Serialize a run-file mutation. SQLite: no-op; caller holds run_lock."""
+        """Caller holds run_lock; writes also take database transaction locks."""
         yield
 
     def insert(self, row, tx=None):
         if tx is None:
             with self.db.transaction(write=True) as tx:
                 return self.insert(row, tx)
+        tx.lock_row('runs', 'workspace_id=? AND run_id=?', (self.workspace_id, row['run_id']))
         values = self._values(row, tx)
         tx.execute(
             'INSERT INTO runs (workspace_id, run_id, project, created_at, owner_account_id, '
             'owner_key, status, fingerprint, last_sync_at, last_sync_key, list_row, last_step, '
             'launch_note, commit_sizes, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '
-            '?, ?, ?, ?)', (self.workspace_id, *values))
+            '?, ?, ?, ?) ON CONFLICT (workspace_id, run_id) DO NOTHING', (self.workspace_id, *values))
 
     def _values(self, row, tx):
         aid = AccountRepo(self.db).ensure_attribution(row.get('owner_user'), tx)
         return tuple(aid if name == 'owner_user' else row.get(name) for name in _RUN_COLUMNS)
 
     def _ensure(self, tx, run_id):
-        if tx.fetchone('SELECT 1 FROM runs WHERE workspace_id=? AND run_id=?', (self.workspace_id, run_id)) is None:
-            tx.execute(
-                'INSERT INTO runs (workspace_id, run_id, list_row, updated_at) VALUES (?, ?, ?, ?)',
-                (self.workspace_id, run_id, json.dumps({'run_id': run_id}), layout.format_timestamp()))
+        """Create a placeholder while the caller holds the runs row lock."""
+        tx.execute(
+            'INSERT INTO runs (workspace_id, run_id, list_row, updated_at) VALUES (?, ?, ?, ?) '
+            'ON CONFLICT (workspace_id, run_id) DO NOTHING',
+            (self.workspace_id, run_id, json.dumps({'run_id': run_id}), layout.format_timestamp()))
 
     def claim_meta(self, run_id, *, owner_user, owner_key, list_row, project, created_at,
                    launch_note, claim, recreate=False):
@@ -739,6 +741,7 @@ class RunRepo:
     def record_file(self, run_id, path, size, sha256=None, last_step=None):
         now = layout.format_timestamp()
         with self.db.transaction(write=True) as tx:
+            tx.lock_row('runs', 'workspace_id=? AND run_id=?', (self.workspace_id, run_id))
             tx.lock_row('run_files', 'workspace_id=? AND run_id=? AND path=?', (self.workspace_id, run_id, path))
             self._ensure(tx, run_id)
             tx.execute(self.db.dialect.upsert(
@@ -789,6 +792,7 @@ class RunRepo:
         if tx is None:
             with self.db.transaction(write=True) as tx:
                 return self.replace_files(run_id, files, tx)
+        tx.lock_row('runs', 'workspace_id=? AND run_id=?', (self.workspace_id, run_id))
         tx.execute('DELETE FROM run_files WHERE workspace_id=? AND run_id=?', (self.workspace_id, run_id))
         for path, size, sha256 in files:
             tx.execute('INSERT INTO run_files (workspace_id, run_id, path, size, sha256) VALUES (?, ?, ?, ?, ?)',
@@ -799,6 +803,7 @@ class RunRepo:
         if tx is None:
             with self.db.transaction(write=True) as tx:
                 return self.upsert_adopted(row, files, tx)
+        tx.lock_row('runs', 'workspace_id=? AND run_id=?', (self.workspace_id, row['run_id']))
         existing = tx.fetchone('SELECT 1 FROM runs WHERE workspace_id=? AND run_id=?', (self.workspace_id, row['run_id']))
         if existing:
             tx.execute(
@@ -816,6 +821,7 @@ class RunRepo:
         if tx is None:
             with self.db.transaction(write=True) as tx:
                 return self.insert_adopted(row, files, tx)
+        tx.lock_row('runs', 'workspace_id=? AND run_id=?', (self.workspace_id, row['run_id']))
         if tx.fetchone('SELECT 1 FROM runs WHERE workspace_id=? AND run_id=?', (self.workspace_id, row['run_id'])):
             return False
         result = tx.execute(

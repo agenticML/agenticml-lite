@@ -1,4 +1,5 @@
 """18.1a storage migration, scoped repositories, sync boundaries and operator CLI."""
+from server_db_helpers import isolate_server_dir, database_url
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 import hashlib
@@ -256,7 +257,7 @@ def test_package17_migration_preserves_every_row_and_moves_store(tmp_path, monke
             shutil.copyfile(path, migrations / path.name)
     with monkeypatch.context() as patch:
         patch.setattr(migrate, 'MIGRATIONS', migrations)
-        db = connect('sqlite:///' + str(data / 'server/agenticml.db'))
+        db = connect(database_url(data / 'server/agenticml.db'))
     old_ids = {'zoe': 'a' * 32, 'anna': 'b' * 32, 'early': 'c' * 32, 'member': 'd' * 32, 'viewer': 'e' * 32}
     secret = 'aml_legacy' + 'x' * 32
     digest = hashlib.sha256(secret.encode()).hexdigest()
@@ -305,6 +306,8 @@ def test_package17_migration_preserves_every_row_and_moves_store(tmp_path, monke
         assert server.run_index.committed_size('old-run', 'meta.json') == 46
         assert server.note_index.read('old-run')['text'] == 'legacy note'
         assert server.audit.repo.tail(1)[0]['actor'] == 'anna'
+        server.audit.repo.insert({'ts': layout.format_timestamp(), 'actor': 'anna', 'action': 'after.migration'})
+        assert server.audit.repo.tail(1)[0]['action'] == 'after.migration'
         from agenticml.server.db.repos import SessionRepo
         assert SessionRepo(server.db).get('s' * 64)['workspace_id'] == default['id']
         assert SessionRepo(server.db).get('p' * 64)['workspace_id'] is None
@@ -725,7 +728,7 @@ def test_convert_store_exdev_and_skips_flag_without_default(tmp_path, monkeypatc
     data = tmp_path / 'data'
     prepare_data_dir(data)
     write_run(data / 'store', 'run-1', 'alice')
-    db = connect('sqlite:///' + str((data / 'server' / 'agenticml.db').resolve()))
+    db = connect(database_url((data / 'server' / 'agenticml.db').resolve()))
 
     def boom(src, dst):
         raise OSError(errno.EXDEV, 'Invalid cross-device link')
@@ -764,6 +767,7 @@ def test_legacy_run_owner_not_attached_without_reclaim_runs(two, tmp_path, capsy
     users_a.add('ghost')
     assert users_a.get('ghost').id == aid
     data = tmp_path / 'other'
+    isolate_server_dir(data / "server")
     with running(data) as other:
         other.users.add('alice', 'admin')
         with other.db.transaction(write=True) as tx:
@@ -783,11 +787,8 @@ def test_legacy_run_owner_not_attached_without_reclaim_runs(two, tmp_path, capsy
 
 
 def test_stale_22_password_session_invalid_after_0003(tmp_path, monkeypatch):
-    import re
-    import sqlite3
     import time
 
-    from agenticml.server.db.dialect import SqliteDialect
     from agenticml.server.db.migrate import MIGRATIONS
     from agenticml.server.users import _password_record
     from test_server_signin import PASSWORD
@@ -796,37 +797,32 @@ def test_stale_22_password_session_invalid_after_0003(tmp_path, monkeypatch):
     monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
     data = tmp_path / 'data'
     prepare_data_dir(data)
-    db_path = data / 'server' / 'agenticml.db'
-    dialect = SqliteDialect()
-    conn = sqlite3.connect(db_path)
-    conn.execute('CREATE TABLE schema_migrations '
-                 '(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)')
-    for path in sorted(p for p in MIGRATIONS.glob('[0-9][0-9][0-9][0-9]_*')
-                       if p.suffix in ('.sql', '.py') and int(p.name[:4]) <= 2):
-        sql = dialect.migration(path.read_text()) if path.suffix == '.sql' else None
-        if sql:
-            for statement in re.split(r';\s*(?:\n|$)', sql):
-                if statement.strip():
-                    conn.execute(statement)
-        conn.execute('INSERT INTO schema_migrations VALUES (?, ?, ?)',
-                     (int(path.name[:4]), path.stem[5:], layout.format_timestamp()))
-    aid = 'ab' * 16
-    conn.execute(
-        'INSERT INTO users (id, name, role, identity, identity_folded, password, '
-        'invite_sha256, invite_expires_at, generation, created_at, created_by) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        (aid, 'alice', 'admin', None, None, json.dumps(_password_record(PASSWORD)),
-         None, None, 1, layout.format_timestamp(), 'cli'))
-    token = 'stale-session-token-value'
-    digest = hashlib.sha256(token.encode('ascii')).hexdigest()
-    now = time.time()
-    conn.execute(
-        'INSERT INTO sessions (token_sha256, user_name, user_id, generation, via, '
-        'key_name, key_sha256, created, last_seen, created_order) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        (digest, 'alice', aid, 0, 'password', None, None, now, now, 1))
-    conn.commit()
-    conn.close()
+    from agenticml.server.db import migrate
+    old = tmp_path / 'old-migrations'
+    old.mkdir()
+    for path in MIGRATIONS.glob('*.sql'):
+        if int(path.name[:4]) <= 2:
+            shutil.copyfile(path, old / path.name)
+    with monkeypatch.context() as patch:
+        patch.setattr(migrate, 'MIGRATIONS', old)
+        db = connect(database_url(data / 'server' / 'agenticml.db'))
+    with db.transaction(write=True) as conn:
+        aid = 'ab' * 16
+        conn.execute(
+            'INSERT INTO users (id, name, role, identity, identity_folded, password, '
+            'invite_sha256, invite_expires_at, generation, created_at, created_by) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (aid, 'alice', 'admin', None, None, json.dumps(_password_record(PASSWORD)),
+             None, None, 1, layout.format_timestamp(), 'cli'))
+        token = 'stale-session-token-value'
+        digest = hashlib.sha256(token.encode('ascii')).hexdigest()
+        now = time.time()
+        conn.execute(
+            'INSERT INTO sessions (token_sha256, user_name, user_id, generation, via, '
+            'key_name, key_sha256, created, last_seen, created_order) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (digest, 'alice', aid, 0, 'password', None, None, now, now, 1))
+    db.close()
     with running(data) as server:
         assert AccountRepo(server.db).get('alice')['generation'] == 1
         status, _, _, _ = authed(server, '/api/w/default/runs', cookie=f'aml_session={token}')

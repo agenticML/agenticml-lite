@@ -1,5 +1,6 @@
 """Users, roles, migration, ownership-by-user, and the users CLI."""
 from __future__ import annotations
+from server_db_helpers import isolate_server_dir, database_url, on_postgres
 from server_db_helpers import default_store
 from server_db_helpers import default_workspace_id
 from server_db_helpers import imported_remote, key_object, user_object, transfer_default_owner
@@ -99,7 +100,8 @@ def test_userstore_crud_and_public(tmp_path):
     users.add("carol", role="admin")
     assert users.remove("bob") == 0
     assert users.get("bob") is None
-    assert stat.S_IMODE(users.db.path.stat().st_mode) == 0o600
+    if users.db.dialect.name == "sqlite":
+        assert stat.S_IMODE(users.db.path.stat().st_mode) == 0o600
 
 
 def test_discard_removes_only_matching_id(tmp_path):
@@ -145,6 +147,7 @@ def test_userstore_strict_parse_rejects(tmp_path, change):
         obj["users"][0]["generation"] = -1
     legacy = tmp_path / 'legacy'
     legacy.mkdir()
+    isolate_server_dir(legacy)
     (legacy / 'users.json').write_text(json.dumps(obj))
     with pytest.raises(DatabaseError, match='could not import users.json'):
         UserStore(legacy, workspace_id=default_workspace_id(legacy))
@@ -306,7 +309,7 @@ def test_migration_crash_and_empty(tmp_path):
     # Model a crash after legacy conversion, before the DB import commit.
     from agenticml.server.db.legacy2x import migrate as convert
     from agenticml.server.db import connect, default_url
-    db = connect(default_url(data))
+    db = connect(database_url(data / "server" / "agenticml.db"))
     assert convert(data, db=db)
     (data / 'server' / 'users.json').unlink()
     db.close()
@@ -315,6 +318,7 @@ def test_migration_crash_and_empty(tmp_path):
     assert KeyStore(data / 'server', workspace_id=default_workspace_id(data / 'server')).list()[0].user == 'admin'
     empty = tmp_path / 'empty'
     prepare_data_dir(empty)
+    isolate_server_dir(empty / "server")
     assert migrate(empty)
     assert UserStore(empty / 'server', workspace_id=default_workspace_id(empty / 'server')).list() == []
     assert not (empty / 'server' / 'users.json').exists()
@@ -390,6 +394,7 @@ def test_make_server_and_cli_keys_list_migrate(tmp_path, capsys, monkeypatch):
 
     other = tmp_path / "cli"
     prepare_data_dir(other)
+    isolate_server_dir(other / "server")
     write_v1_keys(other / "server" / "keys.json", ["alpha"])
     assert cli.main(["server", "keys", "list", "--data", str(other), "--json"]) == 0
     capsys.readouterr()
@@ -594,6 +599,7 @@ def test_status_v1_and_v2_owner_key(tmp_path):
     assert report['users'][0]['name'] == 'admin'
 
     data = tmp_path / "v2"
+    isolate_server_dir(data / "server")
     prepare_data_dir(data)
     keys = KeyStore(data / "server", workspace_id=default_workspace_id(data / "server"))
     keys.create("box")
@@ -887,6 +893,7 @@ def test_migrate_refuses_v2_non_admin_users(tmp_path, caplog):
     prepare_data_dir(data)
     path = data / 'server' / 'keys.json'
     path.write_text(json.dumps(key_object(keys)))
+    isolate_server_dir(data / "server")
     before = path.read_bytes()
     assert not migrate(data)
     assert 'non-admin users' in caplog.text

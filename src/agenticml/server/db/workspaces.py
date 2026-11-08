@@ -223,9 +223,9 @@ class WorkspaceRepo:
             if account is None:
                 raise ClientError('workspace needs an existing owner account')
             wid = secrets.token_hex(16)
-            tx.execute('INSERT INTO workspaces VALUES (?, ?, ?, ?, ?, ?)',
+            tx.execute('INSERT INTO workspaces (id, slug, name, status, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)',
                        (wid, slug, name or slug, 'active', account['id'], layout.format_timestamp()))
-            tx.execute('INSERT INTO memberships VALUES (?, ?, ?)', (wid, account['id'], 'owner'))
+            tx.execute('INSERT INTO memberships (workspace_id, account_id, role) VALUES (?, ?, ?)', (wid, account['id'], 'owner'))
             return self.by_id(wid, tx)
 
     def update(self, slug, *, name=None, new_slug=None, status=None):
@@ -305,7 +305,7 @@ class MembershipRepo:
         tx.advisory_lock('users')
         if self.get(account_id, tx):
             raise ClientError('membership already exists')
-        tx.execute('INSERT INTO memberships VALUES (?, ?, ?)', (self.workspace_id, account_id, role))
+        tx.execute('INSERT INTO memberships (workspace_id, account_id, role) VALUES (?, ?, ?)', (self.workspace_id, account_id, role))
 
     def remove(self, account_id):
         from .repos import UserRepo

@@ -1,4 +1,5 @@
 """Database boundaries, durability, concurrency, and one-time 2.x import."""
+from server_db_helpers import isolate_server_dir, database_url, on_postgres, migration_versions
 from server_db_helpers import default_store
 from server_db_helpers import default_workspace_id
 from concurrent.futures import ThreadPoolExecutor
@@ -28,9 +29,10 @@ from test_server_users import write_v1_keys, write_run
 
 
 def url(path):
-    return 'sqlite:///' + str(path)
+    return os.environ.get('AGENTICML_SERVER_DATABASE_URL') if os.environ.get('AGENTICML_TEST_DATABASE_URL') else 'sqlite:///' + str(path)
 
 
+@pytest.mark.sqlite_only
 def test_pool_pragmas_permissions_rollback_and_nesting(tmp_path):
     db = connect(url(tmp_path / 'state.db'))
     assert stat.S_IMODE(db.path.stat().st_mode) == 0o600
@@ -72,6 +74,7 @@ def test_pool_keeps_at_most_sixteen_idle(tmp_path):
 
 
 @pytest.mark.parametrize('kind', ['symlink','broken_symlink','fifo','directory'])
+@pytest.mark.sqlite_only
 def test_refuse_nonregular_before_connect(tmp_path, monkeypatch, kind):
     path = tmp_path / 'state.db'
     if kind in ('symlink','broken_symlink'):
@@ -86,6 +89,7 @@ def test_refuse_nonregular_before_connect(tmp_path, monkeypatch, kind):
         connect(url(path))
 
 
+@pytest.mark.sqlite_only
 def test_nfs_longest_mount_and_escaped_paths(tmp_path, monkeypatch):
     directory = tmp_path / 'local disk'
     directory.mkdir()
@@ -112,19 +116,52 @@ def test_nfs_longest_mount_and_escaped_paths(tmp_path, monkeypatch):
 
 
 def test_url_precedence_and_validation(tmp_path, monkeypatch, capsys):
-    expected = url(tmp_path / 'server' / 'agenticml.db')
+    monkeypatch.delenv('AGENTICML_SERVER_DATABASE_URL', raising=False)
+    literal_url = lambda path: 'sqlite:///' + str(path)
+    expected = literal_url(tmp_path / 'server' / 'agenticml.db')
     assert default_url(tmp_path) == expected
     assert resolve_url(tmp_path) == expected
-    monkeypatch.setenv('AGENTICML_SERVER_DATABASE_URL', url(tmp_path / 'env.db'))
-    assert resolve_url(tmp_path) == url(tmp_path / 'env.db')
+    monkeypatch.setenv('AGENTICML_SERVER_DATABASE_URL', literal_url(tmp_path / 'env.db'))
+    assert resolve_url(tmp_path) == literal_url(tmp_path / 'env.db')
     assert resolve_url(tmp_path, 'explicit') == 'explicit'
-    for bad in ['postgresql://user:private-password@host/db', 'sqlite:///relative.db']:
+    for bad in ['unsupported://user:private-password@host/db', 'sqlite:///relative.db']:
         with pytest.raises(DatabaseError) as error: connect(bad)
         assert bad not in str(error.value) and 'private-password' not in str(error.value)
         assert cli.main(['server','keys','list','--data',str(tmp_path),'--database',bad]) == 1
         assert 'private-password' not in capsys.readouterr().err
     with pytest.raises(DatabaseError, match='parent must exist'):
-        connect(url(tmp_path / 'absent' / 'state.db'))
+        connect(literal_url(tmp_path / 'absent' / 'state.db'))
+
+
+def test_postgres_url_reports_connection_failure(tmp_path, capsys):
+    pytest.importorskip('psycopg')
+    bad = 'postgresql://user:private-password@127.0.0.1:1/db?connect_timeout=1'
+    with pytest.raises(DatabaseError, match='^could not connect to Postgres$') as error:
+        connect(bad)
+    assert 'private-password' not in str(error.value) and '127.0.0.1' not in str(error.value)
+    assert cli.main(['server', 'keys', 'list', '--data', str(tmp_path), '--database', bad]) == 1
+    assert 'private-password' not in capsys.readouterr().err
+
+
+def test_postgres_dependency_is_lazy_and_missing_extra_is_clear(monkeypatch):
+    import builtins
+    import subprocess
+    import sys
+
+    subprocess.check_call([sys.executable, '-c',
+                           'import agenticml.server.db, sys; assert "psycopg" not in sys.modules'])
+    original = builtins.__import__
+
+    def without_psycopg(name, *args, **kwargs):
+        if name == 'psycopg':
+            raise ImportError('not installed')
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, '__import__', without_psycopg)
+    with pytest.raises(DatabaseError) as error:
+        connect('postgresql://user:private-password@host/db')
+    assert str(error.value) == ("Postgres needs the [postgres] extra: pip install "
+                                "'agenticml-lite[postgres]'")
 
 
 def test_migrations_concurrent_idempotent_and_ordered(tmp_path, monkeypatch):
@@ -134,20 +171,21 @@ def test_migrations_concurrent_idempotent_and_ordered(tmp_path, monkeypatch):
     with ThreadPoolExecutor(2) as pool:
         databases = list(pool.map(open_db, range(2)))
     with databases[0].transaction() as tx:
-        assert [r['version'] for r in tx.fetchall('SELECT * FROM schema_migrations')] == [1, 2, 3, 4]
+        assert [r['version'] for r in tx.fetchall('SELECT * FROM schema_migrations ORDER BY version')] == migration_versions()
     for db in databases: db.close()
     from agenticml.server.db import migrate
     migrations = tmp_path / 'migrations'
     migrations.mkdir()
-    source = Path(migrate.MIGRATIONS) / '0001_initial.sql'
-    (migrations / source.name).write_text(source.read_text())
-    (migrations / '0002_second.sql').write_text('CREATE TABLE second (id {{id}}, value {{blob}});\n')
-    (migrations / '0003_third.sql').write_text('CREATE TABLE third (value {{real}});\n')
-    (migrations / '0004_fourth.sql').write_text('CREATE TABLE fourth (value {{real}});\n')
+    applied = migration_versions()
+    next_version = max(applied) + 1
+    (migrations / f'{next_version:04d}_extra.sql').write_text('CREATE TABLE extra (id {{id}}, value {{blob}});\n')
+    (migrations / f'{next_version + 1:04d}_last.sql').write_text('CREATE TABLE last (value {{real}});\n')
     monkeypatch.setattr(migrate, 'MIGRATIONS', migrations)
     db = connect(url(path))
     with db.transaction() as tx:
-        assert [r[0] for r in tx.fetchall('SELECT version FROM schema_migrations ORDER BY version')] == [1,2,3,4]
+        assert [r[0] for r in tx.fetchall('SELECT version FROM schema_migrations ORDER BY version')] == applied + migration_versions()
+        assert tx.fetchone('SELECT COUNT(*) FROM extra')[0] == 0
+        assert tx.fetchone('SELECT COUNT(*) FROM last')[0] == 0
     db.close()
     connect(url(path)).close()
 
@@ -165,30 +203,40 @@ def test_failed_migration_rolls_back_ddl_and_version(tmp_path, monkeypatch):
     (migrations / '0002_bad.sql').unlink()
     db = connect(url(path))
     with db.transaction() as tx:
-        assert tx.fetchone("SELECT name FROM sqlite_master WHERE name='must_rollback'") is None
-        assert tx.fetchone('SELECT MAX(version) FROM schema_migrations')[0] == 1
+        if db.dialect.name == 'sqlite':
+            assert tx.fetchone("SELECT name FROM sqlite_master WHERE name='must_rollback'") is None
+        else:
+            assert tx.fetchone("SELECT table_name FROM information_schema.tables WHERE table_schema=current_schema() AND table_name='must_rollback'") is None
+        assert tx.fetchone('SELECT MAX(version) FROM schema_migrations')[0] == max(migration_versions())
     db.close()
 
 
 def test_schema_too_new_server_and_cli_refuse(tmp_path, capsys):
     prepare_data_dir(tmp_path)
     db = for_server_dir(tmp_path / 'server')
+    newest = max(migration_versions())
+    future = newest + 1
     with db.transaction(write=True) as tx:
-        tx.execute('INSERT INTO schema_migrations VALUES (?, ?, ?)', (999,'future',layout.format_timestamp()))
+        tx.execute('INSERT INTO schema_migrations VALUES (?, ?, ?)', (future,'future',layout.format_timestamp()))
     db.close()
-    with pytest.raises(SchemaTooNew, match='knows up to 4'):
+    with pytest.raises(SchemaTooNew, match=f'knows up to {newest}'):
         make_server(tmp_path, port=0)
     for command in [('keys','list'),('users','list'),('audit',),('serve',),('status',),('verify',)]:
         assert cli.main(['server',*command,'--data',str(tmp_path)]) == 1
-        assert 'database schema version 999' in capsys.readouterr().err
+        assert f'database schema version {future}' in capsys.readouterr().err
 
 
 def test_missing_status_does_not_create_database(tmp_path):
-    from agenticml.server.admin import status
+    from agenticml.server.admin import status, verify
     prepare_data_dir(tmp_path)
     assert for_server_dir(tmp_path / 'server', create=False) is None
     report = status(tmp_path)
     assert report['keys'] == report['users'] == []
+    verify(tmp_path)
+    assert for_server_dir(tmp_path / 'server', create=False) is None
+    if on_postgres():
+        from agenticml.server.db.postgres import PostgresDatabase
+        assert not PostgresDatabase.exists(resolve_url(tmp_path))
     assert not (tmp_path / 'server' / 'agenticml.db').exists()
 
 
@@ -196,10 +244,12 @@ def test_busy_maps_to_store_unavailable_and_create_is_atomic(tmp_path):
     directory = tmp_path / 'server'
     directory.mkdir()
     keys = KeyStore(directory, workspace_id=default_workspace_id(directory))
-    other = connect(url(keys.db.path))
+    other = connect(url(directory / "agenticml.db"))
     # Shorten only the test connection's timeout (production is five seconds).
-    with keys.db.transaction() as tx: tx.execute('PRAGMA busy_timeout=1')
-    with other.transaction(write=True):
+    with keys.db.transaction() as tx:
+        tx.execute("SET lock_timeout = '50ms'" if on_postgres() else 'PRAGMA busy_timeout=1')
+    with other.transaction(write=True) as tx:
+        tx.advisory_lock('users')
         with pytest.raises(KeyStoreUnavailable) as error: keys.create('first','admin')
         assert isinstance(error.value.__cause__, DatabaseBusy)
     assert keys.list() == [] and UserStore(directory, workspace_id=default_workspace_id(directory)).list() == []
@@ -252,6 +302,7 @@ def test_import_22_password_invite_and_rollback_on_bad_keys(tmp_path):
     key, secret = KeyStore(source, workspace_id=default_workspace_id(source)).create('laptop',user='alice')
     legacy = tmp_path / 'legacy'
     legacy.mkdir()
+    isolate_server_dir(legacy)
     (legacy / 'users.json').write_text(json.dumps({'version':1,'users':[dict(asdict(r), role='admin' if r.role == 'owner' else r.role) for r in users.list()]}))
     (legacy / 'keys.json').write_text('{')
     with pytest.raises(DatabaseError, match='could not import keys.json'): KeyStore(legacy, workspace_id=default_workspace_id(legacy))
@@ -309,8 +360,12 @@ def test_sessions_and_throttle_survive_restart_and_no_old_files(tmp_path, monkey
 
 def test_custom_database_cli_live_server_audit_and_env_precedence(tmp_path, monkeypatch, capsys):
     data = tmp_path / 'data'
-    custom = url(tmp_path / 'custom.db')
-    monkeypatch.setenv('AGENTICML_SERVER_DATABASE_URL',url(tmp_path / 'unused.db'))
+    if on_postgres():
+        custom = isolate_server_dir(tmp_path / 'custom')
+        isolate_server_dir(tmp_path / 'unused')
+    else:
+        custom = url(tmp_path / 'custom.db')
+        monkeypatch.setenv('AGENTICML_SERVER_DATABASE_URL', url(tmp_path / 'unused.db'))
     server = make_server(data,port=0,database=custom)
     try:
         assert cli.main(['server','keys','create','--data',str(data),'--database',custom,
@@ -319,12 +374,18 @@ def test_custom_database_cli_live_server_audit_and_env_precedence(tmp_path, monk
         assert server.keys.verify(secret).name == 'cli-key'
         assert cli.main(['server','audit','--data',str(data),'--database',custom,'--json']) == 0
         assert json.loads(capsys.readouterr().out)[0]['action'] == 'key.create'
-        assert not (tmp_path / 'unused.db').exists()
+        if on_postgres():
+            import psycopg
+            with psycopg.connect(os.environ['AGENTICML_SERVER_DATABASE_URL']) as unused:
+                assert unused.execute("SELECT to_regclass('server_settings')").fetchone()[0] is None
+        else:
+            assert not (tmp_path / 'unused.db').exists()
         assert not (data / 'server' / 'agenticml.db').exists()
     finally:
         server.server_close()
 
 
+@pytest.mark.sqlite_only
 def test_wal_refusal_closes_initial_connection(tmp_path, monkeypatch):
     original = backend.SqliteDatabase._new_connection
     connections = []
@@ -449,15 +510,17 @@ def test_bearer_database_failure_is_private_503(tmp_path, monkeypatch, failure, 
         assert 'private SQL or database URL' not in caplog.text
 
 
-def test_installed_unit_keeps_custom_database_without_printing_it(tmp_path, capsys):
+def test_installed_unit_keeps_custom_database_without_printing_it(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv('AGENTICML_SERVER_DATABASE_URL', raising=False)
     from agenticml.server.up import write_systemd_unit
-    database = url(tmp_path / 'private state.db')
+    database = 'sqlite:///' + str(tmp_path / 'private state.db')
     path = write_systemd_unit(tmp_path / 'data', 8080, home=tmp_path, database=database)
     assert '--database' in path.read_text() and database in path.read_text()
     assert database not in capsys.readouterr().out
 
 
 @pytest.mark.parametrize('stage', ['body', 'commit'])
+@pytest.mark.sqlite_only
 def test_failed_rollback_discards_connection_and_preserves_safe_error(tmp_path, monkeypatch, stage):
     import sqlite3
     original = backend.sqlite3.connect
@@ -533,6 +596,7 @@ def test_import_skips_orphan_keys_and_logs_count(tmp_path, caplog):
     orphan = replace(key, name='orphan', sha256='a' * 64, prefix='orphaned', user='missing')
     legacy = tmp_path / 'legacy'
     legacy.mkdir()
+    isolate_server_dir(legacy)
     (legacy / 'users.json').write_text(json.dumps({'version': 1, 'users': [dict(asdict(r), role='admin' if r.role == 'owner' else r.role) for r in users.list()]}))
     (legacy / 'keys.json').write_text(json.dumps({'version': 2, 'keys': [{k: v for k, v in asdict(key).items() if k not in ('workspace_id', 'account_id')}, {k: v for k, v in asdict(orphan).items() if k not in ('workspace_id', 'account_id')}]}))
     imported = KeyStore(legacy, workspace_id=default_workspace_id(legacy))
@@ -566,6 +630,7 @@ def test_import_refuses_expensive_scrypt_params(tmp_path):
     record['password'] = hostile
     legacy = tmp_path / 'legacy'
     legacy.mkdir()
+    isolate_server_dir(legacy)
     (legacy / 'users.json').write_text(json.dumps({'version': 1, 'users': [record]}))
     with pytest.raises(DatabaseError, match='could not import users.json'):
         UserStore(legacy, workspace_id=default_workspace_id(legacy))
@@ -575,13 +640,16 @@ def test_advisory_lock_hooks_for_last_admin_and_session_create(tmp_path, monkeyp
     from agenticml.server.db.dialect import SqliteDialect
     from agenticml.server.db.repos import SessionRepo
     names = []
-    original = SqliteDialect.advisory_lock
+    from agenticml.server.db.dialect import PostgresDialect
+    from server_db_helpers import on_postgres
+    dialect = PostgresDialect if on_postgres() else SqliteDialect
+    original = dialect.advisory_lock
 
     def spy(self, tx, name):
         names.append(name)
         return original(self, tx, name)
 
-    monkeypatch.setattr(SqliteDialect, 'advisory_lock', spy)
+    monkeypatch.setattr(dialect, 'advisory_lock', spy)
     users = UserStore(tmp_path, workspace_id=default_workspace_id(tmp_path))
     users.add('alice', 'admin')
     users.add('bob', 'admin')
@@ -615,6 +683,7 @@ def test_server_constructor_opens_database_and_close_does_not_raise(tmp_path):
     server.server_close()
 
 
+@pytest.mark.sqlite_only
 def test_warns_when_existing_database_is_group_accessible(tmp_path, caplog):
     path = tmp_path / 'state.db'
     connect(url(path)).close()
@@ -646,3 +715,27 @@ def test_corrupt_password_json_is_store_unavailable(tmp_path, monkeypatch):
             server.users.get('alice')
         code, body, _ = password_login(server, 'alice', PASSWORD)
         assert code == 503 and body == {'error': 'key store unavailable'}
+
+
+def sql_quoted_placeholders(sql):
+    """`'...'` segments of SQL-looking text that contain a `?`."""
+    import re
+    if not re.search(r'\b(?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER)\b', sql):
+        return []
+    return [segment for segment in re.findall(r"'[^']*'", sql) if '?' in segment]
+
+
+def test_repositories_do_not_embed_question_marks_in_sql_literals():
+    import ast
+    assert sql_quoted_placeholders("SELECT * FROM t WHERE name=?") == []
+    assert sql_quoted_placeholders("SELECT * FROM t WHERE name='?'") == ["'?'"]
+    directory = Path(__file__).resolve().parents[1] / 'src/agenticml/server/db'
+    bad = []
+    for path in (*directory.glob('*.py'), *(directory / 'migrations').glob('*.py')):
+        if path.name in ('dialect.py', 'sqlite.py', 'postgres.py'):
+            continue
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                for literal in sql_quoted_placeholders(node.value):
+                    bad.append(f'{path.name}: {literal}')
+    assert bad == []

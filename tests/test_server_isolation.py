@@ -1,6 +1,8 @@
 """18.1b isolation suite: every workspace and server-admin route, two workspaces."""
 from __future__ import annotations
 
+from server_db_helpers import on_postgres
+
 import hashlib
 import io
 import json
@@ -281,7 +283,7 @@ def _write_note(server, slug, cookie, text):
     return json.loads(body)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function" if on_postgres() else "module")
 def iso(tmp_path_factory):
     previous_key = os.environ.pop("AGENTICML_SERVER_KEY", None)
     previous_config = os.environ.get("AGENTICML_CONFIG_DIR")

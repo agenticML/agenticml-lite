@@ -18,6 +18,7 @@ def migrate(db):
     newest = max((int(path.name[:4]) for path in files), default=0)
     scripts = [(int(path.name[:4]), path.stem[5:], path) for path in files]
     with db.transaction(write=True) as tx:
+        tx.advisory_lock('migrate')
         tx.execute('CREATE TABLE IF NOT EXISTS schema_migrations '
                    '(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)')
         version = tx.fetchone('SELECT MAX(version) FROM schema_migrations')[0] or 0

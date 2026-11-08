@@ -4,6 +4,7 @@ from agenticml.server.users import UserStore
 from agenticml.server.db import DatabaseError
 import hashlib
 import json
+import os
 import re
 import stat
 from concurrent.futures import ThreadPoolExecutor
@@ -15,7 +16,7 @@ from agenticml.server import keys as key_module
 from agenticml.server.app import make_server, resolve_data_dir
 from agenticml.server.keys import KeyStore
 from agenticml.store import layout
-from server_db_helpers import default_workspace_id
+from server_db_helpers import default_workspace_id, isolate_server_dir
 
 
 @pytest.fixture
@@ -38,7 +39,8 @@ def test_create_and_public_record(keys):
     raw = json.dumps(key_object(keys))
     assert key not in raw
     assert record.sha256 in raw
-    assert stat.S_IMODE(keys.db.path.stat().st_mode) == 0o600
+    if keys.db.dialect.name == "sqlite":
+        assert stat.S_IMODE(keys.db.path.stat().st_mode) == 0o600
     assert "sha256" not in record.to_public()
     assert record.sha256 not in repr(record)
     assert keys.list() == [record]
@@ -124,6 +126,7 @@ def test_invalid_records_fail_closed(keys, change):
     legacy.mkdir()
     (legacy / 'users.json').write_text(json.dumps(user_object(UserStore(keys.server_dir, workspace_id=default_workspace_id(keys.server_dir)))))
     (legacy / 'keys.json').write_text(json.dumps(obj))
+    isolate_server_dir(legacy)
     with pytest.raises(DatabaseError, match='could not import keys.json'):
         KeyStore(legacy, workspace_id=default_workspace_id(legacy))
 
@@ -136,8 +139,14 @@ def test_symlink_unreadable_and_env_survives(keys, monkeypatch):
     outside.write_text(json.dumps(key_object(keys)))
     (legacy / 'keys.json').symlink_to(outside)
     before = outside.read_bytes()
-    with pytest.raises(DatabaseError, match='could not import keys.json'):
-        KeyStore(legacy, 'a'*32, workspace_id=default_workspace_id(legacy))
+    previous = os.environ.get('AGENTICML_SERVER_DATABASE_URL')
+    isolate_server_dir(legacy)
+    try:
+        with pytest.raises(DatabaseError, match='could not import keys.json'):
+            KeyStore(legacy, 'a'*32, workspace_id=default_workspace_id(legacy))
+    finally:
+        if previous is not None:
+            os.environ['AGENTICML_SERVER_DATABASE_URL'] = previous
     assert outside.read_bytes() == before
     store = KeyStore(keys.server_dir, 'a'*32, workspace_id=default_workspace_id(keys.server_dir))
     store.touch(store.verify('a'*32))

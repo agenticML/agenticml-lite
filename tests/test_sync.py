@@ -24,7 +24,7 @@ from agenticml.store.layout import object_path
 from agenticml.store.overview import OVERVIEW_MIN_POINTS
 from agenticml.store.reader import references_from_bytes, run_references
 from agenticml import sync
-from server_db_helpers import default_workspace_id
+from server_db_helpers import default_workspace_id, isolate_server_dir
 
 
 @contextmanager
@@ -311,6 +311,7 @@ def test_prune_preserves_remote_and_gc_synced(remote, tmp_path, capsys):
     assert push(remote, writer).complete
     assert remote_bin.read_bytes() == content
     assert "scalars/0.bin" not in remote[0].run_index.as_remote(writer.run_id)["sizes"]
+    isolate_server_dir(tmp_path / "second" / "server")
     with running(tmp_path / "second") as server:
         _, key = server.keys.create("box")
         with Client("http://127.0.0.1:%d" % server.server_address[1], key) as client:

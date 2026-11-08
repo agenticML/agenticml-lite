@@ -23,7 +23,7 @@ from agenticml.server.keys import KeyStore
 from agenticml.store import RunReader, RunWriter, layout
 from agenticml.store.gc import run_fingerprint
 from agenticml.store.overview import Overview
-from server_db_helpers import default_workspace_id
+from server_db_helpers import default_workspace_id, isolate_server_dir
 
 
 @contextmanager
@@ -129,6 +129,7 @@ def test_zero_keys_and_environment(tmp_path):
     with running(tmp_path / "empty") as httpd:
         assert raw(httpd, "GET", "/healthz")[0] == 200
         assert raw(httpd, "GET", "/v2/whoami")[0] == 401
+    isolate_server_dir((tmp_path / 'env') / 'server')
     with running(tmp_path / "env", "a" * 32) as httpd:
         assert raw(httpd, "GET", "/v2/whoami", [("Authorization", "Bearer " + "a" * 32)])[1] == {
             "key": "env", "scope": "admin", "user": "env", "role": "admin", "protocol": 2, "workspace": "default",
