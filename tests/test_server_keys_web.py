@@ -1,4 +1,7 @@
 """First-admin setup and admin key lifecycle over the real HTTP server."""
+from server_db_helpers import key_object, user_object
+from agenticml.server.users import UserStore
+from agenticml.server.db import DatabaseError
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
@@ -24,6 +27,7 @@ from agenticml.server.users import UserNameTaken
 from agenticml.server.webauth import WebAuth
 from agenticml.store import RunReader, RunWriter
 from agenticml.ui import server as ui_server
+from server_db_helpers import default_workspace_id
 
 
 # On Python 3.12+, the C json scanner's limit is separate from sys.getrecursionlimit().
@@ -67,7 +71,7 @@ def login(server, key):
     return headers["Set-Cookie"].split(";", 1)[0]
 
 
-def api(server, path="/api/server/keys", method="GET", payload=None, cookie=None, extra=None):
+def api(server, path="/api/w/default/keys", method="GET", payload=None, cookie=None, extra=None):
     headers = csrf(server) if method in ("POST", "DELETE") else {}
     headers["Cookie"] = server.cookie if cookie is None else cookie
     headers.update(extra or {})
@@ -94,7 +98,7 @@ def server(tmp_path, monkeypatch):
     monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
     data = tmp_path / "data"
     prepare_data_dir(data)
-    _, key = KeyStore(data / "server").create("admin", "admin")
+    _, key = KeyStore(data / "server", workspace_id=default_workspace_id(data / "server")).create("admin", "admin")
     with running(data) as httpd:
         httpd.admin_key = key
         httpd.cookie = login(httpd, key)
@@ -128,9 +132,9 @@ def test_setup_startup_page_and_single_use(tmp_path, caplog):
         assert hdrs["Cache-Control"] == "no-store"
         assert "Secure" in hdrs["Set-Cookie"] and hdrs["Set-Cookie"].startswith("__Host-")
         admin = httpd.users.get("admin")
-        assert admin is not None and admin.role == "admin" and admin.password is not None
+        assert admin is not None and admin.role == "owner" and admin.password is not None
         cookie = hdrs["Set-Cookie"].split(";", 1)[0]
-        assert call(httpd, "/api/server/session", headers={"Cookie": cookie})[0] == 200
+        assert call(httpd, "/api/account/session", headers={"Cookie": cookie})[0] == 200
         assert setup(httpd, {"token": token})[0] == 404
         assert call(httpd, "/setup?token=" + token)[0] == 404
         assert all(token not in record.getMessage()
@@ -236,29 +240,31 @@ def test_setup_restart_clears_stale_marker(tmp_path):
     with running(data) as httpd:
         token = httpd.web.setup_token
         assert token is not None
-        assert not (httpd.keys.server_dir / "setup-closed").exists()
+        assert not httpd.keys.setup_closed()
         status, _, payload = setup(httpd)
         assert status == 201 and payload == {"ok": True, "user": "admin", "role": "admin"}
 
 
 def test_setup_closed_marker_mode_and_no_follow(tmp_path):
-    prepare_data_dir(tmp_path / "data")
-    keys = KeyStore(tmp_path / "data" / "server")
-    target = tmp_path / "outside"
-    target.write_bytes(b"secret")
-    marker = keys.server_dir / "setup-closed"
+    data = tmp_path / 'data'
+    prepare_data_dir(data)
+    target = tmp_path / 'outside'
+    target.write_bytes(b'secret')
+    marker = data / 'server' / 'setup-closed'
     marker.symlink_to(target)
-    keys.create("admin", "admin")
-    info = marker.lstat()
-    assert stat.S_ISREG(info.st_mode) and not marker.is_symlink()
-    assert stat.S_IMODE(info.st_mode) == 0o600
-    assert target.read_bytes() == b"secret"
+    keys = KeyStore(data / 'server', workspace_id=default_workspace_id(data / 'server'))
+    assert keys.setup_closed()
+    assert (data / 'server' / 'setup-closed.2x').is_symlink()
+    keys.create('admin', 'admin')
+    assert keys.setup_closed()
+    assert stat.S_IMODE(keys.db.path.stat().st_mode) == 0o600
+    assert target.read_bytes() == b'secret'
 
 
 def test_setup_marker_write_failure_keeps_token(tmp_path, monkeypatch):
     with running(tmp_path / "data") as httpd:
         token = httpd.web.setup_token
-        before = httpd.keys.path.read_bytes() if httpd.keys.path.exists() else None
+        before = httpd.keys.list()
 
         def fail(*_args, **_kwargs):
             raise OSError("disk full")
@@ -268,7 +274,7 @@ def test_setup_marker_write_failure_keeps_token(tmp_path, monkeypatch):
             status, _, body = setup(httpd, {"token": token})
             assert status == 503 and body == {
                 "error": "setup failed; retry or use agenticml server users"}
-        assert (httpd.keys.path.read_bytes() if httpd.keys.path.exists() else None) == before
+        assert (httpd.keys.list()) == before
         assert not httpd.keys.has_admin()
         assert httpd.users.get("admin") is None
         status, _, payload = setup(httpd, {"token": token})
@@ -276,285 +282,201 @@ def test_setup_marker_write_failure_keeps_token(tmp_path, monkeypatch):
 
 
 def test_sync_create_writes_no_marker(tmp_path):
-    prepare_data_dir(tmp_path / "data")
-    keys = KeyStore(tmp_path / "data" / "server")
-    keys.create("box", "sync")
-    assert not (keys.server_dir / "setup-closed").exists()
+    prepare_data_dir(tmp_path)
+    keys = KeyStore(tmp_path / 'server', workspace_id=default_workspace_id(tmp_path / 'server'))
+    keys.create('box')
+    assert not keys.setup_closed()
 
 
 def test_api_admin_create_writes_marker(server):
-    marker = server.keys.server_dir / "setup-closed"
-    marker.unlink(missing_ok=True)
-    assert api(server, method="POST", payload={"name": "second", "scope": "admin"})[0] == 201
-    assert marker.is_file()
+    server.keys.settings.delete('setup_closed')
+    assert api(server, method='POST', payload={'name': 'second', 'scope': 'admin'})[0] == 201
+    assert server.keys.setup_closed()
 
 
 def test_keys_lock_symlink_does_not_crash_startup(tmp_path, caplog):
-    caplog.set_level(logging.DEBUG)
-    data = tmp_path / "data"
+    data = tmp_path / 'data'
     prepare_data_dir(data)
-    (data / "server" / "keys.lock").symlink_to(tmp_path / "outside")
-    httpd = make_server(data, port=0)
-    thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
-    thread.start()
-    try:
-        assert httpd.web.setup_token is None
-        errors = [record for record in caplog.records if record.levelno == logging.ERROR]
-        assert any(record.getMessage() == (
-            "could not lock keys store; setup disabled until the "
-            "file is fixed and the server restarts") for record in errors)
-        assert not any("/setup?token=" in record.getMessage() for record in caplog.records)
-        assert call(httpd, "/setup")[0] == 404
-        assert call(httpd, "/setup?token=anything")[0] == 404
-    finally:
-        httpd.shutdown()
-        thread.join(timeout=5)
-        httpd.server_close()
-        assert not thread.is_alive()
+    outside = tmp_path / 'outside'
+    outside.write_bytes(b'unchanged')
+    (data / 'server' / 'agenticml.db').symlink_to(outside)
+    with pytest.raises(DatabaseError, match='not a regular database file'):
+        make_server(data, port=0)
+    assert outside.read_bytes() == b'unchanged'
+    assert '/setup?token=' not in caplog.text
 
 
-@pytest.mark.parametrize("reader", [False, True], ids=["no-reader", "with-reader"])
-@pytest.mark.parametrize("operation", ["startup", "create"])
+@pytest.mark.parametrize('reader', [False, True])
+@pytest.mark.parametrize('operation', ['startup', 'create'])
 def test_keys_lock_fifo_fails_promptly(tmp_path, caplog, operation, reader):
-    data = tmp_path / "data"
+    data = tmp_path / 'data'
     prepare_data_dir(data)
-    path = data / "server" / "keys.lock"
-    os.mkfifo(path, 0o600)
+    path = data / 'server' / 'agenticml.db'
+    os.mkfifo(path)
     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK) if reader else None
-    results, errors = [], []
-
+    errors = []
     def attempt():
         try:
-            if operation == "startup":
-                results.append(make_server(data, port=0))
-            else:
-                results.append(KeyStore(data / "server").create("worker"))
+            make_server(data, port=0) if operation == 'startup' else KeyStore(data / 'server', workspace_id=default_workspace_id(data / 'server'))
         except Exception as exc:
             errors.append(exc)
-
-    thread = threading.Thread(target=attempt, daemon=True)
+    worker = threading.Thread(target=attempt, daemon=True)
     try:
-        thread.start()
-        thread.join(timeout=3)
-        assert not thread.is_alive(), "keys.lock FIFO blocked the operation"
-        if operation == "startup":
-            assert not errors and len(results) == 1
-            assert results[0].web.setup_token is None
-            assert [record.getMessage() for record in caplog.records
-                    if record.levelno == logging.ERROR] == [
-                "could not lock keys store; migration skipped",
-                "could not lock keys store; setup disabled until the "
-                "file is fixed and the server restarts"]
-            assert not any("/setup?token=" in record.getMessage() for record in caplog.records)
-        else:
-            assert not results and len(errors) == 1 and isinstance(errors[0], OSError)
+        worker.start()
+        worker.join(timeout=3)
+        assert not worker.is_alive()
+        assert len(errors) == 1 and isinstance(errors[0], DatabaseError)
     finally:
-        if fd is not None:
-            os.close(fd)
-        for httpd in results if operation == "startup" else []:
-            httpd.server_close()
+        if fd is not None: os.close(fd)
 
 
-@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="requires procfs fd counts")
+@pytest.mark.skipif(not os.path.isdir('/proc/self/fd'), reason='requires procfs fd counts')
 def test_keys_lock_fifo_with_reader_does_not_leak_fd(tmp_path):
     prepare_data_dir(tmp_path)
-    path = tmp_path / "server" / "keys.lock"
-    os.mkfifo(path, 0o600)
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-    try:
-        before = len(os.listdir("/proc/self/fd"))
-        with pytest.raises(OSError, match="keys.lock is not a regular file"):
-            KeyStore(tmp_path / "server").create("worker")
-        assert len(os.listdir("/proc/self/fd")) == before
-    finally:
-        os.close(fd)
+    os.mkfifo(tmp_path / 'server' / 'agenticml.db')
+    before = len(os.listdir('/proc/self/fd'))
+    with pytest.raises(DatabaseError):
+        KeyStore(tmp_path / 'server', workspace_id=default_workspace_id(tmp_path / 'server'))
+    assert len(os.listdir('/proc/self/fd')) == before
 
 
-@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="requires procfs fd counts")
-@pytest.mark.parametrize("error", [OSError, KeyboardInterrupt])
+@pytest.mark.skipif(not os.path.isdir('/proc/self/fd'), reason='requires procfs fd counts')
+@pytest.mark.parametrize('error', [OSError, KeyboardInterrupt])
 def test_keys_lock_fdopen_failure_does_not_leak_fd(tmp_path, monkeypatch, error):
+    from agenticml.server.db import sqlite
     prepare_data_dir(tmp_path)
-    def fail(*args):
-        raise error("fdopen failed")
-    monkeypatch.setattr(os, "fdopen", fail)
-    before = len(os.listdir("/proc/self/fd"))
-    with pytest.raises(error, match="fdopen failed"):
-        KeyStore(tmp_path / "server").create("worker")
-    assert len(os.listdir("/proc/self/fd")) == before
+    def fail(*args, **kwargs): raise error('connect failed')
+    monkeypatch.setattr(sqlite.sqlite3, 'connect', fail)
+    before = len(os.listdir('/proc/self/fd'))
+    with pytest.raises(DatabaseError if error is OSError else error):
+        KeyStore(tmp_path / 'server', workspace_id=default_workspace_id(tmp_path / 'server'))
+    assert len(os.listdir('/proc/self/fd')) == before
 
 
-def test_undeletable_marker_at_startup_disarms_setup(tmp_path, caplog):
-    caplog.set_level(logging.DEBUG)
-    data = tmp_path / "data"
-    prepare_data_dir(data)
-    (data / "server" / "setup-closed").mkdir()
-    with running(data) as httpd:
+def test_undeletable_marker_at_startup_disarms_setup(tmp_path, caplog, monkeypatch):
+    from agenticml.server.db.repos import SettingsRepo
+    prepare_data_dir(tmp_path)
+    keys = KeyStore(tmp_path / 'server', workspace_id=default_workspace_id(tmp_path / 'server'))
+    keys._write_setup_closed()
+    def fail(*args): raise DatabaseError('private failure')
+    monkeypatch.setattr(SettingsRepo, 'delete', fail)
+    with running(tmp_path) as httpd:
         assert httpd.web.setup_token is None
-        assert not any("/setup?token=" in record.getMessage() for record in caplog.records)
-        assert all("aml_" not in record.getMessage() for record in caplog.records)
+        assert '/setup?token=' not in caplog.text
 
 
 def test_clear_setup_closed_removes_symlink_only(tmp_path):
-    prepare_data_dir(tmp_path / "data")
-    keys = KeyStore(tmp_path / "data" / "server")
-    target = tmp_path / "outside"
-    target.write_bytes(b"keep")
-    marker = keys.server_dir / "setup-closed"
-    marker.symlink_to(target)
+    prepare_data_dir(tmp_path)
+    target = tmp_path / 'outside'
+    target.write_bytes(b'keep')
+    (tmp_path / 'server' / 'setup-closed').symlink_to(target)
+    keys = KeyStore(tmp_path / 'server', workspace_id=default_workspace_id(tmp_path / 'server'))
     keys.clear_setup_closed()
-    assert not marker.exists() and not marker.is_symlink()
-    assert target.read_bytes() == b"keep"
+    assert not keys.setup_closed()
+    with pytest.raises(FileNotFoundError): keys.clear_setup_closed()
+    assert target.read_bytes() == b'keep'
 
 
 def test_setup_closed_true_on_non_enoent(tmp_path, monkeypatch):
-    prepare_data_dir(tmp_path / "data")
-    keys = KeyStore(tmp_path / "data" / "server")
-
-    def fail(_path):
-        raise OSError(13, "permission denied")
-
-    monkeypatch.setattr(os, "lstat", fail)
+    prepare_data_dir(tmp_path)
+    keys = KeyStore(tmp_path / 'server', workspace_id=default_workspace_id(tmp_path / 'server'))
+    def fail(*args): raise DatabaseError('private failure')
+    monkeypatch.setattr(keys.settings, 'get', fail)
     assert keys.setup_closed() is True
 
 
 def test_create_only_if_no_admin_closed_after_external_revoke(tmp_path):
     prepare_data_dir(tmp_path / "data")
-    keys = KeyStore(tmp_path / "data" / "server")
-    external = KeyStore(tmp_path / "data" / "server")
+    keys = KeyStore(tmp_path / "data" / "server", workspace_id=default_workspace_id(tmp_path / "data" / "server"))
+    external = KeyStore(tmp_path / "data" / "server", workspace_id=default_workspace_id(tmp_path / "data" / "server"))
     external.create("operator", "admin")
     external.revoke("operator")
-    before = keys.path.read_bytes() if keys.path.exists() else None
+    before = keys.list()
     with pytest.raises(SetupClosed):
         keys.create("second", "admin", only_if_no_admin=True)
-    assert (keys.path.read_bytes() if keys.path.exists() else None) == before
+    assert (keys.list()) == before
 
 
 def test_arm_setup_waits_on_store_lock(tmp_path):
-    prepare_data_dir(tmp_path / "data")
-    keys = KeyStore(tmp_path / "data" / "server")
-    (keys.server_dir / "setup-closed").write_bytes(b"")
+    prepare_data_dir(tmp_path)
+    keys = KeyStore(tmp_path / 'server', workspace_id=default_workspace_id(tmp_path / 'server'))
+    keys._write_setup_closed()
     web = WebAuth(keys)
-    release = threading.Event()
-    holding = threading.Event()
-
+    holding, release = threading.Event(), threading.Event()
     def hold():
-        with keys._lock:
+        with keys.db.transaction(write=True):
             holding.set()
             assert release.wait(timeout=5)
-
     holder = threading.Thread(target=hold)
     holder.start()
     assert holding.wait(timeout=5)
-    worker = threading.Thread(target=lambda: web.arm_setup("http://127.0.0.1"))
+    worker = threading.Thread(target=lambda: web.arm_setup('http://127.0.0.1'))
     worker.start()
-    worker.join(timeout=0.3)
-    assert worker.is_alive()
-    assert web.setup_token is None
-    assert (keys.server_dir / "setup-closed").exists()
+    worker.join(timeout=.3)
+    assert worker.is_alive() and web.setup_token is None
+    assert keys.setup_closed()
     release.set()
     worker.join(timeout=5)
     holder.join(timeout=5)
-    assert web.setup_token is not None
-    assert not (keys.server_dir / "setup-closed").exists()
+    assert web.setup_token is not None and not keys.setup_closed()
 
 
-def test_prepare_setup_holds_lock_across_clear_and_check(tmp_path):
-    prepare_data_dir(tmp_path / "data")
-    keys = KeyStore(tmp_path / "data" / "server")
-    (keys.server_dir / "setup-closed").write_bytes(b"")
-    held = []
-    real_clear = keys.clear_setup_closed
-    real_read = keys._read
-    lock_path = keys.server_dir / "keys.lock"
-
-    def assert_keys_lock_held():
-        with open(lock_path, "ab") as handle:
-            with pytest.raises(BlockingIOError):
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-    def clear():
-        held.append(keys._lock.locked())
-        assert_keys_lock_held()
-        return real_clear()
-
-    def read():
-        held.append(keys._lock.locked())
-        assert_keys_lock_held()
-        return real_read()
-
-    keys.clear_setup_closed = clear
-    keys._read = read
-    assert keys.prepare_setup() is True
-    assert held == [True, True]
-    assert not (keys.server_dir / "setup-closed").exists()
-    keys.create("operator", "admin")
-    assert keys.prepare_setup() is False
+def test_prepare_setup_holds_lock_across_clear_and_check(tmp_path, monkeypatch):
+    prepare_data_dir(tmp_path)
+    keys = KeyStore(tmp_path / 'server', workspace_id=default_workspace_id(tmp_path / 'server'))
+    keys._write_setup_closed()
+    seen = []
+    real_clear = keys.repo.settings.delete
+    real_read = keys.repo.list
+    def clear(name, tx=None):
+        seen.append(tx)
+        return real_clear(name, tx)
+    def read(tx=None):
+        seen.append(tx)
+        return real_read(tx)
+    monkeypatch.setattr(keys.repo.settings, 'delete', clear)
+    monkeypatch.setattr(keys.repo, 'list', read)
+    assert keys.prepare_setup()
+    assert len(seen) == 2 and seen[0] is not None and seen[0] is seen[1]
+    assert not keys.setup_closed()
+    keys.create('operator', 'admin')
+    assert not keys.prepare_setup()
 
 
 def test_prepare_setup_false_with_env_key(tmp_path):
     prepare_data_dir(tmp_path / "data")
-    keys = KeyStore(tmp_path / "data" / "server", env_key="e" * 32)
+    keys = KeyStore(tmp_path / "data" / "server", env_key="e" * 32, workspace_id=default_workspace_id(tmp_path / "data" / "server"))
     assert keys.prepare_setup() is False
 
 
-@pytest.mark.parametrize("nested", [False, True], ids=["malformed", "deeply-nested"])
+@pytest.mark.parametrize('nested', [False, True])
 def test_setup_corrupt_at_startup_stays_disabled(tmp_path, caplog, nested):
-    data = tmp_path / "data"
-    prepare_data_dir(data)
-    path = data / "server" / "keys.json"
-    depth = DEEP_JSON_DEPTH
-    contents = "[" * depth + "0" + "]" * depth if nested else "private corrupt contents"
-    if nested:
-        with pytest.raises(RecursionError):
-            json.loads(contents)
+    prepare_data_dir(tmp_path)
+    path = tmp_path / 'server' / 'keys.json'
+    contents = '['*DEEP_JSON_DEPTH+'0'+']'*DEEP_JSON_DEPTH if nested else 'private corrupt contents'
     path.write_text(contents)
-    with running(data) as httpd:
-        assert httpd.web.setup_token is None
-        errors = [record for record in caplog.records if record.levelno == logging.ERROR]
-        assert any("setup disabled until the file is fixed and the server restarts"
-                   in record.getMessage() for record in errors)
-        assert all(contents not in record.getMessage() for record in caplog.records)
-        assert not any("/setup?token=" in record.getMessage() for record in caplog.records)
-        # Fixing the file does not enable setup until restart.
-        path.unlink()
-        assert call(httpd, "/setup?token=anything")[0] == 404
-        assert setup(httpd, {"token": "anything"})[0] == 404
-        assert httpd.web.setup_token is None
-    with running(data) as httpd:
-        assert httpd.web.setup_token is not None
+    with pytest.raises(DatabaseError, match='could not import keys.json'):
+        make_server(tmp_path, port=0)
+    assert contents not in caplog.text and '/setup?token=' not in caplog.text
+    path.unlink()
+    with running(tmp_path) as httpd: assert httpd.web.setup_token is not None
 
 
-@pytest.mark.parametrize("field", ["created_at", "last_used_at"])
+@pytest.mark.parametrize('field', ['created_at', 'last_used_at'])
 def test_timestamp_overflow_fails_closed_and_disarms_setup(tmp_path, caplog, field):
-    caplog.set_level(logging.DEBUG)
-    data = tmp_path / "data"
+    directory = tmp_path / 'source'
+    directory.mkdir()
+    keys = KeyStore(directory, workspace_id=default_workspace_id(directory))
+    record, secret = keys.create('admin', 'admin')
+    obj = key_object(keys)
+    obj['keys'][0][field] = '0001-01-01T00:00:00+01:00'
+    data = tmp_path / 'legacy'
     prepare_data_dir(data)
-    keys = KeyStore(data / "server")
-    record, secret = keys.create("admin", "admin")
-    obj = json.loads(keys.path.read_text())
-    obj["keys"][0][field] = "0001-01-01T00:00:00+01:00"
-    keys.path.write_text(json.dumps(obj))
-    with pytest.raises(ValueError, match="^invalid key record$"):
-        keys._read()
-    for _ in range(3):
-        assert keys.list() == []
-    assert [record.getMessage() for record in caplog.records
-            if record.levelno == logging.ERROR] == [
-        "could not load keys.json; file keys disabled until it changes"]
-    caplog.clear()
-    with running(data) as httpd:
-        assert httpd.web.setup_token is None
-        assert [record.getMessage() for record in caplog.records
-                if record.levelno == logging.ERROR] == [
-            "could not load keys.json; setup disabled until the file is fixed "
-            "and the server restarts"]
-        for bearer in (secret, "anything"):
-            assert call(httpd, "/v2/whoami", headers={"Authorization": "Bearer " + bearer})[0] == 401
-        assert call(httpd, "/setup?token=anything")[0] == 404
-        assert setup(httpd, {"token": "anything"})[0] == 404
-        assert all(secret not in message and record.sha256 not in message
-                   and obj["keys"][0][field] not in message and "/setup?token=" not in message
-                   for message in (item.getMessage() for item in caplog.records))
+    (data / 'server' / 'users.json').write_text(json.dumps(user_object(UserStore(directory, workspace_id=default_workspace_id(directory)))))
+    (data / 'server' / 'keys.json').write_text(json.dumps(obj))
+    with pytest.raises(DatabaseError, match='could not import keys.json'):
+        make_server(data, port=0)
+    assert secret not in caplog.text and record.sha256 not in caplog.text
 
 
 @pytest.mark.parametrize("marker", [True, False], ids=["with-marker", "markerless"])
@@ -562,16 +484,16 @@ def test_setup_strict_create_closes_after_false_negative(tmp_path, monkeypatch, 
     with running(tmp_path / "data") as httpd:
         token = httpd.web.setup_token
         # A separate store models the CLI writing while the server runs.
-        external = KeyStore(httpd.keys.server_dir)
+        external = KeyStore(httpd.keys.server_dir, workspace_id=default_workspace_id(httpd.keys.server_dir))
         external.create("operator", "admin")
         if not marker:
-            (external.server_dir / "setup-closed").unlink()
-        before = httpd.keys.path.read_bytes()
+            external.clear_setup_closed()
+        before = httpd.keys.list()
         with monkeypatch.context() as patch:
             patch.setattr(httpd.keys, "has_admin", lambda: False)
             status, _, body = setup(httpd, {"token": token, "name": "second"})
             assert status == 404 and body == {"error": "not found"}
-        assert httpd.keys.path.read_bytes() == before
+        assert httpd.keys.list() == before
         assert [record.name for record in external.list()] == ["operator"]
         assert httpd.web._setup_used and httpd.web.setup_token is None
         external.revoke("operator")
@@ -585,16 +507,16 @@ def test_setup_strict_create_closes_after_false_negative(tmp_path, monkeypatch, 
 def test_store_first_admin_guard(tmp_path, env_key, marker):
     data = tmp_path / "data"
     prepare_data_dir(data)
-    keys = KeyStore(data / "server", env_key=env_key)
+    keys = KeyStore(data / "server", env_key=env_key, workspace_id=default_workspace_id(data / "server"))
     if env_key is None:
         keys.create("sync")
         keys.create("operator", "admin", only_if_no_admin=True)
         if not marker:
-            (keys.server_dir / "setup-closed").unlink()
-    before = keys.path.read_bytes() if keys.path.exists() else None
+            keys.clear_setup_closed()
+    before = keys.list()
     with pytest.raises(SetupClosed):
         keys.create("second", "admin", only_if_no_admin=True)
-    assert (keys.path.read_bytes() if keys.path.exists() else None) == before
+    assert (keys.list()) == before
     # Ordinary CLI/API creates still permit another admin.
     keys.create("second", "admin")
 
@@ -651,7 +573,7 @@ def test_setup_create_value_error_is_private(tmp_path, monkeypatch):
     with running(tmp_path / "data") as httpd:
         def failed(*args, **kwargs):
             raise ValueError("secret detail aml_x")
-        monkeypatch.setattr(httpd.users, "_write", failed)
+        monkeypatch.setattr(httpd.users.repo, "save", failed)
         status, _, body = call(httpd, "/setup", "POST",
                                json.dumps({"token": httpd.web.setup_token,
                                            "password": SETUP_PASSWORD}), csrf(httpd))
@@ -688,16 +610,12 @@ def test_list_public_fields_runs_order_and_env(tmp_path):
         httpd.keys.create("a-box")
         # Fix timestamps so the secondary name ordering is exercised.
         records = [replace(record, created_at=first.created_at) for record in httpd.keys.list() if record.name != "env"]
-        httpd.keys._write(records)
-        runs = httpd.root / "runs"
-        runs.mkdir(exist_ok=True)
+        with httpd.keys.db.transaction(write=True) as tx:
+            for record in records:
+                tx.execute('UPDATE keys SET created_at=? WHERE name=?', (record.created_at, record.name))
+        from server_db_helpers import insert_run
         for name, owner in (("one", "z-box"), ("two", "z-box"), ("three", "a-box")):
-            path = runs / name
-            path.mkdir()
-            (path / "remote.json").write_text(json.dumps({"owner": "admin", "owner_key": owner}))
-        (runs / "linked").symlink_to(runs / "one", target_is_directory=True)
-        (runs / "bad").mkdir()
-        (runs / "bad" / "remote.json").write_text("broken")
+            insert_run(httpd.run_index, name, owner_user="admin", owner_key=owner)
         status, _, payload = api(httpd)
         assert status == 200
         assert payload["host"] == f"http://127.0.0.1:{httpd.server_address[1]}"
@@ -713,14 +631,10 @@ def test_list_public_fields_runs_order_and_env(tmp_path):
 
 
 def test_run_count_scan_cap(server, monkeypatch):
-    monkeypatch.setattr(keyspage, "RUN_SCAN_MAX", 2)
-    runs = server.root / "runs"
-    runs.mkdir(exist_ok=True)
-    for name in ("a", "b"):
-        (runs / name).mkdir()
-    assert api(server)[2]["keys"][0]["runs"] == 0
-    (runs / "c").mkdir()
-    assert api(server)[2]["keys"][0]["runs"] is None
+    from server_db_helpers import insert_run
+    for name in ("a", "b", "c"):
+        insert_run(server.run_index, name, owner_user="admin", owner_key="admin")
+    assert api(server)[2]["keys"][0]["runs"] == 3
 
 
 @pytest.mark.parametrize("state", ["missing", "file", "unreadable"])
@@ -739,7 +653,7 @@ def test_run_counts_unavailable(server, state):
         status, _, payload = api(server)
         assert status == 200
         assert len(payload["keys"]) == 2
-        assert all(row["runs"] == (0 if state == "missing" else None) for row in payload["keys"])
+        assert all(row["runs"] == 0 for row in payload["keys"])
     finally:
         if state == "unreadable":
             runs.chmod(0o700)
@@ -780,7 +694,7 @@ def test_api_public_url(tmp_path):
   + [({}, "invalid or reserved key name"), ([], "invalid JSON body"), (None, "invalid JSON body")])
 def test_create_invalid(server, payload, message):
     # Explicit JSON null still needs a body.
-    status, _, body = call(server, "/api/server/keys", "POST", json.dumps(payload),
+    status, _, body = call(server, "/api/w/default/keys", "POST", json.dumps(payload),
                            csrf(server, Cookie=server.cookie))
     assert status == 400 and json.loads(body) == {"error": message}
 
@@ -788,8 +702,8 @@ def test_create_invalid(server, payload, message):
 def test_create_value_error_is_private(server, monkeypatch):
     def failed(*args, **kwargs):
         raise ValueError("secret detail aml_x")
-    monkeypatch.setattr(server.keys, "_write", failed)
-    status, _, body = call(server, "/api/server/keys", "POST",
+    monkeypatch.setattr(server.keys.repo, "insert", failed)
+    status, _, body = call(server, "/api/w/default/keys", "POST",
                            json.dumps({"name": "box", "scope": "sync"}),
                            csrf(server, Cookie=server.cookie))
     assert status == 400
@@ -799,14 +713,14 @@ def test_create_value_error_is_private(server, monkeypatch):
 
 def test_create_body_protocol(server):
     headers = csrf(server, Cookie=server.cookie)
-    assert call(server, "/api/server/keys", "POST", b"{}", {**headers, "Content-Type": "text/plain"})[0] == 415
-    assert call(server, "/api/server/keys", "POST", b"x" * 4097, headers)[0] == 413
-    assert call(server, "/api/server/keys", "POST", b"", {**headers, "Transfer-Encoding": "chunked"})[0] == 411
-    status, _, body = call(server, "/api/server/keys", "POST", b"{", headers)
+    assert call(server, "/api/w/default/keys", "POST", b"{}", {**headers, "Content-Type": "text/plain"})[0] == 415
+    assert call(server, "/api/w/default/keys", "POST", b"x" * 4097, headers)[0] == 413
+    assert call(server, "/api/w/default/keys", "POST", b"", {**headers, "Transfer-Encoding": "chunked"})[0] == 411
+    status, _, body = call(server, "/api/w/default/keys", "POST", b"{", headers)
     assert status == 400 and json.loads(body) == {"error": "invalid JSON body"}
 
 
-@pytest.mark.parametrize("path", ["/api/server/keys", "/setup"])
+@pytest.mark.parametrize("path", ["/api/w/default/keys", "/setup"])
 def test_validation_short_body_closes_connection(server, path):
     conn = http.client.HTTPConnection(*server.server_address[:2], timeout=5)
     try:
@@ -828,15 +742,15 @@ def test_revoke_keys_sessions_and_logs(server, caplog):
     admin_record, admin = server.keys.create("second", "admin")
     cookie = login(server, admin)
     other_cookie = login(server, admin)
-    assert api(server, "/api/server/keys/box", "DELETE")[2] == {"revoked": "box", "signed_out": False}
+    assert api(server, "/api/w/default/keys/box", "DELETE")[2] == {"revoked": "box", "signed_out": False}
     assert call(server, "/v2/whoami", headers={"Authorization": "Bearer " + sync})[0] == 401
-    assert api(server, "/api/server/keys/second", "DELETE")[0] == 200
-    assert not any(entry["name"] == "second" for entry in server.web._sessions.values())
+    assert api(server, "/api/w/default/keys/second", "DELETE")[0] == 200
+    assert not any(entry["name"] == "second" for entry in server.web.sessions.list().values())
     for old in (cookie, other_cookie):
         assert api(server, cookie=old)[0] == 401
     _, new_key = server.keys.create("second", "admin")
     assert api(server, cookie=login(server, new_key))[0] == 200
-    status, hdrs, payload = api(server, "/api/server/keys/admin", "DELETE")
+    status, hdrs, payload = api(server, "/api/w/default/keys/admin", "DELETE")
     assert status == 200 and payload == {"revoked": "admin", "signed_out": True}
     assert "Max-Age=0" in hdrs["Set-Cookie"] and hdrs["Set-Cookie"].startswith("aml_session=;")
     assert api(server)[0] == 401
@@ -852,10 +766,10 @@ def test_recreated_name_does_not_revive_session(server):
     assert server.keys.revoke("second").sha256 == record.sha256
     _, new_key = server.keys.create("second", "admin")
     # Direct store mutations leave the session intact until the request gate checks its hash.
-    assert server.web._sessions[digest]["name"] == "second"
-    assert server.web._sessions[digest]["sha256"] == record.sha256
+    assert server.web.sessions.list()[digest]["name"] == "second"
+    assert server.web.sessions.list()[digest]["sha256"] == record.sha256
     assert api(server, cookie=cookie)[0] == 401
-    assert digest not in server.web._sessions
+    assert digest not in server.web.sessions.list()
     assert api(server, cookie=login(server, new_key))[0] == 200
 
 
@@ -866,15 +780,15 @@ def test_drop_sessions_matches_name_and_hash(server):
     for record in (old, other, newer):
         server.web._create_session(record)
     server.web.drop_sessions(old.name, old.sha256)
-    assert {(entry["name"], entry["sha256"]) for entry in server.web._sessions.values()} == {
+    assert {(entry["name"], entry["sha256"]) for entry in server.web.sessions.list().values()} == {
         (other.name, other.sha256), (newer.name, newer.sha256)}
 
 
 def test_last_admin_guard_and_cli_recovery(server, monkeypatch):
-    before = server.keys.path.read_bytes()
-    status, _, payload = api(server, "/api/server/keys/admin", "DELETE")
+    before = server.keys.list()
+    status, _, payload = api(server, "/api/w/default/keys/admin", "DELETE")
     assert status == 409 and payload == {"error": "last admin key; create another admin key first, or use the CLI"}
-    assert server.keys.path.read_bytes() == before
+    assert server.keys.list() == before
     monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
     assert cli.main(["server", "keys", "revoke", "admin", "--data", str(server.data_dir)]) == 0
     assert not server.keys.has_admin()
@@ -884,8 +798,8 @@ def test_env_allows_file_admin_revoke(tmp_path):
     with running(tmp_path / "data", env_key="e" * 32) as httpd:
         httpd.keys.create("admin", "admin")
         httpd.cookie = login(httpd, "e" * 32)
-        assert api(httpd, "/api/server/keys/admin", "DELETE")[0] == 200
-        status, _, payload = api(httpd, "/api/server/keys/env", "DELETE")
+        assert api(httpd, "/api/w/default/keys/admin", "DELETE")[0] == 200
+        status, _, payload = api(httpd, "/api/w/default/keys/env", "DELETE")
         assert status == 409 and payload == {"error": "environment key: remove AGENTICML_SERVER_KEY and restart"}
 
 
@@ -896,33 +810,35 @@ def test_concurrent_last_admin_revoke(server):
     def revoke(args):
         name, cookie = args
         barrier.wait(timeout=5)
-        return api(server, "/api/server/keys/" + name, "DELETE", cookie=cookie)[0]
+        return api(server, "/api/w/default/keys/" + name, "DELETE", cookie=cookie)[0]
     with ThreadPoolExecutor(max_workers=2) as pool:
         assert sorted(pool.map(revoke, [("admin", server.cookie), ("second", second)])) == [200, 409]
     assert len(server.keys.list()) == 1 and server.keys.has_admin()
 
 
 def test_api_gate_paths_and_bodyless_connections(server):
-    status, _, body = call(server, "/api/server/keys", headers={
+    status, _, body = call(server, "/api/w/default/keys", headers={
         "Authorization": "Bearer " + server.admin_key,
     })
     assert status == 401 and json.loads(body) == {"error": "login required"}
     for method in ("POST", "DELETE"):
-        path = "/api/server/keys" + ("/box" if method == "DELETE" else "")
+        path = "/api/w/default/keys" + ("/box" if method == "DELETE" else "")
         status, _, body = call(server, path, method, b"{}", {"Cookie": server.cookie})
         assert status == 403 and json.loads(body)["error"] == "cross-site request refused"
         status, _, body = call(server, path, method, b"{}", csrf(server))
         assert status == 401 and json.loads(body) == {"error": "login required"}
-    for name in ("%2e%2e", "%2e", "a%2Fb", "a/b", ""):
-        assert api(server, "/api/server/keys/" + name, "DELETE")[0] == 400
-    assert api(server, "/api/server/keys/missing", "DELETE")[0] == 404
+    for name in ("%2e%2e", "%2e"):
+        assert api(server, "/api/w/default/keys/" + name, "DELETE")[0] == 400
+    for name in ("a%2Fb", "a/b", ""):
+        assert api(server, "/api/w/default/keys/" + name, "DELETE")[0] == 404
+    assert api(server, "/api/w/default/keys/missing", "DELETE")[0] == 404
     assert api(server, "/api/server/unknown")[0] == 404
-    assert api(server, "/api/server/session", "POST")[0] == 405
+    assert api(server, "/api/account/session", "POST")[0] == 405
     assert api(server, method="PATCH")[0] == 405
-    assert api(server, "/api/server/keys/box")[0] == 405
+    assert api(server, "/api/w/default/keys/box")[0] == 405
     status, hdrs, _ = api(server, extra={"Content-Length": "3"})
     assert status == 200 and hdrs["Connection"] == "close"
-    status, hdrs, _ = api(server, "/api/server/keys/missing", "DELETE", extra={"Transfer-Encoding": "chunked"})
+    status, hdrs, _ = api(server, "/api/w/default/keys/missing", "DELETE", extra={"Transfer-Encoding": "chunked"})
     assert status == 404 and hdrs["Connection"] == "close"
 
 
@@ -930,17 +846,17 @@ def test_api_gate_paths_and_bodyless_connections(server):
     ("GET", "/setup?token={token}", "Content-Length", 200),
     ("GET", "/setup?token=wrong", "Content-Length", 404),
     ("GET", "/login", "Transfer-Encoding", 200),
-    ("GET", "/", "Content-Length", 200),
+    ("GET", "/", "Content-Length", 303),
     ("GET", "/static/app.css", "Content-Length", 200),
-    ("GET", "/api/server/keys", "Content-Length", 200),
-    ("HEAD", "/login", "Content-Length", 405),
-    ("DELETE", "/api/server/keys/missing", "Transfer-Encoding", 404),
+    ("GET", "/api/w/default/keys", "Content-Length", 200),
+    ("HEAD", "/login", "Content-Length", 404),
+    ("DELETE", "/api/w/default/keys/missing", "Transfer-Encoding", 404),
 ])
 def test_server_bodyless_response_has_one_close_header(tmp_path, method, path, header, expected):
     with running(tmp_path / "data") as httpd:
         path = path.format(token=httpd.web.setup_token)
         headers = {"Connection": "keep-alive"}
-        if path == "/" or path.startswith("/api/server/keys") or method == "HEAD":
+        if path == "/" or path.startswith("/api/w/default/keys") or method == "HEAD":
             _, key = httpd.keys.create("admin", "admin")
             headers["Cookie"] = login(httpd, key)
         if method == "DELETE":
@@ -988,61 +904,53 @@ def test_sync_key_cannot_reach_api(server):
     _, key = server.keys.create("box")
     for headers in ({"Authorization": "Bearer " + key},
                     {"Cookie": server.web._cookie_name() + "=" + key}):
-        status, _, body = call(server, "/api/server/keys", headers=headers)
+        status, _, body = call(server, "/api/w/default/keys", headers=headers)
         assert status == 401 and json.loads(body) == {"error": "login required"}
 
 
-@pytest.mark.parametrize("nested", [False, True], ids=["malformed", "deeply-nested"])
+@pytest.mark.parametrize('nested', [False, True])
 def test_store_corruption_503_and_cli(tmp_path, capsys, monkeypatch, nested):
-    with running(tmp_path / "data", env_key="e" * 32) as httpd:
-        httpd.cookie = login(httpd, "e" * 32)
-        httpd.keys.create("box")
-        depth = DEEP_JSON_DEPTH
-        contents = "[" * depth + "0" + "]" * depth if nested else "private corrupt contents"
-        if nested:
-            with pytest.raises(RecursionError):
-                json.loads(contents)
-        httpd.keys.path.write_text(contents)
-        for method, path, payload in (("POST", "/api/server/keys", {"name": "new", "scope": "sync"}),
-                                      ("DELETE", "/api/server/keys/box", None)):
-            status, _, body = api(httpd, path, method, payload)
-            assert status == 503 and body == {"error": "key store unavailable"}
-        for action in (["create", "--name", "new"], ["revoke", "box"]):
-            assert cli.main(["server", "keys", *action, "--data", str(httpd.data_dir)]) == 1
-            assert contents not in capsys.readouterr().err
-        assert httpd.keys.path.read_text() == contents
-        # Also exercise the gate's central exception mapping.
-        def unavailable(*args):
-            raise KeyStoreUnavailable("private failure")
-        monkeypatch.setattr(httpd.keys, "current", unavailable)
+    from agenticml.server.db.repos import KeyRepo
+    with running(tmp_path, env_key='e'*32) as httpd:
+        httpd.cookie = login(httpd, 'e'*32)
+        httpd.keys.create('box')
+        before = httpd.keys.list()
+        def fail(*args, **kwargs): raise DatabaseError('private failure')
+        with monkeypatch.context() as patch:
+            patch.setattr(KeyRepo, 'create', fail)
+            patch.setattr(KeyRepo, 'revoke', fail)
+            for method, path, payload in [('POST', '/api/w/default/keys', {'name':'new', 'scope':'sync'}),
+                                          ('DELETE', '/api/w/default/keys/box', None)]:
+                status, _, body = api(httpd, path, method, payload)
+                assert status == 503 and body == {'error':'key store unavailable'}
+            for action in (['create','--name','new'], ['revoke','box']):
+                assert cli.main(['server','keys',*action,'--data',str(tmp_path)]) == 1
+                assert 'private failure' not in capsys.readouterr().err
+        assert httpd.keys.list() == before
+        monkeypatch.setattr(httpd.keys, 'current', fail)
         assert api(httpd)[0] == 503
 
 
-@pytest.mark.parametrize("error", [PermissionError, ValueError, TypeError, RecursionError, KeyStoreUnavailable])
+@pytest.mark.parametrize('error', [PermissionError, ValueError, TypeError, RecursionError, KeyStoreUnavailable])
 def test_touch_read_failure_is_advisory(server, monkeypatch, error):
-    record, secret = server.keys.create("box")
-    assert server.keys.verify(secret) == record  # Reload before making the file unreadable.
-    def unreadable():
-        raise error("private failure")
-    monkeypatch.setattr(server.keys, "_read", unreadable)
+    record, secret = server.keys.create('box')
+    def unreadable(*args): raise error('private failure')
+    monkeypatch.setattr(server.keys.repo, 'touch', unreadable)
     server.keys.touch(record)
-    status, _, body = call(server, "/v2/whoami", headers={"Authorization": "Bearer " + secret})
-    assert status == 200 and json.loads(body)["key"] == "box"
-    for mutate in (lambda: server.keys.create("new"), lambda: server.keys.revoke("box")):
-        with pytest.raises(KeyStoreUnavailable):
-            mutate()
+    status, _, body = call(server, '/v2/whoami', headers={'Authorization':'Bearer '+secret})
+    assert status == 200 and json.loads(body)['key'] == 'box'
 
 
 def test_touch_write_errors_are_throttled(tmp_path, monkeypatch, caplog):
     prepare_data_dir(tmp_path)
-    keys = KeyStore(tmp_path / "server")
+    keys = KeyStore(tmp_path / "server", workspace_id=default_workspace_id(tmp_path / "server"))
     record, secret = keys.create("worker")
     assert keys.verify(secret) == record
     now = [0]
     monkeypatch.setattr("agenticml.server.keys.time.monotonic", lambda: now[0])
-    def unwritable(records):
+    def unwritable(*args):
         raise PermissionError("private failure")
-    monkeypatch.setattr(keys, "_write", unwritable)
+    monkeypatch.setattr(keys.repo, "touch", unwritable)
     for moment in (0, 1, 59):
         now[0] = moment
         keys.touch(record)
@@ -1072,9 +980,9 @@ def test_local_ui_has_no_key_routes(tmp_path):
     thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
     thread.start()
     try:
-        for path in ("/api/server/keys", "/setup", "/static/setup.js"):
+        for path in ("/api/w/default/keys", "/setup", "/static/setup.js"):
             assert call(httpd, path)[0] == 404
-        assert call(httpd, "/api/server/keys/box", "DELETE")[0] == 405
+        assert call(httpd, "/api/w/default/keys/box", "DELETE")[0] == 405
     finally:
         httpd.shutdown()
         thread.join(timeout=5)
@@ -1101,5 +1009,5 @@ def test_api_key_cli_login_and_sync(server, tmp_path, monkeypatch):
         assert remote.series(name) == source.series(name)
     assert (remote.run_dir / "events.jsonl").read_bytes() == (source.run_dir / "events.jsonl").read_bytes()
     assert (remote.run_dir / "media/index.json").read_bytes() == (source.run_dir / "media/index.json").read_bytes()
-    remote_obj = json.loads((remote.run_dir / "remote.json").read_bytes())
+    remote_obj = server.run_index.as_remote(writer.run_id)
     assert remote_obj["owner"] == "admin" and remote_obj["owner_key"] == "box"

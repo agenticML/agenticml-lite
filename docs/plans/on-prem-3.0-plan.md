@@ -64,8 +64,9 @@ Unchanged:
 - Sync protocol v2 (`docs/PROTOCOL.md`): same endpoints, same bytes. A key
   belongs to exactly one workspace, so the server knows the workspace from
   the key and the client does not change. The server stops writing
-  `remote.json` and `artifacts.json` into run directories; the same data is
-  in the database and `/v2/runs/<id>/state` answers as before.
+  `remote.json` into run directories; the same data is in the database
+  and `/v2/runs/<id>/state` answers as before. (`artifacts.json` stays a
+  run file; see package 17.)
 - Workspace roles follow agenticml-server: `owner`, `admin`, `member`,
   `viewer` (2.2's three roles plus `owner`), per workspace.
   Self-hosted sign-in stays as in 2.2 (password + invite, trusted identity
@@ -204,7 +205,7 @@ primary key and of every index.
 | `audit_events` | `audit.jsonl` | 2.2 fields plus workspace (null for server-level events such as workspace creation); no secrets |
 | `runs` | scan of `runs/` + `remote.json` | workspace, run id, project, name, owner account, status, fingerprint, created, last_sync_at, tags, notes |
 | `run_files` | `remote.json` `sizes` | workspace, run id, path, committed size, SHA-256 of atomic files |
-| `run_artifacts` | `artifacts.json` | by-reference artifact mapping |
+| (none) | `artifacts.json` | stays a run file on disk, tracked in `run_files` (changed in package 17: it is client content read by the shared `RunReader`) |
 | `run_metrics` | – | workspace, run id, series id, name, last, min, max, count, last step, decoded byte offset |
 | `objects` | – | workspace, sha256, size, created (which objects a workspace has) |
 | `lineage_refs` | – | workspace, run id, project key, commit |
@@ -463,7 +464,10 @@ follows 18b, then 19; 22 and 23 can follow in parallel (different files).
   files for every series in the test corpus (including NaN, inf and
   restarts), the sort/filter API is tested, the UI suite passes, and the
   runs page has no horizontal overflow at 375px.
-- **23 Operator commands.** 2.x conversion on first start into the
+- **23 Operator commands.** (Changed Nov 7, 2026: packages 16, 17 and 18
+  each import the 2.x state they move, so a 2.x directory keeps working
+  through the release; 23 keeps the end-to-end 2.2-directory test, the
+  refuse-twice hardening, backup and `status`/`verify`.) 2.x conversion on first start into the
   `default` workspace: import `users.json` (users become accounts with a
   membership), `keys.json`, `audit.jsonl`, every `remote.json` and
   `artifacts.json`; the earliest 2.x admin becomes the workspace

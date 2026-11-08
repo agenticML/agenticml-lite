@@ -64,6 +64,17 @@ Update the status column in the PR that changes it. Values: `not started`,
 `planning`, `plan ready`, `in progress`, `in review`, `done (<PR link>)`,
 `blocked: <reason>`. The Plan column links the package plan once written.
 
+Progress is visible while work is under way (decided Nov 8, 2026):
+
+- A package built in several parts gets one sub-row per part (for example
+  18.1a, 18.1b, 18.2) under its own row, each with its own coder and
+  status; the package row is `done` only when every part is.
+- As soon as the first package of a PR is committed, the branch is pushed
+  and a **draft** PR is opened, with the status column already updated.
+  Each later package or part is pushed when it is committed, so the
+  roadmap on the PR branch always shows the current state. The PR leaves
+  draft when every package in it is done and verified.
+
 ### 2.0: self-hosted server, single user
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
@@ -180,16 +191,19 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 16 † | Database layer, SQLite backend, migrations; users, keys, sessions, throttle, audit in tables | 2.2 | Codex | L | – | not started |
-| 17 † | Runs, sync state and notes in the database; append crash safety; run list from the database | 16 | Cursor | L | – | not started |
-| 18 † | Workspaces and accounts: memberships, workspace-bound keys, `/w/<slug>` routes, switcher, server-admin commands, isolation suite | 17 | Codex | L | – | not started |
+| 16 † | Database layer, SQLite backend, migrations; users, keys, sessions, throttle, audit in tables | 2.2 | Codex | L | [plan](packages/16-database-layer.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
+| 17 † | Runs, sync state and notes in the database; append crash safety; run list from the database | 16 | Cursor | L | [plan](packages/17-runs-in-database.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
+| 18 † | Workspaces and accounts: memberships, workspace-bound keys, `/w/<slug>` routes, switcher, server-admin commands, isolation suite | 17 | Codex, Cursor | L | [plan](packages/18-workspaces.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
+| 18.1a | Server core: accounts, workspaces, memberships, migration, `default` conversion, workspace-bound sync, CLI | 17 | Codex, Cursor | L | [plan](packages/18-workspaces.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
+| 18.1b | Route table, `/w/<slug>` and `/api/w/<slug>` routes, account and server-admin APIs, isolation suite | 18.1a | Cursor | L | [plan](packages/18-workspaces.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
+| 18.2 | Dashboard: workspace URLs, switcher, Team and Keys per workspace, admin page, picker | 18.1b | Cursor | M | [plan](packages/18-workspaces.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
 | 18b † | Firebase sign-in for the hosted service | 18 | Cursor | M | – | not started |
 | 18c † | Self-serve sign-up and usage limits (free plan: storage, uploads, requests, people) | 18b | Codex | M | – | not started |
 | 19 † | Postgres backend, row-level security, CI on both backends | 18 | Cursor | M | – | not started |
 | 20 † | Many server processes: database locks, shared throttle and sessions | 19 | Cursor | M | – | not started |
 | 21 | S3 object backend | 18 | Codex | M | – | not started |
 | 22 | Metric summaries; sort and filter runs by metric | 17, 18 | Cursor | M | – | not started |
-| 23 | Operator commands: 2.x conversion, `server backup`, `status`/`verify` on the database | 18 | Codex | S–M | – | not started |
+| 23 | Operator commands: end-to-end 2.x conversion test (the import itself landed in 16–18), `server backup`, `status`/`verify` on the database | 18 | Codex | S–M | – | not started |
 | 24 | AWS hosted deployment (Dockerfile, Terraform, deploy workflow, runbook, real-EFS benchmark) | 18c, 19, 20, 21 | Codex; owner runs it | M | – | not started |
 | 25 | Docs, threat model, version 3.0.0 | 16–24 | Codex; prose Antigravity | M | – | not started |
 | 26 | Retire agenticml-server | 24 live | Owner | S | – | not started |
@@ -255,6 +269,35 @@ Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
+- **Sync client trusts its own cursor after a failed atomic upload** (package 17
+  second review, Nov 8, 2026).
+  - Where: `src/agenticml/sync.py` (atomic-file skip, around line 923).
+  - Problem: if a replacement of an atomic file (for example
+    `scalars/index.json`) reaches the server's disk but the request fails
+    before it is acknowledged, the client keeps its old cursor. If the
+    client's file later returns to the previously acknowledged bytes, the
+    client skips the upload without asking `/state`, so the server keeps
+    the unacknowledged bytes (for example a wrong metric label). Another
+    machine, or a client that asks `/state`, recovers, because `/state`
+    hashes atomic files from disk. 2.2 had the same gap.
+  - Fix: on any failed atomic upload, drop that file's cursor entry so the
+    next pass compares against `/state`.
+  - Done when: a test crashes the server after the rename of an atomic
+    replacement, restores the old bytes on the client, re-syncs with the
+    same `sync.json`, and the server ends with the old bytes.
+- **A removed member's login can be re-added by another workspace**
+  (package 18 review, Nov 8, 2026).
+  - Where: `src/agenticml/server/db/repos.py` `UserRepo.remove` and `add`.
+  - Problem: removing someone from their only workspace keeps their global
+    account (and password) with no memberships. An admin of another
+    workspace can then `add` that login; the account is single-workspace
+    again, so that admin may reset its credentials. Low risk (login-name
+    squatting on a self-hosted server), but surprising.
+  - Fix: when an account loses its last membership, either delete it (if it
+    owns no runs) or mark it so that only a server admin can attach it to a
+    workspace again.
+  - Done when: a test removes a member from their only workspace, another
+    workspace's admin tries to add and reset that login, and is refused.
 - **Compatibility owner rule can mislead a 2.0/2.1 client** (package 11
   review, Nov 6, 2026). Blocked until no 2.0/2.1 sync clients remain.
   - Where: `src/agenticml/server/ingest.py` `compat_owner`.

@@ -24,6 +24,7 @@ from agenticml.store.layout import object_path
 from agenticml.store.overview import OVERVIEW_MIN_POINTS
 from agenticml.store.reader import references_from_bytes, run_references
 from agenticml import sync
+from server_db_helpers import default_workspace_id
 
 
 @contextmanager
@@ -46,7 +47,7 @@ def remote(tmp_path, monkeypatch):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("AGENTICML_CONFIG_DIR", str(tmp_path / "config"))
     with running(tmp_path / "data") as server:
-        _, key = KeyStore(tmp_path / "data" / "server").create("box", scope="sync")
+        _, key = KeyStore(tmp_path / "data" / "server", workspace_id=default_workspace_id(tmp_path / "data" / "server")).create("box", scope="sync")
         url = "http://127.0.0.1:%d" % server.server_address[1]
         with Client(url, key, timeout=2, max_retries=0) as client:
             yield server, client
@@ -102,7 +103,7 @@ def identical(remote, writer, *, dead=False):
     assert allowed(remote[0].root / "runs" / writer.run_id) == expected
     for sha in set().union(*run_references(writer.root, writer.run_id).values()):
         assert object_path(remote[0].root, sha).read_bytes() == object_path(writer.root, sha).read_bytes()
-    return json.loads((remote[0].root / "runs" / writer.run_id / "remote.json").read_bytes())
+    return remote[0].run_index.as_remote(writer.run_id)
 
 
 @pytest.mark.parametrize("status", ["finished", "crashed"])
@@ -309,7 +310,7 @@ def test_prune_preserves_remote_and_gc_synced(remote, tmp_path, capsys):
     assert command(remote, writer, "--reset", writer.run_id) == 0
     assert push(remote, writer).complete
     assert remote_bin.read_bytes() == content
-    assert "scalars/0.bin" not in json.loads((remote_bin.parent.parent / "remote.json").read_bytes())["sizes"]
+    assert "scalars/0.bin" not in remote[0].run_index.as_remote(writer.run_id)["sizes"]
     with running(tmp_path / "second") as server:
         _, key = server.keys.create("box")
         with Client("http://127.0.0.1:%d" % server.server_address[1], key) as client:
@@ -652,10 +653,33 @@ def test_append_mismatch_rewrites_once(remote, tmp_path):
     try:
         push(remote, writer)
         path = remote[0].root / "runs" / writer.run_id / "scalars/0.bin"
+        data = path.read_bytes()
+        path.write_bytes(b"\x00" * 8 + data[8:])
+        saved = json.loads((writer.run_dir / "sync.json").read_text())
+        host = remote[1].base_url
+        saved["hosts"][host]["files"]["scalars/0.bin"]["size"] = 0
+        saved["hosts"][host]["files"]["scalars/0.bin"]["tail"] = hashlib.sha256().hexdigest()
+        (writer.run_dir / "sync.json").write_text(json.dumps(saved))
+        writer.write_scalars([(100, {"loss": .1})])
+        result = push(remote, writer)
+        assert not result.failed
+        assert result.rewritten == 1
+        identical(remote, writer)
+    finally:
+        writer.close()
+
+
+def test_crash_tail_beyond_committed_is_dropped_silently(remote, tmp_path):
+    writer = writer_at(tmp_path, status=None)
+    try:
+        push(remote, writer)
+        path = remote[0].root / "runs" / writer.run_id / "scalars/0.bin"
         with path.open("ab") as handle:
             handle.write(struct.pack("<If", 100, 99.))
         writer.write_scalars([(100, {"loss": .1})])
-        assert push(remote, writer).rewritten == 1
+        result = push(remote, writer)
+        assert not result.failed
+        assert result.rewritten == 0
         identical(remote, writer)
     finally:
         writer.close()

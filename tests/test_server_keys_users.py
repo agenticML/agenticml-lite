@@ -1,4 +1,5 @@
 """Per-user keys and attribution through real dashboard sign-in."""
+from agenticml.server.db import DatabaseError
 from contextlib import contextmanager
 import json
 import threading
@@ -64,11 +65,11 @@ def test_admin_keys_for_users(server):
     assert status == 400 and body == {"error": "admin keys need an admin user"}
     status, _, body = api(server, method="POST", payload={"name": "bad", "scope": "sync", "user": "missing"})
     assert status == 404 and body == {"error": "unknown user"}
-    assert {r["name"] for r in api(server, "/api/server/keys?user=alice")[2]["keys"]} == {"desktop", "laptop"}
-    assert api(server, "/api/server/keys?user=missing")[2]["keys"] == []
-    assert api(server, "/api/server/keys/desktop", "DELETE")[0] == 200
+    assert {r["name"] for r in api(server, "/api/w/default/keys?user=alice")[2]["keys"]} == {"desktop", "laptop"}
+    assert api(server, "/api/w/default/keys?user=missing")[2]["keys"] == []
+    assert api(server, "/api/w/default/keys/desktop", "DELETE")[0] == 200
     for query in ("?user=", "?user=..", "?user=bad%20name"):
-        assert api(server, "/api/server/keys" + query)[0] == 400
+        assert api(server, "/api/w/default/keys" + query)[0] == 400
 
 
 def test_member_keys(server):
@@ -77,7 +78,7 @@ def test_member_keys(server):
     status, _, body = api(server, cookie=cookie)
     assert status == 200 and body["user"] == "alice" and body["role"] == "member"
     assert [r["name"] for r in body["keys"]] == ["alice-session"]
-    assert api(server, "/api/server/keys?user=admin", cookie=cookie)[2]["keys"] == []
+    assert api(server, "/api/w/default/keys?user=admin", cookie=cookie)[2]["keys"] == []
     status, _, body = api(server, method="POST", cookie=cookie, payload={"name": "laptop", "scope": "sync"})
     assert status == 201 and body["record"]["user"] == body["record"]["created_by"] == "alice"
     for payload, message in (
@@ -87,21 +88,21 @@ def test_member_keys(server):
     ):
         status, _, body = api(server, method="POST", cookie=cookie, payload=payload)
         assert status == 403 and body == {"error": message}
-    assert api(server, "/api/server/keys/admin", "DELETE", cookie=cookie)[0] == 404
-    assert api(server, "/api/server/keys/laptop", "DELETE", cookie=cookie)[0] == 200
-    status, headers, body = api(server, "/api/server/keys/alice-session", "DELETE", cookie=cookie)
+    assert api(server, "/api/w/default/keys/admin", "DELETE", cookie=cookie)[0] == 404
+    assert api(server, "/api/w/default/keys/laptop", "DELETE", cookie=cookie)[0] == 200
+    status, headers, body = api(server, "/api/w/default/keys/alice-session", "DELETE", cookie=cookie)
     assert status == 200 and body == {"revoked": "alice-session", "signed_out": False}
     assert "Set-Cookie" not in headers
     assert server.keys.for_user("alice") == []
-    status, _, body = api(server, "/api/server/session", cookie=cookie)
+    status, _, body = api(server, "/api/account/session", cookie=cookie)
     assert status == 200 and body["user"] == "alice" and body["role"] == "member"
     assert body["via"] == "password" and body["key"] is None
 
 
 @pytest.mark.parametrize("method,path,payload", [
-    ("GET", "/api/server/keys", None),
-    ("POST", "/api/server/keys", {"name": "no", "scope": "sync"}),
-    ("DELETE", "/api/server/keys/admin", None),
+    ("GET", "/api/w/default/keys", None),
+    ("POST", "/api/w/default/keys", {"name": "no", "scope": "sync"}),
+    ("DELETE", "/api/w/default/keys/admin", None),
 ])
 def test_viewer_forbidden(server, method, path, payload):
     cookie = principal_session(server, "reader", "viewer")
@@ -118,7 +119,7 @@ def test_inactive_keys_and_removed_user(server, monkeypatch):
     rows = {r["name"]: r for r in api(server)[2]["keys"]}
     assert rows["old-sync"]["active"] and not rows["old-admin"]["active"]
     users.set_role("demoted", "viewer")
-    assert not any(r["active"] for r in api(server, "/api/server/keys?user=demoted")[2]["keys"])
+    assert not any(r["active"] for r in api(server, "/api/w/default/keys?user=demoted")[2]["keys"])
     # A stale record can survive a concurrent removal. It is inactive and a
     # DELETE must not report success, even when list() still returns it.
     stale = server.keys.list()
@@ -126,7 +127,7 @@ def test_inactive_keys_and_removed_user(server, monkeypatch):
     monkeypatch.setattr(server.keys, "list", lambda: stale)
     rows = {r["name"]: r for r in api(server)[2]["keys"]}
     assert not rows["old-sync"]["active"]
-    assert api(server, "/api/server/keys/old-sync", "DELETE")[0] == 404
+    assert api(server, "/api/w/default/keys/old-sync", "DELETE")[0] == 404
 
 
 def test_last_admin_key_counts_usable_admins_only(server):
@@ -134,53 +135,38 @@ def test_last_admin_key_counts_usable_admins_only(server):
     users.add("former", role="admin")
     server.keys.create("old-admin", scope="admin", user="former")
     users.set_role("former", "member")
-    before = server.keys.path.read_bytes()
-    status, _, payload = api(server, "/api/server/keys/admin", "DELETE")
+    before = server.keys.list()
+    status, _, payload = api(server, "/api/w/default/keys/admin", "DELETE")
     assert status == 409 and payload == {
         "error": "last admin key; create another admin key first, or use the CLI",
     }
-    assert server.keys.path.read_bytes() == before
-    status, _, payload = api(server, "/api/server/keys/old-admin", "DELETE")
+    assert server.keys.list() == before
+    status, _, payload = api(server, "/api/w/default/keys/old-admin", "DELETE")
     assert status == 200 and payload == {"revoked": "old-admin", "signed_out": False}
     users.add("other", role="admin")
     server.keys.create("second", scope="admin", user="other")
-    assert api(server, "/api/server/keys/second", "DELETE")[0] == 200
+    assert api(server, "/api/w/default/keys/second", "DELETE")[0] == 200
     server.keys.create("second", scope="admin", user="other")
-    assert api(server, "/api/server/keys/admin", "DELETE")[0] == 200
+    assert api(server, "/api/w/default/keys/admin", "DELETE")[0] == 200
 
 
-@pytest.mark.parametrize("break_users", ["missing", "empty"])
-def test_keep_admin_revoke_fails_closed_without_users_json(server, break_users):
-    before = server.keys.path.read_bytes()
-    path = server.web.users.path
-    if break_users == "missing":
-        path.unlink()
-    else:
-        path.write_text('{"version": 1, "users": []}')
-    with pytest.raises(keys.KeyStoreUnavailable, match="could not load users.json"):
-        server.keys.revoke("admin", keep_admin=True)
-    assert server.keys.path.read_bytes() == before
+@pytest.mark.parametrize('break_users', ['missing', 'empty'])
+def test_keep_admin_revoke_fails_closed_without_users_json(server, monkeypatch, break_users):
+    before = server.keys.list()
+    def fail(*args): raise DatabaseError('private failure')
+    monkeypatch.setattr(server.keys.repo.users, 'list', fail)
+    with pytest.raises(keys.KeyStoreUnavailable): server.keys.revoke('admin', keep_admin=True)
+    assert server.keys.list() == before
 
 
-@pytest.mark.parametrize("break_users", ["corrupt", "unreadable"])
+@pytest.mark.parametrize('break_users', ['corrupt', 'unreadable'])
 def test_unreadable_users_json_dashboard_revoke_503(server, monkeypatch, break_users):
-    before = server.keys.path.read_bytes()
-    admin = server.web.users.get("admin")
-    path = server.web.users.path
-    if break_users == "corrupt":
-        path.write_text("private corrupt contents")
-    else:
-        path.chmod(0o000)
-    # Session auth reloads users.json and would 401; pin get() so the
-    # dashboard request still reaches KeyStore.revoke.
-    monkeypatch.setattr(server.web.users, "get", lambda name: admin if name == "admin" else None)
-    try:
-        status, _, body = api(server, "/api/server/keys/admin", "DELETE")
-    finally:
-        if break_users == "unreadable":
-            path.chmod(0o600)
-    assert status == 503 and body == {"error": "key store unavailable"}
-    assert server.keys.path.read_bytes() == before
+    before = server.keys.list()
+    def fail(*args): raise DatabaseError('private failure')
+    monkeypatch.setattr(server.keys.repo.users, 'list', fail)
+    status, _, body = api(server, '/api/w/default/keys/admin', 'DELETE')
+    assert status == 503 and body == {'error':'key store unavailable'}
+    assert server.keys.list() == before
 
 
 def test_sync_attribution(server, tmp_path, monkeypatch):
@@ -202,8 +188,7 @@ def test_sync_attribution(server, tmp_path, monkeypatch):
     with Client(url, second) as client:
         monkeypatch.setattr(layout, "format_timestamp", lambda: "2026-01-02T00:00:00Z")
         assert push((server, client), writer).complete
-    path = server.root / "runs" / writer.run_id / "remote.json"
-    remote = json.loads(path.read_bytes())
+    remote = server.run_index.as_remote(writer.run_id)
     assert remote["owner"] == "alice" and remote["owner_key"] == "laptop"
     assert remote["last_sync_key"] == "desktop"
     report = admin.status(server.data_dir)
@@ -239,8 +224,9 @@ def test_owner_only_in_server_dashboard(server, tmp_path):
     directory = server.root / "runs" / writer.run_id
     directory.mkdir(parents=True)
     (directory / "meta.json").write_bytes((writer.run_dir / "meta.json").read_bytes())
-    (directory / "remote.json").write_text(json.dumps({"owner": "alice", "owner_key": "laptop"}))
-    for path in ("/api/runs", "/api/runs/" + writer.run_id):
+    from server_db_helpers import adopt_run
+    adopt_run(server.root, directory, server.run_index, owner="alice", owner_key="laptop")
+    for path in ("/api/w/default/runs", "/api/w/default/runs/" + writer.run_id):
         status, _, body = call(server, path, headers={"Cookie": server.cookie})
         assert status == 200
         result = json.loads(body)
@@ -251,8 +237,8 @@ def test_owner_only_in_server_dashboard(server, tmp_path):
             assert status == 200
             result = json.loads(body)
             assert "owner" not in (result[0] if isinstance(result, list) else result)
-    (directory / "remote.json").unlink()
-    assert json.loads(call(server, "/api/runs", headers={"Cookie": server.cookie})[2])[0]["owner"] is None
+    server.run_index.set_owner(writer.run_id, None, None)
+    assert json.loads(call(server, "/api/w/default/runs", headers={"Cookie": server.cookie})[2])[0]["owner"] is None
 
 
 @pytest.mark.parametrize("committed", [False, True])
@@ -299,7 +285,7 @@ def test_whoami_cli_real_server(server, monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("AGENTICML_CONFIG_DIR", str(tmp_path / "config"))
     monkeypatch.setenv("AGENTICML_API_KEY", server.admin_key)
     assert cli.main(["whoami", "--host", f"http://127.0.0.1:{server.server_address[1]}"]) == 0
-    assert "user: admin (admin)\n" in capsys.readouterr().out
+    assert "user: admin (owner)\n" in capsys.readouterr().out
 
 
 def test_status_owner_key_fallback_and_unknown_writer(server):
@@ -310,12 +296,15 @@ def test_status_owner_key_fallback_and_unknown_writer(server):
     (directory / "meta.json").write_text(json.dumps({"run_id": "fallback", "status": "finished"}))
     payload = {"owner": "alice", "owner_key": "laptop", "status": "finished",
                "last_sync_at": "2026-01-01T00:00:00Z"}
-    (directory / "remote.json").write_text(json.dumps(payload))
+    from server_db_helpers import adopt_run
+    adopt_run(server.root, directory, server.run_index, owner="alice", owner_key="laptop",
+              status="finished", last_sync_at=payload["last_sync_at"])
     report = admin.status(server.data_dir)
     row = next(r for r in report["keys"] if r["name"] == "laptop")
     assert row["last_sync_at"] == payload["last_sync_at"] and row["runs"] == 1
     payload["last_sync_key"] = "unknown"
-    (directory / "remote.json").write_text(json.dumps(payload))
+    adopt_run(server.root, directory, server.run_index, owner="alice", owner_key="laptop",
+              status="finished", last_sync_at=payload["last_sync_at"], last_sync_key="unknown")
     report = admin.status(server.data_dir)
     row = next(r for r in report["keys"] if r["name"] == "unknown")
     assert row["revoked"] and row["user"] == "alice" and row["runs"] == 0
@@ -333,7 +322,7 @@ def test_member_cannot_revoke_reused_key_name(server, monkeypatch):
         return original(name, **kwargs)
 
     monkeypatch.setattr(server.keys, "revoke", concurrent_replacement)
-    status, _, body = api(server, "/api/server/keys/laptop", "DELETE", cookie=cookie)
+    status, _, body = api(server, "/api/w/default/keys/laptop", "DELETE", cookie=cookie)
     assert status == 404 and body == {"error": "not found"}
     assert server.keys.for_user("admin")[-1].name == "laptop"
 
@@ -351,7 +340,7 @@ def test_revoke_uses_principal_without_cookie_session(server, monkeypatch):
         return result
 
     monkeypatch.setattr(server.web, "_attach", attach)
-    status, _, body = api(server, "/api/server/keys/laptop", "DELETE")
+    status, _, body = api(server, "/api/w/default/keys/laptop", "DELETE")
     assert status == 200 and body == {"revoked": "laptop", "signed_out": False}
 
 
@@ -364,9 +353,9 @@ def test_reused_key_name_counts_are_per_user(server):
         directory = server.root / "runs" / user
         directory.mkdir(parents=True)
         (directory / "meta.json").write_text(json.dumps({"run_id": user, "status": "finished"}))
-        (directory / "remote.json").write_text(json.dumps({
-            "owner": user, "owner_key": "laptop", "last_sync_key": "laptop",
-            "status": "finished", "last_sync_at": "2026-01-01T00:00:00Z"}))
+        from server_db_helpers import adopt_run
+        adopt_run(server.root, directory, server.run_index, owner=user, owner_key="laptop",
+                  last_sync_key="laptop", status="finished", last_sync_at="2026-01-01T00:00:00Z")
     assert next(r for r in api(server)[2]["keys"] if r["name"] == "laptop")["runs"] == 0
     # Reuse for the member as well: their key row cannot inherit admin's run.
     server.keys.revoke("laptop")
@@ -387,8 +376,9 @@ def test_no_owner_key_counts_only_toward_user(server):
     directory = server.root / "runs" / "legacy"
     directory.mkdir(parents=True)
     (directory / "meta.json").write_text(json.dumps({"run_id": "legacy", "status": "finished"}))
-    (directory / "remote.json").write_text(json.dumps({
-        "owner": "admin", "status": "finished", "last_sync_at": "2026-01-01T00:00:00Z"}))
+    from server_db_helpers import adopt_run
+    adopt_run(server.root, directory, server.run_index, owner="admin",
+              status="finished", last_sync_at="2026-01-01T00:00:00Z")
     assert next(r for r in api(server)[2]["keys"] if r["name"] == "admin")["runs"] == 0
     report = admin.status(server.data_dir)
     assert report["users"][0]["runs"] == 1
@@ -533,9 +523,10 @@ def test_status_owner_key_without_owner_has_no_attribution(server, owner_fields)
     directory = server.root / "runs" / "ownerless"
     directory.mkdir(parents=True)
     (directory / "meta.json").write_text(json.dumps({"run_id": "ownerless", "status": "finished"}))
-    (directory / "remote.json").write_text(json.dumps({
-        **owner_fields, "owner_key": "admin", "last_sync_key": "unknown",
-        "status": "finished", "last_sync_at": "2026-01-01T00:00:00Z"}))
+    from server_db_helpers import adopt_run
+    owner = owner_fields.get("owner") if isinstance(owner_fields.get("owner"), str) else None
+    adopt_run(server.root, directory, server.run_index, owner=owner, owner_key="admin",
+              last_sync_key="unknown", status="finished", last_sync_at="2026-01-01T00:00:00Z")
     report = admin.status(server.data_dir)
     assert report["runs"]["total"] == 1
     assert [(row["name"], row["user"]) for row in report["keys"]] == [("admin", "admin")]
@@ -582,28 +573,31 @@ def test_env_admin_requires_user_in_api_and_cannot_delete_env(tmp_path):
         httpd.web.users.add("bob")
         status, _, body = api(httpd, method="POST", payload={"name": "laptop", "scope": "sync"})
         assert status == 400 and body == {"error": "user is required when the server has more than one user"}
-        status, _, body = api(httpd, "/api/server/keys/env", "DELETE")
+        status, _, body = api(httpd, "/api/w/default/keys/env", "DELETE")
         assert status == 409 and "environment key" in body["error"]
         assert httpd.keys.verify("e" * 32) is not None
 
 
 def test_commit_without_principal_key(tmp_path):
     (tmp_path / "meta.json").write_text(json.dumps({"status": "finished"}))
-    written = {}
     recorded = []
+    committed = []
     handler = SimpleNamespace(
         principal=Principal("alice", "member", "proxy", key=None),
         server=SimpleNamespace(
             audit=SimpleNamespace(record=lambda *args: recorded.append(args)),
-            web=SimpleNamespace(client_address=lambda handler: "127.0.0.1")),
-        _target=lambda directory, name: directory / name,
-        _write_json=lambda directory, name, payload: written.update(payload))
-    result = ingest.IngestHandler._commit(handler, tmp_path, json.dumps({
-        "status": "finished", "fingerprint": "a" * 64, "sizes": {}}).encode(),
+            web=SimpleNamespace(client_address=lambda handler: "127.0.0.1"),
+            run_index=SimpleNamespace(
+                files=lambda run_id: {},
+                commit_sync=lambda *args: committed.append(args))),
+        _target=lambda directory, name: directory / name)
+    handler.workspace = handler.server
+    result = ingest.IngestHandler._commit(
+        handler, tmp_path.name, tmp_path, json.dumps({
+            "status": "finished", "fingerprint": "a" * 64, "sizes": {}}).encode(),
         {"owner": "alice", "owner_key": "laptop"})
     assert result[1] == 200
-    assert written["last_sync_key"] is None
-    assert written["owner"] == "alice" and written["owner_key"] == "laptop"
+    assert committed[0][1:3] == ("finished", "a" * 64) and committed[0][4] is None
     assert recorded == []  # The caller records only after releasing run_lock.
     ingest.IngestHandler._audit_run(handler, tmp_path.name, result[2])
     assert recorded == [("alice", "proxy", "run.finish", tmp_path.name,
@@ -622,7 +616,7 @@ def test_runs_list_reads_remote_once_per_run(server, tmp_path, monkeypatch):
         return original(directory)
 
     monkeypatch.setattr(reader, "read_remote", counted)
-    status, _, raw = call(server, "/api/runs", headers={"Cookie": server.cookie})
+    status, _, raw = call(server, "/api/w/default/runs", headers={"Cookie": server.cookie})
     assert status == 200 and json.loads(raw)[0]["owner"] == "admin"
-    assert len(calls) == 1
+    assert len(calls) == 0
     assert "_remote_owner" not in json.loads(raw)[0]

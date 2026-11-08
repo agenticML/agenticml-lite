@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import re
 import shlex
 import shutil
@@ -16,19 +16,23 @@ import time
 from agenticml import lineage
 from agenticml.store import layout
 from agenticml.store.gc import _format_bytes
-from agenticml.store.reader import list_runs, read_remote, run_references
+from agenticml.store.reader import _remote_status, run_references
 from .app import resolve_data_dir
-from .keys import KeyStore
+from .keys import KeyStore, KeyStoreUnavailable
+from .db import DatabaseError, DatabaseUrlError, SchemaTooNew, for_server_dir
+from .db.repos import RunRepo
+from .db.workspaces import WorkspaceRepo
+from .workspaces import store_root
 from .lineage import _git
-from .users import UserStore, attribution
+from .users import UserStore
 
 _STATUSES = ("running", "finished", "crashed", "stale", "unsynced")
 _OBJECT_TMP = re.compile(r"\.(?:tmp|[0-9a-f]{64})\.\d+\.\d+\.[0-9a-f]{8}\.tmp\Z")
 
 
-def _data_root(data):
+def _data_root(data, database=None):
     data = resolve_data_dir(data)
-    for path in (data, data / "store", data / "server"):
+    for path in (data, data / "server"):
         try:
             if not stat.S_ISDIR(path.lstat().st_mode):
                 raise ValueError(f"not a directory or is a symlink: {path}")
@@ -36,7 +40,17 @@ def _data_root(data):
                 pass
         except FileNotFoundError:
             raise ValueError(f"no server data at {data}") from None
-    return data, data / "store"
+    try:
+        db = for_server_dir(data / 'server', database, create=False)
+        default = WorkspaceRepo(db).get('default') if db else None
+    except (SchemaTooNew, DatabaseUrlError):
+        raise
+    except DatabaseError:
+        default = None
+    root = store_root(data, default['id']) if default else data / 'store'
+    if root.is_symlink():
+        raise ValueError("store is a symlink")
+    return data, root
 
 
 def _safe_path(root, path):
@@ -69,31 +83,43 @@ def _walk(path, on_error, *, missing_ok=True, descend=None):
         yield from _walk(child, on_error, missing_ok=False, descend=descend)
 
 
-def status(data) -> dict:
-    data, root = _data_root(data)
+def status(data, *, database=None) -> dict:
+    data, root = _data_root(data, database)
     counts = dict.fromkeys(_STATUSES, 0)
     keys = []
     warnings = []
     keys_loaded = True
+    db = None
     try:
-        # Use the authoritative read path: list() deliberately swallows corrupt
-        # files for authentication, but an operator needs to see that failure.
-        records = KeyStore(data / "server")._read_v1_or_v2()
-    except (OSError, ValueError, TypeError, RecursionError):
-        records = []
+        db = for_server_dir(data / 'server', database, create=False)
+        from .workspaces import default_workspace_id
+        wid = default_workspace_id(db) if db is not None else None
+        records = KeyStore(data / 'server', db=db, workspace_id=wid).list() if db is not None else []
+        user_records = UserStore(data / 'server', db=db, workspace_id=wid).list() if db is not None else []
+        if db is None:
+            for name in ('users.json', 'keys.json'):
+                try:
+                    (data / 'server' / name).lstat()
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    continue
+                warnings.append(
+                    'found 2.x users.json/keys.json with no database; '
+                    'start the server to import them')
+                break
+    except (SchemaTooNew, DatabaseUrlError):
+        raise
+    except (DatabaseError, KeyStoreUnavailable):
+        records, user_records = [], []
         keys_loaded = False
-        warnings.append("could not load server/keys.json; key revocation status is unknown")
+        warnings.append('could not load server database; key and user status is unknown')
     for record in records:
         row = record.to_public()
-        row.pop("created_by")
+        row.pop('created_by')
         row.update(runs=0, last_sync_at=None)
         keys.append(row)
-    by_key = {(row["name"], row["user"]): row for row in keys}
-    try:
-        user_records = UserStore(data / "server")._read()
-    except (OSError, ValueError, TypeError, RecursionError):
-        user_records = []
-        warnings.append("could not load server/users.json; user status is unknown")
+    by_key = {(row['name'], row['user']): row for row in keys}
     users = [{"name": user.name, "role": user.role, "keys": 0, "runs": 0, "last_sync_at": None}
              for user in user_records]
     by_user = {row["name"]: row for row in users}
@@ -120,26 +146,34 @@ def status(data) -> dict:
             row["last_sync_at"] = stamp
 
     _safe_path(root, root / "runs")
-    runs = list_runs(root)
-    for meta in runs:
-        directory = root / "runs" / meta["run_id"]
-        remote = read_remote(directory)
-        effective = meta["effective_status"] if remote and remote["status"] else "unsynced"
+    run_rows = []
+    if db is not None:
+        try:
+            run_rows = RunRepo(db, WorkspaceRepo(db).require('default')['id']).all_rows()
+        except DatabaseError:
+            run_rows = []
+            warnings.append('could not load runs from the server database')
+    else:
+        run_rows = []
+    now = time.time()
+    for row in run_rows:
+        if row["status"]:
+            effective = _remote_status(
+                {"status": row["status"], "last_sync_at": row["last_sync_at"]}, now)
+        else:
+            effective = "unsynced"
         counts[effective] = counts.get(effective, 0) + 1
-        owner_user, _ = attribution(directory)
+        owner_user = row["owner_user"] if isinstance(row["owner_user"], str) else None
+        owner_key = row["owner_key"] if isinstance(row["owner_key"], str) else None
+        stamp = row["last_sync_at"]
+        writer = row["last_sync_key"] if isinstance(row["last_sync_key"], str) else None
         if owner_user in by_user:
             by_user[owner_user]["runs"] += 1
-        if remote is None:
-            continue
-        owner = remote["owner"]
-        stamp = remote["last_sync_at"]
-        if owner_user in by_user:
             last_sync(by_user[owner_user], stamp)
-        creator = remote["owner_key"]
-        if creator is not None and owner is not None:
-            key_row(creator, owner)["runs"] += 1
-            writer = remote["last_sync_key"] or creator
-            last_sync(key_row(writer, owner), stamp)
+        if owner_key is not None and owner_user is not None:
+            key_row(owner_key, owner_user)["runs"] += 1
+            last_sync(key_row(writer or owner_key, owner_user), stamp)
+    runs = run_rows
     sizes = {"objects_count": 0, "skipped": 0}
 
     def skipped(path, exc):
@@ -159,8 +193,9 @@ def status(data) -> dict:
             "sizes": sizes, "keys": keys, "users": users, "warnings": warnings}
 
 
-def verify(data, *, progress=False) -> dict:
-    data, root = _data_root(data)
+def verify(data, *, progress=False, database=None) -> dict:
+    data, root = _data_root(data, database)
+    db = for_server_dir(data / 'server', database, create=False)
     report = {"ok": True, "checked": {"objects": 0, "runs": 0}, "problems": [], "warnings": []}
 
     def add(kind, path, detail, *, warning=False):
@@ -221,7 +256,7 @@ def verify(data, *, progress=False) -> dict:
             add("run_unreadable", directory, str(exc))
             continue
         report["checked"]["runs"] += 1
-        _verify_remote(root, directory, add)
+        _verify_run_files(root, directory, add, db)
         try:
             refs = run_references(root, directory.name)
             for sha in sorted(set().union(*refs.values())):
@@ -310,44 +345,51 @@ def _referenced_object(objects, sha, prefixes):
     return True
 
 
-def _verify_remote(root, directory, add):
-    path = directory / "remote.json"
-    try:
-        remote = json.loads(layout.read_file_nofollow(path))
-        if not isinstance(remote, dict):
-            raise ValueError("expected a JSON object")
-        if "status" in remote and remote["status"] not in ("running", "finished", "crashed"):
-            raise ValueError("invalid status")
-        sizes = remote.get("sizes", {})
-        if not isinstance(sizes, dict):
-            raise ValueError("invalid sizes")
-        for name, size in sizes.items():
-            parts = PurePosixPath(name)
-            if (not name or parts.is_absolute() or ".." in parts.parts or "\\" in name
-                    or type(size) is not int or size < 0):
-                raise ValueError("invalid size entry")
-    except FileNotFoundError:
+def _verify_run_files(root, directory, add, db):
+    if db is None:
         return
-    except (OSError, ValueError, TypeError, RecursionError) as exc:
-        add("remote_invalid", path, str(exc))
+    index = RunRepo(db, WorkspaceRepo(db).require('default')['id'])
+    if index.get(directory.name) is None:
+        add("unindexed_run", directory, "unindexed run; run agenticml server reindex",
+            warning=True)
         return
-    for name, expected in sizes.items():
+    files = index.files(directory.name)
+    if not files:
+        return
+    for name, info in files.items():
+        expected = info["size"]
         target = directory / name
         try:
-            info = _safe_path(root, target).lstat()
-            if not stat.S_ISREG(info.st_mode):
+            st = _safe_path(root, target).lstat()
+            if not stat.S_ISREG(st.st_mode):
                 raise ValueError("not a regular file")
-            found = info.st_size
+            found = st.st_size
         except FileNotFoundError:
             add("size_mismatch", target, "missing")
             continue
         except (OSError, ValueError) as exc:
             add("size_mismatch", target, str(exc))
             continue
-        if found != expected:
-            ahead = found > expected and remote.get("status") == "running"
-            add("size_ahead" if ahead else "size_mismatch", target,
-                f"expected {expected}, found {found}", warning=ahead)
+        if found < expected:
+            add("size_mismatch", target, f"expected {expected}, found {found}")
+        elif found > expected:
+            add("uncommitted_tail", target, f"expected {expected}, found {found}", warning=True)
+        sha = info.get("sha256")
+        if sha and found == expected:
+            try:
+                digest = hashlib.sha256()
+                with layout.open_nofollow(target) as handle:
+                    remaining = expected
+                    while remaining:
+                        chunk = handle.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        remaining -= len(chunk)
+                if digest.hexdigest() != sha:
+                    add("file_hash", target, f"SHA-256 is {digest.hexdigest()}")
+            except (OSError, ValueError) as exc:
+                add("file_hash", target, str(exc))
 
 
 def _verify_lineage(root, directory, add):

@@ -125,7 +125,7 @@ printf '%s' "$admin_key" | \
     --header 'Content-Type: application/json' --header 'X-AgenticML-Request: 1' --header "Origin: $base_url" \
     --cookie-jar "$temp_dir/cookies" --data-binary @- "$base_url/login" > /dev/null
 curl --silent --show-error --fail --max-time 10 --cookie "$temp_dir/cookies" \
-    "$base_url/api/runs" >"$temp_dir/runs.json"
+    "$base_url/api/w/default/runs" >"$temp_dir/runs.json"
 "$PYTHON" - "$temp_dir/runs.json" "$run_id" <<'PY'
 import json
 import sys

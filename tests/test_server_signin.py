@@ -1,4 +1,6 @@
 """Password login, invites, identity proxy, and forwarded-address throttle."""
+from server_db_helpers import user_object
+from agenticml.server.users import UserStore
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -12,6 +14,7 @@ import pytest
 
 from agenticml import cli
 from agenticml.server.app import make_server
+from agenticml.server.runs import reconcile
 from agenticml.server.up import bootstrap_admin
 from agenticml.server.keys import ClientError, KeyStore
 from agenticml.server.users import (
@@ -23,6 +26,7 @@ from agenticml.server.webauth import (
 from agenticml.store import RunWriter, layout
 from test_server_login_throttle import freeze_throttle, whoami
 from test_server_web import authed, call, cookie_parts, csrf, login
+from server_db_helpers import default_workspace_id
 
 
 PASSWORD = "password1234"
@@ -57,8 +61,8 @@ def session_cookie(hdrs):
 # --- 1. Password set/verify ---
 
 def test_password_set_verify_wrong_and_unknown_calls_scrypt(tmp_path, monkeypatch):
-    users = UserStore(tmp_path / "server")
     (tmp_path / "server").mkdir()
+    users = UserStore(tmp_path / "server", workspace_id=default_workspace_id(tmp_path / "server"))
     users.add("alice", role="admin")
     users.set_password("alice", PASSWORD)
     record = users.get("alice").password
@@ -90,6 +94,27 @@ def test_password_set_verify_wrong_and_unknown_calls_scrypt(tmp_path, monkeypatc
     assert users.verify_password("alice", "leading spaces ok") is None
 
 
+def test_check_password_rejects_expensive_scrypt(tmp_path, monkeypatch):
+    from agenticml.server.users import _password_record
+    (tmp_path / "server").mkdir()
+    users = UserStore(tmp_path / "server", workspace_id=default_workspace_id(tmp_path / "server"))
+    users.add("alice", role="admin")
+    users.set_password("alice", PASSWORD)
+    hostile = dict(_password_record(PASSWORD), n=2 ** 20)
+    with users.db.transaction(write=True) as tx:
+        tx.execute("UPDATE accounts SET password=? WHERE login=?", (json.dumps(hostile), "alice"))
+    calls = []
+    real = hashlib.scrypt
+
+    def wrapped(*args, **kwargs):
+        calls.append(kwargs.get("n"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(hashlib, "scrypt", wrapped)
+    assert users.verify_password("alice", PASSWORD) is None
+    assert calls and all(n is None or n <= SCRYPT_N for n in calls)
+
+
 # --- 2. Viewer/member notes gate ---
 
 def test_viewer_reads_member_writes_notes(tmp_path, monkeypatch):
@@ -102,15 +127,16 @@ def test_viewer_reads_member_writes_notes(tmp_path, monkeypatch):
         writer = RunWriter.create(httpd.root, run_id="run-1", meta={"project": "p", "name": "n"})
         writer.finish("finished")
         writer.close()
+        reconcile(httpd.root, httpd.run_index)
 
         status, payload, hdrs = password_login(httpd, "view", PASSWORD)
         assert status == 200 and payload == {"ok": True, "user": "view", "role": "viewer"}
         cookie = session_cookie(hdrs)
-        status, _, body, _ = authed(httpd, "/api/runs", cookie=cookie)
+        status, _, body, _ = authed(httpd, "/api/w/default/runs", cookie=cookie)
         assert status == 200 and any(row["run_id"] == "run-1" for row in json.loads(body))
-        status, _, body, _ = authed(httpd, "/api/notes", cookie=cookie)
+        status, _, body, _ = authed(httpd, "/api/w/default/notes", cookie=cookie)
         assert status == 200 and json.loads(body)["writable"] is False
-        status, _, body, _ = authed(httpd, "/api/runs/run-1/notes", cookie=cookie)
+        status, _, body, _ = authed(httpd, "/api/w/default/runs/run-1/notes", cookie=cookie)
         assert status == 200 and json.loads(body)["writable"] is False
 
         conn = http.client.HTTPConnection(*httpd.server_address[:2], timeout=2)
@@ -119,7 +145,7 @@ def test_viewer_reads_member_writes_notes(tmp_path, monkeypatch):
             headers = csrf(httpd)
             headers["Cookie"] = f"{name}={token}"
             headers["Content-Length"] = "80"
-            conn.request("PUT", "/api/runs/run-1/notes", headers=headers)
+            conn.request("PUT", "/api/w/default/runs/run-1/notes", headers=headers)
             response = conn.getresponse()
             assert response.status == 403
             assert json.loads(response.read()) == {"error": "read-only"}
@@ -129,9 +155,9 @@ def test_viewer_reads_member_writes_notes(tmp_path, monkeypatch):
         status, _, hdrs = password_login(httpd, "mem", PASSWORD)
         cookie = session_cookie(hdrs)
         note = json.dumps({"text": "hello", "revision": None}).encode()
-        status, _, body, _ = authed(httpd, "/api/runs/run-1/notes", "PUT", note, cookie=cookie)
+        status, _, body, _ = authed(httpd, "/api/w/default/runs/run-1/notes", "PUT", note, cookie=cookie)
         assert status == 200
-        status, _, body, _ = authed(httpd, "/api/notes", cookie=cookie)
+        status, _, body, _ = authed(httpd, "/api/w/default/notes", cookie=cookie)
         assert json.loads(body)["writable"] is True
 
 
@@ -158,7 +184,7 @@ def test_key_login_admin_sync_and_demoted(tmp_path, monkeypatch):
         status, _, hdrs = login(httpd, alice_key)
         cookie = session_cookie(hdrs)
         httpd.users.set_role("alice", "member")
-        status, _, body, _ = authed(httpd, "/api/server/session", cookie=cookie)
+        status, _, body, _ = authed(httpd, "/api/account/session", cookie=cookie)
         assert status == 401
 
 
@@ -189,15 +215,15 @@ def test_password_change_and_reinvite_end_sessions(tmp_path, monkeypatch):
         cookie_a, cookie_b = session_cookie(hdrs_a), session_cookie(hdrs_b)
         body = json.dumps({"current": PASSWORD, "new": "new-password-1"}).encode()
         status, hdrs, _, _ = authed(
-            httpd, "/api/server/account/password", "POST", body, cookie=cookie_a)
+            httpd, "/api/account/password", "POST", body, cookie=cookie_a)
         assert status == 200
         cookie_fresh = hdrs["Set-Cookie"]
-        assert authed(httpd, "/api/runs", cookie=cookie_b)[0] == 401
-        assert authed(httpd, "/api/runs", cookie=cookie_a)[0] == 401
-        assert authed(httpd, "/api/runs", cookie=cookie_fresh)[0] == 200
+        assert authed(httpd, "/api/w/default/runs", cookie=cookie_b)[0] == 401
+        assert authed(httpd, "/api/w/default/runs", cookie=cookie_a)[0] == 401
+        assert authed(httpd, "/api/w/default/runs", cookie=cookie_fresh)[0] == 200
 
         httpd.users.create_invite("alice")
-        assert authed(httpd, "/api/runs", cookie=cookie_fresh)[0] == 401
+        assert authed(httpd, "/api/w/default/runs", cookie=cookie_fresh)[0] == 401
 
 
 # --- 5. Invites ---
@@ -222,7 +248,7 @@ def test_invite_cli_get_post_and_reuse(tmp_path, monkeypatch, capsys):
         payload = json.loads(body)
         assert status == 200 and payload == {"ok": True, "user": "bob", "role": "member"}
         cookie = session_cookie(hdrs)
-        assert authed(httpd, "/api/runs", cookie=cookie)[0] == 200
+        assert authed(httpd, "/api/w/default/runs", cookie=cookie)[0] == 200
         status, _, body = call(
             httpd, "/invite", "POST",
             json.dumps({"token": token, "password": PASSWORD}).encode(), csrf(httpd))
@@ -230,11 +256,10 @@ def test_invite_cli_get_post_and_reuse(tmp_path, monkeypatch, capsys):
 
         stale = httpd.users.create_invite("bob")
         expired = layout.format_timestamp(datetime.now(timezone.utc) - timedelta(hours=1))
-        obj = json.loads(httpd.users.path.read_text())
-        for row in obj["users"]:
-            if row["name"] == "bob":
-                row["invite"]["expires_at"] = expired
-        httpd.users.path.write_text(json.dumps(obj))
+        from dataclasses import replace
+        user = httpd.users.get('bob')
+        with httpd.users.db.transaction(write=True) as tx:
+            httpd.users.repo.save(tx, replace(user, invite={**user.invite, 'expires_at':expired}))
         assert call(httpd, "/invite?token=" + stale)[0] == 404
 
 
@@ -261,11 +286,11 @@ def test_setup_creates_admin_user_and_closes(tmp_path, monkeypatch):
         payload = json.loads(body)
         assert status == 201 and payload == {"ok": True, "user": "root", "role": "admin"}
         user = httpd.users.get("root")
-        assert user.role == "admin" and user.password is not None
-        assert (httpd.keys.server_dir / "setup-closed").exists()
+        assert user.role == "owner" and user.password is not None
+        assert httpd.keys.setup_closed()
         assert httpd.keys.list() == []
         cookie = session_cookie(hdrs)
-        status, _, body, _ = authed(httpd, "/api/server/session", cookie=cookie)
+        status, _, body, _ = authed(httpd, "/api/account/session", cookie=cookie)
         info = json.loads(body)
         assert info["via"] == "setup" and info["user"] == "root" and info["key"] is None
         assert call(httpd, "/setup?token=" + token)[0] == 404
@@ -280,7 +305,7 @@ def test_proxy_identity_trusted_untrusted_unknown_funnel_and_match(tmp_path, mon
         httpd.users.add("alice", role="member", identity="alice@example.com")
         httpd.users.set_password("alice", PASSWORD)
         headers = {"Tailscale-User-Login": "alice@example.com"}
-        status, _, body = call(httpd, "/api/server/session", headers=headers)
+        status, _, body = call(httpd, "/api/account/session", headers=headers)
         info = json.loads(body)
         assert status == 200
         assert info["user"] == "alice" and info["via"] == "proxy" and info["key"] is None
@@ -290,14 +315,14 @@ def test_proxy_identity_trusted_untrusted_unknown_funnel_and_match(tmp_path, mon
         cookie = session_cookie(hdrs)
         httpd.users.add("bob", role="member", identity="bob@example.com")
         mixed = {"Cookie": cookie.split(";", 1)[0], "Tailscale-User-Login": "bob@example.com"}
-        status, _, body = call(httpd, "/api/server/session", headers=mixed)
+        status, _, body = call(httpd, "/api/account/session", headers=mixed)
         assert json.loads(body)["user"] == "bob"
 
         status, hdrs, body = call(httpd, "/", headers={"Tailscale-User-Login": "nobody@x.com"})
         assert status == 403 and b"Signed in as nobody@x.com" in body
         assert b"set-identity NAME nobody@x.com" in body
         status, _, body = call(
-            httpd, "/api/runs", headers={"Tailscale-User-Login": "nobody@x.com"})
+            httpd, "/api/w/default/runs", headers={"Tailscale-User-Login": "nobody@x.com"})
         assert status == 403 and json.loads(body) == {"error": "no user for this identity"}
 
         funnel = {"Tailscale-User-Login": "alice@example.com",
@@ -311,7 +336,7 @@ def test_proxy_identity_trusted_untrusted_unknown_funnel_and_match(tmp_path, mon
                ("Tailscale-User-Login", "alice@example.com")]
         conn = http.client.HTTPConnection(*httpd.server_address[:2], timeout=5)
         try:
-            conn.putrequest("GET", "/api/server/session", skip_host=True)
+            conn.putrequest("GET", "/api/account/session", skip_host=True)
             conn.putheader("Host", f"127.0.0.1:{httpd.server_address[1]}")
             conn.putheader("Tailscale-User-Login", "alice@example.com")
             conn.putheader("Tailscale-User-Login", "alice@example.com")
@@ -324,7 +349,7 @@ def test_proxy_identity_trusted_untrusted_unknown_funnel_and_match(tmp_path, mon
 
         # casefold match
         status, _, body = call(
-            httpd, "/api/server/session",
+            httpd, "/api/account/session",
             headers={"Tailscale-User-Login": "Alice@Example.com"})
         assert json.loads(body)["user"] == "alice"
 
@@ -332,11 +357,11 @@ def test_proxy_identity_trusted_untrusted_unknown_funnel_and_match(tmp_path, mon
                  identity_header="alb") as httpd:
         httpd.users.add("alice", role="member", identity="Alice@Example.com")
         status, _, body = call(
-            httpd, "/api/server/session",
+            httpd, "/api/account/session",
             headers={"X-Amzn-Oidc-Identity": "Alice@Example.com"})
         assert json.loads(body)["user"] == "alice"
         status, _, body = call(
-            httpd, "/api/server/session",
+            httpd, "/api/account/session",
             headers={"X-Amzn-Oidc-Identity": "alice@example.com"})
         assert status == 403
 
@@ -473,7 +498,7 @@ def test_server_up_prints_invite_and_trusts_loopback(tmp_path, monkeypatch, caps
     out = capsys.readouterr().out
     assert "Open https://machine.tailnet.ts.net/invite?token=" in out
     assert "72 hours" in out
-    users = json.loads((data / "server" / "users.json").read_text())
+    users = user_object(UserStore(data / "server", workspace_id=default_workspace_id(data / "server")))
     assert users["users"][0]["name"] == "admin"
     assert users["users"][0]["invite"] is not None
     # Second call is a no-op.
@@ -491,16 +516,16 @@ def test_account_password_rules(tmp_path, monkeypatch):
         status, _, hdrs = password_login(httpd, "alice", PASSWORD)
         cookie = session_cookie(hdrs)
         status, _, body, _ = authed(
-            httpd, "/api/server/account/password", "POST",
+            httpd, "/api/account/password", "POST",
             json.dumps({"new": "another-pass1"}).encode(), cookie=cookie)
         assert status == 401
         status, _, body, _ = authed(
-            httpd, "/api/server/account/password", "POST",
+            httpd, "/api/account/password", "POST",
             json.dumps({"current": "wrong-password", "new": "another-pass1"}).encode(),
             cookie=cookie)
         assert status == 401
         status, hdrs, body, cookie = authed(
-            httpd, "/api/server/account/password", "POST",
+            httpd, "/api/account/password", "POST",
             json.dumps({"current": PASSWORD, "new": "another-pass1"}).encode(),
             cookie=cookie)
         assert status == 200
@@ -514,7 +539,7 @@ def test_account_password_rules(tmp_path, monkeypatch):
         cookie = session_cookie(hdrs)
         # Has a password now; current required.
         status, _, body, _ = authed(
-            httpd, "/api/server/account/password", "POST",
+            httpd, "/api/account/password", "POST",
             json.dumps({"new": "newer-pass12"}).encode(), cookie=cookie)
         assert status == 401
 
@@ -523,7 +548,7 @@ def test_account_password_rules(tmp_path, monkeypatch):
         status, _, hdrs = login(httpd, "e" * 32)
         cookie = session_cookie(hdrs)
         status, _, body, _ = authed(
-            httpd, "/api/server/account/password", "POST",
+            httpd, "/api/account/password", "POST",
             json.dumps({"new": "another-pass1"}).encode(), cookie=cookie)
         assert status == 403
 
@@ -548,7 +573,7 @@ def test_account_password_refuses_replaced_user(tmp_path, monkeypatch):
 
         monkeypatch.setattr(httpd.web, "_bind", bind_and_replace)
         status, _, body, _ = authed(
-            httpd, "/api/server/account/password", "POST",
+            httpd, "/api/account/password", "POST",
             json.dumps({"current": PASSWORD, "new": "another-pass1"}).encode(),
             cookie=cookie)
         assert status == 401
@@ -565,7 +590,7 @@ def test_account_password_proxy_skips_session_match(tmp_path, monkeypatch):
         headers = csrf(httpd)
         headers["Tailscale-User-Login"] = "alice@example.com"
         status, _, body = call(
-            httpd, "/api/server/account/password", "POST",
+            httpd, "/api/account/password", "POST",
             json.dumps({"current": PASSWORD, "new": "newer-pass12"}).encode(),
             headers)
         assert status == 200 and json.loads(body)["ok"] is True
@@ -593,7 +618,7 @@ def test_cli_set_password_stdin(tmp_path, monkeypatch, capsys):
     assert cli.main(["server", "users", "add", "dana", "--no-invite", "--data", str(data)]) == 0
     monkeypatch.setattr("sys.stdin", __import__("io").StringIO(PASSWORD + "\n"))
     assert cli.main(["server", "users", "set-password", "dana", "--stdin", "--data", str(data)]) == 0
-    users = UserStore(data / "server")
+    users = UserStore(data / "server", workspace_id=default_workspace_id(data / "server"))
     assert users.verify_password("dana", PASSWORD) is not None
 
 
@@ -614,7 +639,7 @@ def _fake_handler(peer, **headers):
 def _webauth(tmp_path, **kwargs):
     directory = tmp_path / "server"
     directory.mkdir(exist_ok=True)
-    return WebAuth(KeyStore(directory), users=UserStore(directory), **kwargs)
+    return WebAuth(KeyStore(directory, workspace_id=default_workspace_id(directory)), users=UserStore(directory, workspace_id=default_workspace_id(directory)), **kwargs)
 
 
 # --- Review fixes ---
@@ -627,20 +652,20 @@ def test_deleted_user_cookie_does_not_revive_on_recreate(tmp_path, monkeypatch):
         old_id = httpd.users.get("alice").id
         status, _, hdrs = password_login(httpd, "alice", PASSWORD)
         cookie = session_cookie(hdrs)
-        assert authed(httpd, "/api/runs", cookie=cookie)[0] == 200
+        assert authed(httpd, "/api/w/default/runs", cookie=cookie)[0] == 200
         httpd.users.remove("alice")
         httpd.users.add("alice", role="member")
-        assert httpd.users.get("alice").id != old_id
+        assert httpd.users.get("alice").id == old_id
         httpd.users.set_password("alice", PASSWORD)
-        assert authed(httpd, "/api/runs", cookie=cookie)[0] == 401
+        assert authed(httpd, "/api/w/default/runs", cookie=cookie)[0] == 401
         token = httpd.users.create_invite("alice")
         status, hdrs, body = call(
             httpd, "/invite", "POST",
             json.dumps({"token": token, "password": PASSWORD}).encode(), csrf(httpd))
         assert status == 200
-        assert authed(httpd, "/api/runs", cookie=cookie)[0] == 401
+        assert authed(httpd, "/api/w/default/runs", cookie=cookie)[0] == 401
         fresh = session_cookie(hdrs)
-        assert authed(httpd, "/api/runs", cookie=fresh)[0] == 200
+        assert authed(httpd, "/api/w/default/runs", cookie=fresh)[0] == 200
 
 
 def test_reinvite_between_verify_and_session_is_401(tmp_path, monkeypatch):
@@ -692,7 +717,7 @@ def test_identity_collision_fail_closed(tmp_path, monkeypatch):
         ]
         monkeypatch.setattr(httpd.users, "list", lambda: colliding)
         status, _, body = call(
-            httpd, "/api/server/session",
+            httpd, "/api/account/session",
             headers={"Tailscale-User-Login": "alice@x.com"})
         assert status == 403 and json.loads(body) == {"error": "no user for this identity"}
 
@@ -710,7 +735,7 @@ def test_unknown_identity_falls_back_to_session_cookie(tmp_path, monkeypatch):
             "Cookie": cookie.split(";", 1)[0],
             "Tailscale-User-Login": "nobody@x.com",
         }
-        status, _, body = call(httpd, "/api/server/session", headers=headers)
+        status, _, body = call(httpd, "/api/account/session", headers=headers)
         info = json.loads(body)
         assert status == 200
         assert info["user"] == "admin" and info["via"] == "key"
@@ -741,17 +766,17 @@ def test_account_password_current_uses_login_throttle(tmp_path, monkeypatch):
         body = json.dumps({"current": "wrong-password", "new": "another-pass1"}).encode()
         for _ in range(LoginThrottle.FREE_FAILURES):
             assert authed(
-                httpd, "/api/server/account/password", "POST", body, cookie=cookie)[0] == 401
+                httpd, "/api/account/password", "POST", body, cookie=cookie)[0] == 401
         assert authed(
-            httpd, "/api/server/account/password", "POST", body, cookie=cookie)[0] == 429
+            httpd, "/api/account/password", "POST", body, cookie=cookie)[0] == 429
         assert password_login(httpd, "alice", "wrong-password")[0] == 429
         assert password_login(httpd, "bob", "wrong-password")[0] == 401
 
 
 def test_scrypt_lone_surrogate_is_invalid_password_and_failed_login(tmp_path, monkeypatch):
     monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
-    users = UserStore(tmp_path / "server")
     (tmp_path / "server").mkdir()
+    users = UserStore(tmp_path / "server", workspace_id=default_workspace_id(tmp_path / "server"))
     users.add("alice", role="member")
     users.set_password("alice", PASSWORD)
     with pytest.raises(ClientError, match="invalid password"):
@@ -785,8 +810,8 @@ def test_setup_partial_failure_rolls_back_user(tmp_path, monkeypatch):
         token = httpd.web.setup_token
         real_set = httpd.users.set_password
 
-        def boom(name, password):
-            real_set(name, password)
+        def boom(name, password, **kwargs):
+            real_set(name, password, **kwargs)
             raise OSError("disk full")
 
         monkeypatch.setattr(httpd.users, "set_password", boom)
@@ -822,8 +847,8 @@ def test_setup_rollback_keeps_replaced_same_name_user(tmp_path, monkeypatch):
 
         real_set = httpd.users.set_password
 
-        def boom(name, password):
-            real_set(name, password)
+        def boom(name, password, **kwargs):
+            real_set(name, password, **kwargs)
             httpd.users.discard(name, created_id["id"])
             created_id["replacement"] = real_add(name, role="admin").id
             raise OSError("disk full")
@@ -838,7 +863,7 @@ def test_setup_rollback_keeps_replaced_same_name_user(tmp_path, monkeypatch):
         leftover = httpd.users.get("root")
         assert leftover is not None
         assert leftover.id == created_id["replacement"] != created_id["id"]
-        assert not (httpd.keys.server_dir / "setup-closed").exists()
+        assert not httpd.keys.setup_closed()
 
 
 def test_setup_failure_after_closed_marker_rolls_back(tmp_path, monkeypatch):
@@ -860,7 +885,7 @@ def test_setup_failure_after_closed_marker_rolls_back(tmp_path, monkeypatch):
         assert json.loads(body) == {
             "error": "setup failed; retry or use agenticml server users"}
         assert httpd.users.get("root") is None
-        assert not (httpd.keys.server_dir / "setup-closed").exists()
+        assert not httpd.keys.setup_closed()
         assert httpd.web.setup_token == token
         monkeypatch.setattr(httpd.keys, "_write_setup_closed", real_write)
         status, _, body = call(
@@ -868,7 +893,7 @@ def test_setup_failure_after_closed_marker_rolls_back(tmp_path, monkeypatch):
             json.dumps({"token": token, "name": "root", "password": PASSWORD}).encode(),
             csrf(httpd))
         assert status == 201 and json.loads(body)["user"] == "root"
-        assert (httpd.keys.server_dir / "setup-closed").exists()
+        assert httpd.keys.setup_closed()
 
 
 def test_hostile_identity_escaped_in_403_page(tmp_path, monkeypatch):
@@ -969,13 +994,13 @@ def test_csrf_refused_on_login_invite_setup_and_account_password(tmp_path, monke
         del missing["X-AgenticML-Request"]
         missing.update(extra)
         status, _, payload = call(
-            httpd, "/api/server/account/password", "POST", pw_body, missing)
+            httpd, "/api/account/password", "POST", pw_body, missing)
         assert status == 403 and json.loads(payload) == {
             "error": "cross-site request refused"}
         headers = csrf(httpd, Origin="http://evil.example")
         headers.update(extra)
         status, _, payload = call(
-            httpd, "/api/server/account/password", "POST", pw_body, headers)
+            httpd, "/api/account/password", "POST", pw_body, headers)
         assert status == 403 and json.loads(payload) == {
             "error": "cross-site request refused"}
 
@@ -987,11 +1012,10 @@ def test_expired_invite_post_counts_against_address_throttle(tmp_path, monkeypat
         httpd.users.add("bob", role="member")
         token = httpd.users.create_invite("bob")
         expired = layout.format_timestamp(datetime.now(timezone.utc) - timedelta(hours=1))
-        obj = json.loads(httpd.users.path.read_text())
-        for row in obj["users"]:
-            if row["name"] == "bob":
-                row["invite"]["expires_at"] = expired
-        httpd.users.path.write_text(json.dumps(obj))
+        from dataclasses import replace
+        user = httpd.users.get('bob')
+        with httpd.users.db.transaction(write=True) as tx:
+            httpd.users.repo.save(tx, replace(user, invite={**user.invite, 'expires_at':expired}))
         body = json.dumps({"token": token, "password": PASSWORD}).encode()
         for _ in range(LoginThrottle.FREE_FAILURES):
             status, _, payload = call(httpd, "/invite", "POST", body, csrf(httpd))

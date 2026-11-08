@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from agenticml.server.app import make_server
 from agenticml.server.ingest import IngestHandler
-from agenticml.server.keys import KeyStore
+from agenticml.server.workspaces import default_workspace_id, store_root
 from agenticml.store import RunReader, RunWriter, list_runs
 from agenticml.store.layout import object_path
 from agenticml.store.reader import run_references
@@ -296,16 +296,17 @@ def sync_server(tmp_path):
 
         do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = _dispatch
 
-    def create_key(name):
-        return KeyStore(data / "server").create(name, scope="sync")[1]
-
     server = make_server(data, port=0)
     server.RequestHandlerClass = RecordingHandler
+
+    def create_key(name):
+        return server.keys.create(name, scope="sync")[1]
     thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
     thread.start()
     try:
         yield SimpleNamespace(host=f"http://127.0.0.1:{server.server_port}", key=create_key("testbed"),
-                              store=data / "store", create_key=create_key, calls=calls)
+                              store=store_root(data, default_workspace_id(server.db)),
+                              run_index=server.run_index, create_key=create_key, calls=calls)
     finally:
         server.shutdown()
         server.server_close()
@@ -333,7 +334,7 @@ def assert_synced_run(root, run_id, server, *, dead=False):
     for hashes in run_references(root, run_id).values():
         for sha in hashes:
             assert object_path(server.store, sha).read_bytes() == object_path(root, sha).read_bytes()
-    return json.loads((server.store / "runs" / run_id / "remote.json").read_text())
+    return server.run_index.as_remote(run_id)
 
 
 def test_verified_login_and_online_whoami(cli, sync_server):

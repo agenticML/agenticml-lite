@@ -1,6 +1,7 @@
 """Single-writer server lifecycle and data-directory safety."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import errno
 import logging
@@ -17,9 +18,13 @@ import weakref
 
 from agenticml.store import layout
 from agenticml.ui.server import DashboardServer, _browser_host, _loopback_bind
-from .audit import AuditLog
 from .keys import KeyStore, env_key_looks_weak, validate_env_key
-from .users import UserStore, migrate
+from .users import UserStore
+from .db import for_server_dir
+from .db.repos import NoteRepo, RunRepo
+from .db.workspaces import WorkspaceRepo, require_workspace_id
+from .workspaces import default_workspace_id, prepare_store, store_root
+from .runs import reconcile, store_paths_safe
 from .audit import AuditLog
 from .webauth import IDENTITY_PRESETS, WebAuth
 
@@ -68,12 +73,12 @@ def prepare_data_dir(data):
     """Refuse redirected state directories and cross-device upload renames."""
     data = Path(data)
     data.mkdir(mode=0o700, parents=True, exist_ok=True)
-    for path in (data / "store", data / "server", data / "server" / "tmp"):
+    for path in (data / "server", data / "server" / "tmp", data / "workspaces"):
         _directory(path)
     if (data / "server").stat().st_mode & 0o077:
         logger.warning("server directory is group- or world-accessible: %s", data / "server")
-    if (data / "store").stat().st_dev != (data / "server" / "tmp").stat().st_dev:
-        raise ValueError("server/tmp and store must be on the same filesystem")
+    if (data / "workspaces").stat().st_dev != (data / "server" / "tmp").stat().st_dev:
+        raise ValueError("server/tmp and workspaces must be on the same filesystem")
 
 
 def acquire_server_lock(server_dir):
@@ -100,7 +105,7 @@ def acquire_server_lock(server_dir):
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as exc:
         handle.close()
-        if exc.errno in (errno.EAGAIN, errno.EACCES):
+        if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
             raise ValueError(f"another agenticml server is using {Path(server_dir).parent}") from exc
         if exc.errno in (errno.ENOLCK, errno.ENOSYS, errno.EOPNOTSUPP):
             raise ValueError("server filesystem does not support flock; refusing to run unlocked") from exc
@@ -160,14 +165,24 @@ class IngestServer(DashboardServer):
     daemon_threads = False
 
     def __init__(self, data, host, port, public_url=None, env_key=None,
-                 trusted_proxies=(), identity_header=None):
+                 trusted_proxies=(), identity_header=None, db=None):
         from .ingest import IngestHandler
 
         self.data_dir = Path(data)
         self.tmp_dir = self.data_dir / "server" / "tmp"
-        self.keys = KeyStore(self.data_dir / "server", env_key)
-        self.users = UserStore(self.data_dir / "server")
-        self.audit = AuditLog(self.data_dir / "server")
+        db = db if db is not None else for_server_dir(self.data_dir / "server")
+        self.db = db
+        self.workspaces = WorkspaceRepo(db)
+        default = self.workspaces.get('default')
+        self.default_workspace_id = default_workspace_id(db) if default else None
+        self.run_index = RunRepo(db, self.default_workspace_id) if default else None
+        self.note_index = NoteRepo(db, self.default_workspace_id) if default else None
+        self.keys = KeyStore(self.data_dir / "server", env_key, db=db,
+                             workspace_id=self.default_workspace_id)
+        self.users = UserStore(self.data_dir / "server", db=db, workspace_id=self.default_workspace_id) if default else None
+        self.audit = AuditLog(self.data_dir / "server", db=db, workspace_id=self.default_workspace_id)
+        self._ws_stores = {}
+        self._ws_stores_lock = threading.Lock()
         self.public_url = public_url
         self.web = WebAuth(
             self.keys, public_url, users=self.users,
@@ -185,7 +200,7 @@ class IngestServer(DashboardServer):
         self._server_lock = None
         self._closing_workers = set()
         super().__init__(
-            self.data_dir / "store", host, port, read_only=False,
+            store_root(self.data_dir, default['id']) if default else self.data_dir / 'workspaces' / 'unavailable', host, port, read_only=False,
             handler_class=IngestHandler, auth=self.web, public_url=public_url,
         )
         base = public_url or f"http://{_browser_host(self.server_address[0])}:{self.server_address[1]}"
@@ -195,7 +210,76 @@ class IngestServer(DashboardServer):
             ranges = ", ".join(str(network) for network in self.web.trusted_proxies) or "none"
             logger.info("identity header %s; trusted proxies %s", header, ranges)
 
-    def run_lock(self, run_id):
+    def _after_append_write(self, run_id, path):
+        """Test hook: runs after an append is fsynced and before the size commit."""
+
+    def _after_atomic_write(self, run_id, path):
+        """Test hook: runs after an atomic file is published and before it is recorded."""
+
+    def _after_meta_claim(self, run_id):
+        """Test hook: runs after claiming ownership and before writing meta.json."""
+
+    def drop_workspace_stores(self, workspace_id):
+        """Drop cached stores after a workspace is deleted or by_id returns None."""
+        workspace_id = require_workspace_id(workspace_id)
+        with self._ws_stores_lock:
+            self._ws_stores.pop(workspace_id, None)
+
+    def workspace_stores(self, workspace_id, status):
+        """Cached UserStore/KeyStore/AuditLog for a workspace; rebuilt on status change."""
+        from .access import WorkspaceStores
+
+        workspace_id = require_workspace_id(workspace_id)
+        with self._ws_stores_lock:
+            cached = self._ws_stores.get(workspace_id)
+            if cached is None or cached[0] != status:
+                cached = (status, WorkspaceStores(self, workspace_id))
+                self._ws_stores[workspace_id] = cached
+            return cached[1]
+
+    @contextmanager
+    def run_reader(self, run_id, *, workspace_id):
+        from agenticml.store import reader as store_reader
+
+        wid = require_workspace_id(workspace_id)
+        key = (wid, run_id)
+        index = RunRepo(self.db, wid)
+        with self.reader_lock:
+            if key not in self.readers:
+                self.readers[key] = store_reader.RunReader(
+                    store_root(self.data_dir, wid), run_id, remote=index.normalized_remote)
+            self.readers.move_to_end(key)
+            while len(self.readers) > 64:
+                self.readers.popitem(last=False)
+            current = self.readers[key]
+        yield current
+
+    def cached_reader(self, run_id, *, workspace_id):
+        with self.reader_lock:
+            return self.readers.get((require_workspace_id(workspace_id), run_id))
+
+    def code_pair_diff(self, base_sha, target_sha, budget, *, workspace_id):
+        from agenticml.ui import server as ui
+
+        wid = require_workspace_id(workspace_id)
+        key = (wid, base_sha, target_sha, ui._CODE_DIFF_MAX_BYTES, ui._CODE_DIFF_FILE_LINES,
+               ui._CODE_DIFF_MAX_LINES, ui._CODE_DIFF_LINE_CHARS, ui._CODE_DIFF_AUTOJUNK_THRESHOLD)
+        with self.code_diff_lock:
+            if key in self.code_diffs:
+                self.code_diffs.move_to_end(key)
+                return self.code_diffs[key]
+        result = ui._code_pair_diff(store_root(self.data_dir, wid), base_sha, target_sha,
+                                    ui._CODE_DIFF_MAX_BYTES, ui._CODE_DIFF_FILE_LINES, budget)
+        if 'error' not in result and not budget.exhausted():
+            with self.code_diff_lock:
+                self.code_diffs[key] = result
+                self.code_diffs.move_to_end(key)
+                while len(self.code_diffs) > ui._CODE_DIFF_CACHE_SIZE:
+                    self.code_diffs.popitem(last=False)
+        return result
+
+    def run_lock(self, run_id, *, workspace_id):
+        run_id = (require_workspace_id(workspace_id), run_id)
         with self.run_locks_lock:
             lock = self.run_locks.get(run_id)
             if lock is None:
@@ -203,8 +287,8 @@ class IngestServer(DashboardServer):
                 self.run_locks[run_id] = lock
             return lock
 
-    def object_lock(self, sha):
-        prefix = sha[:2]
+    def object_lock(self, sha, *, workspace_id):
+        prefix = (require_workspace_id(workspace_id), sha[:2])
         with self.object_locks_lock:
             lock = self.object_locks.get(prefix)
             if lock is None:
@@ -254,6 +338,8 @@ class IngestServer(DashboardServer):
         self._closing_workers.clear()
         # If joining workers is interrupted, keep the lock: those workers can
         # still be applying writes while the caller handles the interruption.
+        if self.db is not None:
+            self.db.close()
         if self._server_lock is not None:
             self._server_lock.close()
             self._server_lock = None
@@ -264,7 +350,7 @@ class IPv6IngestServer(IngestServer):
 
 
 def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None,
-                trusted_proxies=(), identity_header=None):
+                trusted_proxies=(), identity_header=None, database=None):
     """Prepare and lock the data directory; port=0 chooses a free port."""
     validate_env_key(env_key)
     if env_key is not None and env_key_looks_weak(env_key):
@@ -274,25 +360,34 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
     public_url = _validate_public_url(public_url)
     data = resolve_data_dir(data)
     prepare_data_dir(data)
+    if not store_paths_safe(data / "store"):
+        raise ValueError("store or store/runs is a symlink or not a directory; fix or move it away")
     handle = acquire_server_lock(data / "server")
+    db = None
     try:
+        db = for_server_dir(data / "server", database)
         _clean_tmp(data / "server" / "tmp")
-        migrate(data, actor="server")
         cls = IPv6IngestServer if ":" in host else IngestServer
-        server = cls(data, host, port, public_url, env_key, trusted_proxies, identity_header)
+        server = cls(data, host, port, public_url, env_key, trusted_proxies, identity_header, db=db)
         server._server_lock = handle
+        for workspace in server.workspaces.list():
+            root = prepare_store(data, workspace['id'])
+            reconcile(root, RunRepo(db, workspace['id']))
         return server
     except BaseException:
+        if db is not None:
+            db.close()
         handle.close()
         raise
 
 
 def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None,
-          trusted_proxies=(), identity_header=None):
+          trusted_proxies=(), identity_header=None, database=None):
     """Run until interrupted, with an optional environment admin key."""
     server = make_server(
         data, host, port, public_url, os.environ.get("AGENTICML_SERVER_KEY"),
-        trusted_proxies, identity_header)
+        trusted_proxies, identity_header,
+        **({"database": database} if database is not None else {}))
     previous_handler = None
     stopping = False
 

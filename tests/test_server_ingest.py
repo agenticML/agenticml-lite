@@ -23,6 +23,7 @@ from agenticml.server.keys import KeyStore
 from agenticml.store import RunReader, RunWriter, layout
 from agenticml.store.gc import run_fingerprint
 from agenticml.store.overview import Overview
+from server_db_helpers import default_workspace_id
 
 
 @contextmanager
@@ -98,7 +99,7 @@ def run_path(server, name=""):
 def foreign_key(server, name="other", user="bob", role="member"):
     from agenticml.server.users import UserStore
 
-    store = UserStore(server.data_dir / "server")
+    store = UserStore(server.data_dir / "server", workspace_id=default_workspace_id(server.data_dir / "server"))
     if store.get(user) is None:
         store.add(user, role=role)
     return server.keys.create(name, user=user)[1]
@@ -114,13 +115,13 @@ def test_health_auth_scopes_and_revocation(server):
         assert response_headers["WWW-Authenticate"] == "Bearer"
     assert raw(server, "GET", "/v2/whoami", [("Authorization", "bEaReR " + server.test_key)])[0] == 200
     assert request(server, "/v2/whoami")[1] == {
-        "key": "one", "scope": "sync", "user": "admin", "role": "admin", "protocol": 2,
+        "key": "one", "scope": "sync", "user": "admin", "role": "owner", "protocol": 2, "workspace": "default",
         "features": (["lineage"] if server.lineage_enabled else []) + ["byref"],
     }
     _, admin = server.keys.create("admin", "admin")
     assert request(server, "/v2/whoami", key=admin)[1]["scope"] == "admin"
     assert put_meta(server, "admin-run", key=admin)[0] == 200
-    KeyStore(server.data_dir / "server").revoke("one")
+    KeyStore(server.data_dir / "server", workspace_id=default_workspace_id(server.data_dir / "server")).revoke("one")
     assert request(server, "/v2/whoami")[0] == 401
 
 
@@ -130,7 +131,7 @@ def test_zero_keys_and_environment(tmp_path):
         assert raw(httpd, "GET", "/v2/whoami")[0] == 401
     with running(tmp_path / "env", "a" * 32) as httpd:
         assert raw(httpd, "GET", "/v2/whoami", [("Authorization", "Bearer " + "a" * 32)])[1] == {
-            "key": "env", "scope": "admin", "user": "env", "role": "admin", "protocol": 2,
+            "key": "env", "scope": "admin", "user": "env", "role": "admin", "protocol": 2, "workspace": "default",
             "features": (["lineage"] if httpd.lineage_enabled else []) + ["byref"],
         }
         assert not (httpd.data_dir / "server" / "keys.json").exists()
@@ -180,7 +181,7 @@ def test_lock_tmp_cleanup_and_permissions(tmp_path, caplog):
         assert "ignoring subdirectory" in caplog.text
         with pytest.raises(ValueError, match="another agenticml server"):
             make_server(tmp_path, port=0)
-        for name in ("store", "server", "server/tmp"):
+        for name in ("workspaces", str(httpd.root.relative_to(tmp_path)), "server", "server/tmp"):
             assert stat.S_IMODE((tmp_path / name).stat().st_mode) == 0o700
     finally:
         httpd.server_close()
@@ -561,7 +562,7 @@ def test_meta_validation_creation_and_ownership(server):
     for path, method in (("files/scalars/index.json", "PUT"), ("append/events.jsonl?offset=0", "POST"), ("commit", "POST")):
         assert request(server, "/v2/runs/unknown/" + path, method, b"{}")[0:2] == (404, {"error": "unknown run"})
     assert put_meta(server)[0] == 200
-    assert json.loads(run_path(server, "remote.json").read_text()) == {"owner": "admin", "owner_key": "one"}
+    assert server.run_index.as_remote("run-1") == {"owner": "admin", "owner_key": "one"}
     second = foreign_key(server, "two")
     for path, method, body in (("files/meta.json", "PUT", b"{}"), ("files/scalars/index.json", "PUT", b"{}"),
                                ("append/events.jsonl?offset=0", "POST", b"{}\n"), ("commit", "POST", b"{}")):
@@ -581,7 +582,7 @@ def test_claim_unowned_run(server, remote):
     if remote is not None:
         (directory / "remote.json").write_bytes(remote)
     assert put_meta(server)[0] == 200
-    assert json.loads((directory / "remote.json").read_bytes()) == {"owner": "admin", "owner_key": "one"}
+    assert server.run_index.as_remote("run-1") == {"owner": "admin", "owner_key": "one"}
 
 
 def test_atomic_validation_and_state(server):
@@ -899,7 +900,7 @@ def test_commit_validation_sizes_status_and_success(server):
     assert commit(server, status="finished")[0:2] == (
         409, {"error": "status does not match meta.json", "status": "running"})
     assert commit(server, sizes={"meta.json": size})[1] == {"complete": True, "fingerprint": "a" * 64}
-    remote = json.loads(run_path(server, "remote.json").read_bytes())
+    remote = server.run_index.as_remote("run-1")
     assert remote == {"owner": "admin", "owner_key": "one", "status": "running",
                       "fingerprint": "a" * 64, "last_sync_at": remote["last_sync_at"],
                       "last_sync_key": "one", "sizes": {"meta.json": size}}
@@ -965,13 +966,16 @@ def test_state_hashes_snapshot_without_blocking_writes(server, monkeypatch, chan
     original = b"{}\n" * (1024 * 1024)
     assert append(server, original, name="events.jsonl")[0] == 200
     before = {name: run_path(server, name).read_bytes() for name in ("meta.json", "events.jsonl")}
-    old_remote = json.loads(run_path(server, "remote.json").read_bytes())
+    old_remote = server.run_index.as_remote("run-1")
     entered, release = threading.Event(), threading.Event()
     handles = []
     hash_prefix = ingest._hash_prefix
     send_json = ingest.IngestHandler._json
+    lock = server.run_lock("run-1", workspace_id=server.default_workspace_id)
 
     def paused(handle, size):
+        if lock.locked():
+            return hash_prefix(handle, size)
         handles.append(handle)
         entered.set()
         assert release.wait(5)
@@ -1011,14 +1015,18 @@ def test_state_batches_under_file_descriptor_limit(server, monkeypatch):
     directory = run_path(server, "scalars")
     directory.mkdir()
     contents = {"meta.json": run_path(server, "meta.json").read_bytes()}
+    files = [("meta.json", len(contents["meta.json"]),
+              hashlib.sha256(contents["meta.json"]).hexdigest())]
     for index in range(400):
         name = f"scalars/{index}.bin"
         contents[name] = index.to_bytes(8, "little")
         run_path(server, name).write_bytes(contents[name])
+        files.append((name, len(contents[name]), None))
+    server.run_index.replace_files("run-1", files)
 
     opened, counts = [], []
     original = layout.open_nofollow
-    lock = server.run_lock("run-1")
+    lock = server.run_lock("run-1", workspace_id=server.default_workspace_id)
     def tracked(path, *args, **kwargs):
         handle = original(path, *args, **kwargs)
         if kwargs.get("buffering") == 0:
@@ -1047,7 +1055,7 @@ def test_state_batches_under_file_descriptor_limit(server, monkeypatch):
 
 
 def test_responses_sent_after_write_locks_released(server, monkeypatch):
-    run_lock = server.run_lock("run-1")
+    run_lock = server.run_lock("run-1", workspace_id=server.default_workspace_id)
     original = ingest.IngestHandler._json
     sent = []
 
@@ -1078,10 +1086,11 @@ def test_responses_sent_after_write_locks_released(server, monkeypatch):
 @pytest.mark.parametrize("truncate", [False, True])
 def test_hard_linked_append_refused_and_state_skips(server, tmp_path, caplog, name, data, truncate):
     put_meta(server)
+    assert append(server, data, name=name)[0] == 200
     outside = tmp_path / "outside"
     outside.write_bytes(data)
     path = run_path(server, name)
-    path.parent.mkdir(exist_ok=True)
+    path.unlink()
     os.link(outside, path)
     assert append(server, data, name=name, query="&truncate=1" if truncate else "")[0:2] == (
         409, {"error": "refusing hard-linked file on server", "path": name})
@@ -1093,6 +1102,63 @@ def test_hard_linked_append_refused_and_state_skips(server, tmp_path, caplog, na
     assert "skipping hard-linked state file" in caplog.text
 
 
+def test_state_omits_oversized_atomic_file_without_full_read(server, monkeypatch, caplog):
+    put_meta(server)
+    name = "artifacts.json"
+    body = b"x" * 200
+    path = run_path(server, name)
+    path.write_bytes(body)
+    server.run_index.record_file("run-1", name, len(body), sha256=hashlib.sha256(body).hexdigest())
+    server.limits.atomic_body = 64
+    read_sizes = []
+    original = layout.open_nofollow
+
+    def tracked(opened, *args, **kwargs):
+        handle = original(opened, *args, **kwargs)
+        if Path(opened) != path:
+            return handle
+        real_read = handle.read
+
+        def spy(*read_args, **read_kwargs):
+            size = read_args[0] if read_args else read_kwargs.get("size", -1)
+            read_sizes.append(size)
+            return real_read(*read_args, **read_kwargs)
+
+        handle.read = spy
+        return handle
+
+    monkeypatch.setattr(layout, "open_nofollow", tracked)
+    status, payload, _ = request(server, "/v2/runs/run-1/state")
+    assert status == 200 and name not in payload["files"]
+    assert "meta.json" in payload["files"]
+    assert read_sizes == []
+    assert not any(isinstance(size, int) and size >= len(body) for size in read_sizes)
+    assert "skipping oversized atomic state file" in caplog.text
+
+
+def test_state_null_atomic_hash_is_recorded_without_error(server, caplog):
+    put_meta(server)
+    path = run_path(server, "scalars/index.json")
+    path.parent.mkdir(exist_ok=True)
+    body = b'{"metrics":[]}'
+    path.write_bytes(body)
+    digest = hashlib.sha256(body).hexdigest()
+    server.run_index.record_file("run-1", "scalars/index.json", len(body), sha256=None)
+    status, payload, _ = request(server, "/v2/runs/run-1/state")
+    assert status == 200
+    assert payload["files"]["scalars/index.json"] == {"size": len(body), "sha256": digest}
+    assert server.run_index.files("run-1")["scalars/index.json"]["sha256"] == digest
+    assert "atomic file differs from recorded hash" not in caplog.text
+
+    wrong = hashlib.sha256(b"other").hexdigest()
+    server.run_index.record_file("run-1", "scalars/index.json", len(body), sha256=wrong)
+    status, payload, _ = request(server, "/v2/runs/run-1/state")
+    assert status == 200
+    assert payload["files"]["scalars/index.json"] == {"size": len(body), "sha256": digest}
+    assert server.run_index.files("run-1")["scalars/index.json"]["sha256"] == digest
+    assert "atomic file differs from recorded hash" in caplog.text
+
+
 @pytest.mark.parametrize("name", ["meta.json", "scalars/index.json", "media/index.json", "scalars/0.ovw"])
 def test_state_skips_hard_linked_atomic_files(server, tmp_path, name):
     put_meta(server)
@@ -1100,6 +1166,7 @@ def test_state_skips_hard_linked_atomic_files(server, tmp_path, name):
     path.parent.mkdir(exist_ok=True)
     if not path.exists():
         path.write_bytes(b"{}")
+        server.run_index.record_file("run-1", name, path.stat().st_size, sha256=hashlib.sha256(b"{}").hexdigest())
     os.link(path, tmp_path / "linked")
     status, payload, _ = request(server, "/v2/runs/run-1/state")
     assert status == 200 and name not in payload["files"]
@@ -1117,12 +1184,15 @@ def test_missing_append_with_gap_creates_nothing(server, name, data):
 
 def test_claim_keeps_existing_remote_metadata(server):
     put_meta(server)
-    remote = {"owner": None, "status": "running", "sizes": {"meta.json": 42},
-              "fingerprint": "a" * 64, "last_sync_at": layout.format_timestamp(), "extra": {"x": 1}}
-    run_path(server, "remote.json").write_text(json.dumps(remote))
+    stamp = layout.format_timestamp()
+    fingerprint = "a" * 64
+    server.run_index.commit_sync("run-1", "running", fingerprint, stamp, "one")
+    server.run_index.set_owner("run-1", None, None)
     assert put_meta(server)[0] == 200
-    assert json.loads(run_path(server, "remote.json").read_bytes()) == {
-        **remote, "owner": "admin", "owner_key": "one"}
+    remote = server.run_index.as_remote("run-1")
+    assert remote["owner"] == "admin" and remote["owner_key"] == "one"
+    assert remote["status"] == "running" and remote["fingerprint"] == fingerprint
+    assert remote["last_sync_at"] == stamp
 
 
 @pytest.mark.parametrize("owner", [None, "other"])
@@ -1132,7 +1202,7 @@ def test_new_run_discards_leftover_remote_metadata(server, owner):
               "fingerprint": "a" * 64, "last_sync_at": layout.format_timestamp()}
     run_path(server, "remote.json").write_text(json.dumps(remote))
     assert put_meta(server)[0] == 200
-    assert json.loads(run_path(server, "remote.json").read_bytes()) == {"owner": "admin", "owner_key": "one"}
+    assert server.run_index.as_remote("run-1") == {"owner": "admin", "owner_key": "one"}
 
 
 @pytest.mark.parametrize("path", ["/healthz", "/v2/whoami", "/v2/runs/run-1/state"])
@@ -1199,7 +1269,7 @@ def test_uploaded_store_modes_follow_startup_umask(tmp_path, mask):
             data = b"object"
             sha = hashlib.sha256(data).hexdigest()
             assert request(httpd, "/v2/objects/" + sha, "PUT", data)[0] == 201
-            paths = [run_path(httpd, name) for name in ("meta.json", "remote.json", "scalars/0.bin", "events.jsonl")]
+            paths = [run_path(httpd, name) for name in ("meta.json", "scalars/0.bin", "events.jsonl")]
             paths.append(layout.object_path(httpd.root, sha))
             assert all(stat.S_IMODE(path.stat().st_mode) == 0o666 & ~mask for path in paths)
     finally:
@@ -1274,7 +1344,7 @@ def test_ownership_rechecked_after_body(server, monkeypatch, route, method, body
 
     def change_owner(self, *args, **kwargs):
         body = read_body(self, *args, **kwargs)
-        run_path(server, "remote.json").write_text('{"owner":"other"}')
+        server.run_index.set_owner("run-1", "other", None)
         return body
 
     monkeypatch.setattr(ingest.IngestHandler, "_read_body", change_owner)

@@ -1,11 +1,14 @@
 """Browser coverage for the Team page, account dialog, and role-aware nav."""
-import json
 import re
 import threading
 
 import pytest
 from agenticml.server.app import make_server
 from agenticml.server.audit import AuditLog
+from agenticml.server.db.workspaces import WorkspaceRepo
+from agenticml.server.runs import adopt_directory
+from agenticml.server.users import UserStore
+from agenticml.server.workspaces import prepare_store
 from agenticml.store import RunWriter, layout
 
 pytest.importorskip("playwright.sync_api")
@@ -35,10 +38,10 @@ def team_server(tmp_path, monkeypatch):
     writer = RunWriter.create(httpd.root, run_id="demo-run", meta={"project": "demo", "name": "synced-run"})
     writer.finish("finished")
     writer.close()
-    (httpd.root / "runs" / "demo-run" / "remote.json").write_text(json.dumps({
+    adopt_directory(httpd.root, httpd.root / "runs" / "demo-run", httpd.run_index, remote={
         "owner": "admin", "status": "finished", "fingerprint": "a" * 64,
-        "last_sync_at": layout.format_timestamp(), "sizes": {},
-    }))
+        "last_sync_at": layout.format_timestamp(),
+    })
     thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
     thread.start()
     url = f"http://127.0.0.1:{httpd.server_address[1]}"
@@ -55,19 +58,37 @@ def user_row(page, name):
         has_text=re.compile(f"^{re.escape(name)}$")))
 
 
-def test_admin_add_role_invite_remove_and_activity(page, context, team_server):
+def test_admin_owner_role_invite_revoke_and_activity(page, context, team_server):
+    httpd = team_server["httpd"]
+    other = WorkspaceRepo(httpd.db).create("other", name="Other", owner="admin")
+    prepare_store(httpd.data_dir, other["id"])
+    UserStore(httpd.data_dir / "server", db=httpd.db, workspace_id=other["id"]).add("bob", "member")
     sign_in(page, team_server, team_server["admin"])
-    expect(page.get_by_text("Signed in as admin · admin")).to_be_visible()
+    expect(page.get_by_text("Signed in as admin · owner")).to_be_visible()
     page.get_by_role("link", name="Team", exact=True).click()
     expect(page.get_by_role("heading", name="Team", exact=True)).to_be_visible()
-    expect(user_row(page, "admin").get_by_role("button", name="Invite link", exact=True)).to_have_count(0)
-    expect(user_row(page, "alice").get_by_role("button", name="Invite link", exact=True)).to_be_visible()
-    page.get_by_role("button", name="Add user", exact=True).click()
-    dialog = page.get_by_role("dialog", name="Add user", exact=True)
-    dialog.get_by_label("Name", exact=True).fill("bob")
+    owner = user_row(page, "admin")
+    expect(owner.locator('td[data-label="Role"]')).to_have_text("owner")
+    expect(owner.get_by_label("Role for admin", exact=True)).to_have_count(0)
+    expect(owner.get_by_role("button", name="Invite link", exact=True)).to_have_count(0)
+    expect(owner.get_by_role("button", name="Remove", exact=True)).to_have_count(0)
+    alice = user_row(page, "alice")
+    expect(alice.get_by_role("button", name="Invite link", exact=True)).to_be_visible()
+    alice.get_by_label("Role for alice", exact=True).select_option("viewer")
+    expect(alice.get_by_label("Role for alice", exact=True)).to_have_value("viewer")
+    page.get_by_role("button", name="Invite", exact=True).click()
+    dialog = page.get_by_role("dialog", name="Invite", exact=True)
+    dialog.get_by_label("Login or email", exact=True).fill("bob")
     expect(dialog.get_by_label("Role", exact=True)).to_have_value("member")
-    dialog.get_by_label("Identity", exact=True).fill("bob@example.com")
-    dialog.get_by_role("button", name="Add user", exact=True).click()
+    dialog.get_by_role("button", name="Invite", exact=True).click()
+    expect(dialog.get_by_text(
+        "This login already has an account and was added to the workspace.")).to_be_visible()
+    dialog.get_by_role("button", name="Close", exact=True).click()
+    expect(user_row(page, "bob")).to_be_visible()
+    page.get_by_role("button", name="Invite", exact=True).click()
+    dialog = page.get_by_role("dialog", name="Invite", exact=True)
+    dialog.get_by_label("Login or email", exact=True).fill("cara")
+    dialog.get_by_role("button", name="Invite", exact=True).click()
     expect(dialog.get_by_text("This invite link is shown once. They choose their own password.")).to_be_visible()
     link = dialog.locator(".key-value").inner_text()
     assert "/invite?token=" in link
@@ -76,26 +97,21 @@ def test_admin_add_role_invite_remove_and_activity(page, context, team_server):
     expect(dialog.get_by_role("button", name="Copied", exact=True)).to_be_visible()
     assert page.evaluate("navigator.clipboard.readText()") == link
     dialog.get_by_role("button", name="Close", exact=True).click()
-    row = user_row(page, "bob")
-    expect(row).to_be_visible()
-    expect(row.locator('td[data-label="Sign-in"]')).to_have_text("invite pending")
-    row.get_by_label("Role for bob", exact=True).select_option("viewer")
-    expect(row.get_by_label("Role for bob", exact=True)).to_have_value("viewer")
-    row.get_by_role("button", name="Invite link", exact=True).click()
-    invite = page.get_by_role("dialog")
-    expect(invite.get_by_text("This signs them out and clears their password.")).to_be_visible()
-    invite.get_by_role("button", name="Create invite link", exact=True).click()
-    expect(invite.locator(".key-value")).to_contain_text("/invite?token=")
-    invite.get_by_role("button", name="Close", exact=True).click()
-    row.get_by_role("button", name="Remove", exact=True).click()
+    pending = page.get_by_role("table", name="Pending invites", exact=True)
+    expect(pending).to_contain_text("cara")
+    pending.get_by_role("button", name="Revoke", exact=True).click()
+    revoke = page.get_by_role("dialog", name="Revoke invite for cara?")
+    revoke.get_by_role("button", name="Revoke", exact=True).click()
+    expect(page.get_by_text("No pending invites.")).to_be_visible()
+    user_row(page, "bob").get_by_role("button", name="Remove", exact=True).click()
     remove = page.get_by_role("dialog")
     expect(remove).to_contain_text("key")
     remove.get_by_role("button", name="Remove", exact=True).click()
     expect(user_row(page, "bob")).to_have_count(0)
     activity = page.get_by_role("table", name="Activity", exact=True)
-    expect(activity).to_contain_text("user.add")
     expect(activity).to_contain_text("user.role")
-    expect(activity).to_contain_text("user.invite")
+    expect(activity).to_contain_text("invite.create")
+    expect(activity).to_contain_text("invite.revoke")
     expect(activity).to_contain_text("user.remove")
 
 
@@ -116,6 +132,29 @@ def test_member_keys_scope_and_no_team_nav(page, team_server):
     expect(options).to_have_count(1)
     expect(options).to_have_text("sync")
     dialog.get_by_role("button", name="Close", exact=True).click()
+
+
+def test_nav_follows_current_workspace_role_after_switch(page, team_server):
+    httpd = team_server["httpd"]
+    httpd.users.add("mira", role="viewer")
+    httpd.users.set_password("mira", PASSWORD)
+    gamma = WorkspaceRepo(httpd.db).create("gamma", name="Gamma", owner="mira")
+    prepare_store(httpd.data_dir, gamma["id"])
+    sign_in_password(page, team_server, "mira", PASSWORD)
+    expect(page.get_by_role("heading", name="Workspaces", exact=True)).to_be_visible()
+    page.goto(f"{team_server['url']}/w/default/")
+    expect(page.get_by_text("Signed in as mira · viewer")).to_be_visible()
+    expect(page.get_by_role("link", name="Keys", exact=True)).to_have_count(0)
+    expect(page.get_by_role("link", name="Team", exact=True)).to_have_count(0)
+    expect(page.locator("#nav-keys")).to_be_hidden()
+    expect(page.locator("#nav-team")).to_be_hidden()
+    page.get_by_role("button", name="Account", exact=True).click()
+    dialog = page.get_by_role("dialog", name="Account", exact=True)
+    dialog.get_by_role("button", name="Switch to Gamma").click()
+    expect(page).to_have_url(re.compile(r"/w/gamma/"))
+    expect(page.get_by_text("Signed in as mira · owner")).to_be_visible()
+    expect(page.get_by_role("link", name="Keys", exact=True)).to_be_visible()
+    expect(page.get_by_role("link", name="Team", exact=True)).to_be_visible()
 
 
 def test_viewer_hides_keys_team_and_notes_editor(page, team_server):
@@ -139,6 +178,8 @@ def test_account_change_password_and_wrong_current(page, team_server):
     dialog = page.get_by_role("dialog", name="Account", exact=True)
     expect(dialog.get_by_text("alice", exact=True)).to_be_visible()
     expect(dialog.get_by_text("member", exact=True)).to_be_visible()
+    expect(dialog.get_by_role("list", name="Workspaces", exact=True)).to_have_count(0)
+    expect(dialog.get_by_role("link", name="Admin", exact=True)).to_have_count(0)
     dialog.get_by_label("Current password", exact=True).fill("wrong-password")
     dialog.get_by_label("New password", exact=True).fill("newpassword12")
     dialog.get_by_label("Confirm password", exact=True).fill("newpassword12")
@@ -164,8 +205,8 @@ def test_no_overflow_team_keys_and_account(page, team_server):
     page.get_by_role("link", name="Team", exact=True).click()
     expect(page.get_by_role("heading", name="Team", exact=True)).to_be_visible()
     assert_no_overflow(page)
-    page.get_by_role("button", name="Add user", exact=True).click()
-    dialog = page.get_by_role("dialog", name="Add user", exact=True)
+    page.get_by_role("button", name="Invite", exact=True).click()
+    dialog = page.get_by_role("dialog", name="Invite", exact=True)
     expect(dialog).to_be_visible()
     assert_no_overflow(page)
     assert_dialog_fits(page, dialog)
@@ -217,7 +258,8 @@ def test_identity_edit_keeps_other_row_draft(page, team_server):
 
 
 def test_load_older_activity(page, team_server):
-    log = AuditLog(team_server["httpd"].data_dir / "server")
+    httpd = team_server["httpd"]
+    log = AuditLog(httpd.data_dir / "server", db=httpd.db, workspace_id=httpd.default_workspace_id)
     for index in range(201):
         log.record("admin", "password", "user.add", f"u{index:03d}", "127.0.0.1", {"role": "member"})
     sign_in(page, team_server, team_server["admin"])

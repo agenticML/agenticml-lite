@@ -1,5 +1,9 @@
 """Users, roles, migration, ownership-by-user, and the users CLI."""
 from __future__ import annotations
+from server_db_helpers import default_store
+from server_db_helpers import default_workspace_id
+from server_db_helpers import imported_remote, key_object, user_object, transfer_default_owner
+from agenticml.server.db import DatabaseError
 
 import hashlib
 import json
@@ -14,6 +18,7 @@ from agenticml.server import admin
 from agenticml.server import up as up_mod
 from agenticml.server import webauth as webauth_mod
 from agenticml.server.app import make_server, prepare_data_dir
+from agenticml.server.db.repos import RunRepo
 from agenticml.server.keys import ClientError, KeyStore, KeyStoreUnavailable, LastAdminError
 from agenticml.server.up import UpError, bootstrap_admin
 from agenticml.server.users import (
@@ -28,7 +33,7 @@ from test_sync import writer_at
 
 def server_dir(tmp_path):
     directory = tmp_path / "server"
-    directory.mkdir()
+    directory.mkdir(exist_ok=True)
     return directory
 
 
@@ -53,13 +58,15 @@ def write_run(root, run_id, owner, extra=None):
         payload.update(extra)
     (directory / "remote.json").write_text(json.dumps(payload))
     (directory / "meta.json").write_text(json.dumps({"run_id": run_id, "status": "running"}))
+    from server_db_helpers import index_if_open
+    index_if_open(root, directory, remote=payload)
     return directory
 
 
 # --- 1. UserStore CRUD and strict parse ---
 
 def test_userstore_crud_and_public(tmp_path):
-    users = UserStore(server_dir(tmp_path))
+    users = UserStore(server_dir(tmp_path), workspace_id=default_workspace_id(server_dir(tmp_path)))
     alice = users.add("alice", role="admin", identity="alice@example.com")
     bob = users.add("bob")
     assert bob.role == "member" and bob.identity is None and bob.generation == 0
@@ -92,13 +99,11 @@ def test_userstore_crud_and_public(tmp_path):
     users.add("carol", role="admin")
     assert users.remove("bob") == 0
     assert users.get("bob") is None
-    path = users.path
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    assert json.loads(path.read_text())["version"] == 1
+    assert stat.S_IMODE(users.db.path.stat().st_mode) == 0o600
 
 
 def test_discard_removes_only_matching_id(tmp_path):
-    users = UserStore(server_dir(tmp_path))
+    users = UserStore(server_dir(tmp_path), workspace_id=default_workspace_id(server_dir(tmp_path)))
     alice = users.add("alice", role="admin")
     users.discard("alice", "0" * 32)
     assert users.get("alice") is not None
@@ -114,10 +119,10 @@ def test_discard_removes_only_matching_id(tmp_path):
     "generation_bool", "generation_negative",
 ])
 def test_userstore_strict_parse_rejects(tmp_path, change):
-    users = UserStore(server_dir(tmp_path))
+    users = UserStore(server_dir(tmp_path), workspace_id=default_workspace_id(server_dir(tmp_path)))
     users.add("alice", role="admin", identity="a@x.com")
     users.add("bob", role="admin", identity="b@x.com")
-    obj = json.loads(users.path.read_text())
+    obj = user_object(users)
     if change == "extra":
         obj["users"][0]["extra"] = 1
     elif change == "missing":
@@ -138,64 +143,66 @@ def test_userstore_strict_parse_rejects(tmp_path, change):
         obj["users"][0]["generation"] = True
     else:
         obj["users"][0]["generation"] = -1
-    users.path.write_text(json.dumps(obj))
-    with pytest.raises(ValueError):
-        users._read()
-    assert users.list() == []
+    legacy = tmp_path / 'legacy'
+    legacy.mkdir()
+    (legacy / 'users.json').write_text(json.dumps(obj))
+    with pytest.raises(DatabaseError, match='could not import users.json'):
+        UserStore(legacy, workspace_id=default_workspace_id(legacy))
 
 
 def test_userstore_corrupt_fails_closed_once_per_change(tmp_path, caplog):
-    users = UserStore(server_dir(tmp_path))
-    users.add("alice", role="admin")
-    users.path.write_bytes(b"not JSON")
+    directory = server_dir(tmp_path)
+    path = directory / 'users.json'
+    path.write_bytes(b'not JSON')
     for _ in range(3):
-        assert users.list() == []
-    assert sum("file users disabled" in r.message for r in caplog.records) == 1
-    users.path.write_text(json.dumps({"version": 1, "users": []}))
-    assert users.list() == []
+        with pytest.raises(DatabaseError, match='could not import users.json'):
+            UserStore(directory, workspace_id=default_workspace_id(directory))
+    path.write_text(json.dumps({'version':1, 'users':[]}))
+    assert UserStore(directory, workspace_id=default_workspace_id(directory)).list() == []
 
 
 @pytest.mark.parametrize("value", ["", " x", "x ", "a" * 257, "a\nb", "a\x00b"])
 def test_invalid_identity(tmp_path, value):
-    users = UserStore(server_dir(tmp_path))
+    users = UserStore(server_dir(tmp_path), workspace_id=default_workspace_id(server_dir(tmp_path)))
     with pytest.raises(ClientError):
         users.add("alice", identity=value)
 
 
 def test_allowed_and_resolve(tmp_path):
     directory = server_dir(tmp_path)
-    users = UserStore(directory)
+    users = UserStore(directory, workspace_id=default_workspace_id(directory))
     users.add("alice", role="admin")
     users.add("view", role="viewer")
-    keys = KeyStore(directory)
+    keys = KeyStore(directory, workspace_id=default_workspace_id(directory))
     _, secret = keys.create("k", user="alice")
     record = keys.verify(secret)
     principal = resolve(keys, users, record)
     alice = users.get("alice")
     assert principal == Principal(
-        "alice", "admin", "key", "k", alice.id, alice.generation)
+        "alice", "owner", "key", "k", alice.id, alice.generation, users.workspace_id, True)
     assert allowed(principal, "sync") and allowed(principal, "users")
     with pytest.raises(KeyError):
         allowed(principal, "unknown")
     view = Principal("view", "viewer", "key", "v")
     assert allowed(view, "read") and not allowed(view, "sync")
     assert resolve(keys, users, keys.verify("missing")) is None
-    env = KeyStore(directory, "e" * 32)
-    assert resolve(env, users, env.verify("e" * 32)) == Principal("env", "admin", "key", "env")
+    env = KeyStore(directory, "e" * 32, workspace_id=default_workspace_id(directory))
+    assert resolve(env, users, env.verify("e" * 32)) == Principal("env", "admin", "key", "env", workspace_id=users.workspace_id)
 
 
 # --- 2. Last-admin ---
 
 def test_last_admin_refusal_env_not_counted(tmp_path):
     directory = server_dir(tmp_path)
-    users = UserStore(directory)
+    users = UserStore(directory, workspace_id=default_workspace_id(directory))
     users.add("alice", role="admin")
-    KeyStore(directory, "e" * 32)
+    KeyStore(directory, "e" * 32, workspace_id=default_workspace_id(directory))
     with pytest.raises(LastAdminError):
         users.remove("alice")
     with pytest.raises(LastAdminError):
         users.set_role("alice", "member")
     users.add("bob", role="admin")
+    transfer_default_owner(users, "bob")
     users.set_role("alice", "member")
     assert users.get("alice").role == "member"
     users.set_role("alice", "admin")
@@ -221,11 +228,11 @@ def test_remove_deletes_keys_and_running_server_rejects(tmp_path, monkeypatch):
 
 def test_create_default_user_rule(tmp_path):
     directory = server_dir(tmp_path)
-    keys = KeyStore(directory)
-    users = UserStore(directory)
+    keys = KeyStore(directory, workspace_id=default_workspace_id(directory))
+    users = UserStore(directory, workspace_id=default_workspace_id(directory))
     record, _ = keys.create("first")
     assert record.user == "admin"
-    assert users.get("admin").role == "admin"
+    assert users.get("admin").role == "owner"
     assert users.get("admin").created_by == "cli"
     record, _ = keys.create("second")
     assert record.user == "admin"
@@ -247,7 +254,7 @@ def test_migration_v1_keys_runs_and_idempotent(tmp_path, caplog):
     data = tmp_path / "data"
     prepare_data_dir(data)
     write_v1_keys(data / "server" / "keys.json", ["alpha", "beta"])
-    root = data / "store"
+    root = default_store(data)
     write_run(root, "run-a", "alpha")
     write_run(root, "run-b", "beta")
     env_dir = write_run(root, "run-env", "env")
@@ -256,29 +263,34 @@ def test_migration_v1_keys_runs_and_idempotent(tmp_path, caplog):
     bad.mkdir(parents=True)
     (bad / "remote.json").write_text("broken")
     assert migrate(data) is True
-    users = json.loads((data / "server" / "users.json").read_text())
-    assert users["version"] == 1
+    root = default_store(data)
+    env_dir = root / "runs" / "run-env"
+    users = user_object(UserStore(data / "server", workspace_id=default_workspace_id(data / "server")))
+    assert (data / "server" / "users.json.2x").is_file()
     assert [u["name"] for u in users["users"]] == ["admin"]
     assert users["users"][0]["role"] == "admin"
     assert users["users"][0]["created_by"] == "migration"
     admin_id = users["users"][0]["id"]
     assert len(admin_id) == 32 and all(ch in "0123456789abcdef" for ch in admin_id)
-    keys_obj = json.loads((data / "server" / "keys.json").read_text())
-    assert keys_obj["version"] == 2
+    keys_obj = key_object(KeyStore(data / "server", workspace_id=default_workspace_id(data / "server")))
+    assert json.loads((data / "server" / "keys.json.2x").read_text())["version"] == 2
     assert {row["name"]: row["user"] for row in keys_obj["keys"]} == {
         "alpha": "admin", "beta": "admin"}
-    assert json.loads((root / "runs" / "run-a" / "remote.json").read_text()) == {
-        "owner": "admin", "owner_key": "alpha"}
-    assert json.loads((root / "runs" / "run-b" / "remote.json").read_text()) == {
-        "owner": "admin", "owner_key": "beta"}
-    assert (env_dir / "remote.json").read_bytes() == env_before
+    from agenticml.server.db import for_server_dir
+    from agenticml.server.db.repos import RunRepo
+    index = RunRepo(for_server_dir(data / "server", create=False), default_workspace_id(for_server_dir(data / "server", create=False)))
+    assert index.as_remote("run-a") == {"owner": "admin", "owner_key": "alpha"}
+    assert index.as_remote("run-b") == {"owner": "admin", "owner_key": "beta"}
+    assert imported_remote(root / "runs" / "run-a")[0] == {"owner": "admin", "owner_key": "alpha"}
+    assert imported_remote(root / "runs" / "run-b")[0] == {"owner": "admin", "owner_key": "beta"}
+    assert imported_remote(env_dir)[1].read_bytes() == env_before
     assert "skipped unreadable remote.json in run-bad" in caplog.text
     assert ("migration skipped 1 corrupt or unreadable remote.json file(s); "
             "those runs keep their old owner") in caplog.text
     assert "migrated 2.0 keys to user admin (2 keys, 2 runs)" in caplog.text
     mtimes = {
         path: path.stat().st_mtime_ns
-        for path in (root / "runs").glob("*/remote.json")
+        for path in (root / "runs").glob("*/remote.json*")
     }
     caplog.clear()
     assert migrate(data) is True
@@ -287,24 +299,26 @@ def test_migration_v1_keys_runs_and_idempotent(tmp_path, caplog):
 
 
 def test_migration_crash_and_empty(tmp_path):
-    data = tmp_path / "data"
+    data = tmp_path / 'data'
     prepare_data_dir(data)
-    write_v1_keys(data / "server" / "keys.json", ["alpha"])
-    write_run(data / "store", "run-a", "alpha")
-    assert migrate(data) is True
-    (data / "server" / "users.json").unlink()
-    assert migrate(data) is True
-    users = json.loads((data / "server" / "users.json").read_text())
-    assert [u["name"] for u in users["users"]] == ["admin"]
-    keys_obj = json.loads((data / "server" / "keys.json").read_text())
-    assert keys_obj["version"] == 2 and keys_obj["keys"][0]["user"] == "admin"
-
-    empty = tmp_path / "empty"
+    write_v1_keys(data / 'server' / 'keys.json', ['alpha'])
+    write_run(default_store(data), 'run-a', 'alpha')
+    # Model a crash after legacy conversion, before the DB import commit.
+    from agenticml.server.db.legacy2x import migrate as convert
+    from agenticml.server.db import connect, default_url
+    db = connect(default_url(data))
+    assert convert(data, db=db)
+    (data / 'server' / 'users.json').unlink()
+    db.close()
+    assert migrate(data)
+    assert UserStore(data / 'server', workspace_id=default_workspace_id(data / 'server')).get('admin').role == 'owner'
+    assert KeyStore(data / 'server', workspace_id=default_workspace_id(data / 'server')).list()[0].user == 'admin'
+    empty = tmp_path / 'empty'
     prepare_data_dir(empty)
-    assert migrate(empty) is True
-    assert json.loads((empty / "server" / "users.json").read_text()) == {
-        "version": 1, "users": []}
-    assert not (empty / "server" / "keys.json").exists()
+    assert migrate(empty)
+    assert UserStore(empty / 'server', workspace_id=default_workspace_id(empty / 'server')).list() == []
+    assert not (empty / 'server' / 'users.json').exists()
+    assert not (empty / 'server' / 'keys.json').exists()
 
 
 def test_migrate_empty_v1_keys_rewrites_to_v2(tmp_path, capsys):
@@ -314,15 +328,15 @@ def test_migrate_empty_v1_keys_rewrites_to_v2(tmp_path, capsys):
     assert json.loads((data / "server" / "keys.json").read_text()) == {
         "version": 1, "keys": []}
     assert migrate(data) is True
-    keys_obj = json.loads((data / "server" / "keys.json").read_text())
-    assert keys_obj == {"version": 2, "keys": []}
-    assert json.loads((data / "server" / "users.json").read_text()) == {
-        "version": 1, "users": []}
+    keys_obj = key_object(KeyStore(data / "server", workspace_id=default_workspace_id(data / "server")))
+    assert json.loads((data / "server" / "keys.json.2x").read_text()) == {"version":2,"keys":[]}
+    assert KeyStore(data / "server", workspace_id=default_workspace_id(data / "server")).list() == []
+    assert UserStore(data / 'server', workspace_id=default_workspace_id(data / 'server')).list() == []
     assert cli.main(["server", "keys", "create", "--name", "first",
                      "--data", str(data)]) == 0
     out = capsys.readouterr().out.strip()
     assert out.startswith("aml_")
-    keys = KeyStore(data / "server")
+    keys = KeyStore(data / "server", workspace_id=default_workspace_id(data / "server"))
     assert [record.name for record in keys.list()] == ["first"]
     assert keys.list()[0].user == "admin"
 
@@ -332,9 +346,9 @@ def test_migrate_logs_skipped_remote_summary(tmp_path, caplog):
     data = tmp_path / "data"
     prepare_data_dir(data)
     write_v1_keys(data / "server" / "keys.json", ["alpha"])
-    write_run(data / "store", "run-a", "alpha")
+    write_run(default_store(data), "run-a", "alpha")
     for name, payload in (("run-bad1", "broken"), ("run-bad2", "[1]")):
-        directory = data / "store" / "runs" / name
+        directory = default_store(data) / "runs" / name
         directory.mkdir()
         (directory / "remote.json").write_text(payload)
     assert migrate(data) is True
@@ -342,19 +356,20 @@ def test_migrate_logs_skipped_remote_summary(tmp_path, caplog):
     assert "skipped unreadable remote.json in run-bad2" in caplog.text
     assert ("migration skipped 2 corrupt or unreadable remote.json file(s); "
             "those runs keep their old owner") in caplog.text
-    assert json.loads((data / "store" / "runs" / "run-a" / "remote.json").read_text()) == {
+    from agenticml.server.db import for_server_dir
+    from agenticml.server.db.repos import RunRepo
+    index = RunRepo(for_server_dir(data / "server", create=False), default_workspace_id(for_server_dir(data / "server", create=False)))
+    assert index.as_remote("run-a") == {"owner": "admin", "owner_key": "alpha"}
+    assert imported_remote(default_store(data) / "runs" / "run-a")[0] == {
         "owner": "admin", "owner_key": "alpha"}
 
 
 def test_v1_keys_with_users_json_fails_closed(tmp_path, caplog):
     directory = server_dir(tmp_path)
-    UserStore(directory)._write([])
-    write_v1_keys(directory / "keys.json", ["alpha"])
-    keys = KeyStore(directory)
-    assert keys.list() == []
-    assert any("keys.json is version 1" in r.message for r in caplog.records)
-    with pytest.raises(KeyStoreUnavailable, match="keys.json is version 1"):
-        keys.create("x")
+    (directory / 'users.json').write_text(json.dumps({'version':1, 'users':[]}))
+    write_v1_keys(directory / 'keys.json', ['alpha'])
+    with pytest.raises(DatabaseError, match='could not import keys.json'):
+        KeyStore(directory, workspace_id=default_workspace_id(directory))
 
 
 # --- 6. make_server and CLI migrate ---
@@ -364,12 +379,12 @@ def test_make_server_and_cli_keys_list_migrate(tmp_path, capsys, monkeypatch):
     data = tmp_path / "data"
     prepare_data_dir(data)
     write_v1_keys(data / "server" / "keys.json", ["alpha"])
-    write_run(data / "store", "run-a", "alpha")
+    write_run(default_store(data), "run-a", "alpha")
     httpd = make_server(data, port=0)
     try:
-        users = json.loads((data / "server" / "users.json").read_text())
+        users = user_object(UserStore(data / "server", workspace_id=default_workspace_id(data / "server")))
         assert [u["name"] for u in users["users"]] == ["admin"]
-        assert json.loads((data / "server" / "keys.json").read_text())["version"] == 2
+        assert json.loads((data / "server" / "keys.json.2x").read_text())["version"] == 2
     finally:
         httpd.server_close()
 
@@ -378,8 +393,8 @@ def test_make_server_and_cli_keys_list_migrate(tmp_path, capsys, monkeypatch):
     write_v1_keys(other / "server" / "keys.json", ["alpha"])
     assert cli.main(["server", "keys", "list", "--data", str(other), "--json"]) == 0
     capsys.readouterr()
-    assert json.loads((other / "server" / "users.json").read_text())["users"][0]["name"] == "admin"
-    assert json.loads((other / "server" / "keys.json").read_text())["version"] == 2
+    assert user_object(UserStore(other / "server", workspace_id=default_workspace_id(other / "server")))["users"][0]["name"] == "admin"
+    assert json.loads((other / "server" / "keys.json.2x").read_text())["version"] == 2
 
 
 # --- 7–8. Ingest roles, ownership, compatibility ---
@@ -423,7 +438,7 @@ def test_member_ownership_and_compat_state(tmp_path, monkeypatch):
         _, second = httpd.keys.create("two", user="alice")
         httpd.test_key = first
         assert put_meta(httpd)[0] == 200
-        remote = json.loads((httpd.root / "runs" / "run-1" / "remote.json").read_text())
+        remote = httpd.run_index.as_remote("run-1")
         assert remote == {"owner": "alice", "owner_key": "one"}
         assert append(httpd, b"{}\n", name="events.jsonl", key=second)[0] == 200
         size = (httpd.root / "runs" / "run-1" / "meta.json").stat().st_size
@@ -441,10 +456,9 @@ def test_member_ownership_and_compat_state(tmp_path, monkeypatch):
         assert status == 409
         assert payload["error"] == "run owned by another user"
         assert payload["owner"] == "alice" and payload["owner_user"] == "alice"
-        remote_path = httpd.root / "runs" / "run-1" / "remote.json"
-        obj = json.loads(remote_path.read_text())
-        obj["last_sync_key"] = "one"
-        remote_path.write_text(json.dumps(obj))
+        row = httpd.run_index.get("run-1")
+        httpd.run_index.commit_sync(
+            "run-1", row["status"], row["fingerprint"], row["last_sync_at"], "one")
         status, state, _ = request(httpd, "/v2/runs/run-1/state", key=other)
         assert status == 200
         assert "owner_key" not in state["remote"]
@@ -486,16 +500,17 @@ def test_session_includes_user_and_ends_on_demote(tmp_path, monkeypatch):
     with running(tmp_path / "data") as httpd:
         _, httpd.admin_key = httpd.keys.create("admin", "admin")
         httpd.users.add("other", role="admin")
+        transfer_default_owner(httpd.users, "other")
         status, _, hdrs = login(httpd)
         assert status == 200
         cookie = hdrs["Set-Cookie"]
-        status, _, body, _ = authed(httpd, "/api/server/session", cookie=cookie)
+        status, _, body, _ = authed(httpd, "/api/account/session", cookie=cookie)
         assert status == 200
         payload = json.loads(body)
         assert payload["user"] == "admin" and payload["role"] == "admin"
         httpd.users.set_role("admin", "member")
         status, _, body = call(
-            httpd, "/api/server/session",
+            httpd, "/api/account/session",
             headers={"Cookie": cookie.split(";", 1)[0]})
         assert status == 401
 
@@ -509,7 +524,7 @@ def test_keys_post_created_by_is_session_user(tmp_path, monkeypatch):
         assert status == 200
         cookie = hdrs["Set-Cookie"]
         status, _, body, _ = authed(
-            httpd, "/api/server/keys", "POST",
+            httpd, "/api/w/default/keys", "POST",
             json.dumps({"name": "alice-box", "scope": "sync"}).encode(),
             cookie=cookie)
         assert status == 201
@@ -530,7 +545,7 @@ def test_users_cli_and_keys_create_user(tmp_path, capsys, monkeypatch):
     assert cli.main(["server", "users", "list", "--json", *data]) == 0
     rows = json.loads(capsys.readouterr().out)
     by_name = {row["name"]: row for row in rows}
-    assert by_name["alice"]["role"] == "admin" and by_name["bob"]["identity"] == "bob@x.com"
+    assert by_name["alice"]["role"] == "owner" and by_name["bob"]["identity"] == "bob@x.com"
     assert by_name["bob"]["keys"] == 0
     assert cli.main(["server", "users", "list", *data]) == 0
     text = capsys.readouterr().out
@@ -552,7 +567,7 @@ def test_users_cli_and_keys_create_user(tmp_path, capsys, monkeypatch):
     assert cli.main(["server", "users", "add", "alice", *data]) == 1
     assert "already exists" in capsys.readouterr().err
     assert cli.main(["server", "users", "remove", "alice", *data]) == 1
-    assert "last admin" in capsys.readouterr().err
+    assert "workspace owner" in capsys.readouterr().err
     assert cli.main(["server", "keys", "create", "--name", "k2", *data]) == 0
     capsys.readouterr()
     assert cli.main(["server", "users", "add", "carol", "--no-invite", *data]) == 0
@@ -567,22 +582,25 @@ def test_status_v1_and_v2_owner_key(tmp_path):
     data = tmp_path / "v1"
     prepare_data_dir(data)
     write_v1_keys(data / "server" / "keys.json", ["box"])
-    write_run(data / "store", "run-a", "box", extra={
+    write_run(default_store(data), "run-a", "box", extra={
         "status": "finished", "last_sync_at": layout.format_timestamp(), "sizes": {}})
     report = admin.status(data)
-    row = next(r for r in report["keys"] if r["name"] == "box")
-    # Before migration supplies owner_key, a name alone cannot identify a key.
-    assert row["runs"] == 0 and row["last_sync_at"] is None
-    assert report["users"] == []
+    assert report['keys'] == report['users'] == []
+    assert not (data / 'server' / 'agenticml.db').exists()
+    assert migrate(data)
+    report = admin.status(data)
+    row = next(r for r in report['keys'] if r['name'] == 'box')
+    assert row['runs'] == 1 and row['last_sync_at'] is not None
+    assert report['users'][0]['name'] == 'admin'
 
     data = tmp_path / "v2"
     prepare_data_dir(data)
-    keys = KeyStore(data / "server")
+    keys = KeyStore(data / "server", workspace_id=default_workspace_id(data / "server"))
     keys.create("box")
-    write_run(data / "store", "run-a", "admin", extra={
+    write_run(default_store(data), "run-a", "admin", extra={
         "owner_key": "box", "status": "finished",
         "last_sync_at": layout.format_timestamp(), "sizes": {}})
-    write_run(data / "store", "run-b", "admin", extra={
+    write_run(default_store(data), "run-b", "admin", extra={
         "owner_key": "missing", "status": "finished",
         "last_sync_at": layout.format_timestamp(), "sizes": {}})
     report = admin.status(data)
@@ -596,7 +614,7 @@ def test_status_v1_and_v2_owner_key(tmp_path):
 
 
 def test_actions_cover_role_table():
-    assert ROLES == ("viewer", "member", "admin")
+    assert ROLES == ("viewer", "member", "admin", "owner")
     assert set(ACTIONS) >= {
         "read", "password", "notes", "sync", "own_keys",
         "admin_keys", "all_keys", "users", "audit",
@@ -607,16 +625,38 @@ def test_bootstrap_admin_non_admin_named_admin(tmp_path, monkeypatch):
     monkeypatch.setattr(up_mod, "_stdout_is_tty", lambda: True)
     data = tmp_path / "data"
     prepare_data_dir(data)
-    UserStore(data / "server").add("admin", role="member")
+    UserStore(data / "server", workspace_id=default_workspace_id(data / "server")).add("admin", role="member")
     with pytest.raises(UpError, match="not an admin"):
         bootstrap_admin(data, "https://example.test")
+
+
+def test_bootstrap_admin_existing_admin_in_other_workspace(tmp_path, monkeypatch, capsys):
+    from agenticml.server.db import for_server_dir
+    from agenticml.server.db.workspaces import WorkspaceRepo
+
+    monkeypatch.setattr(up_mod, "_stdout_is_tty", lambda: True)
+    data = tmp_path / "data"
+    prepare_data_dir(data)
+    db = for_server_dir(data / "server")
+    with db.transaction(write=True) as tx:
+        tx.execute(
+            "INSERT INTO accounts (id, login, display_name, created_at, created_by) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("ab" * 16, "admin", "admin", layout.format_timestamp(), "test"))
+    WorkspaceRepo(db).create("beta", owner="admin")
+    db.close()
+    assert bootstrap_admin(data, "https://example.test") == data.resolve()
+    assert "/invite?token=" in capsys.readouterr().out
+    users = UserStore(data / "server", workspace_id=default_workspace_id(data / "server"))
+    admin = users.get("admin")
+    assert admin is not None and admin.role in ("owner", "admin") and admin.invite is not None
 
 
 def test_bootstrap_admin_prints_invite_guidance_without_password(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(up_mod, "_stdout_is_tty", lambda: True)
     data = tmp_path / "data"
     prepare_data_dir(data)
-    UserStore(data / "server").add("admin", role="admin")
+    UserStore(data / "server", workspace_id=default_workspace_id(data / "server")).add("admin", role="admin")
     assert bootstrap_admin(data, "https://example.test") == data.resolve()
     assert "run `agenticml server users invite admin`" in capsys.readouterr().out
 
@@ -627,10 +667,10 @@ def test_bootstrap_admin_migrates_v1_admin_key(tmp_path, monkeypatch, capsys):
     prepare_data_dir(data)
     write_v1_keys(data / "server" / "keys.json", ["admin"], scopes=["admin"])
     assert bootstrap_admin(data, "https://example.test") == data.resolve()
-    keys = KeyStore(data / "server")
+    keys = KeyStore(data / "server", workspace_id=default_workspace_id(data / "server"))
     assert [record.name for record in keys.list()] == ["admin"]
     assert keys.list()[0].scope == "admin" and keys.list()[0].user == "admin"
-    users = json.loads((data / "server" / "users.json").read_text())
+    users = user_object(UserStore(data / "server", workspace_id=default_workspace_id(data / "server")))
     assert [row["name"] for row in users["users"]] == ["admin"]
     assert not any(line.startswith("aml_") for line in capsys.readouterr().out.splitlines())
 
@@ -640,7 +680,7 @@ def test_bootstrap_admin_raises_when_migrate_fails(tmp_path):
     prepare_data_dir(data)
     write_v1_keys(data / "server" / "keys.json", ["admin"], scopes=["admin"])
     (data / "server" / "keys.lock").mkdir()
-    with pytest.raises(UpError, match="could not migrate keys.json; fix the file and retry"):
+    with pytest.raises(DatabaseError, match="could not import keys.json"):
         bootstrap_admin(data, "https://example.test")
     assert not (data / "server" / "users.json").exists()
 
@@ -654,11 +694,11 @@ def test_migrate_lock_failure_logs_and_cli_aborts(tmp_path, caplog, capsys):
     assert "could not lock keys store" in caplog.text
     assert not (data / "server" / "users.json").exists()
     assert cli.main(["server", "users", "add", "alice", "--data", str(data)]) == 1
-    assert "could not migrate keys.json; fix the file and retry" in capsys.readouterr().err
+    assert "could not import keys.json" in capsys.readouterr().err
     assert not (data / "server" / "users.json").exists()
     capsys.readouterr()
     assert cli.main(["server", "keys", "list", "--data", str(data)]) == 1
-    assert "could not migrate keys.json; fix the file and retry" in capsys.readouterr().err
+    assert "could not import keys.json" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("target", ["users.json", "keys.json"])
@@ -679,7 +719,7 @@ def test_migrate_lstat_permission_error(tmp_path, monkeypatch, caplog, target):
 
     monkeypatch.setattr(os, "lstat", boom)
     assert migrate(data) is False
-    assert f"could not stat {target}; migration skipped" in caplog.text
+    assert "could not import legacy server state" in caplog.text
     if target == "users.json":
         assert json.loads((data / "server" / "keys.json").read_text())["version"] == 1
     else:
@@ -692,21 +732,21 @@ def test_migrate_unreadable_keys_logs_and_cli_aborts(tmp_path, caplog, capsys):
     prepare_data_dir(data)
     (data / "server" / "keys.json").write_text("{")
     assert migrate(data) is False
-    assert "could not read keys.json" in caplog.text
+    assert "could not import legacy server state" in caplog.text
     assert not (data / "server" / "users.json").exists()
     assert cli.main(["server", "users", "add", "alice", "--data", str(data)]) == 1
-    assert "could not migrate keys.json; fix the file and retry" in capsys.readouterr().err
+    assert "could not import keys.json" in capsys.readouterr().err
     assert not (data / "server" / "users.json").exists()
     capsys.readouterr()
     assert cli.main(["server", "keys", "list", "--json", "--data", str(data)]) == 1
-    assert "could not migrate keys.json; fix the file and retry" in capsys.readouterr().err
+    assert "could not import keys.json" in capsys.readouterr().err
 
 
 def test_migrate_aborts_on_remote_write_failure(tmp_path, monkeypatch, caplog):
     data = tmp_path / "data"
     prepare_data_dir(data)
     write_v1_keys(data / "server" / "keys.json", ["alpha"])
-    write_run(data / "store", "run-a", "alpha")
+    write_run(default_store(data), "run-a", "alpha")
     original = layout.atomic_write
 
     def boom(path, payload, *, fsync=False):
@@ -728,7 +768,8 @@ def test_migrate_refuses_symlinked_runs_dir(tmp_path, caplog):
     data = tmp_path / "data"
     prepare_data_dir(data)
     write_v1_keys(data / "server" / "keys.json", ["alpha"])
-    (data / "store" / "runs").symlink_to(outside / "runs")
+    default_store(data).mkdir(exist_ok=True)
+    (default_store(data) / "runs").symlink_to(outside / "runs")
     assert migrate(data) is False
     assert "symlink or not a directory" in caplog.text
     assert (outside / "runs" / "run-out" / "remote.json").read_bytes() == before
@@ -736,39 +777,63 @@ def test_migrate_refuses_symlinked_runs_dir(tmp_path, caplog):
     assert not (data / "server" / "users.json").exists()
 
 
-def test_add_refuses_name_that_owns_runs(tmp_path, capsys):
+def test_add_checks_run_ownership_in_short_write_transaction(tmp_path, monkeypatch):
     data = tmp_path / "data"
     prepare_data_dir(data)
-    users = UserStore(data / "server")
+    users = UserStore(data / "server", workspace_id=default_workspace_id(data / "server"))
+    order = []
+
+    original = RunRepo.name_owns
+
+    def scan(self, name, tx=None):
+        order.append("scan")
+        assert tx is not None
+        return original(self, name, tx)
+
+    monkeypatch.setattr(RunRepo, "name_owns", scan)
+    real_tx = users.db.transaction
+
+    def wrapped(write=False):
+        if write:
+            order.append("write")
+        return real_tx(write=write)
+
+    monkeypatch.setattr(users.db, "transaction", wrapped)
     users.add("alice", role="admin")
-    users.add("bob", role="admin")
-    write_run(data / "store", "run-a", "alice")
-    users.remove("alice")
-    with pytest.raises(ClientError, match="runs are still owned by alice; pass --reclaim-runs"):
-        users.add("alice")
-    assert users.get("alice") is None
-    users.add("alice", reclaim_runs=True)
-    assert users.get("alice") is not None
-    users.remove("alice")
-    assert cli.main(["server", "users", "add", "alice", "--data", str(data)]) == 1
-    assert "runs are still owned by alice" in capsys.readouterr().err
-    assert users.get("alice") is None
-    assert cli.main(["server", "users", "add", "alice", "--reclaim-runs", "--data", str(data)]) == 0
-    assert UserStore(data / "server").get("alice") is not None
+    assert "scan" in order and "write" in order
+    assert order.index("write") < order.index("scan")
+
+
+def test_readding_member_preserves_account_and_run_ownership(tmp_path, capsys):
+    data = tmp_path / 'data'
+    prepare_data_dir(data)
+    users = UserStore(data / 'server', workspace_id=default_workspace_id(data / 'server'))
+    users.add('owner', role='admin')
+    alice = users.add('alice')
+    write_run(default_store(data), 'run-a', 'alice')
+    users.remove('alice')
+    assert users.get('alice') is None
+    assert users.add('alice').id == alice.id
+    users.remove('alice')
+    assert cli.main(['server', 'users', 'add', 'alice', '--data', str(data)]) == 0
+    assert users.get('alice').id == alice.id
+    index = RunRepo(users.db, users.workspace_id)
+    assert index.get('run-a')['owner_user'] == 'alice'
 
 
 def test_add_refuses_when_run_scan_truncated(tmp_path, monkeypatch):
     data = tmp_path / "data"
     prepare_data_dir(data)
-    users = UserStore(data / "server")
+    users = UserStore(data / "server", workspace_id=default_workspace_id(data / "server"))
     users.add("admin", role="admin")
-    write_run(data / "store", "run-a", "zzz")
-    write_run(data / "store", "run-b", "zzz")
-    monkeypatch.setattr("agenticml.server.users.RUN_SCAN_MAX", 1)
-    with pytest.raises(ClientError, match="reclaim-runs"):
-        users.add("alice")
-    users.add("alice", reclaim_runs=True)
+    write_run(default_store(data), "run-a", "zzz")
+    write_run(default_store(data), "run-b", "zzz")
+    users.add("alice")
     assert users.get("alice") is not None
+    with pytest.raises(ClientError, match="reclaim-runs"):
+        users.add("zzz")
+    users.add("zzz", reclaim_runs=True)
+    assert users.get("zzz") is not None
 
 
 def test_resolve_none_after_session_is_401(tmp_path, monkeypatch):
@@ -793,8 +858,8 @@ def test_resolve_none_after_session_is_401(tmp_path, monkeypatch):
             assert json.loads(body) == {"error": "login required"}
             monkeypatch.setattr(webauth_mod, "resolve", real)
 
-        check("/api/server/session")
-        check("/api/server/keys")
+        check("/api/account/session")
+        check("/api/w/default/keys")
 
 
 def test_login_demoted_admin_key_message(tmp_path, monkeypatch):
@@ -803,6 +868,7 @@ def test_login_demoted_admin_key_message(tmp_path, monkeypatch):
         httpd.users.add("alice", role="admin")
         _, secret = httpd.keys.create("alice-admin", "admin", user="alice")
         httpd.users.add("bob", role="admin")
+        transfer_default_owner(httpd.users, "bob")
         httpd.users.set_role("alice", "member")
         status, payload, hdrs = login(httpd, secret)
         assert status == 403
@@ -811,18 +877,21 @@ def test_login_demoted_admin_key_message(tmp_path, monkeypatch):
 
 
 def test_migrate_refuses_v2_non_admin_users(tmp_path, caplog):
-    data = tmp_path / "data"
+    source = tmp_path / 'source'
+    source.mkdir()
+    keys = KeyStore(source, workspace_id=default_workspace_id(source))
+    keys.create('k1')
+    UserStore(source, workspace_id=default_workspace_id(source)).add('bob')
+    keys.create('k2', user='bob')
+    data = tmp_path / 'data'
     prepare_data_dir(data)
-    keys = KeyStore(data / "server")
-    keys.create("k1")
-    UserStore(data / "server").add("bob")
-    keys.create("k2", user="bob")
-    (data / "server" / "users.json").unlink()
-    before = (data / "server" / "keys.json").read_bytes()
-    assert migrate(data) is False
-    assert "non-admin users" in caplog.text
-    assert not (data / "server" / "users.json").exists()
-    assert (data / "server" / "keys.json").read_bytes() == before
+    path = data / 'server' / 'keys.json'
+    path.write_text(json.dumps(key_object(keys)))
+    before = path.read_bytes()
+    assert not migrate(data)
+    assert 'non-admin users' in caplog.text
+    assert not (data / 'server' / 'users.json').exists()
+    assert path.read_bytes() == before
 
 
 def test_promote_viewer_restores_writes(tmp_path, monkeypatch):
@@ -833,7 +902,7 @@ def test_promote_viewer_restores_writes(tmp_path, monkeypatch):
         assert put_meta(httpd, key=secret)[0] == 403
         httpd.users.set_role("view", "member")
         assert put_meta(httpd, key=secret)[0] == 200
-        remote = json.loads((httpd.root / "runs" / "run-1" / "remote.json").read_text())
+        remote = httpd.run_index.as_remote("run-1")
         assert remote == {"owner": "view", "owner_key": "vkey"}
 
 
@@ -872,15 +941,20 @@ def test_migrate_interrupted_partial_remote_rewrite(tmp_path):
     data = tmp_path / "data"
     prepare_data_dir(data)
     write_v1_keys(data / "server" / "keys.json", ["alpha", "beta"])
-    write_run(data / "store", "run-a", "admin", extra={"owner_key": "alpha"})
-    write_run(data / "store", "run-b", "beta")
+    write_run(default_store(data), "run-a", "admin", extra={"owner_key": "alpha"})
+    write_run(default_store(data), "run-b", "beta")
     assert migrate(data) is True
-    assert json.loads((data / "store" / "runs" / "run-a" / "remote.json").read_text()) == {
+    from agenticml.server.db import for_server_dir
+    from agenticml.server.db.repos import RunRepo
+    index = RunRepo(for_server_dir(data / "server", create=False), default_workspace_id(for_server_dir(data / "server", create=False)))
+    assert index.as_remote("run-a") == {"owner": "admin", "owner_key": "alpha"}
+    assert index.as_remote("run-b") == {"owner": "admin", "owner_key": "beta"}
+    assert imported_remote(default_store(data) / "runs" / "run-a")[0] == {
         "owner": "admin", "owner_key": "alpha"}
-    assert json.loads((data / "store" / "runs" / "run-b" / "remote.json").read_text()) == {
+    assert imported_remote(default_store(data) / "runs" / "run-b")[0] == {
         "owner": "admin", "owner_key": "beta"}
-    keys_obj = json.loads((data / "server" / "keys.json").read_text())
-    assert keys_obj["version"] == 2
+    keys_obj = key_object(KeyStore(data / "server", workspace_id=default_workspace_id(data / "server")))
+    assert json.loads((data / "server" / "keys.json.2x").read_text())["version"] == 2
     assert {row["name"]: row["user"] for row in keys_obj["keys"]} == {
         "alpha": "admin", "beta": "admin"}
 
@@ -892,7 +966,7 @@ def test_env_key_dashboard_post_keys(tmp_path, monkeypatch):
         assert status == 200
         cookie = hdrs["Set-Cookie"]
         status, _, body, _ = authed(
-            httpd, "/api/server/keys", "POST",
+            httpd, "/api/w/default/keys", "POST",
             json.dumps({"name": "box", "scope": "sync"}).encode(),
             cookie=cookie)
         assert status == 201

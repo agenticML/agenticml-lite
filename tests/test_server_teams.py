@@ -103,11 +103,11 @@ def teams(tmp_path_factory):
             assert admin_session["role"] == "admin"
 
             status, _, bob_created = api(
-                httpd, "/api/server/users", "POST",
+                httpd, "/api/w/default/members", "POST",
                 {"name": "bob", "role": "member"}, admin_cookie)
             assert status == 201 and bob_created["user"]["role"] == "member"
             status, _, vera_created = api(
-                httpd, "/api/server/users", "POST",
+                httpd, "/api/w/default/members", "POST",
                 {"name": "vera", "role": "viewer"}, admin_cookie)
             assert status == 201 and vera_created["user"]["role"] == "viewer"
 
@@ -117,22 +117,22 @@ def teams(tmp_path_factory):
             assert vera_session == {"ok": True, "user": "vera", "role": "viewer"}
 
             status, _, admin_key = api(
-                httpd, "/api/server/keys", "POST",
+                httpd, "/api/w/default/keys", "POST",
                 {"name": "admin-laptop", "scope": "sync"}, admin_cookie)
             assert status == 201 and admin_key["record"]["user"] == "admin"
             status, _, bob_key = api(
-                httpd, "/api/server/keys", "POST",
+                httpd, "/api/w/default/keys", "POST",
                 {"name": "bob-laptop", "scope": "sync"}, bob_cookie)
             assert status == 201 and bob_key["record"]["user"] == "bob"
             status, _, bob_ci_key = api(
-                httpd, "/api/server/keys", "POST",
+                httpd, "/api/w/default/keys", "POST",
                 {"name": "bob-ci", "scope": "sync", "user": "bob"}, admin_cookie)
             assert status == 201 and bob_ci_key["record"]["user"] == "bob"
             bob_admin_status, _, bob_admin_body = api(
-                httpd, "/api/server/keys", "POST",
+                httpd, "/api/w/default/keys", "POST",
                 {"name": "bad-admin", "scope": "admin"}, bob_cookie)
             bob_other_status, _, bob_other_body = api(
-                httpd, "/api/server/keys", "POST",
+                httpd, "/api/w/default/keys", "POST",
                 {"name": "bad-other", "scope": "sync", "user": "admin"}, bob_cookie)
 
             admin_writer = writer_at(local / "admin", run_id="admin-run")
@@ -158,13 +158,13 @@ def teams(tmp_path_factory):
                 "bob_other_key": (bob_other_status, bob_other_body),
                 "bob_steals_admin": steal(url, bob_key["key"], admin_writer),
                 "admin_steals_bob": steal(url, admin_key["key"], bob_writer),
-                "runs": api(httpd, "/api/runs", cookie=vera_cookie),
+                "runs": api(httpd, "/api/w/default/runs", cookie=vera_cookie),
                 "vera_note": authed(
-                    httpd, "/api/runs/admin-run/notes", "PUT", forbidden, cookie=vera_cookie),
-                "vera_keys": api(httpd, "/api/server/keys", cookie=vera_cookie),
-                "vera_users": api(httpd, "/api/server/users", cookie=vera_cookie),
+                    httpd, "/api/w/default/runs/admin-run/notes", "PUT", forbidden, cookie=vera_cookie),
+                "vera_keys": api(httpd, "/api/w/default/keys", cookie=vera_cookie),
+                "vera_users": api(httpd, "/api/w/default/members", cookie=vera_cookie),
                 "bob_note": authed(
-                    httpd, "/api/runs/admin-run/notes", "PUT", note, cookie=bob_cookie),
+                    httpd, "/api/w/default/runs/admin-run/notes", "PUT", note, cookie=bob_cookie),
             }
     finally:
         if previous_key is not None:
@@ -204,8 +204,8 @@ def test_two_users_share_one_server(teams):
 
 
 def test_audit_lines_for_team_writes(teams):
-    path = teams["data"] / "server" / "audit.jsonl"
-    events = [json.loads(line) for line in path.read_text().splitlines() if line]
+    from server_db_helpers import audit_rows
+    events = audit_rows(teams['data'] / 'server')
     writes = [
         (event["action"], event["actor"], event["target"])
         for event in events
@@ -243,3 +243,10 @@ def test_audit_lines_for_team_writes(teams):
     bob_ci_event, = [event for event in events
                      if event["action"] == "key.create" and event["target"] == "bob-ci"]
     assert bob_ci_event["detail"]["user"] == "bob"
+
+
+def test_team_flow_writes_only_database(teams):
+    directory = teams['data'] / 'server'
+    assert all(path.name.startswith('agenticml.db')
+               or path.name in {'server.lock', 'tmp'} or path.name.endswith('.2x')
+               for path in directory.iterdir())

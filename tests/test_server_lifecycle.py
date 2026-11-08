@@ -1,4 +1,5 @@
 """Graceful signal shutdown through the CLI and connection drain."""
+from server_db_helpers import default_store
 from contextlib import contextmanager
 import http.client
 import json
@@ -18,6 +19,7 @@ import pytest
 
 from agenticml.server import app
 from agenticml.server.keys import KeyStore
+from server_db_helpers import default_workspace_id
 
 pytest.importorskip("fcntl")
 if sys.platform != "linux" or not hasattr(signal, "SIGTERM"):
@@ -27,7 +29,7 @@ if sys.platform != "linux" or not hasattr(signal, "SIGTERM"):
 @contextmanager
 def running_cli(data, keep_alive=False):
     app.prepare_data_dir(data)
-    _, key = KeyStore(data / "server").create("admin", "admin")
+    _, key = KeyStore(data / "server", workspace_id=default_workspace_id(data / "server")).create("admin", "admin")
     root = Path(__file__).resolve().parents[1]
     env = os.environ.copy()
     env.pop("AGENTICML_SERVER_KEY", None)
@@ -124,7 +126,7 @@ def test_signal_drains_append_and_releases_lock(tmp_path, stop_signal):
             status, _, _ = read_response(client)
             assert 200 <= status < 300
         assert_stopped(process)
-    assert (data / "store" / "runs" / "run-1" / "scalars" / "0.bin").read_bytes() == body
+    assert (default_store(data) / "runs" / "run-1" / "scalars" / "0.bin").read_bytes() == body
     with app.make_server(data, port=0):
         pass
 

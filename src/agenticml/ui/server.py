@@ -32,6 +32,75 @@ from agenticml.store import layout, notes, reader
 
 logger = logging.getLogger("agenticml.ui.server")
 
+
+def _workspace_kw(server):
+    """Keyword for IngestServer methods that require an explicit workspace id."""
+    wid = getattr(server, "default_workspace_id", None)
+    return {"workspace_id": wid} if wid is not None else {}
+
+
+def _ctx(handler):
+    return getattr(handler, "workspace", None)
+
+
+def _reset_request_workspace(handler):
+    handler.workspace = None
+    handler._effective_path = None
+
+
+def _require_bound_workspace(handler):
+    """Server mode must not fall back to the default store when unbound."""
+    if _ctx(handler) is None and getattr(handler.server, "auth", None) is not None:
+        raise FileNotFoundError()
+
+
+def _ctx_root(handler):
+    _require_bound_workspace(handler)
+    ws = _ctx(handler)
+    return ws.root if ws is not None else handler.server.root
+
+
+def _ctx_run_index(handler):
+    _require_bound_workspace(handler)
+    ws = _ctx(handler)
+    if ws is not None:
+        return ws.run_index
+    return getattr(handler.server, "run_index", None)
+
+
+def _ctx_note_index(handler):
+    _require_bound_workspace(handler)
+    ws = _ctx(handler)
+    if ws is not None:
+        return ws.note_index
+    return getattr(handler.server, "note_index", None)
+
+
+def _ctx_workspace_id(handler):
+    _require_bound_workspace(handler)
+    ws = _ctx(handler)
+    if ws is not None:
+        return ws.id
+    return getattr(handler.server, "default_workspace_id", None)
+
+
+def _ctx_run_reader(handler, run_id):
+    _require_bound_workspace(handler)
+    ws = _ctx(handler)
+    if ws is not None:
+        return ws.run_reader(run_id)
+    kwargs = _workspace_kw(handler.server)
+    return handler.server.run_reader(run_id, **kwargs) if kwargs else handler.server.run_reader(run_id)
+
+
+def _ctx_cached_reader(handler, run_id):
+    _require_bound_workspace(handler)
+    ws = _ctx(handler)
+    if ws is not None:
+        return ws.cached_reader(run_id)
+    kwargs = _workspace_kw(handler.server)
+    return handler.server.cached_reader(run_id, **kwargs) if kwargs else handler.server.cached_reader(run_id)
+
 _STATIC = Path(__file__).with_name("static")
 _FILES = {
     "index.html": "text/html; charset=utf-8",
@@ -108,6 +177,23 @@ def _summary(value, limit=None):
             if limit is not None and len(kept) >= limit:
                 break
     return kept
+
+
+def run_list_row(meta):
+    """``/api/runs`` fields derived from ``meta.json``. Shared by local list and the server index."""
+    from ..lineage import run_task
+
+    fields = ("run_id", "project", "name", "created_at", "finished_at", "tags", "group")
+    row = {k: meta.get(k) for k in fields}
+    row["name"] = _text(meta.get("name"))
+    row["project"] = _text(meta.get("project"))
+    row["tags"] = _tags(meta.get("tags"))
+    row["status"] = meta.get("status")
+    row["summary"] = _summary(meta.get("summary"))
+    row["config"] = _summary(meta.get("config"), limit=_CONFIG_LIMIT)
+    row["task"], row["task_source"] = run_task(meta)
+    row["arch"] = _lineage_arch(meta)
+    return row
 
 
 def _unique(values):
@@ -387,7 +473,8 @@ def _code_patch_budget(diff, limit, text_limit):
     return result, limit, text_limit
 
 
-def _compare_code(httpd, base_id, target_id, base_manifest, target_manifest, budget=None):
+def _compare_code(httpd, base_id, target_id, base_manifest, target_manifest, budget=None,
+                  workspace_id=None):
     budget = budget if budget is not None else _CodeDiffBudget()
     manifests = [{entry["path"]: entry for entry in manifest}
                  for manifest in (base_manifest, target_manifest)]
@@ -424,7 +511,8 @@ def _compare_code(httpd, base_id, target_id, base_manifest, target_manifest, bud
         if remaining <= 0 or text_left <= 0 or budget.exhausted():
             row.update(_code_diff_result(patch_truncated=True))
             continue
-        diff = httpd.code_pair_diff(row["base_sha256"], row["target_sha256"], budget)
+        diff_kw = {"workspace_id": workspace_id} if workspace_id is not None else _workspace_kw(httpd)
+        diff = httpd.code_pair_diff(row["base_sha256"], row["target_sha256"], budget, **diff_kw)
         patch, remaining, text_left = _code_patch_budget(diff, remaining, text_left)
         row.update(patch)
         # Status totals cover the whole manifest union. Line totals cover only
@@ -636,7 +724,7 @@ def _lineage_arch(meta):
     return arch
 
 
-def _lineage_graph(root, project_filter):
+def _lineage_graph(root, project_filter, remote_lookup=None):
     """Nodes for one project (or every project) and parent edges inside that set.
 
     ``from`` is the parent and ``to`` is the child. An edge is omitted when the
@@ -645,7 +733,7 @@ def _lineage_graph(root, project_filter):
     Timestamps and repo roots are normalized once per request.
     """
     items = []
-    for meta in reader.list_runs(root):
+    for meta in reader.list_runs(root, remote_lookup=remote_lookup):
         if not isinstance(meta, dict):
             continue
         item = _lineage_item(meta)
@@ -1183,20 +1271,25 @@ def _notes_writable(handler):
     return allowed(principal, "notes")
 
 
-def _note_run_id(raw_path):
-    """Run id when ``raw_path`` is exactly ``/api/runs/<id>/notes``."""
-    try:
-        path = unquote(urlsplit(raw_path).path, errors="strict")
-    except (UnicodeDecodeError, ValueError, LookupError):
-        return None
-    prefix = "/api/runs/"
+def _note_run_id(raw_path, effective=None):
+    """Run id when the path is ``/api/runs/<id>/notes``.
+
+    Workspace URLs are rewritten to that form via ``_effective_path`` before
+    this runs; ``/api/w/<slug>/...`` is not parsed here (``parts[3]`` is the slug).
+    """
+    path = effective
+    if path is None:
+        try:
+            path = unquote(urlsplit(raw_path).path, errors="strict")
+        except (UnicodeDecodeError, ValueError, LookupError):
+            return None
     suffix = "/notes"
-    if not path.startswith(prefix) or not path.endswith(suffix):
-        return None
-    run_id = path[len(prefix):-len(suffix)]
-    if not layout.valid_run_id(run_id):
-        return None
-    return run_id
+    prefix = "/api/runs/"
+    if path.startswith(prefix) and path.endswith(suffix):
+        run_id = path[len(prefix):-len(suffix)]
+        if layout.valid_run_id(run_id) and "/" not in run_id:
+            return run_id
+    return None
 
 
 def _parse_note_body(data: bytes):
@@ -1388,6 +1481,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _method_not_allowed(self):
         self._started = False
+        _reset_request_workspace(self)
         try:
             if not self._host_allowed():
                 self._error({"error": "forbidden host"}, 403)
@@ -1404,6 +1498,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         self._started = False
+        _reset_request_workspace(self)
         try:
             if not self._host_allowed():
                 self.close_connection = True
@@ -1549,7 +1644,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return b"".join(chunks)
 
     def _put(self):
-        run_id = _note_run_id(self.path)
+        run_id = _note_run_id(self.path, getattr(self, "_effective_path", None))
         if run_id is None:
             self._method_not_allowed()
             return
@@ -1597,15 +1692,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             raise ValueError("short body")
         text, revision = _parse_note_body(body)
-        saved = notes.write_note(self.server.root, run_id, text, revision)
+        note_index = _ctx_note_index(self)
+        if note_index is not None:
+            saved = note_index.write(run_id, text, revision)
+        else:
+            saved = notes.write_note(_ctx_root(self), run_id, text, revision)
         self._audit_note(run_id, saved)
         saved["writable"] = _notes_writable(self)
         self._json(saved)
 
     def _audit_note(self, run_id, saved):
         try:
-            if getattr(self.server, "audit", None) is not None:
-                self.server.audit.record(
+            ws = _ctx(self)
+            if ws is None and getattr(self.server, "auth", None) is not None:
+                raise FileNotFoundError()
+            log = ws.audit if ws is not None else getattr(self.server, "audit", None)
+            if log is not None:
+                log.record(
                     self.principal.user, self.principal.via, "note.write", run_id,
                     self.server.auth.client_address(self), {"revision": saved["revision"]})
         except Exception:
@@ -1618,6 +1721,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self._started = False
+        _reset_request_workspace(self)
         try:
             if not self._host_allowed():
                 self._error({"error": "forbidden host"}, 403)
@@ -1647,11 +1751,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not isinstance(run_id, str) or not run_id:
             return None
         try:
-            current = self.server.cached_reader(run_id)
+            current = _ctx_cached_reader(self, run_id)
             if current is not None:
                 step = current.last_step()
             else:
-                step = reader.read_last_step(self.server.root, run_id)
+                step = reader.read_last_step(_ctx_root(self), run_id)
         except Exception:
             return None
         if isinstance(step, bool) or not isinstance(step, int):
@@ -1660,9 +1764,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _get(self):
         url = urlsplit(self.path)
-        path = unquote(url.path, errors="strict")
+        path = getattr(self, "_effective_path", None)
+        if path is None:
+            path = unquote(url.path, errors="strict")
         query = parse_qs(url.query, keep_blank_values=True)
         arg = lambda key, default=None: query.get(key, [default])[0]
+        root = _ctx_root(self) if path.startswith("/api/") else None
         if path == "/api/compare/code":
             base_id, target_id = arg("base"), arg("target")
             if not layout.valid_run_id(base_id) or not layout.valid_run_id(target_id):
@@ -1670,16 +1777,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             budget = _CodeDiffBudget()
             manifests = []
             for run_id in dict.fromkeys((base_id, target_id)):
-                run_path = self.server.root / "runs" / run_id
-                if not run_path.resolve().is_relative_to(self.server.root / "runs"):
+                run_path = root / "runs" / run_id
+                if not run_path.resolve().is_relative_to(root / "runs"):
                     raise FileNotFoundError()
-                with self.server.run_reader(run_id) as run:
+                with _ctx_run_reader(self, run_id) as run:
                     # Recheck existence even if this reader was cached earlier.
                     run.meta()
                     manifests.append(run.code_manifest())
             if base_id == target_id:
                 manifests.append(manifests[0])
-            return self._json(_compare_code(self.server, base_id, target_id, *manifests, budget=budget))
+            return self._json(_compare_code(
+                self.server, base_id, target_id, *manifests, budget=budget,
+                workspace_id=_ctx_workspace_id(self)))
         if path == "/api/lineage":
             if "project" in query:
                 project = (query.get("project") or [""])[0]
@@ -1687,7 +1796,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     raise ValueError("invalid project")
             else:
                 project = None
-            return self._json(_lineage_graph(self.server.root, project))
+            lookup = None
+            index = _ctx_run_index(self)
+            if index is not None:
+                lookup = index.normalized_remote
+            return self._json(_lineage_graph(root, project, remote_lookup=lookup))
         if path == "/api/notes":
             if "project" in query:
                 project = (query.get("project") or [""])[0]
@@ -1695,36 +1808,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     raise ValueError("invalid project")
             else:
                 project = None
-            listed = notes.list_notes(self.server.root, project)
+            note_index = _ctx_note_index(self)
+            if note_index is not None:
+                listed = note_index.list_notes(project)
+            else:
+                listed = notes.list_notes(root, project)
             listed["writable"] = _notes_writable(self)
             return self._json(listed)
         if path == "/api/runs":
-            from ..lineage import run_task
-
-            fields = ("run_id", "project", "name", "created_at", "finished_at", "tags", "group")
+            run_index = _ctx_run_index(self)
+            if run_index is not None:
+                return self._json(run_index.dashboard_list())
             runs = []
-            for meta in reader.list_runs(self.server.root, include_owner=self.server.auth is not None):
+            for meta in reader.list_runs(root):
                 if not isinstance(meta, dict):
                     continue
-                row = {k: meta.get(k) for k in fields}
-                row["name"] = _text(meta.get("name"))
-                row["project"] = _text(meta.get("project"))
-                row["tags"] = _tags(meta.get("tags"))
+                row = run_list_row(meta)
                 row["status"] = meta.get("effective_status", meta.get("status"))
-                row["summary"] = _summary(meta.get("summary"))
-                row["config"] = _summary(meta.get("config"), limit=_CONFIG_LIMIT)
-                row["task"], row["task_source"] = run_task(meta)
-                row["arch"] = _lineage_arch(meta)
                 # meta.json and the scalars index do not record a step. The last
                 # _time.bin record is one seek, not a scan of the series files.
                 # Do not route this through run_reader: inserting every row
                 # evicts chart readers from the 64-entry LRU.
                 row["last_step"] = self._list_last_step(meta.get("run_id"))
                 last_sync_at = meta.get("last_sync_at")
-                if last_sync_at is not None or self.server.auth is not None:
+                if last_sync_at is not None:
                     row["last_sync_at"] = last_sync_at
-                if self.server.auth is not None:
-                    row["owner"] = meta.get("_remote_owner")
                 runs.append(row)
             return self._json(runs)
         if path.startswith("/api/runs/"):
@@ -1735,14 +1843,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if len(parts) > 2:
                 raise FileNotFoundError()
             route = parts[1] if len(parts) == 2 else ""
-            run_path = self.server.root / "runs" / run_id
-            if not run_path.resolve().is_relative_to(self.server.root / "runs"):
+            run_path = root / "runs" / run_id
+            if not run_path.resolve().is_relative_to(root / "runs"):
                 raise FileNotFoundError()
             if route == "notes":
-                note = notes.read_note(self.server.root, run_id)
+                note_index = _ctx_note_index(self)
+                if note_index is not None:
+                    note = note_index.read(run_id)
+                else:
+                    note = notes.read_note(root, run_id)
                 note["writable"] = _notes_writable(self)
                 return self._json(note)
-            with self.server.run_reader(run_id) as run:
+            with _ctx_run_reader(self, run_id) as run:
                 if route == "":
                     result = dict(run.meta())
                     result.update(keys=run.keys(), artifacts=run.artifacts(), code_manifest_length=len(run.code_manifest()))
@@ -1750,8 +1862,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     if last_sync_at is not None or self.server.auth is not None:
                         result["last_sync_at"] = last_sync_at
                     if self.server.auth is not None:
-                        remote = reader.read_remote(run_path)
+                        remote = run.remote()
                         result["owner"] = remote["owner"] if remote else None
+                    index = _ctx_run_index(self)
+                    if index is not None:
+                        indexed = index.effective_status(run_id)
+                        if indexed is not None:
+                            result["status"] = indexed
                 elif route == "scalars":
                     limit = max(10, min(5000, int(arg("max_points", "1000"))))
                     start, end = arg("start"), arg("end")
@@ -1794,7 +1911,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     result = run.code_manifest()
                 elif route == "lineage":
                     result = _lineage_changes(
-                        self.server.root, run_id, run.meta(),
+                        root, run_id, run.meta(),
                         server_mode=self.server.auth is not None,
                     )
                 else:
@@ -1812,7 +1929,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             headers = {"Cache-Control": "immutable, max-age=31536000"}
             if self._session_gated():
                 headers = {"Cache-Control": "no-store", "Vary": "Cookie"}
-            return self._stream(_open_regular_object(self.server.root, sha), kind, headers=headers)
+            return self._stream(_open_regular_object(root, sha), kind, headers=headers)
         name = "index.html" if path == "/" else path[len("/static/"):] if path.startswith("/static/") else ""
         if name not in _FILES:
             raise FileNotFoundError()

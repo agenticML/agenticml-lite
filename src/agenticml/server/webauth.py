@@ -1,4 +1,4 @@
-"""Dashboard login, in-memory sessions, identity proxy, and the request gate."""
+"""Dashboard login, persistent sessions, identity proxy, and the request gate."""
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -23,12 +23,14 @@ from agenticml.ui.server import (
     _FILES,
     _STATIC,
     _reject_nonfinite,
+    _reset_request_workspace,
 )
-from . import audit, keyspage, userspage
+from . import keyspage
+from .db import DatabaseError
 from .keys import ClientError, KeyStoreUnavailable, validate_name
 from .users import (
-    InviteInvalid, Principal, ScryptUnavailable, UserNameTaken, UserStore,
-    allowed, resolve, scrypt_available, validate_password,
+    InviteInvalid, Principal, ScryptUnavailable, UserNameTaken, UserRecord, UserStore,
+    _check_password, _dummy_verify, allowed, resolve, scrypt_available, validate_password,
 )
 
 logger = logging.getLogger("agenticml.server.webauth")
@@ -120,6 +122,91 @@ def _bucket(address):
     return str(addr)
 
 
+class MemoryBuckets:
+    def __init__(self):
+        self.entries = OrderedDict()
+
+    def transaction(self, expiry, now, released_ticket=None, outcome=None):
+        from contextlib import nullcontext
+        return nullcontext()
+
+
+class DbBuckets(MemoryBuckets):
+    def __init__(self, db):
+        super().__init__()
+        from .db.repos import ThrottleRepo
+        self.repo = ThrottleRepo(db)
+
+    def transaction(self, expiry, now, released_ticket=None, outcome=None):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def manage():
+            # Single server process; tickets are process-local, counts durable.
+            # Unsaved failure counts stay in memory and are merged (max) with
+            # the database until a save succeeds, so a persistence failure
+            # never lowers the effective delay.
+            original = OrderedDict((k, (v[0], v[1], dict(v[2])))
+                                   for k, v in self.entries.items())
+            applied = False
+            persisted = False
+            try:
+                rows = self.repo.load()
+                holds = {k: dict(v[2]) for k, v in original.items() if v[2]}
+                unsaved = {k: (v[0], v[1]) for k, v in original.items() if v[0]}
+                self.entries.clear()
+                previous = {bucket: (failures, last) for bucket, failures, last in rows}
+                merged = {}
+                for bucket, failures, last in rows:
+                    mem = unsaved.pop(bucket, None)
+                    if mem is not None:
+                        failures, last = max(failures, mem[0]), max(last, mem[1])
+                    merged[bucket] = (failures, last)
+                merged.update(unsaved)
+                for bucket, (failures, last) in merged.items():
+                    if bucket in holds or now - last < expiry:
+                        self.entries[bucket] = (failures, last, holds.pop(bucket, {}))
+                for bucket, pending in holds.items():
+                    self.entries[bucket] = (0, 0, pending)
+                yield
+                applied = True
+                self.repo.save(self.entries, previous)
+                persisted = True
+            except BaseException:
+                if not applied or released_ticket is None:
+                    # Load failed, or begin() could not persist: the caller
+                    # never received a ticket, so drop the unissued hold.
+                    self.entries.clear()
+                    self.entries.update(original)
+                    if (not applied and outcome == "failed"
+                            and isinstance(released_ticket, tuple) and released_ticket):
+                        # finish("failed") never ran; count it in memory so
+                        # the next begin still delays. Unsaved, merged by max.
+                        address = released_ticket[0]
+                        entry = self.entries.get(address)
+                        if entry is not None and released_ticket in entry[2]:
+                            failures, _, holds = entry
+                            self.entries[address] = (
+                                failures + 1, now, dict(holds))
+                        elif entry is None:
+                            self.entries[address] = (1, now, {})
+                raise
+            finally:
+                # A finishing attempt releases its ticket even if its failure
+                # count could not be committed. Never leave an orphaned hold.
+                if isinstance(released_ticket, tuple) and released_ticket:
+                    entry = self.entries.get(released_ticket[0])
+                    if entry is not None:
+                        entry[2].pop(released_ticket, None)
+                for bucket in list(self.entries):
+                    failures, _, holds = self.entries[bucket]
+                    if holds:
+                        continue
+                    if persisted or not failures:
+                        del self.entries[bucket]
+        return manage()
+
+
 class LoginThrottle:
     """Failed-login delays keyed by a caller-supplied bucket. Responses never sleep.
 
@@ -138,14 +225,15 @@ class LoginThrottle:
     EXPIRE_AFTER = 15 * 60
     MAX_ENTRIES = 1024
 
-    def __init__(self, clock=time.monotonic):
+    def __init__(self, clock=time.monotonic, store=None):
         self._clock = clock
         self._lock = threading.Lock()
         self._tickets = itertools.count()
         # address -> (failures, last_failure, holds). holds maps each pending
         # ticket to its own deadline. While every bucket holds a ticket, the
         # table can exceed MAX_ENTRIES, bounded by in-flight connections.
-        self._entries = OrderedDict()
+        self._store = store if store is not None else MemoryBuckets()
+        self._entries = self._store.entries
 
     def _delay(self, n):
         if n < self.FREE_FAILURES:
@@ -160,7 +248,7 @@ class LoginThrottle:
         """Reserve a slot. Returns (retry_after, ticket); ticket is None if refused."""
         address = _bucket(address)
         now = self._clock()
-        with self._lock:
+        with self._lock, self._store.transaction(self.EXPIRE_AFTER, now):
             entry = self._live(address, now)
             if entry is None:
                 failures, last_failure, holds = 0, 0, {}
@@ -184,7 +272,8 @@ class LoginThrottle:
         if ticket is None:
             return
         now = self._clock()
-        with self._lock:
+        with self._lock, self._store.transaction(
+                self.EXPIRE_AFTER, now, released_ticket=ticket, outcome=outcome):
             try:
                 address = ticket[0]
             except (TypeError, IndexError):
@@ -252,13 +341,13 @@ _ASSETS = {
 class WebAuth:
     """Owns /login, /logout, /invite, /setup, sessions, and the request gate."""
 
-    def __init__(self, keys, public_url=None, clock=time.time, throttle_clock=time.monotonic,
+    def __init__(self, keys, public_url=None, clock=time.time, throttle_clock=time.time,
                  users=None, trusted_proxies=(), identity_header=None):
         self.keys = keys
-        self.users = users if users is not None else UserStore(keys.server_dir)
+        self.users = users if users is not None else UserStore(keys.server_dir, db=keys.db, workspace_id=keys.workspace_id or '0' * 32)
         self.public_url = public_url
         self.clock = clock
-        self.throttle = LoginThrottle(clock=throttle_clock)
+        self.throttle = LoginThrottle(clock=throttle_clock, store=DbBuckets(keys.db))
         self.trusted_proxies = parse_trusted_proxies(trusted_proxies)
         self.identity_header = parse_identity_header(identity_header)
         if self.identity_header is not None and not self.trusted_proxies:
@@ -266,12 +355,15 @@ class WebAuth:
         self._identity_name, self._identity_match = (
             IDENTITY_PRESETS[self.identity_header] if self.identity_header else (None, None))
         self._lock = threading.Lock()
-        self._sessions = {}
+        from .db.repos import SessionRepo
+        self.sessions = SessionRepo(keys.db)
         self.setup_token = None
         self._setup_used = False
         self._setup_lock = threading.Lock()
 
     def arm_setup(self, base_url):
+        if self.keys.workspace_id is None:
+            return
         if not self.keys.prepare_setup():
             return
         if self._has_admin_user():
@@ -285,7 +377,7 @@ class WebAuth:
         )
 
     def _has_admin_user(self):
-        return any(user.role == "admin" for user in self.users.list())
+        return any(user.role in ("owner", "admin") for user in self.users.list())
 
     def _setup_armed(self):
         """Caller holds _setup_lock; observing an admin permanently disarms setup."""
@@ -348,20 +440,14 @@ class WebAuth:
         return value
 
     def _user_for_identity(self, identity):
-        matches = []
-        folded = identity.casefold()
-        exact = self._identity_match == "exact"
-        for user in self.users.list():
-            if user.identity is None:
-                continue
-            if exact:
-                if user.identity == identity:
-                    matches.append(user)
-            elif user.identity.casefold() == folded:
-                matches.append(user)
-            if len(matches) > 1:
-                return None
-        return matches[0] if len(matches) == 1 else None
+        from .db.workspaces import AccountRepo
+        account = AccountRepo(self.keys.db).by_identity(
+            identity, exact=self._identity_match == "exact")
+        if account is None:
+            return None
+        return Principal(
+            account["login"], "viewer", "proxy", None, account["id"],
+            account["generation"], server_admin=bool(account["server_admin"]))
 
     def _setup_matches(self, token):
         try:
@@ -382,6 +468,7 @@ class WebAuth:
 
     def handle(self, handler) -> bool:
         """Answer login routes and rejected requests. False means continue."""
+        _reset_request_workspace(handler)
         if handler.command in ("GET", "HEAD", "DELETE") and (
                 handler.headers.get_all("Content-Length") or handler.headers.get_all("Transfer-Encoding")):
             handler.close_connection = True
@@ -433,26 +520,11 @@ class WebAuth:
                     self._refuse(handler, path)
                 return True
             self._bind(handler, principal)
-            if handler.command == "GET" and path == "/api/server/session":
-                self._session_info(handler)
+            from .routes import dispatch_dashboard
+            if dispatch_dashboard(self, handler, path):
                 return True
-            if handler.command == "POST" and path == "/api/server/account/password":
-                self._account_password(handler)
-                return True
-            if path == "/api/server/keys" or (path or "").startswith("/api/server/keys/"):
-                keyspage.handle(self, handler, path)
-                return True
-            if path == "/api/server/users" or (path or "").startswith("/api/server/users/"):
-                userspage.handle(self, handler, path)
-                return True
-            if path == "/api/server/audit":
-                audit.handle(self, handler)
-                return True
-            if (path or "").startswith("/api/server/") and path != "/api/server/session":
-                handler.close_connection = True
-                handler._json({"error": "not found"}, 404)
-                return True
-            return False
+            handler._error({"error": "not found"}, 404)
+            return True
         except _DISCONNECT:
             handler.close_connection = True
             return True
@@ -464,11 +536,14 @@ class WebAuth:
                 except OSError:
                     handler.close_connection = True
             return True
-        except KeyStoreUnavailable:
+        except (KeyStoreUnavailable, DatabaseError):
             if not getattr(handler, "_started", False):
                 handler._error({"error": "key store unavailable"}, 503)
             return True
-        except ValueError:
+        except ValueError as exc:
+            from agenticml.store.notes import NoteTooLarge
+            if isinstance(exc, NoteTooLarge):
+                raise
             if not getattr(handler, "_started", False):
                 handler._error({"error": "invalid request"}, 400)
             return True
@@ -480,7 +555,10 @@ class WebAuth:
     def _audit(self, handler, action, target, detail=None, *, actor=None, via=None):
         try:
             principal = getattr(handler, "principal", None)
-            handler.server.audit.record(
+            from .audit import AuditLog
+            AuditLog(
+                handler.server.data_dir / "server", db=handler.server.db, workspace_id=None
+            ).record(
                 actor if actor is not None else principal.user,
                 via if via is not None else principal.via,
                 action, target, self.client_address(handler), {} if detail is None else detail)
@@ -537,9 +615,9 @@ class WebAuth:
         """
         identity = self.proxy_identity(handler)
         if identity is not None:
-            user = self._user_for_identity(identity)
-            if user is not None:
-                return Principal(user.name, user.role, "proxy"), None
+            principal = self._user_for_identity(identity)
+            if principal is not None:
+                return principal, None
         session = self._session(handler)
         if session is not None:
             principal = self._principal_from_session(session)
@@ -561,6 +639,15 @@ class WebAuth:
             "name": principal.key or "", "sha256": "", "user": principal.user,
         }
 
+    def _stores_for(self, workspace_id):
+        if workspace_id == self.keys.workspace_id:
+            return self.keys, self.users
+        from .keys import KeyStore
+        from .users import UserStore
+        users = UserStore(self.keys.server_dir, db=self.keys.db, workspace_id=workspace_id)
+        keys = KeyStore(self.keys.server_dir, db=self.keys.db, workspace_id=workspace_id)
+        return keys, users
+
     def _principal_from_session(self, session):
         user_name = session.get("user")
         via = session.get("via") or "key"
@@ -571,21 +658,39 @@ class WebAuth:
             principal = resolve(self.keys, self.users, record)
             if principal is None or principal.user != "env":
                 return None
-            return Principal("env", "admin", "key", "env")
-        user = self.users.get(user_name)
-        if (user is None or user.id != session.get("id")
-                or user.generation != session.get("generation")):
-            return None
+            return Principal("env", "admin", "key", "env", workspace_id=record.workspace_id if record else None)
         if via == "key":
             record = self.keys.current(
                 session.get("key") or session.get("name"),
                 session.get("key_sha256") or session.get("sha256"))
-            principal = resolve(self.keys, self.users, record)
-            if (record is None or record.scope != "admin"
-                    or principal is None or principal.role != "admin"):
+            if record is None:
                 return None
-            return Principal(user.name, user.role, "key", record.name)
-        return Principal(user.name, user.role, via, None)
+            keys, users = self._stores_for(record.workspace_id)
+            principal = resolve(keys, users, record)
+            if (record.scope != "admin"
+                    or principal is None or principal.role not in ("owner", "admin")):
+                return None
+            if (principal.id != session.get("id")
+                    or principal.generation != session.get("generation")):
+                return None
+            return principal
+        user = self.users.get(user_name)
+        if user is None:
+            from .db.workspaces import AccountRepo
+            account = AccountRepo(self.keys.db).get(user_name)
+            if (account is None or account["id"] != session.get("id")
+                    or account["generation"] != session.get("generation")):
+                return None
+            return Principal(account["login"], "viewer", via, None, account["id"],
+                             account["generation"], server_admin=bool(account["server_admin"]))
+        if (user.id != session.get("id")
+                or user.generation != session.get("generation")):
+            return None
+        from .db.workspaces import AccountRepo
+        account = AccountRepo(self.keys.db).get(user.name)
+        return Principal(
+            user.name, user.role, via, None, user.id, user.generation,
+            server_admin=bool(account["server_admin"]) if account else False)
 
     def _session(self, handler):
         token = self._read_cookie(handler)
@@ -596,24 +701,25 @@ class WebAuth:
         except UnicodeEncodeError:
             return None
         with self._lock:
-            entry = self._sessions.get(digest)
+            entry = self.sessions.get(digest)
             if entry is None:
                 return None
             now = self.clock()
             if now - entry["last_seen"] >= SESSION_IDLE or now - entry["created"] >= SESSION_MAX_AGE:
-                del self._sessions[digest]
+                self.sessions.delete(digest)
                 return None
             snapshot = dict(entry)
         if self._principal_from_session(snapshot) is None:
             with self._lock:
-                self._sessions.pop(digest, None)
+                self.sessions.delete(digest)
             return None
         with self._lock:
-            current = self._sessions.get(digest)
+            current = self.sessions.get(digest)
             if current is None:
                 return None
             if self.clock() - current["last_seen"] >= 60:
-                current["last_seen"] = self.clock()
+                self.sessions.touch(digest, self.clock())
+                current = self.sessions.get(digest)
             return current
 
     def _attach(self, handler, session, principal=None):
@@ -641,13 +747,22 @@ class WebAuth:
             key = record.name
             key_sha256 = record.sha256
             via = "key"
-            found = None if user == "env" else self.users.get(user)
+            if user == "env":
+                found = None
+            else:
+                _, users = self._stores_for(record.workspace_id)
+                found = users.get(user)
+                if expected is not None:
+                    exp_id, exp_gen = expected
+                    if (found is None or found.id != exp_id
+                            or found.generation != exp_gen):
+                        return None, None
             user_id = None if found is None else found.id
             generation = 0 if found is None else found.generation
         elif user == "env":
             generation = 0 if generation is None else generation
         else:
-            found = self.users.get(user)
+            _, found = self._users_for_login(user)
             if expected is not None:
                 exp_id, exp_gen = expected
                 if (found is None or found.id != exp_id
@@ -666,12 +781,11 @@ class WebAuth:
             "key": key, "key_sha256": key_sha256,
             "name": key or "", "sha256": key_sha256 or "",
             "created": now, "last_seen": now,
+            "workspace_id": (record.workspace_id if record is not None else self.keys.workspace_id) if via == "key" else None,
         }
         with self._lock:
-            while len(self._sessions) >= SESSION_CAP:
-                oldest = min(self._sessions, key=lambda item: self._sessions[item]["last_seen"])
-                del self._sessions[oldest]
-            self._sessions[digest] = entry
+            self.sessions.prune(now, SESSION_IDLE, SESSION_MAX_AGE)
+            self.sessions.create(digest, entry, SESSION_CAP)
         return token, entry
 
     def _session_cookie_for(self, user, via, key=None, key_sha256=None, expected=None):
@@ -694,15 +808,10 @@ class WebAuth:
         except UnicodeEncodeError:
             return
         with self._lock:
-            self._sessions.pop(digest, None)
+            self.sessions.delete(digest)
 
     def drop_sessions(self, name, sha256):
-        with self._lock:
-            for digest, entry in list(self._sessions.items()):
-                key_name = entry.get("key") or entry.get("name")
-                key_hash = entry.get("key_sha256") or entry.get("sha256")
-                if key_name == name and key_hash == sha256:
-                    del self._sessions[digest]
+        self.sessions.delete_for_key(name, sha256)
 
     def _setup_page(self, handler):
         tokens = parse_qs(urlsplit(handler.path).query, keep_blank_values=True).get("token", [])
@@ -764,7 +873,7 @@ class WebAuth:
                 created = None
                 try:
                     created = self.users.add(name, role="admin", created_by="setup")
-                    user = self.users.set_password(name, password)
+                    user = self.users.set_password(name, password, operator=True)
                     self.keys._write_setup_closed()
                 except UserNameTaken:
                     handler._json({"error": "user name already exists"}, 409)
@@ -813,7 +922,7 @@ class WebAuth:
             outcome = "success"
             self._attach(handler, entry, Principal(user.name, user.role, "setup"))
             handler._json(
-                {"ok": True, "user": user.name, "role": user.role},
+                {"ok": True, "user": user.name, "role": "admin" if user.role == "owner" else user.role},
                 201, self._headers({"Set-Cookie": self._cookie(cookie)}),
             )
         except ValueError as exc:
@@ -894,7 +1003,11 @@ class WebAuth:
             if not isinstance(payload.get("key"), str):
                 raise ValueError("invalid login body")
             record = self.keys.verify(payload["key"])
-            principal = resolve(self.keys, self.users, record)
+            if record is None:
+                principal = None
+            else:
+                keys, users = self._stores_for(record.workspace_id)
+                principal = resolve(keys, users, record)
             if record is None or principal is None:
                 logger.info("login failed")
                 outcome = "failed"
@@ -907,7 +1020,7 @@ class WebAuth:
                 handler._json(
                     {"error": "this is a sync key; sign in with an admin key"}, 403, self._headers())
                 return
-            if principal.role != "admin":
+            if principal.role not in ("owner", "admin"):
                 logger.info("login failed")
                 self._audit_login_failed(handler, method="key")
                 handler._json(
@@ -917,9 +1030,7 @@ class WebAuth:
             expected = (
                 None if principal.id is None
                 else (principal.id, principal.generation))
-            token, entry = self._session_cookie_for(
-                principal.user, "key", key=record.name, key_sha256=record.sha256,
-                expected=expected)
+            token, entry = self._create_session(record, expected=expected)
             if entry is None:
                 outcome = "failed"
                 self._audit_login_failed(handler, method="key")
@@ -930,7 +1041,7 @@ class WebAuth:
             self._attach(handler, entry, principal)
             self._audit(handler, "login.ok", principal.user, {"method": "key"})
             handler._json(
-                {"ok": True, "user": principal.user, "role": principal.role},
+                {"ok": True, "user": principal.user, "role": "admin" if principal.role == "owner" else principal.role},
                 headers=self._headers({"Set-Cookie": self._cookie(token)}),
             )
         finally:
@@ -956,7 +1067,7 @@ class WebAuth:
                 handler._json({"error": ScryptUnavailable().args[0]}, 503, self._headers())
                 return
             try:
-                user = self.users.verify_password(name, password)
+                user = self._verify_login_password(name, password)
             except ClientError:
                 logger.info("login failed")
                 outcome = "failed"
@@ -981,7 +1092,7 @@ class WebAuth:
             self._attach(handler, entry, Principal(user.name, user.role, "password"))
             self._audit(handler, "login.ok", user.name, {"method": "password"})
             handler._json(
-                {"ok": True, "user": user.name, "role": user.role},
+                {"ok": True, "user": user.name, "role": "admin" if user.role == "owner" else user.role},
                 headers=self._headers({"Set-Cookie": self._cookie(token)}),
             )
         finally:
@@ -1005,14 +1116,88 @@ class WebAuth:
             self._headers({"Set-Cookie": self._cookie("", max_age=0)}),
         )
 
+    def _workspace_cookie(self, handler):
+        raw = handler.headers.get("Cookie")
+        if not raw:
+            return None
+        try:
+            jar = SimpleCookie()
+            jar.load(raw)
+        except CookieError:
+            return None
+        morsel = jar.get("aml_ws")
+        if morsel is None or not morsel.value:
+            return None
+        from .db.workspaces import validate_slug
+        try:
+            return validate_slug(morsel.value)
+        except ClientError:
+            return None
+
+    def _account_workspaces(self, handler):
+        principal = handler.principal
+        from .db.workspaces import AccountRepo, WorkspaceRepo
+        if principal.user == "env":
+            workspace = WorkspaceRepo(self.keys.db).get("default")
+            if workspace is None or workspace["status"] != "active":
+                return []
+            return [{"slug": workspace["slug"], "name": workspace["name"], "role": "admin"}]
+        rows = AccountRepo(self.keys.db).workspaces(principal.user)
+        session = getattr(handler, "session", None) or {}
+        bound = session.get("workspace_id") if principal.via == "key" else None
+        if bound:
+            workspace = WorkspaceRepo(self.keys.db).by_id(bound)
+            slug = None if workspace is None else workspace["slug"]
+            return [row for row in rows if row["slug"] == slug]
+        return rows
+
+    def _user_from_account(self, account, role="viewer"):
+        raw = account.get("password")
+        try:
+            password = json.loads(raw) if raw else None
+        except (ValueError, TypeError, RecursionError):
+            password = None
+        return UserRecord(
+            account["login"], account["id"], role, account.get("identity"),
+            password, None, int(account.get("generation") or 0),
+            account.get("created_at") or "", account.get("created_by") or "")
+
+    def _users_for_login(self, login):
+        user = self.users.get(login)
+        if user is not None:
+            return self.users, user
+        from .db.workspaces import AccountRepo, WorkspaceRepo
+        slugs = AccountRepo(self.keys.db).workspace_slugs(login)
+        if slugs:
+            workspace = WorkspaceRepo(self.keys.db).get(slugs[0])
+            if workspace is not None:
+                from .users import UserStore
+                users = UserStore(self.keys.server_dir, db=self.keys.db, workspace_id=workspace["id"])
+                found = users.get(login)
+                if found is not None:
+                    return users, found
+        account = AccountRepo(self.keys.db).get(login)
+        if account is None:
+            return None, None
+        return None, self._user_from_account(account)
+
+    def _verify_login_password(self, name, password):
+        users, found = self._users_for_login(name)
+        if users is not None:
+            return users.verify_password(name, password)
+        if found is None or found.password is None or not isinstance(password, str):
+            _dummy_verify(password if isinstance(password, str) else "")
+            return None
+        return found if _check_password(password, found.password) else None
+
     def _session_payload(self, handler):
         principal = handler.principal
-        user = None if principal.user == "env" else self.users.get(principal.user)
+        user = None if principal.user == "env" else self._users_for_login(principal.user)[1]
         key = principal.key if principal.via == "key" else None
         return {
             "server": True,
             "user": principal.user,
-            "role": principal.role,
+            "role": "admin" if principal.role == "owner" else principal.role,
             "via": principal.via,
             "key": key,
             "scope": "admin" if principal.via == "key" else None,
@@ -1025,13 +1210,16 @@ class WebAuth:
             },
             "password_set": bool(user is not None and user.password is not None),
             "identity_proxy": self.identity_header is not None,
+            "workspaces": self._account_workspaces(handler),
+            "server_admin": bool(principal.server_admin),
         }
 
     def _session_info(self, handler):
         handler._json(self._session_payload(handler), headers=self._headers())
 
-    def _check_current_password(self, handler, user, current):
+    def _check_current_password(self, handler, user, current, users=None):
         """Throttle the current-password check. False means a response was sent."""
+        store = self.users if users is None else users
         address = self.client_address(handler)
         address_ticket = self._throttle_or_refuse(handler, address)
         if address_ticket is None:
@@ -1052,7 +1240,7 @@ class WebAuth:
                 handler._json({"error": "invalid current password"}, 401, self._headers())
                 return False
             try:
-                verified = self.users.verify_password(user.name, current)
+                verified = store.verify_password(user.name, current)
             except ClientError:
                 outcome = "failed"
                 handler._json({"error": "invalid password"}, 400, self._headers())
@@ -1069,9 +1257,11 @@ class WebAuth:
 
     def _account_password(self, handler):
         principal = handler.principal
-        if principal.user == "env":
+        # Key-login and env sessions are workspace-bound; setup/invite proved
+        # the account token and may change the password they just set.
+        if principal.via == "key" or principal.user == "env":
             handler.close_connection = True
-            handler._json({"error": "environment user cannot set a password"}, 403, self._headers())
+            handler._json({"error": "this session cannot set a password"}, 403, self._headers())
             return
         try:
             payload = keyspage.read_json(handler, LOGIN_BODY_MAX)
@@ -1081,7 +1271,7 @@ class WebAuth:
             current = payload.get("current")
             if not isinstance(new, str):
                 raise ClientError("invalid password")
-            user = self.users.get(principal.user)
+            users, user = self._users_for_login(principal.user)
             if user is None:
                 handler.close_connection = True
                 handler._json({"error": "login required"}, 401, self._headers())
@@ -1094,12 +1284,12 @@ class WebAuth:
                     handler._json({"error": "login required"}, 401, self._headers())
                     return
             if user.password is not None:
-                if not self._check_current_password(handler, user, current):
+                if not self._check_current_password(handler, user, current, users):
                     return
             if not scrypt_available():
                 handler._json({"error": ScryptUnavailable().args[0]}, 503, self._headers())
                 return
-            updated = self.users.set_password(user.name, new)
+            updated = users.set_password(user.name, new, acting_account_id=user.id)
             self._audit(handler, "user.password", updated.name, {"method": "account"})
             token, entry = self._create_session(
                 user=updated.name, via="password",
@@ -1109,7 +1299,7 @@ class WebAuth:
                 return
             self._attach(handler, entry, Principal(updated.name, updated.role, "password"))
             handler._json(
-                {"ok": True, "user": updated.name, "role": updated.role},
+                {"ok": True, "user": updated.name, "role": "admin" if updated.role == "owner" else updated.role},
                 headers=self._headers({"Set-Cookie": self._cookie(token)}),
             )
         except ScryptUnavailable as exc:
@@ -1124,7 +1314,10 @@ class WebAuth:
         from datetime import datetime, timezone
 
         from agenticml.store import layout as store_layout
+        from .db.workspaces import InviteRepo
 
+        if InviteRepo.find_pending(self.keys.db, token) is not None:
+            return True
         if not isinstance(token, str) or not token:
             return False
         try:
@@ -1148,10 +1341,64 @@ class WebAuth:
                 found = True
         return found
 
+    def _invite_existing_page(self, handler):
+        body = (
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"/>"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>"
+            "<title>agenticml · Sign in</title>"
+            "<link rel=\"stylesheet\" href=\"/static/app.css\"/>"
+            "<script type=\"module\" src=\"/static/invite.js\"></script></head>"
+            "<body class=\"login-page\"><main class=\"login-card\">"
+            "<p class=\"eyebrow\">agenticml</p><h1>You already have an account</h1>"
+            "<p>You already have an account; join this workspace, then sign in with it.</p>"
+            "<form id=\"invite-existing\">"
+            "<button class=\"btn btn-primary\" type=\"submit\">Join workspace</button>"
+            "</form>"
+            "<p><a href=\"/login\">Sign in</a></p>"
+            "<p id=\"error\" class=\"error\" role=\"alert\" hidden></p>"
+            "</main></body></html>"
+        ).encode("utf-8")
+        handler._send(body, "text/html; charset=utf-8", headers=self._headers({"Referrer-Policy": "no-referrer"}))
+
+    def _invite_kind(self, token):
+        """Return (pending_row, kind) where kind is new, existing, or reset."""
+        from .db.workspaces import AccountRepo, InviteRepo, MembershipRepo
+
+        pending = InviteRepo.find_pending(self.keys.db, token)
+        if pending is None:
+            return None, None
+        account = AccountRepo(self.keys.db).get(pending["login"])
+        if account is None:
+            return pending, "new"
+        member = MembershipRepo(self.keys.db, pending["workspace_id"]).get(account["id"])
+        return pending, "reset" if member is not None else "existing"
+
+    def _redeem_workspace_invite(self, token, password=None):
+        from .db.workspaces import AccountRepo, InviteRepo
+        from .users import InviteExistingAccount, InviteInvalid, UserStore
+
+        pending = InviteRepo.find_pending(self.keys.db, token)
+        if pending is None:
+            raise InviteInvalid("invalid invite")
+        InviteRepo(self.keys.db, pending["workspace_id"]).redeem(token, password)
+        users = UserStore(
+            self.keys.server_dir, db=self.keys.db, workspace_id=pending["workspace_id"])
+        user = users.get(pending["login"])
+        if user is None:
+            account = AccountRepo(self.keys.db).get(pending["login"])
+            if account is None:
+                raise InviteInvalid("invalid invite")
+            raise InviteExistingAccount(account["id"])
+        return user
+
     def _invite_page(self, handler):
         tokens = parse_qs(urlsplit(handler.path).query, keep_blank_values=True).get("token", [])
         token = tokens[0] if len(tokens) == 1 else None
-        if not self._invite_pending(token):
+        _, kind = self._invite_kind(token)
+        if kind == "existing":
+            self._invite_existing_page(handler)
+            return
+        if kind not in ("new", "reset") and not self._invite_pending(token):
             handler._json({"error": "not found"}, 404)
             return
         handler._send(
@@ -1159,7 +1406,26 @@ class WebAuth:
             headers=self._headers({"Referrer-Policy": "no-referrer"}),
         )
 
+    def _finish_invite_login(self, handler, user):
+        self._audit(handler, "user.password", user.name, {"method": "invite"},
+                    actor=user.name, via="invite")
+        self._between_verify_and_session(user)
+        cookie, entry = self._session_cookie_for(
+            user.name, "invite", expected=(user.id, user.generation))
+        if entry is None:
+            self._refuse_stale_credentials(handler)
+            return False
+        self._attach(handler, entry, Principal(user.name, user.role, "invite"))
+        self._audit(handler, "login.ok", user.name, {"method": "invite"})
+        handler._json(
+            {"ok": True, "user": user.name, "role": "admin" if user.role == "owner" else user.role},
+            headers=self._headers({"Set-Cookie": self._cookie(cookie)}),
+        )
+        return True
+
     def _invite(self, handler):
+        from .users import InviteExistingAccount, InviteInvalid
+
         if not handler._csrf_ok():
             handler.close_connection = True
             handler._error({"error": "cross-site request refused"}, 403)
@@ -1174,13 +1440,59 @@ class WebAuth:
             if payload is None:
                 return
             token, password = payload.get("token"), payload.get("password")
-            if not isinstance(token, str) or not isinstance(password, str):
+            if not isinstance(token, str):
+                raise ClientError("invalid invite body")
+            pending, kind = self._invite_kind(token)
+            if kind == "existing":
+                try:
+                    self._redeem_workspace_invite(token)
+                except InviteExistingAccount:
+                    outcome = "success"
+                    handler._json(
+                        {"error": "you already have an account; sign in with it"}, 409,
+                        self._headers())
+                    return
+                except InviteInvalid:
+                    outcome = "failed"
+                    handler._json({"error": "not found"}, 404)
+                    return
+                handler._json({"error": "not found"}, 404)
+                return
+            if not isinstance(password, str):
                 raise ClientError("invalid invite body")
             if not scrypt_available():
                 handler._json({"error": ScryptUnavailable().args[0]}, 503, self._headers())
                 return
+            if kind == "new":
+                try:
+                    user = self._redeem_workspace_invite(token, password)
+                except InviteExistingAccount:
+                    outcome = "success"
+                    handler._json(
+                        {"error": "you already have an account; sign in with it"}, 409,
+                        self._headers())
+                    return
+                except InviteInvalid:
+                    outcome = "failed"
+                    handler._json({"error": "not found"}, 404)
+                    return
+                except ScryptUnavailable as exc:
+                    handler._json({"error": str(exc)}, 503, self._headers())
+                    return
+                if not self._finish_invite_login(handler, user):
+                    outcome = "failed"
+                    return
+                outcome = "success"
+                return
             try:
-                user = self.users.redeem_invite(token, password)
+                if pending is not None:
+                    from .users import UserStore
+                    users = UserStore(
+                        self.keys.server_dir, db=self.keys.db,
+                        workspace_id=pending["workspace_id"])
+                    user = users.redeem_invite(token, password)
+                else:
+                    user = self.users.redeem_invite(token, password)
             except InviteInvalid:
                 outcome = "failed"
                 handler._json({"error": "not found"}, 404)
@@ -1188,22 +1500,10 @@ class WebAuth:
             except ScryptUnavailable as exc:
                 handler._json({"error": str(exc)}, 503, self._headers())
                 return
-            self._audit(handler, "user.password", user.name, {"method": "invite"},
-                        actor=user.name, via="invite")
-            self._between_verify_and_session(user)
-            cookie, entry = self._session_cookie_for(
-                user.name, "invite", expected=(user.id, user.generation))
-            if entry is None:
+            if not self._finish_invite_login(handler, user):
                 outcome = "failed"
-                self._refuse_stale_credentials(handler)
                 return
             outcome = "success"
-            self._attach(handler, entry, Principal(user.name, user.role, "invite"))
-            self._audit(handler, "login.ok", user.name, {"method": "invite"})
-            handler._json(
-                {"ok": True, "user": user.name, "role": user.role},
-                headers=self._headers({"Set-Cookie": self._cookie(cookie)}),
-            )
         except ValueError as exc:
             if not getattr(handler, "_started", False):
                 handler._error(
