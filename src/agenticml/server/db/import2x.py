@@ -26,106 +26,108 @@ def import_state(db, server_dir, *, actor='server'):
     settings = SettingsRepo(db)
     if settings.get('imported_2x') is None:
         _import_users_keys(db, directory, actor=actor)
+    from ..workspaces import convert_store
+    convert_store(db, directory.parent)
     _import_runs(db, directory)
 
 
 def _import_users_keys(db, directory, *, actor='server'):
     from ..keys import _parse_keys_object
     from ..users import UserStore
-    from .legacy2x import read_json
+    from .legacy2x import read_json, migrate
+    from .workspaces import WorkspaceRepo
     import json
 
     settings = SettingsRepo(db)
-    # Serialize legacy conversion and import across openers as well as threads.
-    # The conversion uses keys.lock itself; import is guarded by BEGIN IMMEDIATE.
     imported = []
     skipped = 0
     skipped_keys = 0
+    # Prepare all files and legacy rewrites before opening a SQLite writer.
+    for name in ('users.json', 'keys.json'):
+        path = directory / name
+        try:
+            if _exists(path):
+                read_json(path)
+        except (OSError, ValueError, TypeError, RecursionError) as exc:
+            raise DatabaseError(f'could not import {name}: invalid or unreadable file; fix or move it away') from exc
+    if not _exists(directory / 'users.json') and _exists(directory / 'keys.json'):
+        if not migrate(directory.parent, actor=actor, db=db):
+            raise DatabaseError('could not import keys.json: legacy migration failed; fix or move it away')
+    prepared_users, prepared_keys, events = [], [], []
+    for name in ('users.json', 'keys.json'):
+        path = directory / name
+        if not _exists(path):
+            continue
+        try:
+            obj = read_json(path)
+            if name == 'users.json':
+                if (not isinstance(obj, dict) or type(obj.get('version')) is not int
+                        or obj['version'] != 1 or not isinstance(obj.get('users'), list)):
+                    raise ValueError('invalid users.json')
+                names, identities, ids = set(), set(), set()
+                prepared_users = [UserStore._parse_row(row, names, identities, ids) for row in obj['users']]
+            else:
+                prepared_keys = _parse_keys_object(obj, (2,))
+        except Exception as exc:
+            raise DatabaseError(f'could not import {name}: invalid or unreadable records; fix or move it away') from exc
+        imported.append(path)
+    marker = directory / 'setup-closed'
+    closed = _exists(marker)
+    if closed:
+        imported.append(marker)
+    path = directory / 'audit.jsonl'
+    if _exists(path):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise ValueError('not a regular file')
+                file = os.fdopen(fd, 'rb')
+            except BaseException:
+                os.close(fd)
+                raise
+            with file:
+                while True:
+                    line = file.readline(1024 * 1024 + 2)
+                    if not line:
+                        break
+                    if not line.endswith(b'\n') or len(line) > 1024 * 1024 + 1:
+                        while line and not line.endswith(b'\n'):
+                            line = file.readline(64 * 1024)
+                        skipped += 1
+                        continue
+                    try:
+                        event = json.loads(line.decode('utf-8'))
+                        if (not isinstance(event, dict) or not isinstance(event.get('ts'), str)
+                                or any(event.get(k) is not None and not isinstance(event[k], str)
+                                       for k in ('actor', 'via', 'action', 'target', 'client'))):
+                            raise ValueError('invalid audit event')
+                        events.append(event)
+                    except (ValueError, RecursionError):
+                        skipped += 1
+        except (OSError, ValueError):
+            skipped += 1
+        imported.append(path)
     with db.transaction(write=True) as tx:
         tx.advisory_lock('import')
+        tx.advisory_lock('users')
         if settings.get('imported_2x', tx) is not None:
             return
-        for name in ('users.json', 'keys.json'):
-            path = directory / name
-            try:
-                if _exists(path):
-                    read_json(path)
-            except (OSError, ValueError, TypeError, RecursionError) as exc:
-                raise DatabaseError(f'could not import {name}: invalid or unreadable file; '
-                                    'fix or move it away') from exc
-        if not _exists(directory / 'users.json') and _exists(directory / 'keys.json'):
-            # Migration audit uses this transaction too: no nested transaction.
-            from . import legacy2x
-            if not legacy2x.migrate(directory.parent, actor=actor, db=_ImportAuditDb(db, tx)):
-                raise DatabaseError('could not import keys.json: legacy migration failed; fix or move it away')
-        users = UserRepo(db, directory)
-        keys = KeyRepo(db, directory)
-        for name in ('users.json', 'keys.json'):
-            path = directory / name
-            if not _exists(path):
+        wid = WorkspaceRepo(db).get('default', tx)['id']
+        users = UserRepo(db, wid)
+        keys = KeyRepo(db, wid)
+        for record in sorted(prepared_users, key=lambda u: (u.created_at, u.name)):
+            users.save(tx, record)
+        known = {u.name for u in users.list(tx)}
+        for record in prepared_keys:
+            if record.user not in known:
+                skipped_keys += 1
                 continue
-            try:
-                obj = read_json(path)
-                if name == 'users.json':
-                    if (not isinstance(obj, dict) or type(obj.get('version')) is not int
-                            or obj['version'] != 1 or not isinstance(obj.get('users'), list)):
-                        raise ValueError('invalid users.json')
-                    names, identities, ids = set(), set(), set()
-                    for row in obj['users']:
-                        users.save(tx, UserStore._parse_row(row, names, identities, ids))
-                else:
-                    known = {u.name for u in users.list(tx)}
-                    orphaned = 0
-                    for record in _parse_keys_object(obj, (2,)):
-                        if record.user not in known:
-                            orphaned += 1
-                            continue
-                        keys.insert(tx, record)
-                    skipped_keys = orphaned
-            except Exception as exc:
-                raise DatabaseError(f'could not import {name}: invalid or unreadable records; '
-                                    'fix or move it away') from exc
-            imported.append(path)
-        marker = directory / 'setup-closed'
-        if _exists(marker):
+            keys.insert(tx, record)
+        if closed:
             settings.set('setup_closed', layout.format_timestamp(), tx)
-            imported.append(marker)
-        path = directory / 'audit.jsonl'
-        if _exists(path):
-            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-            try:
-                fd = os.open(path, flags)
-                try:
-                    if not stat.S_ISREG(os.fstat(fd).st_mode):
-                        raise ValueError('not a regular file')
-                    file = os.fdopen(fd, 'rb')
-                except BaseException:
-                    os.close(fd)
-                    raise
-                # Read forward with a bounded buffer, retaining file order for
-                # events whose timestamps tie. Drain oversized lines once.
-                with file:
-                    while True:
-                        line = file.readline(1024 * 1024 + 2)
-                        if not line:
-                            break
-                        if not line.endswith(b'\n') or len(line) > 1024 * 1024 + 1:
-                            while line and not line.endswith(b'\n'):
-                                line = file.readline(64 * 1024)
-                            skipped += 1
-                            continue
-                        try:
-                            event = json.loads(line.decode('utf-8'))
-                            if (not isinstance(event, dict) or not isinstance(event.get('ts'), str)
-                                    or any(event.get(k) is not None and not isinstance(event[k], str)
-                                           for k in ('actor', 'via', 'action', 'target', 'client'))):
-                                raise ValueError('invalid audit event')
-                            AuditRepo(db).insert(event, tx)
-                        except (ValueError, RecursionError):
-                            skipped += 1
-            except (OSError, ValueError):
-                skipped += 1
-            imported.append(path)
+        for event in events:
+            AuditRepo(db, wid).insert(event, tx)
         settings.set('imported_2x', layout.format_timestamp(), tx)
     if skipped:
         logger.warning('skipped %d malformed or unreadable legacy audit line(s)', skipped)
@@ -159,12 +161,18 @@ def _import_runs(db, directory):
     settings = SettingsRepo(db)
     if settings.get('imported_runs_2x') is not None:
         return
-    root = directory.parent / 'store'
+    from .workspaces import WorkspaceRepo
+    from ..workspaces import store_root
+    default = WorkspaceRepo(db).get('default')
+    if default is None:
+        return
+    wid = default['id']
+    root = store_root(directory.parent, wid)
     if not store_paths_safe(root):
         raise DatabaseError('could not import runs: store or store/runs is a symlink or not a '
                             'directory; fix or move it away')
     runs_root = root / 'runs'
-    run_index = RunRepo(db)
+    run_index = RunRepo(db, wid)
     try:
         entries = list(os.scandir(runs_root))
     except FileNotFoundError:
@@ -240,14 +248,3 @@ def _import_runs(db, directory):
             logger.warning('could not rename imported %s', path.name)
         else:
             logger.warning('skipping rename of imported %s; %s already exists', path.name, dest.name)
-
-
-class _ImportAuditDb:
-    """Let the legacy migration's best-effort audit join the import transaction."""
-    def __init__(self, db, tx):
-        self.db = db
-        self.tx = tx
-
-    def transaction(self, write=False):
-        from contextlib import nullcontext
-        return nullcontext(self.tx)

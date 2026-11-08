@@ -1,7 +1,7 @@
 # Package 18 †: Workspaces and accounts
 
-Nov 7, 2026 · Supervisor plan · Release 3.0 · Coder: Codex (18.1), Cursor
-(18.2) · Size: L
+Nov 7, 2026 · Supervisor plan · Release 3.0 · Coder: Codex (18.1a, 18.1b),
+Cursor (18.2) · Size: L
 
 Source: [on-prem-3.0-plan.md](../on-prem-3.0-plan.md), "Workspaces and
 accounts (package 18)", "Tables (after package 18)", decisions D9 and the
@@ -257,13 +257,44 @@ isolation suite iterates it.
   start does not convert again; a symlinked or non-directory `<data>/store`
   aborts start with a clear message.
 
+## What 16 and 17 left in place (read before coding)
+
+- `server/db/`: SQLite pool, `Tx.advisory_lock` / `lock_row` hooks
+  (call them around every read-then-write rule; user-row rules share the
+  `users` lock name), numbered migrations (`0001_initial.sql`,
+  `0002_runs.sql`; add `0003_...`), repositories in `db/repos.py`,
+  one-time 2.x import in `db/import2x.py` (`imported_2x`,
+  `imported_runs_2x` flags).
+- `server/runs.py` and `RunRepo` (`server.run_index`): list rows,
+  committed sizes, `commit_sizes`, `claim_meta` (ownership before the
+  file), `reconcile` (insert-only adoption, re-checks before deleting,
+  refuses symlinked `store`/`runs`), offline `server reindex` (holds
+  `server.lock`). In 18 all of this becomes per workspace: run index,
+  reconcile and reindex take a workspace (reindex: `--workspace SLUG`,
+  default every workspace), and `store_paths_safe` checks every
+  workspace store.
+- `/state` hashes atomic files from disk; append files report committed
+  sizes. Keep both rules per workspace.
+- Sessions, throttle and audit are tables; sessions gain `account_id`
+  and (key login) `workspace_id` here.
+
 ## Tasks
 
-- **18.1 (Codex):** migration, accounts/workspaces/memberships/invites
-  repositories, `access.py`, route table and dispatch, workspace-bound
-  ingest and dashboard API handlers (server side), file move, CLI,
-  isolation suite, rewritten server tests. Leaves the dashboard JS for
-  18.2 but must keep the server-side page routes ready for it.
+- **18.1a (Codex):** migration 0003 (accounts, workspaces, memberships,
+  invites, `workspace_id` on every workspace table), default-workspace
+  conversion and the `<data>/store` move, repositories that require a
+  workspace, `access.py`, key → workspace binding for `/v2` (sync,
+  objects, lineage, state per workspace store), env key rule, server-admin
+  flag, CLI (`server workspaces`, `server accounts`, `--workspace` on
+  `users`/`keys`/`audit`/`reindex`), rewritten server tests. The 2.2
+  dashboard API keeps working against the `default` workspace until
+  18.1b (temporary; no new routes yet).
+- **18.1b (Codex):** route table and dispatch, `/w/<slug>/`,
+  `/api/w/<slug>/...`, `/api/account/...`, `/api/admin/...`, `/` redirect
+  and `/workspaces` picker (server side), removal of the 2.2 dashboard
+  API paths, isolation suite (`tests/test_server_isolation.py`) and the
+  two-workspace end-to-end test. Leaves the dashboard JS for 18.2 but
+  serves `index.html` at `/w/<slug>/`.
 - **18.2 (Cursor):** `app.js` / `app.css` / `index.html` and the login,
   setup and invite pages: workspace URLs, API prefix, switcher, team and
   keys pages per workspace, picker page, server-admin page, UI tests in
@@ -284,3 +315,38 @@ isolation suite iterates it.
 
 All checks pass, the isolation suite covers every route, and both
 reviews (Sonnet, and the second † review by the other coder) are clean.
+
+## Decisions made during 18.1a review (Nov 8, 2026)
+
+- **Credentials belong to the account, not the workspace.** A workspace
+  admin or owner may reset the password, send a password invite or change
+  the proxy identity of an account only when that account's sole
+  membership is in their workspace. Otherwise only the person (account
+  page) or a server admin (CLI on the server) can. Without this rule an
+  admin of one workspace could take over a member who also belongs to
+  another workspace (found in review, fixed in 18.1a).
+- **Invites reveal whether a login has an account.** Inviting an existing
+  login adds the membership directly, so a workspace admin learns that
+  the login exists on the server. Accepted for self-hosted (logins are
+  team names). For the hosted service, package 18b decides whether
+  invites must always go through a link that the invited person accepts.
+- **`/setup` is a one-time server bootstrap.** `setup_closed` stays a
+  server-level setting: once any admin key exists, `/setup` never re-arms.
+- **`default` cannot be deleted and its slug cannot change.** The
+  environment key and self-hosted upgrades depend on it; its display name
+  can change.
+- **Deleting a workspace deletes its audit events** (cascade); the
+  server-level `workspace.delete` audit line remains.
+
+## Notes for 18.1b (from the 18.1a reviews)
+
+- `InviteRepo.redeem` raises `InviteExistingAccount` (not a `ValueError`)
+  after committing the membership when the invited login already has an
+  account. The `/invite` route must catch it and tell the person to sign
+  in with their existing credentials (no password form).
+- Wire `require_workspace_member` / `require_workspace_manager` into the
+  dashboard binding step (18.1a uses them only in tests; sync binds
+  through `bind_sync`).
+- The temporary 2.2 dashboard paths resolve `server.default_workspace_id`
+  explicitly (`ui/server.py` `_workspace_kw`); remove them with the 2.2
+  API paths.

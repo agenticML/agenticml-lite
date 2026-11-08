@@ -343,7 +343,7 @@ class WebAuth:
     def __init__(self, keys, public_url=None, clock=time.time, throttle_clock=time.time,
                  users=None, trusted_proxies=(), identity_header=None):
         self.keys = keys
-        self.users = users if users is not None else UserStore(keys.server_dir, db=keys.db)
+        self.users = users if users is not None else UserStore(keys.server_dir, db=keys.db, workspace_id=keys.workspace_id or '0' * 32)
         self.public_url = public_url
         self.clock = clock
         self.throttle = LoginThrottle(clock=throttle_clock, store=DbBuckets(keys.db))
@@ -361,6 +361,8 @@ class WebAuth:
         self._setup_lock = threading.Lock()
 
     def arm_setup(self, base_url):
+        if self.keys.workspace_id is None:
+            return
         if not self.keys.prepare_setup():
             return
         if self._has_admin_user():
@@ -374,7 +376,7 @@ class WebAuth:
         )
 
     def _has_admin_user(self):
-        return any(user.role == "admin" for user in self.users.list())
+        return any(user.role in ("owner", "admin") for user in self.users.list())
 
     def _setup_armed(self):
         """Caller holds _setup_lock; observing an admin permanently disarms setup."""
@@ -651,6 +653,8 @@ class WebAuth:
         }
 
     def _principal_from_session(self, session):
+        if session.get("via") == "key" and session.get("workspace_id") != self.keys.workspace_id:
+            return None
         user_name = session.get("user")
         via = session.get("via") or "key"
         if user_name == "env":
@@ -671,7 +675,7 @@ class WebAuth:
                 session.get("key_sha256") or session.get("sha256"))
             principal = resolve(self.keys, self.users, record)
             if (record is None or record.scope != "admin"
-                    or principal is None or principal.role != "admin"):
+                    or principal is None or principal.role not in ("owner", "admin")):
                 return None
             return Principal(user.name, user.role, "key", record.name)
         return Principal(user.name, user.role, via, None)
@@ -756,6 +760,7 @@ class WebAuth:
             "key": key, "key_sha256": key_sha256,
             "name": key or "", "sha256": key_sha256 or "",
             "created": now, "last_seen": now,
+            "workspace_id": (record.workspace_id if record is not None else self.keys.workspace_id) if via == "key" else None,
         }
         with self._lock:
             self.sessions.prune(now, SESSION_IDLE, SESSION_MAX_AGE)
@@ -847,7 +852,7 @@ class WebAuth:
                 created = None
                 try:
                     created = self.users.add(name, role="admin", created_by="setup")
-                    user = self.users.set_password(name, password)
+                    user = self.users.set_password(name, password, operator=True)
                     self.keys._write_setup_closed()
                 except UserNameTaken:
                     handler._json({"error": "user name already exists"}, 409)
@@ -896,7 +901,7 @@ class WebAuth:
             outcome = "success"
             self._attach(handler, entry, Principal(user.name, user.role, "setup"))
             handler._json(
-                {"ok": True, "user": user.name, "role": user.role},
+                {"ok": True, "user": user.name, "role": "admin" if user.role == "owner" else user.role},
                 201, self._headers({"Set-Cookie": self._cookie(cookie)}),
             )
         except ValueError as exc:
@@ -990,7 +995,7 @@ class WebAuth:
                 handler._json(
                     {"error": "this is a sync key; sign in with an admin key"}, 403, self._headers())
                 return
-            if principal.role != "admin":
+            if principal.role not in ("owner", "admin"):
                 logger.info("login failed")
                 self._audit_login_failed(handler, method="key")
                 handler._json(
@@ -1013,7 +1018,7 @@ class WebAuth:
             self._attach(handler, entry, principal)
             self._audit(handler, "login.ok", principal.user, {"method": "key"})
             handler._json(
-                {"ok": True, "user": principal.user, "role": principal.role},
+                {"ok": True, "user": principal.user, "role": "admin" if principal.role == "owner" else principal.role},
                 headers=self._headers({"Set-Cookie": self._cookie(token)}),
             )
         finally:
@@ -1064,7 +1069,7 @@ class WebAuth:
             self._attach(handler, entry, Principal(user.name, user.role, "password"))
             self._audit(handler, "login.ok", user.name, {"method": "password"})
             handler._json(
-                {"ok": True, "user": user.name, "role": user.role},
+                {"ok": True, "user": user.name, "role": "admin" if user.role == "owner" else user.role},
                 headers=self._headers({"Set-Cookie": self._cookie(token)}),
             )
         finally:
@@ -1095,7 +1100,7 @@ class WebAuth:
         return {
             "server": True,
             "user": principal.user,
-            "role": principal.role,
+            "role": "admin" if principal.role == "owner" else principal.role,
             "via": principal.via,
             "key": key,
             "scope": "admin" if principal.via == "key" else None,
@@ -1182,7 +1187,7 @@ class WebAuth:
             if not scrypt_available():
                 handler._json({"error": ScryptUnavailable().args[0]}, 503, self._headers())
                 return
-            updated = self.users.set_password(user.name, new)
+            updated = self.users.set_password(user.name, new, acting_account_id=user.id)
             self._audit(handler, "user.password", updated.name, {"method": "account"})
             token, entry = self._create_session(
                 user=updated.name, via="password",
@@ -1192,7 +1197,7 @@ class WebAuth:
                 return
             self._attach(handler, entry, Principal(updated.name, updated.role, "password"))
             handler._json(
-                {"ok": True, "user": updated.name, "role": updated.role},
+                {"ok": True, "user": updated.name, "role": "admin" if updated.role == "owner" else updated.role},
                 headers=self._headers({"Set-Cookie": self._cookie(token)}),
             )
         except ScryptUnavailable as exc:
@@ -1284,7 +1289,7 @@ class WebAuth:
             self._attach(handler, entry, Principal(user.name, user.role, "invite"))
             self._audit(handler, "login.ok", user.name, {"method": "invite"})
             handler._json(
-                {"ok": True, "user": user.name, "role": user.role},
+                {"ok": True, "user": user.name, "role": "admin" if user.role == "owner" else user.role},
                 headers=self._headers({"Set-Cookie": self._cookie(cookie)}),
             )
         except ValueError as exc:

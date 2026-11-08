@@ -1,4 +1,6 @@
 """Database boundaries, durability, concurrency, and one-time 2.x import."""
+from server_db_helpers import default_store
+from server_db_helpers import default_workspace_id
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 import hashlib
@@ -132,7 +134,7 @@ def test_migrations_concurrent_idempotent_and_ordered(tmp_path, monkeypatch):
     with ThreadPoolExecutor(2) as pool:
         databases = list(pool.map(open_db, range(2)))
     with databases[0].transaction() as tx:
-        assert [r['version'] for r in tx.fetchall('SELECT * FROM schema_migrations')] == [1, 2]
+        assert [r['version'] for r in tx.fetchall('SELECT * FROM schema_migrations')] == [1, 2, 3]
     for db in databases: db.close()
     from agenticml.server.db import migrate
     migrations = tmp_path / 'migrations'
@@ -173,7 +175,7 @@ def test_schema_too_new_server_and_cli_refuse(tmp_path, capsys):
     with db.transaction(write=True) as tx:
         tx.execute('INSERT INTO schema_migrations VALUES (?, ?, ?)', (999,'future',layout.format_timestamp()))
     db.close()
-    with pytest.raises(SchemaTooNew, match='knows up to 2'):
+    with pytest.raises(SchemaTooNew, match='knows up to 3'):
         make_server(tmp_path, port=0)
     for command in [('keys','list'),('users','list'),('audit',),('serve',),('status',),('verify',)]:
         assert cli.main(['server',*command,'--data',str(tmp_path)]) == 1
@@ -192,21 +194,21 @@ def test_missing_status_does_not_create_database(tmp_path):
 def test_busy_maps_to_store_unavailable_and_create_is_atomic(tmp_path):
     directory = tmp_path / 'server'
     directory.mkdir()
-    keys = KeyStore(directory)
+    keys = KeyStore(directory, workspace_id=default_workspace_id(directory))
     other = connect(url(keys.db.path))
     # Shorten only the test connection's timeout (production is five seconds).
     with keys.db.transaction() as tx: tx.execute('PRAGMA busy_timeout=1')
     with other.transaction(write=True):
         with pytest.raises(KeyStoreUnavailable) as error: keys.create('first','admin')
         assert isinstance(error.value.__cause__, DatabaseBusy)
-    assert keys.list() == [] and UserStore(directory).list() == []
+    assert keys.list() == [] and UserStore(directory, workspace_id=default_workspace_id(directory)).list() == []
     assert not keys.setup_closed()
     other.close()
 
 
 def test_registry_shared_and_closed_pool_reopened(tmp_path):
-    keys = KeyStore(tmp_path)
-    users = UserStore(tmp_path)
+    keys = KeyStore(tmp_path, workspace_id=default_workspace_id(tmp_path))
+    users = UserStore(tmp_path, workspace_id=default_workspace_id(tmp_path))
     assert keys.db is users.db is for_server_dir(tmp_path)
     keys.db.close()
     assert for_server_dir(tmp_path) is not keys.db
@@ -216,52 +218,52 @@ def test_import_v1_once_including_run_owners_and_audit(tmp_path):
     prepare_data_dir(tmp_path)
     directory = tmp_path / 'server'
     write_v1_keys(directory / 'keys.json',['old'], scopes=['admin'])
-    write_run(tmp_path / 'store', 'run-1', 'old')
+    write_run(default_store(tmp_path), 'run-1', 'old')
     row = {'ts':layout.format_timestamp(),'actor':'old','action':'login.ok'}
     (directory / 'audit.jsonl').write_text(json.dumps(row)+'\n'+json.dumps(row))
     (directory / 'setup-closed').touch()
     db = for_server_dir(directory)
-    assert UserStore(directory).get('admin').role == 'admin'
-    assert KeyStore(directory).list()[0].user == 'admin'
-    assert RunRepo(db).as_remote('run-1') == {'owner':'admin','owner_key':'old'}
-    assert (tmp_path / 'store' / 'runs' / 'run-1' / 'remote.json.2x').exists()
-    assert not (tmp_path / 'store' / 'runs' / 'run-1' / 'remote.json').exists()
+    assert UserStore(directory, workspace_id=default_workspace_id(directory)).get('admin').role == 'owner'
+    assert KeyStore(directory, workspace_id=default_workspace_id(directory)).list()[0].user == 'admin'
+    assert RunRepo(db, default_workspace_id(db)).as_remote('run-1') == {'owner':'admin','owner_key':'old'}
+    assert (default_store(tmp_path) / 'runs' / 'run-1' / 'remote.json.2x').exists()
+    assert not (default_store(tmp_path) / 'runs' / 'run-1' / 'remote.json').exists()
     assert SettingsRepo(db).get('setup_closed') is not None
-    assert {r['action'] for r in AuditRepo(db).tail(10)} == {'migration','login.ok'}
+    assert {r['action'] for r in AuditRepo(db, default_workspace_id(db)).tail(10)} == {'migration','login.ok'}
     backups = {p:p.stat().st_mtime_ns for p in directory.glob('*.2x')}
     assert len(backups) == 4 and not (directory / 'keys.lock').exists()
     db.close()
     (directory / 'keys.json').write_text('invalid, deliberately ignored after import')
     db = for_server_dir(directory)
-    assert len(KeyStore(directory).list()) == 1
+    assert len(KeyStore(directory, workspace_id=default_workspace_id(directory)).list()) == 1
     assert {p:p.stat().st_mtime_ns for p in backups} == backups
-    assert len(AuditRepo(db).tail(10)) == 2
+    assert len(AuditRepo(db, default_workspace_id(db)).tail(10)) == 2
 
 
 def test_import_22_password_invite_and_rollback_on_bad_keys(tmp_path):
     source = tmp_path / 'source'
     source.mkdir()
-    users = UserStore(source)
+    users = UserStore(source, workspace_id=default_workspace_id(source))
     users.add('alice','admin',identity='Alice@example.com')
     users.set_password('alice',PASSWORD)
     users.add('bob')
     invite = users.create_invite('bob')
-    key, secret = KeyStore(source).create('laptop',user='alice')
+    key, secret = KeyStore(source, workspace_id=default_workspace_id(source)).create('laptop',user='alice')
     legacy = tmp_path / 'legacy'
     legacy.mkdir()
-    (legacy / 'users.json').write_text(json.dumps({'version':1,'users':[asdict(r) for r in users.list()]}))
+    (legacy / 'users.json').write_text(json.dumps({'version':1,'users':[dict(asdict(r), role='admin' if r.role == 'owner' else r.role) for r in users.list()]}))
     (legacy / 'keys.json').write_text('{')
-    with pytest.raises(DatabaseError, match='could not import keys.json'): KeyStore(legacy)
+    with pytest.raises(DatabaseError, match='could not import keys.json'): KeyStore(legacy, workspace_id=default_workspace_id(legacy))
     db = connect(url(legacy / 'agenticml.db'))
     with db.transaction() as tx:
-        assert tx.fetchone('SELECT COUNT(*) FROM users')[0] == 0
+        assert tx.fetchone('SELECT COUNT(*) FROM accounts')[0] == 0
         assert tx.fetchone("SELECT value FROM server_settings WHERE name='imported_2x'") is None
     db.close()
-    (legacy / 'keys.json').write_text(json.dumps({'version':2,'keys':[asdict(key)]}))
-    imported = UserStore(legacy)
+    (legacy / 'keys.json').write_text(json.dumps({'version':2,'keys':[{k: v for k, v in asdict(key).items() if k not in ('workspace_id', 'account_id')}]}))
+    imported = UserStore(legacy, workspace_id=default_workspace_id(legacy))
     assert imported.verify_password('alice',PASSWORD) is not None
     assert imported.redeem_invite(invite,PASSWORD).name == 'bob'
-    assert KeyStore(legacy).verify(secret).user == 'alice'
+    assert KeyStore(legacy, workspace_id=default_workspace_id(legacy)).verify(secret).user == 'alice'
 
 
 @pytest.mark.parametrize('name',['users.json','keys.json'])
@@ -272,7 +274,7 @@ def test_import_rejects_planted_symlink(tmp_path,name):
     directory.mkdir()
     (directory / name).symlink_to(outside)
     with pytest.raises(DatabaseError, match=f'could not import {name}'):
-        KeyStore(directory)
+        KeyStore(directory, workspace_id=default_workspace_id(directory))
     assert outside.read_text() == 'private state'
 
 
@@ -412,7 +414,7 @@ def test_throttle_load_failure_on_finish_does_not_lower_delay(tmp_path, monkeypa
 def test_webauth_uses_keys_database_for_default_users(tmp_path):
     from agenticml.server.webauth import WebAuth
     db = connect(url(tmp_path / 'custom.db'))
-    keys = KeyStore(tmp_path, db=db)
+    keys = KeyStore(tmp_path, db=db, workspace_id=default_workspace_id(db))
     _, secret = keys.create('admin','admin')
     web = WebAuth(keys)
     assert web.users.db is db
@@ -427,7 +429,7 @@ def test_import_skips_bad_audit_field_types_and_logs_one_count(tmp_path, caplog)
     good = {**row, 'actor':'alice'}
     (tmp_path / 'audit.jsonl').write_text(json.dumps(row)+'\n'+json.dumps(good)+'\n')
     db = for_server_dir(tmp_path)
-    assert [r['actor'] for r in AuditRepo(db).tail(10)] == ['alice']
+    assert [r['actor'] for r in AuditRepo(db, default_workspace_id(db)).tail(10)] == ['alice']
     assert 'skipped 1 malformed or unreadable legacy audit line(s)' in caplog.text
 
 
@@ -439,8 +441,8 @@ def test_bearer_database_failure_is_private_503(tmp_path, monkeypatch, failure, 
         def fail(*args, **kwargs): raise DatabaseBusy('private SQL or database URL')
         if failure.startswith('throttle_'):
             monkeypatch.setattr(server.web.throttle, failure.removeprefix('throttle_'), fail)
-        elif failure == 'key_read': monkeypatch.setattr(server.keys.repo, 'by_digest', fail)
-        else: monkeypatch.setattr(server.users.repo, 'get', fail)
+        elif failure == 'key_read': monkeypatch.setattr(server.keys.verifier, 'by_digest', fail)
+        else: monkeypatch.setattr(type(server.users.repo), 'get', fail)
         code, body, _ = request(server, '/v2/whoami', key=secret)
         assert code == 503 and body == {'error':'key store unavailable'}
         assert 'private SQL or database URL' not in caplog.text
@@ -491,15 +493,15 @@ def test_failed_rollback_discards_connection_and_preserves_safe_error(tmp_path, 
 
 def test_schema_enforces_uniqueness_and_foreign_keys(tmp_path):
     from dataclasses import replace
-    users = UserStore(tmp_path)
+    users = UserStore(tmp_path, workspace_id=default_workspace_id(tmp_path))
     alice = users.add('alice', 'admin', identity='Alice@example.com')
-    key, _ = KeyStore(tmp_path).create('one', user='alice')
+    key, _ = KeyStore(tmp_path, workspace_id=default_workspace_id(tmp_path)).create('one', user='alice')
     for duplicate in [replace(alice, name='other'),
                       replace(alice, name='other', id='0'*32, identity='ALICE@EXAMPLE.COM')]:
         with pytest.raises(DatabaseError):
             with users.db.transaction(write=True) as tx:
                 users.repo.save(tx, duplicate)
-    keys = KeyStore(tmp_path)
+    keys = KeyStore(tmp_path, workspace_id=default_workspace_id(tmp_path))
     for invalid in [replace(key,name='duplicate'), replace(key,name='orphan',sha256='0'*64,user='missing')]:
         with pytest.raises(DatabaseError):
             with keys.db.transaction(write=True) as tx:
@@ -508,9 +510,9 @@ def test_schema_enforces_uniqueness_and_foreign_keys(tmp_path):
 
 
 def test_discard_cascades_keys_without_deleting_reused_name(tmp_path):
-    users = UserStore(tmp_path)
+    users = UserStore(tmp_path, workspace_id=default_workspace_id(tmp_path))
     original = users.add('alice','admin')
-    keys = KeyStore(tmp_path)
+    keys = KeyStore(tmp_path, workspace_id=default_workspace_id(tmp_path))
     _, secret = keys.create('box',user='alice')
     users.discard('alice',original.id)
     assert keys.verify(secret) is None
@@ -524,15 +526,15 @@ def test_import_skips_orphan_keys_and_logs_count(tmp_path, caplog):
     from dataclasses import replace
     source = tmp_path / 'source'
     source.mkdir()
-    users = UserStore(source)
+    users = UserStore(source, workspace_id=default_workspace_id(source))
     users.add('alice', 'admin')
-    key, secret = KeyStore(source).create('laptop', user='alice')
+    key, secret = KeyStore(source, workspace_id=default_workspace_id(source)).create('laptop', user='alice')
     orphan = replace(key, name='orphan', sha256='a' * 64, prefix='orphaned', user='missing')
     legacy = tmp_path / 'legacy'
     legacy.mkdir()
-    (legacy / 'users.json').write_text(json.dumps({'version': 1, 'users': [asdict(r) for r in users.list()]}))
-    (legacy / 'keys.json').write_text(json.dumps({'version': 2, 'keys': [asdict(key), asdict(orphan)]}))
-    imported = KeyStore(legacy)
+    (legacy / 'users.json').write_text(json.dumps({'version': 1, 'users': [dict(asdict(r), role='admin' if r.role == 'owner' else r.role) for r in users.list()]}))
+    (legacy / 'keys.json').write_text(json.dumps({'version': 2, 'keys': [{k: v for k, v in asdict(key).items() if k not in ('workspace_id', 'account_id')}, {k: v for k, v in asdict(orphan).items() if k not in ('workspace_id', 'account_id')}]}))
+    imported = KeyStore(legacy, workspace_id=default_workspace_id(legacy))
     assert {record.name for record in imported.list()} == {'laptop'}
     assert imported.verify(secret).user == 'alice'
     text = caplog.text
@@ -556,16 +558,16 @@ def test_import_refuses_expensive_scrypt_params(tmp_path):
     from agenticml.server.users import _password_record
     source = tmp_path / 'source'
     source.mkdir()
-    users = UserStore(source)
+    users = UserStore(source, workspace_id=default_workspace_id(source))
     users.add('alice', 'admin')
-    record = asdict(users.get('alice'))
+    record = dict(asdict(users.get('alice')), role='admin')
     hostile = dict(_password_record(PASSWORD), n=2 ** 20)
     record['password'] = hostile
     legacy = tmp_path / 'legacy'
     legacy.mkdir()
     (legacy / 'users.json').write_text(json.dumps({'version': 1, 'users': [record]}))
     with pytest.raises(DatabaseError, match='could not import users.json'):
-        UserStore(legacy)
+        UserStore(legacy, workspace_id=default_workspace_id(legacy))
 
 
 def test_advisory_lock_hooks_for_last_admin_and_session_create(tmp_path, monkeypatch):
@@ -579,13 +581,13 @@ def test_advisory_lock_hooks_for_last_admin_and_session_create(tmp_path, monkeyp
         return original(self, tx, name)
 
     monkeypatch.setattr(SqliteDialect, 'advisory_lock', spy)
-    users = UserStore(tmp_path)
+    users = UserStore(tmp_path, workspace_id=default_workspace_id(tmp_path))
     users.add('alice', 'admin')
     users.add('bob', 'admin')
     names.clear()
     users.set_role('bob', 'member')
     assert names == ['users']
-    keys = KeyStore(tmp_path, db=users.db)
+    keys = KeyStore(tmp_path, db=users.db, workspace_id=default_workspace_id(users.db))
     names.clear()
     keys.create('box', user='alice')
     assert names == ['users']
@@ -604,11 +606,11 @@ def test_advisory_lock_hooks_for_last_admin_and_session_create(tmp_path, monkeyp
     assert names == ['sessions']
 
 
-def test_server_close_without_db_does_not_raise(tmp_path):
+def test_server_constructor_opens_database_and_close_does_not_raise(tmp_path):
     from agenticml.server.app import IngestServer
     prepare_data_dir(tmp_path)
     server = IngestServer(tmp_path, '127.0.0.1', 0)
-    assert server.db is None
+    assert server.db is not None
     server.server_close()
 
 
@@ -638,7 +640,7 @@ def test_corrupt_password_json_is_store_unavailable(tmp_path, monkeypatch):
         server.users.add('alice', 'admin')
         server.users.set_password('alice', PASSWORD)
         with server.db.transaction(write=True) as tx:
-            tx.execute("UPDATE users SET password='not-json' WHERE name='alice'")
+            tx.execute("UPDATE accounts SET password='not-json' WHERE login='alice'")
         with pytest.raises(KeyStoreUnavailable):
             server.users.get('alice')
         code, body, _ = password_login(server, 'alice', PASSWORD)

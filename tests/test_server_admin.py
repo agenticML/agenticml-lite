@@ -1,4 +1,6 @@
 """Operator reports against clean, live, and deliberately damaged stores."""
+from server_db_helpers import default_store
+from server_db_helpers import default_workspace_id
 import json
 import os
 from pathlib import Path
@@ -20,7 +22,7 @@ def write_json(path, value):
 
 
 def make_run(data, rid, status="finished", owner="box", stamp=None):
-    directory = data / "store" / "runs" / rid
+    directory = default_store(data) / "runs" / rid
     (directory / "media").mkdir(parents=True)
     (directory / "scalars").mkdir()
     write_json(directory / "meta.json", {"run_id": rid, "project": "demo", "status": status or "running"})
@@ -33,7 +35,7 @@ def make_run(data, rid, status="finished", owner="box", stamp=None):
     if status:
         remote.update(status=status, last_sync_at=stamp or layout.format_timestamp(), sizes=sizes)
     from server_db_helpers import index_if_open
-    if index_if_open(data / "store", directory, remote=remote) is None:
+    if index_if_open(default_store(data), directory, remote=remote) is None:
         write_json(directory / "remote.json", remote)
     return directory
 
@@ -42,11 +44,11 @@ def make_run(data, rid, status="finished", owner="box", stamp=None):
 def store(tmp_path):
     data = tmp_path / "data"
     app.prepare_data_dir(data)
-    KeyStore(data / "server").create("box")
+    KeyStore(data / "server", workspace_id=default_workspace_id(data / "server")).create("box")
     make_run(data, "done")
     make_run(data, "live", "running")
-    sha = objects.put_bytes(data / "store", b"weights")
-    write_json(data / "store" / "runs" / "done" / "artifacts.json", {
+    sha = objects.put_bytes(default_store(data), b"weights")
+    write_json(default_store(data) / "runs" / "done" / "artifacts.json", {
         "version": 1, "artifacts": [{"name": "weights", "version": 1, "sha256": sha, "size": 7}]})
     return data, sha
 
@@ -74,7 +76,7 @@ def test_status_warns_on_unimported_2x_without_database(tmp_path):
 
 def test_verify_warns_on_unindexed_run(store):
     data, _ = store
-    directory = data / "store" / "runs" / "orphan"
+    directory = default_store(data) / "runs" / "orphan"
     (directory / "media").mkdir(parents=True)
     (directory / "scalars").mkdir()
     write_json(directory / "meta.json", {"run_id": "orphan", "project": "demo", "status": "finished"})
@@ -83,7 +85,7 @@ def test_verify_warns_on_unindexed_run(store):
     (directory / "scalars" / "0.bin").write_bytes(b"\0" * 16)
     report = admin.verify(data)
     assert report["ok"] is True
-    assert {"kind": "unindexed_run", "path": "store/runs/orphan",
+    assert {"kind": "unindexed_run", "path": str((default_store(data) / "runs/orphan").relative_to(data)),
             "detail": "unindexed run; run agenticml server reindex"} in report["warnings"]
 
 
@@ -105,12 +107,12 @@ def test_clean_reports_and_key_metadata(store, capsys):
     assert row["name"] == "box" and row["scope"] == "sync" and row["runs"] == 2
     from agenticml.server.db import for_server_dir
     from agenticml.server.db.repos import RunRepo
-    stamps = [row["last_sync_at"] for row in RunRepo(for_server_dir(data / "server", create=False)).all_rows()
+    stamps = [row["last_sync_at"] for row in RunRepo(for_server_dir(data / "server", create=False), default_workspace_id(for_server_dir(data / "server", create=False))).all_rows()
               if row["last_sync_at"]]
     assert row["last_sync_at"] == max(stamps)
     assert set(row) == {"name", "scope", "user", "prefix", "created_at", "last_used_at",
                         "runs", "last_sync_at"}
-    record = KeyStore(data / "server").list()[0]
+    record = KeyStore(data / "server", workspace_id=default_workspace_id(data / "server")).list()[0]
     for action in ("status", "verify"):
         code, text, err = command(data, action, capsys, as_json=False)
         assert code == 0 and not err and record.sha256 not in text
@@ -128,7 +130,7 @@ def test_effective_status_and_revoked_owners(store, monkeypatch):
     make_run(data, "pending", None)
     local = make_run(data, "no-remote", None)
     (local / "remote.json").unlink(missing_ok=True)
-    KeyStore(data / "server").create("unused", "admin")
+    KeyStore(data / "server", workspace_id=default_workspace_id(data / "server")).create("unused", "admin")
     report = admin.status(data)
     assert report["runs"] == {"total": 6, "by_status": {
         "running": 1, "finished": 1, "crashed": 1, "stale": 1, "unsynced": 2}}
@@ -136,13 +138,13 @@ def test_effective_status_and_revoked_owners(store, monkeypatch):
     assert rows["gone"]["revoked"] is True and rows["gone"]["runs"] == 2
     assert rows["gone"]["last_sync_at"] == "2001-01-01T00:00:00Z"
     assert rows["unused"]["runs"] == 0 and rows["unused"]["last_sync_at"] is None
-    KeyStore(data / "server").revoke("box")
+    KeyStore(data / "server", workspace_id=default_workspace_id(data / "server")).revoke("box")
     assert next(row for row in admin.status(data)["keys"] if row["name"] == "box")["revoked"]
 
 
 def test_hash_corruption(store, capsys):
     data, sha = store
-    layout.object_path(data / "store", sha).write_bytes(b"Weights")
+    layout.object_path(default_store(data), sha).write_bytes(b"Weights")
     code, report, _ = command(data, "verify", capsys)
     assert code == 1 and report["ok"] is False and "object_hash" in kinds(report)
 
@@ -150,8 +152,8 @@ def test_hash_corruption(store, capsys):
 @pytest.mark.parametrize("bad_name", [True, False])
 def test_wrong_object_name_or_prefix(store, bad_name):
     data, sha = store
-    path = layout.object_path(data / "store", sha)
-    dest = path.parent / "wrong" if bad_name else data / "store" / "objects" / "ff" / sha
+    path = layout.object_path(default_store(data), sha)
+    dest = path.parent / "wrong" if bad_name else default_store(data) / "objects" / "ff" / sha
     dest.parent.mkdir(exist_ok=True)
     path.rename(dest)
     assert "object_name" in kinds(admin.verify(data))
@@ -160,13 +162,13 @@ def test_wrong_object_name_or_prefix(store, bad_name):
 @pytest.mark.parametrize("loop", [False, True])
 def test_object_symlinks_and_temp_files_are_not_hashed(store, tmp_path, monkeypatch, loop):
     data, sha = store
-    path = layout.object_path(data / "store", sha)
+    path = layout.object_path(default_store(data), sha)
     path.unlink()
     outside = tmp_path / "outside"
     outside.write_bytes(b"secret")
     path.symlink_to(path if loop else outside)
     (path.parent / f".{sha}.123.456.12345678.tmp").write_bytes(b"partial")
-    (data / "store" / "objects" / ".tmp.123.456.12345678.tmp").write_bytes(b"partial")
+    (default_store(data) / "objects" / ".tmp.123.456.12345678.tmp").write_bytes(b"partial")
     original = layout.open_nofollow
 
     def guard(target, *args, **kwargs):
@@ -186,7 +188,7 @@ def test_finished_file_sizes(store, status):
     directory = make_run(data, "short", status)
     (directory / "scalars" / "0.bin").write_bytes(b"\0" * 8)
     report = admin.verify(data)
-    assert {"kind": "size_mismatch", "path": "store/runs/short/scalars/0.bin",
+    assert {"kind": "size_mismatch", "path": str((default_store(data) / "runs/short/scalars/0.bin").relative_to(data)),
             "detail": "expected 16, found 8"} in report["problems"]
     (directory / "scalars" / "0.bin").unlink()
     assert any(row["detail"] == "missing" for row in admin.verify(data)["problems"])
@@ -194,7 +196,7 @@ def test_finished_file_sizes(store, status):
 
 def test_live_size_growth_is_a_warning(store, capsys):
     data, _ = store
-    path = data / "store" / "runs" / "live" / "events.jsonl"
+    path = default_store(data) / "runs" / "live" / "events.jsonl"
     with path.open("ab") as handle:
         handle.write(b'{"kind":"metric"}\n')
     code, report, _ = command(data, "verify", capsys)
@@ -208,7 +210,7 @@ def test_live_size_growth_is_a_warning(store, capsys):
 
 def test_missing_byref_object(store):
     data, sha = store
-    layout.object_path(data / "store", sha).unlink()
+    layout.object_path(default_store(data), sha).unlink()
     report = admin.verify(data)
     assert kinds(report) == {"object_missing"}
     assert report["problems"][0]["detail"] == "referenced by run done"
@@ -217,16 +219,16 @@ def test_missing_byref_object(store):
 @pytest.mark.parametrize("kind", ["directory", "symlink"])
 def test_object_prefix_created_after_walk(store, monkeypatch, tmp_path, kind):
     data, _ = store
-    used = {p.name for p in (data / "store" / "objects").iterdir()}
+    used = {p.name for p in (default_store(data) / "objects").iterdir()}
     prefix = next(f"{i:02x}" for i in range(256) if f"{i:02x}" not in used)
     sha = prefix + "ab" * 31
-    write_json(data / "store" / "runs" / "done" / "artifacts.json", {
+    write_json(default_store(data) / "runs" / "done" / "artifacts.json", {
         "version": 1, "artifacts": [{"name": "late", "version": 1, "sha256": sha, "size": 4}]})
     original = admin._walk
 
     def delayed(path, on_error, **kwargs):
         yield from original(path, on_error, **kwargs)
-        if path == data / "store" / "objects":
+        if path == default_store(data) / "objects":
             directory = path / prefix
             if kind == "directory":
                 directory.mkdir()
@@ -241,17 +243,17 @@ def test_object_prefix_created_after_walk(store, monkeypatch, tmp_path, kind):
     report = admin.verify(data)
     if kind == "directory":
         assert report["ok"] and "object_missing" not in kinds(report)
-        assert admin._referenced_object(data / "store" / "objects", sha, set())
+        assert admin._referenced_object(default_store(data) / "objects", sha, set())
     else:
         assert "object_missing" in kinds(report)
-        assert not admin._referenced_object(data / "store" / "objects", sha, set())
+        assert not admin._referenced_object(default_store(data) / "objects", sha, set())
 
 
 @pytest.mark.parametrize("body", [b"{", b"[]", b'{"sizes": []}', b'{"sizes":{"../outside":1}}',
                                   b'{"sizes":{"meta.json":true}}', b'{"status":"invalid"}'])
 def test_invalid_remote(store, body):
     data, _ = store
-    (data / "store" / "runs" / "done" / "remote.json").write_bytes(body)
+    (default_store(data) / "runs" / "done" / "remote.json").write_bytes(body)
     assert kinds(admin.verify(data)) == set()
 
 
@@ -259,7 +261,7 @@ def test_invalid_remote(store, body):
                                         ("artifacts.json", b"{}"), ("media/index.json", b"[]")])
 def test_unreadable_run_references(store, name, body):
     data, _ = store
-    (data / "store" / "runs" / "done" / name).write_bytes(body)
+    (default_store(data) / "runs" / "done" / name).write_bytes(body)
     assert "run_unreadable" in kinds(admin.verify(data))
 
 
@@ -267,7 +269,7 @@ def test_lineage_ref_and_lock_age(store, capsys, monkeypatch):
     if shutil.which("git") is None:
         pytest.skip("requires git")
     data, _ = store
-    root = data / "store"
+    root = default_store(data)
     source = data / "source"
     source.mkdir()
     (source / "train.py").write_text("x = 1\n")
@@ -281,7 +283,7 @@ def test_lineage_ref_and_lock_age(store, capsys, monkeypatch):
     from agenticml.server.db.repos import RunRepo
     import hashlib
     digest = hashlib.sha256(meta_path.read_bytes()).hexdigest()
-    RunRepo(for_server_dir(data / "server", create=False)).record_file(
+    RunRepo(for_server_dir(data / "server", create=False), default_workspace_id(for_server_dir(data / "server", create=False))).record_file(
         "done", "meta.json", meta_path.stat().st_size, sha256=digest)
     monkeypatch.setenv("GIT_DIR", str(data / "hostile"))
     monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
@@ -311,7 +313,7 @@ def test_lineage_ref_and_lock_age(store, capsys, monkeypatch):
 
 def test_lock_reporting_without_git(store, monkeypatch):
     data, _ = store
-    lock = lineage._repo_path(data / "store", lineage.project_key("demo")) / "refs" / "runs" / "gone.lock"
+    lock = lineage._repo_path(default_store(data), lineage.project_key("demo")) / "refs" / "runs" / "gone.lock"
     lock.parent.mkdir(parents=True)
     lock.write_bytes(b"")
     monkeypatch.setattr(shutil, "which", lambda name: None)
@@ -326,7 +328,7 @@ def test_read_only_and_default_data(store, monkeypatch, capsys):
         pytest.fail("attempt to prepare or lock data")
 
     monkeypatch.setattr(app, "prepare_data_dir", forbidden)
-    db = KeyStore(data / "server").db  # Keep the pool open during the snapshot.
+    db = KeyStore(data / "server", workspace_id=default_workspace_id(data / "server")).db  # Keep the pool open during the snapshot.
     before = {p.relative_to(data): (p.lstat().st_mtime_ns, p.read_bytes() if p.is_file() else None)
               for p in data.rglob("*")}
     for action in ("status", "verify"):
@@ -358,10 +360,10 @@ def test_missing_or_unreadable_data(tmp_path, action, capsys, monkeypatch):
 
 def test_status_counts_skipped_stats_and_ignores_symlink_sizes(store, monkeypatch, tmp_path):
     data, _ = store
-    path = data / "store" / "runs" / "done" / "scalars" / "0.bin"
+    path = default_store(data) / "runs" / "done" / "scalars" / "0.bin"
     outside = tmp_path / "large"
     outside.write_bytes(b"x" * 10000)
-    (data / "store" / "runs" / "link").symlink_to(outside)
+    (default_store(data) / "runs" / "link").symlink_to(outside)
     original = Path.lstat
 
     def denied(self):
@@ -394,7 +396,7 @@ def test_progress_only_in_text_on_tty(store, monkeypatch, capsys):
     original = admin._walk
 
     def many(path, on_error, **kwargs):
-        if path == data / "store" / "objects":
+        if path == default_store(data) / "objects":
             entries = list(original(path, on_error, **kwargs))
             obj = next(row for row in entries if layout.valid_sha(row[0].name))
             yield from (row for row in entries if row != obj)
@@ -425,7 +427,7 @@ def test_environment_owner_is_not_revoked(store, capsys, monkeypatch):
 def test_status_warns_if_keys_cannot_be_loaded(store, capsys, tmp_path, damage):
     from agenticml.server.db import DatabaseError
     data, _ = store
-    db = KeyStore(data / 'server').db
+    db = KeyStore(data / 'server', workspace_id=default_workspace_id(data / 'server')).db
     db.close()
     path = data / 'server' / 'agenticml.db'
     path.unlink()
@@ -479,8 +481,8 @@ def test_empty_server_error_message(store, capsys, monkeypatch, action):
 
 def test_lock_scan_only_visits_valid_repos_run_refs(store, monkeypatch, tmp_path):
     data, _ = store
-    directory = data / "store" / "lineage"
-    repo = lineage._repo_path(data / "store", lineage.project_key("demo"))
+    directory = default_store(data) / "lineage"
+    repo = lineage._repo_path(default_store(data), lineage.project_key("demo"))
     runs = repo / "refs" / "runs"
     runs.mkdir(parents=True)
     (runs / "good.lock").write_bytes(b"")
@@ -496,10 +498,10 @@ def test_lock_scan_only_visits_valid_repos_run_refs(store, monkeypatch, tmp_path
     invalid.mkdir(parents=True)
     (invalid / "hidden.lock").write_bytes(b"")
     (directory / f"{lineage.project_key('link')}.git").symlink_to(repo)
-    linked_refs = lineage._repo_path(data / "store", lineage.project_key("refs-link"))
+    linked_refs = lineage._repo_path(default_store(data), lineage.project_key("refs-link"))
     linked_refs.mkdir()
     (linked_refs / "refs").symlink_to(repo / "refs")
-    linked_runs = lineage._repo_path(data / "store", lineage.project_key("runs-link")) / "refs"
+    linked_runs = lineage._repo_path(default_store(data), lineage.project_key("runs-link")) / "refs"
     linked_runs.mkdir(parents=True)
     (linked_runs / "runs").symlink_to(runs)
     original = os.scandir
@@ -524,7 +526,7 @@ def test_lock_scan_only_visits_valid_repos_run_refs(store, monkeypatch, tmp_path
 
 def test_non_regular_lineage_locks(store, tmp_path):
     data, _ = store
-    runs = lineage._repo_path(data / "store", lineage.project_key("demo")) / "refs" / "runs"
+    runs = lineage._repo_path(default_store(data), lineage.project_key("demo")) / "refs" / "runs"
     runs.mkdir(parents=True)
     directory = runs / "dir.lock"
     directory.mkdir()
@@ -552,7 +554,7 @@ def test_non_regular_lineage_locks(store, tmp_path):
 
 def test_object_scan_prunes_bad_directories_without_resolving_files(store, monkeypatch):
     data, sha = store
-    objects_dir = data / "store" / "objects"
+    objects_dir = default_store(data) / "objects"
     invalid = objects_dir / "not-hex"
     deep = objects_dir / sha[:2] / "nested"
     for path in (invalid, deep):
@@ -581,7 +583,7 @@ def test_object_scan_prunes_bad_directories_without_resolving_files(store, monke
 @pytest.mark.parametrize("component", ["objects", "prefix"])
 def test_object_parent_symlinks_are_not_followed(store, tmp_path, component):
     data, sha = store
-    objects_dir = data / "store" / "objects"
+    objects_dir = default_store(data) / "objects"
     path = objects_dir if component == "objects" else objects_dir / sha[:2]
     outside = tmp_path / "outside"
     path.rename(outside)
@@ -596,7 +598,7 @@ def test_text_safely_escapes_control_characters_and_invalid_utf8(store, capsys):
     name = os.fsdecode(b"unsafe-\x1b-\xff")
     data = data.rename(data.parent / name)
     make_run(data, "unsafe")
-    (data / "store" / "objects" / name).write_bytes(b"bad name")
+    (default_store(data) / "objects" / name).write_bytes(b"bad name")
     for action in ("status", "verify"):
         code, text, err = command(data, action, capsys, as_json=False)
         assert code == (1 if action == "verify" else 0) and not err

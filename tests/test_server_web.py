@@ -13,6 +13,7 @@ from agenticml.server.keys import KeyStore
 from agenticml.store import layout
 from agenticml.store.objects import put_bytes
 from agenticml.ui import server as ui_server
+from server_db_helpers import default_workspace_id
 
 
 @contextmanager
@@ -243,7 +244,7 @@ def test_sessions_expiry_cap_revoke_logout(server, monkeypatch):
 
     _, _, hdrs = login(server)
     cookie = hdrs["Set-Cookie"]
-    KeyStore(server.data_dir / "server").revoke("admin")
+    KeyStore(server.data_dir / "server", workspace_id=default_workspace_id(server.data_dir / "server")).revoke("admin")
     status, _, body, _ = authed(server, "/api/runs", cookie=cookie)
     assert status == 401
     _, server.admin_key = server.keys.create("admin", "admin")
@@ -398,7 +399,7 @@ def test_current_matches_name_and_hash(server):
     assert server.keys.current(record.name, record.sha256) == record
     assert server.keys.current(record.name, "0" * 64) is None
     assert server.keys.current("missing", record.sha256) is None
-    KeyStore(server.data_dir / "server").revoke("admin")
+    KeyStore(server.data_dir / "server", workspace_id=default_workspace_id(server.data_dir / "server")).revoke("admin")
     assert server.keys.current(record.name, record.sha256) is None
 
 

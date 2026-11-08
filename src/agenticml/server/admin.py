@@ -21,6 +21,8 @@ from .app import resolve_data_dir
 from .keys import KeyStore, KeyStoreUnavailable
 from .db import DatabaseError, DatabaseUrlError, SchemaTooNew, for_server_dir
 from .db.repos import RunRepo
+from .db.workspaces import WorkspaceRepo
+from .workspaces import store_root
 from .lineage import _git
 from .users import UserStore
 
@@ -28,9 +30,9 @@ _STATUSES = ("running", "finished", "crashed", "stale", "unsynced")
 _OBJECT_TMP = re.compile(r"\.(?:tmp|[0-9a-f]{64})\.\d+\.\d+\.[0-9a-f]{8}\.tmp\Z")
 
 
-def _data_root(data):
+def _data_root(data, database=None):
     data = resolve_data_dir(data)
-    for path in (data, data / "store", data / "server"):
+    for path in (data, data / "server"):
         try:
             if not stat.S_ISDIR(path.lstat().st_mode):
                 raise ValueError(f"not a directory or is a symlink: {path}")
@@ -38,7 +40,17 @@ def _data_root(data):
                 pass
         except FileNotFoundError:
             raise ValueError(f"no server data at {data}") from None
-    return data, data / "store"
+    try:
+        db = for_server_dir(data / 'server', database, create=False)
+        default = WorkspaceRepo(db).get('default') if db else None
+    except (SchemaTooNew, DatabaseUrlError):
+        raise
+    except DatabaseError:
+        default = None
+    root = store_root(data, default['id']) if default else data / 'store'
+    if root.is_symlink():
+        raise ValueError("store is a symlink")
+    return data, root
 
 
 def _safe_path(root, path):
@@ -72,7 +84,7 @@ def _walk(path, on_error, *, missing_ok=True, descend=None):
 
 
 def status(data, *, database=None) -> dict:
-    data, root = _data_root(data)
+    data, root = _data_root(data, database)
     counts = dict.fromkeys(_STATUSES, 0)
     keys = []
     warnings = []
@@ -80,8 +92,10 @@ def status(data, *, database=None) -> dict:
     db = None
     try:
         db = for_server_dir(data / 'server', database, create=False)
-        records = KeyStore(data / 'server', db=db).list() if db is not None else []
-        user_records = UserStore(data / 'server', db=db).list() if db is not None else []
+        from .workspaces import default_workspace_id
+        wid = default_workspace_id(db) if db is not None else None
+        records = KeyStore(data / 'server', db=db, workspace_id=wid).list() if db is not None else []
+        user_records = UserStore(data / 'server', db=db, workspace_id=wid).list() if db is not None else []
         if db is None:
             for name in ('users.json', 'keys.json'):
                 try:
@@ -135,7 +149,7 @@ def status(data, *, database=None) -> dict:
     run_rows = []
     if db is not None:
         try:
-            run_rows = RunRepo(db).all_rows()
+            run_rows = RunRepo(db, WorkspaceRepo(db).require('default')['id']).all_rows()
         except DatabaseError:
             run_rows = []
             warnings.append('could not load runs from the server database')
@@ -180,7 +194,7 @@ def status(data, *, database=None) -> dict:
 
 
 def verify(data, *, progress=False, database=None) -> dict:
-    data, root = _data_root(data)
+    data, root = _data_root(data, database)
     db = for_server_dir(data / 'server', database, create=False)
     report = {"ok": True, "checked": {"objects": 0, "runs": 0}, "problems": [], "warnings": []}
 
@@ -334,7 +348,7 @@ def _referenced_object(objects, sha, prefixes):
 def _verify_run_files(root, directory, add, db):
     if db is None:
         return
-    index = RunRepo(db)
+    index = RunRepo(db, WorkspaceRepo(db).require('default')['id'])
     if index.get(directory.name) is None:
         add("unindexed_run", directory, "unindexed run; run agenticml server reindex",
             warning=True)

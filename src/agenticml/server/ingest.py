@@ -125,10 +125,14 @@ class IngestHandler(DashboardHandler):
 
     def _dispatch(self):
         self._started = False
+        self.workspace = None
         tmp = None
         lineage_slot = False
         try:
             if self._dashboard_request():
+                if self.server.default_workspace_id is None:
+                    self._json({"error": "not found"}, 404)
+                    return
                 if self.command == "GET":
                     return DashboardHandler.do_GET(self)
                 if self.command == "PUT":
@@ -146,7 +150,7 @@ class IngestHandler(DashboardHandler):
             self.server.keys.touch(record)
             if route == "whoami":
                 self._json({"key": record.name, "scope": record.scope, "user": principal.user,
-                            "role": principal.role, "protocol": 2,
+                            "role": principal.role, "protocol": 2, "workspace": self.workspace.slug,
                             "features": (["lineage"] if self.server.lineage_enabled else []) + ["byref"]})
                 return
             if not allowed(principal, "sync"):
@@ -168,11 +172,11 @@ class IngestHandler(DashboardHandler):
                 self._json(self._state(run_id, principal))
                 return
             if route == "lineage_state":
-                with self.server.run_lock(run_id):
+                with self.workspace.run_lock(run_id):
                     directory = self._run_dir(run_id)
                     self._ownership(directory, principal, False)
                     meta = _json_object(layout.read_file_nofollow(self._target(directory, "meta.json")))
-                    self._json(lineage.state(self.server.root, run_id, meta))
+                    self._json(lineage.state(self.workspace.root, run_id, meta))
                 return
             limit = getattr(self.server.limits, route + "_body")
             length = self._body_length(limit)
@@ -206,7 +210,7 @@ class IngestHandler(DashboardHandler):
                 self._json(payload, status)
             else:
                 pending = None
-                with self.server.run_lock(run_id):
+                with self.workspace.run_lock(run_id):
                     directory = self._run_dir(run_id)
                     remote = self._ownership(directory, principal, route == "atomic" and args[1] == "meta.json")
                     if route == "atomic":
@@ -215,7 +219,7 @@ class IngestHandler(DashboardHandler):
                         payload, status = self._append(run_id, directory, args[1], query, tmp, length, remote)
                     elif route == "lineage":
                         meta = _json_object(layout.read_file_nofollow(self._target(directory, "meta.json")))
-                        payload, status = lineage.receive(self.server.root, run_id, meta, tmp)
+                        payload, status = lineage.receive(self.workspace.root, run_id, meta, tmp)
                     else:
                         payload, status, pending = self._commit(run_id, directory, body, remote)
                 if pending is not None:
@@ -295,7 +299,14 @@ class IngestHandler(DashboardHandler):
                 if match is not None:
                     outcome = "failed"
                 raise _RequestError(401, {"error": "unauthorized"}, {"WWW-Authenticate": "Bearer"})
-            principal = resolve(self.server.keys, self.server.users, record)
+            from .access import bind_sync, WorkspaceNotFound, WorkspaceSuspended
+            try:
+                self.workspace = bind_sync(self.server, record)
+            except WorkspaceSuspended:
+                _fail(403, 'workspace suspended')
+            except WorkspaceNotFound:
+                raise _RequestError(401, {"error": "unauthorized"}, {"WWW-Authenticate": "Bearer"})
+            principal = self.workspace.principal
             if principal is None:
                 raise _RequestError(401, {"error": "unauthorized"}, {"WWW-Authenticate": "Bearer"})
             # Bearer success is ignored: a sync client on the same NAT must not
@@ -348,7 +359,7 @@ class IngestHandler(DashboardHandler):
         return b"".join(chunks) if handle is None else digest.hexdigest()
 
     def _run_dir(self, run_id, create=False):
-        root = self.server.root
+        root = self.workspace.root
         try:
             directory = layout.run_dir(root, run_id)
             for path in (root / "runs", directory, directory / "scalars", directory / "media"):
@@ -372,7 +383,7 @@ class IngestHandler(DashboardHandler):
                 path.parent.mkdir(exist_ok=True)
                 if not stat.S_ISDIR(path.parent.lstat().st_mode):
                     raise ValueError("unsafe parent")
-            layout.contained(self.server.root, path)
+            layout.contained(self.workspace.root, path)
             if (path.exists() or path.is_symlink()) and not _regular(path):
                 raise ValueError("unsafe file")
         except (OSError, ValueError):
@@ -380,18 +391,18 @@ class IngestHandler(DashboardHandler):
         return path
 
     def _remote(self, directory):
-        return self.server.run_index.as_remote(directory.name)
+        return self.workspace.run_index.as_remote(directory.name)
 
     def _ownership(self, directory, principal, meta_write):
         run_id = directory.name
-        row = self.server.run_index.get(run_id)
+        row = self.workspace.run_index.get(run_id)
         exists = _regular(directory / "meta.json")
         owner = row["owner_user"] if row else None
         if not exists and not meta_write:
             _fail(404, "unknown run")
         if isinstance(owner, str) and owner != principal.user:
             _fail(409, "run owned by another user", **compat_owner(principal, owner))
-        return self.server.run_index.as_remote(run_id) if row else {}
+        return self.workspace.run_index.as_remote(run_id) if row else {}
 
     def _atomic(self, run_id, name, body, record, principal, remote):
         obj = None
@@ -414,7 +425,7 @@ class IngestHandler(DashboardHandler):
         if name == "meta.json":
             claim = not exists or not isinstance(remote.get("owner"), str)
             list_row, project, created_at, launch = list_row_from_bytes(body, run_id)
-            self.server.run_index.claim_meta(
+            self.workspace.run_index.claim_meta(
                 run_id, owner_user=principal.user, owner_key=record.name,
                 list_row=list_row, project=project, created_at=created_at,
                 launch_note=launch, claim=claim, recreate=not exists)
@@ -422,12 +433,12 @@ class IngestHandler(DashboardHandler):
             layout.atomic_write(path, body, fsync=True)
             layout.fsync_dir(path.parent)
             self.server._after_atomic_write(run_id, name)
-            self.server.run_index.record_file(run_id, name, len(body), sha256=digest)
+            self.workspace.run_index.record_file(run_id, name, len(body), sha256=digest)
         else:
             layout.atomic_write(path, body, fsync=True)
             layout.fsync_dir(path.parent)
             self.server._after_atomic_write(run_id, name)
-            self.server.run_index.record_file(run_id, name, len(body), sha256=digest)
+            self.workspace.run_index.record_file(run_id, name, len(body), sha256=digest)
         pending = ("run.create", obj) if name == "meta.json" and not exists else None
         return {"size": len(body)}, 200, pending
 
@@ -440,19 +451,19 @@ class IngestHandler(DashboardHandler):
                           "key": self.principal.key}
             else:
                 detail = {"status": obj["status"], "key": self.principal.key}
-            self.server.audit.record(
+            self.workspace.audit.record(
                 self.principal.user, self.principal.via, action, run_id,
                 self.server.web.client_address(self), detail)
         except Exception:
             logger.error("could not record audit event")
 
     def _state(self, run_id, principal):
-        with self.server.run_lock(run_id):
+        with self.workspace.run_lock(run_id):
             directory = self._run_dir(run_id)
             if not _regular(directory / "meta.json"):
                 _fail(404, "unknown run")
             remote = self._remote(directory)
-            recorded = self.server.run_index.files(run_id)
+            recorded = self.workspace.run_index.files(run_id)
             names = list(recorded)
             files = {}
             atomic_names = [name for name in names if _ATOMIC.fullmatch(name)]
@@ -482,11 +493,11 @@ class IngestHandler(DashboardHandler):
                     mismatches.append((name, size, digest))
                     self._warn_atomic_mismatch(run_id, name, info["size"], stored, size, digest)
             for name, size, digest in mismatches:
-                self.server.run_index.record_file(run_id, name, size, sha256=digest)
+                self.workspace.run_index.record_file(run_id, name, size, sha256=digest)
         for start in range(0, len(append_names), _STATE_BATCH):
             with ExitStack() as handles:
                 snapshots = {}
-                with self.server.run_lock(run_id):
+                with self.workspace.run_lock(run_id):
                     directory = self._run_dir(run_id)
                     for name in append_names[start:start + _STATE_BATCH]:
                         committed = recorded[name]["size"]
@@ -518,27 +529,24 @@ class IngestHandler(DashboardHandler):
             shown_remote.pop("last_sync_key", None)
         return {**fields, "files": files, "remote": shown_remote}
 
-    @staticmethod
-    def _warn_short(run_id, name, committed, actual):
-        key = (run_id, name)
+    def _warn_short(self, run_id, name, committed, actual):
+        key = (self.workspace.id, run_id, name)
         if key in _SHORT_WARNED:
             return
         _SHORT_WARNED.add(key)
         logger.error("run file shorter than committed size: %s %s committed=%s actual=%s",
                      run_id, name, committed, actual)
 
-    @staticmethod
-    def _warn_atomic_mismatch(run_id, name, recorded_size, recorded_sha, size, digest):
-        key = (run_id, name)
+    def _warn_atomic_mismatch(self, run_id, name, recorded_size, recorded_sha, size, digest):
+        key = (self.workspace.id, run_id, name)
         if key in _ATOMIC_MISMATCH_WARNED:
             return
         _ATOMIC_MISMATCH_WARNED.add(key)
         logger.error("atomic file differs from recorded hash: %s %s recorded=%s/%s actual=%s/%s",
                      run_id, name, recorded_size, recorded_sha, size, digest)
 
-    @staticmethod
-    def _warn_oversized_atomic(run_id, name, size):
-        key = (run_id, name)
+    def _warn_oversized_atomic(self, run_id, name, size):
+        key = (self.workspace.id, run_id, name)
         if key in _OVERSIZED_ATOMIC_WARNED:
             return
         _OVERSIZED_ATOMIC_WARNED.add(key)
@@ -550,7 +558,7 @@ class IngestHandler(DashboardHandler):
         if (not isinstance(hashes, list) or len(hashes) > self.server.limits.missing_hashes
                 or any(not layout.valid_sha(sha) for sha in hashes)):
             _fail(422, "invalid objects")
-        self._json({"missing": [sha for sha in dict.fromkeys(hashes) if not objects.has(self.server.root, sha)]})
+        self._json({"missing": [sha for sha in dict.fromkeys(hashes) if not objects.has(self.workspace.root, sha)]})
 
     def _object(self, sha, tmp, actual):
         if sha != actual:
@@ -558,11 +566,11 @@ class IngestHandler(DashboardHandler):
         with layout.open_nofollow(tmp, "r+b") as handle:
             os.fchmod(handle.fileno(), self.server.store_file_mode)
             os.fsync(handle.fileno())
-        with self.server.object_lock(sha):
-            dest = layout.object_path(self.server.root, sha)
+        with self.workspace.object_lock(sha):
+            dest = layout.object_path(self.workspace.root, sha)
             if (dest.exists() or dest.is_symlink()) and not _regular(dest):
                 raise ValueError("unsafe object destination")
-            if objects.has(self.server.root, sha):
+            if objects.has(self.workspace.root, sha):
                 os.utime(dest, None, follow_symlinks=False)
                 return {"sha256": sha, "created": False}, 200
             try:
@@ -570,7 +578,7 @@ class IngestHandler(DashboardHandler):
                 created_prefix = True
             except FileExistsError:
                 created_prefix = False
-            layout.object_path(self.server.root, sha)
+            layout.object_path(self.workspace.root, sha)
             if created_prefix:
                 layout.fsync_dir(dest.parent.parent)
             os.replace(tmp, dest)
@@ -609,8 +617,8 @@ class IngestHandler(DashboardHandler):
                     _fail(422, "torn record")
         if truncate and remote.get("status", "running") != "running":
             _fail(409, "run is not running", status=remote.get("status"))
-        with self.server.run_index.file_guard(run_id, name):
-            committed = self.server.run_index.committed_size(run_id, name)
+        with self.workspace.run_index.file_guard(run_id, name):
+            committed = self.workspace.run_index.committed_size(run_id, name)
             return self._apply_append(
                 run_id, directory, name, tmp, length, offset, truncate, committed)
 
@@ -637,7 +645,7 @@ class IngestHandler(DashboardHandler):
             layout.fsync_dir(path.parent)
             self.server._after_append_write(run_id, name)
             last_step = self._time_step(path, length) if name == _TIME_PATH else None
-            self.server.run_index.record_file(run_id, name, length, last_step=last_step)
+            self.workspace.run_index.record_file(run_id, name, length, last_step=last_step)
             return {"size": length}, 200
         with layout.open_nofollow(path, "ab"):
             pass
@@ -692,7 +700,7 @@ class IngestHandler(DashboardHandler):
                 raise
         self.server._after_append_write(run_id, name)
         last_step = self._time_step(path, new_size) if name == _TIME_PATH else None
-        self.server.run_index.record_file(run_id, name, new_size, last_step=last_step)
+        self.workspace.run_index.record_file(run_id, name, new_size, last_step=last_step)
         return {"size": new_size}, 200
 
     @staticmethod
@@ -717,7 +725,7 @@ class IngestHandler(DashboardHandler):
             _fail(404, "unknown run")
         if meta.get("status") != status:
             _fail(409, "status does not match meta.json", status=meta.get("status"))
-        recorded = self.server.run_index.files(run_id)
+        recorded = self.workspace.run_index.files(run_id)
         actual = {}
         for name in sizes:
             committed = recorded[name]["size"] if name in recorded else None
@@ -737,7 +745,7 @@ class IngestHandler(DashboardHandler):
         if actual != sizes:
             _fail(409, "size mismatch", sizes=actual)
         stamp = layout.format_timestamp()
-        self.server.run_index.commit_sync(
+        self.workspace.run_index.commit_sync(
             run_id, status, fingerprint, stamp, self.principal.key, sizes)
         pending = (("run.finish", obj)
                    if status in ("finished", "crashed") and status != remote.get("status")

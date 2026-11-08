@@ -207,7 +207,7 @@ def adopt_directory(root, directory, run_index, *, remote=None, note_body=None, 
         run_index.insert_adopted(row, files, tx)
     if note_body is not None:
         from .db.repos import NoteRepo
-        NoteRepo(run_index.db).upsert(run_id, note_body, layout.format_timestamp(), tx)
+        NoteRepo(run_index.db, run_index.workspace_id).upsert(run_id, note_body, layout.format_timestamp(), tx)
     return run_id
 
 

@@ -7,7 +7,7 @@ from .db import DatabaseError
 from .keys import ClientError, KeyStoreUnavailable, LastAdminError, _NAME, validate_name
 from .keyspage import command_host, read_json
 from .users import (
-    IdentityTaken, ROLES, UserNameTaken, UserNotFound, allowed,
+    CROSS_WORKSPACE_CREDENTIALS, IdentityTaken, ROLES, UserNameTaken, UserNotFound, allowed,
 )
 
 logger = logging.getLogger("agenticml.server.userspage")
@@ -44,6 +44,8 @@ def _audit(handler, principal, action, target, detail=None):
 def _public_row(record, key_counts, run_counts):
     return {
         **record.to_public(),
+        # Temporary 2.2 API compatibility until the workspace dashboard lands.
+        "role": "admin" if record.role == "owner" else record.role,
         "keys": key_counts.get(record.name, 0),
         "runs": None if run_counts is None else run_counts.get(record.name, 0),
     }
@@ -82,6 +84,8 @@ def handle(webauth, handler, path):
             name, role = payload.get("name"), payload.get("role", "member")
             identity = payload.get("identity")
             _user_name(name)
+            from .db.workspaces import AccountRepo
+            existing_account = AccountRepo(webauth.keys.db).get(name)
             try:
                 record = webauth.users.add(
                     name, role=role, identity=identity, created_by=principal.user)
@@ -93,6 +97,10 @@ def handle(webauth, handler, path):
                 return
             except (KeyStoreUnavailable, OSError):
                 handler._json({"error": "key store unavailable"}, 503)
+                return
+            if existing_account is not None:
+                _audit(handler, principal, 'user.add', name, {'role': record.role, 'identity': record.identity})
+                handler._json({'user': record.to_public(), 'invite_url': None, 'expires_at': None}, 201)
                 return
             try:
                 token = webauth.users.create_invite(record.name)
@@ -165,10 +173,13 @@ def handle(webauth, handler, path):
                         return
                     if "role" in payload:
                         role = payload.get("role")
-                        if role not in ROLES:
+                        if role not in ROLES[:-1]:
                             raise ClientError("invalid role")
+                        if found.role == "owner":
+                            handler._json({"error": "last admin"}, 409)
+                            return
                         if found.role == "admin" and role != "admin":
-                            if not any(item.role == "admin" and item.name != name
+                            if not any(item.role in ("owner", "admin") and item.name != name
                                        for item in webauth.users.list()):
                                 handler._json({"error": "last admin"}, 409)
                                 return
@@ -245,4 +256,5 @@ def handle(webauth, handler, path):
             message = str(exc) if isinstance(exc, ClientError) else "invalid request"
             if message == "invalid or reserved key name":
                 message = "invalid or reserved user name"
-            handler._error({"error": message}, 400)
+            status = 403 if message == CROSS_WORKSPACE_CREDENTIALS else 400
+            handler._error({"error": message}, status)

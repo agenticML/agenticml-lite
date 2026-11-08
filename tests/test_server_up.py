@@ -31,6 +31,7 @@ from agenticml.server.up import (
     _NOT_INSTALLED, _NOT_RUNNING, _PORT_443_TAKEN, _SETUP_CLOSED, _SYSTEMD_CONTROL,
     _systemd_quote, write_launchd_plist,
 )
+from server_db_helpers import default_workspace_id
 
 pytest.importorskip("fcntl")
 
@@ -262,7 +263,7 @@ def test_happy_path_and_second_start(tmp_path, monkeypatch):
         ["funnel", "--https=443", "off"],
     ]
     assert all("reset" not in row for row in invocations(log))
-    users = user_object(UserStore(data / "server"))
+    users = user_object(UserStore(data / "server", workspace_id=default_workspace_id(data / "server")))
     assert users["users"][0]["name"] == "admin" and users["users"][0]["role"] == "admin"
     assert users["users"][0]["created_by"] == "server up"
     assert users["users"][0]["invite"] is not None
@@ -273,7 +274,7 @@ def test_happy_path_and_second_start(tmp_path, monkeypatch):
         rest, _ = process.communicate(timeout=10)
         assert process.returncode == 0, rest
         assert "/setup?token=" not in "".join(lines) + rest
-    assert user_object(UserStore(data / "server")) == users
+    assert user_object(UserStore(data / "server", workspace_id=default_workspace_id(data / "server"))) == users
 
 
 def test_funnel_on_failure_still_turns_off(tmp_path, monkeypatch, capsys):
@@ -312,7 +313,7 @@ def test_locked_data_dir_skips_funnel(tmp_path, monkeypatch, capsys):
     log = install_fake(tmp_path, monkeypatch)
     data = tmp_path / "data"
     app.prepare_data_dir(data)
-    KeyStore(data / "server").create("admin", "admin")
+    KeyStore(data / "server", workspace_id=default_workspace_id(data / "server")).create("admin", "admin")
     with app.make_server(data, port=0):
         assert run_up(data, "--port", "0") == 1
     err = capsys.readouterr().err
@@ -426,11 +427,11 @@ def test_existing_admin_user_skips_bootstrap(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     data = tmp_path / "data"
     app.prepare_data_dir(data)
-    KeyStore(data / "server").create("admin", "sync")
+    KeyStore(data / "server", workspace_id=default_workspace_id(data / "server")).create("admin", "sync")
     assert run_up(data, "--install") == 0
-    names = {record.name: record for record in KeyStore(data / "server").list()}
+    names = {record.name: record for record in KeyStore(data / "server", workspace_id=default_workspace_id(data / "server")).list()}
     assert list(names) == ["admin"] and names["admin"].scope == "sync"
-    users = user_object(UserStore(data / "server"))
+    users = user_object(UserStore(data / "server", workspace_id=default_workspace_id(data / "server")))
     assert users["users"][0]["name"] == "admin"
 
 
@@ -439,7 +440,7 @@ def test_non_admin_named_admin_refused(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(up_mod, "_stdout_is_tty", lambda: True)
     data = tmp_path / "data"
     app.prepare_data_dir(data)
-    UserStore(data / "server").add("admin", role="member")
+    UserStore(data / "server", workspace_id=default_workspace_id(data / "server")).add("admin", role="member")
     assert run_up(data, "--install") == 1
     assert capsys.readouterr().err.splitlines()[0] == _ADMIN_NAME_NOT_ADMIN
 
@@ -493,7 +494,7 @@ def test_install_with_env_key_creates_file_admin(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert out.splitlines().count(_ENV_KEY_NOT_INHERITED) == 1
     assert any("/invite?token=" in line for line in out.splitlines())
-    users = user_object(UserStore(data / "server"))
+    users = user_object(UserStore(data / "server", workspace_id=default_workspace_id(data / "server")))
     assert users["users"][0]["name"] == "admin" and users["users"][0]["invite"] is not None
 
 
@@ -506,10 +507,10 @@ def test_install_migrates_v1_admin_and_does_not_create(tmp_path, monkeypatch, ca
     assert run_up(data, "--install") == 0
     out = capsys.readouterr().out
     assert not any(line.startswith("aml_") for line in out.splitlines())
-    keys = KeyStore(data / "server")
+    keys = KeyStore(data / "server", workspace_id=default_workspace_id(data / "server"))
     assert [record.name for record in keys.list()] == ["admin"]
     assert keys.list()[0].scope == "admin" and keys.list()[0].user == "admin"
-    users = user_object(UserStore(data / "server"))
+    users = user_object(UserStore(data / "server", workspace_id=default_workspace_id(data / "server")))
     assert [row["name"] for row in users["users"]] == ["admin"]
 
 
@@ -519,7 +520,7 @@ def test_install_env_key_silent_when_file_admin_exists(tmp_path, monkeypatch, ca
     monkeypatch.setenv("AGENTICML_SERVER_KEY", "a" * 32)
     data = tmp_path / "data"
     app.prepare_data_dir(data)
-    KeyStore(data / "server").create("admin", "admin")
+    KeyStore(data / "server", workspace_id=default_workspace_id(data / "server")).create("admin", "admin")
     assert run_up(data, "--install") == 0
     out = capsys.readouterr().out
     assert _ENV_KEY_NOT_INHERITED not in out
@@ -531,9 +532,9 @@ def test_setup_closed_refuses_bootstrap(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     data = tmp_path / "data"
     app.prepare_data_dir(data)
-    keys = KeyStore(data / "server")
-    KeyStore(data / "server")._write_setup_closed()
-    assert not KeyStore(data / "server").has_admin()
+    keys = KeyStore(data / "server", workspace_id=default_workspace_id(data / "server"))
+    KeyStore(data / "server", workspace_id=default_workspace_id(data / "server"))._write_setup_closed()
+    assert not KeyStore(data / "server", workspace_id=default_workspace_id(data / "server")).has_admin()
     assert run_up(data, "--install") == 1
     assert capsys.readouterr().err.splitlines()[0] == _SETUP_CLOSED
     assert not (data / "server" / "users.json").exists() or json.loads(

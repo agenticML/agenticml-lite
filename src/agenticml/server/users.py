@@ -19,7 +19,7 @@ from .keys import (
 )
 
 logger = logging.getLogger("agenticml.server.users")
-ROLES = ("viewer", "member", "admin")
+ROLES = ("viewer", "member", "admin", "owner")
 INVITE_HOURS = 72
 PASSWORD_MIN = 12
 PASSWORD_MAX = 1024
@@ -58,6 +58,18 @@ class InviteInvalid(ValueError):
     pass
 
 
+class InviteExistingAccount(Exception):
+    """Membership was added; the caller should sign in with existing credentials."""
+
+    def __init__(self, account_id):
+        super().__init__('sign in with your existing credentials')
+        self.account_id = account_id
+
+
+CROSS_WORKSPACE_CREDENTIALS = (
+    'this account belongs to other workspaces; only the person or a server admin can change it')
+
+
 class ScryptUnavailable(ValueError):
     def __init__(self):
         super().__init__(SCRYPT_UNAVAILABLE)
@@ -71,6 +83,8 @@ class Principal:
     key: str | None = None
     id: str | None = None
     generation: int | None = None
+    workspace_id: str | None = None
+    server_admin: bool = False
 
 
 def allowed(principal, action) -> bool:
@@ -235,32 +249,37 @@ def resolve(keys, users, key_record) -> Principal | None:
     """Map a verified key to a live principal, or None if the user is gone."""
     if key_record is None:
         return None
+    if key_record.workspace_id != users.workspace_id:
+        return None
     if key_record.name == "env":
-        return Principal("env", "admin", "key", "env")
+        return Principal("env", "admin", "key", "env", workspace_id=users.workspace_id)
     user = users.get(key_record.user)
     if user is None:
         return None
     return Principal(
-        user.name, user.role, "key", key_record.name, user.id, user.generation)
+        user.name, user.role, "key", key_record.name, user.id, user.generation, users.workspace_id,
+        bool(users.repo.accounts.get(user.name)["server_admin"]))
 
 
-def attribution(run_dir, db):
+def attribution(run_dir, db, workspace_id):
     """Return ``(owner_user, owner_key)`` from the runs table; either may be None."""
     from .db.repos import RunRepo
 
-    return RunRepo(db).attribution(Path(run_dir).name)
+    return RunRepo(db, workspace_id).attribution(Path(run_dir).name)
 
 
 class UserStore:
     """Public user API backed by the shared database pool."""
 
-    def __init__(self, server_dir, *, db=None):
+    def __init__(self, server_dir, *, db=None, workspace_id):
         from .db import for_server_dir
         from .db.repos import UserRepo
+        from .db.workspaces import require_workspace_id
 
         self.server_dir = Path(server_dir)
         self.db = db if db is not None else for_server_dir(self.server_dir)
-        self.repo = UserRepo(self.db, self.server_dir)
+        self.workspace_id = require_workspace_id(workspace_id)
+        self.repo = UserRepo(self.db, self.workspace_id)
 
     def _call(self, name, *args, **kwargs):
         from .db import DatabaseError
@@ -290,17 +309,18 @@ class UserStore:
     def set_role(self, name, role):
         return self._call('set_role', name, role)
 
-    def set_identity(self, name, value):
-        return self._call('set_identity', name, value)
+    def set_identity(self, name, value, *, operator=False):
+        return self._call('set_identity', name, value, operator=operator)
 
-    def set_password(self, name, password):
-        return self._call('set_password', name, password)
+    def set_password(self, name, password, *, operator=False, acting_account_id=None):
+        return self._call('set_password', name, password, operator=operator,
+                          acting_account_id=acting_account_id)
 
     def verify_password(self, name, password):
         return self._call('verify_password', name, password)
 
-    def create_invite(self, name):
-        return self._call('create_invite', name)
+    def create_invite(self, name, *, operator=False):
+        return self._call('create_invite', name, operator=operator)
 
     def redeem_invite(self, token, password):
         return self._call('redeem_invite', token, password)
@@ -329,7 +349,7 @@ class UserStore:
             validate_name(row["name"])
         except ClientError as exc:
             raise ValueError("invalid user record") from exc
-        if row["name"] in names or row["id"] in ids or row["role"] not in ROLES:
+        if row["name"] in names or row["id"] in ids or row["role"] not in ROLES[:-1]:
             raise ValueError("invalid user record")
         if row["identity"] is not None:
             try:

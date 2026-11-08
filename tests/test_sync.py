@@ -24,6 +24,7 @@ from agenticml.store.layout import object_path
 from agenticml.store.overview import OVERVIEW_MIN_POINTS
 from agenticml.store.reader import references_from_bytes, run_references
 from agenticml import sync
+from server_db_helpers import default_workspace_id
 
 
 @contextmanager
@@ -46,7 +47,7 @@ def remote(tmp_path, monkeypatch):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("AGENTICML_CONFIG_DIR", str(tmp_path / "config"))
     with running(tmp_path / "data") as server:
-        _, key = KeyStore(tmp_path / "data" / "server").create("box", scope="sync")
+        _, key = KeyStore(tmp_path / "data" / "server", workspace_id=default_workspace_id(tmp_path / "data" / "server")).create("box", scope="sync")
         url = "http://127.0.0.1:%d" % server.server_address[1]
         with Client(url, key, timeout=2, max_retries=0) as client:
             yield server, client

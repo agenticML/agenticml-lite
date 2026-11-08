@@ -1,4 +1,6 @@
 """Package 17: run index, append crash safety, notes, reconcile, and 2.x import."""
+from server_db_helpers import default_store
+from server_db_helpers import default_workspace_id
 from contextlib import contextmanager
 import errno
 import fcntl
@@ -196,34 +198,35 @@ def test_reindex_cli_rebuilds_list_row(tmp_path, capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "rebuilt 1" in out
     db = for_server_dir(data / "server", create=False)
-    row = RunRepo(db).get("run-1")
+    row = RunRepo(db, default_workspace_id(db)).get("run-1")
     assert json.loads(row["list_row"])["name"] == "after"
 
 
 def test_import_runs_owners_notes_and_second_start(tmp_path, caplog):
     data = tmp_path / "data"
     prepare_data_dir(data)
-    write_run(data / "store", "synced", "alice", extra={
+    write_run(default_store(data), "synced", "alice", extra={
         "owner_key": "laptop", "status": "finished", "fingerprint": "a" * 64,
         "last_sync_at": "2026-01-01T00:00:00Z", "last_sync_key": "laptop",
         "sizes": {"meta.json": 42},
     })
-    write_run(data / "store", "pending", "bob")
-    broken = data / "store" / "runs" / "broken"
+    write_run(default_store(data), "pending", "bob")
+    broken = default_store(data) / "runs" / "broken"
     broken.mkdir(parents=True)
     (broken / "meta.json").write_text(json.dumps({"run_id": "broken", "status": "running"}))
     (broken / "remote.json").write_text("{")
-    linked = data / "store" / "runs" / "linked"
+    linked = default_store(data) / "runs" / "linked"
     linked.mkdir(parents=True)
     (linked / "meta.json").write_text(json.dumps({"run_id": "linked", "status": "running"}))
     outside = tmp_path / "outside-remote.json"
     outside.write_text(json.dumps({"owner": "secret"}))
     (linked / "remote.json").symlink_to(outside)
-    note_dir = data / "store" / "runs" / "synced"
+    note_dir = default_store(data) / "runs" / "synced"
     (note_dir / "notes.md").write_text("hello from 2.x\n")
     db = for_server_dir(data / "server")
-    index = RunRepo(db)
-    notes = NoteRepo(db)
+    note_dir = default_store(data) / "runs" / "synced"
+    index = RunRepo(db, default_workspace_id(db))
+    notes = NoteRepo(db, default_workspace_id(db))
     synced = index.as_remote("synced")
     assert synced["owner"] == "alice" and synced["owner_key"] == "laptop"
     assert synced["status"] == "finished" and synced["fingerprint"] == "a" * 64
@@ -242,7 +245,7 @@ def test_import_runs_owners_notes_and_second_start(tmp_path, caplog):
     db.close()
     db = for_server_dir(data / "server")
     assert SettingsRepo(db).get("imported_runs_2x") == stamp
-    assert RunRepo(db).as_remote("synced")["owner"] == "alice"
+    assert RunRepo(db, default_workspace_id(db)).as_remote("synced")["owner"] == "alice"
     assert "invalid or symlinked remote.json" in caplog.text
 
 
@@ -545,14 +548,14 @@ def test_atomic_crash_does_not_acknowledge_stale_record(tmp_path, monkeypatch):
 def test_import_refuses_symlinked_store_or_runs(tmp_path, which):
     data = tmp_path / "data"
     prepare_data_dir(data)
-    write_run(data / "store", "r1", "alice")
+    write_run(default_store(data), "r1", "alice")
     outside = tmp_path / "outside"
     if which == "store":
-        (data / "store").rename(outside)
-        (data / "store").symlink_to(outside)
+        (default_store(data)).rename(outside)
+        (default_store(data)).symlink_to(outside)
     else:
-        (data / "store" / "runs").rename(outside)
-        (data / "store" / "runs").symlink_to(outside)
+        (default_store(data) / "runs").rename(outside)
+        (default_store(data) / "runs").symlink_to(outside)
     with pytest.raises(DatabaseError, match="symlink or not a directory"):
         for_server_dir(data / "server")
 
@@ -562,17 +565,18 @@ def test_make_server_refuses_symlinked_store_or_runs_after_import(tmp_path, monk
     monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
     data = tmp_path / "data"
     prepare_data_dir(data)
-    write_run(data / "store", "r1", "alice")
+    write_run(default_store(data), "r1", "alice")
     server = make_server(data, port=0)
     server.server_close()
+    root = default_store(data)
     outside = tmp_path / "outside"
     if which == "store":
-        (data / "store").rename(outside)
-        (data / "store").symlink_to(outside)
+        (root).rename(outside)
+        (root).symlink_to(outside)
     else:
-        (data / "store" / "runs").rename(outside)
-        (data / "store" / "runs").symlink_to(outside)
-    with pytest.raises(ValueError, match="symlink"):
+        (root / "runs").rename(outside)
+        (root / "runs").symlink_to(outside)
+    with pytest.raises((ValueError, DatabaseError), match="symlink"):
         make_server(data, port=0)
 
 
@@ -582,22 +586,22 @@ def test_reconcile_skips_symlinked_store_or_runs(tmp_path, monkeypatch, caplog, 
     data = tmp_path / "data"
     prepare_data_dir(data)
     db = for_server_dir(data / "server")
-    index = RunRepo(db)
+    index = RunRepo(db, default_workspace_id(db))
     insert_run(index, "keep-me", owner_user="alice")
     if which == "store":
         outside = tmp_path / "outside-store"
         outside.mkdir()
         link = tmp_path / "linked-store"
-        link.symlink_to(data / "store")
+        link.symlink_to(default_store(data))
         target = link
     else:
-        runs = data / "store" / "runs"
+        runs = default_store(data) / "runs"
         if runs.exists():
             shutil.rmtree(runs)
         outside = tmp_path / "outside-runs"
         outside.mkdir()
         runs.symlink_to(outside)
-        target = data / "store"
+        target = default_store(data)
     with caplog.at_level(logging.WARNING):
         counts = reconcile(target, index)
     assert counts["removed"] == 0 and counts["adopted"] == 0
@@ -610,29 +614,29 @@ def test_reindex_skips_symlinked_store_or_runs(tmp_path, caplog, which):
     data = tmp_path / "data"
     prepare_data_dir(data)
     db = for_server_dir(data / "server")
-    index = RunRepo(db)
+    index = RunRepo(db, default_workspace_id(db))
     insert_run(index, "keep-me", owner_user="alice",
                list_row={"run_id": "keep-me", "project": "original", "name": "before"})
     decoy_meta = json.dumps({
         "run_id": "keep-me", "project": "hacked", "status": "finished", "name": "after",
     })
     if which == "store":
-        directory = data / "store" / "runs" / "keep-me"
+        directory = default_store(data) / "runs" / "keep-me"
         directory.mkdir(parents=True)
         (directory / "meta.json").write_text(decoy_meta)
         link = tmp_path / "linked-store"
-        link.symlink_to(data / "store")
+        link.symlink_to(default_store(data))
         target = link
     else:
         outside = tmp_path / "outside-runs"
         decoy = outside / "keep-me"
         decoy.mkdir(parents=True)
         (decoy / "meta.json").write_text(decoy_meta)
-        runs = data / "store" / "runs"
+        runs = default_store(data) / "runs"
         if runs.exists():
             shutil.rmtree(runs)
         runs.symlink_to(outside)
-        target = data / "store"
+        target = default_store(data)
     with caplog.at_level(logging.WARNING):
         counts = reindex(target, index)
     assert counts["rebuilt"] == 0 and counts["removed"] == 0
@@ -643,12 +647,12 @@ def test_reindex_skips_symlinked_store_or_runs(tmp_path, caplog, which):
 def test_import_reads_files_before_write_transaction(tmp_path, monkeypatch):
     data = tmp_path / "data"
     prepare_data_dir(data)
-    write_run(data / "store", "synced", "alice", extra={
+    write_run(default_store(data), "synced", "alice", extra={
         "owner_key": "laptop", "status": "finished", "fingerprint": "a" * 64,
         "last_sync_at": "2026-01-01T00:00:00Z", "last_sync_key": "laptop",
         "sizes": {"meta.json": 42},
     })
-    scalars = data / "store" / "runs" / "synced" / "scalars"
+    scalars = default_store(data) / "runs" / "synced" / "scalars"
     scalars.mkdir()
     (scalars / "_time.bin").write_bytes(b"\x01\x00\x00\x00\x00\x00\x00\x00")
     writing = {"on": False}
@@ -681,8 +685,8 @@ def test_import_reads_files_before_write_transaction(tmp_path, monkeypatch):
 
     monkeypatch.setattr(SqliteDatabase, "transaction", wrapped_tx)
     db = for_server_dir(data / "server")
-    assert RunRepo(db).get("synced") is not None
-    assert RunRepo(db).get("synced")["last_step"] == 1
+    assert RunRepo(db, default_workspace_id(db)).get("synced") is not None
+    assert RunRepo(db, default_workspace_id(db)).get("synced")["last_step"] == 1
 
 
 def test_detail_status_matches_index_when_commit_never_happens(server):

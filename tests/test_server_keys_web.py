@@ -27,6 +27,7 @@ from agenticml.server.users import UserNameTaken
 from agenticml.server.webauth import WebAuth
 from agenticml.store import RunReader, RunWriter
 from agenticml.ui import server as ui_server
+from server_db_helpers import default_workspace_id
 
 
 # On Python 3.12+, the C json scanner's limit is separate from sys.getrecursionlimit().
@@ -97,7 +98,7 @@ def server(tmp_path, monkeypatch):
     monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
     data = tmp_path / "data"
     prepare_data_dir(data)
-    _, key = KeyStore(data / "server").create("admin", "admin")
+    _, key = KeyStore(data / "server", workspace_id=default_workspace_id(data / "server")).create("admin", "admin")
     with running(data) as httpd:
         httpd.admin_key = key
         httpd.cookie = login(httpd, key)
@@ -131,7 +132,7 @@ def test_setup_startup_page_and_single_use(tmp_path, caplog):
         assert hdrs["Cache-Control"] == "no-store"
         assert "Secure" in hdrs["Set-Cookie"] and hdrs["Set-Cookie"].startswith("__Host-")
         admin = httpd.users.get("admin")
-        assert admin is not None and admin.role == "admin" and admin.password is not None
+        assert admin is not None and admin.role == "owner" and admin.password is not None
         cookie = hdrs["Set-Cookie"].split(";", 1)[0]
         assert call(httpd, "/api/server/session", headers={"Cookie": cookie})[0] == 200
         assert setup(httpd, {"token": token})[0] == 404
@@ -251,7 +252,7 @@ def test_setup_closed_marker_mode_and_no_follow(tmp_path):
     target.write_bytes(b'secret')
     marker = data / 'server' / 'setup-closed'
     marker.symlink_to(target)
-    keys = KeyStore(data / 'server')
+    keys = KeyStore(data / 'server', workspace_id=default_workspace_id(data / 'server'))
     assert keys.setup_closed()
     assert (data / 'server' / 'setup-closed.2x').is_symlink()
     keys.create('admin', 'admin')
@@ -282,7 +283,7 @@ def test_setup_marker_write_failure_keeps_token(tmp_path, monkeypatch):
 
 def test_sync_create_writes_no_marker(tmp_path):
     prepare_data_dir(tmp_path)
-    keys = KeyStore(tmp_path / 'server')
+    keys = KeyStore(tmp_path / 'server', workspace_id=default_workspace_id(tmp_path / 'server'))
     keys.create('box')
     assert not keys.setup_closed()
 
@@ -316,7 +317,7 @@ def test_keys_lock_fifo_fails_promptly(tmp_path, caplog, operation, reader):
     errors = []
     def attempt():
         try:
-            make_server(data, port=0) if operation == 'startup' else KeyStore(data / 'server')
+            make_server(data, port=0) if operation == 'startup' else KeyStore(data / 'server', workspace_id=default_workspace_id(data / 'server'))
         except Exception as exc:
             errors.append(exc)
     worker = threading.Thread(target=attempt, daemon=True)
@@ -335,7 +336,7 @@ def test_keys_lock_fifo_with_reader_does_not_leak_fd(tmp_path):
     os.mkfifo(tmp_path / 'server' / 'agenticml.db')
     before = len(os.listdir('/proc/self/fd'))
     with pytest.raises(DatabaseError):
-        KeyStore(tmp_path / 'server')
+        KeyStore(tmp_path / 'server', workspace_id=default_workspace_id(tmp_path / 'server'))
     assert len(os.listdir('/proc/self/fd')) == before
 
 
@@ -348,14 +349,14 @@ def test_keys_lock_fdopen_failure_does_not_leak_fd(tmp_path, monkeypatch, error)
     monkeypatch.setattr(sqlite.sqlite3, 'connect', fail)
     before = len(os.listdir('/proc/self/fd'))
     with pytest.raises(DatabaseError if error is OSError else error):
-        KeyStore(tmp_path / 'server')
+        KeyStore(tmp_path / 'server', workspace_id=default_workspace_id(tmp_path / 'server'))
     assert len(os.listdir('/proc/self/fd')) == before
 
 
 def test_undeletable_marker_at_startup_disarms_setup(tmp_path, caplog, monkeypatch):
     from agenticml.server.db.repos import SettingsRepo
     prepare_data_dir(tmp_path)
-    keys = KeyStore(tmp_path / 'server')
+    keys = KeyStore(tmp_path / 'server', workspace_id=default_workspace_id(tmp_path / 'server'))
     keys._write_setup_closed()
     def fail(*args): raise DatabaseError('private failure')
     monkeypatch.setattr(SettingsRepo, 'delete', fail)
@@ -369,7 +370,7 @@ def test_clear_setup_closed_removes_symlink_only(tmp_path):
     target = tmp_path / 'outside'
     target.write_bytes(b'keep')
     (tmp_path / 'server' / 'setup-closed').symlink_to(target)
-    keys = KeyStore(tmp_path / 'server')
+    keys = KeyStore(tmp_path / 'server', workspace_id=default_workspace_id(tmp_path / 'server'))
     keys.clear_setup_closed()
     assert not keys.setup_closed()
     with pytest.raises(FileNotFoundError): keys.clear_setup_closed()
@@ -378,7 +379,7 @@ def test_clear_setup_closed_removes_symlink_only(tmp_path):
 
 def test_setup_closed_true_on_non_enoent(tmp_path, monkeypatch):
     prepare_data_dir(tmp_path)
-    keys = KeyStore(tmp_path / 'server')
+    keys = KeyStore(tmp_path / 'server', workspace_id=default_workspace_id(tmp_path / 'server'))
     def fail(*args): raise DatabaseError('private failure')
     monkeypatch.setattr(keys.settings, 'get', fail)
     assert keys.setup_closed() is True
@@ -386,8 +387,8 @@ def test_setup_closed_true_on_non_enoent(tmp_path, monkeypatch):
 
 def test_create_only_if_no_admin_closed_after_external_revoke(tmp_path):
     prepare_data_dir(tmp_path / "data")
-    keys = KeyStore(tmp_path / "data" / "server")
-    external = KeyStore(tmp_path / "data" / "server")
+    keys = KeyStore(tmp_path / "data" / "server", workspace_id=default_workspace_id(tmp_path / "data" / "server"))
+    external = KeyStore(tmp_path / "data" / "server", workspace_id=default_workspace_id(tmp_path / "data" / "server"))
     external.create("operator", "admin")
     external.revoke("operator")
     before = keys.list()
@@ -398,7 +399,7 @@ def test_create_only_if_no_admin_closed_after_external_revoke(tmp_path):
 
 def test_arm_setup_waits_on_store_lock(tmp_path):
     prepare_data_dir(tmp_path)
-    keys = KeyStore(tmp_path / 'server')
+    keys = KeyStore(tmp_path / 'server', workspace_id=default_workspace_id(tmp_path / 'server'))
     keys._write_setup_closed()
     web = WebAuth(keys)
     holding, release = threading.Event(), threading.Event()
@@ -422,7 +423,7 @@ def test_arm_setup_waits_on_store_lock(tmp_path):
 
 def test_prepare_setup_holds_lock_across_clear_and_check(tmp_path, monkeypatch):
     prepare_data_dir(tmp_path)
-    keys = KeyStore(tmp_path / 'server')
+    keys = KeyStore(tmp_path / 'server', workspace_id=default_workspace_id(tmp_path / 'server'))
     keys._write_setup_closed()
     seen = []
     real_clear = keys.repo.settings.delete
@@ -444,7 +445,7 @@ def test_prepare_setup_holds_lock_across_clear_and_check(tmp_path, monkeypatch):
 
 def test_prepare_setup_false_with_env_key(tmp_path):
     prepare_data_dir(tmp_path / "data")
-    keys = KeyStore(tmp_path / "data" / "server", env_key="e" * 32)
+    keys = KeyStore(tmp_path / "data" / "server", env_key="e" * 32, workspace_id=default_workspace_id(tmp_path / "data" / "server"))
     assert keys.prepare_setup() is False
 
 
@@ -465,13 +466,13 @@ def test_setup_corrupt_at_startup_stays_disabled(tmp_path, caplog, nested):
 def test_timestamp_overflow_fails_closed_and_disarms_setup(tmp_path, caplog, field):
     directory = tmp_path / 'source'
     directory.mkdir()
-    keys = KeyStore(directory)
+    keys = KeyStore(directory, workspace_id=default_workspace_id(directory))
     record, secret = keys.create('admin', 'admin')
     obj = key_object(keys)
     obj['keys'][0][field] = '0001-01-01T00:00:00+01:00'
     data = tmp_path / 'legacy'
     prepare_data_dir(data)
-    (data / 'server' / 'users.json').write_text(json.dumps(user_object(UserStore(directory))))
+    (data / 'server' / 'users.json').write_text(json.dumps(user_object(UserStore(directory, workspace_id=default_workspace_id(directory)))))
     (data / 'server' / 'keys.json').write_text(json.dumps(obj))
     with pytest.raises(DatabaseError, match='could not import keys.json'):
         make_server(data, port=0)
@@ -483,7 +484,7 @@ def test_setup_strict_create_closes_after_false_negative(tmp_path, monkeypatch, 
     with running(tmp_path / "data") as httpd:
         token = httpd.web.setup_token
         # A separate store models the CLI writing while the server runs.
-        external = KeyStore(httpd.keys.server_dir)
+        external = KeyStore(httpd.keys.server_dir, workspace_id=default_workspace_id(httpd.keys.server_dir))
         external.create("operator", "admin")
         if not marker:
             external.clear_setup_closed()
@@ -506,7 +507,7 @@ def test_setup_strict_create_closes_after_false_negative(tmp_path, monkeypatch, 
 def test_store_first_admin_guard(tmp_path, env_key, marker):
     data = tmp_path / "data"
     prepare_data_dir(data)
-    keys = KeyStore(data / "server", env_key=env_key)
+    keys = KeyStore(data / "server", env_key=env_key, workspace_id=default_workspace_id(data / "server"))
     if env_key is None:
         keys.create("sync")
         keys.create("operator", "admin", only_if_no_admin=True)
@@ -940,7 +941,7 @@ def test_touch_read_failure_is_advisory(server, monkeypatch, error):
 
 def test_touch_write_errors_are_throttled(tmp_path, monkeypatch, caplog):
     prepare_data_dir(tmp_path)
-    keys = KeyStore(tmp_path / "server")
+    keys = KeyStore(tmp_path / "server", workspace_id=default_workspace_id(tmp_path / "server"))
     record, secret = keys.create("worker")
     assert keys.verify(secret) == record
     now = [0]

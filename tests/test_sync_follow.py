@@ -24,6 +24,7 @@ from agenticml import sync
 
 from test_client import fake_http
 from test_sync import command, identical, push, running, state, writer_at
+from server_db_helpers import default_workspace_id
 
 
 @pytest.fixture
@@ -32,7 +33,7 @@ def remote(tmp_path, monkeypatch):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("AGENTICML_CONFIG_DIR", str(tmp_path / "config"))
     with running(tmp_path / "data") as server:
-        _, key = KeyStore(tmp_path / "data" / "server").create("box", scope="sync")
+        _, key = KeyStore(tmp_path / "data" / "server", workspace_id=default_workspace_id(tmp_path / "data" / "server")).create("box", scope="sync")
         url = "http://127.0.0.1:%d" % server.server_address[1]
         with Client(url, key, timeout=2, max_retries=0) as client:
             yield server, client
@@ -137,7 +138,7 @@ def test_server_down_then_back(tmp_path, monkeypatch, follow_ctx):
     monkeypatch.setattr(sync.random, "uniform", lambda a, b: b)
     data = tmp_path / "data"
     prepare_data_dir(data)
-    _, key = KeyStore(data / "server").create("box", scope="sync")
+    _, key = KeyStore(data / "server", workspace_id=default_workspace_id(data / "server")).create("box", scope="sync")
     sock = socket.socket()
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("127.0.0.1", 0))
@@ -463,7 +464,7 @@ def test_whoami_429_then_syncs(tmp_path, monkeypatch, follow_ctx):
     monkeypatch.setattr(sync.random, "uniform", lambda a, b: b)
     data = tmp_path / "data"
     prepare_data_dir(data)
-    _, key = KeyStore(data / "server").create("box", scope="sync")
+    _, key = KeyStore(data / "server", workspace_id=default_workspace_id(data / "server")).create("box", scope="sync")
     writer = writer_at(tmp_path)
     printed = capture_prints(monkeypatch)
 

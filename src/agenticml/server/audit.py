@@ -39,12 +39,12 @@ def _truncate(value):
 class AuditLog:
     """Best-effort, rate-limited database audit writes."""
 
-    def __init__(self, server_dir, *, db=None):
+    def __init__(self, server_dir, *, db=None, workspace_id):
         from .db import for_server_dir
         from .db.repos import AuditRepo
         self.server_dir = Path(server_dir)
         self.db = db if db is not None else for_server_dir(self.server_dir)
-        self.repo = AuditRepo(self.db)
+        self.repo = AuditRepo(self.db, workspace_id)
         self._log_lock = threading.Lock()
         self._error_at = None
 
@@ -71,7 +71,8 @@ def tail(server_dir, limit=50, before=None):
     if type(limit) is not int or limit < 1:
         raise ValueError("invalid limit")
     db = for_server_dir(server_dir)
-    return AuditRepo(db).tail(min(limit, 1000), before), 0
+    from .workspaces import default_workspace_id
+    return AuditRepo(db, default_workspace_id(db)).tail(min(limit, 1000), before), 0
 
 
 def format_table(events):
@@ -90,7 +91,7 @@ def format_table(events):
                      for row in rows)
 
 
-def cli_main(data, limit, as_json, *, database=None):
+def cli_main(data, limit, as_json, *, database=None, workspace="default", server=False):
     from .app import resolve_data_dir
     from .db import DatabaseError, for_server_dir
     from .db.repos import AuditRepo
@@ -102,7 +103,9 @@ def cli_main(data, limit, as_json, *, database=None):
         directory = resolve_data_dir(data)
         prepare_data_dir(directory)
         db = for_server_dir(directory / 'server', database)
-        events = AuditRepo(db).tail(min(limit, 1000))
+        from .db.workspaces import WorkspaceRepo
+        wid = None if server else WorkspaceRepo(db).require(workspace)['id']
+        events = AuditRepo(db, wid).tail(min(limit, 1000))
     except (OSError, ValueError, DatabaseError) as exc:
         print(f"agenticml server: {exc}", file=sys.stderr)
         return 1

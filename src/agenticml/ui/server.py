@@ -32,6 +32,12 @@ from agenticml.store import layout, notes, reader
 
 logger = logging.getLogger("agenticml.ui.server")
 
+
+def _workspace_kw(server):
+    """Keyword for IngestServer methods that require an explicit workspace id."""
+    wid = getattr(server, "default_workspace_id", None)
+    return {"workspace_id": wid} if wid is not None else {}
+
 _STATIC = Path(__file__).with_name("static")
 _FILES = {
     "index.html": "text/html; charset=utf-8",
@@ -441,7 +447,8 @@ def _compare_code(httpd, base_id, target_id, base_manifest, target_manifest, bud
         if remaining <= 0 or text_left <= 0 or budget.exhausted():
             row.update(_code_diff_result(patch_truncated=True))
             continue
-        diff = httpd.code_pair_diff(row["base_sha256"], row["target_sha256"], budget)
+        diff = httpd.code_pair_diff(row["base_sha256"], row["target_sha256"], budget,
+                                   **_workspace_kw(httpd))
         patch, remaining, text_left = _code_patch_budget(diff, remaining, text_left)
         row.update(patch)
         # Status totals cover the whole manifest union. Line totals cover only
@@ -1668,7 +1675,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not isinstance(run_id, str) or not run_id:
             return None
         try:
-            current = self.server.cached_reader(run_id)
+            current = self.server.cached_reader(run_id, **_workspace_kw(self.server))
             if current is not None:
                 step = current.last_step()
             else:
@@ -1694,7 +1701,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 run_path = self.server.root / "runs" / run_id
                 if not run_path.resolve().is_relative_to(self.server.root / "runs"):
                     raise FileNotFoundError()
-                with self.server.run_reader(run_id) as run:
+                with self.server.run_reader(run_id, **_workspace_kw(self.server)) as run:
                     # Recheck existence even if this reader was cached earlier.
                     run.meta()
                     manifests.append(run.code_manifest())
@@ -1766,7 +1773,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     note = notes.read_note(self.server.root, run_id)
                 note["writable"] = _notes_writable(self)
                 return self._json(note)
-            with self.server.run_reader(run_id) as run:
+            with self.server.run_reader(run_id, **_workspace_kw(self.server)) as run:
                 if route == "":
                     result = dict(run.meta())
                     result.update(keys=run.keys(), artifacts=run.artifacts(), code_manifest_length=len(run.code_manifest()))

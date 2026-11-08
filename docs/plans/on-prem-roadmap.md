@@ -182,7 +182,7 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | --- | --- | --- | --- | --- | --- | --- |
 | 16 † | Database layer, SQLite backend, migrations; users, keys, sessions, throttle, audit in tables | 2.2 | Codex | L | [plan](packages/16-database-layer.md) | done (3.0 PR) |
 | 17 † | Runs, sync state and notes in the database; append crash safety; run list from the database | 16 | Cursor | L | [plan](packages/17-runs-in-database.md) | done (3.0 PR) |
-| 18 † | Workspaces and accounts: memberships, workspace-bound keys, `/w/<slug>` routes, switcher, server-admin commands, isolation suite | 17 | Codex (server), Cursor (dashboard) | L | [plan](packages/18-workspaces.md) | plan ready |
+| 18 † | Workspaces and accounts: memberships, workspace-bound keys, `/w/<slug>` routes, switcher, server-admin commands, isolation suite | 17 | Codex (server), Cursor (dashboard) | L | [plan](packages/18-workspaces.md) | in progress |
 | 18b † | Firebase sign-in for the hosted service | 18 | Cursor | M | – | not started |
 | 18c † | Self-serve sign-up and usage limits (free plan: storage, uploads, requests, people) | 18b | Codex | M | – | not started |
 | 19 † | Postgres backend, row-level security, CI on both backends | 18 | Cursor | M | – | not started |
@@ -271,6 +271,19 @@ priority.
   - Done when: a test crashes the server after the rename of an atomic
     replacement, restores the old bytes on the client, re-syncs with the
     same `sync.json`, and the server ends with the old bytes.
+- **A removed member's login can be re-added by another workspace**
+  (package 18 review, Nov 8, 2026).
+  - Where: `src/agenticml/server/db/repos.py` `UserRepo.remove` and `add`.
+  - Problem: removing someone from their only workspace keeps their global
+    account (and password) with no memberships. An admin of another
+    workspace can then `add` that login; the account is single-workspace
+    again, so that admin may reset its credentials. Low risk (login-name
+    squatting on a self-hosted server), but surprising.
+  - Fix: when an account loses its last membership, either delete it (if it
+    owns no runs) or mark it so that only a server admin can attach it to a
+    workspace again.
+  - Done when: a test removes a member from their only workspace, another
+    workspace's admin tries to add and reset that login, and is refused.
 - **Compatibility owner rule can mislead a 2.0/2.1 client** (package 11
   review, Nov 6, 2026). Blocked until no 2.0/2.1 sync clients remain.
   - Where: `src/agenticml/server/ingest.py` `compat_owner`.

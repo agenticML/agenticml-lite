@@ -1,4 +1,5 @@
 """Audit append safety, backwards paging, and standalone CLI rendering."""
+from server_db_helpers import default_store
 from server_db_helpers import audit_rows, audit_text
 from agenticml.server.db import DatabaseError, for_server_dir
 from agenticml.server.db.repos import AuditRepo
@@ -29,6 +30,7 @@ from test_server_login_throttle import freeze_throttle
 from test_server_signin import PASSWORD, password_login, running
 from test_server_users import write_run, write_v1_keys
 from test_server_web import authed, call, cookie_parts, csrf, login
+from server_db_helpers import default_workspace_id
 
 
 def event(index, **fields):
@@ -53,7 +55,7 @@ def test_record_format_truncation_and_key_order(tmp_path, monkeypatch):
     monkeypatch.setattr(audit.layout, 'format_timestamp', lambda: stamp)
     detail = {'identity':'é'*300, 'nested':[{'project':'x'*300}], 'count':3,
               'missing':None, 'control':'a\n\r\t\x00b'}
-    log = audit.AuditLog(tmp_path)
+    log = audit.AuditLog(tmp_path, workspace_id=default_workspace_id(tmp_path))
     log.record('alice','password','key.create','t'*300,'203.0.113.7',detail)
     rows, skipped = audit.tail(tmp_path)
     assert skipped == 0 and len(rows) == 1
@@ -67,7 +69,7 @@ def test_record_format_truncation_and_key_order(tmp_path, monkeypatch):
 @pytest.mark.parametrize("field", ["actor", "via", "action", "client"])
 def test_record_truncates_all_top_level_strings(tmp_path, field):
     fields = {"actor": "alice", "via": "cli", "action": "key.create", field: "é" * 300}
-    audit.AuditLog(tmp_path).record(**fields)
+    audit.AuditLog(tmp_path, workspace_id=default_workspace_id(tmp_path)).record(**fields)
     assert audit.tail(tmp_path)[0][0][field] == "é" * 256
 
 
@@ -86,7 +88,7 @@ def test_symlink_is_not_followed_and_record_does_not_raise(tmp_path, caplog):
     outside = tmp_path / 'outside'
     outside.write_bytes(b'unchanged')
     (tmp_path / 'audit.jsonl').symlink_to(outside)
-    log = audit.AuditLog(tmp_path)
+    log = audit.AuditLog(tmp_path, workspace_id=default_workspace_id(tmp_path))
     log.record('alice','cli','key.create')
     assert outside.read_bytes() == b'unchanged'
     assert 'skipped 1 malformed or unreadable legacy audit line(s)' in caplog.text
@@ -100,7 +102,7 @@ def test_nonregular_file_is_refused(tmp_path, kind, caplog):
     errors = []
     def check():
         try:
-            audit.AuditLog(tmp_path).record('alice','cli','key.create')
+            audit.AuditLog(tmp_path, workspace_id=default_workspace_id(tmp_path)).record('alice','cli','key.create')
             assert audit.tail(tmp_path)[0][0]['actor'] == 'alice'
         except BaseException as exc: errors.append(exc)
     worker = threading.Thread(target=check, daemon=True)
@@ -115,7 +117,7 @@ def test_eight_concurrent_writers_produce_whole_lines(tmp_path):
 
     def write(worker):
         # Separate objects also exercise the file lock rather than a shared lock.
-        log = audit.AuditLog(tmp_path)
+        log = audit.AuditLog(tmp_path, workspace_id=default_workspace_id(tmp_path))
         barrier.wait(timeout=10)
         for index in range(20):
             log.record(f"user{worker}", "cli", "note.write", f"run{index}",
@@ -131,7 +133,7 @@ def test_eight_concurrent_writers_produce_whole_lines(tmp_path):
 
 
 def test_partial_writes_are_completed_and_synced(tmp_path, monkeypatch):
-    log = audit.AuditLog(tmp_path)
+    log = audit.AuditLog(tmp_path, workspace_id=default_workspace_id(tmp_path))
     log.record('alice','cli','key.create')
     log.db.close()
     assert audit.tail(tmp_path)[0][0]['actor'] == 'alice'
@@ -140,16 +142,16 @@ def test_partial_writes_are_completed_and_synced(tmp_path, monkeypatch):
 
 
 def test_each_record_reopens_after_rotation(tmp_path):
-    first = audit.AuditLog(tmp_path)
+    first = audit.AuditLog(tmp_path, workspace_id=default_workspace_id(tmp_path))
     first.record('alice','cli','key.create')
-    second = audit.AuditLog(tmp_path)
+    second = audit.AuditLog(tmp_path, workspace_id=default_workspace_id(tmp_path))
     second.record('bob','cli','key.revoke')
     first.record('carol','cli','key.create')
     assert [r['actor'] for r in audit.tail(tmp_path)[0]] == ['carol','bob','alice']
 
 
 def test_write_failures_log_at_most_once_per_minute(tmp_path, monkeypatch, caplog):
-    log = audit.AuditLog(tmp_path)
+    log = audit.AuditLog(tmp_path, workspace_id=default_workspace_id(tmp_path))
     clock = iter([0,1,59.999,60,119.999,120])
     monkeypatch.setattr(audit, 'time', SimpleNamespace(monotonic=lambda:next(clock)))
     def fail(*args): raise DatabaseError('secret exception details')
@@ -162,7 +164,7 @@ def test_write_failures_log_at_most_once_per_minute(tmp_path, monkeypatch, caplo
 
 @pytest.mark.parametrize('failure',['serialize','write','fsync'])
 def test_record_failure_does_not_escape(tmp_path, monkeypatch, failure, caplog):
-    log = audit.AuditLog(tmp_path)
+    log = audit.AuditLog(tmp_path, workspace_id=default_workspace_id(tmp_path))
     def fail(*args): raise OSError(errno.ENOSPC,'secret exception details','/secret/path')
     if failure != 'serialize': monkeypatch.setattr(log.repo, 'insert', fail)
     detail = {'invalid':object()} if failure == 'serialize' else None
@@ -173,7 +175,7 @@ def test_record_failure_does_not_escape(tmp_path, monkeypatch, failure, caplog):
 
 @pytest.mark.parametrize('failure',['write','zero_write','fsync'])
 def test_record_rolls_back_failed_append(tmp_path, monkeypatch, failure):
-    log = audit.AuditLog(tmp_path)
+    log = audit.AuditLog(tmp_path, workspace_id=default_workspace_id(tmp_path))
     log.repo.insert(event(0))
     original = log.repo.insert
     def fail(row):
@@ -189,7 +191,7 @@ def test_record_rolls_back_failed_append(tmp_path, monkeypatch, failure):
 
 
 def test_rollback_failure_remains_best_effort(tmp_path, monkeypatch, caplog):
-    log = audit.AuditLog(tmp_path)
+    log = audit.AuditLog(tmp_path, workspace_id=default_workspace_id(tmp_path))
     def fail(*args): raise DatabaseError('private failure')
     monkeypatch.setattr(log.repo,'insert',fail)
     assert log.record('alice','cli','key.create') is None
@@ -363,7 +365,7 @@ class StubHandler:
 
 def call_handle(tmp_path, **kwargs):
     handler = StubHandler(**kwargs)
-    log = audit.AuditLog(tmp_path)
+    log = audit.AuditLog(tmp_path, workspace_id=default_workspace_id(tmp_path))
     handler.server = SimpleNamespace(audit=log)
     webauth = SimpleNamespace(keys=SimpleNamespace(server_dir=tmp_path))
     audit.handle(webauth, handler)
@@ -465,11 +467,11 @@ def http_event(action, target, detail=None, *, actor="alice", via="password", cl
 
 def test_cli_mutations_and_audit_command(tmp_path, capsys, monkeypatch, hook_env):
     data = tmp_path / "data"
-    with expect_events(data, hook_event("user.add", "admin", {"role": "admin", "identity": None})):
+    with expect_events(data, hook_event("user.add", "admin", {"role": "owner", "identity": None})):
         run_cli(data, capsys, "users", "add", "admin", "--role", "admin", "--no-invite")
     # add's invite is a second action, never a duplicate user.add.
     output = run_cli(data, capsys, "users", "add", "alice", "--identity", "a@example.com")
-    expires = UserStore(data / "server").get("alice").invite["expires_at"]
+    expires = UserStore(data / "server", workspace_id=default_workspace_id(data / "server")).get("alice").invite["expires_at"]
     assert [dict(row, ts=None) for row in hook_rows(data)[1:]] == [
         dict(hook_event("user.add", "alice", {"role": "member", "identity": "a@example.com"}), ts=None),
         dict(hook_event("user.invite", "alice", {"expires_at": expires}), ts=None)]
@@ -485,7 +487,7 @@ def test_cli_mutations_and_audit_command(tmp_path, capsys, monkeypatch, hook_env
     assert len(hook_rows(data)) == before + 1
     invite = hook_rows(data)[-1]
     assert {k: v for k, v in invite.items() if k != "ts"} == hook_event(
-        "user.invite", "alice", {"expires_at": UserStore(data / "server").get("alice").invite["expires_at"]})
+        "user.invite", "alice", {"expires_at": UserStore(data / "server", workspace_id=default_workspace_id(data / "server")).get("alice").invite["expires_at"]})
     monkeypatch.setattr("sys.stdin", io.StringIO(PASSWORD + "\n"))
     with expect_events(data, hook_event("user.password", "alice", {"method": "cli"})):
         run_cli(data, capsys, "users", "set-password", "alice", "--stdin")
@@ -521,7 +523,7 @@ def test_migration_actor_once(tmp_path, capsys, monkeypatch, hook_env, trigger):
     data = tmp_path / "data"
     prepare_data_dir(data)
     write_v1_keys(data / "server" / "keys.json", ["old"])
-    write_run(data / "store", "old-run", "old")
+    write_run(default_store(data), "old-run", "old")
     original_record = audit.AuditLog.record
 
     def record_unlocked(log, *args, **kwargs):
@@ -559,10 +561,10 @@ def test_server_up_bootstrap_once(tmp_path, capsys, monkeypatch, hook_env):
     monkeypatch.setattr(up, "install_unit", lambda *a, **kw: None)
     monkeypatch.setattr(up, "_stdout_is_tty", lambda: True)
     output = run_cli(data, capsys, "up", "--install")
-    expires = UserStore(data / "server").get("admin").invite["expires_at"]
+    expires = UserStore(data / "server", workspace_id=default_workspace_id(data / "server")).get("admin").invite["expires_at"]
     rows = hook_rows(data)
     assert [{k: v for k, v in row.items() if k != "ts"} for row in rows] == [
-        hook_event("user.add", "admin", {"role": "admin", "identity": None}),
+        hook_event("user.add", "admin", {"role": "owner", "identity": None}),
         hook_event("user.invite", "admin", {"expires_at": expires})]
     token = output.out.split("token=", 1)[1].split()[0]
     assert token not in audit_text(data / 'server')
@@ -575,7 +577,7 @@ def test_setup_account_password_and_logout(tmp_path, hook_env):
     with running(data) as server:
         token = server.web.setup_token
         with expect_events(data,
-                           http_event("user.add", "alice", {"role": "admin", "identity": None}, via="setup"),
+                           http_event("user.add", "alice", {"role": "owner", "identity": None}, via="setup"),
                            http_event("user.password", "alice", {"method": "setup"}, via="setup"),
                            http_event("setup", "alice", via="setup")):
             status, headers, _ = call(server, "/setup", "POST", json.dumps({
@@ -610,14 +612,14 @@ def test_invite_keys_and_secret_exclusion(tmp_path, capsys, monkeypatch, hook_en
     data = tmp_path / "data"
     output = run_cli(data, capsys, "users", "add", "alice", "--role", "admin")
     invite_token = parse_qs(urlsplit(output.out.splitlines()[0]).query)["token"][0]
-    users = UserStore(data / "server")
+    users = UserStore(data / "server", workspace_id=default_workspace_id(data / "server"))
     secrets = [invite_token, users.get("alice").invite["sha256"], PASSWORD]
     monkeypatch.setattr("sys.stdin", io.StringIO(PASSWORD + "\n"))
     run_cli(data, capsys, "users", "set-password", "alice", "--stdin")
     secrets.extend(users.get("alice").password[k] for k in ("salt", "hash"))
     output = run_cli(data, capsys, "keys", "create", "--name", "cli-key", "--scope", "admin")
     cli_key = output.out.strip()
-    secrets.extend([cli_key, KeyStore(data / "server").list()[0].sha256])
+    secrets.extend([cli_key, KeyStore(data / "server", workspace_id=default_workspace_id(data / "server")).list()[0].sha256])
     output = run_cli(data, capsys, "users", "invite", "alice")
     invite_token = parse_qs(urlsplit(output.out.splitlines()[0]).query)["token"][0]
     secrets.extend([invite_token, users.get("alice").invite["sha256"]])
@@ -663,7 +665,7 @@ def test_invite_keys_and_secret_exclusion(tmp_path, capsys, monkeypatch, hook_en
 def test_audit_api_password_role_gate(tmp_path, capsys, hook_env, role, status):
     data = tmp_path / "data"
     run_cli(data, capsys, "users", "add", "alice", "--role", role, "--no-invite")
-    UserStore(data / "server").set_password("alice", PASSWORD)
+    UserStore(data / "server", workspace_id=default_workspace_id(data / "server")).set_password("alice", PASSWORD)
     with running(data) as server:
         with expect_events(data, http_event("login.ok", "alice", {"method": "password"})):
             code, _, headers = password_login(server, "alice", PASSWORD)
@@ -681,16 +683,16 @@ def test_audit_api_password_role_gate(tmp_path, capsys, hook_env, role, status):
 def test_run_lifecycle_and_notes(tmp_path, capsys, monkeypatch, hook_env, env_key, status):
     data = tmp_path / "data"
     run_cli(data, capsys, "users", "add", "alice", "--no-invite")
-    users = UserStore(data / "server")
+    users = UserStore(data / "server", workspace_id=default_workspace_id(data / "server"))
     users.set_password("alice", PASSWORD)
-    secret = KeyStore(data / "server").create("box", user="alice")[1]
+    secret = KeyStore(data / "server", workspace_id=default_workspace_id(data / "server")).create("box", user="alice")[1]
     actor, key = ("alice", "box") if env_key is None else ("env", "env")
     with running(data, env_key=env_key) as server:
         original_record = server.audit.record
 
         def record_unlocked(*args, **kwargs):
             if args[2] in ("run.create", "run.finish"):
-                lock = server.run_lock(args[3])
+                lock = server.run_lock(args[3], workspace_id=server.default_workspace_id)
                 assert lock.acquire(blocking=False), "audit wrote while holding run_lock"
                 lock.release()
             return original_record(*args, **kwargs)
@@ -831,7 +833,7 @@ def test_first_key_also_attributes_bootstrap_user(tmp_path, capsys, hook_env, vi
     data = tmp_path / "data"
     if via == "cli":
         with expect_events(data,
-                           hook_event("user.add", "admin", {"role": "admin", "identity": None}),
+                           hook_event("user.add", "admin", {"role": "owner", "identity": None}),
                            hook_event("key.create", "box", {"user": "admin", "scope": "admin"})):
             run_cli(data, capsys, "keys", "create", "--name", "box", "--scope", "admin")
     else:
@@ -882,10 +884,13 @@ def test_concurrent_first_keys_attribute_bootstrap_user_once(tmp_path, monkeypat
 
     rows = [{key: value for key, value in row.items() if key != "ts"}
             for row in hook_rows(data) if row["action"] != "login.ok"]
+    # First account on an empty default workspace is the owner (package 18).
+    # Dashboard key-create still records the 2.2-compatible presented role.
+    bootstrap_role = "admin" if via == "key" else "owner"
     assert sorted(rows, key=lambda row: (row["action"], row["target"])) == [
         expected("key.create", name, {"user": "admin", "scope": "admin"}) for name in names
-    ] + [expected("user.add", "admin", {"role": "admin", "identity": None})]
-    assert [user.name for user in UserStore(data / "server").list()] == ["admin"]
+    ] + [expected("user.add", "admin", {"role": bootstrap_role, "identity": None})]
+    assert [user.name for user in UserStore(data / "server", workspace_id=default_workspace_id(data / "server")).list()] == ["admin"]
 
 
 @pytest.mark.parametrize("project", [["project"], {"name": "project"}])
@@ -965,7 +970,7 @@ def test_migration_succeeds_once_when_audit_writer_raises(tmp_path, monkeypatch,
 
     monkeypatch.setattr(audit.AuditLog, "record", fail)
     assert migrate(data)
-    assert UserStore(data / "server").get("admin").role == "admin"
+    assert UserStore(data / "server", workspace_id=default_workspace_id(data / "server")).get("admin").role == "owner"
     assert migrate(data)
     assert len(calls) == 1
     assert "could not record audit event" in caplog.text

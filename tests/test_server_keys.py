@@ -15,6 +15,7 @@ from agenticml.server import keys as key_module
 from agenticml.server.app import make_server, resolve_data_dir
 from agenticml.server.keys import KeyStore
 from agenticml.store import layout
+from server_db_helpers import default_workspace_id
 
 
 @pytest.fixture
@@ -22,7 +23,7 @@ def keys(tmp_path, monkeypatch):
     monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
     directory = tmp_path / "server"
     directory.mkdir()
-    return KeyStore(directory)
+    return KeyStore(directory, workspace_id=default_workspace_id(directory))
 
 
 def test_create_and_public_record(keys):
@@ -70,7 +71,7 @@ def test_duplicate_scope_and_admin_recovery(keys):
 
 def test_env_key(keys):
     key = "a" * 32
-    store = KeyStore(keys.server_dir, key)
+    store = KeyStore(keys.server_dir, key, workspace_id=default_workspace_id(keys.server_dir))
     _, file_key = store.create("file")
     assert store.verify(file_key).name == "file"
     assert store.verify(key).name == "env"
@@ -93,13 +94,13 @@ def test_bad_env_key(tmp_path, value, monkeypatch, capsys):
 
 
 def test_reload_and_corruption(keys, monkeypatch):
-    other = KeyStore(keys.server_dir)
+    other = KeyStore(keys.server_dir, workspace_id=default_workspace_id(keys.server_dir))
     _, secret = other.create("first")
     assert keys.verify(secret).name == "first"
     with monkeypatch.context() as patch:
         def fail(*args):
             raise DatabaseError("private database failure")
-        patch.setattr(keys.repo, 'by_digest', fail)
+        patch.setattr(keys.verifier, 'by_digest', fail)
         with pytest.raises(key_module.KeyStoreUnavailable):
             keys.verify(secret)
     assert keys.verify(secret).name == "first"
@@ -121,10 +122,10 @@ def test_invalid_records_fail_closed(keys, change):
         obj['keys'][0][field] = value
     legacy = keys.server_dir / 'legacy'
     legacy.mkdir()
-    (legacy / 'users.json').write_text(json.dumps(user_object(UserStore(keys.server_dir))))
+    (legacy / 'users.json').write_text(json.dumps(user_object(UserStore(keys.server_dir, workspace_id=default_workspace_id(keys.server_dir)))))
     (legacy / 'keys.json').write_text(json.dumps(obj))
     with pytest.raises(DatabaseError, match='could not import keys.json'):
-        KeyStore(legacy)
+        KeyStore(legacy, workspace_id=default_workspace_id(legacy))
 
 
 def test_symlink_unreadable_and_env_survives(keys, monkeypatch):
@@ -136,9 +137,9 @@ def test_symlink_unreadable_and_env_survives(keys, monkeypatch):
     (legacy / 'keys.json').symlink_to(outside)
     before = outside.read_bytes()
     with pytest.raises(DatabaseError, match='could not import keys.json'):
-        KeyStore(legacy, 'a'*32)
+        KeyStore(legacy, 'a'*32, workspace_id=default_workspace_id(legacy))
     assert outside.read_bytes() == before
-    store = KeyStore(keys.server_dir, 'a'*32)
+    store = KeyStore(keys.server_dir, 'a'*32, workspace_id=default_workspace_id(keys.server_dir))
     store.touch(store.verify('a'*32))
     assert store.verify('a'*32).name == 'env'
     assert store.verify(secret).name == 'one'
@@ -202,7 +203,7 @@ def test_touch_throttles_and_does_not_resurrect(keys, monkeypatch):
     keys.touch(record)
     assert keys.list()[0].last_used_at != last_used
     assert first.last_used_at is not None
-    other = KeyStore(keys.server_dir)
+    other = KeyStore(keys.server_dir, workspace_id=default_workspace_id(keys.server_dir))
     other.revoke("one")
     other.create("one")  # Same name, different digest must also stay untouched.
     keys.touch(record)
@@ -223,7 +224,7 @@ def test_touch_errors_are_advisory(keys, monkeypatch, caplog):
 
 def test_concurrent_key_creates(keys):
     def create(index):
-        return KeyStore(keys.server_dir).create(str(index))
+        return KeyStore(keys.server_dir, workspace_id=default_workspace_id(keys.server_dir)).create(str(index))
     with ThreadPoolExecutor(max_workers=8) as pool:
         records = list(pool.map(create, range(16)))
     assert len(keys.list()) == len(records) == 16
@@ -270,7 +271,7 @@ def test_data_dir_precedence(tmp_path, monkeypatch):
 
 def test_env_prefix_never_exposes_secret(keys, monkeypatch, capsys):
     secret = "operator-secret-" + "a" * 32
-    store = KeyStore(keys.server_dir, secret)
+    store = KeyStore(keys.server_dir, secret, workspace_id=default_workspace_id(keys.server_dir))
     assert store.verify(secret).prefix == "env"
     assert store.verify(secret).to_public()["prefix"] == "env"
     monkeypatch.setenv("AGENTICML_SERVER_KEY", secret)
@@ -310,4 +311,4 @@ def test_cli_keys_recovers_from_invalid_env(tmp_path, monkeypatch, capsys, env_k
             assert "one" in output.out and "env" not in output.out
     assert cli.main(["server", "keys", "revoke", "one", *data]) == 0
     assert not capsys.readouterr().err
-    assert KeyStore(tmp_path / "server").list() == []
+    assert KeyStore(tmp_path / "server", workspace_id=default_workspace_id(tmp_path / "server")).list() == []

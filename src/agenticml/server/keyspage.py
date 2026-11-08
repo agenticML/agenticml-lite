@@ -128,7 +128,7 @@ def handle(webauth, handler, path):
                      and (record.scope != "admin" or allowed(resolved, "admin_keys"))}
                     for record in records if can_see(principal, record)
                     and (user is None or record.user == user)]
-            handler._json({"keys": rows, "user": principal.user, "role": principal.role,
+            handler._json({"keys": rows, "user": principal.user, "role": "admin" if principal.role == "owner" else principal.role,
                            **command_host(webauth, handler)})
         elif path == "/api/server/keys" and handler.command == "POST":
             payload = read_json(handler, LOGIN_BODY_MAX)

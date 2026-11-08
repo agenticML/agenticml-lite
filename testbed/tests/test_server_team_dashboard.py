@@ -217,7 +217,8 @@ def test_identity_edit_keeps_other_row_draft(page, team_server):
 
 
 def test_load_older_activity(page, team_server):
-    log = AuditLog(team_server["httpd"].data_dir / "server")
+    httpd = team_server["httpd"]
+    log = AuditLog(httpd.data_dir / "server", db=httpd.db, workspace_id=httpd.default_workspace_id)
     for index in range(201):
         log.record("admin", "password", "user.add", f"u{index:03d}", "127.0.0.1", {"role": "member"})
     sign_in(page, team_server, team_server["admin"])

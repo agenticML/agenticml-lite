@@ -7,6 +7,7 @@ from agenticml.server import userspage
 from agenticml.server.keys import KeyStoreUnavailable
 from agenticml.store import RunWriter
 from test_server_keys_users import principal_session
+from server_db_helpers import transfer_default_owner
 from test_server_keys_web import call, csrf, login, running, server  # noqa: F401 (fixture)
 
 
@@ -99,16 +100,19 @@ def test_add_with_identity_and_conflicts(server):
     assert status == 400 and body == {"error": "invalid role"}
 
 
-def test_add_refuses_name_that_owns_runs(server):
+def test_add_restores_membership_without_reclaiming_account(server):
     server.users.add("ghost", role="member")
     writer = RunWriter.create(server.root, run_id="old", meta={"project": "p", "name": "n"})
     writer.finish("finished")
     writer.close()
     from server_db_helpers import adopt_run
     adopt_run(server.root, server.root / "runs" / "old", server.run_index, owner="ghost")
+    account_id = server.users.get("ghost").id
     server.users.remove("ghost")
     status, _, body = api(server, method="POST", payload={"name": "ghost", "role": "member"})
-    assert status == 400 and "reclaim-runs" in body["error"]
+    assert status == 201 and body["invite_url"] is None
+    assert server.users.get("ghost").id == account_id
+    assert server.run_index.get("old")["owner_user"] == "ghost"
 
 
 def test_patch_role_identity_last_admin_and_unknown(server):
@@ -132,6 +136,7 @@ def test_patch_role_identity_last_admin_and_unknown(server):
 
 def test_patch_own_role_signs_out_when_another_admin_remains(server):
     api(server, method="POST", payload={"name": "bob", "role": "admin"})
+    transfer_default_owner(server.users, "bob")
     status, headers, body = api(server, "/api/server/users/admin", "PATCH", {"role": "member"})
     assert status == 200 and body["signed_out"] is True and body["user"]["role"] == "member"
     assert "Set-Cookie" in headers and "Max-Age=0" in headers["Set-Cookie"]
@@ -145,7 +150,7 @@ def test_patch_role_errors_do_not_change_identity(server):
     })
     assert status == 409 and body == {"error": "last admin"}
     admin = server.users.get("admin")
-    assert admin.role == "admin" and admin.identity is None
+    assert admin.role == "owner" and admin.identity is None
     status, _, body = api(server, "/api/server/users/bob", "PATCH", {
         "role": "owner", "identity": "bob@x.com",
     })
@@ -171,6 +176,7 @@ def test_patch_identity_error_does_not_change_role(server):
 
 def test_patch_own_role_and_identity_signs_out(server):
     api(server, method="POST", payload={"name": "bob", "role": "admin"})
+    transfer_default_owner(server.users, "bob")
     status, headers, body = api(server, "/api/server/users/admin", "PATCH", {
         "role": "member", "identity": "admin@x.com",
     })
@@ -334,7 +340,8 @@ def test_patch_get_failure_is_503_before_mutation(server, monkeypatch, exc):
     ("users", "list", "PATCH", "/api/server/users/admin", {"role": "member"}),
 ])
 def test_list_get_unavailable_is_503(server, monkeypatch, store, attr, method, path, payload):
-    server.users.add("bob", role="member")
+    server.users.add("bob", role="admin")
+    transfer_default_owner(server.users, "bob")
 
     def boom(*args, **kwargs):
         raise KeyStoreUnavailable("private failure")
@@ -351,7 +358,8 @@ def test_list_get_unavailable_is_503(server, monkeypatch, store, attr, method, p
     ("users", "list", "PATCH", "/api/server/users/admin", {"role": "member"}),
 ])
 def test_list_oserror_is_503(server, monkeypatch, store, attr, method, path, payload):
-    server.users.add("bob", role="member")
+    server.users.add("bob", role="admin")
+    transfer_default_owner(server.users, "bob")
     cookie = server.cookie
     if store == "keys":
         # Key sessions call keys.list() during auth; a password session does not.

@@ -23,6 +23,7 @@ from agenticml.server.keys import KeyStore
 from agenticml.store import RunReader, RunWriter, layout
 from agenticml.store.gc import run_fingerprint
 from agenticml.store.overview import Overview
+from server_db_helpers import default_workspace_id
 
 
 @contextmanager
@@ -98,7 +99,7 @@ def run_path(server, name=""):
 def foreign_key(server, name="other", user="bob", role="member"):
     from agenticml.server.users import UserStore
 
-    store = UserStore(server.data_dir / "server")
+    store = UserStore(server.data_dir / "server", workspace_id=default_workspace_id(server.data_dir / "server"))
     if store.get(user) is None:
         store.add(user, role=role)
     return server.keys.create(name, user=user)[1]
@@ -114,13 +115,13 @@ def test_health_auth_scopes_and_revocation(server):
         assert response_headers["WWW-Authenticate"] == "Bearer"
     assert raw(server, "GET", "/v2/whoami", [("Authorization", "bEaReR " + server.test_key)])[0] == 200
     assert request(server, "/v2/whoami")[1] == {
-        "key": "one", "scope": "sync", "user": "admin", "role": "admin", "protocol": 2,
+        "key": "one", "scope": "sync", "user": "admin", "role": "owner", "protocol": 2, "workspace": "default",
         "features": (["lineage"] if server.lineage_enabled else []) + ["byref"],
     }
     _, admin = server.keys.create("admin", "admin")
     assert request(server, "/v2/whoami", key=admin)[1]["scope"] == "admin"
     assert put_meta(server, "admin-run", key=admin)[0] == 200
-    KeyStore(server.data_dir / "server").revoke("one")
+    KeyStore(server.data_dir / "server", workspace_id=default_workspace_id(server.data_dir / "server")).revoke("one")
     assert request(server, "/v2/whoami")[0] == 401
 
 
@@ -130,7 +131,7 @@ def test_zero_keys_and_environment(tmp_path):
         assert raw(httpd, "GET", "/v2/whoami")[0] == 401
     with running(tmp_path / "env", "a" * 32) as httpd:
         assert raw(httpd, "GET", "/v2/whoami", [("Authorization", "Bearer " + "a" * 32)])[1] == {
-            "key": "env", "scope": "admin", "user": "env", "role": "admin", "protocol": 2,
+            "key": "env", "scope": "admin", "user": "env", "role": "admin", "protocol": 2, "workspace": "default",
             "features": (["lineage"] if httpd.lineage_enabled else []) + ["byref"],
         }
         assert not (httpd.data_dir / "server" / "keys.json").exists()
@@ -180,7 +181,7 @@ def test_lock_tmp_cleanup_and_permissions(tmp_path, caplog):
         assert "ignoring subdirectory" in caplog.text
         with pytest.raises(ValueError, match="another agenticml server"):
             make_server(tmp_path, port=0)
-        for name in ("store", "server", "server/tmp"):
+        for name in ("workspaces", str(httpd.root.relative_to(tmp_path)), "server", "server/tmp"):
             assert stat.S_IMODE((tmp_path / name).stat().st_mode) == 0o700
     finally:
         httpd.server_close()
@@ -970,7 +971,7 @@ def test_state_hashes_snapshot_without_blocking_writes(server, monkeypatch, chan
     handles = []
     hash_prefix = ingest._hash_prefix
     send_json = ingest.IngestHandler._json
-    lock = server.run_lock("run-1")
+    lock = server.run_lock("run-1", workspace_id=server.default_workspace_id)
 
     def paused(handle, size):
         if lock.locked():
@@ -1025,7 +1026,7 @@ def test_state_batches_under_file_descriptor_limit(server, monkeypatch):
 
     opened, counts = [], []
     original = layout.open_nofollow
-    lock = server.run_lock("run-1")
+    lock = server.run_lock("run-1", workspace_id=server.default_workspace_id)
     def tracked(path, *args, **kwargs):
         handle = original(path, *args, **kwargs)
         if kwargs.get("buffering") == 0:
@@ -1054,7 +1055,7 @@ def test_state_batches_under_file_descriptor_limit(server, monkeypatch):
 
 
 def test_responses_sent_after_write_locks_released(server, monkeypatch):
-    run_lock = server.run_lock("run-1")
+    run_lock = server.run_lock("run-1", workspace_id=server.default_workspace_id)
     original = ingest.IngestHandler._json
     sent = []
 

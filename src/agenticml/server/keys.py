@@ -76,13 +76,15 @@ class KeyRecord:
     created_by: str
     last_used_at: str | None
     user: str = ""
+    workspace_id: str | None = None
+    account_id: str | None = None
 
     def to_public(self):
         """Metadata safe for API and CLI output; never includes the hash."""
-        return {k: v for k, v in asdict(self).items() if k != "sha256"}
+        return {k: v for k, v in asdict(self).items() if k not in ("sha256", "workspace_id", "account_id")}
 
 
-_V2_FIELDS = set(KeyRecord.__dataclass_fields__)
+_V2_FIELDS = set(KeyRecord.__dataclass_fields__) - {"workspace_id", "account_id"}
 _V1_FIELDS = _V2_FIELDS - {"user"}
 _V1_MESSAGE = (
     "keys.json is version 1; restore users.json or move users.json away to migrate again"
@@ -130,21 +132,44 @@ def _parse_keys_object(obj, versions):
 class KeyStore:
     """Public key API backed by transactional database repositories."""
 
-    def __init__(self, server_dir, env_key=None, *, db=None):
+    def __init__(self, server_dir, env_key=None, *, db=None, workspace_id):
         from .db import for_server_dir
-        from .db.repos import KeyRepo, SettingsRepo
+        from .db.repos import KeyRepo, KeyVerifier, SettingsRepo
+        from .db.workspaces import WorkspaceRepo, require_workspace_id
 
         validate_env_key(env_key)
         self.server_dir = Path(server_dir)
         self.db = db if db is not None else for_server_dir(self.server_dir)
-        self.repo = KeyRepo(self.db, self.server_dir)
+        self.workspace_id = require_workspace_id(workspace_id) if workspace_id is not None else None
+        self.repo = KeyRepo(self.db, self.workspace_id) if self.workspace_id else None
         self.settings = SettingsRepo(self.db)
+        self.verifier = KeyVerifier(self.db)
         self._touch_log_lock = threading.Lock()
         self._touch_error_at = None
         self._env = None
+        self._env_missing_warned = False
         if env_key is not None:
-            self._env = KeyRecord("env", "admin", self._hash(env_key), "env",
-                                  layout.format_timestamp(), "env", None, user="env")
+            default = WorkspaceRepo(self.db).get('default')
+            if default is None:
+                logger.warning('AGENTICML_SERVER_KEY refused: default workspace does not exist')
+                self._env_missing_warned = True
+            elif self.workspace_id is not None and default['id'] == self.workspace_id:
+                if self._call(self.verifier.by_digest, self._hash(env_key)) is not None:
+                    raise ValueError('AGENTICML_SERVER_KEY conflicts with a stored key')
+                self._env = KeyRecord("env", "admin", self._hash(env_key), "env",
+                                      layout.format_timestamp(), "env", None, user="env", workspace_id=default["id"])
+
+    def _current_env(self):
+        if self._env is None:
+            return None
+        from .db.workspaces import WorkspaceRepo
+        default = self._call(WorkspaceRepo(self.db).get, 'default')
+        if default is None or default['id'] != self._env.workspace_id:
+            if not self._env_missing_warned:
+                logger.warning('AGENTICML_SERVER_KEY refused: default workspace does not exist')
+                self._env_missing_warned = True
+            return None
+        return self._env
 
     @staticmethod
     def _hash(value):
@@ -172,6 +197,8 @@ class KeyStore:
             raise FileNotFoundError('setup_closed')
 
     def prepare_setup(self):
+        if self.repo is None:
+            return False
         try:
             return self._call(self.repo.prepare_setup, self._env is not None)
         except KeyStoreUnavailable:
@@ -180,6 +207,8 @@ class KeyStore:
 
     def create(self, name, scope="sync", created_by="cli", *, user=None,
                only_if_no_admin=False, created_users=None):
+        if self.repo is None:
+            raise ClientError('unknown workspace')
         record, secret, bootstrap = self._call(
             self.repo.create, name, scope, created_by, user=user,
             only_if_no_admin=only_if_no_admin, env=self._env is not None)
@@ -188,7 +217,7 @@ class KeyStore:
         return record, secret
 
     def list(self):
-        return self._call(self.repo.list) + ([self._env] if self._env is not None else [])
+        return (self._call(self.repo.list) if self.repo else []) + ([self._env] if self._env is not None else [])
 
     def for_user(self, name):
         return [record for record in self.list() if record.user == name]
@@ -199,11 +228,12 @@ class KeyStore:
 
     def verify(self, key_str):
         digest = self._hash(key_str)
-        record = self._call(self.repo.by_digest, digest)
+        record = self._call(self.verifier.by_digest, digest)
         if record is not None and hmac.compare_digest(digest, record.sha256):
             return record
-        if self._env is not None and hmac.compare_digest(digest, self._env.sha256):
-            return self._env
+        env = self._current_env()
+        if env is not None and hmac.compare_digest(digest, env.sha256):
+            return env
         return None
 
     def touch(self, record):
@@ -233,11 +263,12 @@ class KeyStore:
 
     def current(self, name, sha256):
         digest = sha256 if isinstance(sha256, str) else ''
-        record = self._call(self.repo.by_digest, digest)
+        record = self._call(self.verifier.by_digest, digest)
         if record is not None and record.name == name and hmac.compare_digest(record.sha256, digest):
             return record
-        if self._env is not None and name == 'env' and hmac.compare_digest(self._env.sha256, digest):
-            return self._env
+        env = self._current_env()
+        if env is not None and name == 'env' and hmac.compare_digest(env.sha256, digest):
+            return env
         return None
 
     def has_admin(self):

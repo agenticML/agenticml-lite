@@ -26,6 +26,7 @@ from agenticml.server.webauth import (
 from agenticml.store import RunWriter, layout
 from test_server_login_throttle import freeze_throttle, whoami
 from test_server_web import authed, call, cookie_parts, csrf, login
+from server_db_helpers import default_workspace_id
 
 
 PASSWORD = "password1234"
@@ -61,7 +62,7 @@ def session_cookie(hdrs):
 
 def test_password_set_verify_wrong_and_unknown_calls_scrypt(tmp_path, monkeypatch):
     (tmp_path / "server").mkdir()
-    users = UserStore(tmp_path / "server")
+    users = UserStore(tmp_path / "server", workspace_id=default_workspace_id(tmp_path / "server"))
     users.add("alice", role="admin")
     users.set_password("alice", PASSWORD)
     record = users.get("alice").password
@@ -96,12 +97,12 @@ def test_password_set_verify_wrong_and_unknown_calls_scrypt(tmp_path, monkeypatc
 def test_check_password_rejects_expensive_scrypt(tmp_path, monkeypatch):
     from agenticml.server.users import _password_record
     (tmp_path / "server").mkdir()
-    users = UserStore(tmp_path / "server")
+    users = UserStore(tmp_path / "server", workspace_id=default_workspace_id(tmp_path / "server"))
     users.add("alice", role="admin")
     users.set_password("alice", PASSWORD)
     hostile = dict(_password_record(PASSWORD), n=2 ** 20)
     with users.db.transaction(write=True) as tx:
-        tx.execute("UPDATE users SET password=? WHERE name=?", (json.dumps(hostile), "alice"))
+        tx.execute("UPDATE accounts SET password=? WHERE login=?", (json.dumps(hostile), "alice"))
     calls = []
     real = hashlib.scrypt
 
@@ -285,7 +286,7 @@ def test_setup_creates_admin_user_and_closes(tmp_path, monkeypatch):
         payload = json.loads(body)
         assert status == 201 and payload == {"ok": True, "user": "root", "role": "admin"}
         user = httpd.users.get("root")
-        assert user.role == "admin" and user.password is not None
+        assert user.role == "owner" and user.password is not None
         assert httpd.keys.setup_closed()
         assert httpd.keys.list() == []
         cookie = session_cookie(hdrs)
@@ -497,7 +498,7 @@ def test_server_up_prints_invite_and_trusts_loopback(tmp_path, monkeypatch, caps
     out = capsys.readouterr().out
     assert "Open https://machine.tailnet.ts.net/invite?token=" in out
     assert "72 hours" in out
-    users = user_object(UserStore(data / "server"))
+    users = user_object(UserStore(data / "server", workspace_id=default_workspace_id(data / "server")))
     assert users["users"][0]["name"] == "admin"
     assert users["users"][0]["invite"] is not None
     # Second call is a no-op.
@@ -617,7 +618,7 @@ def test_cli_set_password_stdin(tmp_path, monkeypatch, capsys):
     assert cli.main(["server", "users", "add", "dana", "--no-invite", "--data", str(data)]) == 0
     monkeypatch.setattr("sys.stdin", __import__("io").StringIO(PASSWORD + "\n"))
     assert cli.main(["server", "users", "set-password", "dana", "--stdin", "--data", str(data)]) == 0
-    users = UserStore(data / "server")
+    users = UserStore(data / "server", workspace_id=default_workspace_id(data / "server"))
     assert users.verify_password("dana", PASSWORD) is not None
 
 
@@ -638,7 +639,7 @@ def _fake_handler(peer, **headers):
 def _webauth(tmp_path, **kwargs):
     directory = tmp_path / "server"
     directory.mkdir(exist_ok=True)
-    return WebAuth(KeyStore(directory), users=UserStore(directory), **kwargs)
+    return WebAuth(KeyStore(directory, workspace_id=default_workspace_id(directory)), users=UserStore(directory, workspace_id=default_workspace_id(directory)), **kwargs)
 
 
 # --- Review fixes ---
@@ -654,7 +655,7 @@ def test_deleted_user_cookie_does_not_revive_on_recreate(tmp_path, monkeypatch):
         assert authed(httpd, "/api/runs", cookie=cookie)[0] == 200
         httpd.users.remove("alice")
         httpd.users.add("alice", role="member")
-        assert httpd.users.get("alice").id != old_id
+        assert httpd.users.get("alice").id == old_id
         httpd.users.set_password("alice", PASSWORD)
         assert authed(httpd, "/api/runs", cookie=cookie)[0] == 401
         token = httpd.users.create_invite("alice")
@@ -775,7 +776,7 @@ def test_account_password_current_uses_login_throttle(tmp_path, monkeypatch):
 def test_scrypt_lone_surrogate_is_invalid_password_and_failed_login(tmp_path, monkeypatch):
     monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
     (tmp_path / "server").mkdir()
-    users = UserStore(tmp_path / "server")
+    users = UserStore(tmp_path / "server", workspace_id=default_workspace_id(tmp_path / "server"))
     users.add("alice", role="member")
     users.set_password("alice", PASSWORD)
     with pytest.raises(ClientError, match="invalid password"):
@@ -809,8 +810,8 @@ def test_setup_partial_failure_rolls_back_user(tmp_path, monkeypatch):
         token = httpd.web.setup_token
         real_set = httpd.users.set_password
 
-        def boom(name, password):
-            real_set(name, password)
+        def boom(name, password, **kwargs):
+            real_set(name, password, **kwargs)
             raise OSError("disk full")
 
         monkeypatch.setattr(httpd.users, "set_password", boom)
@@ -846,8 +847,8 @@ def test_setup_rollback_keeps_replaced_same_name_user(tmp_path, monkeypatch):
 
         real_set = httpd.users.set_password
 
-        def boom(name, password):
-            real_set(name, password)
+        def boom(name, password, **kwargs):
+            real_set(name, password, **kwargs)
             httpd.users.discard(name, created_id["id"])
             created_id["replacement"] = real_add(name, role="admin").id
             raise OSError("disk full")

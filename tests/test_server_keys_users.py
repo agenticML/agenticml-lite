@@ -285,7 +285,7 @@ def test_whoami_cli_real_server(server, monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("AGENTICML_CONFIG_DIR", str(tmp_path / "config"))
     monkeypatch.setenv("AGENTICML_API_KEY", server.admin_key)
     assert cli.main(["whoami", "--host", f"http://127.0.0.1:{server.server_address[1]}"]) == 0
-    assert "user: admin (admin)\n" in capsys.readouterr().out
+    assert "user: admin (owner)\n" in capsys.readouterr().out
 
 
 def test_status_owner_key_fallback_and_unknown_writer(server):
@@ -591,6 +591,7 @@ def test_commit_without_principal_key(tmp_path):
                 files=lambda run_id: {},
                 commit_sync=lambda *args: committed.append(args))),
         _target=lambda directory, name: directory / name)
+    handler.workspace = handler.server
     result = ingest.IngestHandler._commit(
         handler, tmp_path.name, tmp_path, json.dumps({
             "status": "finished", "fingerprint": "a" * 64, "sizes": {}}).encode(),

@@ -18,7 +18,6 @@ from urllib.parse import parse_qs, urlsplit
 
 from agenticml.server.app import make_server
 from agenticml.server.ingest import IngestHandler
-from agenticml.server.keys import KeyStore
 from agenticml.store import RunReader, RunWriter, list_runs
 from agenticml.store.layout import object_path
 from agenticml.store.reader import run_references
@@ -296,11 +295,11 @@ def sync_server(tmp_path):
 
         do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = _dispatch
 
-    def create_key(name):
-        return KeyStore(data / "server").create(name, scope="sync")[1]
-
     server = make_server(data, port=0)
     server.RequestHandlerClass = RecordingHandler
+
+    def create_key(name):
+        return server.keys.create(name, scope="sync")[1]
     thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
     thread.start()
     try:

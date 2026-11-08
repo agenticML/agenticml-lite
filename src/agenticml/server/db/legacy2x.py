@@ -28,7 +28,8 @@ class LegacyKeys:
 
     def _write(self, records):
         storeio.write_json(self.server_dir, self.path,
-                           {'version': 2, 'keys': [asdict(r) for r in records]}, '.keys')
+                           {'version': 2, 'keys': [{k: v for k, v in asdict(r).items() if k not in ('workspace_id', 'account_id')}
+                                                    for r in records]}, '.keys')
 
 
 class LegacyUsers:
@@ -146,7 +147,8 @@ def migrate(data_dir, *, actor="server", db=None):
 def _audit_migration(db, actor, records, rewritten):
     try:
         from ..audit import AuditLog
-        AuditLog(Path('.'), db=db).record(
+        from ..workspaces import default_workspace_id
+        AuditLog(Path('.'), db=db, workspace_id=default_workspace_id(db)).record(
             actor, "server" if actor == "server" else "cli", "migration", "admin",
             detail={"keys": len(records), "runs": rewritten})
     except Exception:

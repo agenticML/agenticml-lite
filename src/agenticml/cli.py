@@ -571,11 +571,13 @@ def cmd_server_keys(args):
         data, directory = _server_data_dir(args)
         actor = cli_actor()
         db = for_server_dir(directory, args.database, actor=actor)
-        log = AuditLog(directory, db=db)
-        keys = KeyStore(directory, env_key=None, db=db)
+        from .server.db.workspaces import WorkspaceRepo
+        wid = WorkspaceRepo(db).require(args.workspace)['id']
+        log = AuditLog(directory, db=db, workspace_id=wid)
+        keys = KeyStore(directory, env_key=None, db=db, workspace_id=wid)
         if args.keys_action == "list":
             try:
-                keys = KeyStore(directory, os.environ.get("AGENTICML_SERVER_KEY"), db=db)
+                keys = KeyStore(directory, os.environ.get("AGENTICML_SERVER_KEY"), db=db, workspace_id=wid)
             except ValueError as exc:
                 print(f"agenticml server: warning: {exc}; listing file keys only", file=sys.stderr)
         if args.keys_action == "create":
@@ -584,7 +586,7 @@ def cmd_server_keys(args):
                 args.name, args.scope, user=args.user, created_users=created_users)
             if created_users:
                 log.record(actor, "cli", "user.add", record.user,
-                           detail={"role": "admin", "identity": None})
+                           detail={"role": created_users[0].role, "identity": None})
             log.record(actor, "cli", "key.create", record.name,
                        detail={"user": record.user, "scope": record.scope})
             print(key)
@@ -598,9 +600,9 @@ def cmd_server_keys(args):
         else:
             user = args.user
             if user is not None:
-                from .server.keys import validate_name
-                validate_name(user)
-                if UserStore(directory, db=db).get(user) is None:
+                from .server.db.workspaces import validate_login
+                user = validate_login(user)
+                if UserStore(directory, db=db, workspace_id=wid).get(user) is None:
                     raise ValueError("unknown user")
             records = [record.to_public() for record in keys.list()
                        if user is None or record.user == user]
@@ -650,6 +652,13 @@ def _read_cli_password(args):
     return first
 
 
+def _print_account_workspaces(db, login):
+    from .server.db.workspaces import AccountRepo
+    slugs = AccountRepo(db).workspace_slugs(login)
+    if len(slugs) > 1:
+        print(f"{login} belongs to workspaces: {', '.join(slugs)}")
+
+
 def cmd_server_users(args):
     from .server.audit import AuditLog, cli_actor
     from .server.keys import KeyStore, KeyStoreUnavailable
@@ -660,27 +669,33 @@ def cmd_server_users(args):
         data, directory = _server_data_dir(args)
         actor = cli_actor()
         db = for_server_dir(directory, args.database, actor=actor)
-        log = AuditLog(directory, db=db)
-        users = UserStore(directory, db=db)
-        keys = KeyStore(directory, db=db)
+        from .server.db.workspaces import WorkspaceRepo
+        wid = WorkspaceRepo(db).require(args.workspace)['id']
+        log = AuditLog(directory, db=db, workspace_id=wid)
+        users = UserStore(directory, db=db, workspace_id=wid)
+        keys = KeyStore(directory, db=db, workspace_id=wid)
         if args.users_action == "add":
+            from .server.db.workspaces import AccountRepo
+            existing_account = AccountRepo(db).get(args.name)
             user = users.add(args.name, role=args.role, identity=args.identity,
                              reclaim_runs=args.reclaim_runs)
             log.record(actor, "cli", "user.add", user.name,
                        detail={"role": user.role, "identity": user.identity})
-            if not args.no_invite:
-                token = users.create_invite(args.name)
+            if not args.no_invite and existing_account is None:
+                token = users.create_invite(args.name, operator=True)
                 log.record(actor, "cli", "user.invite", args.name,
                            detail={"expires_at": users.get(args.name).invite["expires_at"]})
                 _print_invite(token, _invite_base(args))
         elif args.users_action == "invite":
-            token = users.create_invite(args.name)
+            token = users.create_invite(args.name, operator=True)
             log.record(actor, "cli", "user.invite", args.name,
                        detail={"expires_at": users.get(args.name).invite["expires_at"]})
             _print_invite(token, _invite_base(args))
+            _print_account_workspaces(db, args.name)
         elif args.users_action == "set-password":
-            users.set_password(args.name, _read_cli_password(args))
+            users.set_password(args.name, _read_cli_password(args), operator=True)
             log.record(actor, "cli", "user.password", args.name, detail={"method": "cli"})
+            _print_account_workspaces(db, args.name)
         elif args.users_action == "remove":
             removed_keys = keys.for_user(args.name)
             revoked = users.remove(args.name)
@@ -695,9 +710,10 @@ def cmd_server_users(args):
             log.record(actor, "cli", "user.role", args.name,
                        detail={"from": previous.role, "to": args.role})
         elif args.users_action == "set-identity":
-            user = users.set_identity(args.name, args.identity)
+            user = users.set_identity(args.name, args.identity, operator=True)
             log.record(actor, "cli", "user.identity", args.name,
                        detail={"identity": user.identity})
+            _print_account_workspaces(db, args.name)
         else:
             rows = []
             for user in users.list():
@@ -721,10 +737,87 @@ def cmd_server_users(args):
     return 0
 
 
+def cmd_server_workspaces(args):
+    from .server.audit import AuditLog, cli_actor
+    from .server.db import DatabaseError, for_server_dir
+    from .server.db.workspaces import WorkspaceRepo, AccountRepo
+    from .server.workspaces import prepare_store, delete_workspace
+
+    try:
+        data, directory = _server_data_dir(args)
+        db = for_server_dir(directory, args.database)
+        repo = WorkspaceRepo(db)
+        action = args.workspaces_action
+        actor = cli_actor()
+        log = AuditLog(directory, db=db, workspace_id=None)
+        if action == 'list':
+            rows = repo.list()
+            if args.json:
+                print(json.dumps(rows))
+            else:
+                fields = ('slug', 'name', 'status', 'members', 'created_at')
+                _print_table([list(fields)] + [[str(r[k]) for k in fields] for r in rows])
+        elif action == 'create':
+            owner = args.owner
+            if owner is None:
+                admins = [r for r in AccountRepo(db).list() if r['server_admin']]
+                if len(admins) != 1:
+                    raise ValueError('--owner is required when there is not exactly one server admin')
+                owner = admins[0]['login']
+            row = repo.create(args.slug, args.name, owner)
+            prepare_store(data, row['id'])
+            log.record(actor, 'cli', 'workspace.create', row['id'], detail={'slug': row['slug'], 'owner': owner})
+        elif action == 'delete':
+            repo.require(args.slug)
+            confirmation = args.yes_delete if args.yes_delete is not None else input('Type the workspace slug to delete it: ')
+            if confirmation != args.slug:
+                raise ValueError('workspace deletion not confirmed')
+            row = delete_workspace(db, data, args.slug)
+            log.record(actor, 'cli', 'workspace.delete', row['id'], detail={'slug': args.slug})
+        elif action == 'set-owner':
+            row = repo.require(args.slug)
+            repo.set_owner(args.slug, args.owner)
+            log.record(actor, 'cli', 'workspace.owner', row['id'], detail={'owner': args.owner})
+        else:
+            row = repo.update(args.slug, name=args.name, new_slug=args.new_slug) if action == 'rename' else repo.update(
+                args.slug, status='suspended' if action == 'suspend' else 'active')
+            log.record(actor, 'cli', 'workspace.' + action, row['id'], detail={'slug': row['slug']})
+        return 0
+    except (OSError, ValueError, EOFError, DatabaseError) as exc:
+        print(f'agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}', file=sys.stderr)
+        return 1
+
+
+def cmd_server_accounts(args):
+    from .server.audit import AuditLog, cli_actor
+    from .server.db import DatabaseError, for_server_dir
+    from .server.db.workspaces import AccountRepo
+    try:
+        data, directory = _server_data_dir(args)
+        db = for_server_dir(directory, args.database)
+        repo = AccountRepo(db)
+        if args.accounts_action == 'list':
+            rows = repo.list()
+            if args.json:
+                print(json.dumps(rows))
+            else:
+                fields = ('login', 'display_name', 'server_admin', 'created_at')
+                _print_table([list(fields)] + [[str(r[k]) for k in fields] for r in rows])
+        else:
+            repo.set_server_admin(args.login, args.value == 'on')
+            AuditLog(directory, db=db, workspace_id=None).record(
+                cli_actor(), 'cli', 'account.server_admin', args.login, detail={'enabled': args.value == 'on'})
+        return 0
+    except (OSError, ValueError, DatabaseError) as exc:
+        print(f'agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}', file=sys.stderr)
+        return 1
+
+
 def cmd_server_audit(args):
     from .server.audit import cli_main
 
-    return cli_main(args.data, args.limit, args.json, database=args.database)
+    return cli_main(args.data, args.limit, args.json, database=args.database,
+                    workspace=args.workspace, server=args.server)
 
 
 def _cmd_server_report(args, verify=False):
@@ -768,7 +861,7 @@ def cmd_server_reindex(args):
 
     handle = None
     try:
-        data, root = _data_root(args.data)
+        data, directory = _server_data_dir(args)
         try:
             handle = acquire_server_lock(data / "server")
         except ValueError as exc:
@@ -777,7 +870,15 @@ def cmd_server_reindex(args):
                 raise ValueError("stop the server first") from exc
             raise
         db = for_server_dir(data / "server", args.database)
-        counts = reindex(root, RunRepo(db))
+        from .server.db.workspaces import WorkspaceRepo
+        from .server.workspaces import prepare_store
+        workspaces = WorkspaceRepo(db)
+        selected = [workspaces.require(args.workspace)] if args.workspace else workspaces.list()
+        counts = dict(adopted=0, removed=0, rebuilt=0)
+        for workspace in selected:
+            result = reindex(prepare_store(data, workspace['id']), RunRepo(db, workspace['id']))
+            for key in counts:
+                counts[key] += result[key]
         print(f"adopted {counts['adopted']}, removed {counts['removed']}, rebuilt {counts['rebuilt']}")
         return 0
     except KeyboardInterrupt:
@@ -1344,6 +1445,9 @@ def main(argv=None):
     p_audit = server_sub.add_parser("audit", help="Show recent audit events")
     p_audit.add_argument("--data", default=None)
     p_audit.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    scope = p_audit.add_mutually_exclusive_group()
+    scope.add_argument('--workspace', default='default')
+    scope.add_argument('--server', action='store_true')
     p_audit.add_argument("--limit", type=int, default=50)
     p_audit.add_argument("--json", action="store_true")
     p_audit.set_defaults(func=cmd_server_audit)
@@ -1376,13 +1480,48 @@ def main(argv=None):
     p_reindex = server_sub.add_parser("reindex", help="Rebuild the run index from on-disk files")
     p_reindex.add_argument("--data", default=None)
     p_reindex.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_reindex.add_argument("--workspace", default=None, help="Workspace slug (default: every workspace)")
     p_reindex.set_defaults(func=cmd_server_reindex)
+    p_workspaces = server_sub.add_parser('workspaces', help='Manage server workspaces')
+    ws_sub = p_workspaces.add_subparsers(dest='workspaces_action', required=True)
+    for action in ('list', 'create', 'rename', 'suspend', 'resume', 'delete', 'set-owner'):
+        child = ws_sub.add_parser(action)
+        child.add_argument('--data', default=None)
+        child.add_argument('--database', default=None, metavar='URL')
+        child.set_defaults(func=cmd_server_workspaces)
+        if action == 'list':
+            child.add_argument('--json', action='store_true')
+            continue
+        child.add_argument('slug')
+        if action == 'create':
+            child.add_argument('--name', default=None)
+            child.add_argument('--owner', default=None)
+        elif action == 'rename':
+            child.add_argument('--name', required=True)
+            child.add_argument('--slug', dest='new_slug', default=None)
+        elif action == 'delete':
+            child.add_argument('--yes-delete', default=None, metavar='SLUG')
+        elif action == 'set-owner':
+            child.add_argument('--owner', required=True)
+    p_accounts = server_sub.add_parser('accounts', help='Manage global accounts')
+    acc_sub = p_accounts.add_subparsers(dest='accounts_action', required=True)
+    for action in ('list', 'set-server-admin'):
+        child = acc_sub.add_parser(action)
+        child.add_argument('--data', default=None)
+        child.add_argument('--database', default=None, metavar='URL')
+        child.set_defaults(func=cmd_server_accounts)
+        if action == 'list':
+            child.add_argument('--json', action='store_true')
+        else:
+            child.add_argument('login')
+            child.add_argument('value', choices=('on', 'off'))
     p_keys = server_sub.add_parser("keys", help="Create, list, or revoke API keys")
     keys_sub = p_keys.add_subparsers(dest="keys_action", required=True)
     for action in ("create", "list", "revoke"):
         child = keys_sub.add_parser(action)
         child.add_argument("--data", default=None)
         child.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+        child.add_argument("--workspace", default="default")
         child.set_defaults(func=cmd_server_keys)
         if action == "create":
             child.add_argument("--name", required=True)
@@ -1404,40 +1543,47 @@ def main(argv=None):
     p_users_add.add_argument("--public-url", default=None)
     p_users_add.add_argument("--data", default=None)
     p_users_add.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_users_add.add_argument("--workspace", default="default")
     p_users_add.set_defaults(func=cmd_server_users)
     p_users_invite = users_sub.add_parser("invite")
     p_users_invite.add_argument("name")
     p_users_invite.add_argument("--public-url", default=None)
     p_users_invite.add_argument("--data", default=None)
     p_users_invite.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_users_invite.add_argument("--workspace", default="default")
     p_users_invite.set_defaults(func=cmd_server_users)
     p_users_password = users_sub.add_parser("set-password")
     p_users_password.add_argument("name")
     p_users_password.add_argument("--stdin", action="store_true")
     p_users_password.add_argument("--data", default=None)
     p_users_password.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_users_password.add_argument("--workspace", default="default")
     p_users_password.set_defaults(func=cmd_server_users)
     p_users_list = users_sub.add_parser("list")
     p_users_list.add_argument("--json", action="store_true")
     p_users_list.add_argument("--data", default=None)
     p_users_list.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_users_list.add_argument("--workspace", default="default")
     p_users_list.set_defaults(func=cmd_server_users)
     p_users_remove = users_sub.add_parser("remove")
     p_users_remove.add_argument("name")
     p_users_remove.add_argument("--data", default=None)
     p_users_remove.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_users_remove.add_argument("--workspace", default="default")
     p_users_remove.set_defaults(func=cmd_server_users)
     p_users_role = users_sub.add_parser("set-role")
     p_users_role.add_argument("name")
     p_users_role.add_argument("role", choices=("viewer", "member", "admin"))
     p_users_role.add_argument("--data", default=None)
     p_users_role.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_users_role.add_argument("--workspace", default="default")
     p_users_role.set_defaults(func=cmd_server_users)
     p_users_identity = users_sub.add_parser("set-identity")
     p_users_identity.add_argument("name")
     p_users_identity.add_argument("identity", nargs="?", default=None)
     p_users_identity.add_argument("--data", default=None)
     p_users_identity.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_users_identity.add_argument("--workspace", default="default")
     p_users_identity.set_defaults(func=cmd_server_users)
 
     p_sync = sub.add_parser("sync", help="Incrementally upload local runs to a server")

@@ -159,18 +159,20 @@ def bootstrap_admin(data, public_url, *, install=False, database=None):
     actor = cli_actor()
     from .db import for_server_dir
     db = for_server_dir(data / 'server', database, actor=actor)
-    log = AuditLog(data / 'server', db=db)
+    from .workspaces import default_workspace_id
+    wid = default_workspace_id(db)
+    log = AuditLog(data / 'server', db=db, workspace_id=wid)
     env_key = os.environ.get("AGENTICML_SERVER_KEY")
-    keys = KeyStore(data / "server", None if install else env_key, db=db)
-    users = UserStore(data / "server", db=db)
+    keys = KeyStore(data / "server", None if install else env_key, db=db, workspace_id=wid)
+    users = UserStore(data / "server", db=db, workspace_id=wid)
     named = users.get("admin")
-    has_admin_user = any(user.role == "admin" for user in users.list())
-    if named is not None and named.role != "admin" and not keys.has_admin() and not has_admin_user:
+    has_admin_user = any(user.role in ("owner", "admin") for user in users.list())
+    if named is not None and named.role not in ("owner", "admin") and not keys.has_admin() and not has_admin_user:
         raise UpError(_ADMIN_NAME_NOT_ADMIN)
     if keys.has_admin() or has_admin_user:
-        admin_user = named if named is not None and named.role == "admin" else None
+        admin_user = named if named is not None and named.role in ("owner", "admin") else None
         if admin_user is None:
-            admin_user = next((user for user in users.list() if user.role == "admin"), None)
+            admin_user = next((user for user in users.list() if user.role in ("owner", "admin")), None)
         if (admin_user is not None and admin_user.password is None
                 and not _invite_is_live(admin_user)):
             print("no admin password yet: run `agenticml server users invite "
@@ -184,8 +186,8 @@ def bootstrap_admin(data, public_url, *, install=False, database=None):
         users.add("admin", role="admin", created_by="server up")
     except UserNameTaken:
         raise UpError(_ADMIN_NAME_NOT_ADMIN) from None
-    log.record(actor, "cli", "user.add", "admin", detail={"role": "admin", "identity": None})
-    token = users.create_invite("admin")
+    log.record(actor, "cli", "user.add", "admin", detail={"role": users.get("admin").role, "identity": None})
+    token = users.create_invite("admin", operator=True)
     log.record(actor, "cli", "user.invite", "admin",
                detail={"expires_at": users.get("admin").invite["expires_at"]})
     print(f"Open {public_url}/invite?token={token} to choose the admin "
