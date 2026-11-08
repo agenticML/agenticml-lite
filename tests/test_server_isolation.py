@@ -106,6 +106,11 @@ EXAMPLES = {
         "method": "POST", "path": "/invite",
         "body": {"token": "x", "password": PASSWORD},
     },
+    "auth_firebase": {
+        "method": "POST", "path": "/auth/firebase",
+        "body": {"id_token": "x"},
+    },
+    "auth_firebase_config": {"method": "GET", "path": "/auth/firebase/config"},
     "static_login_js": {"method": "GET", "path": "/static/login.js"},
     "static_setup_js": {"method": "GET", "path": "/static/setup.js"},
     "static_invite_js": {"method": "GET", "path": "/static/invite.js"},

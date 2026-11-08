@@ -134,7 +134,7 @@ def test_migrations_concurrent_idempotent_and_ordered(tmp_path, monkeypatch):
     with ThreadPoolExecutor(2) as pool:
         databases = list(pool.map(open_db, range(2)))
     with databases[0].transaction() as tx:
-        assert [r['version'] for r in tx.fetchall('SELECT * FROM schema_migrations')] == [1, 2, 3]
+        assert [r['version'] for r in tx.fetchall('SELECT * FROM schema_migrations')] == [1, 2, 3, 4]
     for db in databases: db.close()
     from agenticml.server.db import migrate
     migrations = tmp_path / 'migrations'
@@ -143,10 +143,11 @@ def test_migrations_concurrent_idempotent_and_ordered(tmp_path, monkeypatch):
     (migrations / source.name).write_text(source.read_text())
     (migrations / '0002_second.sql').write_text('CREATE TABLE second (id {{id}}, value {{blob}});\n')
     (migrations / '0003_third.sql').write_text('CREATE TABLE third (value {{real}});\n')
+    (migrations / '0004_fourth.sql').write_text('CREATE TABLE fourth (value {{real}});\n')
     monkeypatch.setattr(migrate, 'MIGRATIONS', migrations)
     db = connect(url(path))
     with db.transaction() as tx:
-        assert [r[0] for r in tx.fetchall('SELECT version FROM schema_migrations ORDER BY version')] == [1,2,3]
+        assert [r[0] for r in tx.fetchall('SELECT version FROM schema_migrations ORDER BY version')] == [1,2,3,4]
     db.close()
     connect(url(path)).close()
 
@@ -175,7 +176,7 @@ def test_schema_too_new_server_and_cli_refuse(tmp_path, capsys):
     with db.transaction(write=True) as tx:
         tx.execute('INSERT INTO schema_migrations VALUES (?, ?, ?)', (999,'future',layout.format_timestamp()))
     db.close()
-    with pytest.raises(SchemaTooNew, match='knows up to 3'):
+    with pytest.raises(SchemaTooNew, match='knows up to 4'):
         make_server(tmp_path, port=0)
     for command in [('keys','list'),('users','list'),('audit',),('serve',),('status',),('verify',)]:
         assert cli.main(['server',*command,'--data',str(tmp_path)]) == 1

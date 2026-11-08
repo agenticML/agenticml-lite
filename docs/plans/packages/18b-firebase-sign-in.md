@@ -48,7 +48,10 @@ Out of scope: open sign-up and personal workspaces (18c), usage limits
   has **no** credentials (no password record, no proxy identity, no uid).
   Such accounts are created by a server admin (`server accounts add EMAIL`)
   or by an invite. An account with a password or proxy identity is never
-  linked automatically. Otherwise an unknown uid gets no account in 18b
+  linked automatically. Linking and invite acceptance only trust
+  `email_verified` when `provider` is `google.com` or `password`; any other
+  provider is treated as unverified for those two purposes (already-linked
+  uid sign-in is unchanged). Otherwise an unknown uid gets no account in 18b
   (18c adds sign-up) and sees "no access".
 - **Freshness.** `auth_time` must be at most 10 minutes old and the page
   uses Firebase in-memory persistence and signs out of Firebase after the

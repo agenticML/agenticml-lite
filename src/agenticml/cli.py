@@ -486,6 +486,21 @@ def cmd_ui(args):
     return 0
 
 
+def _firebase_from_args(args):
+    from .server.firebase import parse_firebase_config
+
+    project = getattr(args, "firebase_project", None)
+    if project is None:
+        project = os.environ.get("AGENTICML_SERVER_FIREBASE_PROJECT") or None
+    api_key = getattr(args, "firebase_api_key", None)
+    if api_key is None:
+        api_key = os.environ.get("AGENTICML_SERVER_FIREBASE_API_KEY") or None
+    auth_domain = getattr(args, "firebase_auth_domain", None)
+    if auth_domain is None:
+        auth_domain = os.environ.get("AGENTICML_SERVER_FIREBASE_AUTH_DOMAIN") or None
+    return parse_firebase_config(project, api_key, auth_domain)
+
+
 def cmd_server_serve(args):
     from .server import serve
     from .server.db.errors import DatabaseError
@@ -502,11 +517,17 @@ def cmd_server_serve(args):
     identity = args.identity_header
     if identity is None:
         identity = os.environ.get("AGENTICML_SERVER_IDENTITY_HEADER") or None
+    extra = {}
+    if args.database is not None:
+        extra["database"] = args.database
     try:
+        firebase = _firebase_from_args(args)
+        if firebase is not None:
+            extra["firebase"] = firebase
         serve(args.data, args.host, args.port, public_url,
               trusted_proxies=parse_trusted_proxies(proxies),
               identity_header=parse_identity_header(identity),
-              **({"database": args.database} if args.database is not None else {}))
+              **extra)
     except KeyboardInterrupt:
         pass
     except (OSError, ValueError, OverflowError, DatabaseError) as exc:
@@ -530,9 +551,14 @@ def cmd_server_up(args):
     from .server.db.errors import DatabaseError
     from .server.up import UpError, up
 
+    extra = {}
+    if args.database is not None:
+        extra["database"] = args.database
     try:
-        up(args.data, args.port, install=args.install, force=args.force,
-           **({"database": args.database} if args.database is not None else {}))
+        firebase = _firebase_from_args(args)
+        if firebase is not None:
+            extra["firebase"] = firebase
+        up(args.data, args.port, install=args.install, force=args.force, **extra)
     except KeyboardInterrupt:
         pass
     except UpError as exc:
@@ -801,8 +827,26 @@ def cmd_server_accounts(args):
             if args.json:
                 print(json.dumps(rows))
             else:
-                fields = ('login', 'display_name', 'server_admin', 'created_at')
-                _print_table([list(fields)] + [[str(r[k]) for k in fields] for r in rows])
+                fields = ('login', 'display_name', 'server_admin', 'firebase', 'email_verified', 'created_at')
+                table = [list(fields)]
+                for row in rows:
+                    table.append([
+                        row['login'], row['display_name'] or '',
+                        str(row['server_admin']),
+                        'yes' if row.get('firebase_uid') else 'no',
+                        str(row.get('email_verified') or 0),
+                        row['created_at'] or '',
+                    ])
+                _print_table(table)
+        elif args.accounts_action == 'add':
+            account = repo.create(args.login, display_name=args.display_name, created_by='cli')
+            if args.server_admin:
+                repo.set_server_admin(account['login'], True)
+                account = repo.get(account['login'])
+            AuditLog(directory, db=db, workspace_id=None).record(
+                cli_actor(), 'cli', 'account.create', account['login'],
+                detail={'server_admin': bool(args.server_admin),
+                        'display_name': account['display_name']})
         else:
             repo.set_server_admin(args.login, args.value == 'on')
             AuditLog(directory, db=db, workspace_id=None).record(
@@ -1461,6 +1505,12 @@ def main(argv=None):
                         help="Trust this proxy CIDR for X-Forwarded-For and identity headers (repeatable)")
     p_serve.add_argument("--identity-header", choices=("alb", "tailscale", "oauth2-proxy"),
                         default=None, help="Honour this proxy identity header (requires --trusted-proxy)")
+    p_serve.add_argument("--firebase-project", default=None, metavar="ID",
+                        help="Firebase project id (default: AGENTICML_SERVER_FIREBASE_PROJECT)")
+    p_serve.add_argument("--firebase-api-key", default=None, metavar="KEY",
+                        help="Firebase web API key (default: AGENTICML_SERVER_FIREBASE_API_KEY)")
+    p_serve.add_argument("--firebase-auth-domain", default=None, metavar="HOST",
+                        help="Firebase auth domain (default: AGENTICML_SERVER_FIREBASE_AUTH_DOMAIN or <project>.firebaseapp.com)")
     p_serve.set_defaults(func=cmd_server_serve)
     p_up = server_sub.add_parser("up", help="Serve on loopback through Tailscale Funnel")
     p_up.add_argument("--data", default=None, help="Data directory (default: AGENTICML_SERVER_DATA or ~/.agenticml-server)")
@@ -1468,6 +1518,12 @@ def main(argv=None):
     p_up.add_argument("--port", type=_parse_up_port, default=8080)
     p_up.add_argument("--install", action="store_true", help="Write a user service that runs server up, then exit")
     p_up.add_argument("--force", action="store_true", help="Overwrite an existing user service file")
+    p_up.add_argument("--firebase-project", default=None, metavar="ID",
+                     help="Firebase project id (default: AGENTICML_SERVER_FIREBASE_PROJECT)")
+    p_up.add_argument("--firebase-api-key", default=None, metavar="KEY",
+                     help="Firebase web API key (default: AGENTICML_SERVER_FIREBASE_API_KEY)")
+    p_up.add_argument("--firebase-auth-domain", default=None, metavar="HOST",
+                     help="Firebase auth domain (default: AGENTICML_SERVER_FIREBASE_AUTH_DOMAIN or <project>.firebaseapp.com)")
     p_up.set_defaults(func=cmd_server_up)
     for action, func, help_text in (
             ("status", cmd_server_status, "Show runs, sizes, and key activity"),
@@ -1505,13 +1561,17 @@ def main(argv=None):
             child.add_argument('--owner', required=True)
     p_accounts = server_sub.add_parser('accounts', help='Manage global accounts')
     acc_sub = p_accounts.add_subparsers(dest='accounts_action', required=True)
-    for action in ('list', 'set-server-admin'):
+    for action in ('list', 'add', 'set-server-admin'):
         child = acc_sub.add_parser(action)
         child.add_argument('--data', default=None)
         child.add_argument('--database', default=None, metavar='URL')
         child.set_defaults(func=cmd_server_accounts)
         if action == 'list':
             child.add_argument('--json', action='store_true')
+        elif action == 'add':
+            child.add_argument('login')
+            child.add_argument('--display-name', default=None)
+            child.add_argument('--server-admin', action='store_true')
         else:
             child.add_argument('login')
             child.add_argument('value', choices=('on', 'off'))

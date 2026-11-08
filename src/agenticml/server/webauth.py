@@ -342,7 +342,8 @@ class WebAuth:
     """Owns /login, /logout, /invite, /setup, sessions, and the request gate."""
 
     def __init__(self, keys, public_url=None, clock=time.time, throttle_clock=time.time,
-                 users=None, trusted_proxies=(), identity_header=None):
+                 users=None, trusted_proxies=(), identity_header=None,
+                 firebase=None, cert_source=None):
         self.keys = keys
         self.users = users if users is not None else UserStore(keys.server_dir, db=keys.db, workspace_id=keys.workspace_id or '0' * 32)
         self.public_url = public_url
@@ -354,6 +355,17 @@ class WebAuth:
             raise ValueError("identity header requires a trusted proxy")
         self._identity_name, self._identity_match = (
             IDENTITY_PRESETS[self.identity_header] if self.identity_header else (None, None))
+        self.firebase = firebase
+        self.cert_source = cert_source
+        if self.firebase is not None:
+            from .firebase import FIREBASE_EXTRA, FIREBASE_IDENTITY, firebase_available
+            if self.identity_header is not None:
+                raise ValueError(FIREBASE_IDENTITY)
+            if not firebase_available():
+                raise ValueError(FIREBASE_EXTRA)
+            if self.cert_source is None:
+                from .firebase import CertificateSource
+                self.cert_source = CertificateSource()
         self._lock = threading.Lock()
         from .db.repos import SessionRepo
         self.sessions = SessionRepo(keys.db)
@@ -362,6 +374,8 @@ class WebAuth:
         self._setup_lock = threading.Lock()
 
     def arm_setup(self, base_url):
+        if self.firebase is not None:
+            return
         if self.keys.workspace_id is None:
             return
         if not self.keys.prepare_setup():
@@ -474,7 +488,25 @@ class WebAuth:
             handler.close_connection = True
         path = self._path(handler)
         try:
+            if self.firebase is not None and path == "/auth/firebase/config":
+                if handler.command == "GET":
+                    self._firebase_config(handler)
+                else:
+                    handler.close_connection = True
+                    handler._json({"error": "method not allowed"}, 405)
+                return True
+            if self.firebase is not None and path == "/auth/firebase":
+                if handler.command == "POST":
+                    self._firebase_auth(handler)
+                else:
+                    handler.close_connection = True
+                    handler._json({"error": "method not allowed"}, 405)
+                return True
             if path == "/setup":
+                if self.firebase is not None:
+                    handler.close_connection = True
+                    handler._json({"error": "not found"}, 404)
+                    return True
                 with self._setup_lock:
                     self._setup_armed()
                 if handler.command == "GET":
@@ -486,6 +518,16 @@ class WebAuth:
                     handler._json({"error": "method not allowed"}, 405)
                 return True
             if path == "/invite":
+                if self.firebase is not None:
+                    if handler.command == "GET":
+                        self._firebase_login_page(handler)
+                    elif handler.command == "POST":
+                        handler.close_connection = True
+                        handler._json({"error": "not found"}, 404)
+                    else:
+                        handler.close_connection = True
+                        handler._json({"error": "method not allowed"}, 405)
+                    return True
                 if handler.command == "GET":
                     self._invite_page(handler)
                 elif handler.command == "POST":
@@ -498,6 +540,10 @@ class WebAuth:
                 self._asset(handler, path)
                 return True
             if handler.command == "POST" and path == "/login":
+                if self.firebase is not None:
+                    handler.close_connection = True
+                    handler._json({"error": "not found"}, 404)
+                    return True
                 self._login(handler)
                 return True
             if handler.command == "POST" and path == "/logout":
@@ -565,12 +611,15 @@ class WebAuth:
         except Exception:
             logger.error("could not record audit event")
 
-    def _audit_login_failed(self, handler, name=None, *, method):
+    def _audit_login_failed(self, handler, name=None, *, method, provider=None):
         try:
             validate_name(name)
         except ClientError:
             name = None
-        self._audit(handler, "login.failed", name, {"method": method},
+        detail = {"method": method}
+        if method == "firebase":
+            detail["provider"] = provider
+        self._audit(handler, "login.failed", name, detail,
                     actor="anonymous", via=method)
 
     def _path(self, handler):
@@ -943,8 +992,203 @@ class WebAuth:
         handler._send(file.read_bytes(), content_type, headers={"Cache-Control": "no-store"})
 
     def _login_page(self, handler):
+        if self.firebase is not None:
+            self._firebase_login_page(handler)
+            return
         body = (_LOGIN_STATIC / "login.html").read_bytes()
         handler._send(body, "text/html; charset=utf-8", headers=self._headers())
+
+    def _firebase_login_page(self, handler):
+        handler._send(
+            (_LOGIN_STATIC / "firebase-login.html").read_bytes(),
+            "text/html; charset=utf-8",
+            headers=self._headers({"Referrer-Policy": "no-referrer"}),
+        )
+
+    def _firebase_config(self, handler):
+        if self.firebase is None:
+            handler._json({"error": "not found"}, 404)
+            return
+        handler._json(
+            {"projectId": self.firebase.project, "apiKey": self.firebase.api_key,
+             "authDomain": self.firebase.auth_domain},
+            headers=self._headers(),
+        )
+
+    def _firebase_auth(self, handler):
+        from .db.workspaces import AccountRepo, InviteRepo
+        from .firebase import (
+            FirebaseTokenInvalid, FirebaseUnavailable, email_verified_for_link, verify_id_token)
+        from .users import InviteAccountExists, InviteEmailMismatch, InviteInvalid
+
+        if self.firebase is None:
+            handler.close_connection = True
+            handler._json({"error": "not found"}, 404)
+            return
+        if not handler._csrf_ok():
+            handler.close_connection = True
+            logger.info("login refused: cross-site")
+            handler._error({"error": "cross-site request refused"}, 403)
+            return
+        address = self.client_address(handler)
+        ticket = self._throttle_or_refuse(handler, address)
+        if ticket is None:
+            return
+        uid_ticket = None
+        outcome = "ignored"
+        try:
+            payload = self._read_login_payload(handler)
+            if payload is None:
+                return
+            token, invite = payload.get("id_token"), payload.get("invite")
+            if not isinstance(token, str):
+                raise ValueError("invalid login body")
+            if invite is not None and not isinstance(invite, str):
+                raise ValueError("invalid login body")
+            if invite == "":
+                invite = None
+            try:
+                claims = verify_id_token(
+                    token, self.firebase.project, now=self.clock(), keys=self.cert_source)
+            except FirebaseTokenInvalid as exc:
+                logger.info("login failed")
+                logger.debug("firebase token invalid: %s", exc.reason)
+                outcome = "failed"
+                self._audit_login_failed(handler, method="firebase")
+                handler._json({"error": "sign-in failed"}, 401, self._headers())
+                return
+            except FirebaseUnavailable:
+                handler._json({"error": "sign-in unavailable"}, 503, self._headers())
+                return
+            retry_after, uid_ticket = self.throttle.begin("uid:" + claims.uid)
+            if uid_ticket is None:
+                self.throttle.finish(ticket, "ignored")
+                ticket = None
+                handler.close_connection = True
+                handler._json(
+                    {"error": "too many failed logins; try again later"},
+                    429, self._headers({"Retry-After": str(retry_after)}),
+                )
+                return
+            pending = InviteRepo.find_pending(self.keys.db, invite) if invite else None
+            if invite is not None and pending is None:
+                logger.info("login failed")
+                outcome = "failed"
+                self._audit_login_failed(handler, method="firebase", provider=claims.provider)
+                handler._json(
+                    {"error": "this invite is no longer valid", "reason": "invite_invalid"},
+                    403, self._headers())
+                return
+            if pending is not None:
+                from .db.workspaces import emails_equal, is_email_login
+                if (not email_verified_for_link(claims) or not is_email_login(pending["login"])
+                        or not emails_equal(claims.email, pending["login"])):
+                    logger.info("login failed")
+                    outcome = "failed"
+                    self._audit_login_failed(handler, method="firebase", provider=claims.provider)
+                    handler._json(
+                        {"error": "this invite is for a different or unverified email"},
+                        403, self._headers())
+                    return
+            accounts = AccountRepo(self.keys.db)
+            account = None
+            if pending is not None:
+                try:
+                    account = InviteRepo.redeem_firebase(
+                        self.keys.db, invite, claims.uid, claims.email,
+                        email_verified_for_link(claims), claims.name)
+                except InviteEmailMismatch:
+                    logger.info("login failed")
+                    outcome = "failed"
+                    self._audit_login_failed(handler, method="firebase", provider=claims.provider)
+                    handler._json(
+                        {"error": "this invite is for a different or unverified email"},
+                        403, self._headers())
+                    return
+                except InviteAccountExists:
+                    logger.info("login failed")
+                    outcome = "failed"
+                    self._audit_login_failed(handler, method="firebase", provider=claims.provider)
+                    handler._json(
+                        {"error": "an account with this email already exists; "
+                                 "sign in with it or ask a server admin",
+                         "reason": "account_exists"},
+                        403, self._headers())
+                    return
+                except InviteInvalid:
+                    logger.info("login failed")
+                    outcome = "failed"
+                    self._audit_login_failed(handler, method="firebase", provider=claims.provider)
+                    handler._json(
+                        {"error": "this invite is no longer valid", "reason": "invite_invalid"},
+                        403, self._headers())
+                    return
+            if account is None:
+                with self.keys.db.transaction(write=True) as tx:
+                    tx.advisory_lock("users")
+                    account = self._firebase_find_or_claim(accounts, claims, tx)
+            if account is None:
+                logger.info("login failed")
+                outcome = "failed"
+                self._audit_login_failed(handler, method="firebase", provider=claims.provider)
+                handler._json(
+                    {"error": "no access", "reason": "no_account"}, 403, self._headers())
+                return
+            with self.keys.db.transaction(write=True) as tx:
+                tx.advisory_lock("users")
+                accounts.refresh_firebase_email(
+                    account["id"], claims.email, email_verified_for_link(claims), tx)
+                account = dict(tx.fetchone(
+                    "SELECT * FROM accounts WHERE id=?", (account["id"],)))
+            self._between_verify_and_session(account)
+            cookie, entry = self._session_cookie_for(
+                account["login"], "firebase",
+                expected=(account["id"], account["generation"]))
+            if entry is None:
+                outcome = "failed"
+                self._audit_login_failed(handler, method="firebase", provider=claims.provider)
+                self._refuse_stale_credentials(handler)
+                return
+            outcome = "success"
+            if not self._attach(handler, entry):
+                outcome = "failed"
+                self._audit_login_failed(handler, method="firebase", provider=claims.provider)
+                handler._json({"error": "sign-in failed"}, 401, self._headers())
+                return
+            self._audit(handler, "login.ok", account["login"],
+                        {"method": "firebase", "provider": claims.provider},
+                        actor=account["login"], via="firebase")
+            handler._json(
+                {"ok": True, "user": account["login"]},
+                headers=self._headers({"Set-Cookie": self._cookie(cookie)}),
+            )
+        finally:
+            if ticket is not None:
+                self.throttle.finish(ticket, outcome)
+            if uid_ticket is not None:
+                self.throttle.finish(uid_ticket, outcome)
+
+    def _firebase_find_or_claim(self, accounts, claims, tx):
+        from .db.workspaces import emails_equal
+        from .firebase import email_verified_for_link
+
+        found = accounts.by_firebase_uid(claims.uid, tx)
+        if found is not None:
+            return found
+        if not (email_verified_for_link(claims) and claims.email and accounts.claimable(claims.email, tx)):
+            return None
+        account = accounts.get(claims.email, tx)
+        if account is None or not emails_equal(account["login"], claims.email):
+            return None
+        try:
+            accounts.link_firebase(
+                account["id"], claims.uid, claims.email, email_verified_for_link(claims), tx)
+        except (ClientError, DatabaseError):
+            found = accounts.by_firebase_uid(claims.uid, tx)
+            if found is not None:
+                return found
+            raise
+        return accounts.by_firebase_uid(claims.uid, tx) or accounts.get(claims.email, tx)
 
     def _read_login_payload(self, handler):
         length = handler._put_length(LOGIN_BODY_MAX)

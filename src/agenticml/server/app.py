@@ -165,7 +165,8 @@ class IngestServer(DashboardServer):
     daemon_threads = False
 
     def __init__(self, data, host, port, public_url=None, env_key=None,
-                 trusted_proxies=(), identity_header=None, db=None):
+                 trusted_proxies=(), identity_header=None, db=None,
+                 firebase=None, cert_source=None):
         from .ingest import IngestHandler
 
         self.data_dir = Path(data)
@@ -186,7 +187,8 @@ class IngestServer(DashboardServer):
         self.public_url = public_url
         self.web = WebAuth(
             self.keys, public_url, users=self.users,
-            trusted_proxies=trusted_proxies, identity_header=identity_header)
+            trusted_proxies=trusted_proxies, identity_header=identity_header,
+            firebase=firebase, cert_source=cert_source)
         self.store_file_mode = 0o666 & ~_read_umask()
         self.limits = Limits()
         self.lineage_enabled = shutil.which("git") is not None
@@ -350,7 +352,8 @@ class IPv6IngestServer(IngestServer):
 
 
 def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None,
-                trusted_proxies=(), identity_header=None, database=None):
+                trusted_proxies=(), identity_header=None, database=None,
+                firebase=None, cert_source=None):
     """Prepare and lock the data directory; port=0 chooses a free port."""
     validate_env_key(env_key)
     if env_key is not None and env_key_looks_weak(env_key):
@@ -368,7 +371,8 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
         db = for_server_dir(data / "server", database)
         _clean_tmp(data / "server" / "tmp")
         cls = IPv6IngestServer if ":" in host else IngestServer
-        server = cls(data, host, port, public_url, env_key, trusted_proxies, identity_header, db=db)
+        server = cls(data, host, port, public_url, env_key, trusted_proxies, identity_header, db=db,
+                     firebase=firebase, cert_source=cert_source)
         server._server_lock = handle
         for workspace in server.workspaces.list():
             root = prepare_store(data, workspace['id'])
@@ -382,12 +386,19 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
 
 
 def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None,
-          trusted_proxies=(), identity_header=None, database=None):
+          trusted_proxies=(), identity_header=None, database=None,
+          firebase=None, cert_source=None):
     """Run until interrupted, with an optional environment admin key."""
+    extra = {}
+    if database is not None:
+        extra["database"] = database
+    if firebase is not None:
+        extra["firebase"] = firebase
+    if cert_source is not None:
+        extra["cert_source"] = cert_source
     server = make_server(
         data, host, port, public_url, os.environ.get("AGENTICML_SERVER_KEY"),
-        trusted_proxies, identity_header,
-        **({"database": database} if database is not None else {}))
+        trusted_proxies, identity_header, **extra)
     previous_handler = None
     stopping = False
 

@@ -252,7 +252,8 @@ def test_package17_migration_preserves_every_row_and_moves_store(tmp_path, monke
     migrations.mkdir()
     real = migrate.MIGRATIONS
     for path in real.glob('*.sql'):
-        shutil.copyfile(path, migrations / path.name)
+        if int(path.name[:4]) <= 2:
+            shutil.copyfile(path, migrations / path.name)
     with monkeypatch.context() as patch:
         patch.setattr(migrate, 'MIGRATIONS', migrations)
         db = connect('sqlite:///' + str(data / 'server/agenticml.db'))

@@ -62,6 +62,8 @@ _ROUTES.extend([
     _r("POST", r"/setup", "public", None, "setup", "setup_post"),
     _r("GET", r"/invite", "public", None, "invite_page", "invite_get"),
     _r("POST", r"/invite", "public", None, "invite", "invite_post"),
+    _r("POST", r"/auth/firebase", "public", None, "firebase_auth", "auth_firebase"),
+    _r("GET", r"/auth/firebase/config", "public", None, "firebase_config", "auth_firebase_config"),
     _r("GET", r"/static/login.js", "public", None, "public_asset", "static_login_js"),
     _r("GET", r"/static/setup.js", "public", None, "public_asset", "static_setup_js"),
     _r("GET", r"/static/invite.js", "public", None, "public_asset", "static_invite_js"),
