@@ -64,6 +64,17 @@ Update the status column in the PR that changes it. Values: `not started`,
 `planning`, `plan ready`, `in progress`, `in review`, `done (<PR link>)`,
 `blocked: <reason>`. The Plan column links the package plan once written.
 
+Progress is visible while work is under way (decided Nov 8, 2026):
+
+- A package built in several parts gets one sub-row per part (for example
+  18.1a, 18.1b, 18.2) under its own row, each with its own coder and
+  status; the package row is `done` only when every part is.
+- As soon as the first package of a PR is committed, the branch is pushed
+  and a **draft** PR is opened, with the status column already updated.
+  Each later package or part is pushed when it is committed, so the
+  roadmap on the PR branch always shows the current state. The PR leaves
+  draft when every package in it is done and verified.
+
 ### 2.0: self-hosted server, single user
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
@@ -180,9 +191,12 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 16 † | Database layer, SQLite backend, migrations; users, keys, sessions, throttle, audit in tables | 2.2 | Codex | L | [plan](packages/16-database-layer.md) | done (3.0 PR) |
-| 17 † | Runs, sync state and notes in the database; append crash safety; run list from the database | 16 | Cursor | L | [plan](packages/17-runs-in-database.md) | done (3.0 PR) |
-| 18 † | Workspaces and accounts: memberships, workspace-bound keys, `/w/<slug>` routes, switcher, server-admin commands, isolation suite | 17 | Codex, Cursor | L | [plan](packages/18-workspaces.md) | done (3.0 PR) |
+| 16 † | Database layer, SQLite backend, migrations; users, keys, sessions, throttle, audit in tables | 2.2 | Codex | L | [plan](packages/16-database-layer.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
+| 17 † | Runs, sync state and notes in the database; append crash safety; run list from the database | 16 | Cursor | L | [plan](packages/17-runs-in-database.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
+| 18 † | Workspaces and accounts: memberships, workspace-bound keys, `/w/<slug>` routes, switcher, server-admin commands, isolation suite | 17 | Codex, Cursor | L | [plan](packages/18-workspaces.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
+| 18.1a | Server core: accounts, workspaces, memberships, migration, `default` conversion, workspace-bound sync, CLI | 17 | Codex, Cursor | L | [plan](packages/18-workspaces.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
+| 18.1b | Route table, `/w/<slug>` and `/api/w/<slug>` routes, account and server-admin APIs, isolation suite | 18.1a | Cursor | L | [plan](packages/18-workspaces.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
+| 18.2 | Dashboard: workspace URLs, switcher, Team and Keys per workspace, admin page, picker | 18.1b | Cursor | M | [plan](packages/18-workspaces.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
 | 18b † | Firebase sign-in for the hosted service | 18 | Cursor | M | – | not started |
 | 18c † | Self-serve sign-up and usage limits (free plan: storage, uploads, requests, people) | 18b | Codex | M | – | not started |
 | 19 † | Postgres backend, row-level security, CI on both backends | 18 | Cursor | M | – | not started |
