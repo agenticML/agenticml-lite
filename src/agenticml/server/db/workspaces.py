@@ -225,6 +225,7 @@ class WorkspaceRepo:
             wid = secrets.token_hex(16)
             tx.execute('INSERT INTO workspaces (id, slug, name, status, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)',
                        (wid, slug, name or slug, 'active', account['id'], layout.format_timestamp()))
+            tx.execute('INSERT INTO workspace_usage (workspace_id) VALUES (?)', (wid,))
             tx.execute('INSERT INTO memberships (workspace_id, account_id, role) VALUES (?, ?, ?)', (wid, account['id'], 'owner'))
             return self.by_id(wid, tx)
 

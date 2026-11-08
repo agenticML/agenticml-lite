@@ -49,9 +49,7 @@ def for_server_dir(server_dir, url=None, *, create=True, actor='server'):
     key = resolved if path is None else str(path)
     with _registry_lock:
         db = _registry.get(key)
-        if path is None and db is not None and not db.closed:
-            return db
-        if not create and path is None and not PostgresDatabase.exists(resolved):
+        if not create and path is None and (db is None or db.closed) and not PostgresDatabase.exists(resolved):
             return None
         if not create and path is not None:
             try:
@@ -70,4 +68,7 @@ def for_server_dir(server_dir, url=None, *, create=True, actor='server'):
                 db.close()
                 raise
             _registry[key] = db
+        if create:
+            from .backfill import backfill_objects
+            backfill_objects(db, directory.parent)
         return db

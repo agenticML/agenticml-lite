@@ -20,6 +20,8 @@ from ..users import (UserRecord, UserNameTaken, UserNotFound, IdentityTaken, Inv
 
 from .workspaces import AccountRepo, WorkspaceRepo, require_workspace_id, validate_login
 
+from .usage import UsageRepo
+
 logger = logging.getLogger('agenticml.server.db.repos')
 
 
@@ -725,7 +727,7 @@ class RunRepo:
                         'last_sync_key=NULL, last_step=NULL, commit_sizes=NULL, updated_at=? '
                         'WHERE workspace_id=? AND run_id=?',
                         (project, created_at, encoded, launch_note, owner_key, now, self.workspace_id, run_id))
-                    tx.execute('DELETE FROM run_files WHERE workspace_id=? AND run_id=?', (self.workspace_id, run_id))
+                    self.replace_files(run_id, (), tx)
                 if claim and row['owner_user'] is None:
                     tx.execute(
                         'UPDATE runs SET owner_account_id=?, owner_key=?, project=?, '
@@ -738,12 +740,19 @@ class RunRepo:
                         'updated_at=? WHERE workspace_id=? AND run_id=?',
                         (project, created_at, encoded, launch_note, now, self.workspace_id, run_id))
 
-    def record_file(self, run_id, path, size, sha256=None, last_step=None):
+    def record_file(self, run_id, path, size, sha256=None, last_step=None,
+                    upload_bytes=None):
         now = layout.format_timestamp()
         with self.db.transaction(write=True) as tx:
             tx.lock_row('runs', 'workspace_id=? AND run_id=?', (self.workspace_id, run_id))
             tx.lock_row('run_files', 'workspace_id=? AND run_id=? AND path=?', (self.workspace_id, run_id, path))
             self._ensure(tx, run_id)
+            usage = UsageRepo(self.db, self.workspace_id)
+            usage.lock(tx)
+            old_size = self.committed_size(run_id, path, tx)
+            usage.add_stored(size - old_size, tx)
+            if upload_bytes is not None:
+                usage.add_upload(upload_bytes, tx)
             tx.execute(self.db.dialect.upsert(
                 'run_files', ('workspace_id', 'run_id', 'path', 'size', 'sha256'), ('workspace_id', 'run_id', 'path'),
                 ('size', 'sha256')), (self.workspace_id, run_id, path, size, sha256))
@@ -785,6 +794,8 @@ class RunRepo:
         if tx is None:
             with self.db.transaction(write=True) as tx:
                 return self.delete(run_id, tx)
+        tx.lock_row('runs', 'workspace_id=? AND run_id=?', (self.workspace_id, run_id))
+        self.replace_files(run_id, (), tx)
         tx.execute('DELETE FROM runs WHERE workspace_id=? AND run_id=?', (self.workspace_id, run_id))
 
     def replace_files(self, run_id, files, tx=None):
@@ -793,6 +804,11 @@ class RunRepo:
             with self.db.transaction(write=True) as tx:
                 return self.replace_files(run_id, files, tx)
         tx.lock_row('runs', 'workspace_id=? AND run_id=?', (self.workspace_id, run_id))
+        usage = UsageRepo(self.db, self.workspace_id)
+        usage.lock(tx)
+        old_size = sum(f['size'] for f in self.files(run_id, tx).values())
+        files = list(files)
+        usage.add_stored(sum(size for _, size, _ in files) - old_size, tx)
         tx.execute('DELETE FROM run_files WHERE workspace_id=? AND run_id=?', (self.workspace_id, run_id))
         for path, size, sha256 in files:
             tx.execute('INSERT INTO run_files (workspace_id, run_id, path, size, sha256) VALUES (?, ?, ?, ?, ?)',
@@ -829,11 +845,7 @@ class RunRepo:
             (self.workspace_id, *self._values(row, tx)))
         if result.rowcount == 0:
             return False
-        for path, size, sha256 in files:
-            tx.execute(
-                self.db.dialect.upsert(
-                    'run_files', ('workspace_id', 'run_id', 'path', 'size', 'sha256'), ('workspace_id', 'run_id', 'path'), ()),
-                (self.workspace_id, row['run_id'], path, size, sha256))
+        self.replace_files(row['run_id'], files, tx)
         return True
 
     def rebuild_index(self, run_id, list_row, project, created_at, launch_note, last_step, tx=None):

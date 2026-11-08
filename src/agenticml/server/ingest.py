@@ -18,6 +18,7 @@ from agenticml.store.reader import last_step_from_size, parse_artifacts_json
 from agenticml.ui.server import DashboardHandler
 from . import lineage
 from .db import DatabaseError
+from .db.usage import UsageRepo
 from .keys import KeyStoreUnavailable
 from .runs import APPEND as _APPEND, ATOMIC as _ATOMIC, list_row_from_bytes
 from .users import allowed, resolve
@@ -221,6 +222,8 @@ class IngestHandler(DashboardHandler):
                     elif route == "lineage":
                         meta = _json_object(layout.read_file_nofollow(self._target(directory, "meta.json")))
                         payload, status = lineage.receive(self.workspace.root, run_id, meta, tmp)
+                        with self.server.db.transaction(write=True) as tx:
+                            UsageRepo(self.server.db, self.workspace.run_index.workspace_id).add_upload(length, tx)
                     else:
                         payload, status, pending = self._commit(run_id, directory, body, remote)
                 if pending is not None:
@@ -434,12 +437,14 @@ class IngestHandler(DashboardHandler):
             layout.atomic_write(path, body, fsync=True)
             layout.fsync_dir(path.parent)
             self.server._after_atomic_write(run_id, name)
-            self.workspace.run_index.record_file(run_id, name, len(body), sha256=digest)
+            self.workspace.run_index.record_file(run_id, name, len(body), sha256=digest,
+                                                 upload_bytes=len(body))
         else:
             layout.atomic_write(path, body, fsync=True)
             layout.fsync_dir(path.parent)
             self.server._after_atomic_write(run_id, name)
-            self.workspace.run_index.record_file(run_id, name, len(body), sha256=digest)
+            self.workspace.run_index.record_file(run_id, name, len(body), sha256=digest,
+                                                 upload_bytes=len(body))
         pending = ("run.create", obj) if name == "meta.json" and not exists else None
         return {"size": len(body)}, 200, pending
 
@@ -573,6 +578,7 @@ class IngestHandler(DashboardHandler):
                 raise ValueError("unsafe object destination")
             if objects.has(self.workspace.root, sha):
                 os.utime(dest, None, follow_symlinks=False)
+                self._record_object(sha, dest.lstat().st_size, created=False)
                 return {"sha256": sha, "created": False}, 200
             try:
                 dest.parent.mkdir(parents=True)
@@ -584,7 +590,15 @@ class IngestHandler(DashboardHandler):
                 layout.fsync_dir(dest.parent.parent)
             os.replace(tmp, dest)
             layout.fsync_dir(dest.parent)
+            self._record_object(sha, dest.lstat().st_size, created=True)
             return {"sha256": sha, "created": True}, 201
+
+    def _record_object(self, sha, size, *, created):
+        with self.server.db.transaction(write=True) as tx:
+            usage = UsageRepo(self.server.db, self.workspace.run_index.workspace_id)
+            inserted = usage.record_object(sha, size, tx)
+            if created and inserted:
+                usage.add_upload(size, tx)
 
     @staticmethod
     def _append_query(query):
@@ -646,7 +660,8 @@ class IngestHandler(DashboardHandler):
             layout.fsync_dir(path.parent)
             self.server._after_append_write(run_id, name)
             last_step = self._time_step(path, length) if name == _TIME_PATH else None
-            self.workspace.run_index.record_file(run_id, name, length, last_step=last_step)
+            self.workspace.run_index.record_file(run_id, name, length, last_step=last_step,
+                                                 upload_bytes=length)
             return {"size": length}, 200
         with layout.open_nofollow(path, "ab"):
             pass
@@ -701,7 +716,8 @@ class IngestHandler(DashboardHandler):
                 raise
         self.server._after_append_write(run_id, name)
         last_step = self._time_step(path, new_size) if name == _TIME_PATH else None
-        self.workspace.run_index.record_file(run_id, name, new_size, last_step=last_step)
+        self.workspace.run_index.record_file(run_id, name, new_size, last_step=last_step,
+                                             upload_bytes=length)
         return {"size": new_size}, 200
 
     @staticmethod

@@ -800,6 +800,20 @@ def cmd_server_workspaces(args):
                 raise ValueError('workspace deletion not confirmed')
             row = delete_workspace(db, data, args.slug)
             log.record(actor, 'cli', 'workspace.delete', row['id'], detail={'slug': args.slug})
+        elif action == 'recount':
+            from .server.db.usage import UsageRepo
+            if bool(args.slug) == bool(args.all):
+                raise ValueError('specify a workspace slug or --all')
+            rows = repo.list() if args.all else [repo.require(args.slug)]
+            for row in rows:
+                usage = UsageRepo(db, row['id'])
+                with db.transaction(write=True) as tx:
+                    usage.lock(tx)
+                    old = usage.get(tx)['stored_bytes']
+                    new = usage.recount(tx)
+                log.record(actor, 'cli', 'workspace.recount', row['id'],
+                           detail={'slug': row['slug'], 'old_stored_bytes': old, 'new_stored_bytes': new})
+                print(f"{row['slug']}: {old} -> {new} stored bytes")
         elif action == 'set-owner':
             row = repo.require(args.slug)
             repo.set_owner(args.slug, args.owner)
@@ -1540,13 +1554,17 @@ def main(argv=None):
     p_reindex.set_defaults(func=cmd_server_reindex)
     p_workspaces = server_sub.add_parser('workspaces', help='Manage server workspaces')
     ws_sub = p_workspaces.add_subparsers(dest='workspaces_action', required=True)
-    for action in ('list', 'create', 'rename', 'suspend', 'resume', 'delete', 'set-owner'):
+    for action in ('list', 'create', 'rename', 'suspend', 'resume', 'delete', 'set-owner', 'recount'):
         child = ws_sub.add_parser(action)
         child.add_argument('--data', default=None)
         child.add_argument('--database', default=None, metavar='URL')
         child.set_defaults(func=cmd_server_workspaces)
         if action == 'list':
             child.add_argument('--json', action='store_true')
+            continue
+        if action == 'recount':
+            child.add_argument('slug', nargs='?')
+            child.add_argument('--all', action='store_true')
             continue
         child.add_argument('slug')
         if action == 'create':
