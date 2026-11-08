@@ -21,8 +21,16 @@ def _user_name(name):
         raise ClientError("invalid or reserved user name")
 
 
+def _stores(webauth, handler):
+    ws = getattr(handler, "workspace", None)
+    if ws is not None:
+        return ws.keys, ws.users
+    return webauth.keys, webauth.users
+
+
 def _user_run_counts(handler):
-    index = getattr(handler.server, "run_index", None)
+    ws = getattr(handler, "workspace", None)
+    index = ws.run_index if ws is not None else getattr(handler.server, "run_index", None)
     if index is None:
         return {}
     try:
@@ -36,26 +44,28 @@ def _invite_url(webauth, handler, token):
 
 
 def _audit(handler, principal, action, target, detail=None):
-    handler.server.audit.record(
+    ws = getattr(handler, "workspace", None)
+    log = ws.audit if ws is not None else handler.server.audit
+    log.record(
         actor=principal.user, via=principal.via, action=action, target=target,
         client=handler.server.web.client_address(handler), detail=detail)
 
 
-def _public_row(record, key_counts, run_counts):
+def _public_row(record, key_counts, run_counts, *, show_owner=False):
     return {
         **record.to_public(),
-        # Temporary 2.2 API compatibility until the workspace dashboard lands.
-        "role": "admin" if record.role == "owner" else record.role,
+        "role": record.role if show_owner or record.role != "owner" else "admin",
         "keys": key_counts.get(record.name, 0),
         "runs": None if run_counts is None else run_counts.get(record.name, 0),
     }
 
 
-def handle(webauth, handler, path):
+def handle(webauth, handler, path, *, show_owner=False):
     from .webauth import LOGIN_BODY_MAX
 
     try:
         principal = handler.principal
+        keys, users = _stores(webauth, handler)
         if not allowed(principal, "users"):
             handler.close_connection = True
             handler._json({"error": "forbidden"}, 403)
@@ -65,16 +75,17 @@ def handle(webauth, handler, path):
             handler.close_connection = True
         if path == "/api/server/users" and handler.command == "GET":
             try:
-                records = sorted(webauth.users.list(), key=lambda record: (record.created_at, record.name))
+                records = sorted(users.list(), key=lambda record: (record.created_at, record.name))
                 key_counts = {}
-                for key in webauth.keys.list():
+                for key in keys.list():
                     key_counts[key.user] = key_counts.get(key.user, 0) + 1
             except (KeyStoreUnavailable, OSError):
                 handler._json({"error": "key store unavailable"}, 503)
                 return
             run_counts = _user_run_counts(handler)
             handler._json({
-                "users": [_public_row(record, key_counts, run_counts) for record in records],
+                "users": [_public_row(record, key_counts, run_counts, show_owner=show_owner)
+                          for record in records],
                 "me": principal.user,
             })
         elif path == "/api/server/users" and handler.command == "POST":
@@ -85,9 +96,9 @@ def handle(webauth, handler, path):
             identity = payload.get("identity")
             _user_name(name)
             from .db.workspaces import AccountRepo
-            existing_account = AccountRepo(webauth.keys.db).get(name)
+            existing_account = AccountRepo(keys.db).get(name)
             try:
-                record = webauth.users.add(
+                record = users.add(
                     name, role=role, identity=identity, created_by=principal.user)
             except UserNameTaken:
                 handler._json({"error": "user name already exists"}, 409)
@@ -103,10 +114,10 @@ def handle(webauth, handler, path):
                 handler._json({'user': record.to_public(), 'invite_url': None, 'expires_at': None}, 201)
                 return
             try:
-                token = webauth.users.create_invite(record.name)
-                updated = webauth.users.get(record.name)
+                token = users.create_invite(record.name)
+                updated = users.get(record.name)
             except (KeyStoreUnavailable, OSError):
-                webauth.users.discard(record.name, record.id)
+                users.discard(record.name, record.id)
                 handler._json({"error": "key store unavailable"}, 503)
                 return
             expires_at = updated.invite["expires_at"] if updated is not None and updated.invite else None
@@ -136,10 +147,10 @@ def handle(webauth, handler, path):
                     handler._json({"error": _SELF_INVITE}, 409)
                     return
                 try:
-                    token = webauth.users.create_invite(name)
+                    token = users.create_invite(name)
                     expires_at = None
                     try:
-                        updated = webauth.users.get(name)
+                        updated = users.get(name)
                         expires_at = updated.invite["expires_at"] if updated is not None and updated.invite else None
                     finally:
                         # The invite is already persisted, even if its read-back fails.
@@ -167,7 +178,7 @@ def handle(webauth, handler, path):
                     raise ClientError("invalid request")
                 signed_out = False
                 try:
-                    found = webauth.users.get(name)
+                    found = users.get(name)
                     if found is None:
                         handler._json({"error": "not found"}, 404)
                         return
@@ -180,17 +191,17 @@ def handle(webauth, handler, path):
                             return
                         if found.role == "admin" and role != "admin":
                             if not any(item.role in ("owner", "admin") and item.name != name
-                                       for item in webauth.users.list()):
+                                       for item in users.list()):
                                 handler._json({"error": "last admin"}, 409)
                                 return
                     updated = found
                     if "identity" in payload:
-                        updated = webauth.users.set_identity(name, payload.get("identity"))
+                        updated = users.set_identity(name, payload.get("identity"))
                         _audit(handler, principal, "user.identity", name,
                                {"identity": updated.identity})
                     if "role" in payload:
                         previous = updated.role
-                        updated = webauth.users.set_role(name, payload.get("role"))
+                        updated = users.set_role(name, payload.get("role"))
                         _audit(handler, principal, "user.role", name,
                                {"from": previous, "to": updated.role})
                         if name == principal.user:
@@ -219,13 +230,13 @@ def handle(webauth, handler, path):
                 if name == principal.user:
                     handler._json({"error": "you cannot remove yourself"}, 409)
                     return
-                found = webauth.users.get(name)
+                found = users.get(name)
                 if found is None:
                     handler._json({"error": "not found"}, 404)
                     return
                 try:
-                    revoked = [record for record in webauth.keys.list() if record.user == name]
-                    keys_revoked = webauth.users.remove(name)
+                    revoked = [record for record in keys.list() if record.user == name]
+                    keys_revoked = users.remove(name)
                 except UserNotFound:
                     handler._json({"error": "not found"}, 404)
                     return

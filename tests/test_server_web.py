@@ -190,7 +190,9 @@ def test_gate_and_login_assets(server):
     status, _, body, cookie = authed(server, "/api/runs")
     assert status == 200
     assert json.loads(body) == []
-    assert authed(server, "/", cookie=cookie)[0] == 200
+    status, hdrs, _, _ = authed(server, "/", cookie=cookie)
+    assert status == 303 and hdrs["Location"] == "/w/default/"
+    assert authed(server, "/w/default/", cookie=cookie)[0] == 200
     assert authed(server, "/static/app.js", cookie=cookie)[0] == 200
     status, hdrs, _ = authed(server, "/login", cookie=cookie)[:3]
     assert status == 303 and hdrs["Location"] == "/"
@@ -271,7 +273,9 @@ def test_session_endpoint_and_local_ui(server, tmp_path):
         "server": True, "user": "admin", "role": "admin", "via": "key", "key": "admin",
         "scope": "admin",
         "can": {"notes": True, "own_keys": True, "all_keys": True, "users": True, "audit": True},
-        "password_set": False, "identity_proxy": False}
+        "password_set": False, "identity_proxy": False,
+        "workspaces": [{"slug": "default", "name": "Default", "role": "owner"}],
+        "server_admin": True}
 
     httpd = ui_server.make_server(tmp_path, "127.0.0.1", 0)
     thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
@@ -391,7 +395,9 @@ def test_env_key_signs_in(tmp_path, monkeypatch):
             "server": True, "user": "env", "role": "admin", "via": "key", "key": "env",
             "scope": "admin",
             "can": {"notes": True, "own_keys": True, "all_keys": True, "users": True, "audit": True},
-            "password_set": False, "identity_proxy": False}
+            "password_set": False, "identity_proxy": False,
+            "workspaces": [{"slug": "default", "name": "Default", "role": "admin"}],
+            "server_admin": False}
 
 
 def test_current_matches_name_and_hash(server):
@@ -403,14 +409,13 @@ def test_current_matches_name_and_hash(server):
     assert server.keys.current(record.name, record.sha256) is None
 
 
-def test_authenticated_put_non_note_is_405(server):
+def test_authenticated_put_non_note_is_404(server):
     status, hdrs, body, cookie = authed(server, "/foo", "PUT", b"")
-    assert status == 405
-    assert json.loads(body) == {"error": "method not allowed"}
-    assert hdrs.get("Allow") == "GET"
+    assert status == 404
+    assert json.loads(body) == {"error": "not found"}
     status, hdrs, body, _ = authed(server, "/login", "PUT", b"", cookie=cookie)
-    assert status == 405
-    assert json.loads(body) == {"error": "method not allowed"}
+    assert status == 404
+    assert json.loads(body) == {"error": "not found"}
     assert authed(server, "/api/runs", cookie=cookie)[0] == 200
 
 
@@ -491,7 +496,7 @@ def test_server_mode_cache_headers(server, tmp_path, monkeypatch):
     assert hdrs.get("Cache-Control") == "no-store"
     assert "Cookie" in {part.strip() for part in hdrs.get("Vary", "").split(",")}
 
-    status, hdrs, _, cookie = authed(server, "/", cookie=cookie)
+    status, hdrs, _, cookie = authed(server, "/w/default/", cookie=cookie)
     assert status == 200
     assert hdrs.get("Cache-Control") == "private, no-cache"
     etag = hdrs.get("ETag")
@@ -499,7 +504,7 @@ def test_server_mode_cache_headers(server, tmp_path, monkeypatch):
     assert "Cookie" in {part.strip() for part in hdrs.get("Vary", "").split(",")}
 
     status, hdrs, _, _ = authed(
-        server, "/", extra={"If-None-Match": etag}, cookie=cookie)
+        server, "/w/default/", extra={"If-None-Match": etag}, cookie=cookie)
     assert status == 304
     assert hdrs.get("Cache-Control") == "private, no-cache"
     assert "Cookie" in {part.strip() for part in hdrs.get("Vary", "").split(",")}

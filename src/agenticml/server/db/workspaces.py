@@ -52,6 +52,39 @@ class AccountRepo:
             'SELECT w.slug FROM memberships m JOIN workspaces w ON w.id=m.workspace_id '
             'WHERE m.account_id=? ORDER BY w.slug', (account['id'],))]
 
+    def workspaces(self, login, tx=None):
+        """Active workspaces the account belongs to, with membership role."""
+        if tx is None:
+            with self.db.transaction() as tx:
+                return self.workspaces(login, tx)
+        account = self.get(login, tx)
+        if account is None:
+            return []
+        return [{'slug': row['slug'], 'name': row['name'], 'role': row['role']}
+                for row in tx.fetchall(
+                    'SELECT w.slug, w.name, m.role FROM memberships m '
+                    'JOIN workspaces w ON w.id=m.workspace_id '
+                    'WHERE m.account_id=? AND w.status=? ORDER BY w.slug',
+                    (account['id'], 'active'))]
+
+    def by_identity(self, value, *, exact=False):
+        """Return the unique account for ``value``, or None.
+
+        ``exact`` compares ``identity`` as stored; otherwise ``identity_folded``.
+        More than one match is treated as no match, same as 2.2.
+        """
+        if not isinstance(value, str) or not value:
+            return None
+        with self.db.transaction() as tx:
+            if exact:
+                rows = tx.fetchall('SELECT * FROM accounts WHERE identity=?', (value,))
+            else:
+                rows = tx.fetchall(
+                    'SELECT * FROM accounts WHERE identity_folded=?', (value.casefold(),))
+            if len(rows) != 1:
+                return None
+            return dict(rows[0])
+
     def list(self):
         with self.db.transaction() as tx:
             return [dict(r) for r in tx.fetchall(
@@ -148,6 +181,8 @@ class WorkspaceRepo:
                 raise ClientError('unknown workspace')
             if row['slug'] == 'default' and new_slug not in (None, 'default'):
                 raise ClientError('cannot change the default workspace slug; the env key and the self-hosted default depend on it')
+            if row['slug'] == 'default' and status == 'suspended':
+                raise ClientError('cannot suspend the default workspace; the env key and the self-hosted default depend on it')
             if new_slug != slug and new_slug is not None and self.get(new_slug, tx):
                 raise ClientError('workspace slug already exists')
             tx.execute('UPDATE workspaces SET slug=?, name=?, status=? WHERE id=?',
@@ -259,13 +294,39 @@ class InviteRepo:
                         layout.format_timestamp(datetime.now(timezone.utc) + timedelta(hours=72)), invited_by))
         return token
 
-    def redeem(self, token, password):
+    @staticmethod
+    def find_pending(db, token):
+        """Return a live workspace invite for ``token``, or None."""
+        from datetime import datetime, timezone
+        import hashlib
+        import hmac
+        if not isinstance(token, str) or not token:
+            return None
+        try:
+            digest = hashlib.sha256(token.encode('ascii')).hexdigest()
+        except UnicodeEncodeError:
+            return None
+        with db.transaction() as tx:
+            row = tx.fetchone('SELECT * FROM invites WHERE sha256=?', (digest,))
+            if row is None or not hmac.compare_digest(row['sha256'], digest):
+                return None
+            try:
+                if layout.parse_timestamp(row['expires_at']) <= datetime.now(timezone.utc):
+                    return None
+            except (TypeError, ValueError):
+                return None
+            workspace = WorkspaceRepo(db).by_id(row['workspace_id'], tx)
+            if workspace is None or workspace['status'] != 'active':
+                return None
+            return dict(row)
+
+    def redeem(self, token, password=None):
         from datetime import datetime, timezone
         import hashlib
         import hmac
         import json
         from ..users import _password_record, InviteInvalid
-        record = _password_record(password)
+        record = None if password is None else _password_record(password)
         try:
             digest = hashlib.sha256(token.encode('ascii')).hexdigest()
         except (AttributeError, UnicodeEncodeError) as exc:
@@ -282,6 +343,8 @@ class InviteRepo:
             account = AccountRepo(self.db).get(invite['login'], tx)
             existing = account is not None
             if account is None:
+                if record is None:
+                    raise InviteInvalid('invalid invite')
                 aid = secrets.token_hex(16)
                 tx.execute('INSERT INTO accounts (id, login, display_name, password, created_at, created_by) '
                            'VALUES (?, ?, ?, ?, ?, ?)', (aid, invite['login'], invite['login'], json.dumps(record),
@@ -294,3 +357,15 @@ class InviteRepo:
             from ..users import InviteExistingAccount
             raise InviteExistingAccount(aid)
         return aid
+
+    def revoke(self, login):
+        login = validate_login(login)
+        with self.db.transaction(write=True) as tx:
+            tx.advisory_lock('users')
+            row = tx.fetchone('SELECT * FROM invites WHERE workspace_id=? AND login=?',
+                              (self.workspace_id, login))
+            if row is None:
+                return None
+            tx.execute('DELETE FROM invites WHERE workspace_id=? AND login=?',
+                       (self.workspace_id, login))
+            return dict(row)

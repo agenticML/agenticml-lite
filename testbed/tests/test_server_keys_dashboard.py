@@ -659,7 +659,7 @@ def test_route_change_clears_secret_and_ignores_late_response(page, server_ui, s
         await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     }""")
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
-    expect(page).to_have_url(f"{server_ui['url']}/#/")
+    expect(page).to_have_url(f"{server_ui['url']}/w/default/#/")
     assert page.evaluate("window.runReads") == reads
 
 

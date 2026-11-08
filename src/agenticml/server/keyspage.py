@@ -78,8 +78,16 @@ def read_json(handler, limit):
     return payload
 
 
+def _stores(webauth, handler):
+    ws = getattr(handler, "workspace", None)
+    if ws is not None:
+        return ws.keys, ws.users
+    return webauth.keys, webauth.users
+
+
 def _run_counts(handler):
-    index = getattr(handler.server, "run_index", None)
+    ws = getattr(handler, "workspace", None)
+    index = ws.run_index if ws is not None else getattr(handler.server, "run_index", None)
     if index is None:
         return {}
     try:
@@ -94,7 +102,9 @@ def _audit(webauth, handler, action, record):
         target = record.user if action == "user.add" else record.name
         detail = ({"role": "admin", "identity": None} if action == "user.add"
                   else {"user": record.user, "scope": record.scope})
-        handler.server.audit.record(
+        ws = getattr(handler, "workspace", None)
+        log = ws.audit if ws is not None else handler.server.audit
+        log.record(
             principal.user, principal.via, action, target,
             webauth.client_address(handler), detail)
     except Exception:
@@ -106,6 +116,7 @@ def handle(webauth, handler, path):
 
     try:
         principal = handler.principal
+        keys, users = _stores(webauth, handler)
         if not allowed(principal, "own_keys"):
             handler.close_connection = True
             handler._json({"error": "forbidden"}, 403)
@@ -118,12 +129,12 @@ def handle(webauth, handler, path):
             user = query.get("user", [None])[0]
             if user is not None:
                 validate_name(user)
-            records = sorted(webauth.keys.list(), key=lambda record: (
+            records = sorted(keys.list(), key=lambda record: (
                 record.name == "env", record.created_at, record.name))
             counts = _run_counts(handler)
             rows = [{**record.to_public(), "runs": None if counts is None else counts.get((record.name, record.user), 0),
                      "revocable": can_revoke(principal, record) and record.name != "env",
-                     "active": (resolved := resolve(webauth.keys, webauth.users, record)) is not None
+                     "active": (resolved := resolve(keys, users, record)) is not None
                      and allowed(resolved, "sync")
                      and (record.scope != "admin" or allowed(resolved, "admin_keys"))}
                     for record in records if can_see(principal, record)
@@ -151,7 +162,7 @@ def handle(webauth, handler, path):
                 # The env user is not stored; fall through to the default-user rule.
                 key_user = None if env_default else user
                 created_users = []
-                record, value = webauth.keys.create(
+                record, value = keys.create(
                     name, scope, created_by=actor, user=key_user,
                     created_users=created_users)
             except KeyNameTaken:
@@ -179,9 +190,9 @@ def handle(webauth, handler, path):
             name = path[len("/api/server/keys/"):]
             if not _NAME.fullmatch(name) or name in (".", ".."):
                 raise ClientError("invalid or reserved key name")
-            record = next((record for record in webauth.keys.list() if record.name == name), None)
+            record = next((record for record in keys.list() if record.name == name), None)
             if (record is None or not can_see(principal, record)
-                    or resolve(webauth.keys, webauth.users, record) is None):
+                    or resolve(keys, users, record) is None):
                 handler._json({"error": "not found"}, 404)
                 return
             if not can_revoke(principal, record):
@@ -191,7 +202,7 @@ def handle(webauth, handler, path):
                 handler._json({"error": "environment key: remove AGENTICML_SERVER_KEY and restart"}, 409)
                 return
             try:
-                record = webauth.keys.revoke(name, keep_admin=True, expected=record)
+                record = keys.revoke(name, keep_admin=True, expected=record)
             except LastAdminError as exc:
                 handler._json({"error": str(exc)}, 409)
                 return

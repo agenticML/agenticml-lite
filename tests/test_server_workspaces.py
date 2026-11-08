@@ -217,6 +217,11 @@ def test_cli_workspaces_accounts_scoped_keys_users_audit_reindex(tmp_path, capsy
     run('workspaces', 'set-owner', 'alpha', '--owner', 'bob')
     run('workspaces', 'suspend', 'alpha')
     run('workspaces', 'resume', 'alpha')
+    assert cli.main(['server', 'workspaces', 'suspend', 'default', '--data', str(tmp_path)]) == 1
+    err = capsys.readouterr().err
+    assert 'cannot suspend the default workspace' in err
+    assert next(r['status'] for r in json.loads(run('workspaces', 'list', '--json'))
+                if r['slug'] == 'default') == 'active'
     run('workspaces', 'rename', 'alpha', '--name', 'Renamed', '--slug', 'beta')
     run('accounts', 'set-server-admin', 'bob', 'on')
     run('accounts', 'set-server-admin', 'bob', 'off')

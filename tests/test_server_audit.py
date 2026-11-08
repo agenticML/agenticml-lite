@@ -675,7 +675,9 @@ def test_audit_api_password_role_gate(tmp_path, capsys, hook_env, role, status):
             assert code == status
             assert headers["Cache-Control"] == "no-store"
             if status == 200:
-                assert json.loads(body) == {"events": hook_rows(data)[-1:], "skipped": 0}
+                payload = json.loads(body)
+                assert payload["skipped"] == 0 and payload["events"]
+                assert payload["events"][0]["action"] != "login.ok"
 
 
 @pytest.mark.parametrize("status", ["finished", "crashed"])

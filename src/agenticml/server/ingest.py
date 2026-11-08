@@ -126,6 +126,7 @@ class IngestHandler(DashboardHandler):
     def _dispatch(self):
         self._started = False
         self.workspace = None
+        self._effective_path = None
         tmp = None
         lineage_slot = False
         try:

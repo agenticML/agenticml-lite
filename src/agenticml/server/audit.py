@@ -147,7 +147,9 @@ def handle(webauth, handler):
         return
     before = cursors[0] if cursors else None
     try:
-        events = handler.server.audit.repo.tail(min(limit, 1000), before)
+        ws = getattr(handler, "workspace", None)
+        log = ws.audit if ws is not None else handler.server.audit
+        events = log.repo.tail(min(limit, 1000), before)
         skipped = 0
     except (OSError, ValueError, DatabaseError):
         handler._json({"error": "audit log unavailable"}, 503, headers)

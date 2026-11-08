@@ -289,10 +289,12 @@ isolation suite iterates it.
   `users`/`keys`/`audit`/`reindex`), rewritten server tests. The 2.2
   dashboard API keeps working against the `default` workspace until
   18.1b (temporary; no new routes yet).
-- **18.1b (Codex):** route table and dispatch, `/w/<slug>/`,
+- **18.1b (Cursor, in three parts; Codex second review; changed Nov 8,
+  2026 because Codex was at its usage limit):** route table and dispatch, `/w/<slug>/`,
   `/api/w/<slug>/...`, `/api/account/...`, `/api/admin/...`, `/` redirect
   and `/workspaces` picker (server side), removal of the 2.2 dashboard
-  API paths, isolation suite (`tests/test_server_isolation.py`) and the
+  API paths (kept as legacy aliases bound to `default` until 18.2 switches
+  the dashboard JS, then removed in 18.2), isolation suite (`tests/test_server_isolation.py`) and the
   two-workspace end-to-end test. Leaves the dashboard JS for 18.2 but
   serves `index.html` at `/w/<slug>/`.
 - **18.2 (Cursor):** `app.js` / `app.css` / `index.html` and the login,
@@ -350,3 +352,19 @@ reviews (Sonnet, and the second † review by the other coder) are clean.
 - The temporary 2.2 dashboard paths resolve `server.default_workspace_id`
   explicitly (`ui/server.py` `_workspace_kw`); remove them with the 2.2
   API paths.
+
+## Decisions made during 18.1b review (Nov 8, 2026)
+
+- **Unmatched signed-in requests answer 404.** Once a dashboard request is
+  authenticated, any path the route table does not claim gets the same 404
+  as an unknown path (2.2 answered some of these with 405 or 400, for
+  example `HEAD /login` or `DELETE /api/server/keys/`). This closes a
+  bypass where path variants reached the unbound 2.2 handler. Note it in
+  the 3.0 release notes (package 25).
+- **Workspace before method.** For workspace routes the membership check
+  runs before method selection, so a non-member gets the unknown-path
+  answer for every method, never a 405 with `Allow`.
+- **Key-login sessions cannot set passwords.** A key-login session is bound
+  to the key's workspace; it may never set or change the account password
+  or turn into an account-wide session (found in the second review: it
+  was a way to take over an account that belongs to another workspace).

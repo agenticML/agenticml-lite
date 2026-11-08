@@ -48,8 +48,13 @@ class WorkspaceStores:
         self._workspace_id = workspace_id
         self._users = self._keys = self._audit = None
 
+    def _is_default(self):
+        return self._workspace_id == getattr(self._server, 'default_workspace_id', None)
+
     @property
     def users(self):
+        if self._is_default() and getattr(self._server, 'users', None) is not None:
+            return self._server.users
         if self._users is None:
             from .users import UserStore
             self._users = UserStore(self._server.data_dir / 'server', db=self._server.db,
@@ -58,6 +63,8 @@ class WorkspaceStores:
 
     @property
     def keys(self):
+        if self._is_default() and getattr(self._server, 'keys', None) is not None:
+            return self._server.keys
         if self._keys is None:
             from .keys import KeyStore
             self._keys = KeyStore(self._server.data_dir / 'server', db=self._server.db,
@@ -66,6 +73,8 @@ class WorkspaceStores:
 
     @property
     def audit(self):
+        if self._is_default() and getattr(self._server, 'audit', None) is not None:
+            return self._server.audit
         if self._audit is None:
             from .audit import AuditLog
             self._audit = AuditLog(self._server.data_dir / 'server', db=self._server.db,
@@ -96,6 +105,11 @@ class WorkspaceContext:
     def audit(self):
         return self._stores.audit
 
+    @property
+    def invites(self):
+        from .db.workspaces import InviteRepo
+        return InviteRepo(self.server.db, self.id)
+
     def run_reader(self, run_id):
         return self.server.run_reader(run_id, workspace_id=self.id)
 
@@ -112,6 +126,29 @@ class WorkspaceContext:
         return self.server.object_lock(sha, workspace_id=self.id)
 
 
+def _store_root_or_missing(server, workspace_id):
+    import os
+    import stat
+
+    root = store_root(server.data_dir, workspace_id)
+    try:
+        paths = (root.parent.parent, root.parent) + ((root,) if os.path.lexists(root) else ())
+        safe = all(stat.S_ISDIR(p.lstat().st_mode) for p in paths)
+    except OSError:
+        safe = False
+    if not safe:
+        raise WorkspaceNotFound()
+    return root
+
+
+def _context(server, workspace, principal):
+    wid = workspace['id']
+    root = _store_root_or_missing(server, wid)
+    stores = server.workspace_stores(wid, workspace['status'])
+    return WorkspaceContext(wid, workspace['slug'], root, principal,
+                            RunRepo(server.db, wid), NoteRepo(server.db, wid), server, stores)
+
+
 def bind_sync(server, record):
     from .users import resolve
 
@@ -122,19 +159,38 @@ def bind_sync(server, record):
         raise WorkspaceNotFound()
     if workspace['status'] != 'active':
         raise WorkspaceSuspended()
-    import os
-    import stat
-    root = store_root(server.data_dir, wid)
-    try:
-        paths = (root.parent.parent, root.parent) + ((root,) if os.path.lexists(root) else ())
-        safe = all(stat.S_ISDIR(p.lstat().st_mode) for p in paths)
-    except OSError:
-        safe = False
-    if not safe:
-        raise WorkspaceNotFound()
     stores = server.workspace_stores(wid, workspace['status'])
     principal = resolve(None, stores.users, record)
     if principal is None:
         raise WorkspaceNotFound()
-    return WorkspaceContext(wid, workspace['slug'], root, principal,
-                            RunRepo(server.db, wid), NoteRepo(server.db, wid), server, stores)
+    return _context(server, workspace, principal)
+
+
+def bind_dashboard(server, slug, principal, *, key_workspace_id=None):
+    """Resolve a dashboard slug to a WorkspaceContext, or raise WorkspaceNotFound."""
+    from .users import Principal
+
+    workspace = WorkspaceRepo(server.db).get(slug)
+    if workspace is None:
+        raise WorkspaceNotFound()
+    if principal.user == 'env':
+        if (workspace.get('slug') != 'default' or workspace['status'] != 'active'
+                or (key_workspace_id is not None and key_workspace_id != workspace['id'])):
+            raise WorkspaceNotFound()
+        role = 'admin'
+        account_id = None
+        generation = principal.generation
+        server_admin = False
+    else:
+        if principal.id is None:
+            raise WorkspaceNotFound()
+        member = require_workspace_member(
+            server.db, workspace['id'], principal.id, key_workspace_id=key_workspace_id)
+        role = member['role']
+        account_id = principal.id
+        generation = principal.generation
+        server_admin = principal.server_admin
+    bound = Principal(
+        principal.user, role, principal.via, principal.key, account_id, generation,
+        workspace['id'], server_admin)
+    return _context(server, workspace, bound)

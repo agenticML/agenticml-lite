@@ -19,7 +19,13 @@ def user_object(store):
 
 def audit_rows(directory):
     db = for_server_dir(directory, create=False)
-    return list(reversed(AuditRepo(db, default_workspace_id(db)).tail(1000))) if db is not None else []
+    if db is None:
+        return []
+    workspace = list(reversed(AuditRepo(db, default_workspace_id(db)).tail(1000)))
+    server = list(reversed(AuditRepo(db, None).tail(1000)))
+    rows = workspace + server
+    rows.sort(key=lambda row: row["ts"] or "")
+    return rows
 
 
 def audit_text(directory):

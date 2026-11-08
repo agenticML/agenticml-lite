@@ -827,8 +827,10 @@ def test_api_gate_paths_and_bodyless_connections(server):
         assert status == 403 and json.loads(body)["error"] == "cross-site request refused"
         status, _, body = call(server, path, method, b"{}", csrf(server))
         assert status == 401 and json.loads(body) == {"error": "login required"}
-    for name in ("%2e%2e", "%2e", "a%2Fb", "a/b", ""):
+    for name in ("%2e%2e", "%2e"):
         assert api(server, "/api/server/keys/" + name, "DELETE")[0] == 400
+    for name in ("a%2Fb", "a/b", ""):
+        assert api(server, "/api/server/keys/" + name, "DELETE")[0] == 404
     assert api(server, "/api/server/keys/missing", "DELETE")[0] == 404
     assert api(server, "/api/server/unknown")[0] == 404
     assert api(server, "/api/server/session", "POST")[0] == 405
@@ -844,10 +846,10 @@ def test_api_gate_paths_and_bodyless_connections(server):
     ("GET", "/setup?token={token}", "Content-Length", 200),
     ("GET", "/setup?token=wrong", "Content-Length", 404),
     ("GET", "/login", "Transfer-Encoding", 200),
-    ("GET", "/", "Content-Length", 200),
+    ("GET", "/", "Content-Length", 303),
     ("GET", "/static/app.css", "Content-Length", 200),
     ("GET", "/api/server/keys", "Content-Length", 200),
-    ("HEAD", "/login", "Content-Length", 405),
+    ("HEAD", "/login", "Content-Length", 404),
     ("DELETE", "/api/server/keys/missing", "Transfer-Encoding", 404),
 ])
 def test_server_bodyless_response_has_one_close_header(tmp_path, method, path, header, expected):
