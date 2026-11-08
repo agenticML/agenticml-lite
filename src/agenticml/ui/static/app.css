@@ -3173,7 +3173,10 @@ pre,
 /* Keys use the shared table and modal surfaces, with secrets wrapping in place. */
 .key-dialog {
   width: min(560px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
   padding: var(--s-5);
+  overflow-x: hidden;
+  overflow-y: auto;
   overflow-wrap: anywhere;
 }
 .key-dialog > .heading {
@@ -3249,6 +3252,69 @@ pre,
   flex-wrap: wrap;
   gap: var(--s-2);
   min-width: 0;
+}
+.workspace-switcher {
+  min-width: 0;
+}
+.workspace-switcher-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+  min-width: 0;
+}
+.workspace-switcher-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-start;
+  gap: var(--s-2);
+  width: 100%;
+  min-width: 0;
+  text-align: left;
+  height: auto;
+  min-height: var(--ctl-h);
+  white-space: normal;
+}
+.workspace-switcher-name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.workspace-switcher-role {
+  color: var(--text-3);
+  font: var(--fs-sm) var(--font-mono-stack);
+}
+.workspace-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  min-width: 0;
+}
+.workspace-list > li {
+  min-width: 0;
+}
+.picker-page .topbar {
+  height: auto;
+  min-height: var(--topbar-h);
+  flex-wrap: wrap;
+  row-gap: var(--s-2);
+  padding-top: var(--s-2);
+  padding-bottom: var(--s-2);
+}
+.picker-page .breadcrumb {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  flex: 1 1 8rem;
+}
+.picker-page .topbar .btn {
+  flex: none;
 }
 .activity-toolbar {
   display: flex;

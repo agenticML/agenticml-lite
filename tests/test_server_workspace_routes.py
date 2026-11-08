@@ -44,7 +44,7 @@ def _snapshot(status, headers, body):
     return status, filtered, body
 
 
-def test_route_table_lists_workspace_legacy_and_sync():
+def test_route_table_lists_workspace_and_sync():
     table = route_table()
     assert table is route_table()
     names = []
@@ -57,14 +57,12 @@ def test_route_table_lists_workspace_legacy_and_sync():
         scopes.add(route.scope)
     assert len(names) == len(set(names))
     assert scopes >= {"public", "account", "workspace", "sync", "server_admin"}
-    assert any(route.legacy for route in table)
-    assert any(route.name == "runs_list" and not route.legacy for route in table)
-    assert any(route.name == "legacy_runs_list" and route.legacy for route in table)
+    assert any(route.name == "runs_list" for route in table)
+    assert all(not route.name.startswith("legacy_") for route in table)
     assert any(route.scope == "sync" and route.pattern.startswith("/v2/") for route in table)
     assert any("/api/w/" in route.pattern and "members" in route.pattern for route in table)
     assert any("/api/w/" in route.pattern and "invites" in route.pattern for route in table)
     assert any(route.name == "account_session" for route in table)
-    assert any(route.name == "legacy_session" and route.legacy for route in table)
     assert any(route.name == "home" and route.pattern == r"/" for route in table)
     assert any(route.scope == "server_admin" and "/api/admin/workspaces" in route.pattern for route in table)
 
@@ -136,7 +134,7 @@ def test_second_workspace_routes_and_identical_404s(two):
     assert _snapshot(*suspended[:3]) == _snapshot(*unknown_slug[:3])
 
 
-def test_viewer_write_is_403_and_legacy_users_hide_owner(two):
+def test_viewer_write_is_403_and_members_show_owner(two):
     server, a, b, keys_a, _, ka, _ = two
     assert put_meta(server, "alpha-run", key=ka)[0] == 200
     cookie = principal_session(server, "view", "viewer")
@@ -155,10 +153,10 @@ def test_viewer_write_is_403_and_legacy_users_hide_owner(two):
     _, alice_default = server.keys.create("alice-default", "admin", user="alice")
     _, _, hdrs = login(server, alice_default)
     admin_cookie = hdrs["Set-Cookie"]
-    status, _, body, _ = _authed(server, "/api/server/users", cookie=admin_cookie)
+    status, _, body, _ = _authed(server, "/api/w/default/members", cookie=admin_cookie)
     assert status == 200
     by_name = {row["name"]: row for row in json.loads(body)["users"]}
-    assert by_name["alice"]["role"] == "admin"
+    assert by_name["alice"]["role"] == "owner"
 
 
 def test_key_login_is_bound_to_its_workspace(two):
@@ -169,7 +167,7 @@ def test_key_login_is_bound_to_its_workspace(two):
 
     _, _, default_hdrs = login(server, alice_default)
     default_cookie = default_hdrs["Set-Cookie"]
-    assert _authed(server, "/api/runs", cookie=default_cookie)[0] == 200
+    assert _authed(server, "/api/w/default/runs", cookie=default_cookie)[0] == 200
     denied = _authed(server, "/api/w/alpha/runs", cookie=default_cookie)
     unknown = _authed(server, "/api/w/alpha/does-not-exist", cookie=default_cookie)
     assert denied[0] == 404 and json.loads(denied[2]) == {"error": "not found"}
@@ -178,7 +176,7 @@ def test_key_login_is_bound_to_its_workspace(two):
     _, _, alpha_hdrs = login(server, alice_alpha)
     alpha_cookie = alpha_hdrs["Set-Cookie"]
     assert _authed(server, "/api/w/alpha/runs", cookie=alpha_cookie)[0] == 200
-    legacy = _authed(server, "/api/runs", cookie=alpha_cookie)
+    legacy = _authed(server, "/api/w/default/runs", cookie=alpha_cookie)
     missing = _authed(server, "/api/w/default/does-not-exist", cookie=alpha_cookie)
     assert legacy[0] == 404 and json.loads(legacy[2]) == {"error": "not found"}
     assert _snapshot(*legacy[:3]) == _snapshot(*missing[:3])
@@ -227,8 +225,6 @@ def test_account_session_shape_and_password(two):
     assert set(by_slug) == {"default", "alpha"}
     assert by_slug["default"]["role"] == "owner" and by_slug["alpha"]["role"] == "owner"
     assert "name" in by_slug["alpha"]
-    legacy = _authed(server, "/api/server/session", cookie=cookie)
-    assert legacy[0] == 200 and json.loads(legacy[2]) == payload
     listed = _authed(server, "/api/account/workspaces", cookie=cookie)
     assert listed[0] == 200 and json.loads(listed[2]) == {"workspaces": payload["workspaces"]}
 
@@ -258,11 +254,11 @@ def test_key_login_cannot_set_password_or_open_other_workspace(two):
     cookie = hdrs["Set-Cookie"]
     before = AccountRepo(server.db).get("victim")
     new_password = json.dumps({"new": "new-password-1"}).encode()
-    for path in ("/api/account/password", "/api/server/account/password"):
-        status, hdrs, raw, _ = _authed(server, path, "POST", new_password, cookie=cookie)
-        assert status == 403
-        assert json.loads(raw) == {"error": "this session cannot set a password"}
-        assert "Set-Cookie" not in hdrs
+    status, hdrs, raw, _ = _authed(
+        server, "/api/account/password", "POST", new_password, cookie=cookie)
+    assert status == 403
+    assert json.loads(raw) == {"error": "this session cannot set a password"}
+    assert "Set-Cookie" not in hdrs
     after = AccountRepo(server.db).get("victim")
     assert after["password"] == before["password"] and after["generation"] == before["generation"]
     session = json.loads(_authed(server, "/api/account/session", cookie=cookie)[2])
@@ -304,11 +300,11 @@ def test_key_login_cannot_set_password_or_open_other_workspace(two):
     assert status == 200
     key_cookie = hdrs["Set-Cookie"]
     change = json.dumps({"current": "new-password-1", "new": "other-password1"}).encode()
-    for path in ("/api/account/password", "/api/server/account/password"):
-        status, hdrs, raw, _ = _authed(server, path, "POST", change, cookie=key_cookie)
-        assert status == 403
-        assert json.loads(raw) == {"error": "this session cannot set a password"}
-        assert "Set-Cookie" not in hdrs
+    status, hdrs, raw, _ = _authed(
+        server, "/api/account/password", "POST", change, cookie=key_cookie)
+    assert status == 403
+    assert json.loads(raw) == {"error": "this session cannot set a password"}
+    assert "Set-Cookie" not in hdrs
     assert password_login(server, "victim", "new-password-1")[0] == 200
     assert password_login(server, "victim", "other-password1")[0] == 401
     assert _authed(server, "/api/w/beta/runs", cookie=key_cookie)[0] == 404
@@ -334,6 +330,7 @@ def test_home_redirect_and_workspaces_picker(two):
     status, _, body, _ = _authed(server, "/workspaces", cookie=cookie)
     assert status == 200
     assert b'href="/w/default/"' in body and b'href="/w/alpha/"' in body
+    assert b'href="/admin/"' in body
     assert b"<script" not in body
     assert b"app.css" in body
 
@@ -350,6 +347,7 @@ def test_home_redirect_and_workspaces_picker(two):
     assert status == 200
     assert b"You are not a member of any workspace; ask an admin to invite you." in body
     assert b'href="/w/' not in body
+    assert b'href="/admin/"' not in body
 
     _, admin_key = server.keys.create("alice-one", "admin", user="alice")
     _, _, hdrs = login(server, admin_key)

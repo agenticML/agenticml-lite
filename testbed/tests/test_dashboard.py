@@ -80,13 +80,13 @@ def page(context):
     if tab.allow_http_errors:
         problems = [problem for problem in problems if not problem.startswith(("HTTP 4", "HTTP 503", "console: Failed to load resource:"))]
     session_404 = any(
-        problem.startswith("HTTP 404:") and "/api/server/session" in problem
+        problem.startswith("HTTP 404:") and "/api/account/session" in problem
         for problem in problems
     )
     problems = [
         problem for problem in problems
         if not (
-            (problem.startswith("HTTP 404:") and "/api/server/session" in problem)
+            (problem.startswith("HTTP 404:") and "/api/account/session" in problem)
             or (
                 session_404
                 and problem.startswith("console: Failed to load resource:")
@@ -135,6 +135,8 @@ def painted(canvas):
 
 def test_home_lists_every_run(page, ui_server):
     home(page, ui_server)
+    expect(page.get_by_role("button", name="Account", exact=True)).to_have_count(0)
+    expect(page.get_by_role("list", name="Workspaces", exact=True)).to_have_count(0)
     expect(page.locator(".run-row")).to_have_count(5)
     expect(page.locator(".poll-status")).to_have_text("5 runs")
     expect(page.locator(".runs-summary")).to_have_text("5 runs · 2 projects · 2 tasks")
@@ -1267,7 +1269,7 @@ def mock_dashboard(page, runs):
 
     def respond(route):
         path = urlsplit(route.request.url).path
-        if path == "/api/server/session":
+        if path == "/api/account/session":
             route.fulfill(status=404, content_type="application/json",
                           body=json.dumps({"error": "not found"}))
             return

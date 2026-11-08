@@ -513,9 +513,9 @@ def test_cross_workspace_credentials_refused_except_operator_cli(tmp_path, monke
         assert after['password'] == before['password']
         assert after['generation'] == before['generation']
         assert after['identity'] == before['identity']
-        status, _, body = api(server, '/api/server/users/bob/invite', 'POST', {})
+        status, _, body = api(server, '/api/w/default/members/bob/invite', 'POST', {})
         assert status == 403 and body == {'error': CROSS_WORKSPACE_CREDENTIALS}
-        status, _, body = api(server, '/api/server/users/bob', 'PATCH', {'identity': 'bob@example.com'})
+        status, _, body = api(server, '/api/w/default/members/bob', 'PATCH', {'identity': 'bob@example.com'})
         assert status == 403 and body == {'error': CROSS_WORKSPACE_CREDENTIALS}
         server.users.add('cara', 'member')
         server.users.set_password('cara', PASSWORD)
@@ -637,7 +637,7 @@ def test_account_password_self_service_across_workspaces(tmp_path, monkeypatch):
         cookie = session_cookie(hdrs)
         new = PASSWORD + 'xy'
         status, _, body, _ = authed(
-            server, '/api/server/account/password', 'POST',
+            server, '/api/account/password', 'POST',
             json.dumps({'current': PASSWORD, 'new': new}).encode(), cookie=cookie)
         assert status == 200
         assert password_login(server, 'bob', new)[0] == 200
@@ -828,5 +828,5 @@ def test_stale_22_password_session_invalid_after_0003(tmp_path, monkeypatch):
     conn.close()
     with running(data) as server:
         assert AccountRepo(server.db).get('alice')['generation'] == 1
-        status, _, _, _ = authed(server, '/api/runs', cookie=f'aml_session={token}')
+        status, _, _, _ = authed(server, '/api/w/default/runs', cookie=f'aml_session={token}')
         assert status == 401

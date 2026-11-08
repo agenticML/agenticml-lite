@@ -34,11 +34,11 @@ def test_round_trip_download(remote, tmp_path):
     assert listed["sha256"] == sha and listed["byref"] is True
     assert object_path(remote[0].root, sha).read_bytes() == data
     remote[0].admin_key = remote[0].keys.create("admin", "admin")[1]
-    status, _, body, cookie = authed(remote[0], f"/api/runs/{writer.run_id}")
+    status, _, body, cookie = authed(remote[0], f"/api/w/default/runs/{writer.run_id}")
     assert status == 200
     art = json.loads(body)["artifacts"][0]
     assert art["sha256"] == sha and art["byref"] is True
-    status, _, body, _ = authed(remote[0], f"/api/objects/{sha}?type=application/octet-stream", cookie=cookie)
+    status, _, body, _ = authed(remote[0], f"/api/w/default/objects/{sha}?type=application/octet-stream", cookie=cookie)
     assert status == 200 and body == data
 
 

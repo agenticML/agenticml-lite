@@ -1,10 +1,14 @@
 """Browser coverage for the server dashboard login, last synced, and overflow."""
 import json
+import re
 import threading
 
 import pytest
 from agenticml.server.app import make_server
+from agenticml.server.db.repos import RunRepo
+from agenticml.server.db.workspaces import WorkspaceRepo
 from agenticml.server.runs import adopt_directory, reconcile
+from agenticml.server.workspaces import prepare_store
 from agenticml.store import RunWriter, layout
 
 pytest.importorskip("playwright.sync_api")
@@ -108,8 +112,9 @@ def test_login_sync_key_refused_admin_shows_run(page, server_ui):
     page.locator("#key").fill(server_ui["admin"])
     page.locator("#login").get_by_role("button", name="Sign in", exact=True).click()
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+    expect(page).to_have_url(re.compile(r"/w/default/"))
     expect(page.get_by_role("link", name="synced-run", exact=True)).to_be_visible()
-    expect(page.get_by_text("Signed in as admin · admin")).to_be_visible()
+    expect(page.get_by_text("Signed in as admin · owner")).to_be_visible()
 
 
 def test_last_synced_and_sign_out(page, server_ui):
@@ -171,7 +176,7 @@ def test_lineage_inspector_shows_server_code_diff_message(page, tmp_path, monkey
     try:
         sign_in(page, server, admin)
         expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
-        expect(page.get_by_text("Signed in as admin · admin")).to_be_visible()
+        expect(page.get_by_text("Signed in as admin · owner")).to_be_visible()
         page.get_by_role("button", name="Open lineage of asr", exact=True).click()
         dialog = page.get_by_role("dialog")
         expect(dialog).to_be_visible()
@@ -212,6 +217,124 @@ def test_password_sign_in(page, tmp_path, monkeypatch):
     try:
         sign_in_password(page, server, "alice", "password1234")
         expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()
+
+
+def test_non_default_workspace_dashboard_loads_its_own_runs(page, tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    httpd = make_server(tmp_path / "data", port=0)
+    httpd.users.add("admin", role="admin")
+    httpd.users.set_password("admin", "password1234")
+    writer = RunWriter.create(
+        httpd.root, run_id="default-run", meta={"project": "demo", "name": "default-only"})
+    writer.finish("finished")
+    writer.close()
+    adopt_directory(httpd.root, httpd.root / "runs" / "default-run", httpd.run_index, remote={
+        "owner": "admin", "status": "finished", "fingerprint": "a" * 64,
+        "last_sync_at": layout.format_timestamp(),
+    })
+    ws = WorkspaceRepo(httpd.db).create("team-a", name="Team A", owner="admin")
+    root = prepare_store(httpd.data_dir, ws["id"])
+    writer = RunWriter.create(
+        root, run_id="alpha-run", meta={"project": "alpha", "name": "alpha-only"})
+    writer.finish("finished")
+    writer.close()
+    index = RunRepo(httpd.db, ws["id"])
+    adopt_directory(root, root / "runs" / "alpha-run", index, remote={
+        "owner": "admin", "status": "finished", "fingerprint": "b" * 64,
+        "last_sync_at": layout.format_timestamp(),
+    })
+    reconcile(root, index)
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
+    thread.start()
+    server = {"url": f"http://127.0.0.1:{httpd.server_address[1]}"}
+    try:
+        sign_in_password(page, server, "admin", "password1234")
+        expect(page.get_by_role("heading", name="Workspaces", exact=True)).to_be_visible()
+        page.goto(f"{server['url']}/w/team-a/")
+        expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+        expect(page).to_have_url(re.compile(r"/w/team-a/"))
+        expect(page.get_by_role("link", name="alpha-only", exact=True)).to_be_visible()
+        expect(page.get_by_role("link", name="default-only", exact=True)).to_have_count(0)
+        page.goto(f"{server['url']}/w/default/")
+        expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+        expect(page.get_by_role("link", name="default-only", exact=True)).to_be_visible()
+        expect(page.get_by_role("link", name="alpha-only", exact=True)).to_have_count(0)
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()
+
+
+def _seed_workspace_run(httpd, slug, name, run_id, run_name, fingerprint):
+    ws = WorkspaceRepo(httpd.db).create(slug, name=name, owner="admin")
+    root = prepare_store(httpd.data_dir, ws["id"])
+    writer = RunWriter.create(
+        root, run_id=run_id, meta={"project": slug, "name": run_name})
+    writer.finish("finished")
+    writer.close()
+    index = RunRepo(httpd.db, ws["id"])
+    adopt_directory(root, root / "runs" / run_id, index, remote={
+        "owner": "admin", "status": "finished", "fingerprint": fingerprint,
+        "last_sync_at": layout.format_timestamp(),
+    })
+    reconcile(root, index)
+    return ws
+
+
+def test_workspace_switcher_changes_runs_and_sets_cookie(page, context, tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    httpd = make_server(tmp_path / "data", port=0)
+    httpd.users.add("admin", role="admin")
+    httpd.users.set_password("admin", "password1234")
+    writer = RunWriter.create(
+        httpd.root, run_id="default-run", meta={"project": "demo", "name": "default-only"})
+    writer.finish("finished")
+    writer.close()
+    adopt_directory(httpd.root, httpd.root / "runs" / "default-run", httpd.run_index, remote={
+        "owner": "admin", "status": "finished", "fingerprint": "a" * 64,
+        "last_sync_at": layout.format_timestamp(),
+    })
+    _seed_workspace_run(httpd, "team-a", "Team A", "alpha-run", "alpha-only", "b" * 64)
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
+    thread.start()
+    server = {"url": f"http://127.0.0.1:{httpd.server_address[1]}"}
+    try:
+        sign_in_password(page, server, "admin", "password1234")
+        expect(page.get_by_role("heading", name="Workspaces", exact=True)).to_be_visible()
+        page.goto(f"{server['url']}/w/default/")
+        expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+        expect(page.get_by_text("Signed in as admin · owner")).to_be_visible()
+        expect(page.get_by_role("link", name="default-only", exact=True)).to_be_visible()
+        expect(page.get_by_role("link", name="alpha-only", exact=True)).to_have_count(0)
+        page.get_by_role("button", name="Account", exact=True).click()
+        dialog = page.get_by_role("dialog", name="Account", exact=True)
+        expect(dialog.get_by_role("button", name="Current workspace: Default")).to_be_visible()
+        expect(dialog.get_by_role("button", name="Current workspace: Default")).to_contain_text("owner")
+        expect(dialog.get_by_role("button", name="Switch to Team A")).to_be_visible()
+        expect(dialog.get_by_role("button", name="Switch to Team A")).to_contain_text("owner")
+        expect(dialog.get_by_role("link", name="Admin", exact=True)).to_be_visible()
+        page.set_viewport_size({"width": 375, "height": 812})
+        assert_no_overflow(page)
+        dialog.get_by_role("button", name="Switch to Team A").click()
+        expect(page).to_have_url(re.compile(r"/w/team-a/"))
+        expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+        expect(page.get_by_role("link", name="alpha-only", exact=True)).to_be_visible()
+        expect(page.get_by_role("link", name="default-only", exact=True)).to_have_count(0)
+        cookies = {cookie["name"]: cookie for cookie in context.cookies()}
+        assert cookies["aml_ws"]["value"] == "team-a"
+        assert cookies["aml_ws"]["path"] == "/"
+        assert cookies["aml_ws"]["sameSite"] == "Lax"
+        assert cookies["aml_ws"].get("secure") in (False, None)
+        assert_no_overflow(page)
+        page.get_by_role("button", name="Account", exact=True).click()
+        switched = page.get_by_role("dialog", name="Account", exact=True)
+        expect(switched.get_by_role("button", name="Current workspace: Team A")).to_be_visible()
+        expect(switched.get_by_role("button", name="Switch to Default")).to_be_visible()
+        assert_no_overflow(page)
     finally:
         httpd.shutdown()
         thread.join(timeout=5)

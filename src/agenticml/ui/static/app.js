@@ -14,10 +14,126 @@ const fmt = (value) =>
         : String(value);
 const date = (value) =>
   Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString() : "—";
-const apiRun = (id) => `/api/runs/${encodeURIComponent(id)}`;
+// Server dashboard pages live at /w/<slug>/ and prefix APIs with /api/w/<slug>.
+// The local `agenticml ui` (pathname `/`) keeps /api/... so it stays unchanged.
+const WORKSPACE_PAGE = /^\/w\/([^/]+)/;
+function api(path) {
+  const queryAt = path.indexOf("?");
+  const pathname = queryAt < 0 ? path : path.slice(0, queryAt);
+  const query = queryAt < 0 ? "" : path.slice(queryAt);
+  const rest = pathname.replace(/^\/+/, "");
+  if (rest === "account" || rest.startsWith("account/"))
+    return `/api/${rest}${query}`;
+  const match = WORKSPACE_PAGE.exec(location.pathname);
+  if (match)
+    return `/api/w/${encodeURIComponent(match[1])}${rest ? `/${rest}` : ""}${query}`;
+  return `/api${rest ? `/${rest}` : ""}${query}`;
+}
+function currentWorkspaceSlug() {
+  const match = WORKSPACE_PAGE.exec(location.pathname);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+function isAdminPath() {
+  return location.pathname.replace(/\/+$/, "") === "/admin";
+}
+function currentWorkspaceRole(session) {
+  const slug = currentWorkspaceSlug();
+  const role = typeof session?.role === "string" ? session.role : "";
+  if (!slug) return role;
+  const row = sessionWorkspaces(session).find((item) => item.slug === slug);
+  return row && typeof row.role === "string" && row.role ? row.role : role;
+}
+function setWorkspaceCookie(slug) {
+  const parts = [
+    `aml_ws=${encodeURIComponent(slug)}`, "Path=/", "SameSite=Lax", "Max-Age=31536000",
+  ];
+  if (location.protocol === "https:") parts.push("Secure");
+  document.cookie = parts.join("; ");
+}
+function sessionWorkspaces(session) {
+  if (!Array.isArray(session?.workspaces)) return [];
+  return session.workspaces.filter(
+    (row) => row && typeof row.slug === "string" && row.slug,
+  );
+}
+const ROLE_RANK = { viewer: 0, member: 1, admin: 2, owner: 3 };
+const ACTION_ROLE = {
+  read: "viewer", password: "viewer",
+  notes: "member", sync: "member", own_keys: "member",
+  admin_keys: "admin", all_keys: "admin", users: "admin", audit: "admin",
+};
+function roleAllows(role, action) {
+  const have = ROLE_RANK[role];
+  const need = ROLE_RANK[ACTION_ROLE[action]];
+  return Number.isInteger(have) && Number.isInteger(need) && have >= need;
+}
+function workspaceCan(session) {
+  const none = { notes: false, own_keys: false, all_keys: false, users: false, audit: false };
+  const slug = currentWorkspaceSlug();
+  if (!slug) return none;
+  const row = sessionWorkspaces(session).find((item) => item.slug === slug);
+  const role = row && typeof row.role === "string" ? row.role : "";
+  return {
+    notes: roleAllows(role, "notes"),
+    own_keys: roleAllows(role, "own_keys"),
+    all_keys: roleAllows(role, "all_keys"),
+    users: roleAllows(role, "users"),
+    audit: roleAllows(role, "audit"),
+  };
+}
+function switchWorkspace(slug) {
+  setWorkspaceCookie(slug);
+  location.assign(`/w/${encodeURIComponent(slug)}/`);
+}
+function workspaceSwitcher(session) {
+  const workspaces = sessionWorkspaces(session);
+  if (workspaces.length <= 1 && !session.server_admin) return null;
+  const current = currentWorkspaceSlug();
+  const items = workspaces.map((row) => {
+    const name = typeof row.name === "string" && row.name ? row.name : row.slug;
+    const role = typeof row.role === "string" ? row.role : "";
+    const isCurrent = row.slug === current;
+    return el(
+      "li",
+      {},
+      el(
+        "button",
+        {
+          type: "button",
+          class: "btn btn-ghost btn-sm workspace-switcher-item",
+          ...(isCurrent
+            ? {
+                "aria-current": "true",
+                disabled: true,
+                "aria-label": `Current workspace: ${name}`,
+              }
+            : {
+                "aria-label": `Switch to ${name}`,
+                onclick: () => switchWorkspace(row.slug),
+              }),
+        },
+        el("span", { class: "workspace-switcher-name", text: name }),
+        role
+          ? el("span", { class: "workspace-switcher-role", text: role })
+          : null,
+        isCurrent ? chip("current") : null,
+      ),
+    );
+  });
+  return el(
+    "div",
+    { class: "workspace-switcher stack" },
+    el("h3", { class: "eyebrow", text: "Workspaces" }),
+    el("ul", { class: "workspace-switcher-list", "aria-label": "Workspaces" }, ...items),
+    session.server_admin
+      ? el("a", { class: "btn btn-ghost btn-sm", href: "/admin/", text: "Admin" })
+      : null,
+  );
+}
+const apiRun = (id) => api(`/runs/${encodeURIComponent(id)}`);
 const routeRun = (id) => `#/run/${encodeURIComponent(id)}`;
 const objectURL = (sha, type) =>
-  `/api/objects/${encodeURIComponent(sha)}?${new URLSearchParams({ type })}`;
+  `${api(`/objects/${encodeURIComponent(sha)}`)}?${new URLSearchParams({ type })}`;
 function el(tag, attrs = {}, ...children) {
   const node = document.createElement(tag);
   for (const [key, value] of Object.entries(attrs)) {
@@ -240,7 +356,7 @@ async function get(url, signal = controller?.signal) {
   }
   if (!response.ok)
     throw new Error(
-      `${response.status}: ${url.startsWith("/api/objects/") ? "Object unavailable" : await response.text()}`,
+      `${response.status}: ${url.includes("/objects/") ? "Object unavailable" : await response.text()}`,
     );
   return response.json();
 }
@@ -303,7 +419,7 @@ function viaLabel(via) {
       ? "admin key"
       : via || "—";
 }
-fetch("/api/server/session", { credentials: "same-origin" })
+const sessionReady = fetch(api("/account/session"), { credentials: "same-origin" })
   .then(async (response) => {
     let data = null;
     try {
@@ -317,11 +433,13 @@ fetch("/api/server/session", { credentials: "same-origin" })
     if (!response.ok || !data) return;
     serverMode = true;
     serverSession = data;
-    document.querySelector("#nav-keys").hidden = !data.can?.own_keys;
-    document.querySelector("#nav-team").hidden = !data.can?.users;
+    const adminPath = isAdminPath();
+    const can = workspaceCan(data);
+    document.querySelector("#nav-keys").hidden = adminPath || !can.own_keys;
+    document.querySelector("#nav-team").hidden = adminPath || !can.users;
     const box = document.querySelector("#session");
     const label = document.querySelector("#session-label");
-    label.textContent = `Signed in as ${data.user} · ${data.role}`;
+    label.textContent = `Signed in as ${data.user} · ${currentWorkspaceRole(data)}`;
     box.title = label.textContent;
     box.hidden = false;
     document.querySelector("#account").hidden = false;
@@ -408,7 +526,7 @@ function openAccountDialog() {
     }
     save.disabled = true;
     try {
-      const response = await fetch("/api/server/account/password", {
+      const response = await fetch(api("/account/password"), {
         method: "POST",
         credentials: "same-origin",
         headers: { "X-AgenticML-Request": "1", "Content-Type": "application/json" },
@@ -440,8 +558,9 @@ function openAccountDialog() {
       button("Close", () => host.close(), "secondary")),
     el("dl", { class: "kv-list identity" },
       el("div", {}, el("dt", { text: "User" }), el("dd", { text: session.user })),
-      el("div", {}, el("dt", { text: "Role" }), el("dd", { text: session.role })),
+      el("div", {}, el("dt", { text: "Role" }), el("dd", { text: currentWorkspaceRole(session) })),
       el("div", {}, el("dt", { text: "Sign-in" }), el("dd", { text: viaLabel(session.via) }))),
+    workspaceSwitcher(session),
     form, error, status,
   );
   host.addEventListener("keydown", (event) => {
@@ -868,7 +987,7 @@ async function home(version) {
     entry.fetchedAt = Date.now();
     const current = () =>
       epoch === version && entry.token === token && lineage.get(key) === entry;
-    get(`/api/lineage?${new URLSearchParams({ project: key })}`)
+    get(`${api("/lineage")}?${new URLSearchParams({ project: key })}`)
       .then((data) => {
         if (!current()) return;
         if (!Array.isArray(data?.nodes)) throw new Error("Invalid lineage response");
@@ -1824,7 +1943,7 @@ async function home(version) {
   search.oninput = draw;
   async function refresh() {
     try {
-      const result = await get("/api/runs");
+      const result = await get(api("/runs"));
       if (epoch !== version) return;
       runs = result;
       for (const id of selected)
@@ -2956,7 +3075,7 @@ async function runPage(id, version) {
   const signal = controller.signal;
   let [detail, summaries, initialMedia] = await Promise.all([
     get(apiRun(id), signal),
-    get("/api/runs", signal),
+    get(api("/runs"), signal),
     get(`${apiRun(id)}/media`, signal),
   ]);
   if (epoch !== version) return;
@@ -3369,6 +3488,7 @@ async function runPage(id, version) {
     button,
     focus,
     objectURL,
+    codeURL: (runId) => api(`/runs/${encodeURIComponent(runId)}/code`),
     parentId: parentId(),
     onBaseline: (baseline, entry) => {
       if (epoch !== version) return;
@@ -3405,7 +3525,7 @@ async function runPage(id, version) {
     try {
       const [next, index, nextMedia] = await Promise.all([
         get(apiRun(id), signal),
-        get("/api/runs", signal),
+        get(api("/runs"), signal),
         get(`${apiRun(id)}/media`, signal),
       ]);
       if (epoch !== version) return;
@@ -3548,7 +3668,7 @@ async function comparePage(ids, version) {
   const signal = controller.signal;
   const loadRuns = async () => {
     const [index, details] = await Promise.all([
-      get("/api/runs", signal),
+      get(api("/runs"), signal),
       Promise.all(
         ids.map(async (id) => ({
           ...(await get(apiRun(id), signal)),
@@ -3601,7 +3721,7 @@ async function comparePage(ids, version) {
       index === 0 ? "var(--s5)" : `var(--s${((index - 1) % 4) + 1})`,
     ]),
   );
-  codeDiff = createCodeDiff({ runs, colors, signal, el, get, button });
+  codeDiff = createCodeDiff({ runs, colors, signal, el, get, button, apiBase: api("") });
   const parentOfRun = (run) => run.parent_run_id || run.lineage?.parent_run_id;
   const selected = el(
     "div",
@@ -3754,7 +3874,7 @@ async function keysPage(version) {
   };
   cleanup = dispose;
   const content = el("div", { class: "table-scroll" });
-  const allKeys = Boolean(serverSession?.can?.all_keys);
+  const allKeys = Boolean(workspaceCan(serverSession).all_keys);
   const columns = [
     ...(allKeys ? ["User"] : []),
     "Name", "Scope", "Prefix", "Created", "Created by", "Last used", "Runs", "Revoke",
@@ -3893,7 +4013,7 @@ async function keysPage(version) {
     const syncAdminOption = () => {
       if (!allKeys || !userSelect) return;
       const selected = usersByName.get(userSelect.value);
-      adminOption.disabled = !selected || selected.role !== "admin";
+      adminOption.disabled = !selected || (selected.role !== "admin" && selected.role !== "owner");
       if (adminOption.disabled && scope.value === "admin") scope.value = "sync";
     };
     if (userSelect) userSelect.addEventListener("change", syncAdminOption);
@@ -3915,7 +4035,7 @@ async function keysPage(version) {
       try {
         const payload = { name: name.value, scope: scope.value };
         if (userSelect) payload.user = userSelect.value;
-        const data = await request("/api/server/keys", "POST", payload);
+        const data = await request(api("/keys"), "POST", payload);
         if (epoch !== version || !host.open) {
           data.key = null;
           if (epoch === version) await refresh();
@@ -3952,7 +4072,7 @@ async function keysPage(version) {
       error.hidden = true;
       revoke.disabled = true;
       try {
-        const data = await request(`/api/server/keys/${encodeURIComponent(key.name)}`, "DELETE");
+        const data = await request(`${api("/keys")}/${encodeURIComponent(key.name)}`, "DELETE");
         if (epoch !== version) return;
         if (data.signed_out) location.assign("/login");
         else if (host.open) host.close();
@@ -3974,14 +4094,15 @@ async function keysPage(version) {
     const user = usersByName.get(key.user);
     if (!user) return "user is missing";
     if (user.role === "viewer") return "role viewer cannot sync";
-    if (key.scope === "admin" && user.role !== "admin") return "only admins can use admin keys";
+    if (key.scope === "admin" && user.role !== "admin" && user.role !== "owner")
+      return "only admins can use admin keys";
     return "cannot sync with this key";
   }
 
   async function refresh() {
     const sequence = ++refreshSequence;
     if (allKeys && usersByName.size === 0) {
-      const usersResponse = await fetch("/api/server/users", { signal, credentials: "same-origin" });
+      const usersResponse = await fetch(api("/members"), { signal, credentials: "same-origin" });
       if (epoch !== version || sequence !== refreshSequence || disposed) return;
       if (usersResponse.ok) {
         const usersData = await usersResponse.json().catch(() => null);
@@ -3994,7 +4115,7 @@ async function keysPage(version) {
       }
     }
     const query = userFilter?.value ? `?user=${encodeURIComponent(userFilter.value)}` : "";
-    const response = await fetch("/api/server/keys" + query, { signal, credentials: "same-origin" });
+    const response = await fetch(api("/keys") + query, { signal, credentials: "same-origin" });
     if (epoch !== version || sequence !== refreshSequence || disposed) return;
     if (response.status === 404) {
       dispose();
@@ -4095,6 +4216,7 @@ async function teamPage(version) {
   };
   cleanup = dispose;
   const content = el("div", { class: "table-scroll" });
+  const invitesContent = el("div", { class: "table-scroll" });
   const activity = el("div", { class: "table-scroll" });
   const activityStatus = el("div");
   const columns = ["Name", "Role", "Identity", "Sign-in", "Keys", "Runs", "Actions"];
@@ -4191,7 +4313,7 @@ async function teamPage(version) {
           if (epoch === version) showError(content, reason);
         }
         if (epoch === version && !activeDialog)
-          (previous?.isConnected ? previous : addUserButton).focus();
+          (previous?.isConnected ? previous : inviteButton).focus();
       }
     }, { once: true });
     activeDialog = { host, wipe };
@@ -4218,8 +4340,28 @@ async function teamPage(version) {
     body.querySelector("button")?.focus();
   }
 
+  function showAdded(host, body) {
+    body.replaceChildren(
+      el("p", {
+        text: "This login already has an account and was added to the workspace.",
+      }),
+    );
+  }
+
   function presentInvite(data, host, body, copyCode) {
     if (epoch !== version) return;
+    if (data?.added) {
+      if (host && host.open && host.isConnected) {
+        showAdded(host, body);
+        return;
+      }
+      const shown = dialog("Invite");
+      showAdded(shown.host, shown.body);
+      shown.host.showModal();
+      return;
+    }
+    if (typeof data?.invite_url !== "string" || !data.invite_url)
+      throw new Error("Invite did not return a link");
     if (host && host.open && host.isConnected) {
       showInvite(host, body, copyCode, data);
       return;
@@ -4229,36 +4371,31 @@ async function teamPage(version) {
     shown.host.showModal();
   }
 
-  function addUser() {
-    const { host, body, error, copyCode } = dialog("Add user");
-    const name = el("input", {
-      id: "user-name", class: "field", required: true, maxLength: 64,
-      pattern: "[A-Za-z0-9._\\-]{1,64}", autocomplete: "off",
+  function invite() {
+    const { host, body, error, copyCode } = dialog("Invite");
+    const login = el("input", {
+      id: "invite-login", class: "field", required: true, maxLength: 254,
+      autocomplete: "off",
     });
-    const role = el("select", { id: "user-role", class: "field" },
+    const role = el("select", { id: "invite-role", class: "field" },
       el("option", { value: "viewer", text: "viewer" }),
       el("option", { value: "member", text: "member" }),
       el("option", { value: "admin", text: "admin" }));
     role.value = "member";
-    const identity = el("input", {
-      id: "user-identity", class: "field", maxLength: 256, autocomplete: "off",
-    });
-    const create = el("button", { type: "submit", class: "btn btn-primary", text: "Add user" });
+    const create = el("button", { type: "submit", class: "btn btn-primary", text: "Invite" });
     const form = el("form", { class: "stack" },
-      el("label", { class: "field-label", htmlFor: name.id, text: "Name" }), name,
+      el("label", { class: "field-label", htmlFor: login.id, text: "Login or email" }), login,
       el("label", { class: "field-label", htmlFor: role.id, text: "Role" }), role,
-      el("label", { class: "field-label", htmlFor: identity.id, text: "Identity" }), identity,
       create);
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
-      name.setCustomValidity(["env", ".", ".."].includes(name.value) ? "Invalid or reserved user name" : "");
       if (!form.reportValidity()) return;
       error.hidden = true;
       create.disabled = true;
       try {
-        const payload = { name: name.value, role: role.value };
-        if (identity.value) payload.identity = identity.value;
-        const data = await request("/api/server/users", "POST", payload);
+        const data = await request(api("/invites"), "POST", {
+          login: login.value, role: role.value,
+        });
         if (epoch !== version) return;
         presentInvite(data, host, body, copyCode);
       } catch (reason) {
@@ -4266,10 +4403,9 @@ async function teamPage(version) {
         if (reason.name !== "AbortError") create.disabled = false;
       }
     });
-    name.addEventListener("input", () => name.setCustomValidity(""));
     body.append(form);
     host.showModal();
-    name.focus();
+    login.focus();
   }
 
   function confirmAction(title, text, actionLabel, onConfirm) {
@@ -4301,13 +4437,13 @@ async function teamPage(version) {
       `Remove ${user.name}? ${keys} key${user.keys === 1 ? "" : "s"} will be revoked.`,
       "Remove",
       async () => {
-        await request(`/api/server/users/${encodeURIComponent(user.name)}`, "DELETE");
+        await request(`${api("/members")}/${encodeURIComponent(user.name)}`, "DELETE");
       });
   }
 
   async function patchUser(user, payload, { reload = true } = {}) {
     const data = await request(
-      `/api/server/users/${encodeURIComponent(user.name)}`, "PATCH", payload);
+      `${api("/members")}/${encodeURIComponent(user.name)}`, "PATCH", payload);
     if (data.signed_out) {
       location.assign("/login");
       return data;
@@ -4319,6 +4455,7 @@ async function teamPage(version) {
   }
 
   function roleSelect(user) {
+    if (user.role === "owner") return el("span", { text: "owner" });
     const select = el("select", {
       class: "field", "aria-label": `Role for ${user.name}`,
     },
@@ -4369,6 +4506,7 @@ async function teamPage(version) {
   }
 
   function identityField(user) {
+    if (user.role === "owner") return user.identity || "—";
     const input = el("input", {
       class: "field", value: user.identity || "", maxLength: 256, autocomplete: "off",
       "aria-label": `Identity for ${user.name}`,
@@ -4391,9 +4529,48 @@ async function teamPage(version) {
     return user.password_set ? "password" : user.invite_pending ? "invite pending" : "—";
   }
 
+  function renderInvites(invites) {
+    if (!invites.length) {
+      invitesContent.replaceChildren(
+        el("p", { class: "muted", text: "No pending invites." }));
+      return;
+    }
+    const inviteColumns = ["Login", "Role", "Expires", "Invited by", "Actions"];
+    const rows = invites.map((invite) => {
+      const values = [
+        invite.login,
+        typeof invite.role === "string" ? invite.role : "—",
+        invite.expires_at ? date(invite.expires_at) : "—",
+        typeof invite.invited_by === "string" && invite.invited_by ? invite.invited_by : "—",
+        button("Revoke", () => revokeInvite(invite), "secondary"),
+      ];
+      return el("tr", { role: "row" }, ...values.map((value, index) =>
+        el("td", { role: "cell", "data-label": inviteColumns[index] },
+          value == null ? "—" : value)));
+    });
+    invitesContent.replaceChildren(
+      el("table", { class: "keys-table", role: "table", "aria-label": "Pending invites" },
+        el("thead", { role: "rowgroup" }, el("tr", { role: "row" },
+          ...inviteColumns.map((text) => el("th", { role: "columnheader", scope: "col", text })))),
+        el("tbody", { role: "rowgroup" }, ...rows)));
+  }
+
+  function revokeInvite(invite) {
+    confirmAction(
+      `Revoke invite for ${invite.login}?`,
+      `Revoke the pending invite for ${invite.login}?`,
+      "Revoke",
+      async () => {
+        await request(`${api("/invites")}/${encodeURIComponent(invite.login)}`, "DELETE");
+      });
+  }
+
   async function refresh() {
     const sequence = ++refreshSequence;
-    const response = await fetch("/api/server/users", { signal, credentials: "same-origin" });
+    const [response, invitesResponse] = await Promise.all([
+      fetch(api("/members"), { signal, credentials: "same-origin" }),
+      fetch(api("/invites"), { signal, credentials: "same-origin" }),
+    ]);
     if (epoch !== version || sequence !== refreshSequence || disposed) return;
     if (response.status === 404) {
       dispose();
@@ -4401,7 +4578,7 @@ async function teamPage(version) {
       await home(version);
       return;
     }
-    if (response.status === 401) {
+    if (response.status === 401 || invitesResponse.status === 401) {
       dispose();
       location.assign("/login");
       return;
@@ -4415,6 +4592,7 @@ async function teamPage(version) {
       typeof user.name !== "string" || typeof user.role !== "string"))
       throw new Error(`Could not load users (${response.status})`);
     const rows = data.users.map((user) => {
+      const owner = user.role === "owner";
       const values = [
         user.name,
         roleSelect(user),
@@ -4423,8 +4601,10 @@ async function teamPage(version) {
         user.keys == null ? "–" : String(user.keys),
         user.runs == null ? "–" : String(user.runs),
         el("div", { class: "team-actions" },
-          user.name === data.me ? null : button("Invite link", () => inviteUser(user), "secondary"),
-          button("Remove", () => removeUser(user), "secondary")),
+          owner || user.name === data.me
+            ? null
+            : button("Invite link", () => inviteUser(user), "secondary"),
+          owner ? null : button("Remove", () => removeUser(user), "secondary")),
       ];
       return el("tr", { role: "row" }, ...values.map((value, index) =>
         el("td", { role: "cell", "data-label": columns[index] }, value == null ? "–" : value)));
@@ -4433,6 +4613,15 @@ async function teamPage(version) {
       el("thead", { role: "rowgroup" }, el("tr", { role: "row" },
         ...columns.map((text) => el("th", { role: "columnheader", scope: "col", text })))),
       el("tbody", { role: "rowgroup" }, ...rows)));
+    let invites = [];
+    if (invitesResponse.ok) {
+      const invitesData = await invitesResponse.json().catch(() => null);
+      if (Array.isArray(invitesData?.invites))
+        invites = invitesData.invites.filter(
+          (invite) => invite && typeof invite.login === "string" && invite.login);
+    }
+    if (epoch !== version || sequence !== refreshSequence || disposed) return;
+    renderInvites(invites);
     try {
       await refreshActivity(true);
     } catch (reason) {
@@ -4470,7 +4659,7 @@ async function teamPage(version) {
     const sequence = activitySequence;
     const query = new URLSearchParams({ limit: String(limit) });
     if (!reset && oldestTs) query.set("before", oldestTs);
-    const response = await fetch(`/api/server/audit?${query}`, { signal, credentials: "same-origin" });
+    const response = await fetch(`${api("/audit")}?${query}`, { signal, credentials: "same-origin" });
     if (epoch !== version || disposed || sequence !== activitySequence) return false;
     if (response.status === 401) {
       dispose();
@@ -4522,7 +4711,7 @@ async function teamPage(version) {
       confirm.disabled = true;
       try {
         const data = await request(
-          `/api/server/users/${encodeURIComponent(user.name)}/invite`, "POST", {});
+          `${api("/members")}/${encodeURIComponent(user.name)}/invite`, "POST", {});
         if (epoch !== version) return;
         presentInvite(data, host, body, copyCode);
       } catch (reason) {
@@ -4537,14 +4726,281 @@ async function teamPage(version) {
     body.querySelector("button").focus();
   }
 
-  const addUserButton = button("Add user", addUser, "primary");
+  const inviteButton = button("Invite", invite, "primary");
   app.replaceChildren(el("div", { class: "workspace stack" },
-    el("div", { class: "heading" }, el("h1", { text: "Team" }), addUserButton),
+    el("div", { class: "heading" }, el("h1", { text: "Team" }), inviteButton),
     content,
+    el("div", { class: "stack" },
+      el("div", { class: "heading" }, el("h2", { text: "Pending invites" })),
+      invitesContent),
     el("div", { class: "stack" },
       el("div", { class: "heading" }, el("h2", { text: "Activity" })),
       activity,
       el("div", { class: "activity-toolbar" }, loadOlder, activityStatus))));
+  try {
+    await refresh();
+  } catch (reason) {
+    dispose();
+    if (epoch === version) cleanup = () => {};
+    throw reason;
+  }
+}
+
+async function adminPage(version) {
+  const signal = controller.signal;
+  let disposed = false;
+  let refreshSequence = 0;
+  let activeDialog;
+  const closeDialog = () => {
+    activeDialog?.close();
+  };
+  const dispose = () => {
+    disposed = true;
+    closeDialog();
+  };
+  cleanup = dispose;
+  document.querySelector("#nav-keys").hidden = true;
+  document.querySelector("#nav-team").hidden = true;
+  const crumb = document.querySelector(".breadcrumb");
+  crumb.setAttribute("href", "/admin/");
+  crumb.textContent = "agenticml / admin";
+  const content = el("div", { class: "table-scroll" });
+  const activity = el("div", { class: "table-scroll" });
+  const columns = ["Slug", "Name", "Status", "Members", "Created", "Actions"];
+  const activityColumns = ["Time", "Actor", "Action", "Target", "Client"];
+
+  async function write(url, method, payload) {
+    const response = await fetch(url, {
+      method,
+      signal,
+      credentials: "same-origin",
+      headers: { "X-AgenticML-Request": "1", "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (epoch !== version) throw new DOMException("Route changed", "AbortError");
+    if (response.status === 401) {
+      dispose();
+      location.assign("/login");
+      throw new DOMException("Redirecting to login", "AbortError");
+    }
+    const data = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(
+      (typeof data?.error === "string" && data.error) || `Request failed (${response.status})`);
+    return data;
+  }
+
+  function dialog(title) {
+    const previous = document.activeElement;
+    const host = el("dialog", { class: "key-dialog", "aria-label": title });
+    const body = el("div", { class: "stack" });
+    const error = el("p", { class: "error", role: "alert", hidden: true });
+    host.append(
+      el("div", { class: "heading" },
+        el("h2", { text: title }),
+        button("Close", () => host.close(), "secondary")),
+      body, error);
+    host.addEventListener("keydown", (event) => {
+      if (event.key === "Tab") trapTab(host, event);
+    });
+    host.addEventListener("close", () => {
+      host.remove();
+      if (activeDialog === host) activeDialog = null;
+      if (epoch === version && !disposed)
+        (previous?.isConnected ? previous : createButton).focus();
+    }, { once: true });
+    activeDialog = host;
+    app.append(host);
+    return { host, body, error };
+  }
+
+  function failure(error, reason) {
+    if (reason.name === "AbortError") return;
+    error.textContent = reason.message;
+    error.hidden = false;
+  }
+
+  function patchUrl(slug) {
+    return `${api("/admin/workspaces")}/${encodeURIComponent(slug)}`;
+  }
+
+  async function setStatus(workspace, status) {
+    try {
+      await write(patchUrl(workspace.slug), "PATCH", { status });
+      await refresh();
+    } catch (reason) {
+      if (epoch === version) showError(content, reason);
+    }
+  }
+
+  function renameWorkspace(workspace) {
+    const isDefault = workspace.slug === "default";
+    const { host, body, error } = dialog("Rename workspace");
+    const name = el("input", {
+      id: "rename-ws-name", class: "field", required: true, maxLength: 256,
+      autocomplete: "off", value: workspace.name || workspace.slug,
+    });
+    const slug = el("input", {
+      id: "rename-ws-slug", class: "field", required: true, maxLength: 40,
+      pattern: "[a-z0-9][a-z0-9\\-]{0,39}", autocomplete: "off",
+      value: workspace.slug, disabled: isDefault,
+    });
+    const save = el("button", { type: "submit", class: "btn btn-primary", text: "Save" });
+    const form = el("form", { class: "stack" },
+      el("label", { class: "field-label", htmlFor: name.id, text: "Name" }), name,
+      el("label", { class: "field-label", htmlFor: slug.id, text: "Slug" }), slug,
+      save);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      error.hidden = true;
+      save.disabled = true;
+      const payload = { name: name.value.trim() };
+      if (!isDefault) payload.slug = slug.value.trim();
+      try {
+        await write(patchUrl(workspace.slug), "PATCH", payload);
+        host.close();
+        await refresh();
+      } catch (reason) {
+        failure(error, reason);
+        if (reason.name !== "AbortError") save.disabled = false;
+      }
+    });
+    body.append(form);
+    host.showModal();
+    name.focus();
+  }
+
+  function createWorkspace() {
+    const { host, body, error } = dialog("New workspace");
+    const slug = el("input", {
+      id: "new-ws-slug", class: "field", required: true, maxLength: 40,
+      pattern: "[a-z0-9][a-z0-9\\-]{0,39}", autocomplete: "off",
+    });
+    const name = el("input", {
+      id: "new-ws-name", class: "field", required: true, maxLength: 256,
+      autocomplete: "off",
+    });
+    const owner = el("input", {
+      id: "new-ws-owner", class: "field", required: true, maxLength: 254,
+      autocomplete: "off",
+    });
+    const save = el("button", { type: "submit", class: "btn btn-primary", text: "Create" });
+    const form = el("form", { class: "stack" },
+      el("label", { class: "field-label", htmlFor: slug.id, text: "Slug" }), slug,
+      el("label", { class: "field-label", htmlFor: name.id, text: "Name" }), name,
+      el("label", { class: "field-label", htmlFor: owner.id, text: "Owner login" }), owner,
+      save);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      error.hidden = true;
+      save.disabled = true;
+      try {
+        await write(api("/admin/workspaces"), "POST", {
+          slug: slug.value.trim(), name: name.value.trim(), owner: owner.value.trim(),
+        });
+        host.close();
+        await refresh();
+      } catch (reason) {
+        failure(error, reason);
+        if (reason.name !== "AbortError") save.disabled = false;
+      }
+    });
+    body.append(form);
+    host.showModal();
+    slug.focus();
+  }
+
+  function renderActivity(events) {
+    if (!events.length) {
+      activity.replaceChildren(el("p", { class: "muted", text: "No activity yet." }));
+      return;
+    }
+    const rows = events.map((event) => {
+      const values = [
+        date(event.ts), event.actor || "—", event.action || "—",
+        event.target == null || event.target === "" ? "—" : String(event.target),
+        event.client == null || event.client === "" ? "—" : String(event.client),
+      ];
+      return el("tr", { role: "row" }, ...values.map((value, index) =>
+        el("td", { role: "cell", "data-label": activityColumns[index] }, value)));
+    });
+    activity.replaceChildren(el("table", { class: "keys-table", role: "table", "aria-label": "Activity" },
+      el("thead", { role: "rowgroup" }, el("tr", { role: "row" },
+        ...activityColumns.map((text) => el("th", { role: "columnheader", scope: "col", text })))),
+      el("tbody", { role: "rowgroup" }, ...rows)));
+  }
+
+  async function refresh() {
+    const sequence = ++refreshSequence;
+    const [listResponse, auditResponse] = await Promise.all([
+      fetch(api("/admin/workspaces"), { signal, credentials: "same-origin" }),
+      fetch(`${api("/admin/audit")}?${new URLSearchParams({ limit: "200" })}`, {
+        signal, credentials: "same-origin",
+      }),
+    ]);
+    if (epoch !== version || sequence !== refreshSequence || disposed) return;
+    if (listResponse.status === 401 || auditResponse.status === 401) {
+      dispose();
+      location.assign("/login");
+      return;
+    }
+    const data = await listResponse.json().catch(() => null);
+    if (epoch !== version || sequence !== refreshSequence || disposed) return;
+    if (!listResponse.ok) throw new Error(
+      (typeof data?.error === "string" && data.error) || `Could not load workspaces (${listResponse.status})`);
+    if (!Array.isArray(data?.workspaces) || data.workspaces.some((row) =>
+      row === null || typeof row !== "object" || Array.isArray(row) ||
+      typeof row.slug !== "string" || typeof row.name !== "string" ||
+      typeof row.status !== "string"))
+      throw new Error(`Could not load workspaces (${listResponse.status})`);
+    const rows = data.workspaces.map((workspace) => {
+      const isDefault = workspace.slug === "default";
+      const values = [
+        workspace.slug,
+        workspace.name,
+        chip(workspace.status, workspace.status === "active" ? "ok" : "warn"),
+        workspace.members == null ? "—" : String(workspace.members),
+        date(workspace.created_at),
+        el("div", { class: "team-actions" },
+          button("Rename", () => renameWorkspace(workspace), "secondary"),
+          button(
+            workspace.status === "suspended" ? "Resume" : "Suspend",
+            () => setStatus(
+              workspace, workspace.status === "suspended" ? "active" : "suspended"),
+            "secondary",
+            { disabled: isDefault },
+          )),
+      ];
+      return el("tr", { role: "row" }, ...values.map((value, index) =>
+        el("td", { role: "cell", "data-label": columns[index] }, value)));
+    });
+    content.replaceChildren(el("table", { class: "keys-table", role: "table", "aria-label": "Workspaces" },
+      el("thead", { role: "rowgroup" }, el("tr", { role: "row" },
+        ...columns.map((text) => el("th", { role: "columnheader", scope: "col", text })))),
+      el("tbody", { role: "rowgroup" }, ...rows)));
+    if (auditResponse.ok) {
+      const audit = await auditResponse.json().catch(() => null);
+      if (epoch !== version || sequence !== refreshSequence || disposed) return;
+      renderActivity(Array.isArray(audit?.events) ? audit.events : []);
+    } else {
+      const audit = await auditResponse.json().catch(() => null);
+      if (epoch !== version || sequence !== refreshSequence || disposed) return;
+      showError(activity, new Error(
+        (typeof audit?.error === "string" && audit.error) ||
+        `Could not load activity (${auditResponse.status})`));
+    }
+  }
+
+  const createButton = button("New workspace", createWorkspace, "primary");
+  app.replaceChildren(el("div", { class: "workspace stack" },
+    el("div", { class: "heading" },
+      el("h1", { text: "Admin" }),
+      el("div", { class: "inline" },
+        el("a", { class: "btn btn-ghost btn-sm", href: "/workspaces", text: "Workspaces" }),
+        createButton)),
+    content,
+    el("div", { class: "stack" },
+      el("div", { class: "heading" }, el("h2", { text: "Activity" })),
+      activity)));
   try {
     await refresh();
   } catch (reason) {
@@ -4561,8 +5017,16 @@ async function route() {
   cleanup = () => {};
   document.querySelector("#lightbox").close();
   controller = new AbortController();
-  app.replaceChildren(loading("Loading runs…"));
+  app.replaceChildren(loading(isAdminPath() ? "Loading…" : "Loading runs…"));
   try {
+    if (isAdminPath()) {
+      await sessionReady;
+      if (version !== epoch) return;
+      if (serverMode) {
+        await adminPage(version);
+        return;
+      }
+    }
     const hash = location.hash.slice(1) || "/";
     if (hash === "/keys") await keysPage(version);
     else if (hash === "/team") await teamPage(version);

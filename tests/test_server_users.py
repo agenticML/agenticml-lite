@@ -504,13 +504,13 @@ def test_session_includes_user_and_ends_on_demote(tmp_path, monkeypatch):
         status, _, hdrs = login(httpd)
         assert status == 200
         cookie = hdrs["Set-Cookie"]
-        status, _, body, _ = authed(httpd, "/api/server/session", cookie=cookie)
+        status, _, body, _ = authed(httpd, "/api/account/session", cookie=cookie)
         assert status == 200
         payload = json.loads(body)
         assert payload["user"] == "admin" and payload["role"] == "admin"
         httpd.users.set_role("admin", "member")
         status, _, body = call(
-            httpd, "/api/server/session",
+            httpd, "/api/account/session",
             headers={"Cookie": cookie.split(";", 1)[0]})
         assert status == 401
 
@@ -524,7 +524,7 @@ def test_keys_post_created_by_is_session_user(tmp_path, monkeypatch):
         assert status == 200
         cookie = hdrs["Set-Cookie"]
         status, _, body, _ = authed(
-            httpd, "/api/server/keys", "POST",
+            httpd, "/api/w/default/keys", "POST",
             json.dumps({"name": "alice-box", "scope": "sync"}).encode(),
             cookie=cookie)
         assert status == 201
@@ -858,8 +858,8 @@ def test_resolve_none_after_session_is_401(tmp_path, monkeypatch):
             assert json.loads(body) == {"error": "login required"}
             monkeypatch.setattr(webauth_mod, "resolve", real)
 
-        check("/api/server/session")
-        check("/api/server/keys")
+        check("/api/account/session")
+        check("/api/w/default/keys")
 
 
 def test_login_demoted_admin_key_message(tmp_path, monkeypatch):
@@ -966,7 +966,7 @@ def test_env_key_dashboard_post_keys(tmp_path, monkeypatch):
         assert status == 200
         cookie = hdrs["Set-Cookie"]
         status, _, body, _ = authed(
-            httpd, "/api/server/keys", "POST",
+            httpd, "/api/w/default/keys", "POST",
             json.dumps({"name": "box", "scope": "sync"}).encode(),
             cookie=cookie)
         assert status == 201

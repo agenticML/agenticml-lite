@@ -119,7 +119,7 @@ def test_dashboard_lists_10000_runs_without_opening_files(tmp_path, monkeypatch)
 
         monkeypatch.setattr(layout, "open_nofollow", boom)
         monkeypatch.setattr(layout, "read_file_nofollow", boom)
-        status, _, body, _ = authed(server, "/api/runs")
+        status, _, body, _ = authed(server, "/api/w/default/runs")
         assert status == 200
         rows = json.loads(body)
         assert len(rows) == 10000
@@ -133,32 +133,32 @@ def test_notes_conflict_too_large_cleared_launch_and_missing(server):
     launch = "Launch idea"
     meta = json.dumps({"run_id": "run-1", "status": "running", "notes": launch}).encode()
     assert request(server, "/v2/runs/run-1/files/meta.json", "PUT", meta)[0] == 200
-    status, _, body, cookie = authed(server, "/api/runs/run-1/notes")
+    status, _, body, cookie = authed(server, "/api/w/default/runs/run-1/notes")
     assert status == 200
     note = json.loads(body)
     assert note["source"] == "launch" and note["text"] == launch and note["revision"] is None
     saved = json.dumps({"text": "hello", "revision": None}).encode()
-    status, _, body, _ = authed(server, "/api/runs/run-1/notes", "PUT", saved, cookie=cookie)
+    status, _, body, _ = authed(server, "/api/w/default/runs/run-1/notes", "PUT", saved, cookie=cookie)
     assert status == 200
     stored = json.loads(body)
     assert stored["source"] == "file" and stored["text"] == "hello"
     assert server.note_index.read("run-1")["text"] == "hello"
     assert not run_path(server, "notes.md").exists()
     conflict = json.dumps({"text": "nope", "revision": None}).encode()
-    status, _, body, _ = authed(server, "/api/runs/run-1/notes", "PUT", conflict, cookie=cookie)
+    status, _, body, _ = authed(server, "/api/w/default/runs/run-1/notes", "PUT", conflict, cookie=cookie)
     assert status == 409
     huge = json.dumps({"text": "x" * (note_store.MAX_NOTE_BYTES + 1),
                        "revision": stored["revision"]}).encode()
-    status, _, body, _ = authed(server, "/api/runs/run-1/notes", "PUT", huge, cookie=cookie)
+    status, _, body, _ = authed(server, "/api/w/default/runs/run-1/notes", "PUT", huge, cookie=cookie)
     assert status == 413
     cleared = json.dumps({"text": "", "revision": stored["revision"]}).encode()
-    status, _, body, _ = authed(server, "/api/runs/run-1/notes", "PUT", cleared, cookie=cookie)
+    status, _, body, _ = authed(server, "/api/w/default/runs/run-1/notes", "PUT", cleared, cookie=cookie)
     assert status == 200
     empty = json.loads(body)
     assert empty["text"] == "" and empty["source"] == "file"
-    status, _, body, _ = authed(server, "/api/runs/run-1/notes", cookie=cookie)
+    status, _, body, _ = authed(server, "/api/w/default/runs/run-1/notes", cookie=cookie)
     assert json.loads(body)["text"] == ""
-    status, hdrs, body, _ = authed(server, "/api/runs/missing/notes", cookie=cookie)
+    status, hdrs, body, _ = authed(server, "/api/w/default/runs/missing/notes", cookie=cookie)
     assert status == 404
 
 
@@ -253,7 +253,7 @@ def test_adopted_running_meta_is_stale_on_dashboard(server):
     insert_run(server.run_index, "stale-run",
                list_row={"run_id": "stale-run", "status": "running", "project": "p"},
                created_at="2026-01-01T00:00:00Z")
-    status, _, body, _ = authed(server, "/api/runs")
+    status, _, body, _ = authed(server, "/api/w/default/runs")
     rows = {row["run_id"]: row for row in json.loads(body)}
     assert rows["stale-run"]["status"] == "stale"
     assert rows["stale-run"]["owner"] is None
@@ -691,16 +691,16 @@ def test_import_reads_files_before_write_transaction(tmp_path, monkeypatch):
 
 def test_detail_status_matches_index_when_commit_never_happens(server):
     assert put_meta(server, status="finished")[0] == 200
-    status, _, body, cookie = authed(server, "/api/runs")
+    status, _, body, cookie = authed(server, "/api/w/default/runs")
     listed = {row["run_id"]: row for row in json.loads(body)}
-    dstatus, _, dbody, _ = authed(server, "/api/runs/run-1", cookie=cookie)
+    dstatus, _, dbody, _ = authed(server, "/api/w/default/runs/run-1", cookie=cookie)
     detail = json.loads(dbody)
     assert dstatus == 200
     assert listed["run-1"]["status"] == detail["status"] == "finished"
     assert server.run_index.get("run-1")["status"] is None
     assert put_meta(server, status="running")[0] == 200
-    status, _, body, _ = authed(server, "/api/runs", cookie=cookie)
+    status, _, body, _ = authed(server, "/api/w/default/runs", cookie=cookie)
     listed = {row["run_id"]: row for row in json.loads(body)}
-    dstatus, _, dbody, _ = authed(server, "/api/runs/run-1", cookie=cookie)
+    dstatus, _, dbody, _ = authed(server, "/api/w/default/runs/run-1", cookie=cookie)
     detail = json.loads(dbody)
     assert listed["run-1"]["status"] == detail["status"] == "stale"

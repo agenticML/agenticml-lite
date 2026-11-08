@@ -295,13 +295,13 @@ def test_sessions_and_throttle_survive_restart_and_no_old_files(tmp_path, monkey
         db = server.db
     assert db.closed
     with running(tmp_path) as server:
-        assert authed(server,'/api/runs',cookie=cookie)[0] == 200
-        assert authed(server,'/api/runs',cookie=key_cookie)[0] == 200
+        assert authed(server,'/api/w/default/runs',cookie=cookie)[0] == 200
+        assert authed(server,'/api/w/default/runs',cookie=key_cookie)[0] == 200
         delay,ticket = server.web.throttle.begin('203.0.113.4')
         assert ticket is None and delay == 1
         server.users.set_password('alice',PASSWORD+'new')
-        assert authed(server,'/api/runs',cookie=cookie)[0] == 401
-        assert authed(server,'/api/runs',cookie=key_cookie)[0] == 401
+        assert authed(server,'/api/w/default/runs',cookie=cookie)[0] == 401
+        assert authed(server,'/api/w/default/runs',cookie=key_cookie)[0] == 401
     assert all(p.name.startswith('agenticml.db') or p.name in {'server.lock','tmp'}
                for p in (tmp_path / 'server').iterdir())
 

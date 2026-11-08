@@ -89,7 +89,7 @@ def test_round_trip_incremental_diff_and_replay(remote, snapshots, tmp_path):
     assert push(remote, child).complete
     assert lineage.diff(server.root, "child", "parent") == lineage.diff(child.root, "child", "parent")
     server.admin_key = server.keys.create("admin", "admin")[1]
-    status, _, body, _ = authed(server, "/api/runs/child/lineage")
+    status, _, body, _ = authed(server, "/api/w/default/runs/child/lineage")
     assert status == 200
     assert json.loads(body)["files"] == _lineage_changes(child.root, "child", RunReader(child.root, "child").meta())["files"]
     assert upload(client, child, incremental) == {"commit": info(child)["commit"], "created": False}

@@ -21,30 +21,25 @@ _V2_FILE = r"(?P<path>.+)"
 
 
 class Route:
-    __slots__ = ("method", "pattern", "scope", "action", "handler", "name", "legacy", "target", "regex")
+    __slots__ = ("method", "pattern", "scope", "action", "handler", "name", "target", "regex")
 
-    def __init__(self, method, pattern, scope, action, handler, name, legacy=False, target=None):
+    def __init__(self, method, pattern, scope, action, handler, name, target=None):
         self.method = method
         self.pattern = pattern
         self.scope = scope
         self.action = action
         self.handler = handler
         self.name = name
-        self.legacy = legacy
         self.target = target
         self.regex = re.compile(pattern)
 
 
-def _r(method, pattern, scope, action, handler, name, legacy=False, target=None):
-    return Route(method, pattern, scope, action, handler, name, legacy, target)
+def _r(method, pattern, scope, action, handler, name, target=None):
+    return Route(method, pattern, scope, action, handler, name, target)
 
 
 def _ws(method, rest, action, handler, name, target=None):
     return _r(method, r"/api/w/" + _SLUG + r"/" + rest, "workspace", action, handler, name, target=target)
-
-
-def _legacy(method, pattern, action, handler, name, target=None):
-    return _r(method, pattern, "workspace", action, handler, name, legacy=True, target=target)
 
 
 _RUN_SUBS = (
@@ -87,8 +82,6 @@ _ROUTES.extend([
     _r("GET", r"/api/account/session", "account", None, "session", "account_session"),
     _r("POST", r"/api/account/password", "account", "password", "account_password", "account_password"),
     _r("GET", r"/api/account/workspaces", "account", None, "account_workspaces", "account_workspaces"),
-    _r("GET", r"/api/server/session", "account", None, "session", "legacy_session", legacy=True),
-    _r("POST", r"/api/server/account/password", "account", "password", "account_password", "legacy_account_password", legacy=True),
     _r("GET", r"/static/app.js", "account", "read", "static_file", "static_app_js", target="app.js"),
     _r("GET", r"/static/charts.js", "account", "read", "static_file", "static_charts_js", target="charts.js"),
     _r("GET", r"/static/code.js", "account", "read", "static_file", "static_code_js", target="code.js"),
@@ -102,41 +95,25 @@ _ROUTES.extend([
 ])
 for sub, name, target in _RUN_SUBS:
     _ROUTES.append(_ws("GET", r"runs/" + _RUN + sub, "read", "dashboard_get", name, target))
-    _ROUTES.append(_legacy("GET", r"/api/runs/" + _RUN + sub, "read", "dashboard_get", "legacy_" + name, target))
 _ROUTES.extend([
     _ws("GET", r"runs", "read", "dashboard_get", "runs_list", "/api/runs"),
-    _legacy("GET", r"/api/runs", "read", "dashboard_get", "legacy_runs_list", "/api/runs"),
     _ws("PUT", r"runs/" + _RUN + r"/notes", "notes", "dashboard_put", "run_notes_put", "/api/runs/{run_id}/notes"),
-    _legacy("PUT", r"/api/runs/" + _RUN + r"/notes", "notes", "dashboard_put", "legacy_run_notes_put", "/api/runs/{run_id}/notes"),
     _ws("GET", r"compare/code", "read", "dashboard_get", "compare_code", "/api/compare/code"),
-    _legacy("GET", r"/api/compare/code", "read", "dashboard_get", "legacy_compare_code", "/api/compare/code"),
     _ws("GET", r"lineage", "read", "dashboard_get", "lineage_graph", "/api/lineage"),
-    _legacy("GET", r"/api/lineage", "read", "dashboard_get", "legacy_lineage_graph", "/api/lineage"),
     _ws("GET", r"notes", "read", "dashboard_get", "notes_list", "/api/notes"),
-    _legacy("GET", r"/api/notes", "read", "dashboard_get", "legacy_notes_list", "/api/notes"),
     _ws("GET", r"objects/" + _SHA, "read", "dashboard_get", "object_get", "/api/objects/{sha}"),
-    _legacy("GET", r"/api/objects/" + _SHA, "read", "dashboard_get", "legacy_object_get", "/api/objects/{sha}"),
     _ws("GET", r"keys", "own_keys", "keys", "keys_list"),
     _ws("POST", r"keys", "own_keys", "keys", "keys_create"),
     _ws("DELETE", r"keys/" + _NAME, "own_keys", "keys", "keys_revoke"),
-    _legacy("GET", r"/api/server/keys", "own_keys", "keys", "legacy_keys_list"),
-    _legacy("POST", r"/api/server/keys", "own_keys", "keys", "legacy_keys_create"),
-    _legacy("DELETE", r"/api/server/keys/" + _NAME, "own_keys", "keys", "legacy_keys_revoke"),
     _ws("GET", r"members", "users", "members", "members_list"),
     _ws("POST", r"members", "users", "members", "members_create"),
     _ws("PATCH", r"members/" + _LOGIN, "users", "members", "members_patch"),
     _ws("DELETE", r"members/" + _LOGIN, "users", "members", "members_delete"),
     _ws("POST", r"members/" + _LOGIN + r"/invite", "users", "members", "members_invite"),
-    _legacy("GET", r"/api/server/users", "users", "members", "legacy_users_list"),
-    _legacy("POST", r"/api/server/users", "users", "members", "legacy_users_create"),
-    _legacy("PATCH", r"/api/server/users/" + _LOGIN, "users", "members", "legacy_users_patch"),
-    _legacy("DELETE", r"/api/server/users/" + _LOGIN, "users", "members", "legacy_users_delete"),
-    _legacy("POST", r"/api/server/users/" + _LOGIN + r"/invite", "users", "members", "legacy_users_invite"),
     _ws("GET", r"invites", "users", "invites", "invites_list"),
     _ws("POST", r"invites", "users", "invites", "invites_create"),
     _ws("DELETE", r"invites/" + _LOGIN, "users", "invites", "invites_revoke"),
     _ws("GET", r"audit", "audit", "audit", "audit"),
-    _legacy("GET", r"/api/server/audit", "audit", "audit", "legacy_audit"),
 ])
 ROUTES = tuple(_ROUTES)
 
@@ -230,7 +207,7 @@ def _members(webauth, handler, route, match):
         path += "/" + rest
         if route.name.endswith("invite"):
             path += "/invite"
-    userspage.handle(webauth, handler, path, show_owner=not route.legacy)
+    userspage.handle(webauth, handler, path, show_owner=True)
 
 
 def _audit(webauth, handler, route, match):
@@ -268,23 +245,39 @@ def _workspaces_page(webauth, handler, route, match):
     workspaces = webauth._account_workspaces(handler)
     if workspaces:
         items = "".join(
-            "<li><a href=\"/w/{slug}/\">{name}</a></li>".format(
+            '<li><a class="btn btn-ghost workspace-switcher-item" href="/w/{slug}/">'
+            '<span class="workspace-switcher-name">{name}</span>{role}</a></li>'.format(
                 slug=html_escape(row["slug"], quote=True),
-                name=html_escape(row["name"] or row["slug"], quote=True))
+                name=html_escape(row["name"] or row["slug"], quote=True),
+                role=(
+                    '<span class="workspace-switcher-role">{0}</span>'.format(
+                        html_escape(row["role"], quote=True))
+                    if row.get("role") else ""),
+            )
             for row in workspaces)
-        body_inner = "<ul class=\"workspace-list\">" + items + "</ul>"
+        body_inner = '<ul class="workspace-list" aria-label="Workspaces">' + items + "</ul>"
     else:
         body_inner = (
-            "<p>You are not a member of any workspace; ask an admin to invite you.</p>")
+            "<p class=\"muted\">You are not a member of any workspace; "
+            "ask an admin to invite you.</p>")
+    admin_link = (
+        '<a class="btn btn-ghost btn-sm" href="/admin/">Admin</a>'
+        if getattr(handler.principal, "server_admin", False) else "")
     body = (
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"/>"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>"
+        "<meta name=\"color-scheme\" content=\"light dark\"/>"
         "<title>agenticml · Workspaces</title>"
         "<link rel=\"stylesheet\" href=\"/static/app.css\"/></head>"
-        "<body class=\"login-page\"><main class=\"login-card\">"
-        "<p class=\"eyebrow\">agenticml</p><h1>Workspaces</h1>"
+        "<body class=\"picker-page\">"
+        "<header class=\"topbar\">"
+        "<a href=\"/workspaces\" class=\"breadcrumb\">agenticml / workspaces</a>"
+        + admin_link +
+        "</header>"
+        "<main id=\"app\"><div class=\"workspace stack\">"
+        "<div class=\"heading\"><h1>Workspaces</h1></div>"
         + body_inner +
-        "</main></body></html>"
+        "</div></main></body></html>"
     ).encode("utf-8")
     handler._send(body, "text/html; charset=utf-8", headers=webauth._headers())
 

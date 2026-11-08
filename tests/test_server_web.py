@@ -169,11 +169,11 @@ def test_gate_and_login_assets(server):
     assert status == 303
     assert hdrs["Location"] == "/login"
     assert call(server, "/static/app.js")[0] == 303
-    status, _, body = call(server, "/api/runs")
+    status, _, body = call(server, "/api/w/default/runs")
     assert status == 401
     assert json.loads(body) == {"error": "login required"}
     sha = "a" * 64
-    status, _, body = call(server, "/api/objects/" + sha)
+    status, _, body = call(server, "/api/w/default/objects/" + sha)
     assert status == 401
     assert json.loads(body) == {"error": "login required"}
 
@@ -187,7 +187,7 @@ def test_gate_and_login_assets(server):
     assert call(server, "/static/InstrumentSans.woff2")[0] == 200
     assert call(server, "/static/JetBrainsMono.woff2")[0] == 200
 
-    status, _, body, cookie = authed(server, "/api/runs")
+    status, _, body, cookie = authed(server, "/api/w/default/runs")
     assert status == 200
     assert json.loads(body) == []
     status, hdrs, _, _ = authed(server, "/", cookie=cookie)
@@ -201,6 +201,22 @@ def test_gate_and_login_assets(server):
     assert json.loads(body) == {"error": "not found"}
 
 
+def test_removed_22_aliases_are_unknown_path_404(server):
+    status, headers, body, cookie = authed(server, "/api/no-such")
+    unknown = (status, headers, body)
+    assert status == 404 and json.loads(body) == {"error": "not found"}
+    skip = {"date", "set-cookie"}
+    def snapshot(status, headers, body):
+        filtered = {key.lower(): value for key, value in headers.items() if key.lower() not in skip}
+        return status, filtered, body
+    for path in (
+        "/api/runs", "/api/server/keys", "/api/server/users",
+        "/api/server/audit", "/api/server/session", "/api/server/account/password",
+    ):
+        got = authed(server, path, cookie=cookie)[:3]
+        assert snapshot(*got) == snapshot(*unknown), path
+
+
 def test_sessions_expiry_cap_revoke_logout(server, monkeypatch):
     clock = [1_000.0]
     server.web.clock = lambda: clock[0]
@@ -211,18 +227,18 @@ def test_sessions_expiry_cap_revoke_logout(server, monkeypatch):
     status, _, hdrs = login(server)
     cookie = hdrs["Set-Cookie"]
     name, token, _ = cookie_parts(cookie)
-    assert authed(server, "/api/runs", cookie=cookie)[0] == 200
+    assert authed(server, "/api/w/default/runs", cookie=cookie)[0] == 200
     digest = hashlib.sha256(token.encode("ascii")).hexdigest()
     first_seen = server.web.sessions.list()[digest]["last_seen"]
     clock[0] += 30
-    assert authed(server, "/api/runs", cookie=cookie)[0] == 200
+    assert authed(server, "/api/w/default/runs", cookie=cookie)[0] == 200
     assert server.web.sessions.list()[digest]["last_seen"] == first_seen
     clock[0] += 31
-    assert authed(server, "/api/runs", cookie=cookie)[0] == 200
+    assert authed(server, "/api/w/default/runs", cookie=cookie)[0] == 200
     assert server.web.sessions.list()[digest]["last_seen"] == clock[0]
 
     clock[0] += 100
-    status, _, body, _ = authed(server, "/api/runs", cookie=cookie)
+    status, _, body, _ = authed(server, "/api/w/default/runs", cookie=cookie)
     assert status == 401
     assert json.loads(body) == {"error": "login required"}
 
@@ -241,16 +257,16 @@ def test_sessions_expiry_cap_revoke_logout(server, monkeypatch):
         _, _, hdrs = login(server)
         cookies.append(hdrs["Set-Cookie"])
     assert len(server.web.sessions.list()) == 2
-    assert authed(server, "/api/runs", cookie=cookies[0])[0] == 401
-    assert authed(server, "/api/runs", cookie=cookies[2])[0] == 200
+    assert authed(server, "/api/w/default/runs", cookie=cookies[0])[0] == 401
+    assert authed(server, "/api/w/default/runs", cookie=cookies[2])[0] == 200
 
     _, _, hdrs = login(server)
     cookie = hdrs["Set-Cookie"]
     KeyStore(server.data_dir / "server", workspace_id=default_workspace_id(server.data_dir / "server")).revoke("admin")
-    status, _, body, _ = authed(server, "/api/runs", cookie=cookie)
+    status, _, body, _ = authed(server, "/api/w/default/runs", cookie=cookie)
     assert status == 401
     _, server.admin_key = server.keys.create("admin", "admin")
-    assert authed(server, "/api/runs", cookie=cookie)[0] == 401
+    assert authed(server, "/api/w/default/runs", cookie=cookie)[0] == 401
 
     status, _, hdrs = login(server)
     cookie = hdrs["Set-Cookie"]
@@ -258,16 +274,16 @@ def test_sessions_expiry_cap_revoke_logout(server, monkeypatch):
     assert status == 204
     name, _, flags = cookie_parts(hdrs["Set-Cookie"])
     assert flags["max-age"] == "0"
-    assert authed(server, "/api/runs", cookie=cookie)[0] == 401
+    assert authed(server, "/api/w/default/runs", cookie=cookie)[0] == 401
     status, _, _, _ = authed(server, "/logout", "POST", cookie=cookie)
     assert status == 204
 
 
 def test_session_endpoint_and_local_ui(server, tmp_path):
-    status, _, body = call(server, "/api/server/session")
+    status, _, body = call(server, "/api/account/session")
     assert status == 401
     assert json.loads(body) == {"error": "login required"}
-    status, _, body, _ = authed(server, "/api/server/session")
+    status, _, body, _ = authed(server, "/api/account/session")
     assert status == 200
     assert json.loads(body) == {
         "server": True, "user": "admin", "role": "admin", "via": "key", "key": "admin",
@@ -282,7 +298,7 @@ def test_session_endpoint_and_local_ui(server, tmp_path):
     thread.start()
     try:
         assert call(httpd, "/login")[0] == 404
-        assert call(httpd, "/api/server/session")[0] == 404
+        assert call(httpd, "/api/account/session")[0] == 404
         assert call(httpd, "/api/runs")[0] == 200
     finally:
         httpd.shutdown()
@@ -312,7 +328,7 @@ def test_csrf_and_host_with_public_url(tmp_path, monkeypatch):
                 "Host": "ml.example.com",
             }
             headers.update(extra)
-            return call(httpd, "/api/runs/run-1/notes", "PUT", note, headers)
+            return call(httpd, "/api/w/default/runs/run-1/notes", "PUT", note, headers)
 
         assert put({})[0] == 200
         assert put({"Origin": "http://evil.example"})[0] == 403
@@ -322,12 +338,12 @@ def test_csrf_and_host_with_public_url(tmp_path, monkeypatch):
             "X-AgenticML-Request": "1",
             "Host": "ml.example.com",
         }
-        assert call(httpd, "/api/runs/run-1/notes", "PUT", note, missing_origin)[0] == 403
+        assert call(httpd, "/api/w/default/runs/run-1/notes", "PUT", note, missing_origin)[0] == 403
         assert put({"X-AgenticML-Request": "0"})[0] == 403
         assert put({"Sec-Fetch-Site": "cross-site"})[0] == 403
-        assert call(httpd, "/api/runs", headers={"Host": "ml.example.com", "Cookie": f"{name}={token}"})[0] == 200
-        assert call(httpd, "/api/runs", headers={"Host": "localhost", "Cookie": f"{name}={token}"})[0] == 200
-        assert call(httpd, "/api/runs", headers={"Host": "evil.example", "Cookie": f"{name}={token}"})[0] == 403
+        assert call(httpd, "/api/w/default/runs", headers={"Host": "ml.example.com", "Cookie": f"{name}={token}"})[0] == 200
+        assert call(httpd, "/api/w/default/runs", headers={"Host": "localhost", "Cookie": f"{name}={token}"})[0] == 200
+        assert call(httpd, "/api/w/default/runs", headers={"Host": "evil.example", "Cookie": f"{name}={token}"})[0] == 403
 
 
 def test_routing_healthz_v2_and_bearer_ignored(server):
@@ -343,7 +359,7 @@ def test_routing_healthz_v2_and_bearer_ignored(server):
     assert status == 200
     assert json.loads(body)["key"] == "admin"
     status, _, body = call(
-        server, "/api/runs", headers={"Authorization": "Bearer " + server.admin_key})
+        server, "/api/w/default/runs", headers={"Authorization": "Bearer " + server.admin_key})
     assert status == 401
     assert json.loads(body) == {"error": "login required"}
 
@@ -361,21 +377,21 @@ def test_last_sync_lineage_and_notes(server):
     }).encode()
     assert call(server, "/v2/runs/run-1/commit", "POST", commit, headers)[0] == 200
 
-    status, _, body, cookie = authed(server, "/api/runs")
+    status, _, body, cookie = authed(server, "/api/w/default/runs")
     rows = json.loads(body)
     assert rows[0]["last_sync_at"]
     layout.parse_timestamp(rows[0]["last_sync_at"])
-    status, _, body, _ = authed(server, "/api/runs/run-1", cookie=cookie)
+    status, _, body, _ = authed(server, "/api/w/default/runs/run-1", cookie=cookie)
     detail = json.loads(body)
     assert detail["last_sync_at"] == rows[0]["last_sync_at"]
 
-    status, _, body, _ = authed(server, "/api/runs/run-1/lineage", cookie=cookie)
+    status, _, body, _ = authed(server, "/api/w/default/runs/run-1/lineage", cookie=cookie)
     payload = json.loads(body)
     assert payload["error"] == "code diff not available on this server"
     assert payload["files"] == []
 
     note = json.dumps({"text": "server note", "revision": None}).encode()
-    status, _, body, _ = authed(server, "/api/runs/run-1/notes", "PUT", note, cookie=cookie)
+    status, _, body, _ = authed(server, "/api/w/default/runs/run-1/notes", "PUT", note, cookie=cookie)
     assert status == 200
     assert server.note_index.read("run-1")["text"] == "server note"
     assert not (server.root / "runs" / "run-1" / "notes.md").exists()
@@ -389,7 +405,7 @@ def test_env_key_signs_in(tmp_path, monkeypatch):
         status, payload, hdrs = login(httpd, env)
         assert status == 200
         assert payload == {"ok": True, "user": "env", "role": "admin"}
-        status, _, body, _ = authed(httpd, "/api/server/session", cookie=hdrs["Set-Cookie"])
+        status, _, body, _ = authed(httpd, "/api/account/session", cookie=hdrs["Set-Cookie"])
         assert status == 200
         assert json.loads(body) == {
             "server": True, "user": "env", "role": "admin", "via": "key", "key": "env",
@@ -416,7 +432,7 @@ def test_authenticated_put_non_note_is_404(server):
     status, hdrs, body, _ = authed(server, "/login", "PUT", b"", cookie=cookie)
     assert status == 404
     assert json.loads(body) == {"error": "not found"}
-    assert authed(server, "/api/runs", cookie=cookie)[0] == 200
+    assert authed(server, "/api/w/default/runs", cookie=cookie)[0] == 200
 
 
 def test_forged_logout_keeps_session(server):
@@ -431,13 +447,13 @@ def test_forged_logout_keeps_session(server):
     status, _, body = call(server, "/logout", "POST", b"", missing_header)
     assert status == 403
     assert json.loads(body) == {"error": "cross-site request refused"}
-    assert authed(server, "/api/runs", cookie=cookie)[0] == 200
+    assert authed(server, "/api/w/default/runs", cookie=cookie)[0] == 200
 
     status, _, body = call(
         server, "/logout", "POST", b"", {**csrf(server, Origin="http://evil.example"), **jar})
     assert status == 403
     assert json.loads(body) == {"error": "cross-site request refused"}
-    assert authed(server, "/api/runs", cookie=cookie)[0] == 200
+    assert authed(server, "/api/w/default/runs", cookie=cookie)[0] == 200
 
     missing_origin = csrf(server)
     del missing_origin["Origin"]
@@ -445,12 +461,12 @@ def test_forged_logout_keeps_session(server):
     status, _, body = call(server, "/logout", "POST", b"", missing_origin)
     assert status == 403
     assert json.loads(body) == {"error": "cross-site request refused"}
-    assert authed(server, "/api/runs", cookie=cookie)[0] == 200
+    assert authed(server, "/api/w/default/runs", cookie=cookie)[0] == 200
 
 
 def test_unauthenticated_non_get_gate(server):
     for method in ("HEAD", "OPTIONS", "PUT", "POST"):
-        for path in ("/", "/api/runs"):
+        for path in ("/", "/api/w/default/runs"):
             status, hdrs, body = call(server, path, method)
             assert status == 401, (method, path, status)
             assert b"<!DOCTYPE" not in body and b"<html" not in body
@@ -472,7 +488,7 @@ def test_https_public_url_is_normalized(tmp_path, monkeypatch):
         cookie = hdrs["Set-Cookie"]
         token = cookie_parts(cookie)[1]
         status, _, body = call(
-            httpd, "/api/runs",
+            httpd, "/api/w/default/runs",
             headers={"Host": "example.com", "Cookie": f"{name}={token}"},
         )
         assert status == 200
@@ -485,13 +501,13 @@ def test_server_mode_cache_headers(server, tmp_path, monkeypatch):
     auth = {"Authorization": "Bearer " + server.sync_key}
     assert call(server, "/v2/objects/" + sha, "PUT", blob, auth)[0] == 201
 
-    status, hdrs, body, cookie = authed(server, "/api/objects/" + sha)
+    status, hdrs, body, cookie = authed(server, "/api/w/default/objects/" + sha)
     assert status == 200
     assert body == blob
     assert hdrs.get("Cache-Control") == "no-store"
     assert "Cookie" in {part.strip() for part in hdrs.get("Vary", "").split(",")}
 
-    status, hdrs, _, _ = authed(server, "/api/runs", cookie=cookie)
+    status, hdrs, _, _ = authed(server, "/api/w/default/runs", cookie=cookie)
     assert status == 200
     assert hdrs.get("Cache-Control") == "no-store"
     assert "Cookie" in {part.strip() for part in hdrs.get("Vary", "").split(",")}
@@ -543,19 +559,19 @@ def test_hostile_cookie_headers(server):
     name, token, _ = cookie_parts(cookie)
 
     status, _, body = call(
-        server, "/api/runs", headers={"Cookie": f"{name}={token}; {name}=forged"})
+        server, "/api/w/default/runs", headers={"Cookie": f"{name}={token}; {name}=forged"})
     assert status == 401
     assert json.loads(body) == {"error": "login required"}
 
     status, _, body = call(
-        server, "/api/runs", headers={"Cookie": f"{name}=forged; {name}={token}"})
+        server, "/api/w/default/runs", headers={"Cookie": f"{name}=forged; {name}={token}"})
     assert status == 200
     assert json.loads(body) == []
 
-    status, _, body = call(server, "/api/runs", headers={"Cookie": "not a cookie at all !!!!"})
+    status, _, body = call(server, "/api/w/default/runs", headers={"Cookie": "not a cookie at all !!!!"})
     assert status == 401
     assert json.loads(body) == {"error": "login required"}
 
-    status, _, body = call(server, "/api/runs", headers={"Cookie": f"{name}={token}; bad"})
+    status, _, body = call(server, "/api/w/default/runs", headers={"Cookie": f"{name}={token}; bad"})
     assert status == 401
     assert json.loads(body) == {"error": "login required"}

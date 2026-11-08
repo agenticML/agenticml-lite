@@ -284,14 +284,14 @@ def test_closing_during_create_refreshes_after_the_write(page, server_ui):
         else:
             route.continue_()
 
-    page.route("**/api/server/keys", hold_create)
+    page.route("**/api/w/default/keys", hold_create)
     page.get_by_role("button", name="New key", exact=True).click()
     dialog = page.get_by_role("dialog", name="New key", exact=True)
     dialog.get_by_label("Name", exact=True).fill("delayed-worker")
     with page.expect_request(lambda request: request.method == "POST"):
         dialog.get_by_role("button", name="Create", exact=True).click()
     expect(dialog.get_by_role("button", name="Create", exact=True)).to_be_disabled()
-    with page.expect_response(lambda response: response.url.endswith("/api/server/keys")) as listing:
+    with page.expect_response(lambda response: response.url.endswith("/api/w/default/keys")) as listing:
         dialog.get_by_role("button", name="Close", exact=True).click()
     listing.value.finished()
     expect(key_row(page, "delayed-worker")).to_have_count(0)
@@ -461,12 +461,12 @@ def test_create_errors_and_name_validation(page, server_ui):
     name.fill("admin")
     dialog.get_by_role("button", name="Create", exact=True).click()
     expect(dialog.get_by_role("alert")).to_have_text("key name already exists")
-    page.route("**/api/server/keys", lambda route: route.fulfill(
+    page.route("**/api/w/default/keys", lambda route: route.fulfill(
         status=400, json={"error": "invalid key scope"}))
     name.fill("worker")
     dialog.get_by_role("button", name="Create", exact=True).click()
     expect(dialog.get_by_role("alert")).to_have_text("invalid key scope")
-    page.unroute("**/api/server/keys")
+    page.unroute("**/api/w/default/keys")
     dialog.get_by_role("button", name="Close", exact=True).click()
 
 
@@ -515,7 +515,7 @@ def test_create_errors_and_name_validation(page, server_ui):
 def test_unusable_key_responses_show_readable_status(page, server_ui, method, status, body):
     page.allow_http_errors = True
     open_keys(page, server_ui)
-    page.route("**/api/server/keys**", lambda route: route.fulfill(
+    page.route("**/api/w/default/keys**", lambda route: route.fulfill(
         status=status, content_type="text/html", body=body,
     ) if route.request.method == method else route.continue_())
     if method == "GET":
@@ -546,7 +546,7 @@ def test_write_401_keeps_buttons_disabled_until_login(page, context, server_ui, 
     page.allow_http_errors = True
     open_keys(page, server_ui)
     context.clear_cookies()
-    page.route("**/api/server/keys**", lambda route: route.fulfill(
+    page.route("**/api/w/default/keys**", lambda route: route.fulfill(
         status=401, json={"error": "login required"},
     ) if route.request.method == method else route.continue_())
     if method == "POST":
@@ -579,14 +579,14 @@ def test_write_401_keeps_buttons_disabled_until_login(page, context, server_ui, 
 
 def test_older_refresh_does_not_replace_newer_keys(page, server_ui):
     open_keys(page, server_ui)
-    original = page.request.get(f"{server_ui['url']}/api/server/keys").json()
+    original = page.request.get(f"{server_ui['url']}/api/w/default/keys").json()
     pending_create = []
-    page.route("**/api/server/keys", lambda route: pending_create.append(route)
+    page.route("**/api/w/default/keys", lambda route: pending_create.append(route)
                if route.request.method == "POST" else route.continue_())
     page.evaluate("""() => {
         const original = window.fetch;
         window.keyReads = [];
-        window.fetch = (url, options) => url === '/api/server/keys' && !options.method
+        window.fetch = (url, options) => url === '/api/w/default/keys' && !options.method
             ? new Promise(resolve => window.keyReads.push(data => resolve(new Response(JSON.stringify(data)))))
             : original(url, options);
     }""")
@@ -600,7 +600,7 @@ def test_older_refresh_does_not_replace_newer_keys(page, server_ui):
     with page.expect_response(lambda response: response.request.method == "POST"):
         pending_create[0].continue_()
     page.wait_for_function("() => window.keyReads.length === 2")
-    latest = page.request.get(f"{server_ui['url']}/api/server/keys").json()
+    latest = page.request.get(f"{server_ui['url']}/api/w/default/keys").json()
     page.evaluate("data => window.keyReads[1](data)", latest)
     expect(key_row(page, "worker")).to_be_visible()
     page.evaluate("""async data => {
@@ -641,8 +641,8 @@ def test_route_change_clears_secret_and_ignores_late_response(page, server_ui, s
         const original = window.fetch;
         window.runReads = 0;
         window.fetch = (url, options) => {
-            if (url === '/api/runs') window.runReads++;
-            return url === '/api/server/keys' ? new Promise(resolve => {
+            if (url === '/api/w/default/runs') window.runReads++;
+            return url === '/api/w/default/keys' ? new Promise(resolve => {
                 window.resolveKeys = () => resolve(new Response(null, {status}));
             }) : original(url, options);
         };
@@ -702,7 +702,7 @@ def test_keys_failure_removes_navigation_listeners(page, server_ui, failure):
         page.get_by_role("link", name="Keys", exact=True).click()
         expect(page.get_by_role("table", name="Keys", exact=True)).to_be_visible()
         assert page.evaluate("Object.values(window.keysListeners).every(listeners => listeners.size === 1)")
-        page.route("**/api/server/keys", lambda route: route.fulfill(status=401, json={}))
+        page.route("**/api/w/default/keys", lambda route: route.fulfill(status=401, json={}))
         page.get_by_role("button", name="New key", exact=True).click()
         dialog = page.get_by_role("dialog", name="New key", exact=True)
         dialog.get_by_label("Name", exact=True).fill("worker")
@@ -710,7 +710,7 @@ def test_keys_failure_removes_navigation_listeners(page, server_ui, failure):
             dialog.get_by_role("button", name="Create", exact=True).click()
         expect(page.get_by_role("dialog")).to_have_count(0)
     else:
-        page.route("**/api/server/keys", lambda route: route.fulfill(
+        page.route("**/api/w/default/keys", lambda route: route.fulfill(
             status=401 if failure == "refresh-401" else 200, json={}))
         if failure == "refresh-401":
             with page.expect_request(f"{server_ui['url']}/login"):

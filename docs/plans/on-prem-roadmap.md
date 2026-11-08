@@ -182,14 +182,14 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | --- | --- | --- | --- | --- | --- | --- |
 | 16 † | Database layer, SQLite backend, migrations; users, keys, sessions, throttle, audit in tables | 2.2 | Codex | L | [plan](packages/16-database-layer.md) | done (3.0 PR) |
 | 17 † | Runs, sync state and notes in the database; append crash safety; run list from the database | 16 | Cursor | L | [plan](packages/17-runs-in-database.md) | done (3.0 PR) |
-| 18 † | Workspaces and accounts: memberships, workspace-bound keys, `/w/<slug>` routes, switcher, server-admin commands, isolation suite | 17 | Codex (server), Cursor (dashboard) | L | [plan](packages/18-workspaces.md) | in progress |
+| 18 † | Workspaces and accounts: memberships, workspace-bound keys, `/w/<slug>` routes, switcher, server-admin commands, isolation suite | 17 | Codex, Cursor | L | [plan](packages/18-workspaces.md) | done (3.0 PR) |
 | 18b † | Firebase sign-in for the hosted service | 18 | Cursor | M | – | not started |
 | 18c † | Self-serve sign-up and usage limits (free plan: storage, uploads, requests, people) | 18b | Codex | M | – | not started |
 | 19 † | Postgres backend, row-level security, CI on both backends | 18 | Cursor | M | – | not started |
 | 20 † | Many server processes: database locks, shared throttle and sessions | 19 | Cursor | M | – | not started |
 | 21 | S3 object backend | 18 | Codex | M | – | not started |
 | 22 | Metric summaries; sort and filter runs by metric | 17, 18 | Cursor | M | – | not started |
-| 23 | Operator commands: 2.x conversion, `server backup`, `status`/`verify` on the database | 18 | Codex | S–M | – | not started |
+| 23 | Operator commands: end-to-end 2.x conversion test (the import itself landed in 16–18), `server backup`, `status`/`verify` on the database | 18 | Codex | S–M | – | not started |
 | 24 | AWS hosted deployment (Dockerfile, Terraform, deploy workflow, runbook, real-EFS benchmark) | 18c, 19, 20, 21 | Codex; owner runs it | M | – | not started |
 | 25 | Docs, threat model, version 3.0.0 | 16–24 | Codex; prose Antigravity | M | – | not started |
 | 26 | Retire agenticml-server | 24 live | Owner | S | – | not started |

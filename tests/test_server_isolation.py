@@ -36,55 +36,30 @@ B_SHA = hashlib.sha256(B_OBJECT).hexdigest()
 EXAMPLES = {
     "workspace_page": {"method": "GET", "path": "/w/{slug}/"},
     "run_meta": {"method": "GET", "path": "/api/w/{slug}/runs/{run_id}"},
-    "legacy_run_meta": {"method": "GET", "path": "/api/runs/{run_id}"},
     "run_notes": {"method": "GET", "path": "/api/w/{slug}/runs/{run_id}/notes"},
-    "legacy_run_notes": {"method": "GET", "path": "/api/runs/{run_id}/notes"},
     "run_scalars": {"method": "GET", "path": "/api/w/{slug}/runs/{run_id}/scalars"},
-    "legacy_run_scalars": {"method": "GET", "path": "/api/runs/{run_id}/scalars"},
     "run_time": {"method": "GET", "path": "/api/w/{slug}/runs/{run_id}/time"},
-    "legacy_run_time": {"method": "GET", "path": "/api/runs/{run_id}/time"},
     "run_media": {"method": "GET", "path": "/api/w/{slug}/runs/{run_id}/media"},
-    "legacy_run_media": {"method": "GET", "path": "/api/runs/{run_id}/media"},
     "run_code": {"method": "GET", "path": "/api/w/{slug}/runs/{run_id}/code"},
-    "legacy_run_code": {"method": "GET", "path": "/api/runs/{run_id}/code"},
     "run_lineage": {"method": "GET", "path": "/api/w/{slug}/runs/{run_id}/lineage"},
-    "legacy_run_lineage": {"method": "GET", "path": "/api/runs/{run_id}/lineage"},
     "runs_list": {"method": "GET", "path": "/api/w/{slug}/runs"},
-    "legacy_runs_list": {"method": "GET", "path": "/api/runs"},
     "run_notes_put": {
         "method": "PUT", "path": "/api/w/{slug}/runs/{run_id}/notes",
-        "body": {"text": "isolation note", "revision": None},
-    },
-    "legacy_run_notes_put": {
-        "method": "PUT", "path": "/api/runs/{run_id}/notes",
         "body": {"text": "isolation note", "revision": None},
     },
     "compare_code": {
         "method": "GET",
         "path": "/api/w/{slug}/compare/code?base={run_id}&target={run_id}",
     },
-    "legacy_compare_code": {
-        "method": "GET",
-        "path": "/api/compare/code?base={run_id}&target={run_id}",
-    },
     "lineage_graph": {"method": "GET", "path": "/api/w/{slug}/lineage?project=demo"},
-    "legacy_lineage_graph": {"method": "GET", "path": "/api/lineage?project=demo"},
     "notes_list": {"method": "GET", "path": "/api/w/{slug}/notes"},
-    "legacy_notes_list": {"method": "GET", "path": "/api/notes"},
     "object_get": {"method": "GET", "path": "/api/w/{slug}/objects/{sha}"},
-    "legacy_object_get": {"method": "GET", "path": "/api/objects/{sha}"},
     "keys_list": {"method": "GET", "path": "/api/w/{slug}/keys"},
     "keys_create": {
         "method": "POST", "path": "/api/w/{slug}/keys",
         "body": {"name": "isolation-create", "scope": "sync"},
     },
     "keys_revoke": {"method": "DELETE", "path": "/api/w/{slug}/keys/{name}"},
-    "legacy_keys_list": {"method": "GET", "path": "/api/server/keys"},
-    "legacy_keys_create": {
-        "method": "POST", "path": "/api/server/keys",
-        "body": {"name": "isolation-create", "scope": "sync"},
-    },
-    "legacy_keys_revoke": {"method": "DELETE", "path": "/api/server/keys/{name}"},
     "members_list": {"method": "GET", "path": "/api/w/{slug}/members"},
     "members_create": {
         "method": "POST", "path": "/api/w/{slug}/members",
@@ -96,17 +71,6 @@ EXAMPLES = {
     },
     "members_delete": {"method": "DELETE", "path": "/api/w/{slug}/members/{login}"},
     "members_invite": {"method": "POST", "path": "/api/w/{slug}/members/{login}/invite"},
-    "legacy_users_list": {"method": "GET", "path": "/api/server/users"},
-    "legacy_users_create": {
-        "method": "POST", "path": "/api/server/users",
-        "body": {"name": "isolation-user", "role": "member"},
-    },
-    "legacy_users_patch": {
-        "method": "PATCH", "path": "/api/server/users/{login}",
-        "body": {"role": "member"},
-    },
-    "legacy_users_delete": {"method": "DELETE", "path": "/api/server/users/{login}"},
-    "legacy_users_invite": {"method": "POST", "path": "/api/server/users/{login}/invite"},
     "invites_list": {"method": "GET", "path": "/api/w/{slug}/invites"},
     "invites_create": {
         "method": "POST", "path": "/api/w/{slug}/invites",
@@ -114,7 +78,6 @@ EXAMPLES = {
     },
     "invites_revoke": {"method": "DELETE", "path": "/api/w/{slug}/invites/{login}"},
     "audit": {"method": "GET", "path": "/api/w/{slug}/audit"},
-    "legacy_audit": {"method": "GET", "path": "/api/server/audit"},
     "admin_page": {"method": "GET", "path": "/admin/"},
     "admin_workspaces_list": {"method": "GET", "path": "/api/admin/workspaces"},
     "admin_workspaces_create": {
@@ -157,11 +120,6 @@ EXAMPLES = {
         "body": {"new": "new-password-1"},
     },
     "account_workspaces": {"method": "GET", "path": "/api/account/workspaces"},
-    "legacy_session": {"method": "GET", "path": "/api/server/session"},
-    "legacy_account_password": {
-        "method": "POST", "path": "/api/server/account/password",
-        "body": {"new": "new-password-1"},
-    },
     "static_app_js": {"method": "GET", "path": "/static/app.js"},
     "static_charts_js": {"method": "GET", "path": "/static/charts.js"},
     "static_code_js": {"method": "GET", "path": "/static/code.js"},
@@ -185,20 +143,12 @@ def _scoped_names(*scopes):
     return {route.name for route in route_table() if route.scope in scopes}
 
 
-def _routes_by_name():
-    return {route.name: route for route in route_table()}
-
-
-def _examples(*scopes, slug=False, legacy=None):
+def _examples(*scopes, slug=False):
     wanted = _scoped_names(*scopes) if scopes else set(EXAMPLES)
-    routes = _routes_by_name()
     for name, example in EXAMPLES.items():
         if name not in wanted:
             continue
-        route = routes[name]
         if slug and "{slug}" not in example["path"]:
-            continue
-        if legacy is not None and bool(route.legacy) != legacy:
             continue
         yield name, example
 
@@ -515,27 +465,6 @@ def test_workspace_members_options_is_405_with_allow(iso):
             iso["server"], "OPTIONS", _unknown_path(example), cookie=cookie))
         assert foreign == unknown and foreign[0] == 404, (name, foreign, unknown)
 
-    bootstrap = iso["cookies"]["password:bootstrap"]
-    for name, example in _examples("workspace", legacy=True):
-        status, headers, body = _ask(
-            iso["server"], "OPTIONS", _fill(example["path"]), cookie=bootstrap)
-        assert status == 405, (name, status, body)
-        allow = headers.get("Allow") or headers.get("allow")
-        assert allow and example["method"] in allow, (name, allow)
-
-
-def _legacy_missing_path(path):
-    """Map a 2.2 legacy path to the same method on a nonexistent workspace slug."""
-    if path.startswith("/api/server/keys"):
-        return "/api/w/" + MISSING_SLUG + "/keys" + path[len("/api/server/keys"):]
-    if path.startswith("/api/server/users"):
-        return "/api/w/" + MISSING_SLUG + "/members" + path[len("/api/server/users"):]
-    if path.startswith("/api/server/audit"):
-        return "/api/w/" + MISSING_SLUG + "/audit"
-    if path.startswith("/api/"):
-        return "/api/w/" + MISSING_SLUG + path[4:]
-    return path
-
 
 def _not_in_default_principals(iso):
     cookies = iso["cookies"]
@@ -546,26 +475,6 @@ def _not_in_default_principals(iso):
         ("proxy:member-a", None, {"Tailscale-User-Login": "member-a@example.com"}),
         ("proxy:member-b", None, {"Tailscale-User-Login": "member-b@example.com"}),
     ]
-
-
-def test_legacy_workspace_routes_bound_to_default_hide_foreign_workspace(iso):
-    """Password and proxy users who are not in default see legacy paths as missing."""
-    for label, cookie, extra in _not_in_default_principals(iso):
-        for name, example in _examples("workspace", legacy=True):
-            filled = _fill(example["path"])
-            for method in (example["method"], "OPTIONS"):
-                body = None if method in ("GET", "HEAD", "OPTIONS") else example.get("body")
-                got = _snapshot(*_ask(
-                    iso["server"], method, filled,
-                    cookie=cookie, extra=extra, body=body))
-                missing = _snapshot(*_ask(
-                    iso["server"], method, _legacy_missing_path(filled),
-                    cookie=cookie, extra=extra, body=body))
-                unknown = _snapshot(*_ask(
-                    iso["server"], method, _unknown_path(example),
-                    cookie=cookie, extra=extra, body=body))
-                assert got == missing == unknown, (name, label, method, got, missing, unknown)
-                assert got[0] == 404, (name, label, method, got)
 
 
 def test_server_admin_routes_match_unknown_path(iso):
@@ -783,13 +692,13 @@ def test_account_routes_key_login_and_env_cannot_escalate(iso):
         ("key-login:env", iso["cookies"]["key-login:env"], {"default"}),
     )
     for label, cookie, allowed_slugs in cases:
-        for path in ("/api/account/password", "/api/server/account/password"):
+        for path in ("/api/account/password",):
             for body in ({"new": "new-password-1"},
                          {"current": PASSWORD, "new": "new-password-1"}):
                 status, _, raw = _ask(server, "POST", path, cookie=cookie, body=body)
                 assert status == 403, (label, path, body, status, raw)
                 assert json.loads(raw) == {"error": "this session cannot set a password"}
-        for path in ("/api/account/session", "/api/server/session",
+        for path in ("/api/account/session",
                      "/api/account/workspaces"):
             status, _, raw = _ask(server, "GET", path, cookie=cookie)
             assert status == 200, (label, path, status, raw)
@@ -865,7 +774,7 @@ def _variant_paths(path):
 
 
 def test_path_variants_match_unknown_path(iso):
-    """Trailing slash, doubled slash, case, percent-encoding and trailing-dot of every legacy and /api/w/* route."""
+    """Trailing slash, doubled slash, case, percent-encoding and trailing-dot of every /api/w/* route."""
     principals = _not_in_default_principals(iso)
     failures = []
     for principal, cookie, extra in principals:
@@ -873,7 +782,7 @@ def test_path_variants_match_unknown_path(iso):
         unknown = _snapshot(*_ask(
             iso["server"], "GET", "/api/no-such", cookie=cookie, extra=extra))
         for name, example in _examples("workspace"):
-            if not (name.startswith("legacy_") or example["path"].startswith("/api/w/")):
+            if not example["path"].startswith("/api/w/"):
                 continue
             slug = home if example["path"].startswith("/api/w/") else A_SLUG
             filled = _fill(example["path"], slug)

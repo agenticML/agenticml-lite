@@ -354,7 +354,7 @@ def test_cli_main_exits_quietly_on_broken_pipe(tmp_path, monkeypatch, capsys, as
 class StubHandler:
     def __init__(self, command="GET", query="", role="admin"):
         self.command = command
-        self.path = "/api/server/audit" + ("?" + query if query else "")
+        self.path = "/api/w/default/audit" + ("?" + query if query else "")
         self.principal = Principal(user="alice", role=role, via="password")
         self.close_connection = False
         self.response = None
@@ -588,12 +588,12 @@ def test_setup_account_password_and_logout(tmp_path, hook_env):
             assert call(server, "/setup", "POST", json.dumps({
                 "token": token, "name": "alice", "password": PASSWORD}), csrf(server))[0] == 404
         with expect_events(data, http_event("user.password", "alice", {"method": "account"}, via="setup")):
-            status, headers, _, _ = authed(server, "/api/server/account/password", "POST", json.dumps({
+            status, headers, _, _ = authed(server, "/api/account/password", "POST", json.dumps({
                 "current": PASSWORD, "new": PASSWORD + "new"}), cookie=cookie)
             assert status == 200
         cookie = headers["Set-Cookie"]
         with expect_events(data):
-            assert authed(server, "/api/server/account/password", "POST", json.dumps({
+            assert authed(server, "/api/account/password", "POST", json.dumps({
                 "current": "wrong-password", "new": PASSWORD}), cookie=cookie)[0] == 401
         with expect_events(data, http_event("logout", "alice")):
             assert authed(server, "/logout", "POST", cookie=cookie)[0] == 204
@@ -641,15 +641,15 @@ def test_invite_keys_and_secret_exclusion(tmp_path, capsys, monkeypatch, hook_en
             assert call(server, "/invite", "POST", json.dumps({
                 "token": invite_token, "password": PASSWORD}), csrf(server))[0] == 404
         with expect_events(data, expected("key.create", "http-key", {"user": "alice", "scope": "sync"})):
-            status, _, body, _ = authed(server, "/api/server/keys", "POST", json.dumps({
+            status, _, body, _ = authed(server, "/api/w/default/keys", "POST", json.dumps({
                 "name": "http-key", "scope": "sync"}), extra={"X-Forwarded-For": client}, cookie=cookie)
             assert status == 201
         secrets.extend([json.loads(body)["key"], server.keys.list()[-1].sha256])
         with expect_events(data, expected("key.revoke", "http-key", {"user": "alice", "scope": "sync"})):
-            assert authed(server, "/api/server/keys/http-key", "DELETE",
+            assert authed(server, "/api/w/default/keys/http-key", "DELETE",
                           extra=csrf(server, **{"X-Forwarded-For": client}), cookie=cookie)[0] == 200
         with expect_events(data):
-            assert authed(server, "/api/server/keys/http-key", "DELETE", extra=csrf(server), cookie=cookie)[0] == 404
+            assert authed(server, "/api/w/default/keys/http-key", "DELETE", extra=csrf(server), cookie=cookie)[0] == 404
         with expect_events(data, http_event("login.ok", "alice", {"method": "key"}, via="key")):
             assert login(server, cli_key)[0] == 200
         with expect_events(data, http_event("login.failed", "alice", {"method": "password"}, actor="anonymous")):
@@ -671,7 +671,7 @@ def test_audit_api_password_role_gate(tmp_path, capsys, hook_env, role, status):
             code, _, headers = password_login(server, "alice", PASSWORD)
             assert code == 200
         with expect_events(data):
-            code, headers, body, _ = authed(server, "/api/server/audit?limit=1", cookie=headers["Set-Cookie"])
+            code, headers, body, _ = authed(server, "/api/w/default/audit?limit=1", cookie=headers["Set-Cookie"])
             assert code == status
             assert headers["Cache-Control"] == "no-store"
             if status == 200:
@@ -733,11 +733,11 @@ def test_run_lifecycle_and_notes(tmp_path, capsys, monkeypatch, hook_env, env_ke
         cookie = headers["Set-Cookie"]
         revision = hashlib.sha256(b"training note\n").hexdigest()
         with expect_events(data, http_event("note.write", "run-1", {"revision": revision})):
-            code, _, body, _ = authed(server, "/api/runs/run-1/notes", "PUT", json.dumps({
+            code, _, body, _ = authed(server, "/api/w/default/runs/run-1/notes", "PUT", json.dumps({
                 "text": "training note\n", "revision": None}), cookie=cookie)
             assert code == 200 and json.loads(body)["revision"] == revision
         with expect_events(data):
-            assert authed(server, "/api/runs/run-1/notes", "PUT", json.dumps({
+            assert authed(server, "/api/w/default/runs/run-1/notes", "PUT", json.dumps({
                 "text": "conflict", "revision": None}), cookie=cookie)[0] == 409
     raw = audit_text(data / 'server')
     assert secret not in raw
@@ -801,14 +801,14 @@ def test_proxy_requests_do_not_log_logins_but_attribute_writes(tmp_path, hook_en
         headers = {"X-Forwarded-Email": "alice@example.com", "X-Forwarded-For": "198.51.100.8"}
         with expect_events(data):
             for _ in range(2):
-                assert call(server, "/api/runs", headers=headers)[0] == 200
-                assert call(server, "/api/server/session", headers=headers)[0] == 200
+                assert call(server, "/api/w/default/runs", headers=headers)[0] == 200
+                assert call(server, "/api/account/session", headers=headers)[0] == 200
         detail = {"user": "alice", "scope": "sync"}
         with expect_events(data, http_event("key.create", "box", detail, via="proxy", client="198.51.100.8")):
-            assert call(server, "/api/server/keys", "POST", json.dumps({"name": "box", "scope": "sync"}),
+            assert call(server, "/api/w/default/keys", "POST", json.dumps({"name": "box", "scope": "sync"}),
                         csrf(server, **headers))[0] == 201
         with expect_events(data, http_event("key.revoke", "box", detail, via="proxy", client="198.51.100.8")):
-            assert call(server, "/api/server/keys/box", "DELETE", headers=csrf(server, **headers))[0] == 200
+            assert call(server, "/api/w/default/keys/box", "DELETE", headers=csrf(server, **headers))[0] == 200
         with expect_events(data):
             assert call(server, "/logout", "POST", headers=csrf(server, **headers))[0] == 204
 
@@ -823,7 +823,7 @@ def test_http_mutation_succeeds_with_symlinked_audit_file(tmp_path, hook_env):
         (data / "server" / "audit.jsonl").symlink_to(outside)
         code, _, headers = password_login(server, "alice", PASSWORD)
         assert code == 200
-        code, _, _, _ = authed(server, "/api/server/keys", "POST", json.dumps({
+        code, _, _, _ = authed(server, "/api/w/default/keys", "POST", json.dumps({
             "name": "box", "scope": "sync"}), cookie=headers["Set-Cookie"])
         assert code == 201
         assert [key.name for key in server.keys.list()] == ["box"]
@@ -845,7 +845,7 @@ def test_first_key_also_attributes_bootstrap_user(tmp_path, capsys, hook_env, vi
             with expect_events(data,
                                http_event("user.add", "admin", {"role": "admin", "identity": None}, actor="env", via="key"),
                                http_event("key.create", "box", {"user": "admin", "scope": "admin"}, actor="env", via="key")):
-                assert authed(server, "/api/server/keys", "POST", json.dumps({
+                assert authed(server, "/api/w/default/keys", "POST", json.dumps({
                     "name": "box", "scope": "admin"}), cookie=headers["Set-Cookie"])[0] == 201
 
 
@@ -875,7 +875,7 @@ def test_concurrent_first_keys_attribute_bootstrap_user_once(tmp_path, monkeypat
             _, _, headers = login(server, "env-key-secret-with-enough-characters")
 
             def issue(name):
-                return authed(server, "/api/server/keys", "POST", json.dumps({
+                return authed(server, "/api/w/default/keys", "POST", json.dumps({
                     "name": name, "scope": "admin"}), cookie=headers["Set-Cookie"])[0]
 
             with ThreadPoolExecutor(max_workers=2) as pool:
@@ -994,14 +994,14 @@ def test_http_mutations_succeed_when_audit_writer_raises(tmp_path, monkeypatch, 
         code, _, headers = password_login(server, "alice", PASSWORD)
         assert code == 200
         cookie = headers["Set-Cookie"]
-        assert authed(server, "/api/server/keys", "POST", json.dumps({
+        assert authed(server, "/api/w/default/keys", "POST", json.dumps({
             "name": "box", "scope": "sync"}), cookie=cookie)[0] == 201
-        assert authed(server, "/api/server/keys/box", "DELETE", extra=csrf(server), cookie=cookie)[0] == 200
+        assert authed(server, "/api/w/default/keys/box", "DELETE", extra=csrf(server), cookie=cookie)[0] == 200
         assert request(server, "/v2/runs/run-1/files/meta.json", "PUT", json.dumps({
             "run_id": "run-1", "status": "finished", "project": "project"}))[0] == 200
         assert request(server, "/v2/runs/run-1/commit", "POST", json.dumps({
             "status": "finished", "fingerprint": "a" * 64, "sizes": {}}))[0] == 200
-        assert authed(server, "/api/runs/run-1/notes", "PUT", json.dumps({
+        assert authed(server, "/api/w/default/runs/run-1/notes", "PUT", json.dumps({
             "text": "note", "revision": None}), cookie=cookie)[0] == 200
         assert authed(server, "/logout", "POST", cookie=cookie)[0] == 204
     assert "could not record audit event" in caplog.text

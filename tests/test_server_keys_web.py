@@ -71,7 +71,7 @@ def login(server, key):
     return headers["Set-Cookie"].split(";", 1)[0]
 
 
-def api(server, path="/api/server/keys", method="GET", payload=None, cookie=None, extra=None):
+def api(server, path="/api/w/default/keys", method="GET", payload=None, cookie=None, extra=None):
     headers = csrf(server) if method in ("POST", "DELETE") else {}
     headers["Cookie"] = server.cookie if cookie is None else cookie
     headers.update(extra or {})
@@ -134,7 +134,7 @@ def test_setup_startup_page_and_single_use(tmp_path, caplog):
         admin = httpd.users.get("admin")
         assert admin is not None and admin.role == "owner" and admin.password is not None
         cookie = hdrs["Set-Cookie"].split(";", 1)[0]
-        assert call(httpd, "/api/server/session", headers={"Cookie": cookie})[0] == 200
+        assert call(httpd, "/api/account/session", headers={"Cookie": cookie})[0] == 200
         assert setup(httpd, {"token": token})[0] == 404
         assert call(httpd, "/setup?token=" + token)[0] == 404
         assert all(token not in record.getMessage()
@@ -694,7 +694,7 @@ def test_api_public_url(tmp_path):
   + [({}, "invalid or reserved key name"), ([], "invalid JSON body"), (None, "invalid JSON body")])
 def test_create_invalid(server, payload, message):
     # Explicit JSON null still needs a body.
-    status, _, body = call(server, "/api/server/keys", "POST", json.dumps(payload),
+    status, _, body = call(server, "/api/w/default/keys", "POST", json.dumps(payload),
                            csrf(server, Cookie=server.cookie))
     assert status == 400 and json.loads(body) == {"error": message}
 
@@ -703,7 +703,7 @@ def test_create_value_error_is_private(server, monkeypatch):
     def failed(*args, **kwargs):
         raise ValueError("secret detail aml_x")
     monkeypatch.setattr(server.keys.repo, "insert", failed)
-    status, _, body = call(server, "/api/server/keys", "POST",
+    status, _, body = call(server, "/api/w/default/keys", "POST",
                            json.dumps({"name": "box", "scope": "sync"}),
                            csrf(server, Cookie=server.cookie))
     assert status == 400
@@ -713,14 +713,14 @@ def test_create_value_error_is_private(server, monkeypatch):
 
 def test_create_body_protocol(server):
     headers = csrf(server, Cookie=server.cookie)
-    assert call(server, "/api/server/keys", "POST", b"{}", {**headers, "Content-Type": "text/plain"})[0] == 415
-    assert call(server, "/api/server/keys", "POST", b"x" * 4097, headers)[0] == 413
-    assert call(server, "/api/server/keys", "POST", b"", {**headers, "Transfer-Encoding": "chunked"})[0] == 411
-    status, _, body = call(server, "/api/server/keys", "POST", b"{", headers)
+    assert call(server, "/api/w/default/keys", "POST", b"{}", {**headers, "Content-Type": "text/plain"})[0] == 415
+    assert call(server, "/api/w/default/keys", "POST", b"x" * 4097, headers)[0] == 413
+    assert call(server, "/api/w/default/keys", "POST", b"", {**headers, "Transfer-Encoding": "chunked"})[0] == 411
+    status, _, body = call(server, "/api/w/default/keys", "POST", b"{", headers)
     assert status == 400 and json.loads(body) == {"error": "invalid JSON body"}
 
 
-@pytest.mark.parametrize("path", ["/api/server/keys", "/setup"])
+@pytest.mark.parametrize("path", ["/api/w/default/keys", "/setup"])
 def test_validation_short_body_closes_connection(server, path):
     conn = http.client.HTTPConnection(*server.server_address[:2], timeout=5)
     try:
@@ -742,15 +742,15 @@ def test_revoke_keys_sessions_and_logs(server, caplog):
     admin_record, admin = server.keys.create("second", "admin")
     cookie = login(server, admin)
     other_cookie = login(server, admin)
-    assert api(server, "/api/server/keys/box", "DELETE")[2] == {"revoked": "box", "signed_out": False}
+    assert api(server, "/api/w/default/keys/box", "DELETE")[2] == {"revoked": "box", "signed_out": False}
     assert call(server, "/v2/whoami", headers={"Authorization": "Bearer " + sync})[0] == 401
-    assert api(server, "/api/server/keys/second", "DELETE")[0] == 200
+    assert api(server, "/api/w/default/keys/second", "DELETE")[0] == 200
     assert not any(entry["name"] == "second" for entry in server.web.sessions.list().values())
     for old in (cookie, other_cookie):
         assert api(server, cookie=old)[0] == 401
     _, new_key = server.keys.create("second", "admin")
     assert api(server, cookie=login(server, new_key))[0] == 200
-    status, hdrs, payload = api(server, "/api/server/keys/admin", "DELETE")
+    status, hdrs, payload = api(server, "/api/w/default/keys/admin", "DELETE")
     assert status == 200 and payload == {"revoked": "admin", "signed_out": True}
     assert "Max-Age=0" in hdrs["Set-Cookie"] and hdrs["Set-Cookie"].startswith("aml_session=;")
     assert api(server)[0] == 401
@@ -786,7 +786,7 @@ def test_drop_sessions_matches_name_and_hash(server):
 
 def test_last_admin_guard_and_cli_recovery(server, monkeypatch):
     before = server.keys.list()
-    status, _, payload = api(server, "/api/server/keys/admin", "DELETE")
+    status, _, payload = api(server, "/api/w/default/keys/admin", "DELETE")
     assert status == 409 and payload == {"error": "last admin key; create another admin key first, or use the CLI"}
     assert server.keys.list() == before
     monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
@@ -798,8 +798,8 @@ def test_env_allows_file_admin_revoke(tmp_path):
     with running(tmp_path / "data", env_key="e" * 32) as httpd:
         httpd.keys.create("admin", "admin")
         httpd.cookie = login(httpd, "e" * 32)
-        assert api(httpd, "/api/server/keys/admin", "DELETE")[0] == 200
-        status, _, payload = api(httpd, "/api/server/keys/env", "DELETE")
+        assert api(httpd, "/api/w/default/keys/admin", "DELETE")[0] == 200
+        status, _, payload = api(httpd, "/api/w/default/keys/env", "DELETE")
         assert status == 409 and payload == {"error": "environment key: remove AGENTICML_SERVER_KEY and restart"}
 
 
@@ -810,35 +810,35 @@ def test_concurrent_last_admin_revoke(server):
     def revoke(args):
         name, cookie = args
         barrier.wait(timeout=5)
-        return api(server, "/api/server/keys/" + name, "DELETE", cookie=cookie)[0]
+        return api(server, "/api/w/default/keys/" + name, "DELETE", cookie=cookie)[0]
     with ThreadPoolExecutor(max_workers=2) as pool:
         assert sorted(pool.map(revoke, [("admin", server.cookie), ("second", second)])) == [200, 409]
     assert len(server.keys.list()) == 1 and server.keys.has_admin()
 
 
 def test_api_gate_paths_and_bodyless_connections(server):
-    status, _, body = call(server, "/api/server/keys", headers={
+    status, _, body = call(server, "/api/w/default/keys", headers={
         "Authorization": "Bearer " + server.admin_key,
     })
     assert status == 401 and json.loads(body) == {"error": "login required"}
     for method in ("POST", "DELETE"):
-        path = "/api/server/keys" + ("/box" if method == "DELETE" else "")
+        path = "/api/w/default/keys" + ("/box" if method == "DELETE" else "")
         status, _, body = call(server, path, method, b"{}", {"Cookie": server.cookie})
         assert status == 403 and json.loads(body)["error"] == "cross-site request refused"
         status, _, body = call(server, path, method, b"{}", csrf(server))
         assert status == 401 and json.loads(body) == {"error": "login required"}
     for name in ("%2e%2e", "%2e"):
-        assert api(server, "/api/server/keys/" + name, "DELETE")[0] == 400
+        assert api(server, "/api/w/default/keys/" + name, "DELETE")[0] == 400
     for name in ("a%2Fb", "a/b", ""):
-        assert api(server, "/api/server/keys/" + name, "DELETE")[0] == 404
-    assert api(server, "/api/server/keys/missing", "DELETE")[0] == 404
+        assert api(server, "/api/w/default/keys/" + name, "DELETE")[0] == 404
+    assert api(server, "/api/w/default/keys/missing", "DELETE")[0] == 404
     assert api(server, "/api/server/unknown")[0] == 404
-    assert api(server, "/api/server/session", "POST")[0] == 405
+    assert api(server, "/api/account/session", "POST")[0] == 405
     assert api(server, method="PATCH")[0] == 405
-    assert api(server, "/api/server/keys/box")[0] == 405
+    assert api(server, "/api/w/default/keys/box")[0] == 405
     status, hdrs, _ = api(server, extra={"Content-Length": "3"})
     assert status == 200 and hdrs["Connection"] == "close"
-    status, hdrs, _ = api(server, "/api/server/keys/missing", "DELETE", extra={"Transfer-Encoding": "chunked"})
+    status, hdrs, _ = api(server, "/api/w/default/keys/missing", "DELETE", extra={"Transfer-Encoding": "chunked"})
     assert status == 404 and hdrs["Connection"] == "close"
 
 
@@ -848,15 +848,15 @@ def test_api_gate_paths_and_bodyless_connections(server):
     ("GET", "/login", "Transfer-Encoding", 200),
     ("GET", "/", "Content-Length", 303),
     ("GET", "/static/app.css", "Content-Length", 200),
-    ("GET", "/api/server/keys", "Content-Length", 200),
+    ("GET", "/api/w/default/keys", "Content-Length", 200),
     ("HEAD", "/login", "Content-Length", 404),
-    ("DELETE", "/api/server/keys/missing", "Transfer-Encoding", 404),
+    ("DELETE", "/api/w/default/keys/missing", "Transfer-Encoding", 404),
 ])
 def test_server_bodyless_response_has_one_close_header(tmp_path, method, path, header, expected):
     with running(tmp_path / "data") as httpd:
         path = path.format(token=httpd.web.setup_token)
         headers = {"Connection": "keep-alive"}
-        if path == "/" or path.startswith("/api/server/keys") or method == "HEAD":
+        if path == "/" or path.startswith("/api/w/default/keys") or method == "HEAD":
             _, key = httpd.keys.create("admin", "admin")
             headers["Cookie"] = login(httpd, key)
         if method == "DELETE":
@@ -904,7 +904,7 @@ def test_sync_key_cannot_reach_api(server):
     _, key = server.keys.create("box")
     for headers in ({"Authorization": "Bearer " + key},
                     {"Cookie": server.web._cookie_name() + "=" + key}):
-        status, _, body = call(server, "/api/server/keys", headers=headers)
+        status, _, body = call(server, "/api/w/default/keys", headers=headers)
         assert status == 401 and json.loads(body) == {"error": "login required"}
 
 
@@ -919,8 +919,8 @@ def test_store_corruption_503_and_cli(tmp_path, capsys, monkeypatch, nested):
         with monkeypatch.context() as patch:
             patch.setattr(KeyRepo, 'create', fail)
             patch.setattr(KeyRepo, 'revoke', fail)
-            for method, path, payload in [('POST', '/api/server/keys', {'name':'new', 'scope':'sync'}),
-                                          ('DELETE', '/api/server/keys/box', None)]:
+            for method, path, payload in [('POST', '/api/w/default/keys', {'name':'new', 'scope':'sync'}),
+                                          ('DELETE', '/api/w/default/keys/box', None)]:
                 status, _, body = api(httpd, path, method, payload)
                 assert status == 503 and body == {'error':'key store unavailable'}
             for action in (['create','--name','new'], ['revoke','box']):
@@ -980,9 +980,9 @@ def test_local_ui_has_no_key_routes(tmp_path):
     thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
     thread.start()
     try:
-        for path in ("/api/server/keys", "/setup", "/static/setup.js"):
+        for path in ("/api/w/default/keys", "/setup", "/static/setup.js"):
             assert call(httpd, path)[0] == 404
-        assert call(httpd, "/api/server/keys/box", "DELETE")[0] == 405
+        assert call(httpd, "/api/w/default/keys/box", "DELETE")[0] == 405
     finally:
         httpd.shutdown()
         thread.join(timeout=5)
