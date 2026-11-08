@@ -186,7 +186,8 @@ for machines.
 Approved by the owner on Nov 7, 2026: the [3.0 plan](on-prem-3.0-plan.md)
 and decisions D1–D9. Each package plan is written before its package
 starts. Order:
-16 → 17 → 18, then 18b and 21 in parallel, then 18c → 19 → 20; 22 and 23
+16 → 17 → 18, then 18b and 21 in parallel, then 18c → 19 → 20 (19.1,
+the Postgres backend, runs beside 18b; 19.2 needs 18c's tables); 22 and 23
 after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
@@ -197,10 +198,17 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 18.1a | Server core: accounts, workspaces, memberships, migration, `default` conversion, workspace-bound sync, CLI | 17 | Codex, Cursor | L | [plan](packages/18-workspaces.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
 | 18.1b | Route table, `/w/<slug>` and `/api/w/<slug>` routes, account and server-admin APIs, isolation suite | 18.1a | Cursor | L | [plan](packages/18-workspaces.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
 | 18.2 | Dashboard: workspace URLs, switcher, Team and Keys per workspace, admin page, picker | 18.1b | Cursor | M | [plan](packages/18-workspaces.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
-| 18b † | Firebase sign-in for the hosted service | 18 | Cursor | M | – | not started |
-| 18c † | Self-serve sign-up and usage limits (free plan: storage, uploads, requests, people) | 18b | Codex | M | – | not started |
-| 19 † | Postgres backend, row-level security, CI on both backends | 18 | Cursor | M | – | not started |
-| 20 † | Many server processes: database locks, shared throttle and sessions | 19 | Cursor | M | – | not started |
+| 18b † | Firebase sign-in for the hosted service | 18 | Cursor | M | [plan](packages/18b-firebase-sign-in.md) | plan ready |
+| 18b.1 | Token verification, account linking, `/auth/firebase`, invites, CLI, extras | 18 | Cursor | M | [plan](packages/18b-firebase-sign-in.md) | plan ready |
+| 18b.2 | Sign-in page with the vendored Firebase SDK, per-page CSP, UI tests | 18b.1 | Cursor | S | [plan](packages/18b-firebase-sign-in.md) | plan ready |
+| 18c † | Self-serve sign-up and usage limits (free plan: storage, uploads, requests, people) | 18b | Codex | M | [plan](packages/18c-signup-and-limits.md) | plan ready |
+| 18c.1 | Limits core: usage counters, limits file, storage/upload/request/people checks, CLI | 18b | Codex | M | [plan](packages/18c-signup-and-limits.md) | plan ready |
+| 18c.2 | Sign-up with a personal workspace, new workspace, free-workspace limit | 18c.1 | Codex | S | [plan](packages/18c-signup-and-limits.md) | plan ready |
+| 18c.3 | Usage page and banner, admin plan edit, `sync --follow` retry | 18c.2 | Codex | S | [plan](packages/18c-signup-and-limits.md) | plan ready |
+| 19 † | Postgres backend, row-level security, CI on both backends | 18 | Codex, Cursor | M | [plan](packages/19-postgres.md) | plan ready |
+| 19.1 | Postgres backend, dialect, portability audit, test harness, CI job | 18 | Codex | M | [plan](packages/19-postgres.md) | plan ready |
+| 19.2 | Row-level security policies and per-transaction workspace binding | 19.1, 18c | Cursor | S–M | [plan](packages/19-postgres.md) | plan ready |
+| 20 † | Many server processes: database locks, shared throttle and sessions | 19 | Cursor | M | [plan](packages/20-many-processes.md) | plan ready |
 | 21 | S3 object backend | 18 | Codex | M | – | not started |
 | 22 | Metric summaries; sort and filter runs by metric | 17, 18 | Cursor | M | – | not started |
 | 23 | Operator commands: end-to-end 2.x conversion test (the import itself landed in 16–18), `server backup`, `status`/`verify` on the database | 18 | Codex | S–M | – | not started |
