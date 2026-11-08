@@ -20,7 +20,6 @@ from .keys import (
 
 logger = logging.getLogger("agenticml.server.users")
 ROLES = ("viewer", "member", "admin")
-RUN_SCAN_MAX = 10000
 INVITE_HOURS = 72
 PASSWORD_MIN = 12
 PASSWORD_MAX = 1024
@@ -245,20 +244,11 @@ def resolve(keys, users, key_record) -> Principal | None:
         user.name, user.role, "key", key_record.name, user.id, user.generation)
 
 
-def attribution(run_dir):
-    """Return ``(owner_user, owner_key)`` from ``remote.json``; either may be None."""
-    path = Path(run_dir) / "remote.json"
-    try:
-        obj = json.loads(layout.read_file_nofollow(path).decode("utf-8"))
-        if not isinstance(obj, dict):
-            return None, None
-    except FileNotFoundError:
-        return None, None
-    except (OSError, ValueError, RecursionError, TypeError):
-        return None, None
-    owner = obj.get("owner") if isinstance(obj.get("owner"), str) else None
-    owner_key = obj.get("owner_key") if isinstance(obj.get("owner_key"), str) else None
-    return owner, owner_key
+def attribution(run_dir, db):
+    """Return ``(owner_user, owner_key)`` from the runs table; either may be None."""
+    from .db.repos import RunRepo
+
+    return RunRepo(db).attribution(Path(run_dir).name)
 
 
 class UserStore:
@@ -411,37 +401,6 @@ def _remote_is_inside(data, path):
         if parent == current:
             return False
         current = parent
-
-
-def _name_owns_runs(data_dir, name):
-    """True if any remote.json owner is ``name``, or the scan could not finish."""
-    data = Path(data_dir)
-    store = data / "store"
-    runs = store / "runs"
-    for path in (store, runs):
-        try:
-            info = os.lstat(path)
-        except FileNotFoundError:
-            return False
-        except OSError:
-            return True
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            return True
-    try:
-        with os.scandir(runs) as entries:
-            for index, entry in enumerate(entries):
-                if index >= RUN_SCAN_MAX:
-                    return True
-                if not entry.is_dir(follow_symlinks=False):
-                    continue
-                owner, _ = attribution(entry.path)
-                if owner == name:
-                    return True
-    except FileNotFoundError:
-        return False
-    except OSError:
-        return True
-    return False
 
 
 def _scan_runs(runs_dir):

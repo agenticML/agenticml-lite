@@ -15,7 +15,7 @@ from agenticml.server.app import make_server, prepare_data_dir
 from agenticml.server.db import (DatabaseBusy, DatabaseError, SchemaTooNew, connect,
                                 default_url, for_server_dir, resolve_url)
 from agenticml.server.db import sqlite as backend
-from agenticml.server.db.repos import AuditRepo, SessionRepo, SettingsRepo
+from agenticml.server.db.repos import AuditRepo, RunRepo, SessionRepo, SettingsRepo
 from agenticml.server.keys import KeyStore, KeyStoreUnavailable
 from agenticml.server.users import UserStore
 from agenticml.server.webauth import DbBuckets, LoginThrottle
@@ -132,7 +132,7 @@ def test_migrations_concurrent_idempotent_and_ordered(tmp_path, monkeypatch):
     with ThreadPoolExecutor(2) as pool:
         databases = list(pool.map(open_db, range(2)))
     with databases[0].transaction() as tx:
-        assert [r['version'] for r in tx.fetchall('SELECT * FROM schema_migrations')] == [1]
+        assert [r['version'] for r in tx.fetchall('SELECT * FROM schema_migrations')] == [1, 2]
     for db in databases: db.close()
     from agenticml.server.db import migrate
     migrations = tmp_path / 'migrations'
@@ -152,15 +152,14 @@ def test_migrations_concurrent_idempotent_and_ordered(tmp_path, monkeypatch):
 def test_failed_migration_rolls_back_ddl_and_version(tmp_path, monkeypatch):
     from agenticml.server.db import migrate
     path = tmp_path / 'state.db'
-    db = connect(url(path))
-    db.close()
     migrations = tmp_path / 'migrations'
     migrations.mkdir()
-    (migrations / '0001_initial.sql').write_text('')
+    (migrations / '0001_initial.sql').write_text('CREATE TABLE ok (id INTEGER);\n')
     (migrations / '0002_bad.sql').write_text('CREATE TABLE must_rollback (id INTEGER);\nINVALID SQL;\n')
-    with monkeypatch.context() as patch:
-        patch.setattr(migrate,'MIGRATIONS',migrations)
-        with pytest.raises(DatabaseError): connect(url(path))
+    monkeypatch.setattr(migrate, 'MIGRATIONS', migrations)
+    with pytest.raises(DatabaseError):
+        connect(url(path))
+    (migrations / '0002_bad.sql').unlink()
     db = connect(url(path))
     with db.transaction() as tx:
         assert tx.fetchone("SELECT name FROM sqlite_master WHERE name='must_rollback'") is None
@@ -174,7 +173,7 @@ def test_schema_too_new_server_and_cli_refuse(tmp_path, capsys):
     with db.transaction(write=True) as tx:
         tx.execute('INSERT INTO schema_migrations VALUES (?, ?, ?)', (999,'future',layout.format_timestamp()))
     db.close()
-    with pytest.raises(SchemaTooNew, match='knows up to 1'):
+    with pytest.raises(SchemaTooNew, match='knows up to 2'):
         make_server(tmp_path, port=0)
     for command in [('keys','list'),('users','list'),('audit',),('serve',),('status',),('verify',)]:
         assert cli.main(['server',*command,'--data',str(tmp_path)]) == 1
@@ -224,8 +223,9 @@ def test_import_v1_once_including_run_owners_and_audit(tmp_path):
     db = for_server_dir(directory)
     assert UserStore(directory).get('admin').role == 'admin'
     assert KeyStore(directory).list()[0].user == 'admin'
-    assert json.loads((tmp_path / 'store' / 'runs' / 'run-1' / 'remote.json').read_text()) == {
-        'owner':'admin','owner_key':'old'}
+    assert RunRepo(db).as_remote('run-1') == {'owner':'admin','owner_key':'old'}
+    assert (tmp_path / 'store' / 'runs' / 'run-1' / 'remote.json.2x').exists()
+    assert not (tmp_path / 'store' / 'runs' / 'run-1' / 'remote.json').exists()
     assert SettingsRepo(db).get('setup_closed') is not None
     assert {r['action'] for r in AuditRepo(db).tail(10)} == {'migration','login.ok'}
     backups = {p:p.stat().st_mtime_ns for p in directory.glob('*.2x')}

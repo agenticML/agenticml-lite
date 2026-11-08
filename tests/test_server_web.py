@@ -372,8 +372,8 @@ def test_last_sync_lineage_and_notes(server):
     note = json.dumps({"text": "server note", "revision": None}).encode()
     status, _, body, _ = authed(server, "/api/runs/run-1/notes", "PUT", note, cookie=cookie)
     assert status == 200
-    saved = server.root / "runs" / "run-1" / "notes.md"
-    assert saved.read_text(encoding="utf-8") == "server note"
+    assert server.note_index.read("run-1")["text"] == "server note"
+    assert not (server.root / "runs" / "run-1" / "notes.md").exists()
 
 
 def test_env_key_signs_in(tmp_path, monkeypatch):

@@ -1,11 +1,11 @@
 """Browser coverage for the Team page, account dialog, and role-aware nav."""
-import json
 import re
 import threading
 
 import pytest
 from agenticml.server.app import make_server
 from agenticml.server.audit import AuditLog
+from agenticml.server.runs import adopt_directory
 from agenticml.store import RunWriter, layout
 
 pytest.importorskip("playwright.sync_api")
@@ -35,10 +35,10 @@ def team_server(tmp_path, monkeypatch):
     writer = RunWriter.create(httpd.root, run_id="demo-run", meta={"project": "demo", "name": "synced-run"})
     writer.finish("finished")
     writer.close()
-    (httpd.root / "runs" / "demo-run" / "remote.json").write_text(json.dumps({
+    adopt_directory(httpd.root, httpd.root / "runs" / "demo-run", httpd.run_index, remote={
         "owner": "admin", "status": "finished", "fingerprint": "a" * 64,
-        "last_sync_at": layout.format_timestamp(), "sizes": {},
-    }))
+        "last_sync_at": layout.format_timestamp(),
+    })
     thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
     thread.start()
     url = f"http://127.0.0.1:{httpd.server_address[1]}"

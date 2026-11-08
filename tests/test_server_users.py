@@ -1,6 +1,6 @@
 """Users, roles, migration, ownership-by-user, and the users CLI."""
 from __future__ import annotations
-from server_db_helpers import key_object, user_object
+from server_db_helpers import imported_remote, key_object, user_object
 from agenticml.server.db import DatabaseError
 
 import hashlib
@@ -55,6 +55,8 @@ def write_run(root, run_id, owner, extra=None):
         payload.update(extra)
     (directory / "remote.json").write_text(json.dumps(payload))
     (directory / "meta.json").write_text(json.dumps({"run_id": run_id, "status": "running"}))
+    from server_db_helpers import index_if_open
+    index_if_open(root, directory, remote=payload)
     return directory
 
 
@@ -268,18 +270,21 @@ def test_migration_v1_keys_runs_and_idempotent(tmp_path, caplog):
     assert json.loads((data / "server" / "keys.json.2x").read_text())["version"] == 2
     assert {row["name"]: row["user"] for row in keys_obj["keys"]} == {
         "alpha": "admin", "beta": "admin"}
-    assert json.loads((root / "runs" / "run-a" / "remote.json").read_text()) == {
-        "owner": "admin", "owner_key": "alpha"}
-    assert json.loads((root / "runs" / "run-b" / "remote.json").read_text()) == {
-        "owner": "admin", "owner_key": "beta"}
-    assert (env_dir / "remote.json").read_bytes() == env_before
+    from agenticml.server.db import for_server_dir
+    from agenticml.server.db.repos import RunRepo
+    index = RunRepo(for_server_dir(data / "server", create=False))
+    assert index.as_remote("run-a") == {"owner": "admin", "owner_key": "alpha"}
+    assert index.as_remote("run-b") == {"owner": "admin", "owner_key": "beta"}
+    assert imported_remote(root / "runs" / "run-a")[0] == {"owner": "admin", "owner_key": "alpha"}
+    assert imported_remote(root / "runs" / "run-b")[0] == {"owner": "admin", "owner_key": "beta"}
+    assert imported_remote(env_dir)[1].read_bytes() == env_before
     assert "skipped unreadable remote.json in run-bad" in caplog.text
     assert ("migration skipped 1 corrupt or unreadable remote.json file(s); "
             "those runs keep their old owner") in caplog.text
     assert "migrated 2.0 keys to user admin (2 keys, 2 runs)" in caplog.text
     mtimes = {
         path: path.stat().st_mtime_ns
-        for path in (root / "runs").glob("*/remote.json")
+        for path in (root / "runs").glob("*/remote.json*")
     }
     caplog.clear()
     assert migrate(data) is True
@@ -345,7 +350,11 @@ def test_migrate_logs_skipped_remote_summary(tmp_path, caplog):
     assert "skipped unreadable remote.json in run-bad2" in caplog.text
     assert ("migration skipped 2 corrupt or unreadable remote.json file(s); "
             "those runs keep their old owner") in caplog.text
-    assert json.loads((data / "store" / "runs" / "run-a" / "remote.json").read_text()) == {
+    from agenticml.server.db import for_server_dir
+    from agenticml.server.db.repos import RunRepo
+    index = RunRepo(for_server_dir(data / "server", create=False))
+    assert index.as_remote("run-a") == {"owner": "admin", "owner_key": "alpha"}
+    assert imported_remote(data / "store" / "runs" / "run-a")[0] == {
         "owner": "admin", "owner_key": "alpha"}
 
 
@@ -423,7 +432,7 @@ def test_member_ownership_and_compat_state(tmp_path, monkeypatch):
         _, second = httpd.keys.create("two", user="alice")
         httpd.test_key = first
         assert put_meta(httpd)[0] == 200
-        remote = json.loads((httpd.root / "runs" / "run-1" / "remote.json").read_text())
+        remote = httpd.run_index.as_remote("run-1")
         assert remote == {"owner": "alice", "owner_key": "one"}
         assert append(httpd, b"{}\n", name="events.jsonl", key=second)[0] == 200
         size = (httpd.root / "runs" / "run-1" / "meta.json").stat().st_size
@@ -441,10 +450,9 @@ def test_member_ownership_and_compat_state(tmp_path, monkeypatch):
         assert status == 409
         assert payload["error"] == "run owned by another user"
         assert payload["owner"] == "alice" and payload["owner_user"] == "alice"
-        remote_path = httpd.root / "runs" / "run-1" / "remote.json"
-        obj = json.loads(remote_path.read_text())
-        obj["last_sync_key"] = "one"
-        remote_path.write_text(json.dumps(obj))
+        row = httpd.run_index.get("run-1")
+        httpd.run_index.commit_sync(
+            "run-1", row["status"], row["fingerprint"], row["last_sync_at"], "one")
         status, state, _ = request(httpd, "/v2/runs/run-1/state", key=other)
         assert status == 200
         assert "owner_key" not in state["remote"]
@@ -745,12 +753,16 @@ def test_add_scans_runs_before_write_lock(tmp_path, monkeypatch):
     users = UserStore(data / "server")
     order = []
 
-    def scan(*args, **kwargs):
-        order.append("scan")
-        from agenticml.server.users import _name_owns_runs as real
-        return real(*args, **kwargs)
+    from agenticml.server.db.repos import RunRepo
 
-    monkeypatch.setattr("agenticml.server.db.repos._name_owns_runs", scan)
+    def scan(self, name, tx=None):
+        order.append("scan")
+        if tx is None:
+            with self.db.transaction() as tx:
+                return tx.fetchone('SELECT 1 FROM runs WHERE owner_user=?', (name,)) is not None
+        return tx.fetchone('SELECT 1 FROM runs WHERE owner_user=?', (name,)) is not None
+
+    monkeypatch.setattr(RunRepo, "name_owns", scan)
     real_tx = users.db.transaction
 
     def wrapped(write=False):
@@ -792,11 +804,12 @@ def test_add_refuses_when_run_scan_truncated(tmp_path, monkeypatch):
     users.add("admin", role="admin")
     write_run(data / "store", "run-a", "zzz")
     write_run(data / "store", "run-b", "zzz")
-    monkeypatch.setattr("agenticml.server.users.RUN_SCAN_MAX", 1)
-    with pytest.raises(ClientError, match="reclaim-runs"):
-        users.add("alice")
-    users.add("alice", reclaim_runs=True)
+    users.add("alice")
     assert users.get("alice") is not None
+    with pytest.raises(ClientError, match="reclaim-runs"):
+        users.add("zzz")
+    users.add("zzz", reclaim_runs=True)
+    assert users.get("zzz") is not None
 
 
 def test_resolve_none_after_session_is_401(tmp_path, monkeypatch):
@@ -864,7 +877,7 @@ def test_promote_viewer_restores_writes(tmp_path, monkeypatch):
         assert put_meta(httpd, key=secret)[0] == 403
         httpd.users.set_role("view", "member")
         assert put_meta(httpd, key=secret)[0] == 200
-        remote = json.loads((httpd.root / "runs" / "run-1" / "remote.json").read_text())
+        remote = httpd.run_index.as_remote("run-1")
         assert remote == {"owner": "view", "owner_key": "vkey"}
 
 
@@ -906,9 +919,14 @@ def test_migrate_interrupted_partial_remote_rewrite(tmp_path):
     write_run(data / "store", "run-a", "admin", extra={"owner_key": "alpha"})
     write_run(data / "store", "run-b", "beta")
     assert migrate(data) is True
-    assert json.loads((data / "store" / "runs" / "run-a" / "remote.json").read_text()) == {
+    from agenticml.server.db import for_server_dir
+    from agenticml.server.db.repos import RunRepo
+    index = RunRepo(for_server_dir(data / "server", create=False))
+    assert index.as_remote("run-a") == {"owner": "admin", "owner_key": "alpha"}
+    assert index.as_remote("run-b") == {"owner": "admin", "owner_key": "beta"}
+    assert imported_remote(data / "store" / "runs" / "run-a")[0] == {
         "owner": "admin", "owner_key": "alpha"}
-    assert json.loads((data / "store" / "runs" / "run-b" / "remote.json").read_text()) == {
+    assert imported_remote(data / "store" / "runs" / "run-b")[0] == {
         "owner": "admin", "owner_key": "beta"}
     keys_obj = key_object(KeyStore(data / "server"))
     assert json.loads((data / "server" / "keys.json.2x").read_text())["version"] == 2

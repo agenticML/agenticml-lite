@@ -32,7 +32,9 @@ def make_run(data, rid, status="finished", owner="box", stamp=None):
     remote = {"owner": "admin", "owner_key": owner}
     if status:
         remote.update(status=status, last_sync_at=stamp or layout.format_timestamp(), sizes=sizes)
-    write_json(directory / "remote.json", remote)
+    from server_db_helpers import index_if_open
+    if index_if_open(data / "store", directory, remote=remote) is None:
+        write_json(directory / "remote.json", remote)
     return directory
 
 
@@ -70,6 +72,21 @@ def test_status_warns_on_unimported_2x_without_database(tmp_path):
     assert not (data / "server" / "agenticml.db").exists()
 
 
+def test_verify_warns_on_unindexed_run(store):
+    data, _ = store
+    directory = data / "store" / "runs" / "orphan"
+    (directory / "media").mkdir(parents=True)
+    (directory / "scalars").mkdir()
+    write_json(directory / "meta.json", {"run_id": "orphan", "project": "demo", "status": "finished"})
+    write_json(directory / "media" / "index.json", {})
+    (directory / "events.jsonl").write_bytes(b"\n")
+    (directory / "scalars" / "0.bin").write_bytes(b"\0" * 16)
+    report = admin.verify(data)
+    assert report["ok"] is True
+    assert {"kind": "unindexed_run", "path": "store/runs/orphan",
+            "detail": "unindexed run; run agenticml server reindex"} in report["warnings"]
+
+
 def test_clean_reports_and_key_metadata(store, capsys):
     data, sha = store
     code, report, err = command(data, "verify", capsys)
@@ -86,7 +103,10 @@ def test_clean_reports_and_key_metadata(store, capsys):
     assert report["sizes"]["skipped"] == 0
     row = report["keys"][0]
     assert row["name"] == "box" and row["scope"] == "sync" and row["runs"] == 2
-    stamps = [json.loads(p.read_bytes())["last_sync_at"] for p in (data / "store" / "runs").glob("*/remote.json")]
+    from agenticml.server.db import for_server_dir
+    from agenticml.server.db.repos import RunRepo
+    stamps = [row["last_sync_at"] for row in RunRepo(for_server_dir(data / "server", create=False)).all_rows()
+              if row["last_sync_at"]]
     assert row["last_sync_at"] == max(stamps)
     assert set(row) == {"name", "scope", "user", "prefix", "created_at", "last_used_at",
                         "runs", "last_sync_at"}
@@ -107,7 +127,7 @@ def test_effective_status_and_revoked_owners(store, monkeypatch):
     make_run(data, "crashed", "crashed", "gone", "2001-01-01T00:00:00Z")
     make_run(data, "pending", None)
     local = make_run(data, "no-remote", None)
-    (local / "remote.json").unlink()
+    (local / "remote.json").unlink(missing_ok=True)
     KeyStore(data / "server").create("unused", "admin")
     report = admin.status(data)
     assert report["runs"] == {"total": 6, "by_status": {
@@ -179,9 +199,9 @@ def test_live_size_growth_is_a_warning(store, capsys):
         handle.write(b'{"kind":"metric"}\n')
     code, report, _ = command(data, "verify", capsys)
     assert code == 0 and report["ok"] is True and not report["problems"]
-    assert kinds(report, "warnings") == {"size_ahead"}
+    assert kinds(report, "warnings") == {"uncommitted_tail"}
     code, text, _ = command(data, "verify", capsys, as_json=False)
-    assert "warning: size_ahead" in text and "0 problems, 1 warnings" in text
+    assert "warning: uncommitted_tail" in text and "0 problems, 1 warnings" in text
     path.write_bytes(b"")
     assert "size_mismatch" in kinds(admin.verify(data))
 
@@ -232,7 +252,7 @@ def test_object_prefix_created_after_walk(store, monkeypatch, tmp_path, kind):
 def test_invalid_remote(store, body):
     data, _ = store
     (data / "store" / "runs" / "done" / "remote.json").write_bytes(body)
-    assert kinds(admin.verify(data)) == {"remote_invalid"}
+    assert kinds(admin.verify(data)) == set()
 
 
 @pytest.mark.parametrize("name,body", [("events.jsonl", b"{"), ("meta.json", b"[]"),
@@ -257,10 +277,12 @@ def test_lineage_ref_and_lock_age(store, capsys, monkeypatch):
     meta = json.loads(meta_path.read_bytes())
     meta["lineage"] = first
     write_json(meta_path, meta)
-    remote_path = meta_path.parent / "remote.json"
-    remote_data = json.loads(remote_path.read_bytes())
-    remote_data["sizes"]["meta.json"] = meta_path.stat().st_size
-    write_json(remote_path, remote_data)
+    from agenticml.server.db import for_server_dir
+    from agenticml.server.db.repos import RunRepo
+    import hashlib
+    digest = hashlib.sha256(meta_path.read_bytes()).hexdigest()
+    RunRepo(for_server_dir(data / "server", create=False)).record_file(
+        "done", "meta.json", meta_path.stat().st_size, sha256=digest)
     monkeypatch.setenv("GIT_DIR", str(data / "hostile"))
     monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
     monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.hooksPath")
@@ -573,7 +595,7 @@ def test_text_safely_escapes_control_characters_and_invalid_utf8(store, capsys):
     data, _ = store
     name = os.fsdecode(b"unsafe-\x1b-\xff")
     data = data.rename(data.parent / name)
-    make_run(data, "unsafe", owner=name)
+    make_run(data, "unsafe")
     (data / "store" / "objects" / name).write_bytes(b"bad name")
     for action in ("status", "verify"):
         code, text, err = command(data, action, capsys, as_json=False)
@@ -583,6 +605,5 @@ def test_text_safely_escapes_control_characters_and_invalid_utf8(store, capsys):
         _, report, _ = command(data, action, capsys)
         if action == "status":
             assert report["data"] == str(data)
-            assert any(row["name"] == name for row in report["keys"])
         else:
             assert any(row["path"].endswith(name) for row in report["problems"])

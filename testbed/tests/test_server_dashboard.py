@@ -4,6 +4,7 @@ import threading
 
 import pytest
 from agenticml.server.app import make_server
+from agenticml.server.runs import adopt_directory, reconcile
 from agenticml.store import RunWriter, layout
 
 pytest.importorskip("playwright.sync_api")
@@ -61,11 +62,10 @@ def server_ui(tmp_path, monkeypatch):
     writer = RunWriter.create(httpd.root, run_id="demo-run", meta={"project": "demo", "name": "synced-run"})
     writer.finish("finished")
     writer.close()
-    remote = {
+    adopt_directory(httpd.root, httpd.root / "runs" / "demo-run", httpd.run_index, remote={
         "owner": "gpu-box", "status": "finished", "fingerprint": "a" * 64,
-        "last_sync_at": layout.format_timestamp(), "sizes": {},
-    }
-    (httpd.root / "runs" / "demo-run" / "remote.json").write_text(json.dumps(remote))
+        "last_sync_at": layout.format_timestamp(),
+    })
     thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
     thread.start()
     url = f"http://127.0.0.1:{httpd.server_address[1]}"
@@ -164,6 +164,7 @@ def test_lineage_inspector_shows_server_code_diff_message(page, tmp_path, monkey
     httpd = make_server(data, port=0)
     _, admin = httpd.keys.create("admin", "admin")
     ids = _lineage_pair(httpd.root)
+    reconcile(httpd.root, httpd.run_index)
     thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
     thread.start()
     server = {"url": f"http://127.0.0.1:{httpd.server_address[1]}", "admin": admin}

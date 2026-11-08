@@ -225,7 +225,7 @@ def test_stray_local_artifacts_json_is_not_uploaded(remote, tmp_path):
     assert push(remote, writer).complete
     remote_run = remote[0].root / "runs" / writer.run_id
     assert not (remote_run / "artifacts.json").exists()
-    sizes = json.loads((remote_run / "remote.json").read_bytes())["sizes"]
+    sizes = remote[0].run_index.as_remote(writer.run_id).get("sizes", {})
     assert "artifacts.json" not in sizes
 
 
@@ -324,7 +324,7 @@ def test_commit_sizes_include_artifacts_json(remote, tmp_path):
     assert push(remote, writer, artifacts=True).complete
     remote_run = remote[0].root / "runs" / writer.run_id
     mapping = remote_run / "artifacts.json"
-    sizes = json.loads((remote_run / "remote.json").read_bytes())["sizes"]
+    sizes = remote[0].run_index.as_remote(writer.run_id)["sizes"]
     assert sizes["artifacts.json"] == mapping.stat().st_size
 
 

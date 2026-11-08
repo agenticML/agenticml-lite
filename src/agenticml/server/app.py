@@ -1,6 +1,7 @@
 """Single-writer server lifecycle and data-directory safety."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import errno
 import logging
@@ -20,6 +21,8 @@ from agenticml.ui.server import DashboardServer, _browser_host, _loopback_bind
 from .keys import KeyStore, env_key_looks_weak, validate_env_key
 from .users import UserStore
 from .db import for_server_dir
+from .db.repos import NoteRepo, RunRepo
+from .runs import reconcile, store_paths_safe
 from .audit import AuditLog
 from .webauth import IDENTITY_PRESETS, WebAuth
 
@@ -100,7 +103,7 @@ def acquire_server_lock(server_dir):
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as exc:
         handle.close()
-        if exc.errno in (errno.EAGAIN, errno.EACCES):
+        if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
             raise ValueError(f"another agenticml server is using {Path(server_dir).parent}") from exc
         if exc.errno in (errno.ENOLCK, errno.ENOSYS, errno.EOPNOTSUPP):
             raise ValueError("server filesystem does not support flock; refusing to run unlocked") from exc
@@ -166,6 +169,8 @@ class IngestServer(DashboardServer):
         self.data_dir = Path(data)
         self.tmp_dir = self.data_dir / "server" / "tmp"
         self.db = db
+        self.run_index = RunRepo(db)
+        self.note_index = NoteRepo(db)
         self.keys = KeyStore(self.data_dir / "server", env_key, db=db)
         self.users = UserStore(self.data_dir / "server", db=db)
         self.audit = AuditLog(self.data_dir / "server", db=db)
@@ -195,6 +200,29 @@ class IngestServer(DashboardServer):
             header = IDENTITY_PRESETS[self.web.identity_header][0] if self.web.identity_header else "none"
             ranges = ", ".join(str(network) for network in self.web.trusted_proxies) or "none"
             logger.info("identity header %s; trusted proxies %s", header, ranges)
+
+    def _after_append_write(self, run_id, path):
+        """Test hook: runs after an append is fsynced and before the size commit."""
+
+    def _after_atomic_write(self, run_id, path):
+        """Test hook: runs after an atomic file is published and before it is recorded."""
+
+    def _after_meta_claim(self, run_id):
+        """Test hook: runs after claiming ownership and before writing meta.json."""
+
+    @contextmanager
+    def run_reader(self, run_id):
+        from agenticml.store import reader as store_reader
+
+        with self.reader_lock:
+            if run_id not in self.readers:
+                self.readers[run_id] = store_reader.RunReader(
+                    self.root, run_id, remote=self.run_index.normalized_remote)
+            self.readers.move_to_end(run_id)
+            while len(self.readers) > 64:
+                self.readers.popitem(last=False)
+            current = self.readers[run_id]
+        yield current
 
     def run_lock(self, run_id):
         with self.run_locks_lock:
@@ -277,6 +305,8 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
     public_url = _validate_public_url(public_url)
     data = resolve_data_dir(data)
     prepare_data_dir(data)
+    if not store_paths_safe(data / "store"):
+        raise ValueError("store or store/runs is a symlink or not a directory; fix or move it away")
     handle = acquire_server_lock(data / "server")
     db = None
     try:
@@ -285,6 +315,7 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
         cls = IPv6IngestServer if ":" in host else IngestServer
         server = cls(data, host, port, public_url, env_key, trusted_proxies, identity_header, db=db)
         server._server_lock = handle
+        reconcile(server.root, server.run_index)
         return server
     except BaseException:
         if db is not None:

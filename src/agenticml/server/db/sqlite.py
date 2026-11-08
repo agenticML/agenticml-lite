@@ -8,6 +8,7 @@ import sqlite3
 import stat
 import sys
 import threading
+import time
 
 from .dialect import SqliteDialect
 from .errors import DatabaseBusy, DatabaseError
@@ -101,11 +102,28 @@ class SqliteDatabase:
             _check_file(self.path)
             connection = self._new_connection()
             self._idle.append(connection)
-            mode = connection.execute('PRAGMA journal_mode=WAL').fetchone()[0]
+            # journal_mode=WAL needs an exclusive lock and does not always honour
+            # busy_timeout; a concurrent opener may be applying migrations.
+            deadline = time.monotonic() + 5.0
+            while True:
+                try:
+                    mode = connection.execute('PRAGMA journal_mode=WAL').fetchone()[0]
+                    break
+                except sqlite3.OperationalError as exc:
+                    if 'locked' not in str(exc).lower() or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.05)
             if mode.lower() != 'wal':
                 raise DatabaseError('SQLite could not enable WAL journal mode')
             from .migrate import migrate
-            migrate(self)
+            while True:
+                try:
+                    migrate(self)
+                    break
+                except DatabaseBusy:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.05)
         except sqlite3.Error as exc:
             self.close()
             if 'locked' in str(exc).lower():

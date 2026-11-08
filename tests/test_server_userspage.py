@@ -44,8 +44,8 @@ def test_list_me_keys_and_runs(server):
     writer = RunWriter.create(server.root, run_id="bob-run", meta={"project": "p", "name": "n"})
     writer.finish("finished")
     writer.close()
-    (server.root / "runs" / "bob-run" / "remote.json").write_text(
-        json.dumps({"owner": "bob"}))
+    from server_db_helpers import adopt_run
+    adopt_run(server.root, server.root / "runs" / "bob-run", server.run_index, owner="bob")
     status, _, body = api(server)
     assert status == 200 and body["me"] == "admin"
     by_name = {row["name"]: row for row in body["users"]}
@@ -58,16 +58,10 @@ def test_list_me_keys_and_runs(server):
 
 
 def test_run_count_scan_cap(server, monkeypatch):
-    monkeypatch.setattr(userspage, "RUN_SCAN_MAX", 2)
-    runs = server.root / "runs"
-    runs.mkdir(exist_ok=True)
-    for name in ("a", "b"):
-        (runs / name).mkdir()
-        (runs / name / "remote.json").write_text(json.dumps({"owner": "admin"}))
-    assert api(server)[2]["users"][0]["runs"] == 2
-    (runs / "c").mkdir()
-    (runs / "c" / "remote.json").write_text(json.dumps({"owner": "admin"}))
-    assert api(server)[2]["users"][0]["runs"] is None
+    from server_db_helpers import insert_run
+    for name in ("a", "b", "c"):
+        insert_run(server.run_index, name, owner_user="admin")
+    assert api(server)[2]["users"][0]["runs"] == 3
 
 
 def test_add_user_invite_and_audit(server):
@@ -110,7 +104,8 @@ def test_add_refuses_name_that_owns_runs(server):
     writer = RunWriter.create(server.root, run_id="old", meta={"project": "p", "name": "n"})
     writer.finish("finished")
     writer.close()
-    (server.root / "runs" / "old" / "remote.json").write_text(json.dumps({"owner": "ghost"}))
+    from server_db_helpers import adopt_run
+    adopt_run(server.root, server.root / "runs" / "old", server.run_index, owner="ghost")
     server.users.remove("ghost")
     status, _, body = api(server, method="POST", payload={"name": "ghost", "role": "member"})
     assert status == 400 and "reclaim-runs" in body["error"]

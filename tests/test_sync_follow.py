@@ -210,12 +210,8 @@ def test_heartbeat_keeps_running_fresh(remote, tmp_path, monkeypatch, follow_ctx
     writer = writer_at(tmp_path, status=None)
     thread, box = spawn(lambda: command(remote, writer, writer.run_id, "--follow", "--interval", "1"))
     try:
-        path = remote[0].root / "runs" / writer.run_id / "remote.json"
-
         def last_sync():
-            if not path.is_file():
-                return None
-            return json.loads(path.read_bytes()).get("last_sync_at")
+            return remote[0].run_index.as_remote(writer.run_id).get("last_sync_at")
 
         wait_until(lambda: last_sync() is not None, thread, box, follow_ctx, msg="run did not sync")
         first = last_sync()

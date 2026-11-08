@@ -14,6 +14,7 @@ import pytest
 
 from agenticml import cli
 from agenticml.server.app import make_server
+from agenticml.server.runs import reconcile
 from agenticml.server.up import bootstrap_admin
 from agenticml.server.keys import ClientError, KeyStore
 from agenticml.server.users import (
@@ -125,6 +126,7 @@ def test_viewer_reads_member_writes_notes(tmp_path, monkeypatch):
         writer = RunWriter.create(httpd.root, run_id="run-1", meta={"project": "p", "name": "n"})
         writer.finish("finished")
         writer.close()
+        reconcile(httpd.root, httpd.run_index)
 
         status, payload, hdrs = password_login(httpd, "view", PASSWORD)
         assert status == 200 and payload == {"ok": True, "user": "view", "role": "viewer"}

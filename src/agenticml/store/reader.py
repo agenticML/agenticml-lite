@@ -289,7 +289,7 @@ def _remote_status(remote: dict, now: float) -> str:
     return "stale"
 
 
-def list_runs(root, *, include_owner=False) -> list[dict]:
+def list_runs(root, *, include_owner=False, remote_lookup=None) -> list[dict]:
     """One dict per run, newest ``created_at`` first.
 
     Only ``meta.json`` is parsed for identity. Directories whose names are
@@ -300,6 +300,8 @@ def list_runs(root, *, include_owner=False) -> list[dict]:
     lock and an old heartbeat to be crashed. An unknown lock with an old
     heartbeat indicates a stale run. ``include_owner`` carries the normalized
     remote owner in ``_remote_owner`` for server dashboard list responses.
+    When given, ``remote_lookup(run_id)`` returns the normalised remote dict
+    (same shape as ``read_remote``) instead of reading ``remote.json``.
     """
     root_path = Path(root).expanduser().resolve()
     runs_root = str(root_path / "runs")
@@ -340,7 +342,7 @@ def list_runs(root, *, include_owner=False) -> list[dict]:
                         meta_run_id,
                     )
                 meta["run_id"] = dir_run_id
-            remote = read_remote(entry_path)
+            remote = remote_lookup(dir_run_id) if remote_lookup is not None else read_remote(entry_path)
             if include_owner:
                 meta["_remote_owner"] = remote["owner"] if remote else None
             meta["effective_status"] = _status_from(meta, entry_path, now, remote)
@@ -551,6 +553,24 @@ def _ensure_contained(root, path: Path) -> None:
         contained(root, path)
 
 
+def last_step_from_size(path: Path, size: int) -> int | None:
+    """Last complete record's step within the first ``size`` bytes, or None.
+
+    A torn tail inside that prefix is left unread. Missing files are None.
+    Symlinks raise from ``open_nofollow``.
+    """
+    complete = size - size % RECORD_SIZE
+    if complete < RECORD_SIZE:
+        return None
+    try:
+        with open_nofollow(path) as handle:
+            handle.seek(complete - RECORD_SIZE)
+            data = handle.read(RECORD_SIZE)
+            return RECORD_STRUCT.unpack(data)[0] if len(data) == RECORD_SIZE else None
+    except FileNotFoundError:
+        return None
+
+
 def _last_complete_step(path: Path) -> int | None:
     """Step in the last complete record of a scalar file, or None.
 
@@ -560,14 +580,9 @@ def _last_complete_step(path: Path) -> int | None:
     try:
         with open_nofollow(path) as handle:
             size = os.fstat(handle.fileno()).st_size
-            complete = size - size % RECORD_SIZE
-            if complete < RECORD_SIZE:
-                return None
-            handle.seek(complete - RECORD_SIZE)
-            data = handle.read(RECORD_SIZE)
-            return RECORD_STRUCT.unpack(data)[0] if len(data) == RECORD_SIZE else None
     except FileNotFoundError:
         return None
+    return last_step_from_size(path, size)
 
 
 def read_last_step(root, run_id: str) -> int | None:
@@ -590,12 +605,13 @@ class RunReader:
     ``remote()`` reads server-only ``remote.json`` when that file is present.
     """
 
-    def __init__(self, root, run_id: str) -> None:
+    def __init__(self, root, run_id: str, *, remote=None) -> None:
         if not valid_run_id(run_id):
             raise ValueError(f"invalid run id: {run_id!r}")
         self.root = Path(root).expanduser().resolve()
         self.run_dir = run_dir(self.root, run_id)
         self.run_id = run_id
+        self._remote_provider = remote
         self._lock = threading.RLock()
         self._path_cache: dict[str, Path] = {}
         self._meta_path = self._c(self.run_dir / META_NAME)
@@ -629,7 +645,13 @@ class RunReader:
             return path
 
     def remote(self) -> dict | None:
-        """Normalised ``remote.json``, or None if missing or invalid. Re-read on each call."""
+        """Normalised ``remote.json``, or None if missing or invalid. Re-read on each call.
+
+        When constructed with a ``remote`` provider, that callable is used
+        instead of reading ``remote.json``.
+        """
+        if self._remote_provider is not None:
+            return self._remote_provider(self.run_id)
         self._c(self.run_dir / REMOTE_NAME)
         return read_remote(self.run_dir)
 

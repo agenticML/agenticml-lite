@@ -110,6 +110,23 @@ def _summary(value, limit=None):
     return kept
 
 
+def run_list_row(meta):
+    """``/api/runs`` fields derived from ``meta.json``. Shared by local list and the server index."""
+    from ..lineage import run_task
+
+    fields = ("run_id", "project", "name", "created_at", "finished_at", "tags", "group")
+    row = {k: meta.get(k) for k in fields}
+    row["name"] = _text(meta.get("name"))
+    row["project"] = _text(meta.get("project"))
+    row["tags"] = _tags(meta.get("tags"))
+    row["status"] = meta.get("status")
+    row["summary"] = _summary(meta.get("summary"))
+    row["config"] = _summary(meta.get("config"), limit=_CONFIG_LIMIT)
+    row["task"], row["task_source"] = run_task(meta)
+    row["arch"] = _lineage_arch(meta)
+    return row
+
+
 def _unique(values):
     return list(dict.fromkeys(values))
 
@@ -636,7 +653,7 @@ def _lineage_arch(meta):
     return arch
 
 
-def _lineage_graph(root, project_filter):
+def _lineage_graph(root, project_filter, remote_lookup=None):
     """Nodes for one project (or every project) and parent edges inside that set.
 
     ``from`` is the parent and ``to`` is the child. An edge is omitted when the
@@ -645,7 +662,7 @@ def _lineage_graph(root, project_filter):
     Timestamps and repo roots are normalized once per request.
     """
     items = []
-    for meta in reader.list_runs(root):
+    for meta in reader.list_runs(root, remote_lookup=remote_lookup):
         if not isinstance(meta, dict):
             continue
         item = _lineage_item(meta)
@@ -1597,7 +1614,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             raise ValueError("short body")
         text, revision = _parse_note_body(body)
-        saved = notes.write_note(self.server.root, run_id, text, revision)
+        note_index = getattr(self.server, "note_index", None)
+        if note_index is not None:
+            saved = note_index.write(run_id, text, revision)
+        else:
+            saved = notes.write_note(self.server.root, run_id, text, revision)
         self._audit_note(run_id, saved)
         saved["writable"] = _notes_writable(self)
         self._json(saved)
@@ -1687,7 +1708,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     raise ValueError("invalid project")
             else:
                 project = None
-            return self._json(_lineage_graph(self.server.root, project))
+            lookup = None
+            index = getattr(self.server, "run_index", None)
+            if index is not None:
+                lookup = index.normalized_remote
+            return self._json(_lineage_graph(self.server.root, project, remote_lookup=lookup))
         if path == "/api/notes":
             if "project" in query:
                 project = (query.get("project") or [""])[0]
@@ -1695,36 +1720,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     raise ValueError("invalid project")
             else:
                 project = None
-            listed = notes.list_notes(self.server.root, project)
+            note_index = getattr(self.server, "note_index", None)
+            if note_index is not None:
+                listed = note_index.list_notes(project)
+            else:
+                listed = notes.list_notes(self.server.root, project)
             listed["writable"] = _notes_writable(self)
             return self._json(listed)
         if path == "/api/runs":
-            from ..lineage import run_task
-
-            fields = ("run_id", "project", "name", "created_at", "finished_at", "tags", "group")
+            run_index = getattr(self.server, "run_index", None)
+            if run_index is not None:
+                return self._json(run_index.dashboard_list())
             runs = []
-            for meta in reader.list_runs(self.server.root, include_owner=self.server.auth is not None):
+            for meta in reader.list_runs(self.server.root):
                 if not isinstance(meta, dict):
                     continue
-                row = {k: meta.get(k) for k in fields}
-                row["name"] = _text(meta.get("name"))
-                row["project"] = _text(meta.get("project"))
-                row["tags"] = _tags(meta.get("tags"))
+                row = run_list_row(meta)
                 row["status"] = meta.get("effective_status", meta.get("status"))
-                row["summary"] = _summary(meta.get("summary"))
-                row["config"] = _summary(meta.get("config"), limit=_CONFIG_LIMIT)
-                row["task"], row["task_source"] = run_task(meta)
-                row["arch"] = _lineage_arch(meta)
                 # meta.json and the scalars index do not record a step. The last
                 # _time.bin record is one seek, not a scan of the series files.
                 # Do not route this through run_reader: inserting every row
                 # evicts chart readers from the 64-entry LRU.
                 row["last_step"] = self._list_last_step(meta.get("run_id"))
                 last_sync_at = meta.get("last_sync_at")
-                if last_sync_at is not None or self.server.auth is not None:
+                if last_sync_at is not None:
                     row["last_sync_at"] = last_sync_at
-                if self.server.auth is not None:
-                    row["owner"] = meta.get("_remote_owner")
                 runs.append(row)
             return self._json(runs)
         if path.startswith("/api/runs/"):
@@ -1739,7 +1759,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if not run_path.resolve().is_relative_to(self.server.root / "runs"):
                 raise FileNotFoundError()
             if route == "notes":
-                note = notes.read_note(self.server.root, run_id)
+                note_index = getattr(self.server, "note_index", None)
+                if note_index is not None:
+                    note = note_index.read(run_id)
+                else:
+                    note = notes.read_note(self.server.root, run_id)
                 note["writable"] = _notes_writable(self)
                 return self._json(note)
             with self.server.run_reader(run_id) as run:
@@ -1750,8 +1774,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     if last_sync_at is not None or self.server.auth is not None:
                         result["last_sync_at"] = last_sync_at
                     if self.server.auth is not None:
-                        remote = reader.read_remote(run_path)
+                        remote = run.remote()
                         result["owner"] = remote["owner"] if remote else None
+                    index = getattr(self.server, "run_index", None)
+                    if index is not None:
+                        indexed = index.effective_status(run_id)
+                        if indexed is not None:
+                            result["status"] = indexed
                 elif route == "scalars":
                     limit = max(10, min(5000, int(arg("max_points", "1000"))))
                     start, end = arg("start"), arg("end")

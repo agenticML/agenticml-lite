@@ -7,6 +7,7 @@ import threading
 
 import pytest
 from agenticml.server.app import make_server
+from agenticml.server.runs import reconcile
 from agenticml.store import RunWriter
 
 pytest.importorskip("playwright.sync_api")
@@ -379,6 +380,7 @@ def metrics_server(fresh_server):
                           for step in range(3)])
     writer.finish("finished")
     writer.close()
+    reconcile(httpd.root, httpd.run_index)
     return {**fresh_server, "admin": admin, "run_id": writer.run_id}
 
 

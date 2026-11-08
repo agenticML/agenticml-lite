@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import logging
-import os
 
+from .db import DatabaseError
 from .keys import ClientError, KeyStoreUnavailable, LastAdminError, _NAME, validate_name
-from .keyspage import RUN_SCAN_MAX, command_host, read_json
+from .keyspage import command_host, read_json
 from .users import (
-    IdentityTaken, ROLES, UserNameTaken, UserNotFound, allowed, attribution,
+    IdentityTaken, ROLES, UserNameTaken, UserNotFound, allowed,
 )
 
 logger = logging.getLogger("agenticml.server.userspage")
@@ -21,23 +21,14 @@ def _user_name(name):
         raise ClientError("invalid or reserved user name")
 
 
-def _user_run_counts(root):
-    counts = {}
+def _user_run_counts(handler):
+    index = getattr(handler.server, "run_index", None)
+    if index is None:
+        return {}
     try:
-        with os.scandir(root / "runs") as entries:
-            for index, entry in enumerate(entries):
-                if index >= RUN_SCAN_MAX:
-                    return None
-                if not entry.is_dir(follow_symlinks=False):
-                    continue
-                owner, _owner_key = attribution(entry.path)
-                if owner is not None:
-                    counts[owner] = counts.get(owner, 0) + 1
-    except FileNotFoundError:
-        pass
-    except OSError:
+        return index.owner_user_counts()
+    except DatabaseError:
         return None
-    return counts
 
 
 def _invite_url(webauth, handler, token):
@@ -79,7 +70,7 @@ def handle(webauth, handler, path):
             except (KeyStoreUnavailable, OSError):
                 handler._json({"error": "key store unavailable"}, 503)
                 return
-            run_counts = _user_run_counts(handler.server.root)
+            run_counts = _user_run_counts(handler)
             handler._json({
                 "users": [_public_row(record, key_counts, run_counts) for record in records],
                 "me": principal.user,

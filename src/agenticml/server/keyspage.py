@@ -3,15 +3,14 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from urllib.parse import parse_qs, urlsplit
 
 from agenticml.ui.server import _reject_nonfinite
 from .keys import ClientError, KeyNameTaken, KeyStoreUnavailable, LastAdminError, UserRequired, _NAME, validate_name
-from .users import UserNotFound, allowed, attribution, resolve
+from .db import DatabaseError
+from .users import UserNotFound, allowed, resolve
 
 logger = logging.getLogger("agenticml.server.keyspage")
-RUN_SCAN_MAX = 10000
 
 
 def can_see(principal, record) -> bool:
@@ -79,24 +78,14 @@ def read_json(handler, limit):
     return payload
 
 
-def _run_counts(root):
-    counts = {}
+def _run_counts(handler):
+    index = getattr(handler.server, "run_index", None)
+    if index is None:
+        return {}
     try:
-        with os.scandir(root / "runs") as entries:
-            for index, entry in enumerate(entries):
-                if index >= RUN_SCAN_MAX:
-                    return None
-                if not entry.is_dir(follow_symlinks=False):
-                    continue
-                owner, owner_key = attribution(entry.path)
-                if owner_key is not None and owner is not None:
-                    pair = (owner_key, owner)
-                    counts[pair] = counts.get(pair, 0) + 1
-    except FileNotFoundError:
-        pass
-    except OSError:
+        return index.owner_key_counts()
+    except DatabaseError:
         return None
-    return counts
 
 
 def _audit(webauth, handler, action, record):
@@ -131,7 +120,7 @@ def handle(webauth, handler, path):
                 validate_name(user)
             records = sorted(webauth.keys.list(), key=lambda record: (
                 record.name == "env", record.created_at, record.name))
-            counts = _run_counts(handler.server.root)
+            counts = _run_counts(handler)
             rows = [{**record.to_public(), "runs": None if counts is None else counts.get((record.name, record.user), 0),
                      "revocable": can_revoke(principal, record) and record.name != "env",
                      "active": (resolved := resolve(webauth.keys, webauth.users, record)) is not None

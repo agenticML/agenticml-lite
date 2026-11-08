@@ -188,8 +188,7 @@ def test_sync_attribution(server, tmp_path, monkeypatch):
     with Client(url, second) as client:
         monkeypatch.setattr(layout, "format_timestamp", lambda: "2026-01-02T00:00:00Z")
         assert push((server, client), writer).complete
-    path = server.root / "runs" / writer.run_id / "remote.json"
-    remote = json.loads(path.read_bytes())
+    remote = server.run_index.as_remote(writer.run_id)
     assert remote["owner"] == "alice" and remote["owner_key"] == "laptop"
     assert remote["last_sync_key"] == "desktop"
     report = admin.status(server.data_dir)
@@ -225,7 +224,8 @@ def test_owner_only_in_server_dashboard(server, tmp_path):
     directory = server.root / "runs" / writer.run_id
     directory.mkdir(parents=True)
     (directory / "meta.json").write_bytes((writer.run_dir / "meta.json").read_bytes())
-    (directory / "remote.json").write_text(json.dumps({"owner": "alice", "owner_key": "laptop"}))
+    from server_db_helpers import adopt_run
+    adopt_run(server.root, directory, server.run_index, owner="alice", owner_key="laptop")
     for path in ("/api/runs", "/api/runs/" + writer.run_id):
         status, _, body = call(server, path, headers={"Cookie": server.cookie})
         assert status == 200
@@ -237,7 +237,7 @@ def test_owner_only_in_server_dashboard(server, tmp_path):
             assert status == 200
             result = json.loads(body)
             assert "owner" not in (result[0] if isinstance(result, list) else result)
-    (directory / "remote.json").unlink()
+    server.run_index.set_owner(writer.run_id, None, None)
     assert json.loads(call(server, "/api/runs", headers={"Cookie": server.cookie})[2])[0]["owner"] is None
 
 
@@ -296,12 +296,15 @@ def test_status_owner_key_fallback_and_unknown_writer(server):
     (directory / "meta.json").write_text(json.dumps({"run_id": "fallback", "status": "finished"}))
     payload = {"owner": "alice", "owner_key": "laptop", "status": "finished",
                "last_sync_at": "2026-01-01T00:00:00Z"}
-    (directory / "remote.json").write_text(json.dumps(payload))
+    from server_db_helpers import adopt_run
+    adopt_run(server.root, directory, server.run_index, owner="alice", owner_key="laptop",
+              status="finished", last_sync_at=payload["last_sync_at"])
     report = admin.status(server.data_dir)
     row = next(r for r in report["keys"] if r["name"] == "laptop")
     assert row["last_sync_at"] == payload["last_sync_at"] and row["runs"] == 1
     payload["last_sync_key"] = "unknown"
-    (directory / "remote.json").write_text(json.dumps(payload))
+    adopt_run(server.root, directory, server.run_index, owner="alice", owner_key="laptop",
+              status="finished", last_sync_at=payload["last_sync_at"], last_sync_key="unknown")
     report = admin.status(server.data_dir)
     row = next(r for r in report["keys"] if r["name"] == "unknown")
     assert row["revoked"] and row["user"] == "alice" and row["runs"] == 0
@@ -350,9 +353,9 @@ def test_reused_key_name_counts_are_per_user(server):
         directory = server.root / "runs" / user
         directory.mkdir(parents=True)
         (directory / "meta.json").write_text(json.dumps({"run_id": user, "status": "finished"}))
-        (directory / "remote.json").write_text(json.dumps({
-            "owner": user, "owner_key": "laptop", "last_sync_key": "laptop",
-            "status": "finished", "last_sync_at": "2026-01-01T00:00:00Z"}))
+        from server_db_helpers import adopt_run
+        adopt_run(server.root, directory, server.run_index, owner=user, owner_key="laptop",
+                  last_sync_key="laptop", status="finished", last_sync_at="2026-01-01T00:00:00Z")
     assert next(r for r in api(server)[2]["keys"] if r["name"] == "laptop")["runs"] == 0
     # Reuse for the member as well: their key row cannot inherit admin's run.
     server.keys.revoke("laptop")
@@ -373,8 +376,9 @@ def test_no_owner_key_counts_only_toward_user(server):
     directory = server.root / "runs" / "legacy"
     directory.mkdir(parents=True)
     (directory / "meta.json").write_text(json.dumps({"run_id": "legacy", "status": "finished"}))
-    (directory / "remote.json").write_text(json.dumps({
-        "owner": "admin", "status": "finished", "last_sync_at": "2026-01-01T00:00:00Z"}))
+    from server_db_helpers import adopt_run
+    adopt_run(server.root, directory, server.run_index, owner="admin",
+              status="finished", last_sync_at="2026-01-01T00:00:00Z")
     assert next(r for r in api(server)[2]["keys"] if r["name"] == "admin")["runs"] == 0
     report = admin.status(server.data_dir)
     assert report["users"][0]["runs"] == 1
@@ -519,9 +523,10 @@ def test_status_owner_key_without_owner_has_no_attribution(server, owner_fields)
     directory = server.root / "runs" / "ownerless"
     directory.mkdir(parents=True)
     (directory / "meta.json").write_text(json.dumps({"run_id": "ownerless", "status": "finished"}))
-    (directory / "remote.json").write_text(json.dumps({
-        **owner_fields, "owner_key": "admin", "last_sync_key": "unknown",
-        "status": "finished", "last_sync_at": "2026-01-01T00:00:00Z"}))
+    from server_db_helpers import adopt_run
+    owner = owner_fields.get("owner") if isinstance(owner_fields.get("owner"), str) else None
+    adopt_run(server.root, directory, server.run_index, owner=owner, owner_key="admin",
+              last_sync_key="unknown", status="finished", last_sync_at="2026-01-01T00:00:00Z")
     report = admin.status(server.data_dir)
     assert report["runs"]["total"] == 1
     assert [(row["name"], row["user"]) for row in report["keys"]] == [("admin", "admin")]
@@ -575,21 +580,23 @@ def test_env_admin_requires_user_in_api_and_cannot_delete_env(tmp_path):
 
 def test_commit_without_principal_key(tmp_path):
     (tmp_path / "meta.json").write_text(json.dumps({"status": "finished"}))
-    written = {}
     recorded = []
+    committed = []
     handler = SimpleNamespace(
         principal=Principal("alice", "member", "proxy", key=None),
         server=SimpleNamespace(
             audit=SimpleNamespace(record=lambda *args: recorded.append(args)),
-            web=SimpleNamespace(client_address=lambda handler: "127.0.0.1")),
-        _target=lambda directory, name: directory / name,
-        _write_json=lambda directory, name, payload: written.update(payload))
-    result = ingest.IngestHandler._commit(handler, tmp_path, json.dumps({
-        "status": "finished", "fingerprint": "a" * 64, "sizes": {}}).encode(),
+            web=SimpleNamespace(client_address=lambda handler: "127.0.0.1"),
+            run_index=SimpleNamespace(
+                files=lambda run_id: {},
+                commit_sync=lambda *args: committed.append(args))),
+        _target=lambda directory, name: directory / name)
+    result = ingest.IngestHandler._commit(
+        handler, tmp_path.name, tmp_path, json.dumps({
+            "status": "finished", "fingerprint": "a" * 64, "sizes": {}}).encode(),
         {"owner": "alice", "owner_key": "laptop"})
     assert result[1] == 200
-    assert written["last_sync_key"] is None
-    assert written["owner"] == "alice" and written["owner_key"] == "laptop"
+    assert committed[0][1:3] == ("finished", "a" * 64) and committed[0][4] is None
     assert recorded == []  # The caller records only after releasing run_lock.
     ingest.IngestHandler._audit_run(handler, tmp_path.name, result[2])
     assert recorded == [("alice", "proxy", "run.finish", tmp_path.name,
@@ -610,5 +617,5 @@ def test_runs_list_reads_remote_once_per_run(server, tmp_path, monkeypatch):
     monkeypatch.setattr(reader, "read_remote", counted)
     status, _, raw = call(server, "/api/runs", headers={"Cookie": server.cookie})
     assert status == 200 and json.loads(raw)[0]["owner"] == "admin"
-    assert len(calls) == 1
+    assert len(calls) == 0
     assert "_remote_owner" not in json.loads(raw)[0]

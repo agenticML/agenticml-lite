@@ -612,15 +612,9 @@ def test_list_public_fields_runs_order_and_env(tmp_path):
         with httpd.keys.db.transaction(write=True) as tx:
             for record in records:
                 tx.execute('UPDATE keys SET created_at=? WHERE name=?', (record.created_at, record.name))
-        runs = httpd.root / "runs"
-        runs.mkdir(exist_ok=True)
+        from server_db_helpers import insert_run
         for name, owner in (("one", "z-box"), ("two", "z-box"), ("three", "a-box")):
-            path = runs / name
-            path.mkdir()
-            (path / "remote.json").write_text(json.dumps({"owner": "admin", "owner_key": owner}))
-        (runs / "linked").symlink_to(runs / "one", target_is_directory=True)
-        (runs / "bad").mkdir()
-        (runs / "bad" / "remote.json").write_text("broken")
+            insert_run(httpd.run_index, name, owner_user="admin", owner_key=owner)
         status, _, payload = api(httpd)
         assert status == 200
         assert payload["host"] == f"http://127.0.0.1:{httpd.server_address[1]}"
@@ -636,14 +630,10 @@ def test_list_public_fields_runs_order_and_env(tmp_path):
 
 
 def test_run_count_scan_cap(server, monkeypatch):
-    monkeypatch.setattr(keyspage, "RUN_SCAN_MAX", 2)
-    runs = server.root / "runs"
-    runs.mkdir(exist_ok=True)
-    for name in ("a", "b"):
-        (runs / name).mkdir()
-    assert api(server)[2]["keys"][0]["runs"] == 0
-    (runs / "c").mkdir()
-    assert api(server)[2]["keys"][0]["runs"] is None
+    from server_db_helpers import insert_run
+    for name in ("a", "b", "c"):
+        insert_run(server.run_index, name, owner_user="admin", owner_key="admin")
+    assert api(server)[2]["keys"][0]["runs"] == 3
 
 
 @pytest.mark.parametrize("state", ["missing", "file", "unreadable"])
@@ -662,7 +652,7 @@ def test_run_counts_unavailable(server, state):
         status, _, payload = api(server)
         assert status == 200
         assert len(payload["keys"]) == 2
-        assert all(row["runs"] == (0 if state == "missing" else None) for row in payload["keys"])
+        assert all(row["runs"] == 0 for row in payload["keys"])
     finally:
         if state == "unreadable":
             runs.chmod(0o700)
@@ -1016,5 +1006,5 @@ def test_api_key_cli_login_and_sync(server, tmp_path, monkeypatch):
         assert remote.series(name) == source.series(name)
     assert (remote.run_dir / "events.jsonl").read_bytes() == (source.run_dir / "events.jsonl").read_bytes()
     assert (remote.run_dir / "media/index.json").read_bytes() == (source.run_dir / "media/index.json").read_bytes()
-    remote_obj = json.loads((remote.run_dir / "remote.json").read_bytes())
+    remote_obj = server.run_index.as_remote(writer.run_id)
     assert remote_obj["owner"] == "admin" and remote_obj["owner_key"] == "box"

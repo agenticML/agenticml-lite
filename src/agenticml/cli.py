@@ -16,6 +16,7 @@ agenticml code in the script:
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import logging
 import math
@@ -757,6 +758,42 @@ def cmd_server_verify(args):
     return _cmd_server_report(args, verify=True)
 
 
+def cmd_server_reindex(args):
+    from .server.admin import _data_root
+    from .server.app import acquire_server_lock
+    from .server.db import for_server_dir
+    from .server.db.errors import DatabaseError, DatabaseUrlError, SchemaTooNew
+    from .server.db.repos import RunRepo
+    from .server.runs import reindex
+
+    handle = None
+    try:
+        data, root = _data_root(args.data)
+        try:
+            handle = acquire_server_lock(data / "server")
+        except ValueError as exc:
+            cause = exc.__cause__
+            if isinstance(cause, OSError) and cause.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                raise ValueError("stop the server first") from exc
+            raise
+        db = for_server_dir(data / "server", args.database)
+        counts = reindex(root, RunRepo(db))
+        print(f"adopted {counts['adopted']}, removed {counts['removed']}, rebuilt {counts['rebuilt']}")
+        return 0
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+    except (DatabaseError, DatabaseUrlError, SchemaTooNew) as exc:
+        print(f"agenticml server: {exc}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, OverflowError) as exc:
+        print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
+        return 2
+    finally:
+        if handle is not None:
+            handle.close()
+
+
 def cmd_du(args):
     import json
     from .store.gc import _format_bytes, usage
@@ -1336,6 +1373,10 @@ def main(argv=None):
         child.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
         child.add_argument("--json", action="store_true")
         child.set_defaults(func=func)
+    p_reindex = server_sub.add_parser("reindex", help="Rebuild the run index from on-disk files")
+    p_reindex.add_argument("--data", default=None)
+    p_reindex.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_reindex.set_defaults(func=cmd_server_reindex)
     p_keys = server_sub.add_parser("keys", help="Create, list, or revoke API keys")
     keys_sub = p_keys.add_subparsers(dest="keys_action", required=True)
     for action in ("create", "list", "revoke"):
