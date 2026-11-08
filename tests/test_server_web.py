@@ -286,7 +286,8 @@ def test_session_endpoint_and_local_ui(server, tmp_path):
     status, _, body, _ = authed(server, "/api/account/session")
     assert status == 200
     assert json.loads(body) == {
-        "server": True, "user": "admin", "role": "admin", "via": "key", "key": "admin",
+        "server": True, "user": "admin", "role": "admin", "via": "key", "auth": "password",
+        "key": "admin",
         "scope": "admin",
         "can": {"notes": True, "own_keys": True, "all_keys": True, "users": True, "audit": True},
         "password_set": False, "identity_proxy": False,
@@ -408,7 +409,8 @@ def test_env_key_signs_in(tmp_path, monkeypatch):
         status, _, body, _ = authed(httpd, "/api/account/session", cookie=hdrs["Set-Cookie"])
         assert status == 200
         assert json.loads(body) == {
-            "server": True, "user": "env", "role": "admin", "via": "key", "key": "env",
+            "server": True, "user": "env", "role": "admin", "via": "key", "auth": "password",
+            "key": "env",
             "scope": "admin",
             "can": {"notes": True, "own_keys": True, "all_keys": True, "users": True, "audit": True},
             "password_set": False, "identity_proxy": False,

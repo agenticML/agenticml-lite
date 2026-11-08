@@ -6,9 +6,44 @@
     <meta name="color-scheme" content="light dark" />
     <title>agenticml · Sign in</title>
     <link rel="stylesheet" href="/static/app.css" />
+    <script src="/static/vendor/firebase/firebase-app-compat.js" defer></script>
+    <script src="/static/vendor/firebase/firebase-auth-compat.js" defer></script>
+    <script src="/static/firebase-login.js" defer></script>
   </head>
   <body class="login-page">
-    <h1>Sign in</h1>
-    <main></main>
+    <main class="login-card">
+      <p class="eyebrow">agenticml</p>
+      <h1>Sign in</h1>
+      <button id="google" class="btn btn-primary" type="button">Continue with Google</button>
+      <form id="email-login" autocomplete="off">
+        <label class="field-label" for="email">Email</label>
+        <input id="email" class="field" type="email" name="email" autocomplete="username" required />
+        <label class="field-label" for="password">Password</label>
+        <input
+          id="password"
+          class="field"
+          type="password"
+          name="password"
+          autocomplete="current-password"
+          required
+        />
+        <button class="btn btn-primary" type="submit">Sign in</button>
+      </form>
+      <p>
+        <button id="create-account" class="btn btn-ghost" type="button">Create account</button>
+      </p>
+      <p>
+        <button id="forgot" class="btn btn-ghost" type="button">Forgot password</button>
+      </p>
+      <p id="error" class="error" role="alert" hidden></p>
+      <p>
+        <button id="resend" class="btn btn-ghost" type="button" hidden>Resend email</button>
+      </p>
+      <p>
+        <button id="continue-without-invite" class="btn btn-ghost" type="button" hidden>
+          Continue without the invite
+        </button>
+      </p>
+    </main>
   </body>
 </html>

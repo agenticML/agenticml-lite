@@ -492,66 +492,72 @@ function openAccountDialog() {
   const host = el("dialog", { class: "key-dialog", "aria-label": "Account" });
   const error = el("p", { class: "error", role: "alert", hidden: true });
   const status = el("p", { class: "muted", role: "status", hidden: true });
-  const current = session.password_set
-    ? el("input", {
-        id: "account-current", class: "field", type: "password",
-        autocomplete: "current-password", required: true,
-      })
-    : null;
-  const next = el("input", {
-    id: "account-new", class: "field", type: "password",
-    minLength: 12, maxLength: 1024, autocomplete: "new-password", required: true,
-  });
-  const confirm = el("input", {
-    id: "account-confirm", class: "field", type: "password",
-    minLength: 12, maxLength: 1024, autocomplete: "new-password", required: true,
-  });
-  const save = el("button", { type: "submit", class: "btn btn-primary", text: "Change password" });
-  const form = el("form", { class: "stack" },
-    current
-      ? el("label", { class: "field-label", htmlFor: current.id, text: "Current password" })
-      : null,
-    current,
-    el("label", { class: "field-label", htmlFor: next.id, text: "New password" }), next,
-    el("label", { class: "field-label", htmlFor: confirm.id, text: "Confirm password" }), confirm,
-    save);
-  form.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    error.hidden = true;
-    status.hidden = true;
-    if (next.value !== confirm.value) {
-      error.textContent = "Passwords do not match";
-      error.hidden = false;
-      return;
-    }
-    save.disabled = true;
-    try {
-      const response = await fetch(api("/account/password"), {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "X-AgenticML-Request": "1", "Content-Type": "application/json" },
-        body: JSON.stringify(current
-          ? { current: current.value, new: next.value }
-          : { new: next.value }),
-      });
-      const data = await response.json().catch(() => null);
-      if (response.status === 401 && data?.error === "login required") {
-        location.assign("/login");
+  const firebaseAuth = session.auth === "firebase";
+  let current = null;
+  let next = null;
+  let form = null;
+  if (!firebaseAuth) {
+    current = session.password_set
+      ? el("input", {
+          id: "account-current", class: "field", type: "password",
+          autocomplete: "current-password", required: true,
+        })
+      : null;
+    next = el("input", {
+      id: "account-new", class: "field", type: "password",
+      minLength: 12, maxLength: 1024, autocomplete: "new-password", required: true,
+    });
+    const confirm = el("input", {
+      id: "account-confirm", class: "field", type: "password",
+      minLength: 12, maxLength: 1024, autocomplete: "new-password", required: true,
+    });
+    const save = el("button", { type: "submit", class: "btn btn-primary", text: "Change password" });
+    form = el("form", { class: "stack" },
+      current
+        ? el("label", { class: "field-label", htmlFor: current.id, text: "Current password" })
+        : null,
+      current,
+      el("label", { class: "field-label", htmlFor: next.id, text: "New password" }), next,
+      el("label", { class: "field-label", htmlFor: confirm.id, text: "Confirm password" }), confirm,
+      save);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      error.hidden = true;
+      status.hidden = true;
+      if (next.value !== confirm.value) {
+        error.textContent = "Passwords do not match";
+        error.hidden = false;
         return;
       }
-      if (!response.ok) throw new Error(
-        (typeof data?.error === "string" && data.error) || `Password change failed (${response.status})`);
-      if (serverSession) serverSession.password_set = true;
-      status.textContent = "Password updated";
-      status.hidden = false;
-      form.reset();
-    } catch (reason) {
-      error.textContent = reason.message;
-      error.hidden = false;
-    } finally {
-      save.disabled = false;
-    }
-  });
+      save.disabled = true;
+      try {
+        const response = await fetch(api("/account/password"), {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "X-AgenticML-Request": "1", "Content-Type": "application/json" },
+          body: JSON.stringify(current
+            ? { current: current.value, new: next.value }
+            : { new: next.value }),
+        });
+        const data = await response.json().catch(() => null);
+        if (response.status === 401 && data?.error === "login required") {
+          location.assign("/login");
+          return;
+        }
+        if (!response.ok) throw new Error(
+          (typeof data?.error === "string" && data.error) || `Password change failed (${response.status})`);
+        if (serverSession) serverSession.password_set = true;
+        status.textContent = "Password updated";
+        status.hidden = false;
+        form.reset();
+      } catch (reason) {
+        error.textContent = reason.message;
+        error.hidden = false;
+      } finally {
+        save.disabled = false;
+      }
+    });
+  }
   host.append(
     el("div", { class: "heading" },
       el("h2", { text: "Account" }),
@@ -561,7 +567,7 @@ function openAccountDialog() {
       el("div", {}, el("dt", { text: "Role" }), el("dd", { text: currentWorkspaceRole(session) })),
       el("div", {}, el("dt", { text: "Sign-in" }), el("dd", { text: viaLabel(session.via) }))),
     workspaceSwitcher(session),
-    form, error, status,
+    ...(firebaseAuth ? [] : [form, error, status]),
   );
   host.addEventListener("keydown", (event) => {
     if (event.key === "Tab") trapTab(host, event);
@@ -572,7 +578,7 @@ function openAccountDialog() {
   }, { once: true });
   document.body.append(host);
   host.showModal();
-  (current || next).focus();
+  (firebaseAuth ? host.querySelector("button") : (current || next))?.focus();
 }
 // Focus hosts own their keyboard handler so nested focus views close independently.
 function focus(title, subtitle, className = "", onClose = () => {}) {

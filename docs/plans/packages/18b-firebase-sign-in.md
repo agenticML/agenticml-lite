@@ -169,7 +169,8 @@ display_name, created_by, tx)` for credential-less accounts, and
 
 ## Sign-in page (18b.2)
 
-`static/firebase-login.html` + `static/firebase-login.js` (module), served
+`static/firebase-login.html` + `static/firebase-login.js` (classic script
+(the vendored compat builds are UMD)), served
 at `GET /login` and `GET /invite` when Firebase is on; vendored SDK files
 served from `/static/vendor/firebase/*.js` through `_ASSETS`
 (`text/javascript`). The page:
@@ -181,6 +182,8 @@ served from `/static/vendor/firebase/*.js` through `_ASSETS`
   (`signInWithEmailAndPassword`, "Create account" with
   `createUserWithEmailAndPassword` + `sendEmailVerification`, "Forgot
   password" with `sendPasswordResetEmail`);
+- on /invite a blocked popup asks the user to allow pop-ups instead of
+  redirecting, so the invite token is never stored;
 - after sign-in gets `getIdToken(true)`, posts it (with the invite token in
   invite mode), signs out of Firebase, then goes to `/` (or shows the
   server's error text: no access, unverified email, wrong invite email);

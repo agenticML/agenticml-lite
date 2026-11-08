@@ -15,6 +15,8 @@ from cryptography.x509.oid import NameOID
 
 from agenticml import cli
 from agenticml.server.app import make_server, prepare_data_dir
+from agenticml.server.webauth import firebase_login_csp
+from agenticml.ui.server import _CSP
 from agenticml.server.db import connect, for_server_dir
 from agenticml.server.db.errors import DatabaseError
 from agenticml.server.db.repos import AuditRepo
@@ -28,7 +30,7 @@ from agenticml.server.keys import ClientError
 from agenticml.server.runs import reconcile
 from agenticml.store import RunWriter
 from test_server_signin import PASSWORD, running
-from test_server_web import authed, call, csrf
+from test_server_web import authed, call, csrf, login
 
 PROJECT = 'demo-project'
 NOW = 1_700_000_000
@@ -767,8 +769,11 @@ def test_password_and_key_login_and_setup_404_when_firebase_on(tmp_path, monkeyp
             csrf(httpd))
         assert status == 404 and json.loads(body) == {'error': 'not found'}
         status, _, page = call(httpd, '/login')
-        assert status == 200 and b'<main></main>' in page and b'<h1>Sign in</h1>' in page
-        assert b'<script' not in page
+        assert status == 200 and b'<h1>Sign in</h1>' in page
+        assert b'/static/firebase-login.js' in page
+        assert b'/static/vendor/firebase/firebase-app-compat.js' in page
+        assert b'/static/vendor/firebase/firebase-auth-compat.js' in page
+        assert b'onclick=' not in page and b'<script>' not in page
         status, _, invite_page = call(httpd, '/invite?token=abc')
         assert status == 200 and invite_page == page
         status, _, body = call(
@@ -852,6 +857,84 @@ def test_firebase_config_route(tmp_path, monkeypatch):
         got_post = _post_firebase(httpd, _live_token())
         assert got_post[0] == unknown_post[0]
         assert json.loads(got_post[2]) == json.loads(unknown_post[2])
+
+
+_FIREBASE_JS = (
+    '/static/firebase-login.js',
+    '/static/vendor/firebase/firebase-app-compat.js',
+    '/static/vendor/firebase/firebase-auth-compat.js',
+)
+_FIREBASE_LOGIN_CSP = (
+    "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+    "script-src 'self' https://apis.google.com; object-src 'none'; base-uri 'none'; "
+    "frame-ancestors 'none'; connect-src 'self' https://identitytoolkit.googleapis.com "
+    "https://securetoken.googleapis.com https://www.googleapis.com https://apis.google.com; "
+    f"frame-src https://{PROJECT}.firebaseapp.com https://apis.google.com"
+)
+
+
+def test_firebase_login_csp_and_assets(tmp_path, monkeypatch):
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    expected = firebase_login_csp(FIREBASE_CFG.auth_domain)
+    assert expected == _FIREBASE_LOGIN_CSP
+    assert f'https://{FIREBASE_CFG.auth_domain}' in expected
+    with firebase_running(tmp_path / 'on') as httpd:
+        for path in ('/login', '/invite'):
+            status, hdrs, _ = call(httpd, path)
+            assert status == 200
+            assert hdrs.get('Content-Security-Policy') == _FIREBASE_LOGIN_CSP
+        for path in _FIREBASE_JS:
+            status, hdrs, body = call(httpd, path)
+            assert status == 200
+            assert hdrs.get('Content-Type', '').startswith('text/javascript')
+            assert body
+        status, hdrs, _ = call(httpd, '/static/app.css')
+        assert status == 200
+        assert hdrs.get('Content-Security-Policy') == _CSP
+        _member_account(httpd, 'ada@example.com', uid='uid-csp')
+        status, hdrs, body = _post_firebase(
+            httpd, _live_token(sub='uid-csp', email='ada@example.com'))
+        assert status == 200
+        status, hdrs, body, _ = authed(
+            httpd, '/api/account/session', cookie=hdrs['Set-Cookie'])
+        assert status == 200
+        assert hdrs.get('Content-Security-Policy') == _CSP
+        status, hdrs, body = call(httpd, '/login', 'POST', b'{}', csrf(httpd))
+        assert status == 404
+        assert json.loads(body) == {'error': 'not found'}
+        assert hdrs.get('Content-Security-Policy') == _CSP
+    with running(tmp_path / 'off') as httpd:
+        status, hdrs, _ = call(httpd, '/login')
+        assert status == 200
+        assert hdrs.get('Content-Security-Policy') == _CSP
+        unknown = call(httpd, '/no-such-agenticml-route')
+        for path in _FIREBASE_JS:
+            got = call(httpd, path)
+            assert (got[0], got[2]) == (unknown[0], unknown[2])
+            assert got[1].get('Location') == unknown[1].get('Location')
+
+
+def test_session_payload_auth_field(tmp_path, monkeypatch):
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    with running(tmp_path / 'off') as httpd:
+        _, httpd.admin_key = httpd.keys.create('admin', 'admin')
+        _, _, hdrs = login(httpd)
+        status, _, body, _ = authed(httpd, '/api/account/session', cookie=hdrs['Set-Cookie'])
+        assert status == 200
+        payload = json.loads(body)
+        assert payload['auth'] == 'password'
+        assert payload['via'] == 'key'
+    with firebase_running(tmp_path / 'on') as httpd:
+        _member_account(httpd, 'ada@example.com', uid='uid-session')
+        status, hdrs, body = _post_firebase(
+            httpd, _live_token(sub='uid-session', email='ada@example.com'))
+        assert status == 200
+        status, _, body, _ = authed(
+            httpd, '/api/account/session', cookie=hdrs['Set-Cookie'])
+        assert status == 200
+        payload = json.loads(body)
+        assert payload['auth'] == 'firebase'
+        assert payload['via'] == 'firebase'
 
 
 def test_cli_accounts_add_and_list(tmp_path, capsys):
@@ -1120,6 +1203,9 @@ def test_firebase_off_routes_match_unknown_path(tmp_path, monkeypatch):
             ('POST', '/auth/firebase/config', b'{}'),
             ('PUT', '/auth/firebase', b'{}'),
             ('DELETE', '/auth/firebase/config', None),
+            ('GET', '/static/firebase-login.js', None),
+            ('GET', '/static/vendor/firebase/firebase-app-compat.js', None),
+            ('GET', '/static/vendor/firebase/firebase-auth-compat.js', None),
         ]
         for method, path, body in cases:
             headers = csrf(httpd) if method not in ('GET', 'HEAD') else None

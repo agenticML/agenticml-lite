@@ -19,6 +19,7 @@ import time
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from agenticml.ui.server import (
+    _CSP,
     _DISCONNECT,
     _FILES,
     _STATIC,
@@ -328,14 +329,33 @@ class LoginThrottle:
 
 
 _LOGIN_STATIC = Path(__file__).with_name("static")
+_JS = "text/javascript; charset=utf-8"
+_FIREBASE_ASSETS = {
+    "/static/firebase-login.js": (_LOGIN_STATIC / "firebase-login.js", _JS),
+    "/static/vendor/firebase/firebase-app-compat.js": (
+        _LOGIN_STATIC / "vendor/firebase/firebase-app-compat.js", _JS),
+    "/static/vendor/firebase/firebase-auth-compat.js": (
+        _LOGIN_STATIC / "vendor/firebase/firebase-auth-compat.js", _JS),
+}
 _ASSETS = {
-    "/static/login.js": (_LOGIN_STATIC / "login.js", "text/javascript; charset=utf-8"),
-    "/static/setup.js": (_LOGIN_STATIC / "setup.js", "text/javascript; charset=utf-8"),
-    "/static/invite.js": (_LOGIN_STATIC / "invite.js", "text/javascript; charset=utf-8"),
+    "/static/login.js": (_LOGIN_STATIC / "login.js", _JS),
+    "/static/setup.js": (_LOGIN_STATIC / "setup.js", _JS),
+    "/static/invite.js": (_LOGIN_STATIC / "invite.js", _JS),
     "/static/app.css": (_STATIC / "app.css", _FILES["app.css"]),
     "/static/InstrumentSans.woff2": (_STATIC / "InstrumentSans.woff2", _FILES["InstrumentSans.woff2"]),
     "/static/JetBrainsMono.woff2": (_STATIC / "JetBrainsMono.woff2", _FILES["JetBrainsMono.woff2"]),
+    **_FIREBASE_ASSETS,
 }
+
+
+def firebase_login_csp(auth_domain):
+    """Dashboard CSP plus the Google hosts the Firebase sign-in pages need."""
+    return (
+        _CSP.replace("script-src 'self'", "script-src 'self' https://apis.google.com")
+        + "; connect-src 'self' https://identitytoolkit.googleapis.com"
+        " https://securetoken.googleapis.com https://www.googleapis.com https://apis.google.com"
+        + f"; frame-src https://{auth_domain} https://apis.google.com"
+    )
 
 
 class WebAuth:
@@ -537,8 +557,9 @@ class WebAuth:
                     handler._json({"error": "method not allowed"}, 405)
                 return True
             if handler.command == "GET" and path in _ASSETS:
-                self._asset(handler, path)
-                return True
+                if path not in _FIREBASE_ASSETS or self.firebase is not None:
+                    self._asset(handler, path)
+                    return True
             if handler.command == "POST" and path == "/login":
                 if self.firebase is not None:
                     handler.close_connection = True
@@ -1002,7 +1023,10 @@ class WebAuth:
         handler._send(
             (_LOGIN_STATIC / "firebase-login.html").read_bytes(),
             "text/html; charset=utf-8",
-            headers=self._headers({"Referrer-Policy": "no-referrer"}),
+            headers=self._headers({
+                "Referrer-Policy": "no-referrer",
+                "Content-Security-Policy": firebase_login_csp(self.firebase.auth_domain),
+            }),
         )
 
     def _firebase_config(self, handler):
@@ -1443,6 +1467,7 @@ class WebAuth:
             "user": principal.user,
             "role": "admin" if principal.role == "owner" else principal.role,
             "via": principal.via,
+            "auth": "firebase" if self.firebase is not None else "password",
             "key": key,
             "scope": "admin" if principal.via == "key" else None,
             "can": {

@@ -198,9 +198,9 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 18.1a | Server core: accounts, workspaces, memberships, migration, `default` conversion, workspace-bound sync, CLI | 17 | Codex, Cursor | L | [plan](packages/18-workspaces.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
 | 18.1b | Route table, `/w/<slug>` and `/api/w/<slug>` routes, account and server-admin APIs, isolation suite | 18.1a | Cursor | L | [plan](packages/18-workspaces.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
 | 18.2 | Dashboard: workspace URLs, switcher, Team and Keys per workspace, admin page, picker | 18.1b | Cursor | M | [plan](packages/18-workspaces.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
-| 18b † | Firebase sign-in for the hosted service | 18 | Cursor | M | [plan](packages/18b-firebase-sign-in.md) | in progress |
+| 18b † | Firebase sign-in for the hosted service | 18 | Cursor | M | [plan](packages/18b-firebase-sign-in.md) | done (3.0 PR; real sign-in in Backlog) |
 | 18b.1 | Token verification, account linking, `/auth/firebase`, invites, CLI, extras | 18 | Cursor | M | [plan](packages/18b-firebase-sign-in.md) | done (3.0 PR) |
-| 18b.2 | Sign-in page with the vendored Firebase SDK, per-page CSP, UI tests | 18b.1 | Cursor | S | [plan](packages/18b-firebase-sign-in.md) | plan ready |
+| 18b.2 | Sign-in page with the vendored Firebase SDK, per-page CSP, UI tests | 18b.1 | Cursor | S | [plan](packages/18b-firebase-sign-in.md) | done (3.0 PR) |
 | 18c † | Self-serve sign-up and usage limits (free plan: storage, uploads, requests, people) | 18b | Codex | M | [plan](packages/18c-signup-and-limits.md) | plan ready |
 | 18c.1 | Limits core: usage counters, limits file, storage/upload/request/people checks, CLI | 18b | Codex | M | [plan](packages/18c-signup-and-limits.md) | plan ready |
 | 18c.2 | Sign-up with a personal workspace, new workspace, free-workspace limit | 18c.1 | Codex | S | [plan](packages/18c-signup-and-limits.md) | plan ready |
@@ -277,6 +277,31 @@ Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
+- **Check Firebase sign-in against the real Firebase project** (package 18b
+  caveat, Nov 8, 2026).
+  - Where: `src/agenticml/server/firebase.py`, `static/firebase-login.js`,
+    the vendored SDK in `static/vendor/firebase/`.
+  - Problem: tests sign tokens locally and replace the Firebase SDK with a
+    fake in the browser, so Google's real certificates, the real SDK
+    (popup, redirect through `apis.google.com`, email verification) and the
+    sign-in page's CSP were never exercised end to end.
+  - Fix: on a test server with `--firebase-project` (agenticml-server's
+    project), the web API key and the server's host added to the project's
+    authorized domains, sign in once with Google and once with email and
+    password, accept one invite, and watch the browser console for CSP
+    violations.
+  - Done when: those steps pass, or each mismatch is fixed with a test.
+- **Firebase sign-in page test gaps** (package 18b.2 second review, Nov 8,
+  2026).
+  - Where: `testbed/tests/test_server_firebase_dashboard.py`.
+  - Problem: the UI tests do not assert sign-out on terminal failures,
+    in-memory persistence, button disabling while a request is in flight,
+    the mapped Firebase error texts, that nothing is written to
+    `localStorage`/`sessionStorage`, or the account dialog with and without
+    Firebase.
+  - Fix: add those assertions with the fake `firebase` global (delayed
+    promises, injected failures, storage inspection).
+  - Done when: each behaviour has a failing-then-passing UI test.
 - **Sync client trusts its own cursor after a failed atomic upload** (package 17
   second review, Nov 8, 2026).
   - Where: `src/agenticml/sync.py` (atomic-file skip, around line 923).
