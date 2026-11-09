@@ -31,6 +31,10 @@ Authorization: Bearer <key>
 
 - **Key format**: The prefix `aml_` followed by 43 URL-safe base64 characters
   (32 random bytes, e.g. `aml_abc123...`).
+- **Workspace binding**: Every API key belongs to a user account and is bound to
+  exactly one workspace. On `/v2/*` requests, the server identifies the workspace
+  directly from the bearer token. Sync clients do not need to specify a
+  workspace slug in the URL.
 - **Scopes and roles**: Keys belong to users and are issued with either
   `sync` or `admin` scope. A key whose user has role `viewer` can only call
   `GET /v2/whoami`; every other `/v2` endpoint returns `403 Forbidden`
@@ -48,6 +52,21 @@ Authorization: Bearer <key>
   or responses.
 
 ## General rules
+
+### Client support window
+
+Sync clients declare their package version in the `User-Agent` header (e.g. `User-Agent: agenticml-lite/3.0.0`).
+
+The server enforces a minimum client support window via `--min-client-version X.Y` (environment variable `AGENTICML_SERVER_MIN_CLIENT_VERSION`, default `2.2`).
+
+On `/v2/*` requests (except `GET /v2/whoami`), any client with a User-Agent identifying an `agenticml-lite` version older than the minimum is rejected with HTTP `426 Upgrade Required`:
+
+```json
+{"error": "this server needs agenticml-lite >= 2.2; run: pip install -U agenticml-lite"}
+```
+
+- `GET /v2/whoami` is exempt from the 426 check so client capability checks succeed without failing during discovery.
+- Foreign or missing `User-Agent` headers (such as `curl` or third-party HTTP clients) are accepted, keeping the protocol open.
 
 ### Run ID validation
 
@@ -102,7 +121,7 @@ client recovery.
 | `200 OK` | Success | Request completed successfully. |
 | `201 Created` | Created | New content-addressed object stored (`PUT /v2/objects/{sha256}`). |
 | `401 Unauthorized` | Auth failed | Missing, invalid, or revoked bearer token (`WWW-Authenticate: Bearer`). |
-| `403 Forbidden` | Forbidden | Calling key belongs to a `viewer` user (`{"error": "role viewer cannot sync"}`). |
+| `403 Forbidden` | Forbidden | Calling key belongs to a `viewer` user (`{"error": "role viewer cannot sync"}`), or workspace storage/upload quota reached. |
 | `404 Not Found` | Not found | Unknown route, invalid run ID, unallowed path, or unknown run on state/append/commit/non-meta PUT. |
 | `405 Method Not Allowed` | Method rejected | Method not allowed for endpoint (`Allow` header returned). |
 | `408 Request Timeout` | Timeout | Request body read exceeded deadline or client disconnected. |
@@ -110,6 +129,8 @@ client recovery.
 | `411 Length Required` | Missing length | `Content-Length` missing, non-digit, duplicated, or `Transfer-Encoding` present. |
 | `413 Payload Too Large` | Oversized body | Declared body length exceeds endpoint limit. |
 | `422 Unprocessable Entity` | Validation error | Malformed JSON, torn record, object hash mismatch, or invalid query parameters. |
+| `426 Upgrade Required` | Client outdated | User-Agent declares an `agenticml-lite` version below server `--min-client-version`. |
+| `429 Too Many Requests` | Rate limited | Workspace request-rate quota exceeded (`Retry-After` header returned). |
 | `503 Service Unavailable` | Server busy | Request body admission capacity reached (`Retry-After: 5` header returned). |
 | `500 Internal Error` | Internal error | Unexpected server failure (`{"error": "internal error"}`). |
 
@@ -131,7 +152,7 @@ client recovery.
 | Method and path | Request body | Success response | Error codes |
 | --- | --- | --- | --- |
 | `GET /healthz` | None | `200 {"ok": true}` | None |
-| `GET /v2/whoami` | None | `200 {"key": name, "scope": scope, "user": user, "role": role, "protocol": 2, "features": ["lineage", "byref"]}` | 401 |
+| `GET /v2/whoami` | None | `200 {"key": name, "scope": scope, "user": user, "role": role, "protocol": 2, "workspace": slug, "features": ["lineage", "byref"]}` | 401 |
 | `POST /v2/objects/missing` | `{"objects": [sha256, ...]}` | `200 {"missing": [sha256, ...]}` | 401, 403, 411, 413, 422, 503 |
 | `PUT /v2/objects/{sha256}` | Raw bytes (`application/octet-stream`) | `201 {"sha256": sha256, "created": true}` or `200 {"sha256": sha256, "created": false}` | 401, 403, 411, 413, 422, 503 |
 | `GET /v2/runs/{id}/state` | None | `200 {"owner": name, "owner_user": user, "files": {path: {"size": n, "sha256": h}}, "remote": {...}}` | 401, 403, 404 |
@@ -153,7 +174,7 @@ Unauthenticated health check.
 
 ### `GET /v2/whoami`
 
-Identify the calling API key, owning user, role, and server capabilities.
+Identify the calling API key, owning user, role, workspace, and server capabilities.
 
 - **Request**: `GET /v2/whoami`
   - Header: `Authorization: Bearer <key>`
@@ -165,14 +186,16 @@ Identify the calling API key, owning user, role, and server capabilities.
     "user": "alice",
     "role": "member",
     "protocol": 2,
+    "workspace": "default",
     "features": ["lineage", "byref"]
   }
   ```
 - **Errors**:
   - `401 Unauthorized`: `{"error": "unauthorized"}` with `WWW-Authenticate: Bearer`.
 
-The `user` and `role` fields identify the key's owner and assigned role. A key
-belonging to a user with role `viewer` can call `whoami`, but every other `/v2`
+The `user` and `role` fields identify the key's owner and assigned role. The
+`workspace` field identifies the slug of the workspace to which the key is bound.
+A key belonging to a user with role `viewer` can call `whoami`, but every other `/v2`
 route returns `403 Forbidden` (`{"error": "role viewer cannot sync"}`).
 
 The `lineage` feature is present only when Git was found at server startup;
@@ -323,6 +346,10 @@ any valid sync or admin key.
     }
   }
   ```
+  - **Database source of truth**: In version 3.0, the server retrieves file
+    sizes, hashes, owner information, and commit metadata directly from the
+    database (`runs` and `run_files` tables). The server no longer creates or
+    updates `remote.json` files on disk. The response schema remains identical.
   - **Compatibility rule**: To preserve compatibility with 2.0 and 2.1 clients,
     the `owner` field in `state`, `state.remote`, and 409 conflict payloads
     returns the **calling key's name** if the caller's user owns the run. If
@@ -827,6 +854,10 @@ is committed at least every 60 s.
   - **HTTP 4xx client errors**: Any 4xx HTTP response other than `408 Request
     Timeout` and `429 Too Many Requests` (and excluding a second 404
     `RunMissingError` during upload).
+    *Exception in version 3.0*: Under `sync --follow`, an HTTP 403 response with
+    `storage limit reached` is treated as a paused state and retried every 10
+    minutes rather than permanently dropped. Once a workspace administrator
+    increases the storage quota, syncing resumes automatically.
 - **Transient failures** (retried on the next `--watch` pass):
   - Network errors, timeouts, and chunked encoding errors.
   - HTTP `408 Request Timeout`, `429 Too Many Requests`, and 5xx server errors
@@ -834,7 +865,23 @@ is committed at least every 60 s.
   - A second 404 in the same sync pass (`RunMissingError`), allowing recovery on
     the subsequent pass.
 
-### 11. Out of scope in protocol 2.0
+### 11. Dashboard runs list metrics API
+
+In version 3.0, the server dashboard exposes metric summaries directly via `GET /api/w/{slug}/runs` for sorting and filtering runs without reading run files:
+
+- **Query parameters**:
+  - `metrics`: Comma-separated list of metric names to include in each run's `metrics` dictionary (e.g. `?metrics=loss,val_loss,accuracy`). At most 8 names allowed, each up to 200 characters.
+  - `sort`: Metric sorting specification in the format `metric:<name>:<stat>` where `<stat>` is one of `last`, `min`, or `max` (e.g. `?sort=metric:val_loss:min`).
+  - `order`: Sort order, either `asc` (default) or `desc`.
+  - `filter`: Repeatable filter parameter in the format `metric:<name>:<stat>:<op>:<value>` where:
+    - `<stat>`: `last`, `min`, or `max`.
+    - `<op>`: Comparison operator: `lt` (`<`), `le` (`<=`), `gt` (`>`), `ge` (`>=`), or `eq` (`=`).
+    - `<value>`: Finite numeric value.
+    - Up to 8 filters can be combined, e.g. `?filter=metric:accuracy:last:gt:0.95&filter=metric:val_loss:min:lt:0.2`.
+- **Errors**:
+  - `422 Unprocessable Entity`: Invalid metric query syntax, unsupported stat, invalid operator, non-finite number, or more than 8 metric names/filters (`RunsQueryError`).
+
+### 12. Out of scope in protocol 2.0
 
 - **Notes**: `notes.md` is never synced. Local notes remain local; notes
   edited in the server dashboard stay on the server.

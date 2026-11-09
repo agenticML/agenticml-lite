@@ -218,9 +218,9 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 24.1 | Image: Dockerfile, entrypoint, limits file, local hosted smoke test | 21 | Codex, Sonnet | S | [plan](packages/24-aws-deployment.md) | done (3.0 PR) |
 | 24.2 | Terraform, deploy workflow, `deploy-check` CI job, runbook | 24.1 | Codex, Sonnet | M | [plan](packages/24-aws-deployment.md) | done (3.0 PR; `terraform validate` runs in CI) |
 | 24.3 | Apply, first deploy, restore drill, real-EFS benchmark, exit criterion 6 | 24.2 | Owner | S | [plan](packages/24-aws-deployment.md) | not started (Backlog) |
-| 25 | Docs, threat model, version 3.0.0 | 16–24 | Codex; prose Antigravity | M | [plan](packages/25-docs-and-release.md) | in progress |
+| 25 | Docs, threat model, version 3.0.0 | 16–24 | Sonnet (Codex at limit); prose Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR; tag and PyPI release by the owner) |
 | 25.1 | Client support window (426), version 3.0.0, base-install smoke, 2.2 client check | 16–24 | Sonnet (Codex at limit) | S | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
-| 25.2 | SERVER.md, HOSTED.md, threat model, PROTOCOL.md, README, website, SECURITY.md | 25.1 | Antigravity | M | [plan](packages/25-docs-and-release.md) | plan ready |
+| 25.2 | SERVER.md, HOSTED.md, threat model, PROTOCOL.md, README, website, SECURITY.md | 25.1 | Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
 | 26 | Retire agenticml-server | 24 live | Owner | S | – | not started |
 
 - **16–17** move everything the server keeps outside run files into tables
@@ -307,6 +307,30 @@ priority.
     Verify both workspaces, login, run files/metrics, objects, and a new sync.
   - Done when: recovery age/duration and integrity results are recorded and
     drill resources removed without changing live resources.
+- **Release 3.0.0: tag, publish, legal pages (owner)** (Nov 9, 2026).
+  - Where: GitHub releases, PyPI, agenticml.xyz.
+  - Problem: the 3.0 PR sets version 3.0.0 but nothing is tagged or
+    published, and open sign-up needs terms of service, an acceptable use
+    policy and a privacy policy first (3.0 plan release checklist). The
+    `v2.2.0` tag was never created either; the 2.2 client compatibility
+    test falls back to commit `bd0d499` until it exists.
+  - Fix: after merging, tag `v2.2.0` at `bd0d499` and `v3.0.0` at the
+    merge, publish 3.0.0 to PyPI (`publish.yml`), and publish the three
+    policies before setting `open_signup = true` in Terraform.
+  - Done when: `pip install agenticml-lite==3.0.0` works and the policies
+    are linked from the sign-in page.
+- **Metric picker polish** (package 22 review, Nov 9, 2026).
+  - Where: `src/agenticml/ui/static/app.js` runs page;
+    `testbed/tests/test_server_dashboard.py`.
+  - Problem: `/metrics` is loaded once per page load (a metric first
+    logged later, or a workspace that had none at load, needs a reload);
+    filter-token names are matched case-insensitively only against that
+    list; the first `/runs` waits for `/metrics`; the 422 fallback and the
+    250 ms debounce have no UI test.
+  - Fix: refresh `/metrics` every few polls and fetch it in parallel with
+    the first `/runs`; add the two UI tests.
+  - Done when: a metric logged after page load appears in the picker
+    without a reload, with a test.
 - **Stand up the hosted service on AWS (package 24.3, owner)** (Nov 9,
   2026).
   - Where: `deploy/aws/` (Terraform, `README.md` runbook),
