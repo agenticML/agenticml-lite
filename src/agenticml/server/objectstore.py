@@ -188,6 +188,22 @@ class S3Objects(ObjectBackend):
     def delete(self, workspace_id, sha):
         self._call(self.client.delete_object, Bucket=self.bucket, Key=self._key(workspace_id, sha))
 
+    def inventory(self, workspace_id):
+        """Yield (sha256, size) for every object stored for the workspace."""
+        require_workspace_id(workspace_id)
+        prefix = f'{self.prefix + "/" if self.prefix else ""}{workspace_id}/objects/'
+        token = None
+        while True:
+            args = {'ContinuationToken': token} if token else {}
+            page = self._call(self.client.list_objects_v2, Bucket=self.bucket, Prefix=prefix, **args)
+            for item in page.get('Contents', []):
+                parts = item['Key'][len(prefix):].split('/')
+                if len(parts) == 2 and layout.valid_sha(parts[1]) and parts[0] == parts[1][:2]:
+                    yield parts[1], item['Size']
+            if not page.get('IsTruncated'):
+                break
+            token = page['NextContinuationToken']
+
     def delete_workspace(self, workspace_id):
         require_workspace_id(workspace_id)
         prefix = f'{self.prefix + "/" if self.prefix else ""}{workspace_id}/'

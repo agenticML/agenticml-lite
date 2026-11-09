@@ -171,16 +171,17 @@ def test_open_backend(tmp_path, aws, monkeypatch):
         open_backend('s3://agml-test', tmp_path)
 
 
-def test_operator_reports_skip_local_objects(server, monkeypatch):
+def test_operator_reports_use_s3_inventory(server, monkeypatch):
     original = admin._walk
     def walk(path, *args, **kwargs):
         assert 'objects' not in path.parts
         return original(path, *args, **kwargs)
     monkeypatch.setattr(admin, '_walk', walk)
-    warning = 'objects are in S3; object checks come in package 23'
-    assert warning in admin.format_status(admin.status(server.data_dir, objects='s3://agml-test/pfx'))
+    report = admin.status(server.data_dir, objects='s3://agml-test/pfx')
+    assert not report['warnings'] and report['sizes']['objects_count'] == 0
     monkeypatch.setenv('AGENTICML_SERVER_OBJECTS', 's3://agml-test/pfx')
-    assert warning in admin.format_verify(admin.verify(server.data_dir))
+    assert admin.verify(server.data_dir) == {
+        'ok': True, 'checked': {'objects': 0, 'runs': 0}, 'problems': [], 'warnings': []}
 
 
 @pytest.fixture
@@ -377,7 +378,7 @@ def test_cli_operator_objects_option(server, capsys, command):
     from agenticml import cli
     assert cli.main(['server', command, '--data', str(server.data_dir),
                      '--objects', 's3://agml-test/pfx']) == 0
-    assert 'objects are in S3; object checks come in package 23' in capsys.readouterr().out
+    assert 'package 23' not in capsys.readouterr().out
 
 
 def test_cli_serve_objects_reaches_make_server(tmp_path, monkeypatch):

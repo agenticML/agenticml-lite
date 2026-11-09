@@ -975,8 +975,10 @@ def _cmd_server_report(args, verify=False):
     from .server.db.errors import DatabaseError
 
     try:
-        report = (admin.verify(args.data, progress=not args.json, database=args.database, objects=args.objects) if verify
-                  else admin.status(args.data, database=args.database, objects=args.objects))
+        report = (admin.verify(args.data, progress=not args.json, database=args.database, objects=args.objects,
+                               workspace=args.workspace, deep=args.deep) if verify
+                  else admin.status(args.data, database=args.database, objects=args.objects,
+                                    workspace=args.workspace))
         if args.json:
             print(json.dumps(report, indent=2, sort_keys=True))
         else:
@@ -999,6 +1001,32 @@ def cmd_server_status(args):
 
 def cmd_server_verify(args):
     return _cmd_server_report(args, verify=True)
+
+
+def cmd_server_backup(args):
+    from .server import backup
+    from .server.db.errors import DatabaseError
+
+    try:
+        report = backup.backup(args.to, data=args.data, database=args.database, objects=args.objects,
+                               files_only=args.files_only)
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+    except backup.BackupError as exc:
+        print(f"agenticml server: {exc}", file=sys.stderr)
+        return 1
+    except DatabaseError as exc:
+        print(f"agenticml server: {exc}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, OverflowError) as exc:
+        print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(backup.format_report(report, args.to))
+    return 0
 
 
 def cmd_server_reindex(args):
@@ -1647,14 +1675,40 @@ def main(argv=None):
                      help="Allow verified Firebase sign-in to create an account (default: AGENTICML_SERVER_OPEN_SIGNUP)")
     p_up.set_defaults(func=cmd_server_up)
     for action, func, help_text in (
-            ("status", cmd_server_status, "Show runs, sizes, and key activity"),
-            ("verify", cmd_server_verify, "Check objects, run sizes, and lineage")):
+            ("status", cmd_server_status, "Show runs, sizes, and key activity per workspace"),
+            ("verify", cmd_server_verify, "Check objects, run sizes, and lineage per workspace")):
         child = server_sub.add_parser(action, help=help_text)
         child.add_argument("--data", default=None)
         child.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
-        child.add_argument("--objects", default=None, metavar="URL")
+        child.add_argument("--objects", default=None, metavar="URL",
+                           help="Object backend (default: AGENTICML_SERVER_OBJECTS or file://)")
+        child.add_argument("--workspace", default=None, metavar="SLUG",
+                           help="Workspace slug (default: every workspace)")
+        if action == "verify":
+            child.add_argument("--deep", action="store_true",
+                               help="Re-hash every S3 object (file objects are always hashed)")
         child.add_argument("--json", action="store_true")
         child.set_defaults(func=func)
+    p_backup = server_sub.add_parser(
+        "backup", help="Copy the database and files of a running server to a directory",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="The server may keep running. The database is copied first, then each run file up to its\n"
+               "committed size, so the copy is consistent.\n\n"
+               "Restore (SQLite): agenticml server serve --data DIR\n"
+               "Restore (Postgres): restore the pg_dump into an empty database, then run\n"
+               "  agenticml server serve --data DIR --database URL\n"
+               "Postgres needs a dump first: pg_dump --format=custom \"$DATABASE_URL\" > DIR/server.dump,\n"
+               "then --files-only here. S3 objects are not copied (use bucket versioning or AWS Backup).")
+    p_backup.add_argument("--to", required=True, metavar="DIR",
+                          help="Backup directory (must not exist or be empty; not inside the data directory)")
+    p_backup.add_argument("--data", default=None)
+    p_backup.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_backup.add_argument("--objects", default=None, metavar="URL",
+                          help="Object backend (default: AGENTICML_SERVER_OBJECTS or file://)")
+    p_backup.add_argument("--files-only", action="store_true",
+                          help="Postgres: copy files only, after taking a pg_dump")
+    p_backup.add_argument("--json", action="store_true")
+    p_backup.set_defaults(func=cmd_server_backup)
     p_reindex = server_sub.add_parser("reindex", help="Rebuild the run index from on-disk files")
     p_reindex.add_argument("--data", default=None)
     p_reindex.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")

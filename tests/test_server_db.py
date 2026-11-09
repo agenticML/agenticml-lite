@@ -296,7 +296,12 @@ def test_import_v1_once_including_run_owners_and_audit(tmp_path):
     backups = {p:p.stat().st_mtime_ns for p in directory.glob('*.2x')}
     assert len(backups) == 4 and not (directory / 'keys.lock').exists()
     db.close()
-    (directory / 'keys.json').write_text('invalid, deliberately ignored after import')
+    (directory / 'keys.json').write_text('invalid, refused after import')
+    from agenticml.server.db import ConvertedTwice
+    with pytest.raises(ConvertedTwice, match='after this server was converted'):
+        for_server_dir(directory)
+    assert (directory / 'keys.json').read_text() == 'invalid, refused after import'
+    (directory / 'keys.json').unlink()
     db = for_server_dir(directory)
     assert len(KeyStore(directory, workspace_id=default_workspace_id(directory)).list()) == 1
     assert {p:p.stat().st_mtime_ns for p in backups} == backups

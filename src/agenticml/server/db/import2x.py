@@ -6,7 +6,7 @@ from pathlib import Path
 import stat
 
 from agenticml.store import layout
-from .errors import DatabaseError
+from .errors import ConvertedTwice, DatabaseError
 from .repos import AuditRepo, KeyRepo, NoteRepo, RunRepo, SettingsRepo, UserRepo
 
 logger = logging.getLogger('agenticml.server.db.import2x')
@@ -22,12 +22,86 @@ def _exists(path):
         raise DatabaseError(f'could not import {path.name}: unreadable file; fix or move it away') from exc
 
 
+def _after_commit(stage):
+    """Test hook between a conversion commit and its file renames."""
+
+
+def _retire_file(path):
+    """Rename an imported 2.x file to ``<name>.2x``, never replacing an archive."""
+    dest = path.with_name(path.name + '.2x')
+    try:
+        dest.lstat()
+    except FileNotFoundError:
+        try:
+            path.rename(dest)
+        except OSError:
+            logger.warning('could not rename imported %s', path.name)
+    except OSError:
+        logger.warning('could not rename imported %s', path.name)
+    else:
+        logger.warning('skipping rename of imported %s; %s already exists', path.name, dest.name)
+
+
+def _converted_on(settings, name):
+    stamp = settings.get(name)
+    return stamp[:10] if isinstance(stamp, str) else 'an earlier start'
+
+
+def _guard_converted(db, directory):
+    """After conversion: refuse reappeared 2.x state; finish an interrupted retirement.
+
+    The renames come after the database commit, so a file with no ``.2x``
+    beside it is a conversion that stopped in between, not a second 2.x
+    copy. Nothing is imported again either way.
+    """
+    settings = SettingsRepo(db)
+    imported = settings.get('imported_2x')
+    if imported is not None:
+        for name in ('users.json', 'keys.json', 'audit.jsonl', 'setup-closed'):
+            path = directory / name
+            if not _exists(path):
+                continue
+            if not _exists(path.with_name(name + '.2x')):
+                _retire_file(path)
+            elif name != 'setup-closed':
+                raise ConvertedTwice(
+                    f'found 2.x {path} after this server was converted on '
+                    f'{_converted_on(settings, "imported_2x")}; move it away '
+                    f'(the converted copy is {path}.2x)')
+    converted = settings.get('workspace_store_converted')
+    if converted is not None:
+        data = directory.parent
+        from ..workspaces import store_root
+        from .workspaces import WorkspaceRepo
+        default = WorkspaceRepo(db).get('default')
+        copy = store_root(data, default['id']) if default else data / 'workspaces'
+        for runs in (data / 'store' / 'runs', data / 'runs'):
+            if _has_run_directories(runs):
+                raise ConvertedTwice(
+                    f'found 2.x {runs} after this server was converted on '
+                    f'{_converted_on(settings, "workspace_store_converted")}; move it away '
+                    f'(the converted copy is {copy})')
+
+
+def _has_run_directories(path):
+    try:
+        with os.scandir(path) as entries:
+            return any(entry.is_dir(follow_symlinks=False) for entry in entries)
+    except FileNotFoundError:
+        return False
+    except NotADirectoryError:
+        return False
+    except OSError as exc:
+        raise DatabaseError(f'could not inspect {path}: unreadable; fix or move it away') from exc
+
+
 def import_state(db, server_dir, *, actor='server'):
     # The transaction import lock protects rows, but legacy file preparation
     # and retirement also need serialization when multiple processes start.
     with db.session_lock('import:2x', timeout=600) if db.dialect.name == 'postgres' else nullcontext():
         directory = Path(server_dir)
         settings = SettingsRepo(db)
+        _guard_converted(db, directory)
         if settings.get('imported_2x') is None:
             _import_users_keys(db, directory, actor=actor)
         from ..workspaces import convert_store
@@ -137,19 +211,9 @@ def _import_users_keys(db, directory, *, actor='server'):
         logger.warning('skipped %d malformed or unreadable legacy audit line(s)', skipped)
     if skipped_keys:
         logger.warning('skipped %d key(s) whose user is not among the imported users', skipped_keys)
+    _after_commit('users')
     for path in imported:
-        dest = path.with_name(path.name + '.2x')
-        try:
-            dest.lstat()
-        except FileNotFoundError:
-            try:
-                path.rename(dest)
-            except OSError:
-                logger.warning('could not rename imported %s', path.name)
-        except OSError:
-            logger.warning('could not rename imported %s', path.name)
-        else:
-            logger.warning('skipping rename of imported %s; %s already exists', path.name, dest.name)
+        _retire_file(path)
     try:
         (directory / 'keys.lock').unlink(missing_ok=True)
     except OSError:
@@ -164,6 +228,8 @@ def _import_runs(db, directory):
 
     settings = SettingsRepo(db)
     if settings.get('imported_runs_2x') is not None:
+        if settings.get('runs_2x_retired') is None:
+            _finish_run_retirement(db, directory)
         return
     from .workspaces import WorkspaceRepo
     from ..workspaces import store_root
@@ -239,16 +305,32 @@ def _import_runs(db, directory):
             if rename_notes is not None:
                 renamed.append(rename_notes)
         settings.set('imported_runs_2x', layout.format_timestamp(), tx)
+    _after_commit('runs')
     for path in renamed:
-        dest = path.with_name(path.name + '.2x')
+        _retire_file(path)
+    settings.set('runs_2x_retired', layout.format_timestamp())
+
+
+def _finish_run_retirement(db, directory):
+    """Rename remote.json/notes.md left behind by a conversion that stopped before the renames."""
+    from .workspaces import WorkspaceRepo
+    from ..workspaces import store_root
+    default = WorkspaceRepo(db).get('default')
+    if default is None:
+        return
+    root = store_root(directory.parent, default['id'])
+    try:
+        entries = list(os.scandir(root / 'runs'))
+    except OSError:
+        return
+    for entry in entries:
         try:
-            dest.lstat()
-        except FileNotFoundError:
-            try:
-                path.rename(dest)
-            except OSError:
-                logger.warning('could not rename imported %s', path.name)
+            if not entry.is_dir(follow_symlinks=False):
+                continue
         except OSError:
-            logger.warning('could not rename imported %s', path.name)
-        else:
-            logger.warning('skipping rename of imported %s; %s already exists', path.name, dest.name)
+            continue
+        for name in ('remote.json', 'notes.md'):
+            path = Path(entry.path) / name
+            if _exists(path):
+                _retire_file(path)
+    SettingsRepo(db).set('runs_2x_retired', layout.format_timestamp())
