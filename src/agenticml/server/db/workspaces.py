@@ -359,6 +359,7 @@ class WorkspaceRepo:
             account = AccountRepo(self.db).get(validate_login(login), tx)
             if row is None or account is None:
                 raise ClientError('unknown workspace or account')
+            tx.bind_workspace(row['id'])
             tx.execute("UPDATE memberships SET role='admin' WHERE workspace_id=? AND role='owner'", (row['id'],))
             tx.execute(self.db.dialect.upsert('memberships', ('workspace_id', 'account_id', 'role'),
                                              ('workspace_id', 'account_id'), ('role',)),
@@ -602,6 +603,7 @@ class InviteRepo(WorkspaceBound):
                     if linked is None:
                         raise
                     account = linked
+            tx.bind_workspace(invite['workspace_id'])
             members = MembershipRepo(db, invite['workspace_id'])
             if members.get(account['id'], tx) is None:
                 members.add(account['id'], invite['role'], tx)

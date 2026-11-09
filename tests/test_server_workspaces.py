@@ -56,6 +56,21 @@ def test_scoped_repositories_require_workspace(tmp_path):
     db.close()
 
 
+def test_sync_touches_non_default_workspace_key(two):
+    """A sync request must update last_used_at even when the key is not in the default workspace.
+
+    Ingest uses the process-wide KeyStore (bound to default). On Postgres, RLS
+    hides other workspaces unless touch binds ``record.workspace_id``.
+    """
+    server, _, b, _, keys_b, _, kb = two
+    assert b['slug'] != 'default'
+    assert keys_b.verify(kb).last_used_at is None
+    assert request(server, '/v2/whoami', key=kb)[0] == 200
+    used = keys_b.verify(kb).last_used_at
+    assert used is not None
+    layout.parse_timestamp(used)
+
+
 def test_key_digest_is_global_name_and_revocation_are_scoped(two):
     server, a, b, keys_a, keys_b, ka, kb = two
     assert server.keys.verify(ka).workspace_id == a['id']

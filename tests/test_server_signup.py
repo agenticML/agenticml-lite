@@ -491,6 +491,20 @@ def test_discard_store_unlinks_symlink_without_following(tmp_path):
     assert (outside / 'secret').read_text() == 'keep'
 
 
+def test_discard_store_unlinks_id_symlink_not_followed(tmp_path):
+    """A workspaces/<id> symlink is unlinked; its target is left intact."""
+    target = tmp_path / 'payload.txt'
+    target.write_text('keep')
+    data = tmp_path / 'data'
+    parent = data / 'workspaces'
+    parent.mkdir(parents=True)
+    wid = 'c' * 32
+    (parent / wid).symlink_to(target)
+    discard_store(data, wid)
+    assert list(parent.iterdir()) == []
+    assert target.read_text() == 'keep'
+
+
 def test_account_workspaces_prepare_store_databaseerror_drops_row(tmp_path, monkeypatch):
     monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
 

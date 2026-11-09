@@ -688,7 +688,7 @@ def test_lock_loss_before_write_writes_nothing(servers, postgres_admin, monkeypa
     assert run_path(a, 'events.jsonl').read_bytes() == first
 
 
-def test_lock_loss_mid_append_truncates_to_committed(servers, postgres_admin, monkeypatch):
+def test_lock_loss_mid_append_skips_truncate(servers, postgres_admin, monkeypatch):
     a, _ = servers
     assert put_meta(a)[0] == 200
     first = b'{"a":1}\n'
@@ -711,7 +711,115 @@ def test_lock_loss_mid_append_truncates_to_committed(servers, postgres_admin, mo
     assert headers['Retry-After'] == '5'
     assert len(calls) >= 2
     assert a.run_index.committed_size('run-1', 'events.jsonl') == len(first)
-    assert run_path(a, 'events.jsonl').read_bytes() == first
+    on_disk = run_path(a, 'events.jsonl').read_bytes()
+    assert on_disk.startswith(first)
+
+
+def test_lock_loss_append_cleanup_preserves_other_writer(servers, postgres_admin, monkeypatch):
+    a, b = servers
+    assert put_meta(a)[0] == 200
+    first = b'{"a":1}\n'
+    second = b'{"b":2}\n'
+    assert append(a, first, name='events.jsonl')[0] == 200
+    connections = _lock_connections(a.db, monkeypatch)
+    monkeypatch.setattr(ingest, '_LOCK_CONFIRM_BYTES', 8)
+    original = a.db.confirm_session_locks
+    calls = []
+
+    def confirm():
+        calls.append(1)
+        if len(calls) == 2:
+            _kill_backend(connections[-1], postgres_admin)
+            status, payload, _ = append(b, second, offset=len(first), name='events.jsonl')
+            assert status == 200 and payload['size'] == len(first) + len(second)
+        original()
+
+    monkeypatch.setattr(a.db, 'confirm_session_locks', confirm)
+    payload = b'{"c":3}\n' * 100
+    status, _, headers = append(a, payload, offset=len(first), name='events.jsonl')
+    assert status == 503
+    assert headers['Retry-After'] == '5'
+    assert len(calls) >= 2
+    assert a.run_index.committed_size('run-1', 'events.jsonl') == len(first) + len(second)
+    assert run_path(a, 'events.jsonl').read_bytes() == first + second
+
+
+def test_stale_backup_sweep_preserves_other_writer_backup(
+        servers, postgres_admin, monkeypatch):
+    a, b = servers
+    assert put_meta(a)[0] == 200
+    first = b'{"k":"old"}'
+    assert _put_index(a, first)[0] == 200
+    path = run_path(a, 'scalars/index.json')
+    backup = path.parent / '.index.json.bak.1.2.deadbeef.tmp'
+    connections = _lock_connections(a.db, monkeypatch)
+    original = ingest.IngestHandler._remove_stale_atomic_backups
+    raced = []
+
+    def sweep(handler, directory):
+        if handler.server is a and not raced:
+            raced.append(True)
+            _kill_backend(connections[-1], postgres_admin)
+            with b.run_lock('run-1', workspace_id=b.default_workspace_id):
+                os.link(path, backup)
+                original(handler, directory)
+            return
+        original(handler, directory)
+
+    monkeypatch.setattr(ingest.IngestHandler, '_remove_stale_atomic_backups', sweep)
+    status, _, headers = _put_index(a, b'{"k":"new"}')
+    assert status == 503
+    assert headers['Retry-After'] == '5'
+    assert raced and backup.exists()
+    assert path.read_bytes() == first
+    assert path.stat().st_nlink == 2
+
+
+def test_atomic_rollback_skips_when_other_writer_committed(
+        servers, postgres_admin, monkeypatch, caplog):
+    a, b = servers
+    assert put_meta(a)[0] == 200
+    first = b'{"k":"old"}'
+    second = b'{"k":"new"}'
+    third = b'{"k":"bbb"}'
+    assert _put_index(a, first)[0] == 200
+    connections = _lock_connections(a.db, monkeypatch)
+    original_tx = a.db.transaction
+    original_confirm = a.db.confirm_session_locks
+    published = []
+    raced = []
+
+    def after(run_id, name):
+        published.append(run_path(a, name).read_bytes())
+        _kill_backend(connections[-1], postgres_admin)
+
+    def confirm():
+        # After A's transaction has rolled back, let B commit before restore.
+        if published and not raced:
+            raced.append(True)
+            status, payload, _ = _put_index(b, third)
+            assert status == 200 and payload['size'] == len(third)
+        original_confirm()
+
+    monkeypatch.setattr(a, '_after_atomic_write', after)
+    monkeypatch.setattr(a.db, 'confirm_session_locks', confirm)
+
+    @contextmanager
+    def wrapping(write=False):
+        with original_tx(write=write) as tx:
+            yield tx
+            if write and published:
+                raise RuntimeError('injected commit failure')
+
+    monkeypatch.setattr(a.db, 'transaction', wrapping)
+    status, _, headers = _put_index(a, second)
+    assert status == 503
+    assert headers['Retry-After'] == '5'
+    assert published == [second] and raced
+    assert run_path(a, 'scalars/index.json').read_bytes() == third
+    recorded = a.run_index.files('run-1')['scalars/index.json']
+    assert recorded['sha256'] == hashlib.sha256(third).hexdigest()
+    assert 'skipping atomic restore' in caplog.text
 
 
 def test_verify_after_write_refuses_foreign_bytes(servers, monkeypatch, caplog):

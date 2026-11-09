@@ -284,10 +284,19 @@ Atomic files write a temp, fsync, confirm session locks, then compare-and-swap
 on `(size, sha256)` and rename inside the recording transaction (old file
 hard-linked to a backup name so the original inode stays at `path`, new file
 renamed into place, commit, then backup deleted). A CAS miss discards the temp
-and returns 503; a commit failure after rename restores the backup. A SIGKILL
-after rename and before commit still leaves the new bytes published with the
-backup remaining as a tmp name; Python cannot restore after a kill. SQLite
-uses the same path, including `publish()` inside the write transaction
+and returns 503; a commit failure after rename restores the backup only if
+session locks still confirm and `path` is still this writer's published inode.
+Cleanup that changes shared file bytes (append truncate on failure, atomic
+restore/unlink) runs only after `confirm_session_locks()` succeeds immediately
+before it; otherwise the writer skips cleanup and returns 503.
+
+A SIGKILL between replace and COMMIT leaving the new complete atomic file at
+`path` is ACCEPTED: the next `/state` adopts it (it is a complete client
+upload the client will re-send). Under the run lock, leftover
+`.<name>.bak.*.tmp` backup files are removed before an atomic write and in
+`/state`, so a crash between `os.link` and `os.replace` cannot leave the
+committed file hard-linked (which `st_nlink` checks would treat as unsafe).
+SQLite uses the same path, including `publish()` inside the write transaction
 (benign). The CAS cannot lose under the thread lock.
 
 ## Review fixes (Nov 9, 2026)
@@ -299,3 +308,5 @@ uses the same path, including `publish()` inside the write transaction
 - Login throttle transactions prune expired `login_attempts` rows (`last_failure`
   older than now − expiry), skipping any bucket with a live hold in this process,
   so the table cannot grow without bound when only touched buckets are written.
+- Throttle `persisted` is set only after the write transaction commits; a
+  COMMIT failure keeps unsaved failure counts in memory (max-merged on load).

@@ -1,5 +1,6 @@
 """Workspace store layout and crash-resumable single-team conversion."""
 import errno
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -10,6 +11,8 @@ from .db.errors import DatabaseError
 from .db.repos import SettingsRepo
 from .db.workspaces import WorkspaceRepo, require_workspace_id
 from .runs import store_paths_safe
+
+logger = logging.getLogger('agenticml.server.workspaces')
 
 
 def default_workspace_id(db):
@@ -44,47 +47,82 @@ def prepare_store(data, workspace_id):
     return root
 
 
+def _rmtree_at(parent_fd, name):
+    """Delete ``name`` relative to ``parent_fd`` without following symlinks."""
+    try:
+        shutil.rmtree(name, ignore_errors=True, dir_fd=parent_fd)
+        return
+    except TypeError:
+        pass
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        fd = os.open(name, flags, dir_fd=parent_fd)
+    except OSError:
+        try:
+            os.unlink(name, dir_fd=parent_fd)
+        except OSError:
+            pass
+        return
+    try:
+        try:
+            entries = [entry.name for entry in os.scandir(fd)]
+        except OSError:
+            entries = []
+        for entry in entries:
+            try:
+                st = os.lstat(entry, dir_fd=fd)
+            except OSError:
+                continue
+            if stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode):
+                _rmtree_at(fd, entry)
+            else:
+                try:
+                    os.unlink(entry, dir_fd=fd)
+                except OSError:
+                    pass
+    finally:
+        os.close(fd)
+    try:
+        os.rmdir(name, dir_fd=parent_fd)
+    except OSError:
+        pass
+
+
 def discard_store(data, workspace_id):
     """Remove workspaces/<id>/ without following symlinks. Missing is OK."""
     wid = require_workspace_id(workspace_id)
     parent = Path(data) / 'workspaces'
+    if not hasattr(os, 'O_DIRECTORY') or not hasattr(os, 'O_NOFOLLOW'):
+        logger.warning('discard_store skipped: descriptor-relative deletion is unavailable')
+        return
+    if not getattr(shutil.rmtree, 'avoids_symlink_attacks', False):
+        logger.warning('discard_store skipped: shutil.rmtree cannot avoid symlink attacks')
+        return
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     try:
-        parent_st = parent.lstat()
+        parent_fd = os.open(parent, flags)
     except OSError:
         return
-    if stat.S_ISLNK(parent_st.st_mode) or not stat.S_ISDIR(parent_st.st_mode):
-        return
-    target = parent / wid
     try:
-        st = target.lstat()
-    except OSError:
-        return
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        st = os.fstat(parent_fd)
+        if not stat.S_ISDIR(st.st_mode):
+            return
+        if st.st_uid != os.geteuid():
+            logger.warning('discard_store skipped: workspaces directory is not owned by this process')
+            return
         try:
-            os.unlink(target)
+            child = os.lstat(wid, dir_fd=parent_fd)
         except OSError:
-            pass
-        return
-    for root, dirs, files in os.walk(target, topdown=False, followlinks=False):
-        for name in files:
+            return
+        if stat.S_ISLNK(child.st_mode) or not stat.S_ISDIR(child.st_mode):
             try:
-                os.unlink(os.path.join(root, name))
+                os.unlink(wid, dir_fd=parent_fd)
             except OSError:
                 pass
-        for name in dirs:
-            path = os.path.join(root, name)
-            try:
-                dst = os.lstat(path)
-                if stat.S_ISLNK(dst.st_mode):
-                    os.unlink(path)
-                else:
-                    os.rmdir(path)
-            except OSError:
-                pass
-    try:
-        os.rmdir(target)
-    except OSError:
-        pass
+            return
+        _rmtree_at(parent_fd, wid)
+    finally:
+        os.close(parent_fd)
 
 
 def convert_store(db, data):

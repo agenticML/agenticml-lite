@@ -201,14 +201,14 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 18b † | Firebase sign-in for the hosted service | 18 | Cursor | M | [plan](packages/18b-firebase-sign-in.md) | done (3.0 PR; real sign-in in Backlog) |
 | 18b.1 | Token verification, account linking, `/auth/firebase`, invites, CLI, extras | 18 | Cursor | M | [plan](packages/18b-firebase-sign-in.md) | done (3.0 PR) |
 | 18b.2 | Sign-in page with the vendored Firebase SDK, per-page CSP, UI tests | 18b.1 | Cursor | S | [plan](packages/18b-firebase-sign-in.md) | done (3.0 PR) |
-| 18c † | Self-serve sign-up and usage limits (free plan: storage, uploads, requests, people) | 18b | Codex, Cursor | M | [plan](packages/18c-signup-and-limits.md) | done (3.0 PR; 18c.3 second review pending) |
+| 18c † | Self-serve sign-up and usage limits (free plan: storage, uploads, requests, people) | 18b | Codex, Cursor | M | [plan](packages/18c-signup-and-limits.md) | done (3.0 PR) |
 | 18c.1 | Limits core: usage counters, limits file, storage/upload/request/people checks, CLI | 18b | Codex, Cursor | M | [plan](packages/18c-signup-and-limits.md) | done (3.0 PR) |
 | 18c.2 | Sign-up with a personal workspace, new workspace, free-workspace limit | 18c.1 | Cursor | S | [plan](packages/18c-signup-and-limits.md) | done (3.0 PR) |
-| 18c.3 | Usage page and banner, admin plan edit, `sync --follow` retry | 18c.2 | Cursor | S | [plan](packages/18c-signup-and-limits.md) | done (3.0 PR; second review pending) |
-| 19 † | Postgres backend, row-level security, CI on both backends | 18 | Codex, Cursor | M | [plan](packages/19-postgres.md) | done (3.0 PR; 19.2 second review pending) |
+| 18c.3 | Usage page and banner, admin plan edit, `sync --follow` retry | 18c.2 | Cursor | S | [plan](packages/18c-signup-and-limits.md) | done (3.0 PR) |
+| 19 † | Postgres backend, row-level security, CI on both backends | 18 | Codex, Cursor | M | [plan](packages/19-postgres.md) | done (3.0 PR) |
 | 19.1 | Postgres backend, dialect, portability audit, test harness, CI job | 18 | Codex, Cursor | M | [plan](packages/19-postgres.md) | done (3.0 PR) |
-| 19.2 | Row-level security policies and per-transaction workspace binding | 19.1, 18c | Cursor | S–M | [plan](packages/19-postgres.md) | done (3.0 PR; second review pending) |
-| 20 † | Many server processes: database locks, shared throttle and sessions | 19 | Codex, Cursor | M | [plan](packages/20-many-processes.md) | done (3.0 PR; second review of the last fix rounds pending) |
+| 19.2 | Row-level security policies and per-transaction workspace binding | 19.1, 18c | Cursor | S–M | [plan](packages/19-postgres.md) | done (3.0 PR) |
+| 20 † | Many server processes: database locks, shared throttle and sessions | 19 | Codex, Cursor | M | [plan](packages/20-many-processes.md) | done (3.0 PR) |
 | 20.1 | Cross-process session locks, process start, database clock, reader freshness, write fencing (compare-and-swap, lock checks) | 19 | Codex, Cursor | M | [plan](packages/20-many-processes.md) | done (3.0 PR) |
 | 20.2 | Two-process end-to-end test with a kill mid-upload | 20.1 | Codex, Cursor | S | [plan](packages/20-many-processes.md) | done (3.0 PR) |
 | 21 | S3 object backend | 18 | Codex | M | – | not started |

@@ -412,7 +412,8 @@ class KeyRepo(WorkspaceBound):
             return removed
 
     def touch(self, record, now, threshold):
-        with self._tx(write=True) as tx:
+        with self.db.transaction(write=True) as tx:
+            tx.bind_workspace(require_workspace_id(record.workspace_id or self.workspace_id))
             tx.execute('UPDATE keys SET last_used_at=? WHERE workspace_id=? AND name=? AND sha256=? '
                        'AND (last_used_at IS NULL OR last_used_at < ?)',
                        (now, record.workspace_id, record.name, record.sha256, threshold))

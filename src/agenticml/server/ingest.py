@@ -35,6 +35,7 @@ _SHORT_WARNED: set[tuple] = set()
 _ATOMIC_MISMATCH_WARNED: set[tuple] = set()
 _OVERSIZED_ATOMIC_WARNED: set[tuple] = set()
 _TIME_PATH = "scalars/_time.bin"
+_ATOMIC_BACKUP_NAME = re.compile(r"^\..+\.bak\.\d+\.\d+\.[0-9a-f]{8}\.tmp$")
 _ROUTES = [
     ("GET", re.compile(r"/healthz"), "health"),
     ("GET", re.compile(r"/v2/whoami"), "whoami"),
@@ -494,6 +495,7 @@ class IngestHandler(DashboardHandler):
             if name == "meta.json" and (obj.get("run_id") != run_id or obj.get("status") not in _STATUSES):
                 _fail(422, "invalid meta.json")
         directory = self._run_dir(run_id, create=True)
+        self._remove_stale_atomic_backups(directory)
         path = self._target(directory, name, create=True)
         exists = _regular(directory / "meta.json")
         digest = hashlib.sha256(body).hexdigest()
@@ -511,6 +513,7 @@ class IngestHandler(DashboardHandler):
         tmp = layout.unique_tmp(path.parent, f".{path.name}")
         backup = None
         published = False
+        published_id = None
         try:
             with tmp.open("xb") as handle:
                 handle.write(body)
@@ -519,12 +522,14 @@ class IngestHandler(DashboardHandler):
             self.server.db.confirm_session_locks()
 
             def publish():
-                nonlocal backup, published
+                nonlocal backup, published, published_id
                 if _regular(path):
                     backup = layout.unique_tmp(path.parent, f".{path.name}.bak")
                     # Hard link keeps the old inode at path until replace
                     # publishes the temp, so a crash never leaves the name missing.
                     os.link(path, backup)
+                info = tmp.stat()
+                published_id = (info.st_dev, info.st_ino)
                 os.replace(tmp, path)
                 published = True
                 layout.fsync_dir(path.parent)
@@ -536,18 +541,41 @@ class IngestHandler(DashboardHandler):
                 upload_clock=self._upload_clock(),
                 expected_size=committed, expected_sha256=committed_sha,
                 publish=publish)
-        except BaseException:
+        except BaseException as exc:
+            lock_lost = False
             try:
+                if published:
+                    same = False
+                    try:
+                        self.server.db.confirm_session_locks()
+                        current = os.lstat(path)
+                        same = (published_id is not None
+                                and (current.st_dev, current.st_ino) == published_id)
+                    except DatabaseBusy:
+                        lock_lost = True
+                        logger.warning("skipping atomic restore after lock loss")
+                    except OSError:
+                        logger.warning("skipping atomic restore; published file is missing")
+                    else:
+                        if not same:
+                            logger.warning(
+                                "skipping atomic restore; file was replaced by another writer")
+                    if same:
+                        if backup is not None:
+                            os.replace(backup, path)
+                            backup = None
+                            layout.fsync_dir(path.parent)
+                        else:
+                            path.unlink(missing_ok=True)
+                            layout.fsync_dir(path.parent)
                 if backup is not None:
-                    os.replace(backup, path)
-                    backup = None
-                    layout.fsync_dir(path.parent)
-                elif published:
-                    path.unlink(missing_ok=True)
-                    layout.fsync_dir(path.parent)
+                    backup.unlink(missing_ok=True)
                 tmp.unlink(missing_ok=True)
             except OSError:
                 logger.warning("could not restore atomic file after failed record")
+            if lock_lost and isinstance(exc, Exception):
+                raise _RequestError(
+                    503, {"error": "server busy"}, {"Retry-After": "5"}) from exc
             raise
         if backup is not None:
             backup.unlink(missing_ok=True)
@@ -569,11 +597,42 @@ class IngestHandler(DashboardHandler):
         except Exception:
             logger.error("could not record audit event")
 
+    def _remove_stale_atomic_backups(self, directory):
+        """Drop leftover `.<name>.bak.*.tmp` files; under the run lock they are stale."""
+        parents = set()
+        for current, dirnames, filenames in os.walk(directory, followlinks=False):
+            dirnames[:] = [
+                name for name in dirnames
+                if not os.path.islink(os.path.join(current, name))]
+            for name in filenames:
+                if _ATOMIC_BACKUP_NAME.fullmatch(name) is None:
+                    continue
+                path = os.path.join(current, name)
+                try:
+                    info = os.lstat(path)
+                    if not stat.S_ISREG(info.st_mode):
+                        continue
+                    try:
+                        self.server.db.confirm_session_locks()
+                    except DatabaseBusy as exc:
+                        raise _RequestError(
+                            503, {"error": "server busy"}, {"Retry-After": "5"}) from exc
+                    os.unlink(path)
+                    parents.add(current)
+                except OSError:
+                    logger.warning("could not remove stale atomic backup %s", path)
+        for parent in parents:
+            try:
+                layout.fsync_dir(parent)
+            except OSError:
+                logger.warning("could not fsync after removing stale atomic backups")
+
     def _state(self, run_id, principal):
         with self.workspace.run_lock(run_id):
             directory = self._run_dir(run_id)
             if not _regular(directory / "meta.json"):
                 _fail(404, "unknown run")
+            self._remove_stale_atomic_backups(directory)
             remote = self._remote(directory)
             recorded = self.workspace.run_index.files(run_id)
             names = list(recorded)
@@ -843,10 +902,15 @@ class IngestHandler(DashboardHandler):
                                 503, {"error": "server busy"}, {"Retry-After": "5"})
                         remaining -= len(expected)
             except Exception as exc:
-                # A concurrent writer may have committed past write_from; leave
-                # the tail for the next-append truncate rule. Other failures
-                # still drop this request's uncommitted bytes.
+                # Truncate uncommitted bytes only while this writer still holds
+                # the lock. Lock loss (or a 503 concurrent-writer check) leaves
+                # the tail for the next-append truncate-to-committed rule.
                 if started and not (isinstance(exc, _RequestError) and exc.status == 503):
+                    try:
+                        self.server.db.confirm_session_locks()
+                    except DatabaseBusy:
+                        raise _RequestError(
+                            503, {"error": "server busy"}, {"Retry-After": "5"}) from exc
                     os.ftruncate(dest.fileno(), write_from)
                     os.fsync(dest.fileno())
                 raise

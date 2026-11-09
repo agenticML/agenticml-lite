@@ -190,7 +190,9 @@ class DbBuckets(MemoryBuckets):
                     self.repo.save(self.entries, previous, tx, touched=touched,
                                    before_failures=before_failures,
                                    expire_before=now - expiry, keep=held)
-                    persisted = True
+                # COMMIT succeeded. A commit failure must keep unsaved counts
+                # in memory (merged by max on the next load).
+                persisted = True
             except BaseException:
                 if not applied or released_ticket is None:
                     # Load failed, or begin() could not persist: the caller

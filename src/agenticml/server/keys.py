@@ -246,9 +246,13 @@ class KeyStore:
             if not self._due(record):
                 return
             from datetime import datetime, timezone
+            from .db.repos import KeyRepo
             now = time.time()
-            self.repo.touch(record, layout.format_timestamp(datetime.fromtimestamp(now, timezone.utc)),
-                            layout.format_timestamp(datetime.fromtimestamp(now - 60, timezone.utc)))
+            repo = self.repo
+            if record.workspace_id and record.workspace_id != self.workspace_id:
+                repo = KeyRepo(self.db, record.workspace_id)
+            repo.touch(record, layout.format_timestamp(datetime.fromtimestamp(now, timezone.utc)),
+                       layout.format_timestamp(datetime.fromtimestamp(now - 60, timezone.utc)))
         except Exception:
             with self._touch_log_lock:
                 now = time.monotonic()

@@ -1246,6 +1246,26 @@ def test_state_null_atomic_hash_is_recorded_without_error(server, caplog):
     assert "atomic file differs from recorded hash" in caplog.text
 
 
+def test_stale_atomic_backup_removed_on_state_and_write(server):
+    assert put_meta(server)[0] == 200
+    first, second = b'{"k":"old"}', b'{"k":"new"}'
+    assert request(server, "/v2/runs/run-1/files/scalars/index.json", "PUT", first)[0] == 200
+    path = run_path(server, "scalars/index.json")
+    backup = path.parent / ".index.json.bak.1.2.deadbeef.tmp"
+    os.link(path, backup)
+    assert path.stat().st_nlink == 2
+    status, payload, _ = request(server, "/v2/runs/run-1/state")
+    assert status == 200
+    assert "scalars/index.json" in payload["files"]
+    assert not backup.exists()
+    assert path.stat().st_nlink == 1
+    os.link(path, backup)
+    assert request(server, "/v2/runs/run-1/files/scalars/index.json", "PUT", second)[0] == 200
+    assert not backup.exists()
+    assert path.read_bytes() == second
+    assert path.stat().st_nlink == 1
+
+
 @pytest.mark.parametrize("name", ["meta.json", "scalars/index.json", "media/index.json", "scalars/0.ovw"])
 def test_state_skips_hard_linked_atomic_files(server, tmp_path, name):
     put_meta(server)
