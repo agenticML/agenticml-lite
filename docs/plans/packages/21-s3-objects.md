@@ -225,3 +225,31 @@ backend unchanged); the Postgres server suite with
   unchanged (no test edits needed for the file backend), and the real-S3
   check is in the roadmap Backlog for the owner (one sync plus one
   dashboard download against a real bucket with SSE).
+
+## Review corrections (Nov 9, 2026)
+
+- Keep the shared `ObjectStoreUnavailable` exception in stdlib-only
+  `store/errors.py`, re-exported by `server/objectstore.py`. Local dashboard
+  requests must never import the server package. Once response headers are
+  sent, an object outage closes the connection without writing another response.
+- Only S3 error codes `404`, `NoSuchKey` and `NotFound` mean an absent
+  object. A deleted bucket and other 404 errors are service failures.
+- S3 streams fill bounded reads until the requested length or EOF, normalize
+  negative/None lengths to None, and map transport/streaming errors to the
+  shared exception. Both object backends supply a callable for code diffs.
+- `server up` explicitly selects `file://`, including when the environment
+  selects S3. Workspace deletion returns an `object_cleanup_failed` marker
+  on the deleted row so the CLI can warn on stderr with the workspace id.
+- Regression coverage includes actual workspace object directories, fresh
+  hash mismatch with no key, HTTP isolation and usage charging, cleanup of
+  3 and 1005 keys, all four CLI `--objects` paths, bucket deletion, short
+  reads, transport failures, and connection closure after partial responses.
+  The unscoped `/api/objects/<sha>` stream test injects an S3 opener into
+  the local dashboard handler; authenticated server requests use the scoped
+  `/api/w/default/objects/<sha>` route.
+
+Review verification:
+
+- Requested six-file suite: 476 passed.
+- Requested S3 + isolation suite against Postgres at port 55432: 61 passed.
+- Testbed UI suite: 261 passed, 114 deselected (including mobile overflow checks).

@@ -18,6 +18,7 @@ import weakref
 
 from agenticml.store import layout
 from agenticml.ui.server import DashboardServer, _browser_host, _loopback_bind
+from .objectstore import open_backend, ObjectStoreUnavailable
 from .keys import KeyStore, env_key_looks_weak, validate_env_key
 from .users import UserStore
 from .db import DatabaseBusy, for_server_dir, resolve_url, _is_postgres
@@ -383,7 +384,8 @@ class IngestServer(DashboardServer):
             if key in self.code_diffs:
                 self.code_diffs.move_to_end(key)
                 return self.code_diffs[key]
-        result = ui._code_pair_diff(store_root(self.data_dir, wid), base_sha, target_sha,
+        opener = lambda sha: self.objects.open(wid, sha)
+        result = ui._code_pair_diff(opener, base_sha, target_sha,
                                     ui._CODE_DIFF_MAX_BYTES, ui._CODE_DIFF_FILE_LINES, budget)
         if 'error' not in result and not budget.exhausted():
             with self.code_diff_lock:
@@ -493,7 +495,7 @@ class IPv6IngestServer(IngestServer):
 
 def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None,
                 trusted_proxies=(), identity_header=None, database=None,
-                firebase=None, cert_source=None, plans=None, open_signup=False):
+                firebase=None, cert_source=None, plans=None, open_signup=False, objects=None):
     """Prepare and lock the data directory; port=0 chooses a free port."""
     from .firebase import require_open_signup
     from .limits import Plans
@@ -507,6 +509,14 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
             "server keys create or secrets.token_urlsafe(32)")
     public_url = _validate_public_url(public_url)
     data = resolve_data_dir(data)
+    backend = open_backend(objects if objects is not None else os.environ.get("AGENTICML_SERVER_OBJECTS"), data)
+    if backend.name == 's3':
+        try:
+            backend._call(backend.client.head_bucket, Bucket=backend.bucket)
+        except (ObjectStoreUnavailable, FileNotFoundError) as exc:
+            raise ValueError('S3 object bucket is unreachable; check server logs and AWS configuration') from exc
+        if not _is_postgres(resolve_url(data, database)):
+            logger.warning('S3 objects are intended for the hosted Postgres setup')
     prepare_data_dir(data)
     if not store_paths_safe(data / "store"):
         raise ValueError("store or store/runs is a symlink or not a directory; fix or move it away")
@@ -523,6 +533,7 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
         server = cls(data, host, port, public_url, env_key, trusted_proxies, identity_header, db=db,
                      firebase=firebase, cert_source=cert_source, plans=plans,
                      open_signup=open_signup)
+        server.objects = backend
         server._server_lock = handle
         for workspace in server.workspaces.list():
             root = prepare_store(data, workspace['id'])
@@ -538,9 +549,11 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
 
 def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None,
           trusted_proxies=(), identity_header=None, database=None,
-          firebase=None, cert_source=None, plans=None, open_signup=False):
+          firebase=None, cert_source=None, plans=None, open_signup=False, objects=None):
     """Run until interrupted, with an optional environment admin key."""
     extra = {}
+    if objects is not None:
+        extra["objects"] = objects
     if plans is not None:
         extra["plans"] = plans
     if database is not None:

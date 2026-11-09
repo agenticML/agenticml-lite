@@ -211,11 +211,16 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 20 † | Many server processes: database locks, shared throttle and sessions | 19 | Codex, Cursor | M | [plan](packages/20-many-processes.md) | done (3.0 PR) |
 | 20.1 | Cross-process session locks, process start, database clock, reader freshness, write fencing (compare-and-swap, lock checks) | 19 | Codex, Cursor | M | [plan](packages/20-many-processes.md) | done (3.0 PR) |
 | 20.2 | Two-process end-to-end test with a kill mid-upload | 20.1 | Codex, Cursor | S | [plan](packages/20-many-processes.md) | done (3.0 PR) |
-| 21 | S3 object backend | 18 | Codex | M | [plan](packages/21-s3-objects.md) | in progress |
+| 21 | S3 object backend | 18 | Codex, Sonnet | M | [plan](packages/21-s3-objects.md) | done (3.0 PR; real S3 in Backlog) |
 | 22 | Metric summaries; sort and filter runs by metric | 17, 18 | Cursor | M | [plan](packages/22-metric-summaries.md) | in progress |
 | 23 | Operator commands: end-to-end 2.x conversion test (the import itself landed in 16–18), `server backup`, `status`/`verify` on the database | 18, 21, 22 | Codex | S–M | [plan](packages/23-operator-commands.md) | plan ready |
-| 24 | AWS hosted deployment (Dockerfile, Terraform, deploy workflow, runbook, real-EFS benchmark) | 18c, 19, 20, 21 | Codex; owner runs it | M | – | not started |
-| 25 | Docs, threat model, version 3.0.0 | 16–24 | Codex; prose Antigravity | M | – | not started |
+| 24 | AWS hosted deployment (Dockerfile, Terraform, deploy workflow, runbook, real-EFS benchmark) | 18c, 19, 20, 21 | Codex, Sonnet; owner runs it | M | [plan](packages/24-aws-deployment.md) | done (code, 3.0 PR; owner checks in Backlog) |
+| 24.1 | Image: Dockerfile, entrypoint, limits file, local hosted smoke test | 21 | Codex, Sonnet | S | [plan](packages/24-aws-deployment.md) | done (3.0 PR) |
+| 24.2 | Terraform, deploy workflow, `deploy-check` CI job, runbook | 24.1 | Codex, Sonnet | M | [plan](packages/24-aws-deployment.md) | done (3.0 PR; `terraform validate` runs in CI) |
+| 24.3 | Apply, first deploy, restore drill, real-EFS benchmark, exit criterion 6 | 24.2 | Owner | S | [plan](packages/24-aws-deployment.md) | not started (Backlog) |
+| 25 | Docs, threat model, version 3.0.0 | 16–24 | Codex; prose Antigravity | M | [plan](packages/25-docs-and-release.md) | plan ready |
+| 25.1 | Client support window (426), version 3.0.0, base-install smoke, 2.2 client check | 16–24 | Codex | S | [plan](packages/25-docs-and-release.md) | plan ready |
+| 25.2 | SERVER.md, HOSTED.md, threat model, PROTOCOL.md, README, website, SECURITY.md | 25.1 | Antigravity | M | [plan](packages/25-docs-and-release.md) | plan ready |
 | 26 | Retire agenticml-server | 24 live | Owner | S | – | not started |
 
 - **16–17** move everything the server keeps outside run files into tables
@@ -279,6 +284,44 @@ Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
+- **Hosted launch and rolling-upload verification** (package 24.3, owner).
+  - Where: `deploy/aws/README.md`, sections Prerequisites through Upgrades.
+  - Problem: the infrastructure and deployment code have not run in our AWS
+    account; exit criterion 6 needs a real deployment.
+  - Fix: owner reviews Terraform and action pins, applies with zero tasks,
+    pushes the private SHA image, dispatches the protected hosted workflow,
+    scales to two tasks, configures Firebase, and creates two customer
+    workspaces with admin/member accounts and workspace-bound sync keys.
+    Sync through both tasks and roll while uploading; verify acknowledged
+    sizes/hashes and dashboard parity, membership isolation, and client retry.
+  - Done when: `app.agenticml.xyz` serves both workspaces and evidence shows
+    a rolling deployment loses no uploads; record apply/deploy revisions and
+    sign-in, isolation and upload results. Owner only; no agent AWS calls.
+- **Hosted backup restore drill** (package 24.3, owner).
+  - Where: `deploy/aws/README.md`, Restore drill.
+  - Problem: configured backups have not been restored; exit criterion 6
+    requires one real restore.
+  - Fix: restore RDS PITR to a new private instance, EFS from AWS Backup to
+    a new filesystem/access point, and matching S3 versions to a test bucket;
+    point an isolated test service and scoped roles at them with signup off.
+    Verify both workspaces, login, run files/metrics, objects, and a new sync.
+  - Done when: recovery age/duration and integrity results are recorded and
+    drill resources removed without changing live resources.
+- **Stand up the hosted service on AWS (package 24.3, owner)** (Nov 9,
+  2026).
+  - Where: `deploy/aws/` (Terraform, `README.md` runbook),
+    `.github/workflows/deploy.yml`.
+  - Problem: agents wrote and statically checked the stack (image build,
+    `scripts/hosted_smoke.sh` against local Postgres and moto,
+    `terraform fmt`, `terraform validate` in CI) but never ran it in AWS:
+    creating billed resources and a public endpoint is the owner's call.
+  - Fix: follow `deploy/aws/README.md`: state bucket, `terraform apply`,
+    GitHub environment `hosted` with `AWS_DEPLOY_ROLE_ARN`, first deploy,
+    first server admin, two customer workspaces, a rolling deploy during a
+    sync, an RDS + EFS restore drill, and the real-EFS benchmark (replaces
+    the "Run the server benchmark on real EFS" entry below).
+  - Done when: exit criterion 6 of the 3.0 plan holds and `docs/SERVER.md`
+    shows real-EFS numbers.
 - **Many-process follow-ups for package 24** (package 20 reviews, Nov 9,
   2026).
   - Where: `src/agenticml/server/db/postgres.py` (session locks),
@@ -315,6 +358,23 @@ priority.
   - Fix: open outside the registry lock; consider salting keys per schema
     and a connection cap. Revisit in package 20.
   - Done when: each has a test or a recorded decision.
+- **Check S3 objects against a real bucket** (package 21, Nov 9, 2026).
+  - Where: `src/agenticml/server/objectstore.py`, hosted server configuration.
+  - Problem: moto covers the backend; real AWS checksums, conditional writes,
+    IAM and server-side encryption still need an owner check.
+  - Fix: sync a run and download its objects through the dashboard against
+    a real S3 bucket; confirm SSE and workspace-scoped keys.
+  - Done when: one sync and dashboard download match the source bytes and
+    the stored objects have the configured SSE.
+- **Retry object cleanup after a workspace deletion fails** (package 21,
+  Nov 9, 2026).
+  - Where: `server/workspaces.py` `delete_workspace`, S3 workspace prefix.
+  - Problem: an S3 outage after database deletion leaves unreachable bytes;
+    deletion logs a warning with the workspace id.
+  - Fix: retain the warned id and retry prefix deletion when S3 recovers;
+    add durable cleanup tracking if automatic retries are needed.
+  - Done when: a failed cleanup can be retried and removes only that
+    workspace's prefix.
 - **Check Firebase sign-in against the real Firebase project** (package 18b
   caveat, Nov 8, 2026).
   - Where: `src/agenticml/server/firebase.py`, `static/firebase-login.js`,

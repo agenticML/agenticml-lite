@@ -540,6 +540,8 @@ def cmd_server_serve(args):
     if identity is None:
         identity = os.environ.get("AGENTICML_SERVER_IDENTITY_HEADER") or None
     extra = {}
+    if args.objects is not None:
+        extra["objects"] = args.objects
     if args.database is not None:
         extra["database"] = args.database
     try:
@@ -884,7 +886,11 @@ def cmd_server_workspaces(args):
             confirmation = args.yes_delete if args.yes_delete is not None else input('Type the workspace slug to delete it: ')
             if confirmation != args.slug:
                 raise ValueError('workspace deletion not confirmed')
-            row = delete_workspace(db, data, args.slug)
+            from .server.objectstore import open_backend
+            backend = open_backend(args.objects if args.objects is not None else os.environ.get('AGENTICML_SERVER_OBJECTS'), data)
+            row = delete_workspace(db, data, args.slug, objects=backend)
+            if row.get('object_cleanup_failed'):
+                print(f"Warning: object cleanup failed for workspace {row['id']}; bytes are orphaned", file=sys.stderr)
             log.record(actor, 'cli', 'workspace.delete', row['id'], detail={'slug': args.slug})
         elif action == 'recount':
             from .server.db.usage import UsageRepo
@@ -969,8 +975,8 @@ def _cmd_server_report(args, verify=False):
     from .server.db.errors import DatabaseError
 
     try:
-        report = (admin.verify(args.data, progress=not args.json, database=args.database) if verify
-                  else admin.status(args.data, database=args.database))
+        report = (admin.verify(args.data, progress=not args.json, database=args.database, objects=args.objects) if verify
+                  else admin.status(args.data, database=args.database, objects=args.objects))
         if args.json:
             print(json.dumps(report, indent=2, sort_keys=True))
         else:
@@ -1524,6 +1530,8 @@ def main(argv=None):
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     parser = argparse.ArgumentParser(prog="agenticml")
+    from . import __version__
+    parser.add_argument("--version", action="version", version="%(prog)s " + __version__)
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("run", help="Run a Python script inside a tracked run")
 
@@ -1603,6 +1611,7 @@ def main(argv=None):
     p_serve = server_sub.add_parser("serve", help="Serve protocol v2 ingest")
     p_serve.add_argument("--data", default=None, help="Data directory (default: AGENTICML_SERVER_DATA or ~/.agenticml-server)")
     p_serve.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_serve.add_argument("--objects", default=None, metavar="URL", help="Object backend (default: AGENTICML_SERVER_OBJECTS or file://)")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8080)
     p_serve.add_argument("--public-url", default=None, help="Public server URL (default: AGENTICML_SERVER_PUBLIC_URL)")
@@ -1643,6 +1652,7 @@ def main(argv=None):
         child = server_sub.add_parser(action, help=help_text)
         child.add_argument("--data", default=None)
         child.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+        child.add_argument("--objects", default=None, metavar="URL")
         child.add_argument("--json", action="store_true")
         child.set_defaults(func=func)
     p_reindex = server_sub.add_parser("reindex", help="Rebuild the run index from on-disk files")
@@ -1683,6 +1693,7 @@ def main(argv=None):
             child.add_argument('--name', required=True)
             child.add_argument('--slug', dest='new_slug', default=None)
         elif action == 'delete':
+            child.add_argument('--objects', default=None, metavar='URL')
             child.add_argument('--yes-delete', default=None, metavar='SLUG')
         elif action == 'set-owner':
             child.add_argument('--owner', required=True)

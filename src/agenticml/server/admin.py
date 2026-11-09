@@ -83,11 +83,12 @@ def _walk(path, on_error, *, missing_ok=True, descend=None):
         yield from _walk(child, on_error, missing_ok=False, descend=descend)
 
 
-def status(data, *, database=None) -> dict:
+def status(data, *, database=None, objects=None) -> dict:
     data, root = _data_root(data, database)
+    s3 = (objects if objects is not None else os.environ.get('AGENTICML_SERVER_OBJECTS', '')).startswith('s3://')
     counts = dict.fromkeys(_STATUSES, 0)
     keys = []
-    warnings = []
+    warnings = ["objects are in S3; object checks come in package 23"] if s3 else []
     keys_loaded = True
     db = None
     try:
@@ -181,6 +182,8 @@ def status(data, *, database=None) -> dict:
 
     for name in ("runs", "objects", "lineage"):
         sizes[name] = 0
+        if s3 and name == "objects":
+            continue
         for path, info in _walk(root / name, skipped):
             if not stat.S_ISREG(info.st_mode):
                 continue
@@ -193,7 +196,7 @@ def status(data, *, database=None) -> dict:
             "sizes": sizes, "keys": keys, "users": users, "warnings": warnings}
 
 
-def verify(data, *, progress=False, database=None) -> dict:
+def verify(data, *, progress=False, database=None, objects=None) -> dict:
     data, root = _data_root(data, database)
     db = for_server_dir(data / 'server', database, create=False)
     report = {"ok": True, "checked": {"objects": 0, "runs": 0}, "problems": [], "warnings": []}
@@ -205,6 +208,9 @@ def verify(data, *, progress=False, database=None) -> dict:
     def object_error(path, exc):
         add("object_type", path, str(exc))
 
+    s3 = (objects if objects is not None else os.environ.get('AGENTICML_SERVER_OBJECTS', '')).startswith('s3://')
+    if s3:
+        add('objects_s3', root, 'objects are in S3; object checks come in package 23', warning=True)
     objects = root / "objects"
     prefixes = set()
 
@@ -212,7 +218,7 @@ def verify(data, *, progress=False, database=None) -> dict:
         return path == objects or (path.parent == objects
                                    and re.fullmatch(r"[0-9a-f]{2}", path.name) is not None)
 
-    for path, info in _walk(objects, object_error, descend=object_directory):
+    for path, info in (() if s3 else _walk(objects, object_error, descend=object_directory)):
         parts = path.relative_to(objects).parts
         if stat.S_ISREG(info.st_mode) and _OBJECT_TMP.fullmatch(path.name):
             continue
@@ -259,7 +265,7 @@ def verify(data, *, progress=False, database=None) -> dict:
         _verify_run_files(root, directory, add, db)
         try:
             refs = run_references(root, directory.name)
-            for sha in sorted(set().union(*refs.values())):
+            for sha in ([] if s3 else sorted(set().union(*refs.values()))):
                 path = root / "objects" / sha[:2] / sha
                 if not _referenced_object(objects, sha, prefixes):
                     add("object_missing", path, f"referenced by run {directory.name}")

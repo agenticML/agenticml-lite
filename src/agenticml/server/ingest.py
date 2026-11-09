@@ -12,10 +12,11 @@ import stat
 import time
 from urllib.parse import urlsplit
 
-from agenticml.store import layout, objects
+from agenticml.store import layout
 from agenticml.store.overview import Overview
 from agenticml.store.reader import last_step_from_size, parse_artifacts_json
 from agenticml.ui.server import DashboardHandler
+from .objectstore import ObjectStoreUnavailable
 from .db.errors import DatabaseBusy
 from . import lineage
 from .db import DatabaseError
@@ -271,6 +272,10 @@ class IngestHandler(DashboardHandler):
             self._error({"error": "request body timeout"}, 408)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             self.close_connection = True
+        except ObjectStoreUnavailable:
+            self.close_connection = True
+            if not getattr(self, "_started", False):
+                self._json({"error": "object store unavailable"}, 503, {"Retry-After": "5"})
         except DatabaseBusy:
             self.close_connection = True
             self._json({"error": "key store unavailable"}, 503, {"Retry-After": "5"})
@@ -316,7 +321,7 @@ class IngestHandler(DashboardHandler):
             else:
                 growth = length - committed
         elif route == 'object':
-            growth = (0 if usage.has_object(args[0]) or objects.has(self.workspace.root, args[0])
+            growth = (0 if usage.has_object(args[0]) or self.server.objects.exists(self.workspace.id, args[0])
                       else length)
         # Pre-check without a lock for early refusal; re-check under the
         # per-workspace quota lock after receipt so slow bodies never hold
@@ -729,7 +734,7 @@ class IngestHandler(DashboardHandler):
         if (not isinstance(hashes, list) or len(hashes) > self.server.limits.missing_hashes
                 or any(not layout.valid_sha(sha) for sha in hashes)):
             _fail(422, "invalid objects")
-        self._json({"missing": [sha for sha in dict.fromkeys(hashes) if not objects.has(self.workspace.root, sha)]})
+        self._json({"missing": self.server.objects.missing(self.workspace.id, hashes)})
 
     def _object(self, sha, tmp, actual):
         if sha != actual:
@@ -740,30 +745,17 @@ class IngestHandler(DashboardHandler):
         with self.workspace.object_lock(sha), self._quota_lock("object"):
             if self.server.plans is not None:
                 self._check_quota("object", (sha,), "", tmp.stat().st_size)
-            dest = layout.object_path(self.workspace.root, sha)
-            if (dest.exists() or dest.is_symlink()) and not _regular(dest):
-                raise ValueError("unsafe object destination")
-            if objects.has(self.workspace.root, sha):
-                os.utime(dest, None, follow_symlinks=False)
-                self._record_object(sha, dest.lstat().st_size, created=False)
-                return {"sha256": sha, "created": False}, 200
+            backend = self.server.objects
+            size = tmp.stat().st_size
+            created = backend.put(self.workspace.id, sha, tmp, size)
             try:
-                dest.parent.mkdir(parents=True)
-                created_prefix = True
-            except FileExistsError:
-                created_prefix = False
-            layout.object_path(self.workspace.root, sha)
-            if created_prefix:
-                layout.fsync_dir(dest.parent.parent)
-            os.replace(tmp, dest)
-            layout.fsync_dir(dest.parent)
-            try:
-                self._record_object(sha, dest.lstat().st_size, created=True)
+                self._record_object(sha, size if created else backend.size(self.workspace.id, sha),
+                                    created=created)
             except Exception:
-                dest.unlink()
-                layout.fsync_dir(dest.parent)
+                if created:
+                    backend.delete(self.workspace.id, sha)
                 raise
-            return {"sha256": sha, "created": True}, 201
+            return {"sha256": sha, "created": created}, 201 if created else 200
 
     def _record_object(self, sha, size, *, created):
         with self.server.db.transaction(write=True) as tx:
