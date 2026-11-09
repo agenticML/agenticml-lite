@@ -211,9 +211,9 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 20 † | Many server processes: database locks, shared throttle and sessions | 19 | Codex, Cursor | M | [plan](packages/20-many-processes.md) | done (3.0 PR) |
 | 20.1 | Cross-process session locks, process start, database clock, reader freshness, write fencing (compare-and-swap, lock checks) | 19 | Codex, Cursor | M | [plan](packages/20-many-processes.md) | done (3.0 PR) |
 | 20.2 | Two-process end-to-end test with a kill mid-upload | 20.1 | Codex, Cursor | S | [plan](packages/20-many-processes.md) | done (3.0 PR) |
-| 21 | S3 object backend | 18 | Codex | M | – | not started |
-| 22 | Metric summaries; sort and filter runs by metric | 17, 18 | Cursor | M | – | not started |
-| 23 | Operator commands: end-to-end 2.x conversion test (the import itself landed in 16–18), `server backup`, `status`/`verify` on the database | 18 | Codex | S–M | – | not started |
+| 21 | S3 object backend | 18 | Codex | M | [plan](packages/21-s3-objects.md) | in progress |
+| 22 | Metric summaries; sort and filter runs by metric | 17, 18 | Cursor | M | [plan](packages/22-metric-summaries.md) | in progress |
+| 23 | Operator commands: end-to-end 2.x conversion test (the import itself landed in 16–18), `server backup`, `status`/`verify` on the database | 18, 21, 22 | Codex | S–M | [plan](packages/23-operator-commands.md) | plan ready |
 | 24 | AWS hosted deployment (Dockerfile, Terraform, deploy workflow, runbook, real-EFS benchmark) | 18c, 19, 20, 21 | Codex; owner runs it | M | – | not started |
 | 25 | Docs, threat model, version 3.0.0 | 16–24 | Codex; prose Antigravity | M | – | not started |
 | 26 | Retire agenticml-server | 24 live | Owner | S | – | not started |
