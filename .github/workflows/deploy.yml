@@ -1,0 +1,66 @@
+name: Deploy hosted service
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit SHA, tag or branch to deploy (blank uses workflow ref)
+        required: false
+        type: string
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: hosted-deploy
+  cancel-in-progress: false
+jobs:
+  deploy:
+    environment: hosted
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-2' }}
+      ECR_REPOSITORY: agenticml/lite-server
+      ECS_CLUSTER: agenticml-hosted
+      ECS_SERVICE: agenticml-hosted
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build or reuse immutable commit image
+        shell: bash
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          image="${REGISTRY}/${ECR_REPOSITORY}:${sha}"
+          # Distinguish a missing tag from authentication/network failures.
+          if aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$sha" > /tmp/image.json 2>/tmp/ecr-error; then
+            echo "Reusing existing immutable image $sha"
+          elif grep -q ImageNotFoundException /tmp/ecr-error; then
+            docker build -f deploy/aws/Dockerfile -t "$image" .
+            docker push "$image"
+          else
+            cat /tmp/ecr-error >&2
+            exit 1
+          fi
+          echo "DEPLOY_IMAGE=$image" >> "$GITHUB_ENV"
+      - name: Register revision and roll service
+        shell: bash
+        run: |
+          set -euo pipefail
+          current=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --query 'services[0].taskDefinition' --output text)
+          aws ecs describe-task-definition --task-definition "$current" > /tmp/current-task.json
+          python3 deploy/aws/swap_image.py "$DEPLOY_IMAGE" < /tmp/current-task.json > /tmp/register-task.json
+          next=$(aws ecs register-task-definition --cli-input-json file:///tmp/register-task.json --query 'taskDefinition.taskDefinitionArn' --output text)
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --task-definition "$next" > /dev/null
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+          actual=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --query 'services[0].taskDefinition' --output text)
+          test "$actual" = "$next" || { echo 'Deployment rolled back; inspect ECS events' >&2; exit 1; }

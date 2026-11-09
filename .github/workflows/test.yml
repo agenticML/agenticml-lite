@@ -107,3 +107,44 @@ jobs:
         env:
           AGENTICML_TEST_DATABASE_URL: postgresql://postgres:test-password@localhost:5432/postgres
         run: python -m pytest -q -rs tests
+
+  deploy-check:
+    name: Hosted deployment static checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Detect deployment changes
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            git diff --name-only "$BASE_SHA" "$HEAD_SHA" > /tmp/deploy-changed-files
+          fi
+          if [[ "$EVENT_NAME" != pull_request ]] || grep -Eq '^(deploy/aws/|\.github/workflows/(deploy|test)\.yml$|pyproject\.toml$|\.dockerignore$)' /tmp/deploy-changed-files; then
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: hashicorp/setup-terraform@v3
+        if: steps.changes.outputs.run == 'true'
+        with:
+          terraform_version: 1.6.6
+      - name: Terraform format and validate
+        if: steps.changes.outputs.run == 'true'
+        working-directory: deploy/aws/terraform
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false
+          terraform validate
+      - name: Build and check hosted image
+        if: steps.changes.outputs.run == 'true'
+        run: |
+          docker build -f deploy/aws/Dockerfile -t agenticml-hosted-check .
+          docker run --rm --entrypoint agenticml agenticml-hosted-check --version
+          docker run --rm --entrypoint python agenticml-hosted-check -c 'import psycopg, boto3, jwt'
