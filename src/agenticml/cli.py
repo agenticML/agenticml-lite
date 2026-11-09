@@ -553,6 +553,11 @@ def cmd_server_serve(args):
             extra["firebase"] = firebase
         if _open_signup_from_args(args, firebase, plans):
             extra["open_signup"] = True
+        min_client = args.min_client_version
+        if min_client is None:
+            min_client = os.environ.get("AGENTICML_SERVER_MIN_CLIENT_VERSION") or None
+        if min_client is not None:
+            extra["min_client_version"] = min_client
         serve(args.data, args.host, args.port, public_url,
               trusted_proxies=parse_trusted_proxies(proxies),
               identity_header=parse_identity_header(identity),
@@ -1656,6 +1661,9 @@ def main(argv=None):
     p_serve.add_argument("--limits", default=None, metavar="FILE", help="Workspace limits JSON (default: AGENTICML_SERVER_LIMITS)")
     p_serve.add_argument("--open-signup", action="store_true",
                         help="Allow verified Firebase sign-in to create an account (default: AGENTICML_SERVER_OPEN_SIGNUP)")
+    p_serve.add_argument("--min-client-version", default=None, metavar="X.Y",
+                         help="Reject agenticml-lite clients older than this on /v2 "
+                              "(default: AGENTICML_SERVER_MIN_CLIENT_VERSION or 2.2)")
     p_serve.set_defaults(func=cmd_server_serve)
     p_up = server_sub.add_parser("up", help="Serve on loopback through Tailscale Funnel")
     p_up.add_argument("--data", default=None, help="Data directory (default: AGENTICML_SERVER_DATA or ~/.agenticml-server)")

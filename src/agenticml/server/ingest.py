@@ -19,6 +19,7 @@ from agenticml.ui.server import DashboardHandler
 from .objectstore import ObjectStoreUnavailable
 from .db.errors import DatabaseBusy
 from . import lineage
+from .clientwindow import too_old, upgrade_message
 from .db import DatabaseError
 from .db.usage import UsageRepo
 from .access import WorkspaceNotFound
@@ -153,6 +154,9 @@ class IngestHandler(DashboardHandler):
             if route == "health":
                 self._json({"ok": True})
                 return
+            # Not whoami: 2.x clients show a 4xx on it as "not an agenticml server".
+            if route != "whoami" and too_old(self.headers.get("User-Agent"), self.server.min_client):
+                _fail(426, upgrade_message(self.server.min_client))
             record, principal = self._authenticate()
             self.principal = principal
             if self.server.plans is not None:

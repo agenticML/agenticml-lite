@@ -24,6 +24,9 @@ jobs:
         python: ["3.10", "3.12"]
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The 2.2 client compatibility test exports the 2.2.0 release from git.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v7
         with:
@@ -39,9 +42,13 @@ jobs:
       - name: Run unit tests
         run: python -m pytest -q tests
 
-      - name: Run server smoke test
+      - name: Run server smoke test on a base install
         if: matrix.python == '3.12'
-        run: PYTHON=python bash scripts/server_smoke.sh
+        run: |
+          # A fresh venv with `pip install .` only (no extras, no [dev]).
+          python -m venv "$RUNNER_TEMP/base-venv"
+          "$RUNNER_TEMP/base-venv/bin/python" -m pip install .
+          PYTHON="$RUNNER_TEMP/base-venv/bin/python" bash scripts/server_smoke.sh
 
   testbed:
     name: Testbed and dashboard UI
