@@ -9,6 +9,7 @@ import os
 import shutil
 import struct
 import threading
+from types import SimpleNamespace
 
 import pytest
 import requests
@@ -17,6 +18,7 @@ from agenticml import cli
 from agenticml.client import Client, Conflict
 from agenticml.server.app import make_server
 from agenticml.server.keys import KeyStore
+from test_client import fake_http
 from test_server_ingest import foreign_key
 from agenticml.store import RunReader, RunWriter
 from agenticml.store.gc import run_fingerprint, usage
@@ -24,7 +26,7 @@ from agenticml.store.layout import object_path
 from agenticml.store.overview import OVERVIEW_MIN_POINTS
 from agenticml.store.reader import references_from_bytes, run_references
 from agenticml import sync
-from server_db_helpers import default_workspace_id
+from server_db_helpers import default_workspace_id, isolate_server_dir
 
 
 @contextmanager
@@ -299,7 +301,7 @@ def test_server_backup_recovery(remote, tmp_path):
         writer.close()
 
 
-def test_prune_preserves_remote_and_gc_synced(remote, tmp_path, capsys):
+def test_prune_preserves_remote_and_gc_synced(remote, tmp_path, capsys, monkeypatch):
     writer = writer_at(tmp_path, count=OVERVIEW_MIN_POINTS + 1)
     assert command(remote, writer, writer.run_id, "--prune") == 0
     assert not (writer.run_dir / "scalars/0.bin").exists()
@@ -311,6 +313,7 @@ def test_prune_preserves_remote_and_gc_synced(remote, tmp_path, capsys):
     assert push(remote, writer).complete
     assert remote_bin.read_bytes() == content
     assert "scalars/0.bin" not in remote[0].run_index.as_remote(writer.run_id)["sizes"]
+    isolate_server_dir(tmp_path / "second" / "server", monkeypatch)
     with running(tmp_path / "second") as server:
         _, key = server.keys.create("box")
         with Client("http://127.0.0.1:%d" % server.server_address[1], key) as client:
@@ -544,6 +547,70 @@ def test_short_error(code, expected, permanent):
     assert sync._short_error(error).startswith(expected)
     assert "\x1b" not in sync._short_error(error)
     assert sync._permanent_failure(error) == permanent
+
+
+def _http_error(code, body):
+    response = requests.Response()
+    response.status_code = code
+    response._content = body
+    response.encoding = "utf-8"
+    return requests.HTTPError(response=response)
+
+
+def _json_http_error(code, error):
+    return _http_error(code, json.dumps({"error": error}).encode())
+
+
+@pytest.mark.parametrize("error", [
+    "storage limit reached: 4.9 GB of 5.0 GB used; delete runs or ask for more",
+    "daily upload limit reached: 2.0 GB of 2.0 GB today; resets at 00:00 UTC (in 3 h 12 min)",
+])
+def test_quota_limit_is_detected_but_still_permanent(error):
+    exc = _json_http_error(403, error)
+    assert sync._is_quota_limit(exc)
+    assert sync._permanent_failure(exc)
+    assert sync._short_error(exc) == f"HTTP 403: {error}"
+
+
+@pytest.mark.parametrize("code,body", [
+    (403, json.dumps({"error": "role viewer cannot sync"}).encode()),
+    (403, json.dumps({"error": "people limit reached (5 of 5)"}).encode()),
+    (403, json.dumps({"error": "workspace suspended"}).encode()),
+    (401, json.dumps({"error": "storage limit reached: 4.9 GB of 5.0 GB used"}).encode()),
+    (429, json.dumps({"error": "daily upload limit reached: 2.0 GB of 2.0 GB today"}).encode()),
+    (403, json.dumps({"error": "not storage limit reached"}).encode()),
+    (403, b""),
+    (403, b"plain text from a 2.2 server"),
+])
+def test_quota_limit_ignores_other_errors(code, body):
+    assert not sync._is_quota_limit(_http_error(code, body))
+
+
+def test_plain_sync_quota_limit_exits_1(tmp_path, monkeypatch, capsys):
+    for name in ("AGENTICML_HOST", "AGENTICML_API_KEY", "AGENTICML_SERVER_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AGENTICML_CONFIG_DIR", str(tmp_path / "config"))
+    message = "storage limit reached: 4.9 GB of 5.0 GB used; delete runs or ask for more"
+    whoami = json.dumps({
+        "protocol": 2, "key": "box", "scope": "sync", "user": "admin",
+        "role": "owner", "workspace": "default", "features": [],
+    }).encode()
+    body = json.dumps({"error": message}).encode()
+
+    def quota(request):
+        path = request.path.split("?", 1)[0]
+        if path == "/v2/whoami":
+            request._send(200, whoami, {"Content-Type": "application/json"})
+        else:
+            request._send(403, body, {"Content-Type": "application/json"})
+
+    writer = writer_at(tmp_path)
+    with fake_http(quota) as (_httpd, url):
+        remote = (None, SimpleNamespace(base_url=url, api_key="secret-key"))
+        assert command(remote, writer, writer.run_id) == 1
+    captured = capsys.readouterr()
+    assert message in captured.out
+    assert "secret-key" not in captured.out + captured.err
 
 
 def test_watch_is_bounded_in_tests(remote, tmp_path, monkeypatch):

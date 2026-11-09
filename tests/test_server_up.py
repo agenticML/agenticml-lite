@@ -26,14 +26,29 @@ from agenticml.server import up as up_mod
 from agenticml.server.users import UserStore
 from test_server_users import write_v1_keys
 from agenticml.server.up import (
-    UpError, _ADMIN_NAME_NOT_ADMIN, _ENV_KEY_NOT_INHERITED, _INSTALL_ENV_DATABASE,
-    _INSTALL_NEEDS_PORT, _NO_ADMIN_TTY, _NO_DNS, _NO_FUNNEL, _NO_HTTPS,
-    _NOT_INSTALLED, _NOT_RUNNING, _PORT_443_TAKEN, _SETUP_CLOSED, _SYSTEMD_CONTROL,
-    _systemd_quote, write_launchd_plist,
+    UpError, _ADMIN_NAME_NOT_ADMIN, _DATABASE_URL_NEWLINE, _ENV_DATABASE_KEY,
+    _ENV_FILE_MARKER, _ENV_KEY_NOT_INHERITED, _ENV_PATH_CONTROL, _ENV_PATH_GLOB,
+    _INSTALL_ENV_DATABASE, _INSTALL_NEEDS_PORT, _NO_ADMIN_TTY, _NO_DNS,
+    _NO_FUNNEL, _NO_HTTPS, _NOT_INSTALLED, _NOT_RUNNING, _PORT_443_TAKEN,
+    _SETUP_CLOSED, _SHELL_NEED_ESCAPE, _SYSTEMD_CONTROL, _UNSAFE_DIR_SYMLINK,
+    _UNSAFE_DIR_WRITABLE, _environment_file_assignment, _remove_our_env_file,
+    _systemd_quote, launchd_plist_path, systemd_env_path, systemd_unit_path,
+    write_launchd_plist, write_systemd_unit,
 )
 from server_db_helpers import default_workspace_id
 
 pytest.importorskip("fcntl")
+
+
+@pytest.fixture(autouse=True)
+def _up_tests_independent_of_umask(tmp_path):
+    previous = os.umask(0o022)
+    os.chmod(tmp_path, 0o755)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
 
 FAKE = r'''
 import json, os, sys, time
@@ -309,6 +324,7 @@ def test_funnel_off_failure_warns_and_exits_0(tmp_path, monkeypatch):
     assert funnel_toggles(log)[-1] == ["funnel", "--https=443", "off"]
 
 
+@pytest.mark.sqlite_only
 def test_locked_data_dir_skips_funnel(tmp_path, monkeypatch, capsys):
     log = install_fake(tmp_path, monkeypatch)
     data = tmp_path / "data"
@@ -345,7 +361,8 @@ def test_install_linux_quotes_spaces_and_does_not_serve(tmp_path, monkeypatch, c
     assert "WantedBy=default.target" in text
     assert "RestartPreventExitStatus" not in text
     assert "--database" not in text
-    assert stat.S_IMODE(unit.stat().st_mode) == 0o644
+    assert "EnvironmentFile=" not in text
+    assert stat.S_IMODE(unit.stat().st_mode) == 0o600
     foreign = tmp_path / "other" / ".config/systemd/user/agenticml-server-up.service"
     monkeypatch.setenv("HOME", str(tmp_path / "other"))
     foreign.parent.mkdir(parents=True)
@@ -367,13 +384,47 @@ def test_install_omits_environment_database_url(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("AGENTICML_SERVER_DATABASE_URL", "sqlite:///" + str(env_path))
     data = tmp_path / "data"
     assert run_up(data, "--install") == 0
-    text = (home / ".config/systemd/user/agenticml-server-up.service").read_text()
+    unit = home / ".config/systemd/user/agenticml-server-up.service"
+    text = unit.read_text()
     captured = capsys.readouterr()
     assert "--database" not in text
+    assert "EnvironmentFile=" not in text
     assert "secret-password" not in text
     assert "secret-password" not in captured.out
+    assert not systemd_env_path(home).exists()
     assert _INSTALL_ENV_DATABASE in captured.out
     assert captured.out.count(_INSTALL_ENV_DATABASE) == 1
+    assert stat.S_IMODE(unit.stat().st_mode) == 0o600
+
+
+def test_install_writes_absolute_resolved_limits_path(tmp_path, monkeypatch):
+    from agenticml.server.limits import UNLIMITED
+
+    install_fake(tmp_path, monkeypatch)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    limits = tmp_path / "limits.json"
+    limits.write_text(json.dumps({
+        "default_plan": "free",
+        "free_workspaces_per_account": 1,
+        "plans": {"free": dict(UNLIMITED)},
+    }))
+    monkeypatch.chdir(tmp_path)
+    data = tmp_path / "data"
+    assert run_up(data, "--install", "--limits", "limits.json") == 0
+    resolved = str(limits.resolve())
+    text = (home / ".config/systemd/user/agenticml-server-up.service").read_text()
+    assert "--limits " + resolved in text
+    linux_home = tmp_path / "linux-home"
+    linux_home.mkdir()
+    unit = write_systemd_unit(data, 8080, home=linux_home, limits="limits.json")
+    assert "--limits " + resolved in unit.read_text()
+    mac_home = tmp_path / "mac-home"
+    mac_home.mkdir()
+    plist = write_launchd_plist(data, 8080, home=mac_home, limits="limits.json")
+    args = plistlib.loads(plist.read_bytes())["ProgramArguments"]
+    assert args[args.index("--limits") + 1] == resolved
 
 
 def test_launchd_writer(tmp_path, monkeypatch, capsys):
@@ -393,12 +444,498 @@ def test_launchd_writer(tmp_path, monkeypatch, capsys):
     assert payload["StandardOutPath"] == log_path
     assert payload["StandardErrorPath"] == log_path
     assert capsys.readouterr().out.strip() == f"launchctl load -w {path}"
-    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+    assert "EnvironmentVariables" not in payload
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
     path.write_bytes(plistlib.dumps({"Label": "other.job"}))
     with pytest.raises(UpError, match="refusing to overwrite"):
         write_launchd_plist(data, 8080, home=home)
     write_launchd_plist(data, 8080, home=home, force=True)
     assert plistlib.loads(path.read_bytes())["Label"] == "xyz.agenticml.server-up"
+
+
+def test_install_explicit_database_uses_env_file_not_argv(tmp_path, monkeypatch, capsys):
+    install_fake(tmp_path, monkeypatch)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    data = tmp_path / "data"
+    database = "sqlite:///" + str(tmp_path / "private state.db")
+    assert run_up(data, "--port", "9090", "--install", "--database", database) == 0
+    captured = capsys.readouterr()
+    unit = home / ".config/systemd/user/agenticml-server-up.service"
+    env_path = systemd_env_path(home)
+    text = unit.read_text()
+    assert "--database" not in text and database not in text
+    assert f"EnvironmentFile={env_path}\n" in text
+    assert f'EnvironmentFile="{env_path}"' not in text
+    assert "EnvironmentFile=-" not in text
+    assert env_path.read_text() == (
+        f"{_ENV_FILE_MARKER}\n"
+        f"{_environment_file_assignment(_ENV_DATABASE_KEY, database)}")
+    assert database not in captured.out
+    assert stat.S_IMODE(unit.stat().st_mode) == stat.S_IMODE(env_path.stat().st_mode) == 0o600
+
+
+def test_launchd_database_goes_in_environment_variables(tmp_path, capsys):
+    database = "sqlite:///" + str(tmp_path / "private state.db")
+    path = write_launchd_plist(tmp_path / "data", 8080, home=tmp_path, database=database)
+    payload = plistlib.loads(path.read_bytes())
+    assert "--database" not in payload["ProgramArguments"]
+    assert database not in payload["ProgramArguments"]
+    assert payload["EnvironmentVariables"][_ENV_DATABASE_KEY] == database
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert database not in capsys.readouterr().out
+
+
+def _parse_environment_file(text):
+    """systemd 249 parse_env_file_internal as used by load_env_file (no $ expansion)."""
+    whitespace, newline, comments = " \t\n\r", "\n\r", "#;"
+    pre_key, key_st, pre_value, value_st, value_esc = range(5)
+    single_q, double_q, double_esc, comment, comment_esc = range(5, 10)
+    state = pre_key
+    key, value = [], []
+    last_key_ws = last_value_ws = None
+    env = {}
+
+    def push(trim_value_ws):
+        k = "".join(key)
+        if last_key_ws is not None:
+            k = k[:last_key_ws]
+        v = "".join(value)
+        if trim_value_ws and last_value_ws is not None:
+            v = v[:last_value_ws]
+        env[k] = v
+
+    for char in text:
+        if state == pre_key:
+            if char in comments:
+                state = comment
+            elif char not in whitespace:
+                state = key_st
+                key, value = [char], []
+                last_key_ws = last_value_ws = None
+        elif state == key_st:
+            if char in newline:
+                state = pre_key
+                key = []
+            elif char == "=":
+                state = pre_value
+                last_value_ws = None
+            else:
+                if char not in whitespace:
+                    last_key_ws = None
+                elif last_key_ws is None:
+                    last_key_ws = len(key)
+                key.append(char)
+        elif state == pre_value:
+            if char in newline:
+                push(False)
+                state = pre_key
+                key, value = [], []
+            elif char == "'":
+                state = single_q
+            elif char == '"':
+                state = double_q
+            elif char == "\\":
+                state = value_esc
+            elif char not in whitespace:
+                state = value_st
+                value = [char]
+        elif state == value_st:
+            if char in newline:
+                push(True)
+                state = pre_key
+                key, value = [], []
+            elif char == "\\":
+                state = value_esc
+                last_value_ws = None
+            else:
+                if char not in whitespace:
+                    last_value_ws = None
+                elif last_value_ws is None:
+                    last_value_ws = len(value)
+                value.append(char)
+        elif state == value_esc:
+            state = value_st
+            if char not in newline:
+                value.append(char)
+        elif state == single_q:
+            if char == "'":
+                state = pre_value
+            else:
+                value.append(char)
+        elif state == double_q:
+            if char == '"':
+                state = pre_value
+            elif char == "\\":
+                state = double_esc
+            else:
+                value.append(char)
+        elif state == double_esc:
+            state = double_q
+            if char in _SHELL_NEED_ESCAPE:
+                value.append(char)
+            elif char != "\n":
+                value.append("\\")
+                value.append(char)
+        elif state == comment:
+            if char == "\\":
+                state = comment_esc
+            elif char in newline:
+                state = pre_key
+        elif state == comment_esc:
+            state = comment
+    if state in (pre_value, value_st, value_esc, single_q, double_q, double_esc):
+        push(state == value_st)
+    return env
+
+
+def test_environment_file_assignment_quoting_and_refuses_newline_nul(tmp_path):
+    assert _environment_file_assignment(_ENV_DATABASE_KEY, 'sqlite:///a"b\\c') == (
+        'AGENTICML_SERVER_DATABASE_URL="sqlite:///a\\"b\\\\c"\n')
+    for value in (
+        'sqlite:///a"b\\c',
+        "postgresql://u:p$ass@h/db",
+        "postgresql://u:p%cent@h/db",
+        "postgresql://u:p#hash@h/db",
+        "postgresql://u:p`tick@h/db",
+        "postgresql://u:p$a%b#c`d\"e\\f@h/db",
+    ):
+        text = (
+            f"{_ENV_FILE_MARKER}\n"
+            f"{_environment_file_assignment(_ENV_DATABASE_KEY, value)}")
+        parsed = _parse_environment_file(text)[_ENV_DATABASE_KEY]
+        assert parsed == value
+        assert parsed.encode("utf-8") == value.encode("utf-8")
+    for writer in (write_systemd_unit, write_launchd_plist):
+        home = tmp_path / "h"
+        for bad in ("postgresql://x\ny", "postgresql://x\ry", "postgresql://x\0y"):
+            with pytest.raises(UpError, match=_DATABASE_URL_NEWLINE):
+                writer(tmp_path / "data", 8080, home=home, database=bad)
+            assert not systemd_env_path(home).exists()
+            assert not launchd_plist_path(home).exists()
+            assert not (home / "Library" / "Logs").exists()
+
+
+def test_install_env_file_path_unquoted_with_space_dollar_percent(tmp_path):
+    home = tmp_path / "user name$x%y"
+    database = "sqlite:///" + str(tmp_path / "private.db")
+    path = write_systemd_unit(tmp_path / "data", 8080, home=home, database=database)
+    env_path = systemd_env_path(home)
+    text = path.read_text()
+    line = "EnvironmentFile=" + str(env_path).replace("%", "%%")
+    assert line + "\n" in text
+    assert f'EnvironmentFile="{env_path}"' not in text
+    assert "EnvironmentFile=-" not in text
+    env_file_line = [row for row in text.splitlines() if row.startswith("EnvironmentFile=")]
+    assert env_file_line == [line]
+    assert "$$" not in env_file_line[0]
+
+
+def test_env_file_refuse_overwrite_without_marker(tmp_path, capsys):
+    home = tmp_path / "home"
+    env_path = systemd_env_path(home)
+    env_path.parent.mkdir(parents=True)
+    env_path.write_text("SECRETS=keep\n")
+    with pytest.raises(UpError, match="refusing to overwrite"):
+        write_systemd_unit(tmp_path / "data", 8080, home=home, database="sqlite:///x")
+    assert env_path.read_text() == "SECRETS=keep\n"
+    assert not systemd_unit_path(home).exists()
+    write_systemd_unit(
+        tmp_path / "data", 8080, home=home, force=True, database="sqlite:///x")
+    assert env_path.read_text().startswith(_ENV_FILE_MARKER + "\n")
+    assert "sqlite:///x" in env_path.read_text()
+    write_systemd_unit(
+        tmp_path / "data", 8080, home=home, database="sqlite:///second")
+    assert "sqlite:///second" in env_path.read_text()
+    assert "sqlite:///x" not in env_path.read_text()
+    capsys.readouterr()
+
+
+def test_reinstall_without_database_removes_our_env_file(tmp_path, capsys):
+    home = tmp_path / "home"
+    write_systemd_unit(
+        tmp_path / "data", 8080, home=home, database="sqlite:///secret")
+    env_path = systemd_env_path(home)
+    assert env_path.exists()
+    write_systemd_unit(tmp_path / "data", 8080, home=home)
+    assert not env_path.exists()
+    assert "EnvironmentFile=" not in systemd_unit_path(home).read_text()
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    env_path.write_text("NOTOURS=1\n")
+    write_systemd_unit(tmp_path / "data", 8080, home=home)
+    assert env_path.read_text() == "NOTOURS=1\n"
+    capsys.readouterr()
+
+
+def test_failed_unit_write_leaves_no_env_file(tmp_path):
+    home = tmp_path / "home"
+    unit = systemd_unit_path(home)
+    unit.parent.mkdir(parents=True)
+    unit.mkdir()
+    env_path = systemd_env_path(home)
+    with pytest.raises(OSError):
+        write_systemd_unit(
+            tmp_path / "data", 8080, home=home, force=True,
+            database="postgresql://u:secret@h/db")
+    assert not env_path.exists()
+
+
+def test_install_rewrites_0644_files_to_0600(tmp_path, capsys):
+    home = tmp_path / "home"
+    unit = systemd_unit_path(home)
+    env_path = systemd_env_path(home)
+    plist = launchd_plist_path(home)
+    unit.parent.mkdir(parents=True)
+    env_path.parent.mkdir(parents=True)
+    plist.parent.mkdir(parents=True)
+    unit.write_text("# Managed by agenticml server up\n[Unit]\n")
+    unit.chmod(0o644)
+    env_path.write_text(_ENV_FILE_MARKER + "\nOLD=1\n")
+    env_path.chmod(0o644)
+    plist.write_bytes(plistlib.dumps({"Label": "xyz.agenticml.server-up"}))
+    plist.chmod(0o644)
+    write_systemd_unit(
+        tmp_path / "data", 8080, home=home, database="sqlite:///x")
+    assert stat.S_IMODE(unit.stat().st_mode) == 0o600
+    assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
+    write_launchd_plist(tmp_path / "data", 8080, home=home)
+    assert stat.S_IMODE(plist.stat().st_mode) == 0o600
+    capsys.readouterr()
+
+
+def test_environment_file_path_refuses_control_characters(tmp_path):
+    for bad in ("\x01", "\t", "\x7f"):
+        home = tmp_path / f"h{bad}ome"
+        with pytest.raises(UpError, match=_ENV_PATH_CONTROL):
+            write_systemd_unit(
+                tmp_path / "data", 8080, home=home, database="sqlite:///x")
+        assert not systemd_env_path(home).exists()
+        assert not systemd_unit_path(home).exists()
+
+
+@pytest.mark.parametrize("bad", ["*", "?", "[", "]", "\\"])
+def test_environment_file_path_refuses_glob_characters(tmp_path, bad):
+    home = tmp_path / f"h{bad}ome"
+    with pytest.raises(UpError) as exc:
+        write_systemd_unit(
+            tmp_path / "data", 8080, home=home, database="sqlite:///x")
+    assert str(exc.value) == _ENV_PATH_GLOB
+    assert not systemd_env_path(home).exists()
+    assert not systemd_unit_path(home).exists()
+
+
+def test_atomic_write_refuses_symlinked_agenticml_dir(tmp_path):
+    home = tmp_path / "home"
+    real = tmp_path / "captured"
+    real.mkdir()
+    env_dir = home / ".config" / "agenticml"
+    env_dir.parent.mkdir(parents=True)
+    env_dir.symlink_to(real)
+    with pytest.raises(UpError, match=_UNSAFE_DIR_SYMLINK):
+        write_systemd_unit(
+            tmp_path / "data", 8080, home=home, database="sqlite:///x")
+    assert list(real.iterdir()) == []
+    assert not systemd_env_path(home).is_file()
+
+
+def test_atomic_write_refuses_group_writable_agenticml_dir(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    env_dir = home / ".config" / "agenticml"
+    env_dir.mkdir(parents=True)
+    env_dir.chmod(0o770)
+    monkeypatch.setattr(up_mod, "_is_user_private_group", lambda gid: False)
+    with pytest.raises(UpError, match=_UNSAFE_DIR_WRITABLE):
+        write_systemd_unit(
+            tmp_path / "data", 8080, home=home, database="sqlite:///x")
+    assert not systemd_env_path(home).exists()
+
+
+def test_atomic_write_creates_private_dirs_and_env_file(tmp_path, capsys):
+    home = tmp_path / "home"
+    write_systemd_unit(
+        tmp_path / "data", 8080, home=home, database="sqlite:///x")
+    env_dir = home / ".config" / "agenticml"
+    unit_dir = home / ".config" / "systemd" / "user"
+    assert env_dir.is_dir() and not env_dir.is_symlink()
+    assert unit_dir.is_dir() and not unit_dir.is_symlink()
+    assert stat.S_IMODE(env_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(unit_dir.stat().st_mode) == 0o700
+    env_path = systemd_env_path(home)
+    assert env_path.read_text().startswith(_ENV_FILE_MARKER + "\n")
+    assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
+    capsys.readouterr()
+
+
+def test_atomic_write_refuses_symlinked_config_dir(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    real = tmp_path / "captured"
+    real.mkdir()
+    (real / "agenticml").mkdir()
+    (home / ".config").symlink_to(real)
+    with pytest.raises(UpError) as exc:
+        write_systemd_unit(
+            tmp_path / "data", 8080, home=home, database="sqlite:///x")
+    assert str(home / ".config") in str(exc.value)
+    assert _UNSAFE_DIR_SYMLINK in str(exc.value)
+    assert list((real / "agenticml").iterdir()) == []
+    assert not (real / "systemd").exists()
+    assert not systemd_env_path(home).is_file()
+
+
+def test_atomic_write_refuses_group_writable_config_dir(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    config = home / ".config"
+    config.mkdir(parents=True)
+    config.chmod(0o770)
+    monkeypatch.setattr(up_mod, "_is_user_private_group", lambda gid: False)
+    with pytest.raises(UpError) as exc:
+        write_systemd_unit(
+            tmp_path / "data", 8080, home=home, database="sqlite:///x")
+    assert str(config) in str(exc.value)
+    assert _UNSAFE_DIR_WRITABLE in str(exc.value)
+    assert not systemd_env_path(home).exists()
+
+
+def test_atomic_write_refuses_group_writable_home(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    home.chmod(0o770)
+    monkeypatch.setattr(up_mod, "_is_user_private_group", lambda gid: False)
+    with pytest.raises(UpError) as exc:
+        write_systemd_unit(
+            tmp_path / "data", 8080, home=home, database="sqlite:///x")
+    assert str(home) in str(exc.value)
+    assert _UNSAFE_DIR_WRITABLE in str(exc.value)
+    assert not systemd_env_path(home).exists()
+
+
+def test_atomic_write_accepts_group_writable_user_private_group(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "home"
+    unit_dir = home / ".config" / "systemd" / "user"
+    unit_dir.mkdir(parents=True)
+    for path in (home, home / ".config", home / ".config" / "systemd", unit_dir):
+        path.chmod(0o775)
+    monkeypatch.setattr(up_mod, "_is_user_private_group", lambda gid: gid == os.getgid())
+    write_systemd_unit(
+        tmp_path / "data", 8080, home=home, database="sqlite:///x")
+    env_dir = home / ".config" / "agenticml"
+    assert env_dir.is_dir() and stat.S_IMODE(env_dir.stat().st_mode) == 0o700
+    assert systemd_env_path(home).is_file()
+    capsys.readouterr()
+
+
+def test_atomic_write_refuses_group_writable_other_group(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    home.chmod(0o775)
+    monkeypatch.setattr(up_mod, "_is_user_private_group", lambda gid: False)
+    with pytest.raises(UpError, match=_UNSAFE_DIR_WRITABLE):
+        write_systemd_unit(
+            tmp_path / "data", 8080, home=home, database="sqlite:///x")
+    assert not systemd_env_path(home).exists()
+
+
+def test_atomic_write_refuses_world_writable_even_with_private_group(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    home.chmod(0o777)
+    monkeypatch.setattr(up_mod, "_is_user_private_group", lambda gid: True)
+    with pytest.raises(UpError, match=_UNSAFE_DIR_WRITABLE):
+        write_systemd_unit(
+            tmp_path / "data", 8080, home=home, database="sqlite:///x")
+    assert not systemd_env_path(home).exists()
+
+
+def test_user_private_group_rule(monkeypatch):
+    class User:
+        pw_name = "alice"
+
+    class Group:
+        def __init__(self, name, members):
+            self.gr_name = name
+            self.gr_mem = members
+
+    monkeypatch.setattr(up_mod.os, "getgid", lambda: 1000)
+    monkeypatch.setattr(up_mod.os, "geteuid", lambda: 42)
+    monkeypatch.setattr(up_mod.pwd, "getpwuid", lambda uid: User())
+    monkeypatch.setattr(up_mod.grp, "getgrgid", lambda gid: Group("alice", []))
+    assert up_mod._is_user_private_group(1000) is True
+    monkeypatch.setattr(up_mod.grp, "getgrgid", lambda gid: Group("alice", ["alice"]))
+    assert up_mod._is_user_private_group(1000) is True
+    monkeypatch.setattr(up_mod.grp, "getgrgid", lambda gid: Group("alice", ["bob"]))
+    assert up_mod._is_user_private_group(1000) is False
+    monkeypatch.setattr(up_mod.grp, "getgrgid", lambda gid: Group("users", []))
+    assert up_mod._is_user_private_group(1000) is False
+    assert up_mod._is_user_private_group(1001) is False
+
+
+def test_remove_our_env_file_does_not_follow_symlinked_dir(tmp_path, capsys):
+    home = tmp_path / "home"
+    write_systemd_unit(
+        tmp_path / "data", 8080, home=home, database="sqlite:///secret")
+    env_path = systemd_env_path(home)
+    payload = env_path.read_text()
+    captured = tmp_path / "captured"
+    captured.mkdir()
+    env_path.rename(captured / "server.env")
+    env_path.parent.rmdir()
+    env_path.parent.symlink_to(captured)
+    with pytest.raises(UpError, match=_UNSAFE_DIR_SYMLINK):
+        write_systemd_unit(tmp_path / "data", 8080, home=home)
+    assert (captured / "server.env").read_text() == payload
+    capsys.readouterr()
+
+
+def test_remove_our_env_file_refuses_symlinked_config_dir(tmp_path, capsys):
+    home = tmp_path / "home"
+    home.mkdir()
+    write_systemd_unit(
+        tmp_path / "data", 8080, home=home, database="sqlite:///secret")
+    env_path = systemd_env_path(home)
+    payload = env_path.read_text()
+    config = home / ".config"
+    captured = tmp_path / "captured"
+    config.rename(captured)
+    config.symlink_to(captured)
+    with pytest.raises(UpError) as exc:
+        _remove_our_env_file(env_path, home=home)
+    assert str(config) in str(exc.value)
+    assert _UNSAFE_DIR_SYMLINK in str(exc.value)
+    assert (captured / "agenticml" / "server.env").read_text() == payload
+    capsys.readouterr()
+
+
+def test_remove_our_env_file_refuses_group_writable_config_dir(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "home"
+    write_systemd_unit(
+        tmp_path / "data", 8080, home=home, database="sqlite:///secret")
+    env_path = systemd_env_path(home)
+    config = home / ".config"
+    config.chmod(0o770)
+    monkeypatch.setattr(up_mod, "_is_user_private_group", lambda gid: False)
+    with pytest.raises(UpError) as exc:
+        _remove_our_env_file(env_path, home=home)
+    assert str(config) in str(exc.value)
+    assert _UNSAFE_DIR_WRITABLE in str(exc.value)
+    assert env_path.exists()
+    capsys.readouterr()
+
+
+def test_remove_our_env_file_refuses_group_writable_home(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "home"
+    write_systemd_unit(
+        tmp_path / "data", 8080, home=home, database="sqlite:///secret")
+    env_path = systemd_env_path(home)
+    home.chmod(0o770)
+    monkeypatch.setattr(up_mod, "_is_user_private_group", lambda gid: False)
+    with pytest.raises(UpError) as exc:
+        _remove_our_env_file(env_path, home=home)
+    assert str(home) in str(exc.value)
+    assert _UNSAFE_DIR_WRITABLE in str(exc.value)
+    assert env_path.exists()
+    capsys.readouterr()
 
 
 def test_env_key_skips_create(tmp_path, monkeypatch):

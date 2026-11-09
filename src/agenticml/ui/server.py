@@ -1411,8 +1411,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(length))
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Content-Security-Policy", _CSP)
-        for name, value in (headers or {}).items():
+        extra = {} if headers is None else dict(headers)
+        self.send_header("Content-Security-Policy", extra.pop("Content-Security-Policy", _CSP))
+        for name, value in extra.items():
             self.send_header(name, value)
         self.end_headers()
 

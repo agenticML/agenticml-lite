@@ -401,9 +401,12 @@ def test_reindex_cli_refuses_while_server_holds_lock(tmp_path, capsys, monkeypat
     data = tmp_path / "data"
     with running(data):
         assert cli.main(["server", "reindex", "--data", str(data)]) == 2
-    assert "stop the server first" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert ("stop the server first" in err
+            or "stop every agenticml server using this database first" in err)
 
 
+@pytest.mark.sqlite_only
 def test_reindex_cli_lock_eacces_prints_reason(tmp_path, capsys, monkeypatch):
     monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
     data = tmp_path / "data"
@@ -532,7 +535,7 @@ def test_atomic_crash_does_not_acknowledge_stale_record(tmp_path, monkeypatch):
                     "PUT", body_b, key)
                 assert status == 500
                 remote_index = server.root / "runs" / writer.run_id / "scalars/index.json"
-                assert remote_index.read_bytes() == body_b
+                assert remote_index.read_bytes() == body_a
                 recorded = server.run_index.files(writer.run_id)["scalars/index.json"]
                 assert recorded["sha256"] == hashlib.sha256(body_a).hexdigest()
                 server._after_atomic_write = lambda *a: None

@@ -286,12 +286,13 @@ def test_session_endpoint_and_local_ui(server, tmp_path):
     status, _, body, _ = authed(server, "/api/account/session")
     assert status == 200
     assert json.loads(body) == {
-        "server": True, "user": "admin", "role": "admin", "via": "key", "key": "admin",
+        "server": True, "user": "admin", "role": "admin", "via": "key", "auth": "password",
+        "key": "admin",
         "scope": "admin",
         "can": {"notes": True, "own_keys": True, "all_keys": True, "users": True, "audit": True},
         "password_set": False, "identity_proxy": False,
         "workspaces": [{"slug": "default", "name": "Default", "role": "owner"}],
-        "server_admin": True}
+        "server_admin": True, "open_signup": False}
 
     httpd = ui_server.make_server(tmp_path, "127.0.0.1", 0)
     thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
@@ -408,12 +409,13 @@ def test_env_key_signs_in(tmp_path, monkeypatch):
         status, _, body, _ = authed(httpd, "/api/account/session", cookie=hdrs["Set-Cookie"])
         assert status == 200
         assert json.loads(body) == {
-            "server": True, "user": "env", "role": "admin", "via": "key", "key": "env",
+            "server": True, "user": "env", "role": "admin", "via": "key", "auth": "password",
+            "key": "env",
             "scope": "admin",
             "can": {"notes": True, "own_keys": True, "all_keys": True, "users": True, "audit": True},
             "password_set": False, "identity_proxy": False,
             "workspaces": [{"slug": "default", "name": "Default", "role": "admin"}],
-            "server_admin": False}
+            "server_admin": False, "open_signup": False}
 
 
 def test_current_matches_name_and_hash(server):

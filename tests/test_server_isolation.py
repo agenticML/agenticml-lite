@@ -1,6 +1,8 @@
 """18.1b isolation suite: every workspace and server-admin route, two workspaces."""
 from __future__ import annotations
 
+from server_db_helpers import on_postgres
+
 import hashlib
 import io
 import json
@@ -54,6 +56,7 @@ EXAMPLES = {
     "lineage_graph": {"method": "GET", "path": "/api/w/{slug}/lineage?project=demo"},
     "notes_list": {"method": "GET", "path": "/api/w/{slug}/notes"},
     "object_get": {"method": "GET", "path": "/api/w/{slug}/objects/{sha}"},
+    "workspace_usage": {"method": "GET", "path": "/api/w/{slug}/usage"},
     "keys_list": {"method": "GET", "path": "/api/w/{slug}/keys"},
     "keys_create": {
         "method": "POST", "path": "/api/w/{slug}/keys",
@@ -106,9 +109,17 @@ EXAMPLES = {
         "method": "POST", "path": "/invite",
         "body": {"token": "x", "password": PASSWORD},
     },
+    "auth_firebase": {
+        "method": "POST", "path": "/auth/firebase",
+        "body": {"id_token": "x"},
+    },
+    "auth_firebase_config": {"method": "GET", "path": "/auth/firebase/config"},
     "static_login_js": {"method": "GET", "path": "/static/login.js"},
     "static_setup_js": {"method": "GET", "path": "/static/setup.js"},
     "static_invite_js": {"method": "GET", "path": "/static/invite.js"},
+    "static_firebase_login_js": {"method": "GET", "path": "/static/firebase-login.js"},
+    "static_firebase_app": {"method": "GET", "path": "/static/vendor/firebase/firebase-app-compat.js"},
+    "static_firebase_auth": {"method": "GET", "path": "/static/vendor/firebase/firebase-auth-compat.js"},
     "static_app_css": {"method": "GET", "path": "/static/app.css"},
     "static_font_sans": {"method": "GET", "path": "/static/InstrumentSans.woff2"},
     "static_font_mono": {"method": "GET", "path": "/static/JetBrainsMono.woff2"},
@@ -120,6 +131,10 @@ EXAMPLES = {
         "body": {"new": "new-password-1"},
     },
     "account_workspaces": {"method": "GET", "path": "/api/account/workspaces"},
+    "account_workspaces_create": {
+        "method": "POST", "path": "/api/account/workspaces",
+        "body": {"slug": "nope", "name": "Nope"},
+    },
     "static_app_js": {"method": "GET", "path": "/static/app.js"},
     "static_charts_js": {"method": "GET", "path": "/static/charts.js"},
     "static_code_js": {"method": "GET", "path": "/static/code.js"},
@@ -273,7 +288,7 @@ def _write_note(server, slug, cookie, text):
     return json.loads(body)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function" if on_postgres() else "module")
 def iso(tmp_path_factory):
     previous_key = os.environ.pop("AGENTICML_SERVER_KEY", None)
     previous_config = os.environ.get("AGENTICML_CONFIG_DIR")

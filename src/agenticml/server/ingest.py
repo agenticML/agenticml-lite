@@ -1,7 +1,7 @@
 """Authenticated protocol v2 writes, with bounded bodies and serialized apply."""
 from __future__ import annotations
 
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 import hashlib
 import json
 import logging
@@ -16,20 +16,26 @@ from agenticml.store import layout, objects
 from agenticml.store.overview import Overview
 from agenticml.store.reader import last_step_from_size, parse_artifacts_json
 from agenticml.ui.server import DashboardHandler
+from .db.errors import DatabaseBusy
 from . import lineage
 from .db import DatabaseError
+from .db.usage import UsageRepo
+from .access import WorkspaceNotFound
+from .limits import LimitReached
 from .keys import KeyStoreUnavailable
 from .runs import APPEND as _APPEND, ATOMIC as _ATOMIC, list_row_from_bytes
 from .users import allowed, resolve
 
 logger = logging.getLogger("agenticml.server.ingest")
 _CHUNK = 64 * 1024
+_LOCK_CONFIRM_BYTES = 8 * 1024 * 1024
 _STATE_BATCH = 64
 _ID = r"([A-Za-z0-9][A-Za-z0-9._-]{0,127})"
 _SHORT_WARNED: set[tuple] = set()
 _ATOMIC_MISMATCH_WARNED: set[tuple] = set()
 _OVERSIZED_ATOMIC_WARNED: set[tuple] = set()
 _TIME_PATH = "scalars/_time.bin"
+_ATOMIC_BACKUP_NAME = re.compile(r"^\..+\.bak\.\d+\.\d+\.[0-9a-f]{8}\.tmp$")
 _ROUTES = [
     ("GET", re.compile(r"/healthz"), "health"),
     ("GET", re.compile(r"/v2/whoami"), "whoami"),
@@ -148,6 +154,10 @@ class IngestHandler(DashboardHandler):
                 return
             record, principal = self._authenticate()
             self.principal = principal
+            if self.server.plans is not None:
+                retry = self.server.plans.request(self.server.db, self.workspace.id)
+                if retry is not None:
+                    raise _RequestError(429, {"error": "too many requests"}, {"Retry-After": str(retry)})
             self.server.keys.touch(record)
             if route == "whoami":
                 self._json({"key": record.name, "scope": record.scope, "user": principal.user,
@@ -184,8 +194,18 @@ class IngestHandler(DashboardHandler):
             if route in ("atomic", "append", "commit", "lineage"):
                 # Reject obvious conflicts without receiving a large upload.
                 # Ownership is checked authoritatively again under the lock.
-                self._ownership(self._run_dir(run_id), principal,
-                                route == "atomic" and args[1] == "meta.json")
+                with self.workspace.run_lock(run_id) if route == "append" else nullcontext():
+                    self._ownership(self._run_dir(run_id), principal,
+                                    route == "atomic" and args[1] == "meta.json")
+                    if route == "append":
+                        offset, _ = self._append_query(query)
+                        if args[1].endswith('.bin') and (offset % layout.RECORD_SIZE or length % layout.RECORD_SIZE):
+                            _fail(422, "torn record")
+                        committed = self.workspace.run_index.committed_size(run_id, args[1])
+                        if offset > committed:
+                            raise _RequestError(409, {"size": committed})
+            if self.server.plans is not None and route in ('atomic', 'append', 'object', 'lineage'):
+                self._check_quota(route, args, query, length)
             if not self.server._admit_body(self.connection, self.server.limits.concurrent_bodies):
                 self.close_connection = True
                 raise _RequestError(503, {"error": "server busy"}, {"Retry-After": "5"})
@@ -211,21 +231,36 @@ class IngestHandler(DashboardHandler):
                 self._json(payload, status)
             else:
                 pending = None
-                with self.workspace.run_lock(run_id):
+                with self.workspace.run_lock(run_id), (self._quota_lock(route) if route != "lineage" else nullcontext()):
                     directory = self._run_dir(run_id)
                     remote = self._ownership(directory, principal, route == "atomic" and args[1] == "meta.json")
+                    if self.server.plans is not None and route in ("atomic", "append"):
+                        self._check_quota(route, args, query, length)
                     if route == "atomic":
                         payload, status, pending = self._atomic(run_id, args[1], body, record, principal, remote)
                     elif route == "append":
                         payload, status = self._append(run_id, directory, args[1], query, tmp, length, remote)
                     elif route == "lineage":
                         meta = _json_object(layout.read_file_nofollow(self._target(directory, "meta.json")))
-                        payload, status = lineage.receive(self.workspace.root, run_id, meta, tmp)
+                        with self.server.lineage_lock(self.workspace.id, lineage._info(meta)["project_key"]):
+                            payload, status = lineage.receive(self.workspace.root, run_id, meta, tmp)
+                        if self.server.plans is not None:
+                            with self._quota_lock(route):
+                                self._check_quota(route, args, query, length)
+                                with self.server.db.transaction(write=True) as tx:
+                                    tx.bind_workspace(self.workspace.id)
+                                    self._usage().add_upload(length, tx)
                     else:
                         payload, status, pending = self._commit(run_id, directory, body, remote)
                 if pending is not None:
                     self._audit_run(run_id, pending)
                 self._json(payload, status)
+        except WorkspaceNotFound:
+            self.close_connection = True
+            self._json({"error": "not found"}, 404)
+        except LimitReached as exc:
+            self.close_connection = True
+            self._json({"error": str(exc)}, 403)
         except (_RequestError, lineage.LineageError) as exc:
             # A rejected request may leave an announced body unread.
             if self.headers.get_all("Content-Length") or self.headers.get_all("Transfer-Encoding"):
@@ -236,6 +271,9 @@ class IngestHandler(DashboardHandler):
             self._error({"error": "request body timeout"}, 408)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             self.close_connection = True
+        except DatabaseBusy:
+            self.close_connection = True
+            self._json({"error": "key store unavailable"}, 503, {"Retry-After": "5"})
         except (DatabaseError, KeyStoreUnavailable):
             self.close_connection = True
             self._error({"error": "key store unavailable"}, 503)
@@ -251,6 +289,43 @@ class IngestHandler(DashboardHandler):
                 tmp.unlink(missing_ok=True)
 
     do_GET = do_PUT = do_POST = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = do_TRACE = do_CONNECT = _dispatch
+
+    def _quota_lock(self, route):
+        if self.server.plans is not None and route in ('atomic', 'append', 'object', 'lineage'):
+            return self.server.quota_lock(self.workspace.id)
+        return nullcontext()
+
+    def _upload_clock(self):
+        plans = self.server.plans
+        return ((lambda: plans.clock().date().isoformat())
+                if plans is not None and plans.has_clock_override else None)
+
+    def _usage(self):
+        return UsageRepo(self.server.db, self.workspace.id, clock=self._upload_clock())
+
+    def _check_quota(self, route, args, query, length):
+        usage = self._usage()
+        limits = self.server.plans.limits_for(self.server.workspaces.by_id(self.workspace.id))
+        growth = None
+        if route in ('atomic', 'append'):
+            committed = self.workspace.run_index.committed_size(args[0], args[1])
+            if route == 'append':
+                offset, truncate = self._append_query(query)
+                if offset <= committed:
+                    growth = length - committed if truncate else max(0, offset + length - committed)
+            else:
+                growth = length - committed
+        elif route == 'object':
+            growth = (0 if usage.has_object(args[0]) or objects.has(self.workspace.root, args[0])
+                      else length)
+        # Pre-check without a lock for early refusal; re-check under the
+        # per-workspace quota lock after receipt so slow bodies never hold
+        # run/object locks. Final check, publish and accounting hold that
+        # quota lock; receiving network bytes never holds it. Production
+        # periods come from the database clock unless a test overrode it.
+        self.server.plans.check_upload(
+            limits, usage.get(), length, growth,
+            now=usage.now() if not self.server.plans.has_clock_override else None)
 
     def _method_not_allowed(self):
         """Dashboard PUTs must not recurse; ingest unknown methods still 405."""
@@ -420,6 +495,7 @@ class IngestHandler(DashboardHandler):
             if name == "meta.json" and (obj.get("run_id") != run_id or obj.get("status") not in _STATUSES):
                 _fail(422, "invalid meta.json")
         directory = self._run_dir(run_id, create=True)
+        self._remove_stale_atomic_backups(directory)
         path = self._target(directory, name, create=True)
         exists = _regular(directory / "meta.json")
         digest = hashlib.sha256(body).hexdigest()
@@ -431,15 +507,78 @@ class IngestHandler(DashboardHandler):
                 list_row=list_row, project=project, created_at=created_at,
                 launch_note=launch, claim=claim, recreate=not exists)
             self.server._after_meta_claim(run_id)
-            layout.atomic_write(path, body, fsync=True)
-            layout.fsync_dir(path.parent)
-            self.server._after_atomic_write(run_id, name)
-            self.workspace.run_index.record_file(run_id, name, len(body), sha256=digest)
-        else:
-            layout.atomic_write(path, body, fsync=True)
-            layout.fsync_dir(path.parent)
-            self.server._after_atomic_write(run_id, name)
-            self.workspace.run_index.record_file(run_id, name, len(body), sha256=digest)
+        recorded = self.workspace.run_index.files(run_id).get(name)
+        committed = 0 if recorded is None else recorded["size"]
+        committed_sha = None if recorded is None else recorded["sha256"]
+        tmp = layout.unique_tmp(path.parent, f".{path.name}")
+        backup = None
+        published = False
+        published_id = None
+        try:
+            with tmp.open("xb") as handle:
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            self.server.db.confirm_session_locks()
+
+            def publish():
+                nonlocal backup, published, published_id
+                if _regular(path):
+                    backup = layout.unique_tmp(path.parent, f".{path.name}.bak")
+                    # Hard link keeps the old inode at path until replace
+                    # publishes the temp, so a crash never leaves the name missing.
+                    os.link(path, backup)
+                info = tmp.stat()
+                published_id = (info.st_dev, info.st_ino)
+                os.replace(tmp, path)
+                published = True
+                layout.fsync_dir(path.parent)
+                self.server._after_atomic_write(run_id, name)
+
+            self.workspace.run_index.record_file(
+                run_id, name, len(body), sha256=digest,
+                upload_bytes=len(body) if self.server.plans is not None else None,
+                upload_clock=self._upload_clock(),
+                expected_size=committed, expected_sha256=committed_sha,
+                publish=publish)
+        except BaseException as exc:
+            lock_lost = False
+            try:
+                if published:
+                    same = False
+                    try:
+                        self.server.db.confirm_session_locks()
+                        current = os.lstat(path)
+                        same = (published_id is not None
+                                and (current.st_dev, current.st_ino) == published_id)
+                    except DatabaseBusy:
+                        lock_lost = True
+                        logger.warning("skipping atomic restore after lock loss")
+                    except OSError:
+                        logger.warning("skipping atomic restore; published file is missing")
+                    else:
+                        if not same:
+                            logger.warning(
+                                "skipping atomic restore; file was replaced by another writer")
+                    if same:
+                        if backup is not None:
+                            os.replace(backup, path)
+                            backup = None
+                            layout.fsync_dir(path.parent)
+                        else:
+                            path.unlink(missing_ok=True)
+                            layout.fsync_dir(path.parent)
+                if backup is not None:
+                    backup.unlink(missing_ok=True)
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("could not restore atomic file after failed record")
+            if lock_lost and isinstance(exc, Exception):
+                raise _RequestError(
+                    503, {"error": "server busy"}, {"Retry-After": "5"}) from exc
+            raise
+        if backup is not None:
+            backup.unlink(missing_ok=True)
         pending = ("run.create", obj) if name == "meta.json" and not exists else None
         return {"size": len(body)}, 200, pending
 
@@ -458,11 +597,42 @@ class IngestHandler(DashboardHandler):
         except Exception:
             logger.error("could not record audit event")
 
+    def _remove_stale_atomic_backups(self, directory):
+        """Drop leftover `.<name>.bak.*.tmp` files; under the run lock they are stale."""
+        parents = set()
+        for current, dirnames, filenames in os.walk(directory, followlinks=False):
+            dirnames[:] = [
+                name for name in dirnames
+                if not os.path.islink(os.path.join(current, name))]
+            for name in filenames:
+                if _ATOMIC_BACKUP_NAME.fullmatch(name) is None:
+                    continue
+                path = os.path.join(current, name)
+                try:
+                    info = os.lstat(path)
+                    if not stat.S_ISREG(info.st_mode):
+                        continue
+                    try:
+                        self.server.db.confirm_session_locks()
+                    except DatabaseBusy as exc:
+                        raise _RequestError(
+                            503, {"error": "server busy"}, {"Retry-After": "5"}) from exc
+                    os.unlink(path)
+                    parents.add(current)
+                except OSError:
+                    logger.warning("could not remove stale atomic backup %s", path)
+        for parent in parents:
+            try:
+                layout.fsync_dir(parent)
+            except OSError:
+                logger.warning("could not fsync after removing stale atomic backups")
+
     def _state(self, run_id, principal):
         with self.workspace.run_lock(run_id):
             directory = self._run_dir(run_id)
             if not _regular(directory / "meta.json"):
                 _fail(404, "unknown run")
+            self._remove_stale_atomic_backups(directory)
             remote = self._remote(directory)
             recorded = self.workspace.run_index.files(run_id)
             names = list(recorded)
@@ -567,12 +737,15 @@ class IngestHandler(DashboardHandler):
         with layout.open_nofollow(tmp, "r+b") as handle:
             os.fchmod(handle.fileno(), self.server.store_file_mode)
             os.fsync(handle.fileno())
-        with self.workspace.object_lock(sha):
+        with self.workspace.object_lock(sha), self._quota_lock("object"):
+            if self.server.plans is not None:
+                self._check_quota("object", (sha,), "", tmp.stat().st_size)
             dest = layout.object_path(self.workspace.root, sha)
             if (dest.exists() or dest.is_symlink()) and not _regular(dest):
                 raise ValueError("unsafe object destination")
             if objects.has(self.workspace.root, sha):
                 os.utime(dest, None, follow_symlinks=False)
+                self._record_object(sha, dest.lstat().st_size, created=False)
                 return {"sha256": sha, "created": False}, 200
             try:
                 dest.parent.mkdir(parents=True)
@@ -584,7 +757,21 @@ class IngestHandler(DashboardHandler):
                 layout.fsync_dir(dest.parent.parent)
             os.replace(tmp, dest)
             layout.fsync_dir(dest.parent)
+            try:
+                self._record_object(sha, dest.lstat().st_size, created=True)
+            except Exception:
+                dest.unlink()
+                layout.fsync_dir(dest.parent)
+                raise
             return {"sha256": sha, "created": True}, 201
+
+    def _record_object(self, sha, size, *, created):
+        with self.server.db.transaction(write=True) as tx:
+            tx.bind_workspace(self.workspace.id)
+            usage = self._usage()
+            usage.record_object(sha, size, tx)
+            if self.server.plans is not None:
+                usage.add_upload(size, tx)
 
     @staticmethod
     def _append_query(query):
@@ -642,11 +829,14 @@ class IngestHandler(DashboardHandler):
             with layout.open_nofollow(tmp, "r+b") as handle:
                 os.fchmod(handle.fileno(), self.server.store_file_mode)
                 os.fsync(handle.fileno())
+            self.server.db.confirm_session_locks()
             os.replace(tmp, path)
             layout.fsync_dir(path.parent)
             self.server._after_append_write(run_id, name)
             last_step = self._time_step(path, length) if name == _TIME_PATH else None
-            self.workspace.run_index.record_file(run_id, name, length, last_step=last_step)
+            self.workspace.run_index.record_file(run_id, name, length, last_step=last_step,
+                                                 upload_bytes=length if self.server.plans is not None else None, upload_clock=self._upload_clock(),
+                                                 expected_size=committed)
             return {"size": length}, 200
         with layout.open_nofollow(path, "ab"):
             pass
@@ -668,6 +858,7 @@ class IngestHandler(DashboardHandler):
                 if dest.read(len(chunk)) != chunk:
                     raise _RequestError(409, {"size": committed, "mismatch": True})
                 remaining -= len(chunk)
+            self.server.db.confirm_session_locks()
             if info.st_size > committed:
                 os.ftruncate(dest.fileno(), committed)
                 os.fsync(dest.fileno())
@@ -677,6 +868,7 @@ class IngestHandler(DashboardHandler):
             dest.seek(write_from)
             started = False
             written_total = 0
+            confirmed = 0
             try:
                 while True:
                     chunk = source.read(_CHUNK)
@@ -690,18 +882,43 @@ class IngestHandler(DashboardHandler):
                             raise OSError("short append write")
                         written_total += written
                         view = view[written:]
+                        if written_total - confirmed >= _LOCK_CONFIRM_BYTES:
+                            self.server.db.confirm_session_locks()
+                            confirmed = written_total
                 if started:
                     os.fsync(dest.fileno())
                 new_size = write_from + written_total
                 layout.fsync_dir(path.parent)
-            except Exception:
-                if started:
+                if length and written_total:
+                    dest.seek(write_from)
+                    source.seek(write_from - offset)
+                    remaining = written_total
+                    while remaining:
+                        expected = source.read(min(_CHUNK, remaining))
+                        actual = dest.read(len(expected))
+                        if not expected or actual != expected:
+                            logger.warning("concurrent writer detected")
+                            raise _RequestError(
+                                503, {"error": "server busy"}, {"Retry-After": "5"})
+                        remaining -= len(expected)
+            except Exception as exc:
+                # Truncate uncommitted bytes only while this writer still holds
+                # the lock. Lock loss (or a 503 concurrent-writer check) leaves
+                # the tail for the next-append truncate-to-committed rule.
+                if started and not (isinstance(exc, _RequestError) and exc.status == 503):
+                    try:
+                        self.server.db.confirm_session_locks()
+                    except DatabaseBusy:
+                        raise _RequestError(
+                            503, {"error": "server busy"}, {"Retry-After": "5"}) from exc
                     os.ftruncate(dest.fileno(), write_from)
                     os.fsync(dest.fileno())
                 raise
         self.server._after_append_write(run_id, name)
         last_step = self._time_step(path, new_size) if name == _TIME_PATH else None
-        self.workspace.run_index.record_file(run_id, name, new_size, last_step=last_step)
+        self.workspace.run_index.record_file(run_id, name, new_size, last_step=last_step,
+                                             upload_bytes=length if self.server.plans is not None else None, upload_clock=self._upload_clock(),
+                                             expected_size=committed)
         return {"size": new_size}, 200
 
     @staticmethod

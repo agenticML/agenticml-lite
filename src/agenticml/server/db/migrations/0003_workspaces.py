@@ -41,7 +41,7 @@ CREATE TABLE runs (
  run_id TEXT NOT NULL, project TEXT, created_at TEXT, owner_account_id TEXT REFERENCES accounts(id),
  owner_key TEXT, status TEXT CHECK (status IS NULL OR status IN ('running','finished','crashed')),
  fingerprint TEXT, last_sync_at TEXT, last_sync_key TEXT, list_row TEXT NOT NULL,
- last_step INTEGER, launch_note TEXT, commit_sizes TEXT, updated_at TEXT NOT NULL,
+ last_step BIGINT, launch_note TEXT, commit_sizes TEXT, updated_at TEXT NOT NULL,
  PRIMARY KEY (workspace_id, run_id)
 );
 CREATE INDEX runs_created ON runs(workspace_id, created_at, run_id);
@@ -88,20 +88,20 @@ def upgrade(tx, dialect):
     accounts = {}
     for user in users:
         accounts[user['name']] = user['id']
-        tx.execute('INSERT INTO accounts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        tx.execute('INSERT INTO accounts (id, login, display_name, identity, identity_folded, password, server_admin, generation, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                    (user['id'], user['name'], user['name'], user['identity'], user['identity_folded'],
                     user['password'], int(user['id'] == owner), user['generation'],
                     user['created_at'], user['created_by']))
-    tx.execute('INSERT INTO workspaces VALUES (?, ?, ?, ?, ?, ?)',
+    tx.execute('INSERT INTO workspaces (id, slug, name, status, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)',
                (wid, 'default', 'Default', 'active', owner, layout.format_timestamp()))
     for user in users:
         role = 'owner' if user['id'] == owner else user['role']
-        tx.execute('INSERT INTO memberships VALUES (?, ?, ?)', (wid, user['id'], role))
+        tx.execute('INSERT INTO memberships (workspace_id, account_id, role) VALUES (?, ?, ?)', (wid, user['id'], role))
         if user['invite_sha256'] is not None:
-            tx.execute('INSERT INTO invites VALUES (?, ?, ?, ?, ?, ?)',
+            tx.execute('INSERT INTO invites (workspace_id, login, role, sha256, expires_at, invited_by) VALUES (?, ?, ?, ?, ?, ?)',
                        (wid, user['name'], 'admin' if role == 'owner' else role, user['invite_sha256'], user['invite_expires_at'], user['created_by']))
     for key in old['keys']:
-        tx.execute('INSERT INTO keys VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        tx.execute('INSERT INTO keys (workspace_id, name, account_id, scope, sha256, prefix, created_at, created_by, last_used_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
                    (wid, key['name'], accounts[key['user_name']], key['scope'], key['sha256'],
                     key['prefix'], key['created_at'], key['created_by'], key['last_used_at']))
     for run in old['runs']:
@@ -119,12 +119,15 @@ def upgrade(tx, dialect):
         for row in old[name]:
             tx.execute('INSERT INTO ' + name + ' (workspace_id, ' + ', '.join(row) + ') VALUES (' +
                        ', '.join('?' for _ in range(len(row) + 1)) + ')', (wid, *row.values()))
+    if dialect.name == 'postgres':
+        tx.execute("SELECT setval(pg_get_serial_sequence('audit_events','id'), "
+                   "COALESCE(MAX(id),1)) FROM audit_events")
     for row in old['sessions']:
         aid = accounts.get(row['user_name'])
         if row['user_id'] != aid:
             aid = None
         # Env sessions have no persisted account. Stale sessions remain invalid.
-        tx.execute('INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        tx.execute('INSERT INTO sessions (token_sha256, account_id, workspace_id, generation, via, key_name, key_sha256, created, last_seen, created_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                    (row['token_sha256'], aid, wid if row['via'] == 'key' else None,
                     row['generation'], row['via'], row['key_name'], row['key_sha256'],
                     row['created'], row['last_seen'], row['created_order']))

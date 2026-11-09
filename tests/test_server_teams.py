@@ -2,6 +2,7 @@
 
 HTTP only, except creating the first admin with the CLI.
 """
+from server_db_helpers import on_postgres
 from contextlib import contextmanager
 import io
 import json
@@ -87,7 +88,7 @@ def steal(url, key, writer):
     return None
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="function" if on_postgres() else "module")
 def teams(tmp_path_factory):
     data = tmp_path_factory.mktemp("data")
     config = tmp_path_factory.mktemp("config")

@@ -85,9 +85,118 @@ function switchWorkspace(slug) {
   setWorkspaceCookie(slug);
   location.assign(`/w/${encodeURIComponent(slug)}/`);
 }
+function formatGb(bytes) {
+  if (bytes == null) return "unlimited";
+  return `${(Number(bytes) / 1e9).toFixed(1)} GB`;
+}
+function formatLimitCount(value) {
+  return value == null ? "unlimited" : String(value);
+}
+function usageBannerMessages(data) {
+  const items = [];
+  const consider = (used, limit, warn, reached) => {
+    if (limit == null || !Number.isFinite(used)) return;
+    if (used >= limit)
+      items.push({ text: reached, tone: "danger" });
+    else if (used >= 0.8 * limit)
+      items.push({ text: warn(Math.floor((100 * used) / limit)), tone: "warn" });
+  };
+  consider(
+    data?.storage?.used, data?.storage?.limit,
+    (pct) => `Storage ${pct}% used`,
+    "Storage limit reached: syncing is paused",
+  );
+  consider(
+    data?.uploads_today?.used, data?.uploads_today?.limit,
+    (pct) => `Daily uploads ${pct}% used`,
+    "Daily upload limit reached: resets at 00:00 UTC",
+  );
+  return items;
+}
+function usageBannerHost() {
+  let node = document.querySelector("#usage-banner");
+  if (node) return node;
+  node = el("div", { id: "usage-banner", class: "usage-banners", hidden: true });
+  document.querySelector("header.topbar")?.after(node);
+  return node;
+}
+async function loadUsageBanner() {
+  const host = usageBannerHost();
+  if (!serverMode || isAdminPath() || !currentWorkspaceSlug()) {
+    host.replaceChildren();
+    host.hidden = true;
+    return;
+  }
+  try {
+    const response = await fetch(api("/usage"), { credentials: "same-origin" });
+    const data = await response.json().catch(() => null);
+    if (!response.ok || !data || data.limits === null) {
+      host.replaceChildren();
+      host.hidden = true;
+      return;
+    }
+    const items = usageBannerMessages(data);
+    if (!items.length) {
+      host.replaceChildren();
+      host.hidden = true;
+      return;
+    }
+    host.hidden = false;
+    host.replaceChildren(...items.map((item) => el("p", {
+      class: `callout callout-${item.tone} usage-banner`,
+      role: "status",
+      text: item.text,
+    })));
+  } catch {
+    host.replaceChildren();
+    host.hidden = true;
+  }
+}
+function newWorkspaceForm(session) {
+  if (!session.open_signup) return null;
+  const error = el("p", { class: "error", role: "alert", hidden: true });
+  const slug = el("input", {
+    id: "switcher-new-slug", class: "field", required: true, maxLength: 40,
+    pattern: "[a-z0-9][a-z0-9\\-]{0,39}", autocomplete: "off",
+  });
+  const name = el("input", {
+    id: "switcher-new-name", class: "field", required: true, maxLength: 256,
+    autocomplete: "off",
+  });
+  const save = el("button", { type: "submit", class: "btn btn-primary btn-sm", text: "Create" });
+  const form = el("form", { class: "stack workspace-new" },
+    el("h3", { class: "eyebrow", text: "New workspace" }),
+    el("label", { class: "field-label", htmlFor: slug.id, text: "Slug" }), slug,
+    el("label", { class: "field-label", htmlFor: name.id, text: "Name" }), name,
+    save, error);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    error.hidden = true;
+    save.disabled = true;
+    try {
+      const response = await fetch(api("/account/workspaces"), {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "X-AgenticML-Request": "1", "Content-Type": "application/json" },
+        body: JSON.stringify({ slug: slug.value.trim(), name: name.value.trim() }),
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(
+        (typeof data?.error === "string" && data.error) || `Request failed (${response.status})`);
+      if (typeof data?.slug !== "string" || !data.slug)
+        throw new Error("workspace was not created");
+      switchWorkspace(data.slug);
+    } catch (reason) {
+      error.textContent = reason.message;
+      error.hidden = false;
+      save.disabled = false;
+    }
+  });
+  return form;
+}
 function workspaceSwitcher(session) {
   const workspaces = sessionWorkspaces(session);
-  if (workspaces.length <= 1 && !session.server_admin) return null;
+  if (workspaces.length <= 1 && !session.server_admin && !session.open_signup) return null;
   const current = currentWorkspaceSlug();
   const items = workspaces.map((row) => {
     const name = typeof row.name === "string" && row.name ? row.name : row.slug;
@@ -125,6 +234,7 @@ function workspaceSwitcher(session) {
     { class: "workspace-switcher stack" },
     el("h3", { class: "eyebrow", text: "Workspaces" }),
     el("ul", { class: "workspace-switcher-list", "aria-label": "Workspaces" }, ...items),
+    newWorkspaceForm(session),
     session.server_admin
       ? el("a", { class: "btn btn-ghost btn-sm", href: "/admin/", text: "Admin" })
       : null,
@@ -454,6 +564,7 @@ const sessionReady = fetch(api("/account/session"), { credentials: "same-origin"
       location.assign("/login");
     };
     document.querySelector("#account").onclick = () => openAccountDialog();
+    loadUsageBanner();
   })
   .catch(() => {});
 document.querySelector("#close-lightbox").onclick = () =>
@@ -492,66 +603,72 @@ function openAccountDialog() {
   const host = el("dialog", { class: "key-dialog", "aria-label": "Account" });
   const error = el("p", { class: "error", role: "alert", hidden: true });
   const status = el("p", { class: "muted", role: "status", hidden: true });
-  const current = session.password_set
-    ? el("input", {
-        id: "account-current", class: "field", type: "password",
-        autocomplete: "current-password", required: true,
-      })
-    : null;
-  const next = el("input", {
-    id: "account-new", class: "field", type: "password",
-    minLength: 12, maxLength: 1024, autocomplete: "new-password", required: true,
-  });
-  const confirm = el("input", {
-    id: "account-confirm", class: "field", type: "password",
-    minLength: 12, maxLength: 1024, autocomplete: "new-password", required: true,
-  });
-  const save = el("button", { type: "submit", class: "btn btn-primary", text: "Change password" });
-  const form = el("form", { class: "stack" },
-    current
-      ? el("label", { class: "field-label", htmlFor: current.id, text: "Current password" })
-      : null,
-    current,
-    el("label", { class: "field-label", htmlFor: next.id, text: "New password" }), next,
-    el("label", { class: "field-label", htmlFor: confirm.id, text: "Confirm password" }), confirm,
-    save);
-  form.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    error.hidden = true;
-    status.hidden = true;
-    if (next.value !== confirm.value) {
-      error.textContent = "Passwords do not match";
-      error.hidden = false;
-      return;
-    }
-    save.disabled = true;
-    try {
-      const response = await fetch(api("/account/password"), {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "X-AgenticML-Request": "1", "Content-Type": "application/json" },
-        body: JSON.stringify(current
-          ? { current: current.value, new: next.value }
-          : { new: next.value }),
-      });
-      const data = await response.json().catch(() => null);
-      if (response.status === 401 && data?.error === "login required") {
-        location.assign("/login");
+  const firebaseAuth = session.auth === "firebase";
+  let current = null;
+  let next = null;
+  let form = null;
+  if (!firebaseAuth) {
+    current = session.password_set
+      ? el("input", {
+          id: "account-current", class: "field", type: "password",
+          autocomplete: "current-password", required: true,
+        })
+      : null;
+    next = el("input", {
+      id: "account-new", class: "field", type: "password",
+      minLength: 12, maxLength: 1024, autocomplete: "new-password", required: true,
+    });
+    const confirm = el("input", {
+      id: "account-confirm", class: "field", type: "password",
+      minLength: 12, maxLength: 1024, autocomplete: "new-password", required: true,
+    });
+    const save = el("button", { type: "submit", class: "btn btn-primary", text: "Change password" });
+    form = el("form", { class: "stack" },
+      current
+        ? el("label", { class: "field-label", htmlFor: current.id, text: "Current password" })
+        : null,
+      current,
+      el("label", { class: "field-label", htmlFor: next.id, text: "New password" }), next,
+      el("label", { class: "field-label", htmlFor: confirm.id, text: "Confirm password" }), confirm,
+      save);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      error.hidden = true;
+      status.hidden = true;
+      if (next.value !== confirm.value) {
+        error.textContent = "Passwords do not match";
+        error.hidden = false;
         return;
       }
-      if (!response.ok) throw new Error(
-        (typeof data?.error === "string" && data.error) || `Password change failed (${response.status})`);
-      if (serverSession) serverSession.password_set = true;
-      status.textContent = "Password updated";
-      status.hidden = false;
-      form.reset();
-    } catch (reason) {
-      error.textContent = reason.message;
-      error.hidden = false;
-    } finally {
-      save.disabled = false;
-    }
-  });
+      save.disabled = true;
+      try {
+        const response = await fetch(api("/account/password"), {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "X-AgenticML-Request": "1", "Content-Type": "application/json" },
+          body: JSON.stringify(current
+            ? { current: current.value, new: next.value }
+            : { new: next.value }),
+        });
+        const data = await response.json().catch(() => null);
+        if (response.status === 401 && data?.error === "login required") {
+          location.assign("/login");
+          return;
+        }
+        if (!response.ok) throw new Error(
+          (typeof data?.error === "string" && data.error) || `Password change failed (${response.status})`);
+        if (serverSession) serverSession.password_set = true;
+        status.textContent = "Password updated";
+        status.hidden = false;
+        form.reset();
+      } catch (reason) {
+        error.textContent = reason.message;
+        error.hidden = false;
+      } finally {
+        save.disabled = false;
+      }
+    });
+  }
   host.append(
     el("div", { class: "heading" },
       el("h2", { text: "Account" }),
@@ -561,7 +678,7 @@ function openAccountDialog() {
       el("div", {}, el("dt", { text: "Role" }), el("dd", { text: currentWorkspaceRole(session) })),
       el("div", {}, el("dt", { text: "Sign-in" }), el("dd", { text: viaLabel(session.via) }))),
     workspaceSwitcher(session),
-    form, error, status,
+    ...(firebaseAuth ? [] : [form, error, status]),
   );
   host.addEventListener("keydown", (event) => {
     if (event.key === "Tab") trapTab(host, event);
@@ -572,7 +689,7 @@ function openAccountDialog() {
   }, { once: true });
   document.body.append(host);
   host.showModal();
-  (current || next).focus();
+  (firebaseAuth ? host.querySelector("button") : (current || next))?.focus();
 }
 // Focus hosts own their keyboard handler so nested focus views close independently.
 function focus(title, subtitle, className = "", onClose = () => {}) {
@@ -4216,6 +4333,7 @@ async function teamPage(version) {
   };
   cleanup = dispose;
   const content = el("div", { class: "table-scroll" });
+  const usageBox = el("section", { class: "stack usage-section", hidden: true, "aria-label": "Usage" });
   const invitesContent = el("div", { class: "table-scroll" });
   const activity = el("div", { class: "table-scroll" });
   const activityStatus = el("div");
@@ -4565,11 +4683,31 @@ async function teamPage(version) {
       });
   }
 
+  function renderUsage(data) {
+    if (!data || data.limits === null) {
+      usageBox.hidden = true;
+      usageBox.replaceChildren();
+      return;
+    }
+    const pair = (label, value) => el("div", {}, el("dt", { text: label }), el("dd", { text: value }));
+    usageBox.hidden = false;
+    usageBox.replaceChildren(
+      el("div", { class: "heading" }, el("h2", { text: "Usage" })),
+      el("dl", { class: "kv-list identity usage-list" },
+        pair("Storage", `${formatGb(data.storage?.used)} of ${formatGb(data.storage?.limit)}`),
+        pair("Daily uploads", `${formatGb(data.uploads_today?.used)} of ${formatGb(data.uploads_today?.limit)}`),
+        pair("Requests per minute", formatLimitCount(data.requests_per_minute?.limit)),
+        pair("People", `${data.people?.used ?? "—"} of ${formatLimitCount(data.people?.limit)}`),
+      ),
+    );
+  }
+
   async function refresh() {
     const sequence = ++refreshSequence;
-    const [response, invitesResponse] = await Promise.all([
+    const [response, invitesResponse, usageResponse] = await Promise.all([
       fetch(api("/members"), { signal, credentials: "same-origin" }),
       fetch(api("/invites"), { signal, credentials: "same-origin" }),
+      fetch(api("/usage"), { signal, credentials: "same-origin" }),
     ]);
     if (epoch !== version || sequence !== refreshSequence || disposed) return;
     if (response.status === 404) {
@@ -4622,6 +4760,13 @@ async function teamPage(version) {
     }
     if (epoch !== version || sequence !== refreshSequence || disposed) return;
     renderInvites(invites);
+    if (usageResponse.ok) {
+      const usage = await usageResponse.json().catch(() => null);
+      if (epoch !== version || sequence !== refreshSequence || disposed) return;
+      renderUsage(usage);
+    } else {
+      renderUsage(null);
+    }
     try {
       await refreshActivity(true);
     } catch (reason) {
@@ -4730,6 +4875,7 @@ async function teamPage(version) {
   app.replaceChildren(el("div", { class: "workspace stack" },
     el("div", { class: "heading" }, el("h1", { text: "Team" }), inviteButton),
     content,
+    usageBox,
     el("div", { class: "stack" },
       el("div", { class: "heading" }, el("h2", { text: "Pending invites" })),
       invitesContent),
@@ -4766,7 +4912,7 @@ async function adminPage(version) {
   crumb.textContent = "agenticml / admin";
   const content = el("div", { class: "table-scroll" });
   const activity = el("div", { class: "table-scroll" });
-  const columns = ["Slug", "Name", "Status", "Members", "Created", "Actions"];
+  const columns = ["Slug", "Name", "Status", "Plan", "Storage", "Uploads today", "People", "Members", "Created", "Actions"];
   const activityColumns = ["Time", "Actor", "Action", "Target", "Client"];
 
   async function write(url, method, payload) {
@@ -4830,6 +4976,88 @@ async function adminPage(version) {
     } catch (reason) {
       if (epoch === version) showError(content, reason);
     }
+  }
+
+  function parseLimitField(value) {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    if (!/^[0-9]+$/.test(trimmed)) throw new Error("limits must be non-negative integers or empty for unlimited");
+    const parsed = Number(trimmed);
+    if (!Number.isSafeInteger(parsed)) throw new Error("limits must be non-negative integers or empty for unlimited");
+    return parsed;
+  }
+
+  function fillLimitField(input, value) {
+    input.value = value == null ? "" : String(value);
+  }
+
+  function editPlan(workspace) {
+    const { host, body, error } = dialog("Edit plan");
+    const plan = el("select", { id: "plan-ws-plan", class: "field" },
+      el("option", { value: "free", text: "free" }),
+      el("option", { value: "custom", text: "custom" }));
+    plan.value = workspace.plan === "custom" ? "custom" : "free";
+    const current = workspace.limits && typeof workspace.limits === "object" && !Array.isArray(workspace.limits)
+      ? workspace.limits : {};
+    const storage = el("input", {
+      id: "plan-ws-storage", class: "field", inputMode: "numeric", autocomplete: "off",
+      placeholder: "unlimited",
+    });
+    const uploads = el("input", {
+      id: "plan-ws-uploads", class: "field", inputMode: "numeric", autocomplete: "off",
+      placeholder: "unlimited",
+    });
+    const requests = el("input", {
+      id: "plan-ws-requests", class: "field", inputMode: "numeric", autocomplete: "off",
+      placeholder: "unlimited",
+    });
+    const people = el("input", {
+      id: "plan-ws-people", class: "field", inputMode: "numeric", autocomplete: "off",
+      placeholder: "unlimited",
+    });
+    fillLimitField(storage, current.storage_bytes);
+    fillLimitField(uploads, current.upload_bytes_per_day);
+    fillLimitField(requests, current.requests_per_minute);
+    fillLimitField(people, current.people);
+    const customFields = el("div", { class: "stack" },
+      el("label", { class: "field-label", htmlFor: storage.id, text: "Storage bytes" }), storage,
+      el("label", { class: "field-label", htmlFor: uploads.id, text: "Upload bytes per day" }), uploads,
+      el("label", { class: "field-label", htmlFor: requests.id, text: "Requests per minute" }), requests,
+      el("label", { class: "field-label", htmlFor: people.id, text: "People" }), people);
+    const syncCustom = () => {
+      customFields.hidden = plan.value !== "custom";
+    };
+    plan.addEventListener("change", syncCustom);
+    syncCustom();
+    const save = el("button", { type: "submit", class: "btn btn-primary", text: "Save" });
+    const form = el("form", { class: "stack" },
+      el("label", { class: "field-label", htmlFor: plan.id, text: "Plan" }), plan,
+      customFields, save);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      error.hidden = true;
+      save.disabled = true;
+      try {
+        const payload = { plan: plan.value };
+        if (plan.value === "custom") {
+          payload.limits = {
+            storage_bytes: parseLimitField(storage.value),
+            upload_bytes_per_day: parseLimitField(uploads.value),
+            requests_per_minute: parseLimitField(requests.value),
+            people: parseLimitField(people.value),
+          };
+        }
+        await write(patchUrl(workspace.slug), "PATCH", payload);
+        host.close();
+        await refresh();
+      } catch (reason) {
+        failure(error, reason);
+        if (reason.name !== "AbortError") save.disabled = false;
+      }
+    });
+    body.append(form);
+    host.showModal();
+    plan.focus();
   }
 
   function renameWorkspace(workspace) {
@@ -4958,10 +5186,15 @@ async function adminPage(version) {
         workspace.slug,
         workspace.name,
         chip(workspace.status, workspace.status === "active" ? "ok" : "warn"),
+        workspace.plan || "free",
+        formatGb(workspace.stored_bytes ?? 0),
+        formatGb(workspace.uploads_today ?? 0),
+        workspace.people == null ? "—" : String(workspace.people),
         workspace.members == null ? "—" : String(workspace.members),
         date(workspace.created_at),
         el("div", { class: "team-actions" },
           button("Rename", () => renameWorkspace(workspace), "secondary"),
+          button("Plan", () => editPlan(workspace), "secondary"),
           button(
             workspace.status === "suspended" ? "Resume" : "Suspend",
             () => setStatus(

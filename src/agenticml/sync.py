@@ -41,7 +41,10 @@ FOLLOW_INTERVAL = 30.0
 HEARTBEAT = 60.0
 BACKOFF_MAX = 300.0
 FAILURE_REMINDER = 600.0
+LIMIT_RETRY = 600.0
+_QUOTA_PREFIXES = ("storage limit reached", "daily upload limit reached")
 _BACKOFF_EXP_CAP = 16
+_clock = time.monotonic
 _ATOMIC = re.compile(r"(?:meta\.json|artifacts\.json|scalars/index\.json|media/index\.json|scalars/(?:0|[1-9][0-9]{0,8})\.ovw)")
 _APPEND = re.compile(r"(?:events\.jsonl|scalars/_time\.bin|scalars/(?:0|[1-9][0-9]{0,8})\.bin)")
 _TRANSIENT_STATUS = frozenset({408, 429})
@@ -1105,6 +1108,18 @@ def _short_error(exc):
     return type(exc).__name__
 
 
+def _is_quota_limit(exc):
+    """True for 403s that `--follow` retries instead of dropping."""
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) != 403:
+        return False
+    return _error_detail(response).startswith(_QUOTA_PREFIXES)
+
+
+def _follow_attempt_done(run_id):
+    """Hook after a follow attempt has updated quota_until. Tests wait on this."""
+
+
 def _permanent_failure(exc):
     if isinstance(exc, RunMissingError):
         return False
@@ -1280,6 +1295,8 @@ def _follow(args, root, host, api_key):
     last_status = {}
     failure_log = _FailureLog()
     permanent_ids = set()
+    quota_until = {}
+    quota_announced = set()
     consecutive = 0
     active = None
     byref_warned = False
@@ -1333,43 +1350,66 @@ def _follow(args, root, host, api_key):
                     features=identity.get("features", []), artifacts=artifacts, user=identity.get("user"),
                 ) if rid not in permanent_ids]
                 failure_log.prune(selected)
+                keep = set(selected)
+                quota_until = {rid: until for rid, until in quota_until.items() if rid in keep}
+                quota_announced.intersection_update(keep)
+                now = _clock()
                 for run_id in selected:
                     if stop.is_set():
                         raise SyncStopped()
+                    if quota_until.get(run_id, 0) > now:
+                        continue
                     active = SyncResult(run_id)
                     results[run_id] = active
+                    skip_emit = False
                     try:
-                        reader = RunReader(root, run_id)
                         try:
-                            if _effective(reader, reader.meta()) == "running":
-                                saw_running = True
-                        except Exception:
-                            pass
-                        sync_run(reader, host, client, active, prune=prune, artifacts=artifacts)
-                    except SyncStopped:
-                        raise
-                    except Exception as exc:
-                        if _is_unauthorized(exc):
-                            print(f"agenticml sync: {_short_error(exc)}", file=sys.stderr)
-                            return 3
-                        if _is_unreachable(exc):
-                            unreachable = exc
+                            reader = RunReader(root, run_id)
+                            try:
+                                if _effective(reader, reader.meta()) == "running":
+                                    saw_running = True
+                            except Exception:
+                                pass
+                            sync_run(reader, host, client, active, prune=prune, artifacts=artifacts)
+                        except SyncStopped:
+                            raise
+                        except Exception as exc:
+                            if _is_unauthorized(exc):
+                                print(f"agenticml sync: {_short_error(exc)}", file=sys.stderr)
+                                return 3
+                            if _is_unreachable(exc):
+                                unreachable = exc
+                                active.failed = True
+                                active.status = f"failed: {_short_error(exc)}"
+                                active = None
+                                break
                             active.failed = True
                             active.status = f"failed: {_short_error(exc)}"
-                            active = None
-                            break
-                        active.failed = True
-                        active.permanent = _permanent_failure(exc)
-                        active.status = f"failed: {_short_error(exc)}"
-                        if active.permanent:
-                            permanent_ids.add(run_id)
-                    else:
-                        if active.status == "partial (running)":
-                            saw_running = True
-                        if active.permanent:
-                            permanent_ids.add(run_id)
-                    _emit_follow(active, last_status, failure_log)
-                    active = None
+                            if _is_quota_limit(exc):
+                                quota_until[run_id] = _clock() + LIMIT_RETRY
+                                if run_id not in quota_announced:
+                                    print(active.line(), flush=True)
+                                    last_status[run_id] = active.status
+                                    quota_announced.add(run_id)
+                                skip_emit = True
+                            else:
+                                quota_until.pop(run_id, None)
+                                quota_announced.discard(run_id)
+                                active.permanent = _permanent_failure(exc)
+                                if active.permanent:
+                                    permanent_ids.add(run_id)
+                        else:
+                            quota_until.pop(run_id, None)
+                            quota_announced.discard(run_id)
+                            if active.status == "partial (running)":
+                                saw_running = True
+                            if active.permanent:
+                                permanent_ids.add(run_id)
+                        if not skip_emit:
+                            _emit_follow(active, last_status, failure_log)
+                        active = None
+                    finally:
+                        _follow_attempt_done(run_id)
             if unreachable is None and run_ids:
                 pending = False
                 failed = False

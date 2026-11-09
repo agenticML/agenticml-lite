@@ -9,6 +9,15 @@ from agenticml.server.workspaces import default_workspace_id as _default_workspa
 from agenticml.store import layout
 
 
+def migration_versions():
+    """Versions in the active migration directory, including Python migrations."""
+    from agenticml.server.db import migrate
+
+    return sorted(int(path.name[:4])
+                  for path in migrate.MIGRATIONS.glob('[0-9][0-9][0-9][0-9]_*')
+                  if path.suffix in ('.sql', '.py'))
+
+
 def key_object(store):
     return {'version': 2, 'keys': [{k:v for k,v in asdict(row).items() if k not in ('workspace_id','account_id')} for row in store.repo.list()]}
 
@@ -18,6 +27,8 @@ def user_object(store):
 
 
 def audit_rows(directory):
+    if not directory.is_dir():
+        return []
     db = for_server_dir(directory, create=False)
     if db is None:
         return []
@@ -112,3 +123,44 @@ def default_store(data):
 
 def transfer_default_owner(users, login):
     WorkspaceRepo(users.db).set_owner('default', login)
+
+
+def on_postgres():
+    import os
+    return bool(os.environ.get('AGENTICML_TEST_DATABASE_URL'))
+
+
+def postgres_url(base, schema, *, role='agenticml_test', password='agenticml-test-password'):
+    """Preserve libpq query settings while selecting a test role and schema."""
+    from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+    parts = urlsplit(base)
+    host = parts.netloc.rsplit('@', 1)[-1]
+    query = dict(parse_qsl(parts.query))
+    query['options'] = (query.get('options', '') + ' -c search_path=' + schema).strip()
+    return urlunsplit(parts._replace(
+        netloc=quote(role, safe='') + ':' + quote(password, safe='') + '@' + host,
+        query=urlencode(query, quote_via=quote)))
+
+
+_schema_url = None
+
+
+def isolate_server_dir(directory, monkeypatch):
+    """Give an independent server directory its own schema in this test.
+
+    Select before opening its repositories or starting a subprocess server.
+    SQLite already isolates directories and needs no override. Returns the
+    URL now selected on Postgres; None on SQLite. Uses monkeypatch so the
+    env change is undone when the test ends.
+    """
+    if on_postgres():
+        url = _schema_url(str(directory.resolve()))
+        monkeypatch.setenv('AGENTICML_SERVER_DATABASE_URL', url)
+        return url
+    return None
+
+
+def database_url(path):
+    """Backend-aware URL for tests opening a database without importing files."""
+    import os
+    return os.environ['AGENTICML_SERVER_DATABASE_URL'] if on_postgres() else 'sqlite:///' + str(path)

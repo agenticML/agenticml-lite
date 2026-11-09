@@ -1,4 +1,5 @@
 """First-admin setup and admin key lifecycle over the real HTTP server."""
+from server_db_helpers import isolate_server_dir, database_url
 from server_db_helpers import key_object, user_object
 from agenticml.server.users import UserStore
 from agenticml.server.db import DatabaseError
@@ -257,7 +258,8 @@ def test_setup_closed_marker_mode_and_no_follow(tmp_path):
     assert (data / 'server' / 'setup-closed.2x').is_symlink()
     keys.create('admin', 'admin')
     assert keys.setup_closed()
-    assert stat.S_IMODE(keys.db.path.stat().st_mode) == 0o600
+    if keys.db.dialect.name == "sqlite":
+        assert stat.S_IMODE(keys.db.path.stat().st_mode) == 0o600
     assert target.read_bytes() == b'secret'
 
 
@@ -294,6 +296,7 @@ def test_api_admin_create_writes_marker(server):
     assert server.keys.setup_closed()
 
 
+@pytest.mark.sqlite_only
 def test_keys_lock_symlink_does_not_crash_startup(tmp_path, caplog):
     data = tmp_path / 'data'
     prepare_data_dir(data)
@@ -308,6 +311,7 @@ def test_keys_lock_symlink_does_not_crash_startup(tmp_path, caplog):
 
 @pytest.mark.parametrize('reader', [False, True])
 @pytest.mark.parametrize('operation', ['startup', 'create'])
+@pytest.mark.sqlite_only
 def test_keys_lock_fifo_fails_promptly(tmp_path, caplog, operation, reader):
     data = tmp_path / 'data'
     prepare_data_dir(data)
@@ -331,6 +335,7 @@ def test_keys_lock_fifo_fails_promptly(tmp_path, caplog, operation, reader):
 
 
 @pytest.mark.skipif(not os.path.isdir('/proc/self/fd'), reason='requires procfs fd counts')
+@pytest.mark.sqlite_only
 def test_keys_lock_fifo_with_reader_does_not_leak_fd(tmp_path):
     prepare_data_dir(tmp_path)
     os.mkfifo(tmp_path / 'server' / 'agenticml.db')
@@ -342,6 +347,7 @@ def test_keys_lock_fifo_with_reader_does_not_leak_fd(tmp_path):
 
 @pytest.mark.skipif(not os.path.isdir('/proc/self/fd'), reason='requires procfs fd counts')
 @pytest.mark.parametrize('error', [OSError, KeyboardInterrupt])
+@pytest.mark.sqlite_only
 def test_keys_lock_fdopen_failure_does_not_leak_fd(tmp_path, monkeypatch, error):
     from agenticml.server.db import sqlite
     prepare_data_dir(tmp_path)
@@ -404,7 +410,8 @@ def test_arm_setup_waits_on_store_lock(tmp_path):
     web = WebAuth(keys)
     holding, release = threading.Event(), threading.Event()
     def hold():
-        with keys.db.transaction(write=True):
+        with keys.db.transaction(write=True) as tx:
+            tx.advisory_lock('users')
             holding.set()
             assert release.wait(timeout=5)
     holder = threading.Thread(target=hold)
@@ -463,7 +470,7 @@ def test_setup_corrupt_at_startup_stays_disabled(tmp_path, caplog, nested):
 
 
 @pytest.mark.parametrize('field', ['created_at', 'last_used_at'])
-def test_timestamp_overflow_fails_closed_and_disarms_setup(tmp_path, caplog, field):
+def test_timestamp_overflow_fails_closed_and_disarms_setup(tmp_path, caplog, field, monkeypatch):
     directory = tmp_path / 'source'
     directory.mkdir()
     keys = KeyStore(directory, workspace_id=default_workspace_id(directory))
@@ -472,7 +479,9 @@ def test_timestamp_overflow_fails_closed_and_disarms_setup(tmp_path, caplog, fie
     obj['keys'][0][field] = '0001-01-01T00:00:00+01:00'
     data = tmp_path / 'legacy'
     prepare_data_dir(data)
-    (data / 'server' / 'users.json').write_text(json.dumps(user_object(UserStore(directory, workspace_id=default_workspace_id(directory)))))
+    users = user_object(UserStore(directory, workspace_id=default_workspace_id(directory)))
+    isolate_server_dir(data / "server", monkeypatch)
+    (data / 'server' / 'users.json').write_text(json.dumps(users))
     (data / 'server' / 'keys.json').write_text(json.dumps(obj))
     with pytest.raises(DatabaseError, match='could not import keys.json'):
         make_server(data, port=0)
@@ -611,6 +620,7 @@ def test_list_public_fields_runs_order_and_env(tmp_path):
         # Fix timestamps so the secondary name ordering is exercised.
         records = [replace(record, created_at=first.created_at) for record in httpd.keys.list() if record.name != "env"]
         with httpd.keys.db.transaction(write=True) as tx:
+            tx.bind_workspace(httpd.default_workspace_id)
             for record in records:
                 tx.execute('UPDATE keys SET created_at=? WHERE name=?', (record.created_at, record.name))
         from server_db_helpers import insert_run

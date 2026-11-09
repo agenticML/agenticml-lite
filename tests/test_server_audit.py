@@ -63,7 +63,8 @@ def test_record_format_truncation_and_key_order(tmp_path, monkeypatch):
                        'target':'t'*256,'client':'203.0.113.7',
                        'detail':{**detail,'identity':'é'*256,'nested':[{'project':'x'*256}]}}
     assert len(detail['identity']) == 300
-    assert stat.S_IMODE(log.db.path.stat().st_mode) == 0o600
+    if log.db.dialect.name == "sqlite":
+        assert stat.S_IMODE(log.db.path.stat().st_mode) == 0o600
 
 
 @pytest.mark.parametrize("field", ["actor", "via", "action", "client"])
@@ -138,7 +139,10 @@ def test_partial_writes_are_completed_and_synced(tmp_path, monkeypatch):
     log.db.close()
     assert audit.tail(tmp_path)[0][0]['actor'] == 'alice'
     with for_server_dir(tmp_path).transaction() as tx:
-        assert tx.fetchone('PRAGMA synchronous')[0] == 2
+        if tx.dialect.name == 'sqlite':
+            assert tx.fetchone('PRAGMA synchronous')[0] == 2
+        else:
+            assert tx.fetchone('SHOW synchronous_commit')[0] == 'on'
 
 
 def test_each_record_reopens_after_rotation(tmp_path):

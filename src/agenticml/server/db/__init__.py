@@ -6,6 +6,7 @@ import weakref
 
 from .errors import DatabaseBusy, DatabaseError, DatabaseUrlError, SchemaTooNew
 from .sqlite import SqliteDatabase
+from .postgres import PostgresDatabase
 
 _registry = weakref.WeakValueDictionary()
 _registry_lock = threading.RLock()
@@ -22,7 +23,7 @@ def resolve_url(data_dir, url=None):
 
 def _path(url):
     if not isinstance(url, str) or not url.startswith('sqlite:///'):
-        raise DatabaseUrlError('unsupported database URL scheme; only sqlite:/// is supported in this version')
+        raise DatabaseUrlError('unsupported database URL scheme; use sqlite:/// or postgresql:// (postgres://)')
     path = Path(url[len('sqlite:///'):])
     if not path.is_absolute():
         raise DatabaseUrlError('SQLite database path must be absolute')
@@ -30,7 +31,13 @@ def _path(url):
     return path.parent.resolve() / path.name
 
 
+def _is_postgres(url):
+    return isinstance(url, str) and url.startswith(('postgresql://', 'postgres://'))
+
+
 def connect(url):
+    if _is_postgres(url):
+        return PostgresDatabase(url)
     return SqliteDatabase(_path(url))
 
 
@@ -38,16 +45,45 @@ def for_server_dir(server_dir, url=None, *, create=True, actor='server'):
     directory = Path(server_dir)
     resolved = url if url is not None else (os.environ.get('AGENTICML_SERVER_DATABASE_URL')
                                                or 'sqlite:///' + str(directory.absolute() / 'agenticml.db'))
-    path = _path(resolved)
+    path = None if _is_postgres(resolved) else _path(resolved)
+    key = resolved if path is None else str(path)
+    if path is None:
+        # Network I/O and migration/import locks must not block the registry.
+        with _registry_lock:
+            db = _registry.get(key)
+        if db is None or db.closed:
+            if not create and not PostgresDatabase.exists(resolved):
+                return None
+            candidate = connect(resolved)
+            try:
+                from .import2x import import_state
+                import_state(candidate, directory, actor=actor)
+            except BaseException:
+                candidate.close()
+                raise
+            with _registry_lock:
+                db = _registry.get(key)
+                if db is None or db.closed:
+                    db = candidate
+                    _registry[key] = db
+            if db is not candidate:
+                candidate.close()
+        if create:
+            from .backfill import backfill_objects
+            backfill_objects(db, directory.parent)
+        return db
     with _registry_lock:
-        if not create:
+        db = _registry.get(key)
+        if not create and path is None and (db is None or db.closed) and not PostgresDatabase.exists(resolved):
+            return None
+        if not create and path is not None:
             try:
                 path.lstat()
             except FileNotFoundError:
                 return None
             except OSError as exc:
                 raise DatabaseError('could not inspect SQLite database') from exc
-        db = _registry.get(str(path))
+        db = _registry.get(key)
         if db is None or db.closed:
             db = connect(resolved)
             try:
@@ -56,5 +92,8 @@ def for_server_dir(server_dir, url=None, *, create=True, actor='server'):
             except BaseException:
                 db.close()
                 raise
-            _registry[str(path)] = db
+            _registry[key] = db
+        if create:
+            from .backfill import backfill_objects
+            backfill_objects(db, directory.parent)
         return db

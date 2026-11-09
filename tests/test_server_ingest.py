@@ -23,7 +23,7 @@ from agenticml.server.keys import KeyStore
 from agenticml.store import RunReader, RunWriter, layout
 from agenticml.store.gc import run_fingerprint
 from agenticml.store.overview import Overview
-from server_db_helpers import default_workspace_id
+from server_db_helpers import default_workspace_id, isolate_server_dir
 
 
 @contextmanager
@@ -125,10 +125,11 @@ def test_health_auth_scopes_and_revocation(server):
     assert request(server, "/v2/whoami")[0] == 401
 
 
-def test_zero_keys_and_environment(tmp_path):
+def test_zero_keys_and_environment(tmp_path, monkeypatch):
     with running(tmp_path / "empty") as httpd:
         assert raw(httpd, "GET", "/healthz")[0] == 200
         assert raw(httpd, "GET", "/v2/whoami")[0] == 401
+    isolate_server_dir((tmp_path / 'env') / 'server', monkeypatch)
     with running(tmp_path / "env", "a" * 32) as httpd:
         assert raw(httpd, "GET", "/v2/whoami", [("Authorization", "Bearer " + "a" * 32)])[1] == {
             "key": "env", "scope": "admin", "user": "env", "role": "admin", "protocol": 2, "workspace": "default",
@@ -166,6 +167,7 @@ def test_default_bind_cli_and_shutdown(tmp_path, monkeypatch, capsys):
         pass
 
 
+@pytest.mark.sqlite_only
 def test_lock_tmp_cleanup_and_permissions(tmp_path, caplog):
     app.prepare_data_dir(tmp_path)
     tmp = tmp_path / "server" / "tmp"
@@ -189,6 +191,7 @@ def test_lock_tmp_cleanup_and_permissions(tmp_path, caplog):
         pass
 
 
+@pytest.mark.sqlite_only
 def test_startup_removes_abandoned_lineage_quarantines(tmp_path, caplog):
     app.prepare_data_dir(tmp_path)
     tmp = tmp_path / "server" / "tmp"
@@ -208,6 +211,7 @@ def test_startup_removes_abandoned_lineage_quarantines(tmp_path, caplog):
 
 
 @pytest.mark.parametrize("reader", [False, True], ids=["no-reader", "with-reader"])
+@pytest.mark.sqlite_only
 def test_server_lock_fifo_fails_promptly(tmp_path, reader):
     app.prepare_data_dir(tmp_path)
     path = tmp_path / "server" / "server.lock"
@@ -239,6 +243,7 @@ def test_server_lock_fifo_fails_promptly(tmp_path, reader):
 
 @pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="requires procfs fd counts")
 @pytest.mark.parametrize("error", [OSError, KeyboardInterrupt])
+@pytest.mark.sqlite_only
 def test_server_lock_fdopen_failure_does_not_leak_fd(tmp_path, monkeypatch, error):
     app.prepare_data_dir(tmp_path)
     def fail(*args):
@@ -248,6 +253,17 @@ def test_server_lock_fdopen_failure_does_not_leak_fd(tmp_path, monkeypatch, erro
     with pytest.raises(error, match="fdopen failed"):
         make_server(tmp_path, port=0)
     assert len(os.listdir("/proc/self/fd")) == before
+
+
+def _assert_server_lock_held(httpd, tmp_path):
+    if httpd.db.dialect.name == 'postgres':
+        with pytest.raises(ValueError, match='stop every agenticml server'):
+            with httpd.db.server_lock():
+                pass
+    else:
+        assert not httpd._server_lock.closed
+        with pytest.raises(ValueError, match="another agenticml server"):
+            make_server(tmp_path, port=0)
 
 
 def test_close_holds_lock_until_active_handler_finishes(tmp_path, monkeypatch):
@@ -277,8 +293,7 @@ def test_close_holds_lock_until_active_handler_finishes(tmp_path, monkeypatch):
         closing.start()
         client.join(timeout=3)
         assert closing.is_alive()
-        with pytest.raises(ValueError, match="another agenticml server"):
-            make_server(tmp_path, port=0)
+        _assert_server_lock_held(httpd, tmp_path)
     finally:
         release.set()
         httpd.shutdown()
@@ -301,9 +316,7 @@ def test_interrupted_close_keeps_server_lock(tmp_path, monkeypatch):
             patch.setattr(app.DashboardServer, "server_close", interrupted)
             with pytest.raises(KeyboardInterrupt):
                 httpd.server_close()
-            assert not httpd._server_lock.closed
-            with pytest.raises(ValueError, match="another agenticml server"):
-                make_server(tmp_path, port=0)
+            _assert_server_lock_held(httpd, tmp_path)
     finally:
         httpd.server_close()
 
@@ -344,12 +357,11 @@ def test_retried_close_waits_after_interrupted_worker_join(tmp_path, monkeypatch
         monkeypatch.setattr(worker, "join", interrupted_once)
         with pytest.raises(KeyboardInterrupt):
             httpd.server_close()
-        assert not httpd._server_lock.closed
+        _assert_server_lock_held(httpd, tmp_path)
         closing.start()
         assert rejoining.wait(3)
         assert closing.is_alive()
-        with pytest.raises(ValueError, match="another agenticml server"):
-            make_server(tmp_path, port=0)
+        _assert_server_lock_held(httpd, tmp_path)
     finally:
         release.set()
         httpd.shutdown()
@@ -374,6 +386,7 @@ def test_cross_device_tmp_refused(tmp_path, monkeypatch):
         make_server(tmp_path, port=0)
 
 
+@pytest.mark.sqlite_only
 def test_missing_fcntl_refused(tmp_path, monkeypatch, capsys):
     monkeypatch.setitem(sys.modules, "fcntl", None)
     with pytest.raises(ValueError, match="POSIX fcntl"):
@@ -398,6 +411,7 @@ def test_unsafe_data_directories(tmp_path, name, kind):
 
 
 @pytest.mark.parametrize("err", [errno.ENOLCK, errno.ENOSYS, errno.EOPNOTSUPP])
+@pytest.mark.sqlite_only
 def test_unsupported_lock_refused(tmp_path, monkeypatch, err):
     import fcntl
     def failed(*args):
@@ -583,6 +597,79 @@ def test_claim_unowned_run(server, remote):
         (directory / "remote.json").write_bytes(remote)
     assert put_meta(server)[0] == 200
     assert server.run_index.as_remote("run-1") == {"owner": "admin", "owner_key": "one"}
+
+
+def test_atomic_publish_rename_failure_keeps_old_file(server, monkeypatch):
+    assert put_meta(server)[0] == 200
+    first, second = b'{"k":"old"}', b'{"k":"new"}'
+    assert request(server, "/v2/runs/run-1/files/scalars/index.json", "PUT", first)[0] == 200
+    path = run_path(server, "scalars/index.json")
+    real = os.replace
+    seen = []
+
+    def boom(src, dst, *args, **kwargs):
+        if Path(dst) == path and not seen:
+            seen.append(path.is_file() and path.read_bytes() == first)
+            raise OSError("injected publish rename failure")
+        return real(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", boom)
+    status, _, _ = request(server, "/v2/runs/run-1/files/scalars/index.json", "PUT", second)
+    assert status == 500
+    assert seen == [True]
+    assert path.is_file() and path.read_bytes() == first
+    recorded = server.run_index.files("run-1")["scalars/index.json"]
+    assert recorded["sha256"] == hashlib.sha256(first).hexdigest()
+
+
+def test_atomic_publish_old_content_stays_until_rename(server, monkeypatch):
+    assert put_meta(server)[0] == 200
+    first, second = b'{"k":"old"}', b'{"k":"new"}'
+    assert request(server, "/v2/runs/run-1/files/scalars/index.json", "PUT", first)[0] == 200
+    path = run_path(server, "scalars/index.json")
+    real = os.replace
+    seen = []
+
+    def tracking(src, dst, *args, **kwargs):
+        if Path(dst) == path:
+            seen.append(path.is_file() and path.read_bytes() == first)
+        return real(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", tracking)
+    assert request(server, "/v2/runs/run-1/files/scalars/index.json", "PUT", second)[0] == 200
+    assert seen == [True]
+    assert path.read_bytes() == second
+
+
+def test_verify_after_write_503_does_not_truncate(server, monkeypatch, caplog):
+    assert put_meta(server)[0] == 200
+    first = b'{"a":1}\n'
+    assert append(server, first, name="events.jsonl")[0] == 200
+    committed = len(first)
+    path = run_path(server, "events.jsonl")
+    original = server.db.confirm_session_locks
+    injected = []
+
+    def confirm():
+        original()
+        size = path.stat().st_size
+        if size > committed and not injected:
+            with open(path, "r+b") as handle:
+                handle.seek(committed)
+                handle.write(b"CORRUPT!")
+            injected.append(True)
+
+    monkeypatch.setattr(server.db, "confirm_session_locks", confirm)
+    monkeypatch.setattr(ingest, "_LOCK_CONFIRM_BYTES", 1)
+    payload = b'{"b":2}\n' * 20
+    status, _, headers = append(server, payload, offset=committed, name="events.jsonl")
+    assert injected and status == 503
+    assert headers["Retry-After"] == "5"
+    assert "concurrent writer detected" in caplog.text
+    on_disk = path.read_bytes()
+    assert server.run_index.committed_size("run-1", "events.jsonl") == committed
+    assert on_disk.startswith(first)
+    assert len(on_disk) > committed
 
 
 def test_atomic_validation_and_state(server):
@@ -1159,6 +1246,26 @@ def test_state_null_atomic_hash_is_recorded_without_error(server, caplog):
     assert "atomic file differs from recorded hash" in caplog.text
 
 
+def test_stale_atomic_backup_removed_on_state_and_write(server):
+    assert put_meta(server)[0] == 200
+    first, second = b'{"k":"old"}', b'{"k":"new"}'
+    assert request(server, "/v2/runs/run-1/files/scalars/index.json", "PUT", first)[0] == 200
+    path = run_path(server, "scalars/index.json")
+    backup = path.parent / ".index.json.bak.1.2.deadbeef.tmp"
+    os.link(path, backup)
+    assert path.stat().st_nlink == 2
+    status, payload, _ = request(server, "/v2/runs/run-1/state")
+    assert status == 200
+    assert "scalars/index.json" in payload["files"]
+    assert not backup.exists()
+    assert path.stat().st_nlink == 1
+    os.link(path, backup)
+    assert request(server, "/v2/runs/run-1/files/scalars/index.json", "PUT", second)[0] == 200
+    assert not backup.exists()
+    assert path.read_bytes() == second
+    assert path.stat().st_nlink == 1
+
+
 @pytest.mark.parametrize("name", ["meta.json", "scalars/index.json", "media/index.json", "scalars/0.ovw"])
 def test_state_skips_hard_linked_atomic_files(server, tmp_path, name):
     put_meta(server)
@@ -1351,3 +1458,24 @@ def test_ownership_rechecked_after_body(server, monkeypatch, route, method, body
     assert request(server, "/v2/runs/run-1/" + route, method, body)[0:2] == (
         409, {"error": "run owned by another user", "owner": "other", "owner_user": "other"})
     assert not run_path(server, "events.jsonl").exists()
+
+
+@pytest.mark.parametrize('enabled,delay,pytest_test,expected', [
+    (None, '1500', 't', []),
+    ('0', '1500', 't', []),
+    ('1', None, 't', []),
+    ('1', '1500', None, []),
+    ('1', '1500', 't', [1.5]),
+])
+def test_append_delay_requires_hooks_and_pytest(monkeypatch, capsys, enabled, delay, pytest_test, expected):
+    for key, value in (('AGENTICML_TEST_HOOKS', enabled), ('AGENTICML_TEST_APPEND_DELAY_MS', delay),
+                       ('PYTEST_CURRENT_TEST', pytest_test)):
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+    sleeps = []
+    monkeypatch.setattr(app.time, 'sleep', sleeps.append)
+    app.IngestServer._after_append_write(None, 'run', 'events.jsonl')
+    assert sleeps == expected
+    assert bool(capsys.readouterr().out) == bool(expected)

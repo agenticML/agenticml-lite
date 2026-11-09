@@ -58,6 +58,21 @@ class InviteInvalid(ValueError):
     pass
 
 
+class InviteEmailMismatch(ValueError):
+    """Firebase invite email does not match the verified token email."""
+
+    def __init__(self):
+        super().__init__('this invite is for a different or unverified email')
+
+
+class InviteAccountExists(ValueError):
+    """Invite email matches a credentialed account; the invite stays pending."""
+
+    def __init__(self):
+        super().__init__(
+            'an account with this email already exists; sign in with it or ask a server admin')
+
+
 class InviteExistingAccount(Exception):
     """Membership was added; the caller should sign in with existing credentials."""
 
@@ -297,8 +312,8 @@ class UserStore:
     def by_identity(self, value):
         return self._call('by_identity', value)
 
-    def add(self, name, role="member", identity=None, created_by="cli", *, reclaim_runs=False):
-        return self._call('add', name, role, identity, created_by, reclaim_runs=reclaim_runs)
+    def add(self, name, role="member", identity=None, created_by="cli", *, reclaim_runs=False, plans=None):
+        return self._call('add', name, role, identity, created_by, reclaim_runs=reclaim_runs, plans=plans)
 
     def remove(self, name):
         return self._call('remove', name)

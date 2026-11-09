@@ -11,14 +11,16 @@ import time
 
 from agenticml.store import layout
 from agenticml.store import notes as note_store
-from .errors import DatabaseError
+from .errors import DatabaseBusy, DatabaseError
 from ..keys import (ClientError, KeyNameTaken, LastAdminError, SetupClosed,
                     UserRequired, KeyRecord, validate_name)
 from ..users import (UserRecord, UserNameTaken, UserNotFound, IdentityTaken, InviteInvalid,
                      CROSS_WORKSPACE_CREDENTIALS, ROLES, INVITE_HOURS, _new_user_id, _identity_taken,
                      validate_identity, _password_record, _dummy_verify, _check_password)
 
-from .workspaces import AccountRepo, WorkspaceRepo, require_workspace_id, validate_login
+from .workspaces import AccountRepo, WorkspaceBound, WorkspaceRepo, require_workspace_id, validate_login
+
+from .usage import UsageRepo
 
 logger = logging.getLogger('agenticml.server.db.repos')
 
@@ -49,7 +51,7 @@ class SettingsRepo:
         return tx.execute('DELETE FROM server_settings WHERE name=?', (name,)).rowcount
 
 
-class UserRepo:
+class UserRepo(WorkspaceBound):
     """Compatibility facade for accounts joined to one workspace's membership."""
     def __init__(self, db, workspace_id):
         self.db = db
@@ -74,37 +76,38 @@ class UserRepo:
                 'WHERE m.workspace_id=? ')
 
     def save(self, tx, record):
-        existing = self.accounts.get(record.name, tx)
-        aid = existing['id'] if existing else record.id
-        columns = ('id', 'login', 'display_name', 'identity', 'identity_folded', 'password',
-                   'generation', 'created_at', 'created_by')
-        updates = ('identity', 'identity_folded', 'password', 'generation')
-        if existing is not None and existing['created_by'] == 'legacy run owner':
-            updates = updates + ('created_by',)
-        tx.execute(self.db.dialect.upsert('accounts', columns, ('login',), updates),
-                   (aid, record.name, record.name, record.identity,
-                    record.identity.casefold() if record.identity is not None else None,
-                    json.dumps(record.password) if record.password is not None else None,
-                    record.generation, record.created_at, record.created_by))
-        role = record.role
-        owner = tx.fetchone("SELECT 1 FROM memberships WHERE workspace_id=? AND role='owner'", (self.workspace_id,))
-        if role == 'admin' and owner is None:
-            role = 'owner'
-            workspace = WorkspaceRepo(self.db).by_id(self.workspace_id, tx)
-            if workspace['slug'] == 'default':
-                tx.execute('UPDATE accounts SET server_admin=1 WHERE id=?', (aid,))
-            tx.execute('UPDATE workspaces SET created_by=? WHERE id=?', (aid, self.workspace_id))
-        tx.execute(self.db.dialect.upsert('memberships', ('workspace_id', 'account_id', 'role'),
-                                         ('workspace_id', 'account_id'), ('role',)),
-                   (self.workspace_id, aid, role))
-        if record.invite:
-            tx.execute(self.db.dialect.upsert('invites',
-                       ('workspace_id', 'login', 'role', 'sha256', 'expires_at', 'invited_by'),
-                       ('workspace_id', 'login'), ('role', 'sha256', 'expires_at', 'invited_by')),
-                       (self.workspace_id, record.name, 'admin' if role == 'owner' else role, record.invite['sha256'],
-                        record.invite['expires_at'], record.created_by))
-        else:
-            tx.execute('DELETE FROM invites WHERE workspace_id=? AND login=?', (self.workspace_id, record.name))
+        with self._bind(tx):
+            existing = self.accounts.get(record.name, tx)
+            aid = existing['id'] if existing else record.id
+            columns = ('id', 'login', 'display_name', 'identity', 'identity_folded', 'password',
+                       'generation', 'created_at', 'created_by')
+            updates = ('identity', 'identity_folded', 'password', 'generation')
+            if existing is not None and existing['created_by'] == 'legacy run owner':
+                updates = updates + ('created_by',)
+            tx.execute(self.db.dialect.upsert('accounts', columns, ('login',), updates),
+                       (aid, record.name, record.name, record.identity,
+                        record.identity.casefold() if record.identity is not None else None,
+                        json.dumps(record.password) if record.password is not None else None,
+                        record.generation, record.created_at, record.created_by))
+            role = record.role
+            owner = tx.fetchone("SELECT 1 FROM memberships WHERE workspace_id=? AND role='owner'", (self.workspace_id,))
+            if role == 'admin' and owner is None:
+                role = 'owner'
+                workspace = WorkspaceRepo(self.db).by_id(self.workspace_id, tx)
+                if workspace['slug'] == 'default':
+                    tx.execute('UPDATE accounts SET server_admin=1 WHERE id=?', (aid,))
+                tx.execute('UPDATE workspaces SET created_by=? WHERE id=?', (aid, self.workspace_id))
+            tx.execute(self.db.dialect.upsert('memberships', ('workspace_id', 'account_id', 'role'),
+                                             ('workspace_id', 'account_id'), ('role',)),
+                       (self.workspace_id, aid, role))
+            if record.invite:
+                tx.execute(self.db.dialect.upsert('invites',
+                           ('workspace_id', 'login', 'role', 'sha256', 'expires_at', 'invited_by'),
+                           ('workspace_id', 'login'), ('role', 'sha256', 'expires_at', 'invited_by')),
+                           (self.workspace_id, record.name, 'admin' if role == 'owner' else role, record.invite['sha256'],
+                            record.invite['expires_at'], record.created_by))
+            else:
+                tx.execute('DELETE FROM invites WHERE workspace_id=? AND login=?', (self.workspace_id, record.name))
 
     @staticmethod
     def _new(name, role, identity, created_by):
@@ -118,28 +121,32 @@ class UserRepo:
 
     def list(self, tx=None):
         if tx is None:
-            with self.db.transaction() as tx:
+            with self._tx() as tx:
                 return self.list(tx)
-        return [self.decode(row) for row in tx.fetchall(self._select() + 'ORDER BY a.created_at, a.login', (self.workspace_id,))]
+        with self._bind(tx):
+            return [self.decode(row) for row in tx.fetchall(self._select() + 'ORDER BY a.created_at, a.login', (self.workspace_id,))]
 
     def get(self, name, tx=None):
         if tx is None:
-            with self.db.transaction() as tx:
+            with self._tx() as tx:
                 return self.get(name, tx)
-        row = tx.fetchone(self._select() + 'AND a.login=?', (self.workspace_id, name))
-        return self.decode(row) if row else None
+        with self._bind(tx):
+            row = tx.fetchone(self._select() + 'AND a.login=?', (self.workspace_id, name))
+            return self.decode(row) if row else None
 
     def by_identity(self, value):
-        with self.db.transaction() as tx:
+        with self._tx() as tx:
             row = tx.fetchone(self._select() + 'AND a.identity=?', (self.workspace_id, value))
             return self.decode(row) if row else None
 
-    def add(self, name, role='member', identity=None, created_by='cli', *, reclaim_runs=False):
+    def add(self, name, role='member', identity=None, created_by='cli', *, reclaim_runs=False, plans=None):
         record = self._new(name, role, identity, created_by)
-        with self.db.transaction(write=True) as tx:
+        with self._tx(write=True) as tx:
             tx.advisory_lock('users')
             if self.get(record.name, tx):
                 raise UserNameTaken('user name already exists')
+            if plans is not None:
+                plans.check_people(self.db, self.workspace_id, tx)
             existing = self.accounts.get(record.name, tx)
             if not reclaim_runs:
                 if existing is not None and existing['created_by'] == 'legacy run owner':
@@ -162,7 +169,7 @@ class UserRepo:
             return self.get(record.name, tx)
 
     def remove(self, name):
-        with self.db.transaction(write=True) as tx:
+        with self._tx(write=True) as tx:
             tx.advisory_lock('users')
             found = self.get(name, tx)
             if found is None:
@@ -178,7 +185,7 @@ class UserRepo:
 
     def discard(self, name, user_id):
         try:
-            with self.db.transaction(write=True) as tx:
+            with self._tx(write=True) as tx:
                 tx.advisory_lock('users')
                 found = self.get(name, tx)
                 if found is None or found.id != user_id:
@@ -192,7 +199,7 @@ class UserRepo:
     def set_role(self, name, role):
         if role not in ROLES[:-1]:
             raise ClientError('invalid role')
-        with self.db.transaction(write=True) as tx:
+        with self._tx(write=True) as tx:
             tx.advisory_lock('users')
             found = self.get(name, tx)
             if found is None:
@@ -209,14 +216,15 @@ class UserRepo:
             return
         if acting_account_id == account_id:
             return
-        other = tx.fetchone('SELECT 1 FROM memberships WHERE account_id=? AND workspace_id!=?',
-                            (account_id, self.workspace_id))
+        with tx.cross_scope('reject cross-workspace credentials'):
+            other = tx.fetchone('SELECT 1 FROM memberships WHERE account_id=? AND workspace_id!=?',
+                                (account_id, self.workspace_id))
         if other:
             raise ClientError(CROSS_WORKSPACE_CREDENTIALS)
 
     def set_identity(self, name, value, *, operator=False):
         identity = validate_identity(value)
-        with self.db.transaction(write=True) as tx:
+        with self._tx(write=True) as tx:
             tx.advisory_lock('users')
             found = self.get(name, tx)
             if found is None:
@@ -232,7 +240,7 @@ class UserRepo:
 
     def set_password(self, name, password, *, operator=False, acting_account_id=None):
         record = _password_record(password)
-        with self.db.transaction(write=True) as tx:
+        with self._tx(write=True) as tx:
             tx.advisory_lock('users')
             found = self.get(name, tx)
             if found is None:
@@ -254,7 +262,7 @@ class UserRepo:
         token = secrets.token_urlsafe(32)
         digest = hashlib.sha256(token.encode('ascii')).hexdigest()
         expires_at = layout.format_timestamp(datetime.now(timezone.utc) + timedelta(hours=INVITE_HOURS))
-        with self.db.transaction(write=True) as tx:
+        with self._tx(write=True) as tx:
             tx.advisory_lock('users')
             found = self.get(name, tx)
             if found is None:
@@ -273,7 +281,7 @@ class UserRepo:
             digest = hashlib.sha256(token.encode('ascii')).hexdigest()
         except UnicodeEncodeError as exc:
             raise InviteInvalid('invalid invite') from exc
-        with self.db.transaction(write=True) as tx:
+        with self._tx(write=True) as tx:
             tx.advisory_lock('users')
             row = tx.fetchone(self._select() + 'AND i.sha256=?', (self.workspace_id, digest))
             matched = self.decode(row) if row else None
@@ -298,12 +306,13 @@ class KeyVerifier:
 
     def by_digest(self, digest):
         with self.db.transaction() as tx:
+            tx.cross_workspace('key lookup by digest')
             row = tx.fetchone('SELECT k.*, a.login AS user_name FROM keys k JOIN accounts a ON a.id=k.account_id '
                               'WHERE k.sha256=?', (digest,))
             return KeyRepo.decode(row) if row else None
 
 
-class KeyRepo:
+class KeyRepo(WorkspaceBound):
     def __init__(self, db, workspace_id):
         self.db = db
         self.workspace_id = require_workspace_id(workspace_id)
@@ -317,19 +326,21 @@ class KeyRepo:
 
     def list(self, tx=None):
         if tx is None:
-            with self.db.transaction() as tx:
+            with self._tx() as tx:
                 return self.list(tx)
-        return [self.decode(row) for row in tx.fetchall('SELECT k.*, a.login AS user_name FROM keys k JOIN accounts a ON a.id=k.account_id '
-            'WHERE k.workspace_id=? ORDER BY k.created_at, k.name', (self.workspace_id,))]
+        with self._bind(tx):
+            return [self.decode(row) for row in tx.fetchall('SELECT k.*, a.login AS user_name FROM keys k JOIN accounts a ON a.id=k.account_id '
+                'WHERE k.workspace_id=? ORDER BY k.created_at, k.name', (self.workspace_id,))]
 
     def insert(self, tx, record):
-        chosen = self.users.get(record.user, tx)
-        if chosen is None:
-            raise DatabaseError('could not read or write database')
-        tx.execute('INSERT INTO keys (workspace_id, name, account_id, scope, sha256, prefix, '
-                   'created_at, created_by, last_used_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                   (self.workspace_id, record.name, chosen.id, record.scope, record.sha256,
-                    record.prefix, record.created_at, record.created_by, record.last_used_at))
+        with self._bind(tx):
+            chosen = self.users.get(record.user, tx)
+            if chosen is None:
+                raise DatabaseError('could not read or write database')
+            tx.execute('INSERT INTO keys (workspace_id, name, account_id, scope, sha256, prefix, '
+                       'created_at, created_by, last_used_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                       (self.workspace_id, record.name, chosen.id, record.scope, record.sha256,
+                        record.prefix, record.created_at, record.created_by, record.last_used_at))
 
     def create(self, name, scope, created_by, *, user, only_if_no_admin, env):
         validate_name(name)
@@ -338,7 +349,7 @@ class KeyRepo:
         if not isinstance(created_by, str):
             raise ValueError('created_by must be a string')
         bootstrap = None
-        with self.db.transaction(write=True) as tx:
+        with self._tx(write=True) as tx:
             tx.advisory_lock('users')
             records = self.list(tx)
             if only_if_no_admin and (self.settings.get('setup_closed', tx) is not None
@@ -385,7 +396,7 @@ class KeyRepo:
     def revoke(self, name, *, keep_admin=False, expected=None, env=False):
         if name == 'env':
             raise ValueError('the env key cannot be revoked')
-        with self.db.transaction(write=True) as tx:
+        with self._tx(write=True) as tx:
             tx.advisory_lock('users')
             records = self.list(tx)
             removed = next((r for r in records if r.name == name), None)
@@ -402,12 +413,13 @@ class KeyRepo:
 
     def touch(self, record, now, threshold):
         with self.db.transaction(write=True) as tx:
+            tx.bind_workspace(require_workspace_id(record.workspace_id or self.workspace_id))
             tx.execute('UPDATE keys SET last_used_at=? WHERE workspace_id=? AND name=? AND sha256=? '
                        'AND (last_used_at IS NULL OR last_used_at < ?)',
                        (now, record.workspace_id, record.name, record.sha256, threshold))
 
     def prepare_setup(self, env):
-        with self.db.transaction(write=True) as tx:
+        with self._tx(write=True) as tx:
             tx.advisory_lock('users')
             self.settings.delete('setup_closed', tx)
             return not env and not any(r.scope == 'admin' for r in self.list(tx))
@@ -416,6 +428,12 @@ class KeyRepo:
 class SessionRepo:
     def __init__(self, db):
         self.db = db
+
+    @contextmanager
+    def _tx(self, write=False):
+        with self.db.transaction(write=write) as tx:
+            tx.cross_workspace('sessions')
+            yield tx
 
     @staticmethod
     def decode(row):
@@ -426,7 +444,7 @@ class SessionRepo:
                     created=row['created'], last_seen=row['last_seen'])
 
     def create(self, digest, entry, cap):
-        with self.db.transaction(write=True) as tx:
+        with self._tx(write=True) as tx:
             tx.advisory_lock('sessions')
             count = tx.fetchone('SELECT COUNT(*) FROM sessions')[0]
             if count >= cap:
@@ -440,29 +458,29 @@ class SessionRepo:
                         entry['key'], entry['key_sha256'], entry['created'], entry['last_seen'], order))
 
     def get(self, digest):
-        with self.db.transaction() as tx:
+        with self._tx() as tx:
             row = tx.fetchone('SELECT s.*, a.login FROM sessions s LEFT JOIN accounts a ON a.id=s.account_id WHERE token_sha256=?', (digest,))
             return self.decode(row) if row else None
 
     def list(self):
-        with self.db.transaction() as tx:
+        with self._tx() as tx:
             return {r['token_sha256']: self.decode(r) for r in tx.fetchall('SELECT s.*, a.login FROM sessions s LEFT JOIN accounts a ON a.id=s.account_id')}
 
     def touch(self, digest, now):
-        with self.db.transaction(write=True) as tx:
+        with self._tx(write=True) as tx:
             tx.execute('UPDATE sessions SET last_seen=? WHERE token_sha256=? AND last_seen<=?',
                        (now, digest, now - 60))
 
     def delete(self, digest):
-        with self.db.transaction(write=True) as tx:
+        with self._tx(write=True) as tx:
             tx.execute('DELETE FROM sessions WHERE token_sha256=?', (digest,))
 
     def delete_for_key(self, name, sha256):
-        with self.db.transaction(write=True) as tx:
+        with self._tx(write=True) as tx:
             tx.execute('DELETE FROM sessions WHERE key_name=? AND key_sha256=?', (name, sha256))
 
     def prune(self, now, idle, max_age):
-        with self.db.transaction(write=True) as tx:
+        with self._tx(write=True) as tx:
             tx.execute('DELETE FROM sessions WHERE last_seen<=? OR created<=?', (now-idle, now-max_age))
 
 
@@ -470,43 +488,95 @@ class ThrottleRepo:
     def __init__(self, db):
         self.db = db
 
-    def load(self):
-        with self.db.transaction() as tx:
-            tx.advisory_lock('throttle')
-            return [(r['bucket'], r['failures'], r['last_failure']) for r in
-                    tx.fetchall('SELECT * FROM login_attempts ORDER BY last_failure, bucket')]
+    def load(self, bucket=None, tx=None):
+        if tx is None:
+            with self.db.transaction() as tx:
+                tx.advisory_lock('throttle')
+                return self.load(bucket, tx)
+        sql = 'SELECT * FROM login_attempts'
+        params = ()
+        if bucket is not None:
+            sql += ' WHERE bucket=?'
+            params = (bucket,)
+        return [(r['bucket'], r['failures'], r['last_failure']) for r in
+                tx.fetchall(sql + ' ORDER BY last_failure, bucket', params)]
 
-    def save(self, entries, previous):
+    def save(self, entries, previous, tx=None, *, touched=None, before_failures=None,
+             expire_before=None, keep=()):
         current = {bucket: (failures, last) for bucket, (failures, last, _) in entries.items()
                    if failures}
-        with self.db.transaction(write=True) as tx:
-            tx.advisory_lock('throttle')
-            for bucket in previous.keys() - current.keys():
+        if tx is None:
+            with self.db.transaction(write=True) as tx:
+                tx.advisory_lock('throttle')
+                return self.save(entries, previous, tx, touched=touched,
+                                 before_failures=before_failures,
+                                 expire_before=expire_before, keep=keep)
+        if touched is None:
+            touched = set(previous) | set(current)
+        before_failures = before_failures or {}
+        fn = 'GREATEST' if self.db.dialect.name == 'postgres' else 'MAX'
+        for bucket in touched:
+            value = current.get(bucket)
+            if value is None:
                 tx.execute('DELETE FROM login_attempts WHERE bucket=?', (bucket,))
-            for bucket, value in current.items():
-                if previous.get(bucket) != value:
-                    tx.execute(self.db.dialect.upsert(
-                        'login_attempts', ('bucket', 'failures', 'last_failure'), ('bucket',),
-                        ('failures', 'last_failure')), (bucket, *value))
+                continue
+            failures, last = value
+            db_failures = previous.get(bucket, (0, 0))[0]
+            increment = failures > before_failures.get(bucket, db_failures)
+            base = 'login_attempts.failures + 1' if increment else 'login_attempts.failures'
+            tx.execute(
+                'INSERT INTO login_attempts (bucket, failures, last_failure) VALUES (?, ?, ?) '
+                'ON CONFLICT (bucket) DO UPDATE SET '
+                f'failures={fn}({base}, excluded.failures), '
+                f'last_failure={fn}(login_attempts.last_failure, excluded.last_failure)',
+                (bucket, failures, last))
+        if expire_before is not None:
+            held = tuple(keep)
+            if held:
+                tx.execute(
+                    'DELETE FROM login_attempts WHERE last_failure < ? AND bucket NOT IN ('
+                    + ','.join('?' * len(held)) + ')',
+                    (expire_before,) + held)
+            else:
+                tx.execute('DELETE FROM login_attempts WHERE last_failure < ?', (expire_before,))
 
 
-class AuditRepo:
+class AuditRepo(WorkspaceBound):
     def __init__(self, db, workspace_id):
         self.db = db
         self.workspace_id = require_workspace_id(workspace_id) if workspace_id is not None else None
 
+    @contextmanager
+    def _bind(self, tx, restore=True):
+        previous = tx.bound
+        if self.workspace_id is None:
+            tx.cross_workspace('server-level audit')
+        else:
+            tx.bind_workspace(self.workspace_id)
+        try:
+            yield
+        except BaseException:
+            # An aborted Postgres transaction cannot run set_config; doing so
+            # would raise InFailedSqlTransaction and hide lock/deadlock errors.
+            tx.bound = previous
+            raise
+        else:
+            if restore:
+                tx._set_binding(previous)
+
     def insert(self, event, tx=None):
         if tx is None:
-            with self.db.transaction(write=True) as tx:
+            with self._tx(write=True) as tx:
                 return self.insert(event, tx)
-        tx.execute('INSERT INTO audit_events (workspace_id, ts, actor, via, action, target, client, detail) '
-                   'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                   (self.workspace_id,) + tuple(event.get(k) for k in
-                   ('ts', 'actor', 'via', 'action', 'target', 'client')) +
-                   (json.dumps(event.get('detail')) if event.get('detail') is not None else None,))
+        with self._bind(tx):
+            tx.execute('INSERT INTO audit_events (workspace_id, ts, actor, via, action, target, client, detail) '
+                       'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                       (self.workspace_id,) + tuple(event.get(k) for k in
+                       ('ts', 'actor', 'via', 'action', 'target', 'client')) +
+                       (json.dumps(event.get('detail')) if event.get('detail') is not None else None,))
 
     def tail(self, limit, before=None):
-        with self.db.transaction() as tx:
+        with self._tx() as tx:
             sql = ('SELECT ts, actor, via, action, target, client, detail FROM audit_events WHERE ' +
                    ('workspace_id=? ' if self.workspace_id is not None else 'workspace_id IS NULL '))
             params = (self.workspace_id,) if self.workspace_id is not None else ()
@@ -529,140 +599,151 @@ def _run_dict(row):
     return {name: row[name] for name in _RUN_COLUMNS}
 
 
-class RunRepo:
+class RunRepo(WorkspaceBound):
     def __init__(self, db, workspace_id):
         self.db = db
         self.workspace_id = require_workspace_id(workspace_id)
 
     def get(self, run_id, tx=None):
         if tx is None:
-            with self.db.transaction() as tx:
+            with self._tx() as tx:
                 return self.get(run_id, tx)
-        row = tx.fetchone('SELECT *, (SELECT login FROM accounts WHERE '
-                          'id=runs.owner_account_id) AS owner_user FROM runs WHERE '
-                          'workspace_id=? AND run_id=?', (self.workspace_id, run_id))
-        return _run_dict(row) if row else None
+        with self._bind(tx):
+            row = tx.fetchone('SELECT *, (SELECT login FROM accounts WHERE '
+                              'id=runs.owner_account_id) AS owner_user FROM runs WHERE '
+                              'workspace_id=? AND run_id=?', (self.workspace_id, run_id))
+            return _run_dict(row) if row else None
 
     def ids(self, tx=None):
         if tx is None:
-            with self.db.transaction() as tx:
+            with self._tx() as tx:
                 return self.ids(tx)
-        return {row['run_id'] for row in tx.fetchall('SELECT run_id FROM runs WHERE workspace_id=?', (self.workspace_id,))}
+        with self._bind(tx):
+            return {row['run_id'] for row in tx.fetchall('SELECT run_id FROM runs WHERE workspace_id=?', (self.workspace_id,))}
 
     def list_rows(self, tx=None):
         """Dashboard list: newest created_at first, matching reader._run_sort_key."""
         if tx is None:
-            with self.db.transaction() as tx:
+            with self._tx() as tx:
                 return self.list_rows(tx)
-        return [_run_dict(row) for row in tx.fetchall(
-            'SELECT *, (SELECT login FROM accounts WHERE id=runs.owner_account_id) AS '
-            "owner_user FROM runs WHERE workspace_id=? ORDER BY COALESCE(created_at, '') DESC, "
-            'run_id DESC', (self.workspace_id,))]
+        with self._bind(tx):
+            return [_run_dict(row) for row in tx.fetchall(
+                'SELECT *, (SELECT login FROM accounts WHERE id=runs.owner_account_id) AS '
+                "owner_user FROM runs WHERE workspace_id=? ORDER BY COALESCE(created_at, '') DESC, "
+                'run_id DESC', (self.workspace_id,))]
 
     def all_rows(self, tx=None):
         if tx is None:
-            with self.db.transaction() as tx:
+            with self._tx() as tx:
                 return self.all_rows(tx)
-        return [_run_dict(row) for row in tx.fetchall('SELECT *, (SELECT login FROM accounts WHERE '
-                                                      'id=runs.owner_account_id) AS owner_user FROM runs '
-                                                      'WHERE workspace_id=?', (self.workspace_id,))]
+        with self._bind(tx):
+            return [_run_dict(row) for row in tx.fetchall('SELECT *, (SELECT login FROM accounts WHERE '
+                                                          'id=runs.owner_account_id) AS owner_user FROM runs '
+                                                          'WHERE workspace_id=?', (self.workspace_id,))]
 
     def files(self, run_id, tx=None):
         if tx is None:
-            with self.db.transaction() as tx:
+            with self._tx() as tx:
                 return self.files(run_id, tx)
-        return {row['path']: {'size': row['size'], 'sha256': row['sha256']}
-                for row in tx.fetchall('SELECT path, size, sha256 FROM run_files WHERE workspace_id=? AND run_id=?',
-                                       (self.workspace_id, run_id))}
+        with self._bind(tx):
+            return {row['path']: {'size': row['size'], 'sha256': row['sha256']}
+                    for row in tx.fetchall('SELECT path, size, sha256 FROM run_files WHERE workspace_id=? AND run_id=?',
+                                           (self.workspace_id, run_id))}
 
     def committed_size(self, run_id, path, tx=None):
         if tx is None:
-            with self.db.transaction() as tx:
+            with self._tx() as tx:
                 return self.committed_size(run_id, path, tx)
-        row = tx.fetchone('SELECT size FROM run_files WHERE workspace_id=? AND run_id=? AND path=?', (self.workspace_id, run_id, path))
-        return 0 if row is None else row['size']
+        with self._bind(tx):
+            row = tx.fetchone('SELECT size FROM run_files WHERE workspace_id=? AND run_id=? AND path=?', (self.workspace_id, run_id, path))
+            return 0 if row is None else row['size']
 
     def name_owns(self, name, tx=None):
         if tx is None:
-            with self.db.transaction() as tx:
+            with self._tx() as tx:
                 return self.name_owns(name, tx)
-        return tx.fetchone('SELECT 1 FROM runs WHERE workspace_id=? AND '
-                           'owner_account_id=(SELECT id FROM accounts WHERE login=?)', (self.workspace_id, name)) is not None
+        with self._bind(tx):
+            return tx.fetchone('SELECT 1 FROM runs WHERE workspace_id=? AND '
+                               'owner_account_id=(SELECT id FROM accounts WHERE login=?)', (self.workspace_id, name)) is not None
 
     def owner_key_counts(self, tx=None):
         """(owner_key, owner_user) -> run count for keys that created a run."""
         if tx is None:
-            with self.db.transaction() as tx:
+            with self._tx() as tx:
                 return self.owner_key_counts(tx)
-        counts = {}
-        for row in tx.fetchall(
-                'SELECT owner_key, (SELECT login FROM accounts WHERE id=owner_account_id) AS '
-                'owner_user, COUNT(*) AS n FROM runs WHERE workspace_id=? AND owner_key IS NOT '
-                'NULL AND owner_account_id IS NOT NULL GROUP BY owner_key, owner_account_id', (self.workspace_id,)):
-            counts[(row['owner_key'], row['owner_user'])] = row['n']
-        return counts
+        with self._bind(tx):
+            counts = {}
+            for row in tx.fetchall(
+                    'SELECT owner_key, (SELECT login FROM accounts WHERE id=owner_account_id) AS '
+                    'owner_user, COUNT(*) AS n FROM runs WHERE workspace_id=? AND owner_key IS NOT '
+                    'NULL AND owner_account_id IS NOT NULL GROUP BY owner_key, owner_account_id', (self.workspace_id,)):
+                counts[(row['owner_key'], row['owner_user'])] = row['n']
+            return counts
 
     def owner_user_counts(self, tx=None):
         if tx is None:
-            with self.db.transaction() as tx:
+            with self._tx() as tx:
                 return self.owner_user_counts(tx)
-        return {row['owner_user']: row['n'] for row in tx.fetchall(
-            'SELECT (SELECT login FROM accounts WHERE id=owner_account_id) AS owner_user, '
-            'COUNT(*) AS n FROM runs WHERE workspace_id=? AND owner_account_id IS NOT NULL '
-            'GROUP BY owner_account_id', (self.workspace_id,))}
+        with self._bind(tx):
+            return {row['owner_user']: row['n'] for row in tx.fetchall(
+                'SELECT (SELECT login FROM accounts WHERE id=owner_account_id) AS owner_user, '
+                'COUNT(*) AS n FROM runs WHERE workspace_id=? AND owner_account_id IS NOT NULL '
+                'GROUP BY owner_account_id', (self.workspace_id,))}
 
     def as_remote(self, run_id, tx=None):
         """2.2 remote.json object shape for /state and tests."""
         if tx is None:
-            with self.db.transaction() as tx:
+            with self._tx() as tx:
                 return self.as_remote(run_id, tx)
-        row = self.get(run_id, tx)
-        if row is None:
-            return {}
-        payload = {}
-        if isinstance(row['owner_user'], str):
-            payload['owner'] = row['owner_user']
-        elif row['status'] is not None:
-            payload['owner'] = None
-        if isinstance(row['owner_key'], str):
-            payload['owner_key'] = row['owner_key']
-        if row['status'] is not None:
-            payload['status'] = row['status']
-            payload['fingerprint'] = row['fingerprint']
-            payload['last_sync_at'] = row['last_sync_at']
-            payload['last_sync_key'] = row['last_sync_key']
-            raw = row['commit_sizes']
-            if raw is not None:
-                try:
-                    sizes = json.loads(raw)
-                except (ValueError, TypeError, RecursionError):
-                    sizes = None
-                if isinstance(sizes, dict):
-                    payload['sizes'] = sizes
-        return payload
+        with self._bind(tx):
+            row = self.get(run_id, tx)
+            if row is None:
+                return {}
+            payload = {}
+            if isinstance(row['owner_user'], str):
+                payload['owner'] = row['owner_user']
+            elif row['status'] is not None:
+                payload['owner'] = None
+            if isinstance(row['owner_key'], str):
+                payload['owner_key'] = row['owner_key']
+            if row['status'] is not None:
+                payload['status'] = row['status']
+                payload['fingerprint'] = row['fingerprint']
+                payload['last_sync_at'] = row['last_sync_at']
+                payload['last_sync_key'] = row['last_sync_key']
+                raw = row['commit_sizes']
+                if raw is not None:
+                    try:
+                        sizes = json.loads(raw)
+                    except (ValueError, TypeError, RecursionError):
+                        sizes = None
+                    if isinstance(sizes, dict):
+                        payload['sizes'] = sizes
+            return payload
 
     def normalized_remote(self, run_id, tx=None):
         """Shape of store.reader.read_remote, or None when the run has no row."""
         if tx is None:
-            with self.db.transaction() as tx:
+            with self._tx() as tx:
                 return self.normalized_remote(run_id, tx)
-        row = self.get(run_id, tx)
-        if row is None:
-            return None
-        owner = row['owner_user'] if isinstance(row['owner_user'], str) else None
-        attribution = {name: row[name] if isinstance(row[name], str) else None
-                       for name in ('owner_key', 'last_sync_key')}
-        if row['status'] is None:
-            return {'status': None, 'last_sync_at': None, 'owner': owner, **attribution}
-        last_sync_at = row['last_sync_at']
-        if isinstance(last_sync_at, str):
-            try:
-                layout.parse_timestamp(last_sync_at)
-            except (TypeError, ValueError, OverflowError):
+        with self._bind(tx):
+            row = self.get(run_id, tx)
+            if row is None:
+                return None
+            owner = row['owner_user'] if isinstance(row['owner_user'], str) else None
+            attribution = {name: row[name] if isinstance(row[name], str) else None
+                           for name in ('owner_key', 'last_sync_key')}
+            if row['status'] is None:
+                return {'status': None, 'last_sync_at': None, 'owner': owner, **attribution}
+            last_sync_at = row['last_sync_at']
+            if isinstance(last_sync_at, str):
+                try:
+                    layout.parse_timestamp(last_sync_at)
+                except (TypeError, ValueError, OverflowError):
+                    last_sync_at = None
+            else:
                 last_sync_at = None
-        else:
-            last_sync_at = None
-        return {'status': row['status'], 'last_sync_at': last_sync_at, 'owner': owner, **attribution}
+            return {'status': row['status'], 'last_sync_at': last_sync_at, 'owner': owner, **attribution}
 
     def attribution(self, run_id, tx=None):
         row = self.get(run_id, tx)
@@ -674,36 +755,39 @@ class RunRepo:
 
     @contextmanager
     def file_guard(self, run_id, path):
-        """Serialize a run-file mutation. SQLite: no-op; caller holds run_lock."""
+        """Caller holds run_lock; writes also take database transaction locks."""
         yield
 
     def insert(self, row, tx=None):
         if tx is None:
-            with self.db.transaction(write=True) as tx:
+            with self._tx(write=True) as tx:
                 return self.insert(row, tx)
-        values = self._values(row, tx)
-        tx.execute(
-            'INSERT INTO runs (workspace_id, run_id, project, created_at, owner_account_id, '
-            'owner_key, status, fingerprint, last_sync_at, last_sync_key, list_row, last_step, '
-            'launch_note, commit_sizes, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '
-            '?, ?, ?, ?)', (self.workspace_id, *values))
+        with self._bind(tx):
+            tx.lock_row('runs', 'workspace_id=? AND run_id=?', (self.workspace_id, row['run_id']))
+            values = self._values(row, tx)
+            tx.execute(
+                'INSERT INTO runs (workspace_id, run_id, project, created_at, owner_account_id, '
+                'owner_key, status, fingerprint, last_sync_at, last_sync_key, list_row, last_step, '
+                'launch_note, commit_sizes, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '
+                '?, ?, ?, ?) ON CONFLICT (workspace_id, run_id) DO NOTHING', (self.workspace_id, *values))
 
     def _values(self, row, tx):
         aid = AccountRepo(self.db).ensure_attribution(row.get('owner_user'), tx)
         return tuple(aid if name == 'owner_user' else row.get(name) for name in _RUN_COLUMNS)
 
     def _ensure(self, tx, run_id):
-        if tx.fetchone('SELECT 1 FROM runs WHERE workspace_id=? AND run_id=?', (self.workspace_id, run_id)) is None:
-            tx.execute(
-                'INSERT INTO runs (workspace_id, run_id, list_row, updated_at) VALUES (?, ?, ?, ?)',
-                (self.workspace_id, run_id, json.dumps({'run_id': run_id}), layout.format_timestamp()))
+        """Create a placeholder while the caller holds the runs row lock."""
+        tx.execute(
+            'INSERT INTO runs (workspace_id, run_id, list_row, updated_at) VALUES (?, ?, ?, ?) '
+            'ON CONFLICT (workspace_id, run_id) DO NOTHING',
+            (self.workspace_id, run_id, json.dumps({'run_id': run_id}), layout.format_timestamp()))
 
     def claim_meta(self, run_id, *, owner_user, owner_key, list_row, project, created_at,
                    launch_note, claim, recreate=False):
         """Insert or claim the run row before meta.json is written."""
         now = layout.format_timestamp()
         encoded = json.dumps(list_row)
-        with self.db.transaction(write=True) as tx:
+        with self._tx(write=True) as tx:
             tx.lock_row('runs', 'workspace_id=? AND run_id=?', (self.workspace_id, run_id))
             owner_user = AccountRepo(self.db).ensure_attribution(owner_user, tx)
             row = tx.fetchone('SELECT *, (SELECT login FROM accounts WHERE '
@@ -723,7 +807,7 @@ class RunRepo:
                         'last_sync_key=NULL, last_step=NULL, commit_sizes=NULL, updated_at=? '
                         'WHERE workspace_id=? AND run_id=?',
                         (project, created_at, encoded, launch_note, owner_key, now, self.workspace_id, run_id))
-                    tx.execute('DELETE FROM run_files WHERE workspace_id=? AND run_id=?', (self.workspace_id, run_id))
+                    self.replace_files(run_id, (), tx)
                 if claim and row['owner_user'] is None:
                     tx.execute(
                         'UPDATE runs SET owner_account_id=?, owner_key=?, project=?, '
@@ -736,11 +820,31 @@ class RunRepo:
                         'updated_at=? WHERE workspace_id=? AND run_id=?',
                         (project, created_at, encoded, launch_note, now, self.workspace_id, run_id))
 
-    def record_file(self, run_id, path, size, sha256=None, last_step=None):
+    def record_file(self, run_id, path, size, sha256=None, last_step=None,
+                    upload_bytes=None, upload_clock=None, *, expected_size=None,
+                    expected_sha256=None, publish=None):
         now = layout.format_timestamp()
-        with self.db.transaction(write=True) as tx:
+        self.db.confirm_session_locks()
+        with self._tx(write=True) as tx:
+            tx.lock_row('runs', 'workspace_id=? AND run_id=?', (self.workspace_id, run_id))
             tx.lock_row('run_files', 'workspace_id=? AND run_id=? AND path=?', (self.workspace_id, run_id, path))
             self._ensure(tx, run_id)
+            usage = UsageRepo(self.db, self.workspace_id, clock=upload_clock)
+            usage.lock(tx)
+            row = tx.fetchone(
+                'SELECT size, sha256 FROM run_files WHERE workspace_id=? AND run_id=? AND path=?',
+                (self.workspace_id, run_id, path))
+            old_size = 0 if row is None else row['size']
+            old_sha = None if row is None else row['sha256']
+            if expected_size is not None and old_size != expected_size:
+                raise DatabaseBusy('database is locked')
+            if expected_sha256 is not None and old_sha != expected_sha256:
+                raise DatabaseBusy('database is locked')
+            if publish is not None:
+                publish()
+            usage.add_stored(size - old_size, tx)
+            if upload_bytes is not None:
+                usage.add_upload(upload_bytes, tx)
             tx.execute(self.db.dialect.upsert(
                 'run_files', ('workspace_id', 'run_id', 'path', 'size', 'sha256'), ('workspace_id', 'run_id', 'path'),
                 ('size', 'sha256')), (self.workspace_id, run_id, path, size, sha256))
@@ -754,7 +858,7 @@ class RunRepo:
                     commit_sizes=None):
         now = layout.format_timestamp()
         encoded = json.dumps(commit_sizes) if commit_sizes is not None else None
-        with self.db.transaction(write=True) as tx:
+        with self._tx(write=True) as tx:
             tx.lock_row('runs', 'workspace_id=? AND run_id=?', (self.workspace_id, run_id))
             self._ensure(tx, run_id)
             if commit_sizes is not None:
@@ -770,7 +874,7 @@ class RunRepo:
 
     def set_owner(self, run_id, owner_user, owner_key):
         now = layout.format_timestamp()
-        with self.db.transaction(write=True) as tx:
+        with self._tx(write=True) as tx:
             tx.lock_row('runs', 'workspace_id=? AND run_id=?', (self.workspace_id, run_id))
             self._ensure(tx, run_id)
             owner_user = AccountRepo(self.db).ensure_attribution(owner_user, tx)
@@ -780,66 +884,77 @@ class RunRepo:
 
     def delete(self, run_id, tx=None):
         if tx is None:
-            with self.db.transaction(write=True) as tx:
+            with self._tx(write=True) as tx:
                 return self.delete(run_id, tx)
-        tx.execute('DELETE FROM runs WHERE workspace_id=? AND run_id=?', (self.workspace_id, run_id))
+        with self._bind(tx):
+            tx.lock_row('runs', 'workspace_id=? AND run_id=?', (self.workspace_id, run_id))
+            self.replace_files(run_id, (), tx)
+            tx.execute('DELETE FROM runs WHERE workspace_id=? AND run_id=?', (self.workspace_id, run_id))
 
     def replace_files(self, run_id, files, tx=None):
         """files: iterable of (path, size, sha256). Replaces all run_files rows."""
         if tx is None:
-            with self.db.transaction(write=True) as tx:
+            with self._tx(write=True) as tx:
                 return self.replace_files(run_id, files, tx)
-        tx.execute('DELETE FROM run_files WHERE workspace_id=? AND run_id=?', (self.workspace_id, run_id))
-        for path, size, sha256 in files:
-            tx.execute('INSERT INTO run_files (workspace_id, run_id, path, size, sha256) VALUES (?, ?, ?, ?, ?)',
-                       (self.workspace_id, run_id, path, size, sha256))
+        with self._bind(tx):
+            tx.lock_row('runs', 'workspace_id=? AND run_id=?', (self.workspace_id, run_id))
+            usage = UsageRepo(self.db, self.workspace_id)
+            usage.lock(tx)
+            old_size = sum(f['size'] for f in self.files(run_id, tx).values())
+            files = list(files)
+            usage.add_stored(sum(size for _, size, _ in files) - old_size, tx)
+            tx.execute('DELETE FROM run_files WHERE workspace_id=? AND run_id=?', (self.workspace_id, run_id))
+            for path, size, sha256 in files:
+                tx.execute('INSERT INTO run_files (workspace_id, run_id, path, size, sha256) VALUES (?, ?, ?, ?, ?)',
+                           (self.workspace_id, run_id, path, size, sha256))
 
     def upsert_adopted(self, row, files, tx=None):
         """Insert or replace an adopted/imported run and its files (import only)."""
         if tx is None:
-            with self.db.transaction(write=True) as tx:
+            with self._tx(write=True) as tx:
                 return self.upsert_adopted(row, files, tx)
-        existing = tx.fetchone('SELECT 1 FROM runs WHERE workspace_id=? AND run_id=?', (self.workspace_id, row['run_id']))
-        if existing:
-            tx.execute(
-                'UPDATE runs SET project=?, created_at=?, owner_account_id=?, owner_key=?, '
-                'status=?, fingerprint=?, last_sync_at=?, last_sync_key=?, list_row=?, '
-                'last_step=?, launch_note=?, commit_sizes=?, updated_at=? WHERE workspace_id=? '
-                'AND run_id=?',
-                (row.get('project'), row.get('created_at'), AccountRepo(self.db).ensure_attribution(row.get('owner_user'), tx), row.get('owner_key'), row.get('status'), row.get('fingerprint'), row.get('last_sync_at'), row.get('last_sync_key'), row['list_row'], row.get('last_step'), row.get('launch_note'), row.get('commit_sizes'), row['updated_at'], self.workspace_id, row['run_id']))
-        else:
-            self.insert(row, tx)
-        self.replace_files(row['run_id'], files, tx)
+        with self._bind(tx):
+            tx.lock_row('runs', 'workspace_id=? AND run_id=?', (self.workspace_id, row['run_id']))
+            existing = tx.fetchone('SELECT 1 FROM runs WHERE workspace_id=? AND run_id=?', (self.workspace_id, row['run_id']))
+            if existing:
+                tx.execute(
+                    'UPDATE runs SET project=?, created_at=?, owner_account_id=?, owner_key=?, '
+                    'status=?, fingerprint=?, last_sync_at=?, last_sync_key=?, list_row=?, '
+                    'last_step=?, launch_note=?, commit_sizes=?, updated_at=? WHERE workspace_id=? '
+                    'AND run_id=?',
+                    (row.get('project'), row.get('created_at'), AccountRepo(self.db).ensure_attribution(row.get('owner_user'), tx), row.get('owner_key'), row.get('status'), row.get('fingerprint'), row.get('last_sync_at'), row.get('last_sync_key'), row['list_row'], row.get('last_step'), row.get('launch_note'), row.get('commit_sizes'), row['updated_at'], self.workspace_id, row['run_id']))
+            else:
+                self.insert(row, tx)
+            self.replace_files(row['run_id'], files, tx)
 
     def insert_adopted(self, row, files, tx=None):
         """Insert a reconcile-adopted run only when the row is still absent."""
         if tx is None:
-            with self.db.transaction(write=True) as tx:
+            with self._tx(write=True) as tx:
                 return self.insert_adopted(row, files, tx)
-        if tx.fetchone('SELECT 1 FROM runs WHERE workspace_id=? AND run_id=?', (self.workspace_id, row['run_id'])):
-            return False
-        result = tx.execute(
-            self.db.dialect.upsert('runs', ('workspace_id',) + _RUN_DB_COLUMNS, ('workspace_id', 'run_id'), ()),
-            (self.workspace_id, *self._values(row, tx)))
-        if result.rowcount == 0:
-            return False
-        for path, size, sha256 in files:
-            tx.execute(
-                self.db.dialect.upsert(
-                    'run_files', ('workspace_id', 'run_id', 'path', 'size', 'sha256'), ('workspace_id', 'run_id', 'path'), ()),
-                (self.workspace_id, row['run_id'], path, size, sha256))
-        return True
+        with self._bind(tx):
+            tx.lock_row('runs', 'workspace_id=? AND run_id=?', (self.workspace_id, row['run_id']))
+            if tx.fetchone('SELECT 1 FROM runs WHERE workspace_id=? AND run_id=?', (self.workspace_id, row['run_id'])):
+                return False
+            result = tx.execute(
+                self.db.dialect.upsert('runs', ('workspace_id',) + _RUN_DB_COLUMNS, ('workspace_id', 'run_id'), ()),
+                (self.workspace_id, *self._values(row, tx)))
+            if result.rowcount == 0:
+                return False
+            self.replace_files(row['run_id'], files, tx)
+            return True
 
     def rebuild_index(self, run_id, list_row, project, created_at, launch_note, last_step, tx=None):
         if tx is None:
-            with self.db.transaction(write=True) as tx:
+            with self._tx(write=True) as tx:
                 return self.rebuild_index(
                     run_id, list_row, project, created_at, launch_note, last_step, tx)
-        now = layout.format_timestamp()
-        tx.execute(
-            'UPDATE runs SET list_row=?, project=?, created_at=?, launch_note=?, last_step=?, '
-            'updated_at=? WHERE workspace_id=? AND run_id=?',
-            (json.dumps(list_row), project, created_at, launch_note, last_step, now, self.workspace_id, run_id))
+        with self._bind(tx):
+            now = layout.format_timestamp()
+            tx.execute(
+                'UPDATE runs SET list_row=?, project=?, created_at=?, launch_note=?, last_step=?, '
+                'updated_at=? WHERE workspace_id=? AND run_id=?',
+                (json.dumps(list_row), project, created_at, launch_note, last_step, now, self.workspace_id, run_id))
 
     def dashboard_list(self):
         """One ``/api/runs`` row per indexed run. No file access."""
@@ -879,7 +994,7 @@ class RunRepo:
         return _effective_status_from_run(run, list_row, time.time(), _remote_status)
 
 
-class NoteRepo:
+class NoteRepo(WorkspaceBound):
     def __init__(self, db, workspace_id):
         self.db = db
         self.workspace_id = require_workspace_id(workspace_id)
@@ -906,7 +1021,7 @@ class NoteRepo:
         return note_store._empty()
 
     def read(self, run_id):
-        with self.db.transaction() as tx:
+        with self._tx() as tx:
             run = tx.fetchone('SELECT *, (SELECT login FROM accounts WHERE '
                               'id=runs.owner_account_id) AS owner_user FROM runs WHERE '
                               'workspace_id=? AND run_id=?', (self.workspace_id, run_id))
@@ -925,7 +1040,7 @@ class NoteRepo:
         if len(data) > note_store.MAX_NOTE_BYTES:
             raise note_store.NoteTooLarge(f'note exceeds {note_store.MAX_NOTE_BYTES} bytes')
         now = layout.format_timestamp()
-        with self.db.transaction(write=True) as tx:
+        with self._tx(write=True) as tx:
             tx.lock_row('run_notes', 'workspace_id=? AND run_id=?', (self.workspace_id, run_id))
             run = tx.fetchone('SELECT *, (SELECT login FROM accounts WHERE '
                               'id=runs.owner_account_id) AS owner_user FROM runs WHERE '
@@ -952,18 +1067,19 @@ class NoteRepo:
 
     def upsert(self, run_id, body, updated_at, tx=None):
         if tx is None:
-            with self.db.transaction(write=True) as tx:
+            with self._tx(write=True) as tx:
                 return self.upsert(run_id, body, updated_at, tx)
-        tx.execute(self.db.dialect.upsert(
-            'run_notes', ('workspace_id', 'run_id', 'body', 'updated_at'), ('workspace_id', 'run_id'),
-            ('body', 'updated_at')), (self.workspace_id, run_id, body, updated_at))
+        with self._bind(tx):
+            tx.execute(self.db.dialect.upsert(
+                'run_notes', ('workspace_id', 'run_id', 'body', 'updated_at'), ('workspace_id', 'run_id'),
+                ('body', 'updated_at')), (self.workspace_id, run_id, body, updated_at))
 
     def list_notes(self, project=None, limit_bytes=4 * 1024 * 1024):
         from agenticml.store.reader import _remote_status
         from agenticml.ui.server import _text
 
         now = datetime.now(timezone.utc).timestamp()
-        with self.db.transaction() as tx:
+        with self._tx() as tx:
             runs = list(tx.fetchall('SELECT *, (SELECT login FROM accounts WHERE '
                                     'id=runs.owner_account_id) AS owner_user FROM runs WHERE '
                                     'workspace_id=?', (self.workspace_id,)))

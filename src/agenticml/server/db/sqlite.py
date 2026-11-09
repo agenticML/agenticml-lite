@@ -68,6 +68,7 @@ class Tx:
     def __init__(self, connection, dialect):
         self.connection = connection
         self.dialect = dialect
+        self.bound = None
 
     def execute(self, sql, params=()):
         return self.connection.execute(self.dialect.placeholders(sql), params)
@@ -83,6 +84,41 @@ class Tx:
 
     def advisory_lock(self, name):
         return self.dialect.advisory_lock(self, name)
+
+    def _set_binding(self, value):
+        if self.dialect.name != 'sqlite':
+            self.execute("SELECT set_config('app.workspace_id', ?, true)",
+                         ('' if value is None else value,))
+        self.bound = value
+
+    def bind_workspace(self, wid):
+        self._set_binding(wid)
+
+    def cross_workspace(self, reason):
+        if not isinstance(reason, str) or not reason:
+            raise ValueError('cross-workspace reason is required')
+        self._set_binding('*')
+
+    @contextmanager
+    def cross_scope(self, reason):
+        """Set ``'*'`` for the block, then restore the previous binding.
+
+        Use this when a caller-supplied transaction needs a brief
+        cross-workspace query and then more work in the original scope.
+        Transactions opened solely for cross-workspace work can keep
+        ``cross_workspace``.
+        """
+        previous = self.bound
+        self.cross_workspace(reason)
+        try:
+            yield
+        except BaseException:
+            # An aborted Postgres transaction cannot run set_config; doing so
+            # would raise InFailedSqlTransaction and hide lock/deadlock errors.
+            self.bound = previous
+            raise
+        else:
+            self._set_binding(previous)
 
 
 class SqliteDatabase:
@@ -189,6 +225,9 @@ class SqliteDatabase:
                             pass
                     else:
                         self._idle.append(connection)
+
+    def confirm_session_locks(self):
+        return
 
     def close(self):
         with self._lock:

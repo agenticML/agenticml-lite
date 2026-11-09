@@ -1,4 +1,5 @@
 """18.1a storage migration, scoped repositories, sync boundaries and operator CLI."""
+from server_db_helpers import isolate_server_dir, database_url
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 import hashlib
@@ -53,6 +54,21 @@ def test_scoped_repositories_require_workspace(tmp_path):
         with pytest.raises(ValueError, match='workspace id'):
             repo(*args, '')
     db.close()
+
+
+def test_sync_touches_non_default_workspace_key(two):
+    """A sync request must update last_used_at even when the key is not in the default workspace.
+
+    Ingest uses the process-wide KeyStore (bound to default). On Postgres, RLS
+    hides other workspaces unless touch binds ``record.workspace_id``.
+    """
+    server, _, b, _, keys_b, _, kb = two
+    assert b['slug'] != 'default'
+    assert keys_b.verify(kb).last_used_at is None
+    assert request(server, '/v2/whoami', key=kb)[0] == 200
+    used = keys_b.verify(kb).last_used_at
+    assert used is not None
+    layout.parse_timestamp(used)
 
 
 def test_key_digest_is_global_name_and_revocation_are_scoped(two):
@@ -112,8 +128,12 @@ def test_sync_state_append_commit_objects_and_same_id_stay_separate(two):
         assert note.read('same')['text'] == owner
         assert {r['owner'] for r in index.dashboard_list()} == {owner}
     assert server.run_index.ids() == set()
-    assert server.run_lock('same', workspace_id=a['id']) is not server.run_lock('same', workspace_id=b['id'])
-    assert server.object_lock(sha, workspace_id=a['id']) is not server.object_lock(sha, workspace_id=b['id'])
+    run_a, run_b = (server.run_lock('same', workspace_id=ws['id']) for ws in (a, b))
+    object_a, object_b = (server.object_lock(sha, workspace_id=ws['id']) for ws in (a, b))
+    assert (getattr(run_a, '_lock', run_a), getattr(run_a, '_key', None)) != (
+        getattr(run_b, '_lock', run_b), getattr(run_b, '_key', None))
+    assert (getattr(object_a, '_lock', object_a), getattr(object_a, '_key', None)) != (
+        getattr(object_b, '_lock', object_b), getattr(object_b, '_key', None))
 
 
 def test_lineage_receive_and_state_are_scoped(two, tmp_path):
@@ -188,6 +208,7 @@ def test_env_key_default_admin_never_server_admin_and_no_default(tmp_path, caplo
         assert request(server, '/v2/whoami', key=env)[1]['workspace'] == 'default'
     db = for_server_dir(tmp_path / 'server')
     with db.transaction(write=True) as tx:
+        tx.cross_workspace('test delete default workspace')
         tx.execute("DELETE FROM workspaces WHERE slug='default'")
     db.close()
     with running(tmp_path, env) as server:
@@ -252,10 +273,11 @@ def test_package17_migration_preserves_every_row_and_moves_store(tmp_path, monke
     migrations.mkdir()
     real = migrate.MIGRATIONS
     for path in real.glob('*.sql'):
-        shutil.copyfile(path, migrations / path.name)
+        if int(path.name[:4]) <= 2:
+            shutil.copyfile(path, migrations / path.name)
     with monkeypatch.context() as patch:
         patch.setattr(migrate, 'MIGRATIONS', migrations)
-        db = connect('sqlite:///' + str(data / 'server/agenticml.db'))
+        db = connect(database_url(data / 'server/agenticml.db'))
     old_ids = {'zoe': 'a' * 32, 'anna': 'b' * 32, 'early': 'c' * 32, 'member': 'd' * 32, 'viewer': 'e' * 32}
     secret = 'aml_legacy' + 'x' * 32
     digest = hashlib.sha256(secret.encode()).hexdigest()
@@ -304,6 +326,8 @@ def test_package17_migration_preserves_every_row_and_moves_store(tmp_path, monke
         assert server.run_index.committed_size('old-run', 'meta.json') == 46
         assert server.note_index.read('old-run')['text'] == 'legacy note'
         assert server.audit.repo.tail(1)[0]['actor'] == 'anna'
+        server.audit.repo.insert({'ts': layout.format_timestamp(), 'actor': 'anna', 'action': 'after.migration'})
+        assert server.audit.repo.tail(1)[0]['action'] == 'after.migration'
         from agenticml.server.db.repos import SessionRepo
         assert SessionRepo(server.db).get('s' * 64)['workspace_id'] == default['id']
         assert SessionRepo(server.db).get('p' * 64)['workspace_id'] is None
@@ -502,6 +526,7 @@ def test_cross_workspace_credentials_refused_except_operator_cli(tmp_path, monke
         token = secrets.token_urlsafe(32)
         digest = hashlib.sha256(token.encode('ascii')).hexdigest()
         with server.db.transaction(write=True) as tx:
+            tx.bind_workspace(server.users.workspace_id)
             tx.execute(
                 'INSERT INTO invites (workspace_id, login, role, sha256, expires_at, invited_by) '
                 'VALUES (?, ?, ?, ?, ?, ?)',
@@ -724,7 +749,7 @@ def test_convert_store_exdev_and_skips_flag_without_default(tmp_path, monkeypatc
     data = tmp_path / 'data'
     prepare_data_dir(data)
     write_run(data / 'store', 'run-1', 'alice')
-    db = connect('sqlite:///' + str((data / 'server' / 'agenticml.db').resolve()))
+    db = connect(database_url((data / 'server' / 'agenticml.db').resolve()))
 
     def boom(src, dst):
         raise OSError(errno.EXDEV, 'Invalid cross-device link')
@@ -734,13 +759,14 @@ def test_convert_store_exdev_and_skips_flag_without_default(tmp_path, monkeypatc
         with pytest.raises(DatabaseError, match='server/tmp and workspaces must be on the same filesystem'):
             convert_store(db, data)
     with db.transaction(write=True) as tx:
+        tx.cross_workspace('test delete workspaces')
         tx.execute('DELETE FROM workspaces')
     convert_store(db, data)
     assert SettingsRepo(db).get('workspace_store_converted') is None
     db.close()
 
 
-def test_legacy_run_owner_not_attached_without_reclaim_runs(two, tmp_path, capsys):
+def test_legacy_run_owner_not_attached_without_reclaim_runs(two, tmp_path, capsys, monkeypatch):
     from agenticml.server.keys import ClientError
 
     server, a, b, _, _, _, _ = two
@@ -763,6 +789,7 @@ def test_legacy_run_owner_not_attached_without_reclaim_runs(two, tmp_path, capsy
     users_a.add('ghost')
     assert users_a.get('ghost').id == aid
     data = tmp_path / 'other'
+    isolate_server_dir(data / "server", monkeypatch)
     with running(data) as other:
         other.users.add('alice', 'admin')
         with other.db.transaction(write=True) as tx:
@@ -782,11 +809,8 @@ def test_legacy_run_owner_not_attached_without_reclaim_runs(two, tmp_path, capsy
 
 
 def test_stale_22_password_session_invalid_after_0003(tmp_path, monkeypatch):
-    import re
-    import sqlite3
     import time
 
-    from agenticml.server.db.dialect import SqliteDialect
     from agenticml.server.db.migrate import MIGRATIONS
     from agenticml.server.users import _password_record
     from test_server_signin import PASSWORD
@@ -795,37 +819,32 @@ def test_stale_22_password_session_invalid_after_0003(tmp_path, monkeypatch):
     monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
     data = tmp_path / 'data'
     prepare_data_dir(data)
-    db_path = data / 'server' / 'agenticml.db'
-    dialect = SqliteDialect()
-    conn = sqlite3.connect(db_path)
-    conn.execute('CREATE TABLE schema_migrations '
-                 '(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)')
-    for path in sorted(p for p in MIGRATIONS.glob('[0-9][0-9][0-9][0-9]_*')
-                       if p.suffix in ('.sql', '.py') and int(p.name[:4]) <= 2):
-        sql = dialect.migration(path.read_text()) if path.suffix == '.sql' else None
-        if sql:
-            for statement in re.split(r';\s*(?:\n|$)', sql):
-                if statement.strip():
-                    conn.execute(statement)
-        conn.execute('INSERT INTO schema_migrations VALUES (?, ?, ?)',
-                     (int(path.name[:4]), path.stem[5:], layout.format_timestamp()))
-    aid = 'ab' * 16
-    conn.execute(
-        'INSERT INTO users (id, name, role, identity, identity_folded, password, '
-        'invite_sha256, invite_expires_at, generation, created_at, created_by) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        (aid, 'alice', 'admin', None, None, json.dumps(_password_record(PASSWORD)),
-         None, None, 1, layout.format_timestamp(), 'cli'))
-    token = 'stale-session-token-value'
-    digest = hashlib.sha256(token.encode('ascii')).hexdigest()
-    now = time.time()
-    conn.execute(
-        'INSERT INTO sessions (token_sha256, user_name, user_id, generation, via, '
-        'key_name, key_sha256, created, last_seen, created_order) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        (digest, 'alice', aid, 0, 'password', None, None, now, now, 1))
-    conn.commit()
-    conn.close()
+    from agenticml.server.db import migrate
+    old = tmp_path / 'old-migrations'
+    old.mkdir()
+    for path in MIGRATIONS.glob('*.sql'):
+        if int(path.name[:4]) <= 2:
+            shutil.copyfile(path, old / path.name)
+    with monkeypatch.context() as patch:
+        patch.setattr(migrate, 'MIGRATIONS', old)
+        db = connect(database_url(data / 'server' / 'agenticml.db'))
+    with db.transaction(write=True) as conn:
+        aid = 'ab' * 16
+        conn.execute(
+            'INSERT INTO users (id, name, role, identity, identity_folded, password, '
+            'invite_sha256, invite_expires_at, generation, created_at, created_by) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (aid, 'alice', 'admin', None, None, json.dumps(_password_record(PASSWORD)),
+             None, None, 1, layout.format_timestamp(), 'cli'))
+        token = 'stale-session-token-value'
+        digest = hashlib.sha256(token.encode('ascii')).hexdigest()
+        now = time.time()
+        conn.execute(
+            'INSERT INTO sessions (token_sha256, user_name, user_id, generation, via, '
+            'key_name, key_sha256, created, last_seen, created_order) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (digest, 'alice', aid, 0, 'password', None, None, now, now, 1))
+    db.close()
     with running(data) as server:
         assert AccountRepo(server.db).get('alice')['generation'] == 1
         status, _, _, _ = authed(server, '/api/w/default/runs', cookie=f'aml_session={token}')

@@ -71,6 +71,7 @@ def test_status_warns_on_unimported_2x_without_database(tmp_path):
     write_v1_keys(data / "server" / "keys.json", ["old"])
     report = admin.status(data)
     assert any("2.x" in warning and "keys.json" in warning for warning in report["warnings"])
+    assert (data / "server" / "keys.json").exists()
     assert not (data / "server" / "agenticml.db").exists()
 
 
@@ -424,6 +425,7 @@ def test_environment_owner_is_not_revoked(store, capsys, monkeypatch):
 
 
 @pytest.mark.parametrize('damage', ['corrupt','invalid_records','symlink','broken_symlink'])
+@pytest.mark.sqlite_only
 def test_status_warns_if_keys_cannot_be_loaded(store, capsys, tmp_path, damage):
     from agenticml.server.db import DatabaseError
     data, _ = store

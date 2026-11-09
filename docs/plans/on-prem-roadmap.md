@@ -186,7 +186,8 @@ for machines.
 Approved by the owner on Nov 7, 2026: the [3.0 plan](on-prem-3.0-plan.md)
 and decisions D1–D9. Each package plan is written before its package
 starts. Order:
-16 → 17 → 18, then 18b and 21 in parallel, then 18c → 19 → 20; 22 and 23
+16 → 17 → 18, then 18b and 21 in parallel, then 18c → 19 → 20 (19.1,
+the Postgres backend, runs beside 18b; 19.2 needs 18c's tables); 22 and 23
 after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
@@ -197,10 +198,19 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 18.1a | Server core: accounts, workspaces, memberships, migration, `default` conversion, workspace-bound sync, CLI | 17 | Codex, Cursor | L | [plan](packages/18-workspaces.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
 | 18.1b | Route table, `/w/<slug>` and `/api/w/<slug>` routes, account and server-admin APIs, isolation suite | 18.1a | Cursor | L | [plan](packages/18-workspaces.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
 | 18.2 | Dashboard: workspace URLs, switcher, Team and Keys per workspace, admin page, picker | 18.1b | Cursor | M | [plan](packages/18-workspaces.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
-| 18b † | Firebase sign-in for the hosted service | 18 | Cursor | M | – | not started |
-| 18c † | Self-serve sign-up and usage limits (free plan: storage, uploads, requests, people) | 18b | Codex | M | – | not started |
-| 19 † | Postgres backend, row-level security, CI on both backends | 18 | Cursor | M | – | not started |
-| 20 † | Many server processes: database locks, shared throttle and sessions | 19 | Cursor | M | – | not started |
+| 18b † | Firebase sign-in for the hosted service | 18 | Cursor | M | [plan](packages/18b-firebase-sign-in.md) | done (3.0 PR; real sign-in in Backlog) |
+| 18b.1 | Token verification, account linking, `/auth/firebase`, invites, CLI, extras | 18 | Cursor | M | [plan](packages/18b-firebase-sign-in.md) | done (3.0 PR) |
+| 18b.2 | Sign-in page with the vendored Firebase SDK, per-page CSP, UI tests | 18b.1 | Cursor | S | [plan](packages/18b-firebase-sign-in.md) | done (3.0 PR) |
+| 18c † | Self-serve sign-up and usage limits (free plan: storage, uploads, requests, people) | 18b | Codex, Cursor | M | [plan](packages/18c-signup-and-limits.md) | done (3.0 PR) |
+| 18c.1 | Limits core: usage counters, limits file, storage/upload/request/people checks, CLI | 18b | Codex, Cursor | M | [plan](packages/18c-signup-and-limits.md) | done (3.0 PR) |
+| 18c.2 | Sign-up with a personal workspace, new workspace, free-workspace limit | 18c.1 | Cursor | S | [plan](packages/18c-signup-and-limits.md) | done (3.0 PR) |
+| 18c.3 | Usage page and banner, admin plan edit, `sync --follow` retry | 18c.2 | Cursor | S | [plan](packages/18c-signup-and-limits.md) | done (3.0 PR) |
+| 19 † | Postgres backend, row-level security, CI on both backends | 18 | Codex, Cursor | M | [plan](packages/19-postgres.md) | done (3.0 PR) |
+| 19.1 | Postgres backend, dialect, portability audit, test harness, CI job | 18 | Codex, Cursor | M | [plan](packages/19-postgres.md) | done (3.0 PR) |
+| 19.2 | Row-level security policies and per-transaction workspace binding | 19.1, 18c | Cursor | S–M | [plan](packages/19-postgres.md) | done (3.0 PR) |
+| 20 † | Many server processes: database locks, shared throttle and sessions | 19 | Codex, Cursor | M | [plan](packages/20-many-processes.md) | done (3.0 PR) |
+| 20.1 | Cross-process session locks, process start, database clock, reader freshness, write fencing (compare-and-swap, lock checks) | 19 | Codex, Cursor | M | [plan](packages/20-many-processes.md) | done (3.0 PR) |
+| 20.2 | Two-process end-to-end test with a kill mid-upload | 20.1 | Codex, Cursor | S | [plan](packages/20-many-processes.md) | done (3.0 PR) |
 | 21 | S3 object backend | 18 | Codex | M | – | not started |
 | 22 | Metric summaries; sort and filter runs by metric | 17, 18 | Cursor | M | – | not started |
 | 23 | Operator commands: end-to-end 2.x conversion test (the import itself landed in 16–18), `server backup`, `status`/`verify` on the database | 18 | Codex | S–M | – | not started |
@@ -269,6 +279,67 @@ Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
+- **Many-process follow-ups for package 24** (package 20 reviews, Nov 9,
+  2026).
+  - Where: `src/agenticml/server/db/postgres.py` (session locks),
+    `store/reader.py`, `server/routes.py` usage views.
+  - Problem: every session lock opens a fresh Postgres connection (slow on
+    TLS/RDS; pins connections under RDS Proxy or pgbouncer); dashboard reads
+    query the committed size per file call; the usage page computes "today"
+    from the process clock while enforcement uses the database clock; a
+    process paused longer than the keepalive window while holding a lock
+    can still write after losing it (checks narrow this to the time
+    between two checks; see the package 20 plan).
+  - Fix: pool lock connections; cache committed sizes per read; use the
+    database clock in the usage views; record the paused-process residual
+    in the package 25 threat model and measure the rest in package 24.
+  - Done when: package 24's benchmark shows acceptable lock latency and the
+    threat model names the residual.
+- **Admin plan edits: concurrent merge and free→custom defaults** (package
+  18c.3 review, Nov 9, 2026).
+  - Where: `src/agenticml/server/routes.py` admin PATCH; `ui/static/app.js`
+    `editPlan`.
+  - Problem: the custom-limits merge reads outside the `set_plan`
+    transaction (two admins can overwrite each other's partial edits), and
+    switching free → custom opens empty fields (unlimited) instead of the
+    free limits.
+  - Fix: read and write in one transaction; prefill the free limits.
+  - Done when: both have tests.
+- **Remaining package 19.1 second-review notes** (Nov 9, 2026; the
+  password, test-isolation, connect-timeout and exception-chain items were
+  fixed in the 3.0 PR).
+  - Where: `src/agenticml/server/db/__init__.py`, `db/postgres.py`.
+  - Problem: the registry lock is held across Postgres network I/O; advisory
+    lock keys are database-wide (parallel test schemas share them); total
+    connections are not capped (only idle ones).
+  - Fix: open outside the registry lock; consider salting keys per schema
+    and a connection cap. Revisit in package 20.
+  - Done when: each has a test or a recorded decision.
+- **Check Firebase sign-in against the real Firebase project** (package 18b
+  caveat, Nov 8, 2026).
+  - Where: `src/agenticml/server/firebase.py`, `static/firebase-login.js`,
+    the vendored SDK in `static/vendor/firebase/`.
+  - Problem: tests sign tokens locally and replace the Firebase SDK with a
+    fake in the browser, so Google's real certificates, the real SDK
+    (popup, redirect through `apis.google.com`, email verification) and the
+    sign-in page's CSP were never exercised end to end.
+  - Fix: on a test server with `--firebase-project` (agenticml-server's
+    project), the web API key and the server's host added to the project's
+    authorized domains, sign in once with Google and once with email and
+    password, accept one invite, and watch the browser console for CSP
+    violations.
+  - Done when: those steps pass, or each mismatch is fixed with a test.
+- **Firebase sign-in page test gaps** (package 18b.2 second review, Nov 8,
+  2026).
+  - Where: `testbed/tests/test_server_firebase_dashboard.py`.
+  - Problem: the UI tests do not assert sign-out on terminal failures,
+    in-memory persistence, button disabling while a request is in flight,
+    the mapped Firebase error texts, that nothing is written to
+    `localStorage`/`sessionStorage`, or the account dialog with and without
+    Firebase.
+  - Fix: add those assertions with the fake `firebase` global (delayed
+    promises, injected failures, storage inspection).
+  - Done when: each behaviour has a failing-then-passing UI test.
 - **Sync client trusts its own cursor after a failed atomic upload** (package 17
   second review, Nov 8, 2026).
   - Where: `src/agenticml/sync.py` (atomic-file skip, around line 923).

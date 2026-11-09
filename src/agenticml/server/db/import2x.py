@@ -1,4 +1,5 @@
 """Import legacy state exactly once, then retire the old files."""
+from contextlib import nullcontext
 import logging
 import os
 from pathlib import Path
@@ -22,13 +23,16 @@ def _exists(path):
 
 
 def import_state(db, server_dir, *, actor='server'):
-    directory = Path(server_dir)
-    settings = SettingsRepo(db)
-    if settings.get('imported_2x') is None:
-        _import_users_keys(db, directory, actor=actor)
-    from ..workspaces import convert_store
-    convert_store(db, directory.parent)
-    _import_runs(db, directory)
+    # The transaction import lock protects rows, but legacy file preparation
+    # and retirement also need serialization when multiple processes start.
+    with db.session_lock('import:2x', timeout=600) if db.dialect.name == 'postgres' else nullcontext():
+        directory = Path(server_dir)
+        settings = SettingsRepo(db)
+        if settings.get('imported_2x') is None:
+            _import_users_keys(db, directory, actor=actor)
+        from ..workspaces import convert_store
+        convert_store(db, directory.parent)
+        _import_runs(db, directory)
 
 
 def _import_users_keys(db, directory, *, actor='server'):

@@ -23,7 +23,7 @@ from agenticml.server.keys import KeyStore
 from agenticml import sync
 
 from test_client import fake_http
-from test_sync import command, identical, push, running, state, writer_at
+from test_sync import _json_http_error, command, identical, push, running, state, writer_at
 from server_db_helpers import default_workspace_id
 
 
@@ -631,6 +631,16 @@ def _count_emits(monkeypatch):
     return seen
 
 
+def _count_attempts(monkeypatch):
+    seen = []
+
+    def done(run_id):
+        seen.append(run_id)
+
+    monkeypatch.setattr(sync, "_follow_attempt_done", done)
+    return seen
+
+
 def _failure_clock(monkeypatch, start=0.0):
     now = {"t": start}
     real = sync._FailureLog
@@ -795,6 +805,257 @@ def test_follow_failure_same_status_different_counts_prints_once(
     finally:
         stop_follow(follow_ctx)
         join_follow(thread, box, follow_ctx)
+
+
+_STORAGE_LIMIT = "storage limit reached: 4.9 GB of 5.0 GB used; delete runs or ask for more"
+_DAILY_LIMIT = "daily upload limit reached: 2.0 GB of 2.0 GB today; resets at 00:00 UTC (in 3 h 12 min)"
+_QUOTA_WHOAMI = json.dumps({
+    "protocol": 2, "key": "box", "scope": "sync", "user": "admin",
+    "role": "owner", "workspace": "default", "features": [],
+}).encode()
+
+
+def _quota_clock(monkeypatch, start=0.0):
+    now = {"t": start}
+    monkeypatch.setattr(sync, "_clock", lambda: now["t"])
+    return now
+
+
+def _quota_handler(message):
+    body = json.dumps({"error": message}).encode()
+
+    def handler(request):
+        path = request.path.split("?", 1)[0]
+        if path == "/v2/whoami":
+            request._send(200, _QUOTA_WHOAMI, {"Content-Type": "application/json"})
+        else:
+            request._send(403, body, {"Content-Type": "application/json"})
+
+    return handler
+
+
+def _varying_quota_handler(kind):
+    n = {"i": 0}
+
+    def handler(request):
+        path = request.path.split("?", 1)[0]
+        if path == "/v2/whoami":
+            request._send(200, _QUOTA_WHOAMI, {"Content-Type": "application/json"})
+            return
+        n["i"] += 1
+        if kind == "daily":
+            message = (
+                "daily upload limit reached: 2.0 GB of 2.0 GB today; "
+                "resets at 00:00 UTC (in %d h %d min)" % (n["i"], n["i"] * 3)
+            )
+        else:
+            message = (
+                "storage limit reached: %.1f GB of 5.0 GB used; delete runs or ask for more"
+                % (4.0 + n["i"] * 0.1)
+            )
+        request._send(403, json.dumps({"error": message}).encode(),
+                      {"Content-Type": "application/json"})
+
+    return handler
+
+
+def _quota_follow_setup(tmp_path, monkeypatch):
+    for name in ("AGENTICML_HOST", "AGENTICML_API_KEY", "AGENTICML_SERVER_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AGENTICML_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setattr(sync, "BACKOFF_MAX", 0.08)
+    data = tmp_path / "data"
+    prepare_data_dir(data)
+    _, key = KeyStore(data / "server", workspace_id=default_workspace_id(data / "server")).create("box", scope="sync")
+    return data, key
+
+
+@pytest.mark.parametrize("message", [_STORAGE_LIMIT, _DAILY_LIMIT])
+def test_follow_quota_limit_retries_after_interval(tmp_path, monkeypatch, follow_ctx, message):
+    data, key = _quota_follow_setup(tmp_path, monkeypatch)
+    clock = _quota_clock(monkeypatch)
+    writer = writer_at(tmp_path)
+    printed = capture_prints(monkeypatch)
+    attempts = _count_attempts(monkeypatch)
+
+    with fake_http(_quota_handler(message)) as (httpd, url):
+        port = httpd.server_address[1]
+        remote = (None, SimpleNamespace(base_url=url, api_key=key))
+        thread, box = spawn(lambda: command(remote, writer, writer.run_id, "--follow", "--interval", "0.03"))
+        wait_until(lambda: attempts.count(writer.run_id) >= 1, thread, box, follow_ctx,
+                   msg="quota 403 was not reported")
+        time.sleep(0.1)
+        assert attempts.count(writer.run_id) == 1
+        lines = _failure_lines(printed, writer.run_id)
+        assert len(lines) == 1
+        assert message in lines[0]
+        assert " (still failing)" not in lines[0]
+        clock["t"] = sync.LIMIT_RETRY
+        wait_until(lambda: attempts.count(writer.run_id) >= 2, thread, box, follow_ctx,
+                   msg="quota 403 was not retried after LIMIT_RETRY")
+        assert len(_failure_lines(printed, writer.run_id)) == 1
+        httpd.shutdown()
+    server = make_server(data, port=port)
+    serve = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
+    serve.start()
+    try:
+        clock["t"] = sync.LIMIT_RETRY * 2
+        code = join_follow(thread, box, follow_ctx, timeout=5)
+        assert code == 0
+        identical((server, SimpleNamespace(base_url=url, api_key=key)), writer)
+        fail_lines = _failure_lines(printed, writer.run_id)
+        assert len(fail_lines) == 1
+        assert message in fail_lines[0]
+        success_lines = [ln for ln in "".join(printed["out"]).splitlines()
+                         if writer.run_id in ln and "failed:" not in ln]
+        assert len(success_lines) == 1
+        assert key not in "".join(printed["out"]) + "".join(printed["err"])
+    finally:
+        server.shutdown()
+        serve.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("kind", ["storage", "daily"])
+def test_follow_quota_limit_changing_message_prints_once(tmp_path, monkeypatch, follow_ctx, kind):
+    _data, key = _quota_follow_setup(tmp_path, monkeypatch)
+    clock = _quota_clock(monkeypatch)
+    fail_clock = _failure_clock(monkeypatch)
+    writer = writer_at(tmp_path)
+    printed = capture_prints(monkeypatch)
+    attempts = _count_attempts(monkeypatch)
+
+    with fake_http(_varying_quota_handler(kind)) as (_httpd, url):
+        remote = (None, SimpleNamespace(base_url=url, api_key=key))
+        thread, box = spawn(lambda: command(remote, writer, writer.run_id, "--follow", "--interval", "0.03"))
+        try:
+            wait_until(lambda: attempts.count(writer.run_id) >= 1, thread, box, follow_ctx,
+                       msg="quota 403 was not reported")
+            time.sleep(0.1)
+            first = _failure_lines(printed, writer.run_id)
+            assert len(first) == 1
+            assert " (still failing)" not in first[0]
+            clock["t"] = sync.LIMIT_RETRY
+            wait_until(lambda: attempts.count(writer.run_id) >= 2, thread, box, follow_ctx,
+                       msg="quota 403 was not retried")
+            time.sleep(0.1)
+            clock["t"] = sync.LIMIT_RETRY * 2
+            wait_until(lambda: attempts.count(writer.run_id) >= 3, thread, box, follow_ctx,
+                       msg="quota 403 was not retried a second time")
+            time.sleep(0.1)
+            assert len(_failure_lines(printed, writer.run_id)) == 1
+            fail_clock["t"] = sync.FAILURE_REMINDER
+            clock["t"] = sync.LIMIT_RETRY * 3
+            wait_until(lambda: attempts.count(writer.run_id) >= 4, thread, box, follow_ctx,
+                       msg="quota 403 was not retried after FAILURE_REMINDER")
+            lines = _failure_lines(printed, writer.run_id)
+            assert len(lines) == 1
+            assert " (still failing)" not in "".join(printed["out"])
+            if kind == "daily":
+                assert "in 1 h 3 min" in lines[0]
+                assert "in 2 h 6 min" not in "".join(printed["out"])
+            else:
+                assert "4.1 GB" in lines[0]
+                assert "4.2 GB" not in "".join(printed["out"])
+        finally:
+            stop_follow(follow_ctx)
+            join_follow(thread, box, follow_ctx)
+
+
+def test_follow_quota_limit_prints_again_on_new_streak(remote, tmp_path, monkeypatch, follow_ctx):
+    writer = writer_at(tmp_path, status=None)
+    printed = capture_prints(monkeypatch)
+    clock = _quota_clock(monkeypatch)
+    n = {"i": 0}
+    original = sync.sync_run
+
+    def quota_ok_quota(reader, *args, **kwargs):
+        i = n["i"]
+        n["i"] += 1
+        if i == 1:
+            return original(reader, *args, **kwargs)
+        raise _json_http_error(
+            403,
+            "storage limit reached: %.1f GB of 5.0 GB used; delete runs or ask for more"
+            % (4.0 + i * 0.1),
+        )
+
+    monkeypatch.setattr(sync, "sync_run", quota_ok_quota)
+    thread, box = spawn(lambda: command(
+        remote, writer, writer.run_id, "--follow", "--interval", "0.02"))
+    try:
+        wait_until(lambda: len(_failure_lines(printed, writer.run_id)) >= 1,
+                   thread, box, follow_ctx, msg="first quota limit was not printed")
+        assert len(_failure_lines(printed, writer.run_id)) == 1
+        clock["t"] = sync.LIMIT_RETRY
+        wait_until(lambda: len(_failure_lines(printed, writer.run_id)) >= 2,
+                   thread, box, follow_ctx,
+                   msg="new quota streak after success was not printed")
+        fail_lines = _failure_lines(printed, writer.run_id)
+        success_lines = [ln for ln in "".join(printed["out"]).splitlines()
+                         if writer.run_id in ln and "failed:" not in ln]
+        assert len(fail_lines) == 2
+        assert " (still failing)" not in fail_lines[0]
+        assert " (still failing)" not in fail_lines[1]
+        assert "4.0 GB" in fail_lines[0]
+        assert "4.2 GB" in fail_lines[1]
+        assert len(success_lines) >= 1
+    finally:
+        stop_follow(follow_ctx)
+        join_follow(thread, box, follow_ctx)
+        writer.close()
+
+
+def test_follow_quota_limit_retries_each_run_after_interval(tmp_path, monkeypatch, follow_ctx):
+    _data, key = _quota_follow_setup(tmp_path, monkeypatch)
+    clock = _quota_clock(monkeypatch)
+    writers = [writer_at(tmp_path, run_id="run-%d" % i) for i in range(3)]
+    printed = capture_prints(monkeypatch)
+    attempts = _count_attempts(monkeypatch)
+    run_ids = [writer.run_id for writer in writers]
+
+    with fake_http(_quota_handler(_STORAGE_LIMIT)) as (_httpd, url):
+        remote = (None, SimpleNamespace(base_url=url, api_key=key))
+        thread, box = spawn(lambda: command(
+            remote, writers[0], *run_ids, "--follow", "--interval", "0.03"))
+        try:
+            wait_until(lambda: len(attempts) >= 3, thread, box, follow_ctx,
+                       msg="not every limited run was attempted")
+            time.sleep(0.1)
+            assert len(attempts) == 3
+            assert sorted(attempts) == sorted(run_ids)
+            clock["t"] = sync.LIMIT_RETRY
+            wait_until(lambda: len(attempts) >= 6, thread, box, follow_ctx,
+                       msg="limited runs were not retried after LIMIT_RETRY")
+            assert len(attempts) == 6
+            assert sorted(attempts[3:6]) == sorted(run_ids)
+            for rid in run_ids:
+                lines = _failure_lines(printed, rid)
+                assert len(lines) == 1
+                assert " (still failing)" not in lines[0]
+        finally:
+            stop_follow(follow_ctx)
+            join_follow(thread, box, follow_ctx)
+
+
+def test_follow_other_403_is_dropped(tmp_path, monkeypatch, follow_ctx):
+    for name in ("AGENTICML_HOST", "AGENTICML_API_KEY", "AGENTICML_SERVER_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AGENTICML_CONFIG_DIR", str(tmp_path / "config"))
+    message = "role viewer cannot sync"
+    writer = writer_at(tmp_path)
+    printed = capture_prints(monkeypatch)
+    emits = _count_emits(monkeypatch)
+    with fake_http(_quota_handler(message)) as (_httpd, url):
+        remote = (None, SimpleNamespace(base_url=url, api_key="secret-key"))
+        thread, box = spawn(lambda: command(remote, writer, writer.run_id, "--follow", "--interval", "0.03"))
+        code = join_follow(thread, box, follow_ctx, timeout=5)
+        assert code == 1
+    assert emits.count(writer.run_id) == 1
+    lines = _failure_lines(printed, writer.run_id)
+    assert len(lines) == 1
+    assert message in lines[0]
+    assert "secret-key" not in "".join(printed["out"]) + "".join(printed["err"])
 
 
 def test_watch_failure_prints_reminder_after_interval(remote, tmp_path, monkeypatch):

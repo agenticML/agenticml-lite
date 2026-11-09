@@ -486,6 +486,43 @@ def cmd_ui(args):
     return 0
 
 
+def _env_flag(name):
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes"}
+
+
+def _firebase_from_args(args):
+    from .server.firebase import parse_firebase_config
+
+    project = getattr(args, "firebase_project", None)
+    if project is None:
+        project = os.environ.get("AGENTICML_SERVER_FIREBASE_PROJECT") or None
+    api_key = getattr(args, "firebase_api_key", None)
+    if api_key is None:
+        api_key = os.environ.get("AGENTICML_SERVER_FIREBASE_API_KEY") or None
+    auth_domain = getattr(args, "firebase_auth_domain", None)
+    if auth_domain is None:
+        auth_domain = os.environ.get("AGENTICML_SERVER_FIREBASE_AUTH_DOMAIN") or None
+    return parse_firebase_config(project, api_key, auth_domain)
+
+
+def _limits_from_args(args):
+    from .server.limits import Plans
+
+    path = getattr(args, "limits", None) or os.environ.get("AGENTICML_SERVER_LIMITS")
+    if not path:
+        return None, None
+    path = str(Path(path).expanduser().resolve())
+    return path, Plans.load(path)
+
+
+def _open_signup_from_args(args, firebase, plans=None):
+    from .server.firebase import require_open_signup
+
+    open_signup = bool(getattr(args, "open_signup", False) or _env_flag("AGENTICML_SERVER_OPEN_SIGNUP"))
+    require_open_signup(open_signup, firebase, plans)
+    return open_signup
+
+
 def cmd_server_serve(args):
     from .server import serve
     from .server.db.errors import DatabaseError
@@ -502,11 +539,22 @@ def cmd_server_serve(args):
     identity = args.identity_header
     if identity is None:
         identity = os.environ.get("AGENTICML_SERVER_IDENTITY_HEADER") or None
+    extra = {}
+    if args.database is not None:
+        extra["database"] = args.database
     try:
+        _, plans = _limits_from_args(args)
+        if plans is not None:
+            extra["plans"] = plans
+        firebase = _firebase_from_args(args)
+        if firebase is not None:
+            extra["firebase"] = firebase
+        if _open_signup_from_args(args, firebase, plans):
+            extra["open_signup"] = True
         serve(args.data, args.host, args.port, public_url,
               trusted_proxies=parse_trusted_proxies(proxies),
               identity_header=parse_identity_header(identity),
-              **({"database": args.database} if args.database is not None else {}))
+              **extra)
     except KeyboardInterrupt:
         pass
     except (OSError, ValueError, OverflowError, DatabaseError) as exc:
@@ -530,9 +578,21 @@ def cmd_server_up(args):
     from .server.db.errors import DatabaseError
     from .server.up import UpError, up
 
+    extra = {}
+    if args.database is not None:
+        extra["database"] = args.database
     try:
-        up(args.data, args.port, install=args.install, force=args.force,
-           **({"database": args.database} if args.database is not None else {}))
+        limits_file, plans = _limits_from_args(args)
+        if plans is not None:
+            extra["plans"] = plans
+        if limits_file is not None:
+            extra["limits"] = limits_file
+        firebase = _firebase_from_args(args)
+        if firebase is not None:
+            extra["firebase"] = firebase
+        if _open_signup_from_args(args, firebase, plans):
+            extra["open_signup"] = True
+        up(args.data, args.port, install=args.install, force=args.force, **extra)
     except KeyboardInterrupt:
         pass
     except UpError as exc:
@@ -757,6 +817,58 @@ def cmd_server_workspaces(args):
             else:
                 fields = ('slug', 'name', 'status', 'members', 'created_at')
                 _print_table([list(fields)] + [[str(r[k]) for k in fields] for r in rows])
+        elif action == 'usage':
+            from .server.limits import Plans
+            from .server.db.usage import UsageRepo, utc_day
+            limits_file = args.limits or os.environ.get('AGENTICML_SERVER_LIMITS')
+            plans = Plans.load(limits_file) if limits_file else None
+            rows = []
+            for workspace in repo.list():
+                usage = UsageRepo(db, workspace['id'])
+                counters = usage.get()
+                limits = (plans.limits_for(workspace) if plans else
+                          json.loads(workspace['custom_limits']) if workspace['plan'] == 'custom' else None)
+                rows.append({'slug': workspace['slug'], 'plan': workspace['plan'],
+                             'stored_bytes': counters['stored_bytes'], 'limits': limits,
+                             'upload_bytes': counters['upload_bytes'] if counters['upload_day'] and counters['upload_day'] >= utc_day() else 0,
+                             'people': usage.people()})
+            rows.sort(key=lambda row: (-row['stored_bytes'], row['slug']))
+            if args.json:
+                print(json.dumps(rows))
+            else:
+                def maximum(value):
+                    return 'unlimited' if value is None else str(value)
+                fields = ('slug', 'plan', 'storage used/limit (bytes)', 'uploads today (bytes)', 'people')
+                _print_table([list(fields)] + [[row['slug'], row['plan'],
+                    str(row['stored_bytes']) + '/' + (maximum(row['limits']['storage_bytes']) if row['limits'] is not None else 'no limits file'),
+                    str(row['upload_bytes']), str(row['people'])] for row in rows])
+        elif action == 'set-plan':
+            from .server.limits import Plans, UNLIMITED, parse_size, parse_count
+            raw = (args.storage, args.uploads_per_day, args.requests_per_minute, args.people)
+            if args.plan == 'free' and any(value is not None for value in raw):
+                raise ValueError('free plan cannot have custom limits')
+            current = repo.require(args.slug)
+            custom = None
+            if args.plan == 'custom':
+                limits_file = args.limits or os.environ.get('AGENTICML_SERVER_LIMITS')
+                if current['plan'] == 'custom':
+                    custom = json.loads(current['custom_limits'])
+                elif limits_file:
+                    custom = dict(Plans.load(limits_file).free)
+                else:
+                    if all(value is None for value in raw):
+                        raise ValueError('custom plan requires at least one limit flag without a limits file')
+                    custom = dict(UNLIMITED)
+                keys = ('storage_bytes', 'upload_bytes_per_day', 'requests_per_minute', 'people')
+                for key, value, parse in zip(keys, raw, (parse_size, parse_size, parse_count, parse_count)):
+                    if value is not None:
+                        custom[key] = parse(value)
+            old, new = repo.set_plan(args.slug, args.plan, custom if args.plan == 'custom' else None)
+            def plan_values(row):
+                return {'plan': row['plan'], 'limits': json.loads(row['custom_limits']) if row['custom_limits'] else None}
+            log.record(actor, 'cli', 'workspace.plan', new['id'],
+                       detail={'slug': new['slug'], 'old': plan_values(old), 'new': plan_values(new)})
+            print(json.dumps(plan_values(new)))
         elif action == 'create':
             owner = args.owner
             if owner is None:
@@ -774,6 +886,20 @@ def cmd_server_workspaces(args):
                 raise ValueError('workspace deletion not confirmed')
             row = delete_workspace(db, data, args.slug)
             log.record(actor, 'cli', 'workspace.delete', row['id'], detail={'slug': args.slug})
+        elif action == 'recount':
+            from .server.db.usage import UsageRepo
+            if bool(args.slug) == bool(args.all):
+                raise ValueError('specify a workspace slug or --all')
+            rows = repo.list() if args.all else [repo.require(args.slug)]
+            for row in rows:
+                usage = UsageRepo(db, row['id'])
+                with db.transaction(write=True) as tx:
+                    usage.lock(tx)
+                    old = usage.get(tx)['stored_bytes']
+                    new = usage.recount(tx)
+                log.record(actor, 'cli', 'workspace.recount', row['id'],
+                           detail={'slug': row['slug'], 'old_stored_bytes': old, 'new_stored_bytes': new})
+                print(f"{row['slug']}: {old} -> {new} stored bytes")
         elif action == 'set-owner':
             row = repo.require(args.slug)
             repo.set_owner(args.slug, args.owner)
@@ -801,8 +927,26 @@ def cmd_server_accounts(args):
             if args.json:
                 print(json.dumps(rows))
             else:
-                fields = ('login', 'display_name', 'server_admin', 'created_at')
-                _print_table([list(fields)] + [[str(r[k]) for k in fields] for r in rows])
+                fields = ('login', 'display_name', 'server_admin', 'firebase', 'email_verified', 'created_at')
+                table = [list(fields)]
+                for row in rows:
+                    table.append([
+                        row['login'], row['display_name'] or '',
+                        str(row['server_admin']),
+                        'yes' if row.get('firebase_uid') else 'no',
+                        str(row.get('email_verified') or 0),
+                        row['created_at'] or '',
+                    ])
+                _print_table(table)
+        elif args.accounts_action == 'add':
+            account = repo.create(args.login, display_name=args.display_name, created_by='cli')
+            if args.server_admin:
+                repo.set_server_admin(account['login'], True)
+                account = repo.get(account['login'])
+            AuditLog(directory, db=db, workspace_id=None).record(
+                cli_actor(), 'cli', 'account.create', account['login'],
+                detail={'server_admin': bool(args.server_admin),
+                        'display_name': account['display_name']})
         else:
             repo.set_server_admin(args.login, args.value == 'on')
             AuditLog(directory, db=db, workspace_id=None).record(
@@ -854,7 +998,7 @@ def cmd_server_verify(args):
 def cmd_server_reindex(args):
     from .server.admin import _data_root
     from .server.app import acquire_server_lock
-    from .server.db import for_server_dir
+    from .server.db import for_server_dir, resolve_url, _is_postgres
     from .server.db.errors import DatabaseError, DatabaseUrlError, SchemaTooNew
     from .server.db.repos import RunRepo
     from .server.runs import reindex
@@ -863,13 +1007,18 @@ def cmd_server_reindex(args):
     try:
         data, directory = _server_data_dir(args)
         try:
-            handle = acquire_server_lock(data / "server")
+            if not _is_postgres(resolve_url(data, args.database)):
+                handle = acquire_server_lock(data / "server")
         except ValueError as exc:
             cause = exc.__cause__
             if isinstance(cause, OSError) and cause.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
                 raise ValueError("stop the server first") from exc
             raise
         db = for_server_dir(data / "server", args.database)
+        if db.dialect.name == "postgres":
+            from contextlib import ExitStack
+            handle = ExitStack()
+            handle.enter_context(db.server_lock())
         from .server.db.workspaces import WorkspaceRepo
         from .server.workspaces import prepare_store
         workspaces = WorkspaceRepo(db)
@@ -1461,6 +1610,15 @@ def main(argv=None):
                         help="Trust this proxy CIDR for X-Forwarded-For and identity headers (repeatable)")
     p_serve.add_argument("--identity-header", choices=("alb", "tailscale", "oauth2-proxy"),
                         default=None, help="Honour this proxy identity header (requires --trusted-proxy)")
+    p_serve.add_argument("--firebase-project", default=None, metavar="ID",
+                        help="Firebase project id (default: AGENTICML_SERVER_FIREBASE_PROJECT)")
+    p_serve.add_argument("--firebase-api-key", default=None, metavar="KEY",
+                        help="Firebase web API key (default: AGENTICML_SERVER_FIREBASE_API_KEY)")
+    p_serve.add_argument("--firebase-auth-domain", default=None, metavar="HOST",
+                        help="Firebase auth domain (default: AGENTICML_SERVER_FIREBASE_AUTH_DOMAIN or <project>.firebaseapp.com)")
+    p_serve.add_argument("--limits", default=None, metavar="FILE", help="Workspace limits JSON (default: AGENTICML_SERVER_LIMITS)")
+    p_serve.add_argument("--open-signup", action="store_true",
+                        help="Allow verified Firebase sign-in to create an account (default: AGENTICML_SERVER_OPEN_SIGNUP)")
     p_serve.set_defaults(func=cmd_server_serve)
     p_up = server_sub.add_parser("up", help="Serve on loopback through Tailscale Funnel")
     p_up.add_argument("--data", default=None, help="Data directory (default: AGENTICML_SERVER_DATA or ~/.agenticml-server)")
@@ -1468,6 +1626,16 @@ def main(argv=None):
     p_up.add_argument("--port", type=_parse_up_port, default=8080)
     p_up.add_argument("--install", action="store_true", help="Write a user service that runs server up, then exit")
     p_up.add_argument("--force", action="store_true", help="Overwrite an existing user service file")
+    p_up.add_argument("--firebase-project", default=None, metavar="ID",
+                     help="Firebase project id (default: AGENTICML_SERVER_FIREBASE_PROJECT)")
+    p_up.add_argument("--firebase-api-key", default=None, metavar="KEY",
+                     help="Firebase web API key (default: AGENTICML_SERVER_FIREBASE_API_KEY)")
+    p_up.add_argument("--firebase-auth-domain", default=None, metavar="HOST",
+                     help="Firebase auth domain (default: AGENTICML_SERVER_FIREBASE_AUTH_DOMAIN or <project>.firebaseapp.com)")
+    p_up.add_argument("--limits", default=None, metavar="FILE",
+                     help="Workspace limits JSON (default: AGENTICML_SERVER_LIMITS)")
+    p_up.add_argument("--open-signup", action="store_true",
+                     help="Allow verified Firebase sign-in to create an account (default: AGENTICML_SERVER_OPEN_SIGNUP)")
     p_up.set_defaults(func=cmd_server_up)
     for action, func, help_text in (
             ("status", cmd_server_status, "Show runs, sizes, and key activity"),
@@ -1484,16 +1652,31 @@ def main(argv=None):
     p_reindex.set_defaults(func=cmd_server_reindex)
     p_workspaces = server_sub.add_parser('workspaces', help='Manage server workspaces')
     ws_sub = p_workspaces.add_subparsers(dest='workspaces_action', required=True)
-    for action in ('list', 'create', 'rename', 'suspend', 'resume', 'delete', 'set-owner'):
+    for action in ('list', 'create', 'rename', 'suspend', 'resume', 'delete', 'set-owner', 'recount', 'usage', 'set-plan'):
         child = ws_sub.add_parser(action)
         child.add_argument('--data', default=None)
         child.add_argument('--database', default=None, metavar='URL')
         child.set_defaults(func=cmd_server_workspaces)
-        if action == 'list':
+        if action in ('list', 'usage'):
+            if action == 'usage':
+                child.add_argument('--limits', default=None, metavar='FILE',
+                                   help='Workspace limits JSON (default: AGENTICML_SERVER_LIMITS)')
             child.add_argument('--json', action='store_true')
             continue
+        if action == 'recount':
+            child.add_argument('slug', nargs='?')
+            child.add_argument('--all', action='store_true')
+            continue
         child.add_argument('slug')
-        if action == 'create':
+        if action == 'set-plan':
+            child.add_argument('--limits', default=None, metavar='FILE',
+                               help='Base free plan limits JSON (default: AGENTICML_SERVER_LIMITS)')
+            child.add_argument('plan', choices=('free', 'custom'))
+            child.add_argument('--storage', default=None)
+            child.add_argument('--uploads-per-day', default=None)
+            child.add_argument('--requests-per-minute', default=None)
+            child.add_argument('--people', default=None)
+        elif action == 'create':
             child.add_argument('--name', default=None)
             child.add_argument('--owner', default=None)
         elif action == 'rename':
@@ -1505,13 +1688,17 @@ def main(argv=None):
             child.add_argument('--owner', required=True)
     p_accounts = server_sub.add_parser('accounts', help='Manage global accounts')
     acc_sub = p_accounts.add_subparsers(dest='accounts_action', required=True)
-    for action in ('list', 'set-server-admin'):
+    for action in ('list', 'add', 'set-server-admin'):
         child = acc_sub.add_parser(action)
         child.add_argument('--data', default=None)
         child.add_argument('--database', default=None, metavar='URL')
         child.set_defaults(func=cmd_server_accounts)
         if action == 'list':
             child.add_argument('--json', action='store_true')
+        elif action == 'add':
+            child.add_argument('login')
+            child.add_argument('--display-name', default=None)
+            child.add_argument('--server-admin', action='store_true')
         else:
             child.add_argument('login')
             child.add_argument('value', choices=('on', 'off'))

@@ -1,7 +1,7 @@
-"""Single-writer server lifecycle and data-directory safety."""
+"""Server lifecycle and data-directory safety."""
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import errno
 import logging
@@ -20,7 +20,7 @@ from agenticml.store import layout
 from agenticml.ui.server import DashboardServer, _browser_host, _loopback_bind
 from .keys import KeyStore, env_key_looks_weak, validate_env_key
 from .users import UserStore
-from .db import for_server_dir
+from .db import DatabaseBusy, for_server_dir, resolve_url, _is_postgres
 from .db.repos import NoteRepo, RunRepo
 from .db.workspaces import WorkspaceRepo, require_workspace_id
 from .workspaces import default_workspace_id, prepare_store, store_root
@@ -113,15 +113,36 @@ def acquire_server_lock(server_dir):
     return handle
 
 
-def _clean_tmp(tmp_dir):
+def tmp_retention_seconds():
+    """Age after which Postgres mode may delete another process's tmp file.
+
+    A legal slow body can last BODY_DEADLINE + OBJECT_BODY_LIMIT /
+    BODY_BYTES_PER_SECOND (~2.3 h). Plus a 1 h margin. Host clocks and
+    filesystem mtime are assumed to agree within that margin; larger skew
+    can delete an in-flight upload or retain a dead file longer.
+    """
+    return BODY_DEADLINE + OBJECT_BODY_LIMIT / BODY_BYTES_PER_SECOND + 3600
+
+
+def _clean_tmp(tmp_dir, *, postgres=False):
+    cutoff = time.time() - tmp_retention_seconds()
     for entry in tmp_dir.iterdir():
-        if stat.S_ISDIR(entry.lstat().st_mode):
+        try:
+            info = entry.lstat()
+        except FileNotFoundError:
+            continue
+        if postgres and info.st_mtime >= cutoff:
+            continue
+        if stat.S_ISDIR(info.st_mode):
             if entry.name.startswith("lineage-"):
-                shutil.rmtree(entry)
+                try:
+                    shutil.rmtree(entry)
+                except FileNotFoundError:
+                    pass  # Another starting process already cleaned it.
             else:
                 logger.warning("ignoring subdirectory in server/tmp: %s", entry)
         else:
-            os.unlink(entry)
+            entry.unlink(missing_ok=True)
 
 
 def _validate_public_url(value):
@@ -160,18 +181,99 @@ def _read_umask():
     return mask
 
 
+class _ProcessLock:
+    """Thread lock followed by a database session lock, released in reverse."""
+
+    def __init__(self, lock, db, key):
+        self._lock, self._db, self._key = lock, db, key
+        self._session = None
+
+    def locked(self):
+        return self._lock.locked()
+
+    def acquire(self, blocking=True, timeout=-1):
+        if not blocking:
+            wait = 0
+        elif timeout is None or timeout < 0:
+            wait = None
+        else:
+            wait = timeout
+        deadline = None if wait is None else time.monotonic() + wait
+        if wait == 0:
+            got = self._lock.acquire(False)
+        elif wait is None:
+            got = self._lock.acquire()
+        else:
+            got = self._lock.acquire(True, wait)
+        if not got:
+            return False
+        try:
+            if not blocking:
+                session = self._db.session_lock(self._key, timeout=0, try_lock=True)
+            elif deadline is None:
+                session = self._db.session_lock(self._key, timeout=-1)
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise DatabaseBusy('database is locked')
+                session = self._db.session_lock(self._key, timeout=remaining)
+            session.__enter__()
+        except DatabaseBusy:
+            self._lock.release()
+            if blocking and wait is None:
+                raise
+            return False
+        except BaseException:
+            self._lock.release()
+            raise
+        self._session = session
+        return True
+
+    def release(self):
+        session = self._session
+        self._session = None
+        try:
+            if session is not None:
+                session.__exit__(None, None, None)
+        finally:
+            self._lock.release()
+
+    def __enter__(self):
+        self._lock.acquire()
+        try:
+            self._session = self._db.session_lock(self._key)
+            self._session.__enter__()
+        except BaseException:
+            self._lock.release()
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        session = self._session
+        self._session = None
+        try:
+            if session is not None:
+                return session.__exit__(*exc)
+        finally:
+            self._lock.release()
+
+
 class IngestServer(DashboardServer):
     # The writer lock must outlive every handler, including during shutdown.
     daemon_threads = False
 
     def __init__(self, data, host, port, public_url=None, env_key=None,
-                 trusted_proxies=(), identity_header=None, db=None):
+                 trusted_proxies=(), identity_header=None, db=None,
+                 firebase=None, cert_source=None, plans=None, open_signup=False):
+        from .firebase import require_open_signup
         from .ingest import IngestHandler
 
+        require_open_signup(open_signup, firebase, plans)
         self.data_dir = Path(data)
         self.tmp_dir = self.data_dir / "server" / "tmp"
         db = db if db is not None else for_server_dir(self.data_dir / "server")
         self.db = db
+        self.plans = plans
         self.workspaces = WorkspaceRepo(db)
         default = self.workspaces.get('default')
         self.default_workspace_id = default_workspace_id(db) if default else None
@@ -186,7 +288,9 @@ class IngestServer(DashboardServer):
         self.public_url = public_url
         self.web = WebAuth(
             self.keys, public_url, users=self.users,
-            trusted_proxies=trusted_proxies, identity_header=identity_header)
+            trusted_proxies=trusted_proxies, identity_header=identity_header,
+            firebase=firebase, cert_source=cert_source, plans=plans,
+            open_signup=open_signup)
         self.store_file_mode = 0o666 & ~_read_umask()
         self.limits = Limits()
         self.lineage_enabled = shutil.which("git") is not None
@@ -195,8 +299,12 @@ class IngestServer(DashboardServer):
             logger.warning("git is not installed; lineage code diffs are disabled")
         self.run_locks = weakref.WeakValueDictionary()
         self.run_locks_lock = threading.Lock()
+        self.quota_locks = weakref.WeakValueDictionary()
+        self.quota_locks_lock = threading.Lock()
         self.object_locks = weakref.WeakValueDictionary()
         self.object_locks_lock = threading.Lock()
+        self.lineage_locks = weakref.WeakValueDictionary()
+        self.lineage_locks_lock = threading.Lock()
         self._server_lock = None
         self._closing_workers = set()
         super().__init__(
@@ -212,9 +320,15 @@ class IngestServer(DashboardServer):
 
     def _after_append_write(self, run_id, path):
         """Test hook: runs after an append is fsynced and before the size commit."""
+        if (os.environ.get("AGENTICML_TEST_HOOKS") == "1"
+                and os.environ.get("PYTEST_CURRENT_TEST")):
+            delay = int(os.environ.get("AGENTICML_TEST_APPEND_DELAY_MS", "0"))
+            if delay > 0:
+                print(f"AGENTICML_TEST_APPEND_WRITE {run_id} {path}\n", end="", flush=True)
+                time.sleep(delay / 1000)
 
     def _after_atomic_write(self, run_id, path):
-        """Test hook: runs after an atomic file is published and before it is recorded."""
+        """Test hook: after rename+fsync, still inside the recording transaction."""
 
     def _after_meta_claim(self, run_id):
         """Test hook: runs after claiming ownership and before writing meta.json."""
@@ -247,7 +361,8 @@ class IngestServer(DashboardServer):
         with self.reader_lock:
             if key not in self.readers:
                 self.readers[key] = store_reader.RunReader(
-                    store_root(self.data_dir, wid), run_id, remote=index.normalized_remote)
+                    store_root(self.data_dir, wid), run_id, remote=index.normalized_remote,
+                    committed_size=index.committed_size if self.db.dialect.name == "postgres" else None)
             self.readers.move_to_end(key)
             while len(self.readers) > 64:
                 self.readers.popitem(last=False)
@@ -285,7 +400,20 @@ class IngestServer(DashboardServer):
             if lock is None:
                 lock = threading.Lock()
                 self.run_locks[run_id] = lock
-            return lock
+            return self._combined_lock(lock, f"run:{run_id[0]}:{run_id[1]}")
+
+    def quota_lock(self, workspace_id):
+        """Lock check, publish and accounting after the run/object lock.
+
+        Nothing may wait on a run/object lock while holding this lock.
+        """
+        workspace_id = require_workspace_id(workspace_id)
+        with self.quota_locks_lock:
+            lock = self.quota_locks.get(workspace_id)
+            if lock is None:
+                lock = threading.Lock()
+                self.quota_locks[workspace_id] = lock
+            return self._combined_lock(lock, f"quota:{workspace_id}")
 
     def object_lock(self, sha, *, workspace_id):
         prefix = (require_workspace_id(workspace_id), sha[:2])
@@ -294,7 +422,21 @@ class IngestServer(DashboardServer):
             if lock is None:
                 lock = threading.Lock()
                 self.object_locks[prefix] = lock
-            return lock
+            return self._combined_lock(lock, f"object:{prefix[0]}:{prefix[1]}")
+
+    def _combined_lock(self, lock, key):
+        # Order: thread → session → transaction; run/object → quota.
+        return _ProcessLock(lock, self.db, key) if self.db.dialect.name == "postgres" else lock
+
+    def lineage_lock(self, workspace_id, project_key):
+        workspace_id = require_workspace_id(workspace_id)
+        key = (workspace_id, project_key)
+        with self.lineage_locks_lock:
+            lock = self.lineage_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self.lineage_locks[key] = lock
+            return self._combined_lock(lock, f"lineage:{workspace_id}:{project_key}")
 
     def server_close(self, *, drain=0.0):
         if drain > 0:
@@ -350,8 +492,14 @@ class IPv6IngestServer(IngestServer):
 
 
 def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None,
-                trusted_proxies=(), identity_header=None, database=None):
+                trusted_proxies=(), identity_header=None, database=None,
+                firebase=None, cert_source=None, plans=None, open_signup=False):
     """Prepare and lock the data directory; port=0 chooses a free port."""
+    from .firebase import require_open_signup
+    from .limits import Plans
+    if plans is not None and not isinstance(plans, Plans):
+        plans = Plans.load(plans)
+    require_open_signup(open_signup, firebase, plans)
     validate_env_key(env_key)
     if env_key is not None and env_key_looks_weak(env_key):
         logger.warning(
@@ -362,13 +510,19 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
     prepare_data_dir(data)
     if not store_paths_safe(data / "store"):
         raise ValueError("store or store/runs is a symlink or not a directory; fix or move it away")
-    handle = acquire_server_lock(data / "server")
+    handle = (None if _is_postgres(resolve_url(data, database))
+              else acquire_server_lock(data / "server"))
     db = None
     try:
         db = for_server_dir(data / "server", database)
-        _clean_tmp(data / "server" / "tmp")
+        if db.dialect.name == "postgres":
+            handle = ExitStack()
+            handle.enter_context(db.server_lock(shared=True))
+        _clean_tmp(data / "server" / "tmp", postgres=db.dialect.name == "postgres")
         cls = IPv6IngestServer if ":" in host else IngestServer
-        server = cls(data, host, port, public_url, env_key, trusted_proxies, identity_header, db=db)
+        server = cls(data, host, port, public_url, env_key, trusted_proxies, identity_header, db=db,
+                     firebase=firebase, cert_source=cert_source, plans=plans,
+                     open_signup=open_signup)
         server._server_lock = handle
         for workspace in server.workspaces.list():
             root = prepare_store(data, workspace['id'])
@@ -377,17 +531,29 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
     except BaseException:
         if db is not None:
             db.close()
-        handle.close()
+        if handle is not None:
+            handle.close()
         raise
 
 
 def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None,
-          trusted_proxies=(), identity_header=None, database=None):
+          trusted_proxies=(), identity_header=None, database=None,
+          firebase=None, cert_source=None, plans=None, open_signup=False):
     """Run until interrupted, with an optional environment admin key."""
+    extra = {}
+    if plans is not None:
+        extra["plans"] = plans
+    if database is not None:
+        extra["database"] = database
+    if firebase is not None:
+        extra["firebase"] = firebase
+    if cert_source is not None:
+        extra["cert_source"] = cert_source
+    if open_signup:
+        extra["open_signup"] = True
     server = make_server(
         data, host, port, public_url, os.environ.get("AGENTICML_SERVER_KEY"),
-        trusted_proxies, identity_header,
-        **({"database": database} if database is not None else {}))
+        trusted_proxies, identity_header, **extra)
     previous_handler = None
     stopping = False
 

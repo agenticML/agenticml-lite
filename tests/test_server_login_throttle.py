@@ -1,6 +1,8 @@
 """Per-address login throttle and weak environment-key warning."""
+from concurrent.futures import ThreadPoolExecutor
 import http.client
 import json
+import os
 import secrets
 import socket
 import sys
@@ -274,6 +276,109 @@ def test_holds_never_expire_or_evict(throttle_factory):
         record_failed(throttle, "held")
     retry, ticket = throttle.begin("held")
     assert ticket is None
+
+
+@pytest.mark.skipif(not os.environ.get('AGENTICML_TEST_DATABASE_URL'),
+                    reason='AGENTICML_TEST_DATABASE_URL is not set')
+def test_throttle_two_dbbuckets_concurrent_failures_and_isolated_success(server_database):
+    from agenticml.server.db.postgres import PostgresDatabase
+    from agenticml.server.db.repos import ThrottleRepo
+    from agenticml.server.webauth import DbBuckets
+
+    db_a, db_b = PostgresDatabase(server_database), PostgresDatabase(server_database)
+    try:
+        a = LoginThrottle(clock=lambda: 0.0, store=DbBuckets(db_a))
+        b = LoginThrottle(clock=lambda: 0.0, store=DbBuckets(db_b))
+        shared = '198.51.100.10'
+        barrier = threading.Barrier(8)
+
+        def fail_together(throttle):
+            retry, ticket = throttle.begin(shared)
+            assert retry == 0 and ticket is not None
+            barrier.wait(timeout=10)
+            throttle.finish(ticket, 'failed')
+
+        with ThreadPoolExecutor(8) as pool:
+            futures = [pool.submit(fail_together, (a, b)[i % 2]) for i in range(8)]
+            for future in futures:
+                future.result(timeout=20)
+        rows = {bucket: failures for bucket, failures, _ in ThrottleRepo(db_a).load()}
+        assert rows[shared] == 8
+
+        kept, cleared = '198.51.100.11', '198.51.100.12'
+        for _ in range(3):
+            record_failed(a, cleared)
+            record_failed(b, kept)
+        retry, ticket = a.begin(cleared)
+        assert ticket is not None
+        a.finish(ticket, 'success')
+        rows = {bucket: failures for bucket, failures, _ in ThrottleRepo(db_a).load()}
+        assert rows[kept] == 3
+        assert cleared not in rows
+    finally:
+        db_a.close()
+        db_b.close()
+
+
+def test_throttle_commit_failure_keeps_unsaved_counts(throttle_factory, monkeypatch):
+    from contextlib import contextmanager
+
+    now = [0.0]
+    throttle = throttle_factory(clock=lambda: now[0])
+    if not hasattr(throttle._store, "repo"):
+        pytest.skip("database throttle store required")
+    for _ in range(LoginThrottle.FREE_FAILURES - 1):
+        record_failed(throttle, "a")
+    original = throttle._store.db.transaction
+    injected = []
+
+    @contextmanager
+    def wrapping(write=False):
+        with original(write=write) as tx:
+            yield tx
+            if write and not injected:
+                entry = throttle._store.entries.get("a")
+                if entry is not None and entry[0] >= LoginThrottle.FREE_FAILURES:
+                    injected.append(True)
+                    raise RuntimeError("injected commit failure")
+
+    monkeypatch.setattr(throttle._store.db, "transaction", wrapping)
+    retry, ticket = throttle.begin("a")
+    assert ticket is not None and retry == 0
+    with pytest.raises(RuntimeError, match="injected commit failure"):
+        throttle.finish(ticket, "failed")
+    assert injected
+    retry, ticket = throttle.begin("a")
+    assert ticket is None
+    assert retry >= 1
+
+
+def test_expired_throttle_rows_pruned_on_next_login(throttle_factory):
+    now = [0.0]
+    throttle = throttle_factory(clock=lambda: now[0])
+    repo = getattr(throttle._store, "repo", None)
+    if repo is None:
+        pytest.skip("database throttle store required")
+    for index in range(20):
+        record_failed(throttle, f"old-{index}")
+    assert len(repo.load()) == 20
+    now[0] = LoginThrottle.EXPIRE_AFTER + 1
+    record_failed(throttle, "new")
+    rows = {bucket: failures for bucket, failures, _ in repo.load()}
+    assert rows == {"new": 1}
+
+    now[0] = 0.0
+    throttle = throttle_factory(clock=lambda: now[0])
+    repo = throttle._store.repo
+    for index in range(20):
+        record_failed(throttle, f"old-{index}")
+    record_failed(throttle, "held")
+    _, held = throttle.begin("held")
+    assert held is not None
+    now[0] = LoginThrottle.EXPIRE_AFTER + 1
+    record_failed(throttle, "new")
+    rows = {bucket: failures for bucket, failures, _ in repo.load()}
+    assert rows == {"held": 1, "new": 1}
 
 
 def test_drop_at_zero_and_unknown_ticket(throttle_factory):
