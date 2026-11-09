@@ -29,6 +29,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 import webbrowser
 
 from agenticml.store import layout, notes, reader
+from agenticml.store.errors import ObjectStoreUnavailable
 
 logger = logging.getLogger("agenticml.ui.server")
 
@@ -58,6 +59,12 @@ def _ctx_root(handler):
     _require_bound_workspace(handler)
     ws = _ctx(handler)
     return ws.root if ws is not None else handler.server.root
+
+
+def _ctx_open_object(handler):
+    root = _ctx_root(handler)
+    ws = _ctx(handler)
+    return ws.open_object if ws is not None else lambda sha: _open_regular_object(root, sha)
 
 
 def _ctx_run_index(handler):
@@ -322,7 +329,7 @@ class _CodeDiffBudget:
         return self.bytes_left <= 0 or time.monotonic() >= self.deadline
 
 
-def _code_pair_diff(root, base_sha, target_sha, byte_limit, line_limit, budget):
+def _code_pair_diff(open_object, base_sha, target_sha, byte_limit, line_limit, budget):
     """Diff bounded UTF-8 snapshots. Missing sides are empty, never objects."""
     result = _code_diff_result()
     blobs = []
@@ -334,7 +341,7 @@ def _code_pair_diff(root, base_sha, target_sha, byte_limit, line_limit, budget):
                 if budget.exhausted():
                     return _code_diff_result(patch_truncated=True)
                 read_limit = min(byte_limit + 1, budget.bytes_left)
-                with _open_regular_object(root, sha) as stream:
+                with open_object(sha) as stream:
                     blob = stream.read(read_limit)
                 budget.bytes_left -= len(blob)
                 # Stop at the first oversized side; do not open the other one.
@@ -1234,7 +1241,7 @@ class DashboardServer(ThreadingHTTPServer):
             if key in self.code_diffs:
                 self.code_diffs.move_to_end(key)
                 return self.code_diffs[key]
-        result = _code_pair_diff(self.root, base_sha, target_sha,
+        result = _code_pair_diff(lambda sha: _open_regular_object(self.root, sha), base_sha, target_sha,
                                  _CODE_DIFF_MAX_BYTES, _CODE_DIFF_FILE_LINES, budget)
         # Retry unavailable snapshots and reads cut short by a request budget.
         if "error" not in result and not budget.exhausted():
@@ -1424,7 +1431,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _stream(self, handle, content_type, headers=None):
         try:
-            length = os.fstat(handle.fileno()).st_size
+            length = handle.size if hasattr(handle, "size") else os.fstat(handle.fileno()).st_size
             self._begin(200, content_type, length, headers)
             remaining = length
             while remaining > 0:
@@ -1730,6 +1737,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if self.server.auth is not None and self.server.auth.handle(self):
                 return
             self._get()
+        except ObjectStoreUnavailable:
+            if self._started:
+                self.close_connection = True
+            else:
+                self._json({"error": "object store unavailable"}, 503, {"Retry-After": "5"})
         except _DISCONNECT:
             self.close_connection = True
         except ValueError:
@@ -1816,10 +1828,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 listed = notes.list_notes(root, project)
             listed["writable"] = _notes_writable(self)
             return self._json(listed)
+        if path == "/api/metrics":
+            run_index = _ctx_run_index(self)
+            if run_index is None:
+                raise FileNotFoundError()
+            return self._json({"metrics": run_index.metric_names()})
         if path == "/api/runs":
             run_index = _ctx_run_index(self)
             if run_index is not None:
-                return self._json(run_index.dashboard_list())
+                from agenticml.server.metrics import RunsQueryError, parse_runs_query
+                try:
+                    metrics, sort, order, filters = parse_runs_query(query)
+                except RunsQueryError as exc:
+                    return self._json({"error": str(exc)}, 422)
+                return self._json(run_index.dashboard_list(
+                    metrics=metrics, sort=sort, order=order, filters=filters))
             runs = []
             for meta in reader.list_runs(root):
                 if not isinstance(meta, dict):
@@ -1930,7 +1953,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             headers = {"Cache-Control": "immutable, max-age=31536000"}
             if self._session_gated():
                 headers = {"Cache-Control": "no-store", "Vary": "Cookie"}
-            return self._stream(_open_regular_object(root, sha), kind, headers=headers)
+            return self._stream(_ctx_open_object(self)(sha), kind, headers=headers)
         name = "index.html" if path == "/" else path[len("/static/"):] if path.startswith("/static/") else ""
         if name not in _FILES:
             raise FileNotFoundError()

@@ -540,6 +540,8 @@ def cmd_server_serve(args):
     if identity is None:
         identity = os.environ.get("AGENTICML_SERVER_IDENTITY_HEADER") or None
     extra = {}
+    if args.objects is not None:
+        extra["objects"] = args.objects
     if args.database is not None:
         extra["database"] = args.database
     try:
@@ -551,6 +553,11 @@ def cmd_server_serve(args):
             extra["firebase"] = firebase
         if _open_signup_from_args(args, firebase, plans):
             extra["open_signup"] = True
+        min_client = args.min_client_version
+        if min_client is None:
+            min_client = os.environ.get("AGENTICML_SERVER_MIN_CLIENT_VERSION") or None
+        if min_client is not None:
+            extra["min_client_version"] = min_client
         serve(args.data, args.host, args.port, public_url,
               trusted_proxies=parse_trusted_proxies(proxies),
               identity_header=parse_identity_header(identity),
@@ -884,7 +891,11 @@ def cmd_server_workspaces(args):
             confirmation = args.yes_delete if args.yes_delete is not None else input('Type the workspace slug to delete it: ')
             if confirmation != args.slug:
                 raise ValueError('workspace deletion not confirmed')
-            row = delete_workspace(db, data, args.slug)
+            from .server.objectstore import open_backend
+            backend = open_backend(args.objects if args.objects is not None else os.environ.get('AGENTICML_SERVER_OBJECTS'), data)
+            row = delete_workspace(db, data, args.slug, objects=backend)
+            if row.get('object_cleanup_failed'):
+                print(f"Warning: object cleanup failed for workspace {row['id']}; bytes are orphaned", file=sys.stderr)
             log.record(actor, 'cli', 'workspace.delete', row['id'], detail={'slug': args.slug})
         elif action == 'recount':
             from .server.db.usage import UsageRepo
@@ -969,8 +980,10 @@ def _cmd_server_report(args, verify=False):
     from .server.db.errors import DatabaseError
 
     try:
-        report = (admin.verify(args.data, progress=not args.json, database=args.database) if verify
-                  else admin.status(args.data, database=args.database))
+        report = (admin.verify(args.data, progress=not args.json, database=args.database, objects=args.objects,
+                               workspace=args.workspace, deep=args.deep) if verify
+                  else admin.status(args.data, database=args.database, objects=args.objects,
+                                    workspace=args.workspace))
         if args.json:
             print(json.dumps(report, indent=2, sort_keys=True))
         else:
@@ -993,6 +1006,32 @@ def cmd_server_status(args):
 
 def cmd_server_verify(args):
     return _cmd_server_report(args, verify=True)
+
+
+def cmd_server_backup(args):
+    from .server import backup
+    from .server.db.errors import DatabaseError
+
+    try:
+        report = backup.backup(args.to, data=args.data, database=args.database, objects=args.objects,
+                               files_only=args.files_only)
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+    except backup.BackupError as exc:
+        print(f"agenticml server: {exc}", file=sys.stderr)
+        return 1
+    except DatabaseError as exc:
+        print(f"agenticml server: {exc}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, OverflowError) as exc:
+        print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(backup.format_report(report, args.to))
+    return 0
 
 
 def cmd_server_reindex(args):
@@ -1030,6 +1069,74 @@ def cmd_server_reindex(args):
                 counts[key] += result[key]
         print(f"adopted {counts['adopted']}, removed {counts['removed']}, rebuilt {counts['rebuilt']}")
         return 0
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+    except (DatabaseError, DatabaseUrlError, SchemaTooNew) as exc:
+        print(f"agenticml server: {exc}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, OverflowError) as exc:
+        print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
+        return 2
+    finally:
+        if handle is not None:
+            handle.close()
+
+
+def cmd_server_metrics_rebuild(args):
+    from .server.app import acquire_server_lock
+    from .server.db import for_server_dir, resolve_url, _is_postgres
+    from .server.db.backfill import lock_run
+    from .server.db.errors import DatabaseBusy, DatabaseError, DatabaseUrlError, SchemaTooNew
+    from .server.db.repos import RunRepo
+    from .server.db.workspaces import WorkspaceRepo
+    from .server.workspaces import prepare_store
+
+    handle = None
+    try:
+        data, directory = _server_data_dir(args)
+        try:
+            if not _is_postgres(resolve_url(data, args.database)):
+                handle = acquire_server_lock(data / "server")
+        except ValueError as exc:
+            cause = exc.__cause__
+            if isinstance(cause, OSError) and cause.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                raise ValueError("stop the server first") from exc
+            raise
+        db = for_server_dir(directory, args.database)
+        workspaces = WorkspaceRepo(db)
+        selected = [workspaces.require(args.workspace)] if args.workspace else workspaces.list()
+        run_id = args.run_id
+        if run_id is not None and not valid_run_id(run_id):
+            raise ValueError("invalid run id")
+        rebuilt = 0
+        skipped = 0
+        found = False
+        for workspace in selected:
+            wid = workspace['id']
+            root = prepare_store(data, wid)
+            repo = RunRepo(db, wid)
+            if run_id is not None:
+                if repo.get(run_id) is None:
+                    continue
+                ids = [run_id]
+                found = True
+            else:
+                ids = [row['run_id'] for row in repo.all_rows()]
+            for current in ids:
+                try:
+                    with lock_run(db, wid, current):
+                        repo.rebuild_metrics(current, root)
+                except DatabaseBusy:
+                    print(f"agenticml server: warning: skipped locked run {current}",
+                          file=sys.stderr)
+                    skipped += 1
+                    continue
+                rebuilt += 1
+        if run_id is not None and not found:
+            raise ValueError("unknown run")
+        print(f"rebuilt {rebuilt}")
+        return 1 if skipped else 0
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return 130
@@ -1524,6 +1631,8 @@ def main(argv=None):
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     parser = argparse.ArgumentParser(prog="agenticml")
+    from . import __version__
+    parser.add_argument("--version", action="version", version="%(prog)s " + __version__)
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("run", help="Run a Python script inside a tracked run")
 
@@ -1603,6 +1712,7 @@ def main(argv=None):
     p_serve = server_sub.add_parser("serve", help="Serve protocol v2 ingest")
     p_serve.add_argument("--data", default=None, help="Data directory (default: AGENTICML_SERVER_DATA or ~/.agenticml-server)")
     p_serve.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_serve.add_argument("--objects", default=None, metavar="URL", help="Object backend (default: AGENTICML_SERVER_OBJECTS or file://)")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8080)
     p_serve.add_argument("--public-url", default=None, help="Public server URL (default: AGENTICML_SERVER_PUBLIC_URL)")
@@ -1619,6 +1729,9 @@ def main(argv=None):
     p_serve.add_argument("--limits", default=None, metavar="FILE", help="Workspace limits JSON (default: AGENTICML_SERVER_LIMITS)")
     p_serve.add_argument("--open-signup", action="store_true",
                         help="Allow verified Firebase sign-in to create an account (default: AGENTICML_SERVER_OPEN_SIGNUP)")
+    p_serve.add_argument("--min-client-version", default=None, metavar="X.Y",
+                         help="Reject agenticml-lite clients older than this on /v2 "
+                              "(default: AGENTICML_SERVER_MIN_CLIENT_VERSION or 2.2)")
     p_serve.set_defaults(func=cmd_server_serve)
     p_up = server_sub.add_parser("up", help="Serve on loopback through Tailscale Funnel")
     p_up.add_argument("--data", default=None, help="Data directory (default: AGENTICML_SERVER_DATA or ~/.agenticml-server)")
@@ -1638,18 +1751,53 @@ def main(argv=None):
                      help="Allow verified Firebase sign-in to create an account (default: AGENTICML_SERVER_OPEN_SIGNUP)")
     p_up.set_defaults(func=cmd_server_up)
     for action, func, help_text in (
-            ("status", cmd_server_status, "Show runs, sizes, and key activity"),
-            ("verify", cmd_server_verify, "Check objects, run sizes, and lineage")):
+            ("status", cmd_server_status, "Show runs, sizes, and key activity per workspace"),
+            ("verify", cmd_server_verify, "Check objects, run sizes, and lineage per workspace")):
         child = server_sub.add_parser(action, help=help_text)
         child.add_argument("--data", default=None)
         child.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+        child.add_argument("--objects", default=None, metavar="URL",
+                           help="Object backend (default: AGENTICML_SERVER_OBJECTS or file://)")
+        child.add_argument("--workspace", default=None, metavar="SLUG",
+                           help="Workspace slug (default: every workspace)")
+        if action == "verify":
+            child.add_argument("--deep", action="store_true",
+                               help="Re-hash every S3 object (file objects are always hashed)")
         child.add_argument("--json", action="store_true")
         child.set_defaults(func=func)
+    p_backup = server_sub.add_parser(
+        "backup", help="Copy the database and files of a running server to a directory",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="The server may keep running. The database is copied first, then each run file up to its\n"
+               "committed size, so the copy is consistent.\n\n"
+               "Restore (SQLite): agenticml server serve --data DIR\n"
+               "Restore (Postgres): restore the pg_dump into an empty database, then run\n"
+               "  agenticml server serve --data DIR --database URL\n"
+               "Postgres needs a dump first: pg_dump --format=custom \"$DATABASE_URL\" > DIR/server.dump,\n"
+               "then --files-only here. S3 objects are not copied (use bucket versioning or AWS Backup).")
+    p_backup.add_argument("--to", required=True, metavar="DIR",
+                          help="Backup directory (must not exist or be empty; not inside the data directory)")
+    p_backup.add_argument("--data", default=None)
+    p_backup.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_backup.add_argument("--objects", default=None, metavar="URL",
+                          help="Object backend (default: AGENTICML_SERVER_OBJECTS or file://)")
+    p_backup.add_argument("--files-only", action="store_true",
+                          help="Postgres: copy files only, after taking a pg_dump")
+    p_backup.add_argument("--json", action="store_true")
+    p_backup.set_defaults(func=cmd_server_backup)
     p_reindex = server_sub.add_parser("reindex", help="Rebuild the run index from on-disk files")
     p_reindex.add_argument("--data", default=None)
     p_reindex.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
     p_reindex.add_argument("--workspace", default=None, help="Workspace slug (default: every workspace)")
     p_reindex.set_defaults(func=cmd_server_reindex)
+    p_metrics = server_sub.add_parser("metrics", help="Rebuild metric summaries")
+    metrics_sub = p_metrics.add_subparsers(dest="metrics_action", required=True)
+    p_rebuild = metrics_sub.add_parser("rebuild", help="Recompute metric summaries from committed files")
+    p_rebuild.add_argument("--data", default=None)
+    p_rebuild.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_rebuild.add_argument("--workspace", default=None, help="Workspace slug (default: every workspace)")
+    p_rebuild.add_argument("--run", default=None, dest="run_id", help="Run id (default: every run)")
+    p_rebuild.set_defaults(func=cmd_server_metrics_rebuild)
     p_workspaces = server_sub.add_parser('workspaces', help='Manage server workspaces')
     ws_sub = p_workspaces.add_subparsers(dest='workspaces_action', required=True)
     for action in ('list', 'create', 'rename', 'suspend', 'resume', 'delete', 'set-owner', 'recount', 'usage', 'set-plan'):
@@ -1683,6 +1831,7 @@ def main(argv=None):
             child.add_argument('--name', required=True)
             child.add_argument('--slug', dest='new_slug', default=None)
         elif action == 'delete':
+            child.add_argument('--objects', default=None, metavar='URL')
             child.add_argument('--yes-delete', default=None, metavar='SLUG')
         elif action == 'set-owner':
             child.add_argument('--owner', required=True)

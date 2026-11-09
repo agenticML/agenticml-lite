@@ -547,14 +547,17 @@ features from D3.
 
 ## Release checklist
 
-- [ ] Packages 16–25 done, each with its plan file and tests.
-- [ ] `testbed/.venv/bin/python -m pytest -q tests` passes on SQLite, and
+- [x] Packages 16–25 done, each with its plan file and tests (24.3 is the
+      owner's AWS apply; see the roadmap Backlog).
+- [x] `testbed/.venv/bin/python -m pytest -q tests` passes on SQLite, and
       the server suite passes on Postgres in CI.
-- [ ] UI suite passes; no horizontal overflow at 375px.
-- [ ] `scripts/server_smoke.sh` passes on a fresh venv with the base install
+- [x] UI suite passes; no horizontal overflow at 375px.
+- [x] `scripts/server_smoke.sh` passes on a fresh venv with the base install
       (no extras).
-- [ ] A 2.2 client syncs to 3.0 (self-hosted and hosted).
-- [ ] Exit criteria 1–7 hold.
+- [ ] A 2.2 client syncs to 3.0 (self-hosted and hosted). Self-hosted: done
+      (`tests/test_server_client_window.py`); hosted: owner, after 24.3.
+- [ ] Exit criteria 1–7 hold. 1–5 hold (tests); 6 and 7 need the live
+      hosted service (owner, roadmap Backlog).
 - [ ] Terms of service, acceptable use policy and privacy policy published
       on agenticml.xyz before sign-up opens (owner; not code).
-- [ ] Docs updated; roadmap statuses set; version 3.0.0.
+- [x] Docs updated; roadmap statuses set; version 3.0.0.

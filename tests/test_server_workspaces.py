@@ -479,10 +479,15 @@ def test_reader_and_code_diff_caches_include_workspace(two, monkeypatch):
             assert reader_b.remote()['owner'] == 'bob'
             assert server.cached_reader('same', workspace_id=a['id']) is reader_a
             assert server.cached_reader('same', workspace_id=b['id']) is reader_b
-    calls = []
-    def diff(root, *args):
-        calls.append(root)
-        return {'files': [], 'workspace_store': str(root)}
+    opened = []
+    class FakeObjects:
+        def open(self, workspace_id, sha):
+            opened.append((workspace_id, sha))
+            return io.BytesIO(b'')
+    monkeypatch.setattr(server, 'objects', FakeObjects())
+    def diff(open_object, *args):
+        open_object('0' * 64).close()
+        return {'files': [], 'workspace_id': opened[-1][0]}
     monkeypatch.setattr(ui, '_code_pair_diff', diff)
     class Budget:
         def exhausted(self):
@@ -491,7 +496,7 @@ def test_reader_and_code_diff_caches_include_workspace(two, monkeypatch):
     result_b = server.code_pair_diff('a', 'b', Budget(), workspace_id=b['id'])
     assert result_a != result_b
     assert server.code_pair_diff('a', 'b', Budget(), workspace_id=a['id']) == result_a
-    assert calls == [store_root(server.data_dir, a['id']), store_root(server.data_dir, b['id'])]
+    assert opened == [(a['id'], '0' * 64), (b['id'], '0' * 64)]
 
 
 CROSS_WORKSPACE_CREDENTIALS = (

@@ -12,17 +12,23 @@ import stat
 import time
 from urllib.parse import urlsplit
 
-from agenticml.store import layout, objects
+from agenticml.store import layout
 from agenticml.store.overview import Overview
 from agenticml.store.reader import last_step_from_size, parse_artifacts_json
 from agenticml.ui.server import DashboardHandler
+from .objectstore import ObjectStoreUnavailable
 from .db.errors import DatabaseBusy
 from . import lineage
+from .clientwindow import too_old, upgrade_message
 from .db import DatabaseError
 from .db.usage import UsageRepo
 from .access import WorkspaceNotFound
 from .limits import LimitReached
 from .keys import KeyStoreUnavailable
+from .metrics import (
+    empty_summary, fold, parse_index_obj, read_range,
+    series_id_from_path, summarize_file,
+)
 from .runs import APPEND as _APPEND, ATOMIC as _ATOMIC, list_row_from_bytes
 from .users import allowed, resolve
 
@@ -152,6 +158,9 @@ class IngestHandler(DashboardHandler):
             if route == "health":
                 self._json({"ok": True})
                 return
+            # Not whoami: 2.x clients show a 4xx on it as "not an agenticml server".
+            if route != "whoami" and too_old(self.headers.get("User-Agent"), self.server.min_client):
+                _fail(426, upgrade_message(self.server.min_client))
             record, principal = self._authenticate()
             self.principal = principal
             if self.server.plans is not None:
@@ -271,6 +280,10 @@ class IngestHandler(DashboardHandler):
             self._error({"error": "request body timeout"}, 408)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             self.close_connection = True
+        except ObjectStoreUnavailable:
+            self.close_connection = True
+            if not getattr(self, "_started", False):
+                self._json({"error": "object store unavailable"}, 503, {"Retry-After": "5"})
         except DatabaseBusy:
             self.close_connection = True
             self._json({"error": "key store unavailable"}, 503, {"Retry-After": "5"})
@@ -316,7 +329,7 @@ class IngestHandler(DashboardHandler):
             else:
                 growth = length - committed
         elif route == 'object':
-            growth = (0 if usage.has_object(args[0]) or objects.has(self.workspace.root, args[0])
+            growth = (0 if usage.has_object(args[0]) or self.server.objects.exists(self.workspace.id, args[0])
                       else length)
         # Pre-check without a lock for early refusal; re-check under the
         # per-workspace quota lock after receipt so slow bodies never hold
@@ -540,7 +553,8 @@ class IngestHandler(DashboardHandler):
                 upload_bytes=len(body) if self.server.plans is not None else None,
                 upload_clock=self._upload_clock(),
                 expected_size=committed, expected_sha256=committed_sha,
-                publish=publish)
+                publish=publish,
+                metric_names=parse_index_obj(obj) if name == "scalars/index.json" else None)
         except BaseException as exc:
             lock_lost = False
             try:
@@ -729,7 +743,7 @@ class IngestHandler(DashboardHandler):
         if (not isinstance(hashes, list) or len(hashes) > self.server.limits.missing_hashes
                 or any(not layout.valid_sha(sha) for sha in hashes)):
             _fail(422, "invalid objects")
-        self._json({"missing": [sha for sha in dict.fromkeys(hashes) if not objects.has(self.workspace.root, sha)]})
+        self._json({"missing": self.server.objects.missing(self.workspace.id, hashes)})
 
     def _object(self, sha, tmp, actual):
         if sha != actual:
@@ -740,30 +754,17 @@ class IngestHandler(DashboardHandler):
         with self.workspace.object_lock(sha), self._quota_lock("object"):
             if self.server.plans is not None:
                 self._check_quota("object", (sha,), "", tmp.stat().st_size)
-            dest = layout.object_path(self.workspace.root, sha)
-            if (dest.exists() or dest.is_symlink()) and not _regular(dest):
-                raise ValueError("unsafe object destination")
-            if objects.has(self.workspace.root, sha):
-                os.utime(dest, None, follow_symlinks=False)
-                self._record_object(sha, dest.lstat().st_size, created=False)
-                return {"sha256": sha, "created": False}, 200
+            backend = self.server.objects
+            size = tmp.stat().st_size
+            created = backend.put(self.workspace.id, sha, tmp, size)
             try:
-                dest.parent.mkdir(parents=True)
-                created_prefix = True
-            except FileExistsError:
-                created_prefix = False
-            layout.object_path(self.workspace.root, sha)
-            if created_prefix:
-                layout.fsync_dir(dest.parent.parent)
-            os.replace(tmp, dest)
-            layout.fsync_dir(dest.parent)
-            try:
-                self._record_object(sha, dest.lstat().st_size, created=True)
+                self._record_object(sha, size if created else backend.size(self.workspace.id, sha),
+                                    created=created)
             except Exception:
-                dest.unlink()
-                layout.fsync_dir(dest.parent)
+                if created:
+                    backend.delete(self.workspace.id, sha)
                 raise
-            return {"sha256": sha, "created": True}, 201
+            return {"sha256": sha, "created": created}, 201 if created else 200
 
     def _record_object(self, sha, size, *, created):
         with self.server.db.transaction(write=True) as tx:
@@ -834,9 +835,13 @@ class IngestHandler(DashboardHandler):
             layout.fsync_dir(path.parent)
             self.server._after_append_write(run_id, name)
             last_step = self._time_step(path, length) if name == _TIME_PATH else None
+            metric, metric_replace, metric_path = self._series_metric(
+                directory, name, committed, length, truncate=True)
             self.workspace.run_index.record_file(run_id, name, length, last_step=last_step,
                                                  upload_bytes=length if self.server.plans is not None else None, upload_clock=self._upload_clock(),
-                                                 expected_size=committed)
+                                                 expected_size=committed,
+                                                 metric=metric, metric_replace=metric_replace,
+                                                 metric_path=metric_path)
             return {"size": length}, 200
         with layout.open_nofollow(path, "ab"):
             pass
@@ -916,9 +921,13 @@ class IngestHandler(DashboardHandler):
                 raise
         self.server._after_append_write(run_id, name)
         last_step = self._time_step(path, new_size) if name == _TIME_PATH else None
+        metric, metric_replace, metric_path = self._series_metric(
+            directory, name, committed, new_size, truncate=False)
         self.workspace.run_index.record_file(run_id, name, new_size, last_step=last_step,
                                              upload_bytes=length if self.server.plans is not None else None, upload_clock=self._upload_clock(),
-                                             expected_size=committed)
+                                             expected_size=committed,
+                                             metric=metric, metric_replace=metric_replace,
+                                             metric_path=metric_path)
         return {"size": new_size}, 200
 
     @staticmethod
@@ -927,6 +936,17 @@ class IngestHandler(DashboardHandler):
             return last_step_from_size(path, size)
         except (OSError, ValueError):
             return None
+
+    def _series_metric(self, directory, name, committed, new_size, *, truncate):
+        series_id = series_id_from_path(name)
+        if series_id is None:
+            return None, False, None
+        dest = self._target(directory, name)
+        if truncate:
+            summary = summarize_file(dest, new_size)
+        else:
+            summary = fold(empty_summary(), read_range(dest, committed, new_size))
+        return (series_id, summary), truncate, dest
 
     def _commit(self, run_id, directory, body, remote):
         obj = _json_object(body)

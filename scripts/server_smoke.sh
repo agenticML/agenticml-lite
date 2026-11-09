@@ -125,6 +125,9 @@ printf '%s' "$admin_key" | \
     --header 'Content-Type: application/json' --header 'X-AgenticML-Request: 1' --header "Origin: $base_url" \
     --cookie-jar "$temp_dir/cookies" --data-binary @- "$base_url/login" > /dev/null
 curl --silent --show-error --fail --max-time 10 --cookie "$temp_dir/cookies" \
+    "$base_url/w/default/" >"$temp_dir/page.html"
+grep --quiet --ignore-case '<html' "$temp_dir/page.html" || { echo "smoke: /w/default/ is not a page" >&2; exit 1; }
+curl --silent --show-error --fail --max-time 10 --cookie "$temp_dir/cookies" \
     "$base_url/api/w/default/runs" >"$temp_dir/runs.json"
 "$PYTHON" - "$temp_dir/runs.json" "$run_id" <<'PY'
 import json
@@ -157,4 +160,21 @@ else
     exit 1
 fi
 echo 'smoke: server exited 0 on SIGTERM'
+
+# The data directory is free again: status and verify read the same store.
+"$PYTHON" -m agenticml server status --data "$temp_dir/data" --json >"$temp_dir/status.json"
+"$PYTHON" -m agenticml server verify --data "$temp_dir/data" --json >"$temp_dir/verify.json"
+"$PYTHON" - "$temp_dir" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+temp = Path(sys.argv[1])
+status = json.loads((temp / "status.json").read_text())
+assert status["runs"]["total"] == 1 and status["runs"]["by_status"]["finished"] == 1, status
+assert [item["slug"] for item in status["workspaces"]] == ["default"], status["workspaces"]
+verify = json.loads((temp / "verify.json").read_text())
+assert verify["ok"] is True and verify["problems"] == [], verify
+assert verify["checked"]["runs"] == 1 and verify["checked"]["objects"] >= 1, verify
+PY
 echo 'smoke: OK'

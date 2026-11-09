@@ -122,6 +122,9 @@ class WorkspaceContext:
     def run_lock(self, run_id):
         return self.server.run_lock(run_id, workspace_id=self.id)
 
+    def open_object(self, sha):
+        return self.server.objects.open(self.id, sha)
+
     def object_lock(self, sha):
         return self.server.object_lock(sha, workspace_id=self.id)
 

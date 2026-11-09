@@ -1,556 +1,446 @@
 # AgenticML Server
 
-`agenticml server` is a self-hosted synchronization server and shared web dashboard for AgenticML runs.
+`agenticml server` is a synchronization server and shared web dashboard for AgenticML runs.
+
+It runs in two modes from the same codebase:
+- **Self-hosted**: runs on your own hardware or VM. Server state lives in SQLite, run files and objects on local disk. One workspace (`default`) is configured by default; operators can create more. No external dependencies, no Docker container required.
+- **Hosted**: multi-workspace deployment on AWS. Server state lives in PostgreSQL (Amazon RDS), content-addressed objects in Amazon S3, run files and shadow Git lineage on Amazon EFS. Multiple server processes run behind an Application Load Balancer on a single hostname (`app.agenticml.xyz`) with Firebase authentication.
 
 ## Architecture
 
-The server runs as a single process backed by a single data directory.
+- **Workspaces**: All experiment runs, API keys, and team memberships belong to a workspace. Workspaces provide strict data isolation on a single server hostname.
+- **Database storage**: Server state (accounts, workspaces, memberships, API keys, sessions, audit events, run metadata, committed file sizes, and metric summaries) lives in a SQL database: SQLite for single-process self-hosted deployments, PostgreSQL for multi-process or hosted deployments.
+- **Run files**: Raw run files (`meta.json`, `events.jsonl`, `scalars/*`, `media/index.json`) and shadow Git lineage repositories remain in standard filesystem directories (`<data>/workspaces/<workspace_id>/store/` and `lineage/`).
+- **Object storage**: Blobs (source code snapshots, media files, and copied artifacts) are content-addressed by SHA-256 and stored on local disk under `<data>/workspaces/<workspace_id>/store/objects/` or in Amazon S3. Objects are isolated per workspace.
+- **Single-writer vs multi-process**:
+  - SQLite deployments acquire an exclusive lock on `<data>/server/server.lock` and run as a single process.
+  - PostgreSQL deployments support multiple concurrent server processes sharing the database and data directory. Concurrency is coordinated through database row locks and transactional advisory locks.
+- **Network and TLS**: The server serves plain HTTP over a single TCP port. In production, run it behind a TLS-terminating reverse proxy such as AWS ALB, Caddy, or Tailscale.
 
-- **Storage**: The server stores experiment runs in `<data>/store/` using the standard v1 store layout described in [FORMAT.md](FORMAT.md).
-- **Single writer**: The server process acquires an exclusive file lock on `<data>/server/server.lock`. If another server process attempts to start against the same data directory, it exits with:
-  ```
-  another agenticml server is using <data>
-  ```
-- **POSIX requirement**: The server relies on POSIX `fcntl` file locking. It runs on Linux and POSIX-compliant hosts. It does not run directly on Windows (the client CLI and `agenticml ui` support Windows).
-- **Network and TLS**: The server serves plain HTTP over a single TCP port. In production, run it behind a TLS-terminating reverse proxy such as AWS Application Load Balancer (ALB), Tailscale Serve, or Caddy.
+## Installation and extras
 
-## Installation and running
-
-Install `agenticml-lite` into a virtual environment on a POSIX host (Python 3.10+):
+Install `agenticml-lite` into a Python virtual environment (Python 3.10+ on Linux or POSIX hosts):
 
 ```bash
-sudo python3 -m venv /opt/agenticml
-sudo /opt/agenticml/bin/python -m pip install agenticml-lite
+python3 -m venv /opt/agenticml
+/opt/agenticml/bin/pip install agenticml-lite
 ```
 
-Run directly (a venv anywhere the user owns is fine, e.g. `python3 -m venv ~/agenticml-venv`):
+The base package has zero required third-party dependencies and uses the standard library SQLite backend and local filesystem object storage.
+
+Optional extras are available for PostgreSQL, S3, and Firebase:
+
 ```bash
-/opt/agenticml/bin/agenticml server serve --data DIR --host 127.0.0.1 --port 8080 --public-url https://...
+# PostgreSQL database backend (psycopg binary)
+pip install "agenticml-lite[postgres]"
+
+# Amazon S3 object storage (boto3)
+pip install "agenticml-lite[s3]"
+
+# Firebase ID token verification (PyJWT with cryptography)
+pip install "agenticml-lite[firebase]"
+
+# Hosted bundle: postgres, s3, and firebase
+pip install "agenticml-lite[hosted]"
 ```
-`--data` falls back to `AGENTICML_SERVER_DATA`, then `~/.agenticml-server`. `--public-url` falls back to `AGENTICML_SERVER_PUBLIC_URL`.
 
-### Quick start on a laptop: `server up`
+## Running the server
 
-On a Mac or Linux machine with Tailscale already installed and logged in:
+Start the server using `agenticml server serve`:
+
+```bash
+agenticml server serve --data /var/lib/agenticml-server --host 127.0.0.1 --port 8080 --public-url https://aml.example.com
+```
+
+### Quick start on a workstation: `server up`
+
+On a machine with Tailscale installed and logged in:
 
 ```bash
 agenticml server up
 ```
 
-`server up` makes the server reachable from the public internet through Tailscale Funnel: anyone can reach the login page; credentials grant access. It takes port 443 of this machine's Tailscale serve config. This checks that Tailscale is running and that HTTPS certificates and Funnel are already allowed in the admin console (those approvals stay manual), creates the first admin user with a 72-hour invite link if no admin exists, serves on loopback, and turns Funnel on until the server stops. `Ctrl+C`, SIGTERM, or SIGHUP (closing the terminal) turns Funnel off. After SIGKILL, a crash, or power loss, Funnel stays on. The next `server up` on the same port turns it back on and off again; a stale Funnel entry for a different port is refused ("Tailscale already serves port 443 on this machine: check `tailscale funnel status` and turn it off first") and must be turned off with `tailscale funnel --https=443 off` first. `server up` trusts its local Tailscale proxy on loopback (`127.0.0.1`, `::1`), and failed-login throttling uses the real client address from `X-Forwarded-For` (rightmost untrusted hop) plus a per-user-name bucket, so Funnel visitors do not share one bucket.
+`server up` makes the server reachable over the public internet through Tailscale Funnel. It binds loopback port 8080, configures Funnel on port 443 of the machine's Tailscale domain, and generates a first-admin invite link if no admin exists. Throttling uses client addresses from `X-Forwarded-For` and per-account buckets.
 
-To start at login (systemd user unit on Linux, launchd agent on macOS):
+To install as a background user service (systemd user unit on Linux, launchd agent on macOS):
 
 ```bash
 agenticml server up --install
 ```
 
-Then run the `systemctl --user` / `loginctl enable-linger` or `launchctl load` command it prints.
+### Production systemd service
 
-The rest of this page is the manual path: `server serve` plus your own TLS proxy (including production systemd).
-
-### TLS proxy
-
-The server serves plain HTTP over its configured port (typically loopback `127.0.0.1:8080`). In production or across a network, terminate TLS using a reverse proxy and configure the public URL:
-
-- **Laptop or workstation (Tailscale):**
-  ```bash
-  tailscale serve --bg 8080
-  export AGENTICML_SERVER_PUBLIC_URL=https://<machine>.<tailnet>.ts.net
-  ```
-  Or replace those steps with `agenticml server up` (Funnel instead of Serve; see above).
-- **Production:** Run behind Caddy, Nginx, or a cloud load balancer. Set the public URL to the proxied HTTPS URL.
-
-### Systemd service
-
-A production system unit example is provided in [deploy/systemd/agenticml-server.service](../deploy/systemd/agenticml-server.service). See [deploy/systemd/README.md](../deploy/systemd/README.md) for full setup instructions:
+For Linux production systems, run the server as a systemd system service. See [deploy/systemd/agenticml-server.service](../deploy/systemd/agenticml-server.service) and [deploy/systemd/README.md](../deploy/systemd/README.md):
 
 ```bash
 sudo python3 -m venv /opt/agenticml
 sudo /opt/agenticml/bin/python -m pip install agenticml-lite
 sudo useradd --system --home /var/lib/agenticml-server --shell /usr/sbin/nologin agenticml
-sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.2.0/deploy/systemd/agenticml-server.service
+sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v3.0.0/deploy/systemd/agenticml-server.service
 ```
 
-Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`). Edit `AGENTICML_SERVER_PUBLIC_URL` in the unit (or `sudo systemctl edit agenticml-server`), then `daemon-reload` and `enable --now`:
+Edit `/etc/systemd/system/agenticml-server.service` or use `sudo systemctl edit agenticml-server` to set `AGENTICML_SERVER_PUBLIC_URL`. Then enable and start the service:
 
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now agenticml-server
 ```
 
-The unit runs under the `agenticml` user and group, stores data in `/var/lib/agenticml-server` (managed by `StateDirectory`), binds `127.0.0.1:8080`, and reads optional environment settings from `/etc/agenticml-server.env`.
-
 Check service status and logs:
+
 ```bash
 sudo systemctl status agenticml-server
 sudo journalctl -u agenticml-server -f
 ```
-Stop the service:
-```bash
-sudo systemctl stop agenticml-server
-```
 
-## Authentication and keys
+## Workspaces and routing
 
-All API and dashboard requests (except `GET /healthz`) require authentication.
+All data on the server is scoped to a workspace.
 
-### Users and roles
+### Workspace URLs
 
-AgenticML supports multiple users with role-based access. Every user has one of three roles:
+- Dashboard views: `/w/<slug>/...` (e.g. `/w/default/`, `/w/team-a/runs/20261109...`).
+- Dashboard APIs: `/api/w/<slug>/...`.
+- Global routes (no workspace prefix): `/account`, `/login`, `/invite`, `/healthz`, and `/admin/workspaces`.
 
-| Action | `viewer` | `member` | `admin` |
-| --- | --- | --- | --- |
-| Read dashboard (every project) | yes | yes | yes |
-| Change own password | yes | yes | yes |
-| Edit run notes | – | yes | yes |
-| Sync (`/v2` writes) with own keys | – | yes | yes |
-| Issue / revoke own sync keys | – | yes | yes |
-| Hold admin-scope keys, sign in with a key | – | – | yes |
-| See / revoke everyone's keys, issue keys for anyone | – | – | yes |
-| Manage users, change roles, create invite links | – | – | yes |
-| Read the audit log | – | – | yes |
+When an account belongs to multiple workspaces, the dashboard provides a workspace switcher in the navigation menu. Navigating to `/` redirects to the last-used workspace or the workspace selection page.
 
-- **Project visibility**: Viewers and members see every project on the server. Access is server-wide; there is no per-project access control.
-- **Ownership**: Keys belong to users, and runs belong to users. Any key belonging to a person can write to runs owned by that person and nobody else's (including admins).
-- **Viewer keys**: A key belonging to a user with role `viewer` can only call `GET /v2/whoami`. Every other `/v2` endpoint returns `403 Forbidden` (`{"error": "role viewer cannot sync"}`). Viewers read through the web dashboard, not through sync keys.
+### Roles and permissions
 
-#### Managing users with the CLI
+Every member of a workspace holds one of four roles within that workspace:
 
-Manage users with `agenticml server users`:
+| Action | `viewer` | `member` | `admin` | `owner` |
+| --- | --- | --- | --- | --- |
+| Read dashboard and runs | yes | yes | yes | yes |
+| Edit run notes | – | yes | yes | yes |
+| Sync runs (`/v2` writes) | – | yes | yes | yes |
+| Issue / revoke own sync keys | – | yes | yes | yes |
+| Manage workspace members and invites | – | – | yes | yes |
+| Issue / revoke keys for any member | – | – | yes | yes |
+| Change workspace settings and rename | – | – | yes | yes |
+| Delete workspace | – | – | – | yes |
 
-```bash
-# Add a user (prints a one-time invite link; role defaults to member)
-agenticml server users add NAME [--role viewer|member|admin] [--identity ID] [--no-invite] [--reclaim-runs] [--public-url URL] [--data DIR]
+- **`owner`**: The creator of the workspace. A workspace has exactly one owner. The owner cannot be removed or demoted. Ownership can be transferred with `server workspaces set-owner`.
+- **`admin`**: Full administrative rights within the workspace (members, invites, keys, notes, settings).
+- **`member`**: Can sync runs, edit notes, and manage their own sync keys.
+- **`viewer`**: Read-only dashboard access. Viewer sync keys can only call `GET /v2/whoami`; all other `/v2` endpoints return `403 Forbidden`.
 
-# List all users
-agenticml server users list [--json] [--data DIR]
+### Server administrators
 
-# Remove a user and revoke their keys (their runs keep their owner)
-agenticml server users remove NAME [--data DIR]
+A global account can have the `server_admin` flag set. Server administrators:
+- Manage workspaces: create, rename, suspend, resume, and delete workspaces.
+- Manage accounts: list accounts, create accounts, and grant or revoke server administrator privileges.
+- View global storage and usage across all workspaces.
+- Configure workspace plans and limits.
+- **Isolation boundary**: Server administrators cannot view, list, or download runs or files within a workspace unless they are explicitly added as a member of that workspace.
 
-# Change a user's role
-agenticml server users set-role NAME ROLE [--data DIR]
+### Workspace management CLI
 
-# Set or clear a user's proxy identity (omit ID to clear)
-agenticml server users set-identity NAME [ID] [--data DIR]
-
-# Create a fresh 72-hour invite link
-agenticml server users invite NAME [--public-url URL] [--data DIR]
-
-# Set a password directly via CLI
-agenticml server users set-password NAME [--stdin] [--data DIR]
-```
-
-User management rules:
-- **Last admin guard**: The last admin user cannot be removed or demoted.
-- **Reclaiming runs**: Re-adding a user name that still owns runs requires `--reclaim-runs` to prevent accidentally inheriting previous runs.
-- **Invites**: `users add` (unless `--no-invite`) and `users invite` print a one-time invite link: `<public-url>/invite?token=...`. The link is valid for 72 hours. The person chooses a password between 12 and 1024 characters there. Re-inviting a user clears their password and immediately signs them out everywhere.
-
-### Key scopes
-
-Keys belong to users and are issued with one of two scopes:
-
-| Scope | Allowed operations | Intended use |
-| --- | --- | --- |
-| `sync` | Call `/v2` endpoints (push runs, upload objects, read run state) for runs owned by the key's user. Cannot sign in to the web dashboard. | Training machines and unattended worker nodes. |
-| `admin` | Everything `sync` can do (for the admin's own runs), plus sign in to the web dashboard, issue keys, and revoke keys. Requires an admin user. | Human operators and administrators. |
-
-### Bootstrap: First admin user
-
-When a server starts with no admin user, no admin key, and `AGENTICML_SERVER_KEY` is unset, it generates a single-use setup token in memory and logs:
-
-```
-No admin user yet. Open <public-url or http://host:port>/setup?token=<token> to create one, or run: agenticml server users add admin --role admin
-```
-
-To retrieve the setup link:
-- Terminal: Check the standard output from `agenticml server serve`.
-- systemd: Run `sudo journalctl -u agenticml-server`.
-
-Open the `/setup?token=<token>` link in a browser. It prompts for a user name (default `admin`) and a password (entered twice), creates the first admin user with that password, and signs the browser in.
-
-`agenticml server up` handles bootstrap automatically: if no admin exists, it creates user `admin` (role `admin`) and prints an invite link instead of an admin key:
-```
-Open <public_url>/invite?token=<token> to choose the admin password. The link works once, for 72 hours.
-```
-
-The setup token is stored only in memory and becomes invalid once used, after a server restart, or once an admin user exists. After an admin user exists, `/setup` returns 404.
-
-### Environment admin key
-
-You can pre-configure an admin key via environment variable:
+Manage workspaces using `agenticml server workspaces`:
 
 ```bash
-export AGENTICML_SERVER_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+# List all workspaces
+agenticml server workspaces list [--json] [--database URL] [--data DIR]
+
+# Create a new workspace
+agenticml server workspaces create SLUG [--name NAME] [--owner LOGIN] [--database URL] [--data DIR]
+
+# Rename a workspace or change its slug
+agenticml server workspaces rename SLUG --name NEW_NAME [--slug NEW_SLUG] [--database URL] [--data DIR]
+
+# Suspend or resume a workspace (suspended workspaces reject all access with 404)
+agenticml server workspaces suspend SLUG [--database URL] [--data DIR]
+agenticml server workspaces resume SLUG [--database URL] [--data DIR]
+
+# Delete a workspace (requires typed confirmation of the slug; deletes files and objects)
+agenticml server workspaces delete SLUG [--yes-delete SLUG] [--objects URL] [--database URL] [--data DIR]
+
+# Transfer workspace ownership
+agenticml server workspaces set-owner SLUG --owner LOGIN [--database URL] [--data DIR]
+
+# View usage across all workspaces
+agenticml server workspaces usage [--limits FILE] [--json] [--database URL] [--data DIR]
+
+# Adjust workspace limits or plan
+agenticml server workspaces set-plan SLUG custom --storage 50GB --uploads-per-day 10GB --requests-per-minute 1200 --people 20
+agenticml server workspaces set-plan SLUG free [--database URL] [--data DIR]
+
+# Recount stored bytes from committed database state
+agenticml server workspaces recount SLUG [--database URL] [--data DIR]
+agenticml server workspaces recount --all [--database URL] [--data DIR]
 ```
 
-Under systemd, configure `AGENTICML_SERVER_KEY` in the unit's environment file (e.g. `/etc/agenticml-server.env`, owned by root with mode `0600`).
+### Account management CLI
 
-Rules for `AGENTICML_SERVER_KEY`:
-- Acts as a built-in admin user named `env`.
-- Stored only in memory; never written to `keys.json` or `users.json`.
-- Cannot be revoked from the Keys web page. To revoke it, remove the environment variable and restart the server.
-- Must consist of 32 to 256 allowed ASCII characters (`[A-Za-z0-9._~+/=-]`). The server warns at startup if the key has low entropy.
-
-### Managing keys in the dashboard
-
-Keys in the dashboard are managed per user:
-- Members see only their own keys. They can create and revoke `sync` keys for their own machines.
-- Admins see everyone's keys, can filter by user, revoke any key, and issue keys for any user.
-- Admins have access to a **Team** page in the dashboard to view users, roles, pending invite links, and activity.
-
-To create a key in the dashboard:
-1. Navigate to **Keys** in the sidebar.
-2. Click **New key**, enter a descriptive name (e.g. `gpu-cluster-1`), and select the scope (`sync` is default).
-3. The key is displayed once with a copy button and a pre-formatted `agenticml login` command. Store the key immediately; the server stores only its SHA-256 digest and cannot recover it.
-4. Click **Revoke** next to a key to revoke it. Revocation takes effect immediately without a server restart. The last admin key cannot be revoked from the page. Revoking the key your own session uses signs you out.
-
-### Managing keys with the CLI
-
-The server CLI can create, list, and revoke keys on the server host while the server is running.
+Manage global user accounts using `agenticml server accounts`:
 
 ```bash
-# Create a sync key (--user is required when more than one user exists)
-agenticml server keys create --name worker-1 --scope sync [--user USER] --data DIR
+# List all registered accounts
+agenticml server accounts list [--json] [--database URL] [--data DIR]
 
-# Create an admin key (requires an admin user)
-agenticml server keys create --name operator-2 --scope admin [--user USER] --data DIR
+# Add a global account
+agenticml server accounts add LOGIN [--display-name NAME] [--server-admin] [--database URL] [--data DIR]
 
-# List keys (optionally filter by user)
-agenticml server keys list [--user USER] --data DIR
-
-# Revoke a key
-agenticml server keys revoke worker-1 --data DIR
+# Grant or revoke server admin privileges
+agenticml server accounts set-server-admin LOGIN on|off [--database URL] [--data DIR]
 ```
 
-Under systemd, run the commands as the service user with the same data directory:
+### Workspace membership and user CLI
+
+Manage memberships and users within a specific workspace using `agenticml server users`:
 
 ```bash
-sudo -u agenticml /opt/agenticml/bin/agenticml server keys create --name worker-1 --scope sync --data /var/lib/agenticml-server
-sudo -u agenticml /opt/agenticml/bin/agenticml server keys list --data /var/lib/agenticml-server
-sudo -u agenticml /opt/agenticml/bin/agenticml server keys revoke worker-1 --data /var/lib/agenticml-server
+# Add a member to a workspace (creates global account if needed; prints invite link)
+agenticml server users add LOGIN --workspace SLUG [--role viewer|member|admin] [--no-invite] [--public-url URL]
+
+# Generate a 72-hour invite link for a user
+agenticml server users invite LOGIN --workspace SLUG [--public-url URL]
+
+# Set a local password for a user
+agenticml server users set-password LOGIN --workspace SLUG [--stdin]
+
+# List members in a workspace
+agenticml server users list --workspace SLUG [--json]
+
+# Change a member's role
+agenticml server users set-role LOGIN member|admin --workspace SLUG
+
+# Remove a member from a workspace (revokes their keys in this workspace)
+agenticml server users remove LOGIN --workspace SLUG
+
+# Set proxy identity for header authentication
+agenticml server users set-identity LOGIN [IDENTITY] --workspace SLUG
 ```
 
-`keys create` prints the plaintext key once to stdout and status information to stderr.
+`--workspace` defaults to `default`.
 
-### Dashboard login and sessions
+## API keys and sync authentication
 
-Users sign in to the dashboard using one of three methods:
+All sync requests over [protocol v2](PROTOCOL.md) authenticate using HTTP bearer tokens:
 
-1. **User name and password**: Enter user name and password at `/login`.
-2. **Trusted identity proxy**: Automatic sign-in using proxy headers from an upstream proxy (see below).
-3. **Admin key fallback**: Administrators can sign in using an `admin`-scope key. `sync` keys never sign in (rejected with HTTP 403).
+```http
+Authorization: Bearer aml_...
+```
 
-Session management:
-- On success, the server sets a session cookie with `HttpOnly`, `SameSite=Strict`, and `Path=/`. When `--public-url` is HTTPS, the cookie is named `__Host-aml_session` and includes `Secure`; otherwise it is named `aml_session`.
-- Sessions live in memory: 12-hour idle timeout, 7-day maximum lifetime.
-- Sessions are bound to the user's account ID and generation counter. Changing a password, re-inviting, or removing a user ends their sessions everywhere.
-- Failed login attempts are throttled using the real client IP address from `X-Forwarded-For` (rightmost untrusted hop) on trusted-proxy connections, plus a per-user-name bucket (`user:<name>`).
-- CSRF protection requires requests to include the `X-AgenticML-Request` header and an `Origin` matching `--public-url`.
-- The dashboard rejects requests whose `Host` header does not match the host in `--public-url` or a loopback address (`localhost`, `127.0.0.1`, `::1`). When binding off loopback, always configure `--public-url`.
+### Key properties
 
-### Trusted identity proxy
+- **Workspace binding**: Every API key belongs to exactly one workspace and one user account.
+- **Automatic workspace resolution**: The server resolves the workspace directly from the bearer key on incoming `/v2` requests. Sync clients do not need to specify a workspace slug or URL prefix.
+- **Run ownership**: Runs synced with an API key are owned by the account associated with that key. Only keys belonging to the run's owner can write or append to that run.
+- **Identity verification**: `GET /v2/whoami` reports the calling key name, user account, role, protocol version, and the bound workspace slug (`"workspace": "<slug>"`).
+- **Multiple workspaces on one machine**: `agenticml login` saves one key per server hostname. To sync runs to different workspaces on the same server from one machine, override the key per command or training run using the `AGENTICML_API_KEY` environment variable.
 
-The server supports single sign-on using identity headers passed by a reverse proxy:
+### Managing API keys via CLI
+
+Manage keys with `agenticml server keys`:
 
 ```bash
-agenticml server serve --trusted-proxy CIDR [--trusted-proxy CIDR ...] --identity-header alb|tailscale|oauth2-proxy
+# Create an API key in a workspace (prints plaintext key once)
+agenticml server keys create --name KEY_NAME --workspace SLUG [--scope sync|admin] [--user LOGIN]
+
+# List keys in a workspace
+agenticml server keys list --workspace SLUG [--user LOGIN] [--json]
+
+# Revoke an API key immediately
+agenticml server keys revoke KEY_NAME --workspace SLUG
 ```
 
-Flags can also be configured with environment variables:
-- `AGENTICML_SERVER_TRUSTED_PROXIES`: comma-separated CIDR strings (e.g. `127.0.0.1,::1,10.0.0.0/16`). Plain IP addresses imply `/32` or `/128`.
-- `AGENTICML_SERVER_IDENTITY_HEADER`: preset name (`alb`, `tailscale`, or `oauth2-proxy`).
+`--workspace` defaults to `default`. The `--scope` flag defaults to `sync`. `admin` scope keys permit both `/v2` sync and passwordless dashboard login (self-hosted only).
 
-#### Header presets
+## PostgreSQL and multi-process deployment
 
-| Preset | Header | Matching rule |
-| --- | --- | --- |
-| `alb` | `X-Amzn-Oidc-Identity` | Exact match against user `identity`. |
-| `tailscale` | `Tailscale-User-Login` | Case-insensitive match against user `identity`. |
-| `oauth2-proxy` | `X-Forwarded-Email` | Case-insensitive match against user `identity`. |
-
-#### Proxy rules and security
-
-- **Trusted proxy requirement**: Identity headers and `X-Forwarded-For` client addresses are honoured only on connections from configured `--trusted-proxy` addresses. Requests from untrusted peers have identity headers ignored and use the direct TCP peer address.
-- **Refused catch-alls**: Addresses `0.0.0.0/0` and `::/0` are refused at startup ("refusing to trust every address").
-- **Header requires proxy**: Passing `--identity-header` without at least one `--trusted-proxy` is a startup error.
-- **Tailscale Funnel visitors**: Requests carrying the `Tailscale-Funnel-Request` header never get an identity.
-- **Unknown identity**: An unknown identity returns an HTTP 403 page ("Signed in as X by your identity proxy, but no AgenticML user has that identity. Ask an admin to run `agenticml server users set-identity NAME X`.") or JSON `{"error": "no user for this identity"}` on API routes.
-- **Assigning identities**: Set each person's identity with `agenticml server users set-identity NAME ID`.
-
-#### Proxy service examples
-
-Example flags to pass in systemd `ExecStart`:
-
-- **AWS Application Load Balancer (ALB)** in VPC subnet `10.0.0.0/16`:
-  ```bash
-  --trusted-proxy 10.0.0.0/16 --identity-header alb
-  ```
-- **Tailscale Serve** on the same host:
-  ```bash
-  --trusted-proxy 127.0.0.1 --trusted-proxy ::1 --identity-header tailscale
-  ```
-- **oauth2-proxy** on the same host:
-  ```bash
-  --trusted-proxy 127.0.0.1 --identity-header oauth2-proxy
-  ```
-
-## Client setup
-
-Configure training machines to sync experiments to the server.
-
-### 1. Install client
+For high-availability, high-throughput, or hosted deployments, configure PostgreSQL as the server database:
 
 ```bash
-pip install agenticml-lite
+agenticml server serve \
+  --data /var/lib/agenticml-server \
+  --database "postgresql://agenticml:password@db.example.com:5432/agenticml?sslmode=verify-full"
 ```
 
-### 2. Log in
+Benefits of PostgreSQL:
+- **Multiple server processes**: The single-writer `server.lock` file is bypassed. Multiple server processes can run concurrently across multiple hosts or containers behind a load balancer.
+- **Distributed concurrency**: File appends and commits use PostgreSQL row locks on `run_files` and transaction-level advisory locks (`pg_advisory_xact_lock`).
+- **Shared state**: Web sessions, failed login throttling, and rate limits are shared across all server processes in database tables.
+- **Row-Level Security**: Defense-in-depth isolation ensures queries only access rows matching the session's active workspace.
 
-On each training machine:
+Run files and shadow Git repositories must reside on a shared POSIX network filesystem (such as Amazon EFS mounted with NFSv4.1).
+
+## Amazon S3 object storage
+
+Store content-addressed blobs (code snapshots, media, copied artifacts) in Amazon S3 instead of local disk:
 
 ```bash
-agenticml login --host https://aml.example.com
+agenticml server serve \
+  --data /var/lib/agenticml-server \
+  --objects s3://my-agenticml-bucket/optional-prefix
 ```
 
-The command prompts for the API key interactively or reads it from stdin:
+S3 storage features:
+- **Key layout**: Objects are stored at `{prefix}/{workspace_id}/objects/{hh}/{sha256}`.
+- **Workspace isolation**: Objects are strictly partitioned by workspace ID. Missing-object checks (`POST /v2/objects/missing`) inspect only the calling workspace's inventory; files are never deduplicated across workspaces.
+- **Server-side encryption**: Uploads enable AWS server-side encryption (`AES256` by default). Set `AGENTICML_SERVER_S3_KMS_KEY_ID` to use AWS KMS encryption (`aws:kms`).
+- **Custom endpoints**: Use `AGENTICML_SERVER_S3_ENDPOINT_URL` for MinIO, LocalStack, or AWS VPC endpoints.
+- **Direct streaming**: Objects stream directly through the server with streaming SHA-256 verification. The server does not issue pre-signed S3 URLs, ensuring workspace access controls are enforced on every download.
+
+## Metric summaries and runs list query
+
+The server maintains per-series metric summaries in the `run_metrics` table for every run.
+
+### Summary calculation
+
+When a client appends records to `scalars/<n>.bin`, the server parses new records and updates the series summary in the same transaction:
+- `last_value`: value of the final record in append order.
+- `last_step`: step number of the final record.
+- `min_value` / `max_value`: minimum and maximum values (skipping NaN, preserving $\pm\infty$).
+- `count`: total number of records.
+
+### Query API (`/api/w/<slug>/runs`)
+
+Dashboard API queries filter and sort runs by metric summaries directly in SQL without reading run files:
+- `metrics=name1,name2`: include summary statistics for specified metric names (up to 8 metrics).
+- `sort=metric:<name>:<stat>`: sort by metric stat (`last`, `min`, `max`), e.g. `sort=metric:val_loss:min`.
+- `order=asc|desc`: sort direction (default `asc`).
+- `filter=metric:<name>:<stat>:<op>:<value>`: filter runs, e.g. `filter=metric:accuracy:last:gt:0.95`. Ops: `lt`, `le`, `gt`, `ge`, `eq` (up to 8 filters).
+
+### Rebuilding metric summaries
+
+If scalar files were copied or imported out of band, recompute summaries using `agenticml server metrics rebuild`:
 
 ```bash
-echo "$AGENTICML_API_KEY" | agenticml login --host https://aml.example.com
+agenticml server metrics rebuild [--workspace SLUG] [--run RUN_ID] [--data DIR] [--database URL]
 ```
 
-Do not pass `--key` on the command line; arguments are visible in process tables (`ps`).
+## Usage limits and quotas
 
-Credentials are saved in `~/.config/agenticml/credentials.json` with permissions `0600`.
-
-Verify connection and permissions:
+Enforce storage and traffic limits per workspace using `--limits`:
 
 ```bash
-agenticml whoami
+agenticml server serve --limits /etc/agenticml-limits.json
 ```
 
-If the key is rejected or revoked, `agenticml whoami` exits with status code `1`.
-
-### 3. Sync runs
-
-Manually sync all unsynced or updated runs:
-
-```bash
-agenticml sync --all
-```
-
-To continuously follow and sync active training runs:
-
-```bash
-agenticml sync --follow
-```
-
-Properties of `--follow`:
-- Implies `--all`.
-- Polls for changes every `--interval` seconds (default 30 seconds).
-- Commits running runs to the server at least every 60 seconds.
-- Backs off exponentially up to 5 minutes when the server is unreachable.
-
-### 4. Background service (systemd)
-
-To run `agenticml sync --follow` as a background user daemon on Linux, install the user systemd unit described in [deploy/systemd/README.md](../deploy/systemd/README.md):
-
-```bash
-mkdir -p ~/.config/systemd/user
-curl -fsSL -o ~/.config/systemd/user/agenticml-sync.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.2.0/deploy/systemd/agenticml-sync.service
-```
-
-Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`).
-
-```bash
-systemctl --user daemon-reload
-systemctl --user enable --now agenticml-sync
-loginctl enable-linger $USER
-```
-
-If the key is rejected (exit code 3), the service does not restart automatically. Update credentials with `agenticml login` and restart the unit.
-
-## Run status on server
-
-The server tracks run lifecycle via commits recorded in `remote.json`:
-
-| Stored status | Condition | Dashboard status |
-| --- | --- | --- |
-| `finished` | Client finished run | `finished` |
-| `crashed` | Client reported crash | `crashed` |
-| `running` | Last sync commit within `AGENTICML_REMOTE_STALE_SECONDS` (default 600 s) | `running` |
-| `running` | Last sync commit older than `AGENTICML_REMOTE_STALE_SECONDS` | `stale` |
-
-Runs uploaded with `sync --follow` commit heartbeats at least every 60 seconds while active, preventing live runs from showing as stale.
-
-## Sync features and limits
-
-The server supports metric, scalar, event, media, copied artifact, by-reference artifact, and lineage synchronization over [protocol v2](PROTOCOL.md). Install `git` on the server to enable lineage code diffs. Git is detected at startup; if missing, the server logs a warning and leaves the `lineage` feature off. The client sends incremental shadow-repository bundles, and server code diffs then match local diffs. No server worktree checkout is needed.
-
-`agenticml sync --artifacts` uploads `copy=False` artifacts whose source file is unchanged since it was logged, then records the mapping in server-only `artifacts.json`. A changed or missing source is skipped with one warning. Without `--artifacts`, those artifacts stay as metadata. The local dashboard never serves arbitrary local paths.
-
-Lineage validation supports data directory paths containing `:`. Repository
-initialization and ref publication failures (including stale Git lock files),
-Git timeouts, and filesystem failures return retryable 503 `lineage busy`
-responses; clients leave the run incomplete without remembering a permanent
-skip. If a failed publication cannot be safely rolled back, the server retains
-the promoted packs so any published ref keeps its objects. Startup removes
-abandoned `lineage-*` quarantine directories under `server/tmp` after a crash
-and warns about other subdirectories.
-
-The following limits remain:
-
-- **Run notes (`notes.md`)**: Notes remain local to the machine where they were written.
-- **Run ownership**: Runs belong to users. Any key belonging to the owning user can update that user's runs. Pushing to an existing run ID using a key belonging to another user fails with HTTP 409 Conflict ("run owned by another user").
-
-## Audit log
-
-The server maintains an append-only audit trail at `<data>/server/audit.jsonl`. Every write operation writes one JSON line with the following fields:
+Example limits configuration file:
 
 ```json
-{"ts": "2026-11-06T18:00:00.000000Z", "actor": "alice", "via": "password", "action": "key.create", "target": "laptop", "client": "198.51.100.23", "detail": {"scope": "sync", "user": "alice"}}
+{
+  "free": {
+    "storage_bytes": 5000000000,
+    "upload_bytes_per_day": 2000000000,
+    "requests_per_minute": 600,
+    "people": 5,
+    "workspaces_per_account": 1
+  }
+}
 ```
 
-- `ts`: UTC timestamp in ISO 8601 with microsecond precision.
-- `actor`: User name of the authenticated principal; `cli:<user>` for CLI operations; `server` during initial startup migration; `anonymous` for failed logins.
-- `via`: Authentication mechanism: `password`, `key`, `proxy`, `setup`, `invite`, `cli`, or `server`.
-- `action`: Name of the event (see table below).
-- `target`: Subject of the action (user name, key name, or run ID).
-- `client`: Client IP address from `X-Forwarded-For` or TCP connection; `null` for CLI commands.
-- `detail`: Action-specific attributes (role, scopes, migration counts).
+### Limit enforcement
 
-### Audit actions
+- **Storage limit**: Sum of committed run files and objects. Checked before writes. Uploads that would exceed the quota return HTTP `403 Forbidden` (`{"error": "storage limit reached: ..."}`). Reads, deletes, and notes remain accessible.
+- **Daily upload quota**: Bytes uploaded within the current UTC day. Exceeding the quota returns HTTP 403 with the reset time.
+- **Request rate limit**: Requests per minute per workspace across all server processes. Exceeding the rate returns HTTP `429 Too Many Requests` with a `Retry-After` header.
+- **People quota**: Maximum members plus pending invites. Inviting additional members is blocked once the quota is reached.
+- **Free workspaces**: Maximum free-plan workspaces an individual account can own.
 
-| Action | Description |
-| --- | --- |
-| `user.add` | User created. |
-| `user.remove` | User removed and their keys revoked. |
-| `user.role` | User role changed. |
-| `user.identity` | User proxy identity assigned or cleared. |
-| `user.invite` | Invite link generated. |
-| `user.password` | User password set or changed. |
-| `key.create` | API key created. |
-| `key.revoke` | API key revoked. |
-| `setup` | Initial admin user created via `/setup`. |
-| `login.ok` | Successful sign-in with a password, an invite link, or an admin key. |
-| `login.failed` | Failed login attempt (401 or 403). |
-| `logout` | Session signed out. |
-| `run.create` | Initial run creation (first `meta.json`). |
-| `run.finish` | Run status transitioned to `finished` or `crashed`. |
-| `note.write` | Run note modified in the server dashboard. |
-| `migration` | In-place migration of 2.0/2.1 data on first startup. |
+## Backups and restore
 
-- **No secrets logged**: Key values, key hashes, passwords, password hashes, invite tokens, and session cookies are never written to the audit log.
-- **Viewing the log**: Administrators can view audit entries using the CLI or through the dashboard Activity section:
-  ```bash
-  agenticml server audit [--limit N] [--json] [--data DIR]
-  ```
-- **Log rotation**: The server has no built-in rotation. Because `audit.jsonl` is reopened for each write under an advisory file lock, system utilities like `logrotate` with `create` mode work cleanly:
-  ```
-  /var/lib/agenticml-server/server/audit.jsonl {
-      weekly
-      rotate 12
-      compress
-      missingok
-      notifempty
-      create 0600 agenticml agenticml
-  }
-  ```
+### Consistent backup while running: `server backup`
+
+The server includes an online backup command that copies server state while the server is running:
+
+```bash
+agenticml server backup --to /backups/20261109-0000 [--data DIR] [--database URL] [--objects URL]
+```
+
+Backup consistency rule:
+1. The database is copied first:
+   - For SQLite: captured using the SQLite Online Backup API.
+   - For PostgreSQL: take a dump first (`pg_dump --format=custom "$DATABASE_URL" > /backups/.../server.dump`), then run `server backup --files-only`.
+2. Run files are copied second, truncated to the exact committed sizes recorded in the database snapshot. Any bytes appended after the snapshot are excluded, ensuring consistent files.
+3. Local content-addressed objects and shadow Git lineage repositories are copied. (S3 objects are not copied; protect S3 using bucket versioning and AWS Backup).
+4. Writes a metadata manifest to `BACKUP.json`.
+
+### Restoring from backup
+
+To restore a SQLite server:
+1. Point `agenticml server serve` at the backup directory:
+   ```bash
+   agenticml server serve --data /backups/20261109-0000
+   ```
+2. Or copy the contents into your standard data directory and set permissions.
+
+To restore a PostgreSQL server:
+1. Restore the PostgreSQL database dump into an empty database:
+   ```bash
+   pg_restore --clean --if-exists -d "$DATABASE_URL" /backups/20261109-0000/server.dump
+   ```
+2. Start the server pointing to the restored data directory and database:
+   ```bash
+   agenticml server serve --data /backups/20261109-0000 --database "$DATABASE_URL"
+   ```
+
+## Operator diagnostics: `status` and `verify`
+
+Inspect server health and data integrity on the host:
+
+```bash
+# Overview of workspaces, runs, disk usage, and key activity
+agenticml server status [--workspace SLUG] [--data DIR] [--database URL] [--objects URL] [--json]
+
+# Integrity check: verify run file sizes, object SHA-256 hashes, and lineage refs
+agenticml server verify [--workspace SLUG] [--deep] [--data DIR] [--database URL] [--objects URL] [--json]
+```
+
+- `status` displays workspace counts, run counts by status, committed storage, and key activity.
+- `verify` checks file sizes against database committed records, tests object presence, and checks lineage refs. Adding `--deep` streams and re-hashes all S3 objects (local filesystem objects are always hashed). Exits `0` when clean, `1` on corruption or missing data, and `2` on usage errors.
+
+## Upgrading from 2.x to 3.0
+
+When starting a 3.0 server against an existing 2.x data directory, the server automatically migrates data in place on first start:
+
+1. **Automatic database migration**: Creates the SQLite database at `<data>/server/agenticml.db` and applies migrations.
+2. **Workspace creation**: Creates the `default` workspace.
+3. **Account and membership import**: Imports `users.json`. Legacy users become global accounts and members of `default`. The earliest administrator is assigned as the workspace `owner`.
+4. **Keys and audit import**: `keys.json` and `audit.jsonl` are imported into database tables.
+5. **Run and metadata import**: Scans run directories, imports `remote.json` and `artifacts.json` into `runs` and `run_files` tables, and moves runs into `<data>/workspaces/<workspace_id>/store/runs/`.
+6. **File retirement**: Legacy files are renamed with a `.2x` extension (`users.json.2x`, `keys.json.2x`, `audit.jsonl.2x`).
+7. **Refusal to convert twice**: If old 2.x files reappear alongside converted state, the server refuses to start with an error:
+   ```
+   found 2.x <path> after this server was converted on <date>; move it away (the converted copy is <path>.2x)
+   ```
+
+Sync clients on version 2.2 continue to sync to a 3.0 server without modification.
 
 ## Configuration reference
 
 ### CLI options (`agenticml server serve`)
 
-| Option | Environment variable | Default | Description |
+| Flag | Environment variable | Default | Description |
 | --- | --- | --- | --- |
 | `--data DIR` | `AGENTICML_SERVER_DATA` | `~/.agenticml-server` | Path to server data directory. |
-| `--host HOST` | | `127.0.0.1` | Host interface to bind. |
+| `--database URL` | `AGENTICML_SERVER_DATABASE_URL` | `sqlite:///<data>/server/agenticml.db` | Database connection URL (`sqlite:///path` or `postgresql://...`). |
+| `--objects URL` | `AGENTICML_SERVER_OBJECTS` | `file://` | Object storage backend (`file://` or `s3://bucket/prefix`). |
+| `--host HOST` | | `127.0.0.1` | Network interface to bind. |
 | `--port PORT` | | `8080` | TCP port to listen on. |
-| `--public-url URL` | `AGENTICML_SERVER_PUBLIC_URL` | unset | Canonical public URL (e.g. `https://aml.example.com`). Required behind reverse proxies for Host header checks, Origin checks, and `__Host-` cookies. Empty string is treated as unset. |
-| `--trusted-proxy CIDR` | `AGENTICML_SERVER_TRUSTED_PROXIES` | unset | Trust this proxy CIDR for `X-Forwarded-For` and identity headers (repeatable; comma-separated in env). Refuses `0.0.0.0/0` and `::/0`. |
+| `--public-url URL` | `AGENTICML_SERVER_PUBLIC_URL` | unset | Canonical public URL (e.g. `https://aml.example.com`). Required behind reverse proxies for Host/Origin validation and cookies. |
+| `--trusted-proxy CIDR` | `AGENTICML_SERVER_TRUSTED_PROXIES` | unset | Trust proxy CIDR for `X-Forwarded-For` and identity headers (repeatable; comma-separated in env). Refuses `0.0.0.0/0` and `::/0`. |
 | `--identity-header PRESET` | `AGENTICML_SERVER_IDENTITY_HEADER` | unset | Honour proxy identity header (`alb`, `tailscale`, or `oauth2-proxy`). Requires `--trusted-proxy`. |
-| | `AGENTICML_SERVER_KEY` | unset | Static admin API key named `env`. Stored only in memory. |
-| | `AGENTICML_REMOTE_STALE_SECONDS` | `600` | Inactivity threshold before an active run is marked `stale`. |
+| `--firebase-project ID` | `AGENTICML_SERVER_FIREBASE_PROJECT` | unset | Firebase project ID for token verification. |
+| `--firebase-api-key KEY` | `AGENTICML_SERVER_FIREBASE_API_KEY` | unset | Firebase web API key for dashboard sign-in. |
+| `--firebase-auth-domain HOST` | `AGENTICML_SERVER_FIREBASE_AUTH_DOMAIN` | unset | Firebase auth domain (defaults to `<project>.firebaseapp.com`). |
+| `--limits FILE` | `AGENTICML_SERVER_LIMITS` | unset | Path to JSON file defining workspace usage limits and plans. |
+| `--open-signup` | `AGENTICML_SERVER_OPEN_SIGNUP` | off | Allow verified Firebase sign-in to create an account and personal workspace. |
+| `--min-client-version X.Y` | `AGENTICML_SERVER_MIN_CLIENT_VERSION` | `2.2` | Reject `agenticml-lite` clients older than `X.Y` on `/v2` requests with HTTP 426. |
 
-## Data directory layout and backups
-
-The server data directory contains two subdirectories:
-
-```
-<data>/
-├── store/                 # Standard v1 store layout (see docs/FORMAT.md)
-│   ├── runs/              # Individual run directories
-│   │   └── <run_id>/
-│   │       ├── meta.json
-│   │       ├── events.jsonl
-│   │       ├── scalars/
-│   │       ├── media/
-│   │       └── remote.json
-│   └── objects/           # Content-addressed blobs (code, media, copied artifacts)
-└── server/                # Server metadata and runtime locks
-    ├── audit.jsonl        # Append-only audit log (mode 0600)
-    ├── keys.json          # Key metadata and SHA-256 digests (mode 0600)
-    ├── keys.lock          # Lock for atomic key and user modifications
-    ├── server.lock        # Exclusive single-writer lock for server process
-    ├── tmp/               # Ingest staging directory (must be on same filesystem as store/)
-    └── users.json         # User records, password scrypt hashes, and invites (mode 0600)
-```
-
-### Performing backups
-
-Stop the service cleanly before backing up the data directory to release `server.lock` and flush pending writes. Back up `<data>/server/users.json`, `<data>/server/keys.json`, and `<data>/server/audit.jsonl` along with the store:
-```bash
-sudo systemctl stop agenticml-server
-sudo tar czf agenticml-backup.tgz -C /var/lib/agenticml-server .
-sudo systemctl start agenticml-server
-```
-
-### Restoring backups
-
-To restore a backup, stop the service, extract the backup directory into the data directory, verify permissions, and start the service:
-```bash
-sudo systemctl stop agenticml-server
-sudo tar xzf agenticml-backup.tgz -C /var/lib/agenticml-server
-sudo chown -R agenticml:agenticml /var/lib/agenticml-server
-sudo systemctl start agenticml-server
-```
-
-## Operator commands
-
-Inspect the data directory on the server host:
-
-```bash
-agenticml server status --data /var/lib/agenticml-server
-agenticml server verify --data /var/lib/agenticml-server
-```
-
-Both commands are read-only and work while the server is running. Add `--json`
-for machine-readable output. `status` shows run counts by effective dashboard
-status (`unsynced` before a remote status is committed), disk sizes, skipped
-size entries, and each key's run count and latest sync. JSON includes a
-top-level `warnings` list. Runs owned by `AGENTICML_SERVER_KEY` are marked
-`"env": true`. A corrupt or unreadable `keys.json` is a warning and still
-exits 0. Revoked owners remain visible; key secrets and hashes are never
-printed.
-
-`verify` streams SHA-256 checks of stored objects and checks committed run
-file sizes, missing references (including by-reference artifacts), lineage
-refs, and leftover Git ref locks. It exits 0 when clean (warnings are allowed),
-1 for problems, and 2 for usage errors or an unreadable data directory. Files
-that grew beyond a running run's committed sizes are warnings because a sync
-may be in progress. A ref lock younger than ten minutes is also a warning;
-older locks are problems. Stop the server before using the printed removal
-command for a leftover lock. Verification never repairs or removes files.
-
-After [restoring a backup](#restoring-backups), run `server verify` before
-resuming syncs. Recheck live-sync warnings once the run has finished.
+Additional environment variables:
+- `AGENTICML_SERVER_KEY`: Static admin API key named `env` kept in memory. Bound to the `default` workspace.
+- `AGENTICML_SERVER_S3_ENDPOINT_URL`: Custom S3 endpoint URL for MinIO, LocalStack, or VPC endpoints.
+- `AGENTICML_SERVER_S3_KMS_KEY_ID`: AWS KMS Key ID or ARN for S3 server-side encryption (`aws:kms`).
+- `AGENTICML_REMOTE_STALE_SECONDS`: Inactivity threshold before an active run is marked `stale` (default `600`).
 
 ## Network filesystems (EFS)
 
-Every append, atomic write, and object put on the server does `os.fsync` plus a directory fsync. That is the main extra cost when `<data>` is on EFS or another network filesystem. `server/tmp` and `store` must already be on the same filesystem (the server refuses to start otherwise). Run a single server process per data directory. NFSv4 emulates `flock` on `server.lock`; AWS documents NFSv4.1 (`nfsvers=4.1`) for EFS, and that is the recommended mount.
+Every append, atomic write, and object put on the server does `os.fsync` plus a directory fsync. That is the main extra cost when `<data>` is on EFS or another network filesystem. `server/tmp` and `store` must already be on the same filesystem (the server refuses to start otherwise). Run a single server process per data directory when using SQLite. NFSv4 emulates `flock` on `server.lock`; AWS documents NFSv4.1 (`nfsvers=4.1`) for EFS, and that is the recommended mount.
 
-These numbers were measured on local NVMe, then again with a modelled fsync delay injected **only in the benchmark's server process**. They are not measurements on real EFS. 5 ms and 20 ms are assumptions for typical EFS commit latency on small writes. Recommendations below are from **1 and 8 clients only**; larger N is unmeasured.
+These numbers were measured on local NVMe, then again with a modelled fsync delay injected **only in the benchmark's server process**. They are modelled numbers, not measurements on real EFS (labelled as modelled until the owner's real-EFS benchmark run). 5 ms and 20 ms are assumptions for typical EFS commit latency on small writes. Recommendations below are from **1 and 8 clients only**; larger N is unmeasured.
 
 The first published tables held a process-wide `objects_lock` across each object PUT's temp-file `fsync`, rename, and directory fsync. After those runs, object writes fsync the private temp file with no lock held, then take one lock per `objects/<hh>` prefix only for the unsafe-destination check, the already-present check, `mkdir`, `os.replace`, and the directory fsync. The 20 ms 1-client and 8-client configs and the local 8-client config were re-run after that change. Before/after rows below use the numbers already published here as **before**. The local 1-client and both 5 ms rows were not re-run (labelled pre-change). Every before/after row is a single run with unquantified noise. The before and after runs were not on guaranteed identical machine state.
 
@@ -611,52 +501,25 @@ Machines behind the same NAT or HTTP proxy share one throttle bucket, even if th
 
 `--quick` is a smoke size (under a minute). Replace the modelled tables above with real-EFS numbers when that run is done.
 
-## Upgrades
-
-Back up the data directory first.
-
-One server process per data directory; downgrades are not supported. Read release notes prior to upgrading.
-
-1. Upgrade the package in the virtual environment:
-   ```bash
-   sudo /opt/agenticml/bin/pip install -U agenticml-lite
-   ```
-2. Restart the server service:
-   ```bash
-   sudo systemctl restart agenticml-server
-   ```
-3. Verify server health:
-   ```bash
-   curl -s http://127.0.0.1:8080/healthz
-   ```
-
-Because the server holds an exclusive lock on `<data>/server/server.lock`, only one server process may access the data directory at a time.
-
-### Upgrading from 2.0 or 2.1 to 2.2
-
-When starting a 2.2 server against an existing 2.0 or 2.1 data directory, the server migrates the data in place automatically on first start:
-
-- A single user named `admin` with role `admin` is created in `users.json`.
-- All existing keys in `keys.json` are upgraded to version 2 format and assigned to user `admin`.
-- Existing runs have their `owner` in `remote.json` rewritten to `admin`, with the previous key name retained as `owner_key`.
-- No manual migration steps are needed.
-- After starting the server, set a password for the `admin` user using an invite link or the CLI:
-  ```bash
-  agenticml server users invite admin
-  # or: agenticml server users set-password admin
-  ```
-- Existing 2.0 and 2.1 sync clients continue working seamlessly against a 2.2 server.
-
 ## Troubleshooting
 
 ### "another agenticml server is using <data>"
-The error means another server process has the same data directory open. Check `systemctl status agenticml-server` or look for running `agenticml server serve` processes on the host. Stop the other process and start again.
+Another server process has the SQLite data directory open. Check `systemctl status agenticml-server` or look for running `agenticml server serve` processes on the host. Stop the conflicting process. If multiple processes are required, use PostgreSQL via `--database`.
 
 ### HTTP 403 ("forbidden host") on dashboard
-When the server is accessed through a proxy or external hostname, the browser sends that hostname in the HTTP `Host` header. The dashboard accepts only loopback hostnames (`localhost`, `127.0.0.1`, `::1`) unless `--public-url` is configured; a refused Host receives HTTP 403 with `{"error": "forbidden host"}`. Set `AGENTICML_SERVER_PUBLIC_URL=https://<your-hostname>` in the server environment (or `/etc/agenticml-server.env` under systemd).
+The dashboard accepts requests only from loopback addresses unless `--public-url` is configured. When operating behind a reverse proxy, set `AGENTICML_SERVER_PUBLIC_URL=https://<your-hostname>` in the server environment (or `/etc/agenticml-server.env` under systemd).
+
+### HTTP 426 ("this server needs agenticml-lite >= X.Y")
+The sync client is running an older `agenticml-lite` version below `--min-client-version` (default 2.2). Update the client package on the training machine:
+```bash
+pip install -U agenticml-lite
+```
 
 ### `agenticml sync` exits with status 3 (`401 Unauthorized`)
-When running `agenticml sync` (including `--follow` and `--watch`), the client exits with status code 3 if the server returns 401 because the API key was rejected or revoked. Run `agenticml login --host https://...` to enter a new key, or check key status on the server with `agenticml server keys list`.
+The client's API key is missing, invalid, or has been revoked. Run `agenticml login --host https://...` to enter a new key, or check key status on the server with `agenticml server keys list --workspace <slug>`.
+
+### HTTP 403 ("storage limit reached")
+The workspace has reached its storage quota (committed run files plus objects). Additional uploads are rejected until an administrator raises the quota using `agenticml server workspaces set-plan <slug> custom --storage <size>` or removes unnecessary runs. Existing runs remain readable. Under `sync --follow`, the client automatically retries every 10 minutes and resumes once the limit is raised.
 
 ### Runs appear as "stale" in dashboard
-A run appears stale when its status in `remote.json` is `running` but no commit has occurred for longer than `AGENTICML_REMOTE_STALE_SECONDS` (default 600 seconds). Ensure training jobs run `agenticml sync --follow` to send heartbeats, or check network connectivity between the training node and the server.
+A run appears stale when its status is `running` but no commit heartbeat has arrived for longer than `AGENTICML_REMOTE_STALE_SECONDS` (default 600 seconds). Ensure training jobs run `agenticml sync --follow`, which transmits heartbeats every 60 seconds while runs are active.

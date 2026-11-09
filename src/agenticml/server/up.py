@@ -735,7 +735,7 @@ def up(data=None, port=8080, *, install=False, force=False, database=None, fireb
         print(f"AgenticML is live at {public_url}", flush=True)
 
     try:
-        serve_extra = {}
+        serve_extra = {"objects": "file://"}
         if database is not None:
             serve_extra["database"] = database
         if firebase is not None:

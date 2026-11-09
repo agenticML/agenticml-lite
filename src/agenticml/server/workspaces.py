@@ -164,11 +164,18 @@ def convert_store(db, data):
         prepare_store(data, workspace['id'])
 
 
-def delete_workspace(db, data, slug):
+def delete_workspace(db, data, slug, *, objects=None):
+    """Delete the workspace; mark the returned row if object cleanup failed."""
     row = WorkspaceRepo(db).require(slug)
     root = prepare_store(data, row['id'])
     # No SQLite transaction is held across filesystem operations.
     WorkspaceRepo(db).delete(slug)
     shutil.rmtree(root.parent)
     layout.fsync_dir(root.parent.parent)
+    if objects is not None:
+        try:
+            objects.delete_workspace(row['id'])
+        except Exception:
+            row = dict(row, object_cleanup_failed=True)
+            logger.warning('object cleanup failed for workspace %s; bytes are orphaned', row['id'], exc_info=True)
     return row

@@ -4,7 +4,7 @@ from pathlib import Path
 import threading
 import weakref
 
-from .errors import DatabaseBusy, DatabaseError, DatabaseUrlError, SchemaTooNew
+from .errors import ConvertedTwice, DatabaseBusy, DatabaseError, DatabaseUrlError, SchemaTooNew
 from .sqlite import SqliteDatabase
 from .postgres import PostgresDatabase
 

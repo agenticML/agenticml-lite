@@ -103,8 +103,12 @@ def index_if_open(root, directory, remote=None, note_body=None):
     db = for_server_dir(server_dir, create=False)
     if db is None:
         return None
-    return adopt_directory(root, directory, RunRepo(db, default_workspace_id(db)), remote=remote, note_body=note_body,
-                           overwrite=True)
+    index = RunRepo(db, default_workspace_id(db))
+    adopted = adopt_directory(root, directory, index, remote=remote, note_body=note_body,
+                              overwrite=True)
+    if adopted is not None:
+        index.rebuild_metrics(adopted, root)
+    return adopted
 
 
 def default_workspace_id(db):
@@ -164,3 +168,78 @@ def database_url(path):
     """Backend-aware URL for tests opening a database without importing files."""
     import os
     return os.environ['AGENTICML_SERVER_DATABASE_URL'] if on_postgres() else 'sqlite:///' + str(path)
+
+
+def record_object(data, sha, size, *, slug='default'):
+    """Record a hand-placed object in the database as the server does on upload."""
+    from agenticml.server.db.usage import UsageRepo
+    db = for_server_dir(data / 'server', create=False)
+    wid = WorkspaceRepo(db).require(slug)['id']
+    with db.transaction(write=True) as tx:
+        UsageRepo(db, wid).record_object(sha, size, tx)
+
+
+def write_22_data_dir(data, local, *, runs=('old-1', 'old-2')):
+    """Build a 2.2-shaped server data directory by writing the 2.2 files directly.
+
+    users.json (admin x2, member, viewer), keys.json (version 2, bound to
+    users), audit.jsonl, setup-closed, and ``store/`` with one directory per
+    run (copied from a real local writer, plus 2.2 remote.json and notes.md),
+    ``store/objects`` and a bare lineage repository. Returns the secrets and
+    the run writers so tests can keep syncing the same runs.
+    """
+    import hashlib
+    import shutil
+    import subprocess
+    from agenticml.lineage import project_key
+    from agenticml.server.app import prepare_data_dir
+    from agenticml.store import RunWriter
+
+    prepare_data_dir(data)
+    server = data / 'server'
+
+    def user(name, role, created):
+        return {'name': name, 'id': hashlib.sha256(name.encode()).hexdigest()[:32], 'role': role,
+                'identity': None, 'password': None, 'invite': None, 'generation': 0,
+                'created_at': created, 'created_by': 'cli'}
+
+    (server / 'users.json').write_text(json.dumps({'version': 1, 'users': [
+        user('alice', 'admin', '2025-01-01T00:00:00Z'), user('dave', 'admin', '2025-03-01T00:00:00Z'),
+        user('bob', 'member', '2025-02-01T00:00:00Z'), user('carol', 'viewer', '2025-02-02T00:00:00Z')]}))
+    secrets = {'alice-admin': 'salice' + 'x' * 32, 'bob-sync': 'sbob' + 'y' * 32,
+               'carol-sync': 'scarol' + 'z' * 32}
+    owners = {'alice-admin': ('alice', 'admin'), 'bob-sync': ('bob', 'sync'), 'carol-sync': ('carol', 'sync')}
+    (server / 'keys.json').write_text(json.dumps({'version': 2, 'keys': [
+        {'name': name, 'scope': owners[name][1], 'sha256': hashlib.sha256(secret.encode()).hexdigest(),
+         'prefix': secret[:8], 'created_at': '2025-02-03T00:00:00Z', 'created_by': 'cli',
+         'last_used_at': None, 'user': owners[name][0]} for name, secret in secrets.items()]}))
+    (server / 'audit.jsonl').write_text(''.join(json.dumps(event) + '\n' for event in (
+        {'ts': '2025-02-04T00:00:00Z', 'actor': 'alice', 'via': 'cli', 'action': 'key.create',
+         'target': 'bob-sync', 'client': None},
+        {'ts': '2025-02-05T00:00:00Z', 'actor': 'bob', 'via': 'web', 'action': 'login.ok',
+         'target': None, 'client': None})))
+    (server / 'setup-closed').write_text('')
+    store = data / 'store'
+    writers = {}
+    for index, run_id in enumerate(runs):
+        writer = RunWriter.create(local, run_id=run_id, meta={'project': 'demo', 'name': run_id})
+        writer.write_scalars([(i, {'loss': 1 / (i + 1)}) for i in range(8)])
+        writer.add_code([], [('train.py', ('print(%d)\n' % index).encode())])
+        writers[run_id] = writer
+        target = store / 'runs' / run_id
+        shutil.copytree(writer.run_dir, target, ignore=shutil.ignore_patterns('sync.json'))
+        sizes = {path.relative_to(target).as_posix(): path.stat().st_size
+                 for path in target.rglob('*') if path.is_file()}
+        (target / 'remote.json').write_text(json.dumps({
+            'owner': 'bob', 'owner_key': 'bob-sync', 'status': 'running',
+            'last_sync_at': '2025-02-06T00:00:00Z', 'last_sync_key': 'bob-sync',
+            'fingerprint': 'f' * 8, 'sizes': {k: v for k, v in sizes.items() if k != 'remote.json'}}))
+        if index == 0:
+            (target / 'notes.md').write_text('first imported note\n')
+        for sha_dir in (writer.root / 'objects').glob('*') if (writer.root / 'objects').is_dir() else ():
+            shutil.copytree(sha_dir, store / 'objects' / sha_dir.name, dirs_exist_ok=True)
+    git = shutil.which('git')
+    if git:
+        repo = store / 'lineage' / (project_key('demo') + '.git')
+        subprocess.run([git, 'init', '--bare', '-q', str(repo)], check=True)
+    return secrets, writers

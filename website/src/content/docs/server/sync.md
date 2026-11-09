@@ -35,7 +35,15 @@ Credentials are stored in `~/.config/agenticml/credentials.json` (permissions `0
 agenticml whoami
 ```
 
-If the API key is rejected or revoked by the server, `agenticml whoami` exits with status code `1`.
+The response confirms the key name, owning user, assigned role, and bound workspace slug. If the API key is invalid or revoked, `agenticml whoami` exits with status code `1`.
+
+### Syncing to multiple workspaces
+
+The CLI saves one API key per server URL. If a machine needs to sync runs to multiple workspaces on the same server, set the `AGENTICML_API_KEY` environment variable per process or command:
+
+```bash
+AGENTICML_API_KEY=aml_... agenticml sync --all
+```
 
 ## Synchronizing runs
 
@@ -66,6 +74,7 @@ Behavior of `--follow`:
 - Checks for new metrics and files every `--interval` seconds (defaults to 30 seconds).
 - Sends commit heartbeats for active running runs at least every 60 seconds.
 - Backs off up to 5 minutes when the server is unavailable.
+- **Storage limits**: If the target workspace reaches its storage limit, the server answers HTTP `403 Forbidden` (`storage limit reached`). `--follow` pauses that run and automatically retries every 10 minutes, resuming synchronization once an administrator raises the quota.
 
 ### Background service with systemd
 
@@ -73,7 +82,7 @@ On Linux machines, run `sync --follow` as a user-level systemd service:
 
 ```bash
 mkdir -p ~/.config/systemd/user
-curl -fsSL -o ~/.config/systemd/user/agenticml-sync.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.2.0/deploy/systemd/agenticml-sync.service
+curl -fsSL -o ~/.config/systemd/user/agenticml-sync.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v3.0.0/deploy/systemd/agenticml-sync.service
 ```
 
 Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`).
@@ -88,7 +97,7 @@ If the server rejects credentials (exit code 3), the service stops without resta
 
 ## Server run status
 
-The server updates the status of each run based on commits recorded in `remote.json`:
+The server updates run status based on commits recorded in the server database:
 
 | Status | Condition |
 | --- | --- |
@@ -99,12 +108,11 @@ The server updates the status of each run based on commits recorded in `remote.j
 
 `agenticml sync --follow` sends heartbeat commits every 60 seconds for active runs, ensuring runs remain in `running` status.
 
-## Limitations in Release 2.0
+## Full fidelity features
 
-- **Run notes (`notes.md`)**: Notes are not synced to the server in 2.0.
-- **By-reference artifacts**: Artifacts logged with `copy=False` are not transferred.
-- **Lineage code diffs**: The server renders the lineage graph, but Git commit diffs are not uploaded in 2.0 (the dashboard displays "code diff not available on this server").
-- **Key ownership**: A run is owned by the key that creates it. Pushing to an existing run ID using a different key is refused.
+- **Lineage code diffs**: When Git is installed on the server, `agenticml sync` replicates shadow Git bundles, allowing the web dashboard to render source code diffs and commit histories.
+- **By-reference artifacts**: Use `agenticml sync --artifacts` to upload files logged with `copy=False`.
+- **User ownership**: Runs are owned by the account holding the sync key. Any key belonging to that account can append to the run.
 
 ## Next
 

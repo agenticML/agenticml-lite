@@ -15,3 +15,7 @@ class SchemaTooNew(DatabaseError):
 
 class DatabaseUrlError(DatabaseError):
     """Invalid configuration, distinct from failure to read an existing store."""
+
+
+class ConvertedTwice(DatabaseError):
+    """A 2.x file reappeared after this server was already converted."""

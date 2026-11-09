@@ -251,6 +251,7 @@ def reconcile(root, run_index):
         if run_id in known:
             continue
         if adopt_directory(root, directory, run_index) is not None:
+            run_index.rebuild_metrics(run_id, root)
             adopted += 1
     for run_id in known - set(on_disk):
         path = root / "runs" / run_id
@@ -282,6 +283,7 @@ def reindex(root, run_index):
         files = _on_disk_files(root, directory)
         last_step = _last_step(directory, files)
         run_index.rebuild_index(row["run_id"], list_row, project, created_at, launch, last_step)
+        run_index.rebuild_metrics(row["run_id"], root)
         rebuilt += 1
     counts["rebuilt"] = rebuilt
     return counts

@@ -9,9 +9,16 @@ Documentation: <https://agenticml.github.io/agenticml-lite/>
 ```bash
 pip install agenticml-lite
 
+# Optional client extras
 pip install "agenticml-lite[system]"   # psutil: CPU, memory, disk
 pip install "agenticml-lite[gpu]"      # NVIDIA GPU metrics via pynvml
 pip install "agenticml-lite[media]"    # Pillow, for numpy and PIL images
+
+# Optional server extras
+pip install "agenticml-lite[postgres]" # PostgreSQL database backend (psycopg)
+pip install "agenticml-lite[s3]"       # Amazon S3 object storage (boto3)
+pip install "agenticml-lite[firebase]" # Firebase Auth token verification (PyJWT)
+pip install "agenticml-lite[hosted]"   # Full hosted bundle (postgres, s3, firebase)
 ```
 
 ## Quickstart
@@ -207,7 +214,7 @@ Not uploaded in 2.0: notes (`notes.md`), by-reference (`copy=False`) artifacts, 
 
 ## On-prem server
 
-The server runs as a single process backed by a single data directory, serving the shared web dashboard and the sync API. It runs on your own machines; there is no vendor backend. See [docs/SERVER.md](docs/SERVER.md) for the full reference, and [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) and [SECURITY.md](SECURITY.md) for security.
+The server runs on your own machines (or as our hosted service on AWS) to provide a shared web dashboard and synchronization endpoint. Server state lives in a SQL database (SQLite by default, or PostgreSQL), with experiment files and lineage on disk (or EFS) and content-addressed objects on disk or in Amazon S3. See [docs/SERVER.md](docs/SERVER.md) for the complete reference, [docs/HOSTED.md](docs/HOSTED.md) for hosted operations, and [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for security.
 
 ### Start the server
 
@@ -216,18 +223,21 @@ Install `agenticml-lite` into a virtual environment on a POSIX host (Python 3.10
 ```bash
 sudo python3 -m venv /opt/agenticml
 sudo /opt/agenticml/bin/python -m pip install agenticml-lite
+
+# Optional: PostgreSQL backend, S3 objects, or Firebase authentication
+sudo /opt/agenticml/bin/python -m pip install "agenticml-lite[postgres,s3]"
 ```
 
-Run directly (a venv anywhere the user owns is fine, e.g. `python3 -m venv ~/agenticml-venv`):
+Run directly:
 ```bash
 /opt/agenticml/bin/agenticml server serve --data DIR --host 127.0.0.1 --port 8080 --public-url https://...
 ```
-`--data` falls back to `AGENTICML_SERVER_DATA`, then `~/.agenticml-server`. `--public-url` falls back to `AGENTICML_SERVER_PUBLIC_URL`.
+`--data` falls back to `AGENTICML_SERVER_DATA`, then `~/.agenticml-server`. `--database` defaults to SQLite at `<data>/server/agenticml.db`, or accepts PostgreSQL (`postgresql://...`). `--objects` defaults to `file://` (local disk) or accepts Amazon S3 (`s3://bucket/prefix`). `--public-url` falls back to `AGENTICML_SERVER_PUBLIC_URL`.
 
 Or run as a systemd service: see [deploy/systemd/README.md](deploy/systemd/README.md) and [deploy/systemd/agenticml-server.service](deploy/systemd/agenticml-server.service).
 ```bash
 sudo useradd --system --home /var/lib/agenticml-server --shell /usr/sbin/nologin agenticml
-sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v2.2.0/deploy/systemd/agenticml-server.service
+sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v3.0.0/deploy/systemd/agenticml-server.service
 ```
 Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`). Edit `AGENTICML_SERVER_PUBLIC_URL` in the unit (or `sudo systemctl edit agenticml-server`), then `daemon-reload` and `enable --now`:
 ```bash
@@ -236,10 +246,17 @@ sudo systemctl enable --now agenticml-server
 ```
 
 Put a TLS reverse proxy in front:
-- **Laptop or workstation:** `agenticml server up` makes the server reachable from the public internet through Tailscale Funnel (anyone can reach the login page; only keys grant access). It takes port 443 of this machine's Tailscale serve config. After SIGKILL, a crash, or power loss, Funnel stays on. The next `server up` on the same port turns it back on and off again; a stale Funnel entry for a different port is refused ("Tailscale already serves port 443 on this machine: check `tailscale funnel status` and turn it off first") and must be turned off with `tailscale funnel --https=443 off` first. Funnel visitors all arrive from `127.0.0.1`, so they share one failed-login throttle bucket (someone sending bad keys can delay sign-in and syncs by up to 60 s; fixed by package 13 in 2.2). Manual steps: `tailscale serve --bg 8080` and set `AGENTICML_SERVER_PUBLIC_URL=https://<machine>.<tailnet>.ts.net`, or pass `--public-url`.
-- **Production:** Caddy or a load balancer. Set the public URL to the proxied HTTPS URL.
+- **Workstation:** `agenticml server up` makes the server reachable from the public internet through Tailscale Funnel. Manual steps: `tailscale serve --bg 8080` and set `AGENTICML_SERVER_PUBLIC_URL=https://<machine>.<tailnet>.ts.net`.
+- **Production:** Caddy, Nginx, or an AWS Application Load Balancer. Set the public URL to the proxied HTTPS URL.
 
-### First admin key
+### Workspaces and roles
+
+All experiment runs, API keys, and memberships belong to a **workspace**:
+- Workspaces provide full data isolation on a single hostname. Dashboard URLs are prefixed with `/w/<slug>/` (e.g. `/w/default/`).
+- Roles per workspace: `owner` (creator; cannot be removed), `admin` (manages members, keys, invites), `member` (syncs runs, edits notes), `viewer` (read-only dashboard).
+- Manage workspaces via CLI: `agenticml server workspaces {list,create,rename,suspend,resume,delete,usage,set-plan}`.
+
+### First admin account and sign in
 
 When starting with an empty data directory, read the setup link from the server's terminal output, or from the journal under systemd:
 ```bash
@@ -249,35 +266,22 @@ Look for:
 ```
 No admin key yet. Open <url>/setup?token=<token> to create one, or run: agenticml server keys create --name admin --scope admin
 ```
-Open the `/setup?token=<token>` URL in a browser, name the key, and save it. It is shown once.
+Open `/setup?token=<token>` in a browser to create your administrator key and sign in.
 
-CLI alternative (runs on the server host while the server is up):
+CLI alternative (creates an account and invite in the default workspace):
 ```bash
-agenticml server keys create --name admin --scope admin --data DIR
-# or under systemd:
-sudo -u agenticml /opt/agenticml/bin/agenticml server keys create --name admin --scope admin --data /var/lib/agenticml-server
+agenticml server users add admin --role admin --data /var/lib/agenticml-server
 ```
-
-Or set an environment variable by exporting `AGENTICML_SERVER_KEY` before `agenticml server serve`:
-```bash
-export AGENTICML_SERVER_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
-```
-Under systemd, set it in `/etc/agenticml-server.env` (root-owned, mode 0600).
-It is the admin key named `env`, and it can't be revoked from the Keys page.
-
-### Sign in
-
-Open the server's public URL in a browser and sign in with the admin key.
 
 ### Issue a sync key per training machine
 
-On the **Keys** page, click **New key**, name it (e.g. `gpu-box-1`), and keep the default scope `sync`. Copy the shown `agenticml login` command.
+Every API key is bound to a specific workspace and owning account. On sync (`/v2`), the server identifies the workspace directly from the key.
+
+In the dashboard, open **Keys** → **New key**, name it (e.g. `gpu-box-1`), and copy the shown command.
 
 CLI alternative:
 ```bash
-agenticml server keys create --name gpu-box-1 --data DIR
-# or under systemd:
-sudo -u agenticml /opt/agenticml/bin/agenticml server keys create --name gpu-box-1 --data /var/lib/agenticml-server
+agenticml server keys create --name gpu-box-1 --workspace default --data /var/lib/agenticml-server
 ```
 The plaintext key is printed once.
 
@@ -294,60 +298,38 @@ Verify authentication:
 ```bash
 agenticml whoami
 ```
+The response displays your key name, user account, role, and bound workspace slug.
 
 Sync runs once, or follow continuously:
 ```bash
 agenticml sync --all       # sync all incomplete or changed runs once
 agenticml sync --follow    # keep syncing active and new runs
 ```
-`--follow` picks up new runs, heartbeats running runs at least every 60 s, and backs off up to 5 min while the server is down. If the key is rejected, `sync` exits 3.
-
-For a user systemd unit, see [deploy/systemd/README.md](deploy/systemd/README.md).
-
-### Watch runs
-
-Watch runs in the shared dashboard at the public URL. Run statuses: `running`, `finished`, `crashed`, or `stale` (when no commit arrives for `AGENTICML_REMOTE_STALE_SECONDS`, default 600).
-
-Not uploaded in 2.0: notes, `copy=False` artifacts, lineage code diffs. Each run is owned by the key that created it.
-
-### Revoke a key
-
-From the dashboard: **Keys** page → **Revoke**.
-
-CLI alternative:
-```bash
-agenticml server keys revoke NAME --data DIR
-# or under systemd:
-sudo -u agenticml /opt/agenticml/bin/agenticml server keys revoke NAME --data /var/lib/agenticml-server
-```
-Revocation takes effect without a restart, and that machine's sync stops on its next request with exit 3. The last admin key cannot be revoked from the page; use the CLI.
+`--follow` picks up new runs, heartbeats running runs at least every 60 s, and backs off up to 5 min while the server is down. If a workspace reaches its storage limit, `--follow` automatically pauses and retries every 10 minutes until quota is raised.
 
 ### Back up
 
-Stop the service cleanly before copying the data directory:
+Take a consistent backup of a running server without stopping service:
 ```bash
-sudo systemctl stop agenticml-server
-sudo tar czf agenticml-backup.tgz -C /var/lib/agenticml-server .
-sudo systemctl start agenticml-server
+agenticml server backup --to /backups/20261109-0000
 ```
+The command snapshots the SQLite database (or requires `pg_dump` first with `--files-only` for PostgreSQL) and copies each run file up to its committed size recorded in the database.
 
-Restore: stop the service, extract the backup into the data directory, set ownership, and start the service:
+Restore SQLite:
 ```bash
-sudo systemctl stop agenticml-server
-sudo tar xzf agenticml-backup.tgz -C /var/lib/agenticml-server
-sudo chown -R agenticml:agenticml /var/lib/agenticml-server
-sudo systemctl start agenticml-server
+agenticml server serve --data /backups/20261109-0000
 ```
+Restore PostgreSQL: restore the dump with `pg_restore`, then run `agenticml server serve --data /backups/20261109-0000 --database "$DATABASE_URL"`.
 
-### Upgrade
+### Upgrade from 2.x to 3.0
 
 Back up first.
 
-One server per data directory; downgrades aren't supported. Upgrade the package in the venv and restart the service:
-```bash
-sudo /opt/agenticml/bin/pip install -U agenticml-lite
-sudo systemctl restart agenticml-server
-```
+When a 3.0 server starts against an existing 2.x data directory, it automatically converts the data in place into the `default` workspace:
+- Accounts, keys, audit events, runs, and committed sizes migrate into the database.
+- 2.x files are renamed with a `.2x` extension (`users.json.2x`, `keys.json.2x`, `audit.jsonl.2x`).
+- If old 2.x files reappear alongside converted state, the server refuses to start twice to protect against data overwrites.
+- Existing 2.2 sync clients continue syncing to 3.0 without changes.
 
 ## Configuration
 
@@ -421,9 +403,9 @@ Bump the version in `pyproject.toml` and `src/agenticml/__init__.py`, then push 
 
 ```bash
 # bump version in pyproject.toml and src/agenticml/__init__.py
-git commit -am "release: v2.2.0"
-git tag v2.2.0
-git push origin v2.2.0
+git commit -am "release: v3.0.0"
+git tag v3.0.0
+git push origin v3.0.0
 ```
 
 ## License

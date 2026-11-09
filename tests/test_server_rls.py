@@ -50,6 +50,13 @@ def _seed(db, wid):
         'launch_note': None, 'commit_sizes': None, 'updated_at': layout.format_timestamp(),
     })
     RunRepo(db, wid).replace_files('rls-run', [('meta.json', 4, None)])
+    with db.transaction(write=True) as tx:
+        tx.bind_workspace(wid)
+        tx.execute(
+            'INSERT INTO run_metrics (workspace_id, run_id, series_id, name, last_value, '
+            'min_value, max_value, count, last_step, decoded_bytes) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (wid, 'rls-run', 0, 'loss', 1.0, 1.0, 1.0, 1, 0, 8))
     NoteRepo(db, wid).upsert('rls-run', 'note', layout.format_timestamp())
     AuditRepo(db, wid).insert({'ts': layout.format_timestamp(), 'actor': 'rls', 'action': 'rls.seed'})
     SessionRepo(db).create('a' * 64, {
