@@ -396,6 +396,36 @@ def test_install_omits_environment_database_url(tmp_path, monkeypatch, capsys):
     assert stat.S_IMODE(unit.stat().st_mode) == 0o600
 
 
+def test_install_writes_absolute_resolved_limits_path(tmp_path, monkeypatch):
+    from agenticml.server.limits import UNLIMITED
+
+    install_fake(tmp_path, monkeypatch)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    limits = tmp_path / "limits.json"
+    limits.write_text(json.dumps({
+        "default_plan": "free",
+        "free_workspaces_per_account": 1,
+        "plans": {"free": dict(UNLIMITED)},
+    }))
+    monkeypatch.chdir(tmp_path)
+    data = tmp_path / "data"
+    assert run_up(data, "--install", "--limits", "limits.json") == 0
+    resolved = str(limits.resolve())
+    text = (home / ".config/systemd/user/agenticml-server-up.service").read_text()
+    assert "--limits " + resolved in text
+    linux_home = tmp_path / "linux-home"
+    linux_home.mkdir()
+    unit = write_systemd_unit(data, 8080, home=linux_home, limits="limits.json")
+    assert "--limits " + resolved in unit.read_text()
+    mac_home = tmp_path / "mac-home"
+    mac_home.mkdir()
+    plist = write_launchd_plist(data, 8080, home=mac_home, limits="limits.json")
+    args = plistlib.loads(plist.read_bytes())["ProgramArguments"]
+    assert args[args.index("--limits") + 1] == resolved
+
+
 def test_launchd_writer(tmp_path, monkeypatch, capsys):
     home = tmp_path / "mac-home"
     data = tmp_path / "data dir"

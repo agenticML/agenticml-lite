@@ -363,7 +363,7 @@ class WebAuth:
 
     def __init__(self, keys, public_url=None, clock=time.time, throttle_clock=time.time,
                  users=None, trusted_proxies=(), identity_header=None,
-                 firebase=None, cert_source=None):
+                 firebase=None, cert_source=None, plans=None, open_signup=False):
         self.keys = keys
         self.users = users if users is not None else UserStore(keys.server_dir, db=keys.db, workspace_id=keys.workspace_id or '0' * 32)
         self.public_url = public_url
@@ -377,6 +377,7 @@ class WebAuth:
             IDENTITY_PRESETS[self.identity_header] if self.identity_header else (None, None))
         self.firebase = firebase
         self.cert_source = cert_source
+        self.open_signup = bool(open_signup)
         if self.firebase is not None:
             from .firebase import FIREBASE_EXTRA, FIREBASE_IDENTITY, firebase_available
             if self.identity_header is not None:
@@ -386,6 +387,8 @@ class WebAuth:
             if self.cert_source is None:
                 from .firebase import CertificateSource
                 self.cert_source = CertificateSource()
+        from .firebase import require_open_signup
+        require_open_signup(self.open_signup, self.firebase, plans)
         self._lock = threading.Lock()
         from .db.repos import SessionRepo
         self.sessions = SessionRepo(keys.db)
@@ -1147,10 +1150,33 @@ class WebAuth:
                         {"error": "this invite is no longer valid", "reason": "invite_invalid"},
                         403, self._headers())
                     return
+            signed_up = False
+            created_workspace = None
+            unverified = False
             if account is None:
                 with self.keys.db.transaction(write=True) as tx:
                     tx.advisory_lock("users")
                     account = self._firebase_find_or_claim(accounts, claims, tx)
+                    plans = getattr(handler.server, "plans", None)
+                    if account is None and self.open_signup:
+                        if email_verified_for_link(claims) and claims.email:
+                            account, created_workspace = self._firebase_open_signup(
+                                accounts, claims, tx, plans)
+                            signed_up = account is not None
+                        else:
+                            unverified = True
+                    elif account is not None and self.open_signup:
+                        created_workspace = self._recover_signup_workspace(
+                            account, claims, tx, plans)
+            if unverified:
+                logger.info("login failed")
+                outcome = "failed"
+                self._audit_login_failed(
+                    handler, method="firebase", provider=claims.provider)
+                handler._json(
+                    {"error": "verify your email", "reason": "email_unverified"},
+                    403, self._headers())
+                return
             if account is None:
                 logger.info("login failed")
                 outcome = "failed"
@@ -1158,6 +1184,16 @@ class WebAuth:
                 handler._json(
                     {"error": "no access", "reason": "no_account"}, 403, self._headers())
                 return
+            created_workspace = self._prepare_created_workspace(
+                handler, created_workspace, account)
+            if signed_up:
+                self._audit(handler, "account.signup", account["login"],
+                            actor=account["login"], via="signup")
+            if created_workspace is not None:
+                self._audit(
+                    handler, "workspace.create", created_workspace["id"],
+                    {"slug": created_workspace["slug"], "name": created_workspace["name"]},
+                    actor=account["login"], via="signup")
             with self.keys.db.transaction(write=True) as tx:
                 tx.advisory_lock("users")
                 accounts.refresh_firebase_email(
@@ -1213,6 +1249,78 @@ class WebAuth:
                 return found
             raise
         return accounts.by_firebase_uid(claims.uid, tx) or accounts.get(claims.email, tx)
+
+    def _firebase_open_signup(self, accounts, claims, tx, plans):
+        if accounts.get(claims.email, tx) is not None:
+            return None, None
+        display = claims.name if isinstance(claims.name, str) and claims.name.strip() else (
+            claims.email.split("@", 1)[0] or "workspace")
+        account = accounts.create(claims.email, display, "signup", tx)
+        accounts.link_firebase(account["id"], claims.uid, claims.email, True, tx)
+        account = accounts.by_firebase_uid(claims.uid, tx) or accounts.get(claims.email, tx)
+        return account, self._create_signup_workspace(account, claims, tx, plans)
+
+    def _signup_pending_key(self, account_id):
+        return f"signup_pending:{account_id}"
+
+    def _recover_signup_workspace(self, account, claims, tx, plans):
+        from .db.repos import SettingsRepo
+        from .firebase import email_verified_for_link
+
+        if account.get("created_by") != "signup":
+            return None
+        if not email_verified_for_link(claims):
+            return None
+        if tx.fetchone("SELECT 1 FROM memberships WHERE account_id=?", (account["id"],)):
+            return None
+        if SettingsRepo(self.keys.db).get(self._signup_pending_key(account["id"]), tx) is None:
+            return None
+        return self._create_signup_workspace(account, claims, tx, plans)
+
+    def _create_signup_workspace(self, account, claims, tx, plans):
+        from .db.workspaces import WorkspaceRepo, slug_from_email_local
+
+        workspaces = WorkspaceRepo(self.keys.db)
+        # A limits file with free_workspaces_per_account=0 creates the account
+        # but no workspace; the dashboard shows the "no workspaces" state.
+        limit = None if plans is None else plans.free_workspaces_per_account
+        if limit is not None and workspaces.owned_free_count(account["id"], tx) >= limit:
+            return None
+        login = account["login"]
+        display = claims.name if isinstance(claims.name, str) and claims.name.strip() else (
+            login.split("@", 1)[0] or "workspace")
+        slug = workspaces.allocate_slug(slug_from_email_local(login), tx)
+        suffix = "'s workspace"
+        name = display + suffix
+        if len(name) > 256:
+            name = display[:256 - len(suffix)].rstrip() + suffix
+        return workspaces.create(
+            slug, name, login, tx, plan="free", personal=1)
+
+    def _prepare_created_workspace(self, handler, created_workspace, account):
+        from .db.repos import SettingsRepo
+        from .db.workspaces import WorkspaceRepo
+        from .workspaces import prepare_store
+
+        if created_workspace is None:
+            return None
+        marker = self._signup_pending_key(account["id"])
+        try:
+            prepare_store(handler.server.data_dir, created_workspace["id"])
+        except (OSError, DatabaseError):
+            logger.exception("could not create workspace store")
+            try:
+                with self.keys.db.transaction(write=True) as tx:
+                    tx.advisory_lock("users")
+                    row = WorkspaceRepo(self.keys.db).get(created_workspace["slug"], tx)
+                    if row is not None and row["slug"] != "default":
+                        tx.execute("DELETE FROM workspaces WHERE id=?", (row["id"],))
+                    SettingsRepo(self.keys.db).set(marker, "1", tx)
+            except Exception:
+                logger.exception("could not delete workspace after store failure")
+            return None
+        SettingsRepo(self.keys.db).delete(marker)
+        return created_workspace
 
     def _read_login_payload(self, handler):
         length = handler._put_length(LOGIN_BODY_MAX)

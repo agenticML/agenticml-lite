@@ -166,9 +166,11 @@ class IngestServer(DashboardServer):
 
     def __init__(self, data, host, port, public_url=None, env_key=None,
                  trusted_proxies=(), identity_header=None, db=None,
-                 firebase=None, cert_source=None, plans=None):
+                 firebase=None, cert_source=None, plans=None, open_signup=False):
+        from .firebase import require_open_signup
         from .ingest import IngestHandler
 
+        require_open_signup(open_signup, firebase, plans)
         self.data_dir = Path(data)
         self.tmp_dir = self.data_dir / "server" / "tmp"
         db = db if db is not None else for_server_dir(self.data_dir / "server")
@@ -189,7 +191,8 @@ class IngestServer(DashboardServer):
         self.web = WebAuth(
             self.keys, public_url, users=self.users,
             trusted_proxies=trusted_proxies, identity_header=identity_header,
-            firebase=firebase, cert_source=cert_source)
+            firebase=firebase, cert_source=cert_source, plans=plans,
+            open_signup=open_signup)
         self.store_file_mode = 0o666 & ~_read_umask()
         self.limits = Limits()
         self.lineage_enabled = shutil.which("git") is not None
@@ -369,11 +372,13 @@ class IPv6IngestServer(IngestServer):
 
 def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None,
                 trusted_proxies=(), identity_header=None, database=None,
-                firebase=None, cert_source=None, plans=None):
+                firebase=None, cert_source=None, plans=None, open_signup=False):
     """Prepare and lock the data directory; port=0 chooses a free port."""
+    from .firebase import require_open_signup
     from .limits import Plans
     if plans is not None and not isinstance(plans, Plans):
         plans = Plans.load(plans)
+    require_open_signup(open_signup, firebase, plans)
     validate_env_key(env_key)
     if env_key is not None and env_key_looks_weak(env_key):
         logger.warning(
@@ -391,7 +396,8 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
         _clean_tmp(data / "server" / "tmp")
         cls = IPv6IngestServer if ":" in host else IngestServer
         server = cls(data, host, port, public_url, env_key, trusted_proxies, identity_header, db=db,
-                     firebase=firebase, cert_source=cert_source, plans=plans)
+                     firebase=firebase, cert_source=cert_source, plans=plans,
+                     open_signup=open_signup)
         server._server_lock = handle
         for workspace in server.workspaces.list():
             root = prepare_store(data, workspace['id'])
@@ -406,7 +412,7 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
 
 def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None,
           trusted_proxies=(), identity_header=None, database=None,
-          firebase=None, cert_source=None, plans=None):
+          firebase=None, cert_source=None, plans=None, open_signup=False):
     """Run until interrupted, with an optional environment admin key."""
     extra = {}
     if plans is not None:
@@ -417,6 +423,8 @@ def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None
         extra["firebase"] = firebase
     if cert_source is not None:
         extra["cert_source"] = cert_source
+    if open_signup:
+        extra["open_signup"] = True
     server = make_server(
         data, host, port, public_url, os.environ.get("AGENTICML_SERVER_KEY"),
         trusted_proxies, identity_header, **extra)

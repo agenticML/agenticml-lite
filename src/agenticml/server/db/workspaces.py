@@ -8,12 +8,20 @@ from .errors import DatabaseError
 
 _RESERVED = {'admin', 'api', 'static', 'w', 'account', 'login', 'logout', 'setup', 'invite', 'healthz', 'v2'}
 _EMAIL_LOGIN = re.compile(r'[^\s@]+@[^\s@]+\.[^\s@]+')
+_SLUG_OTHER = re.compile('[^a-z0-9]+')
 
 
 def validate_slug(slug):
     if not isinstance(slug, str) or not re.fullmatch('[a-z0-9][a-z0-9-]{0,39}', slug) or slug in _RESERVED:
         raise ClientError('invalid or reserved workspace slug')
     return slug
+
+
+def slug_from_email_local(email):
+    """Turn an email's local part into a workspace slug: ``[a-z0-9-]``, max 32."""
+    local = email.split('@', 1)[0].lower() if isinstance(email, str) and '@' in email else ''
+    cleaned = _SLUG_OTHER.sub('-', local).strip('-')[:32].rstrip('-')
+    return cleaned or 'workspace'
 
 
 def is_email_login(login):
@@ -211,23 +219,51 @@ class WorkspaceRepo:
                 'SELECT w.*, (SELECT COUNT(*) FROM memberships m WHERE m.workspace_id=w.id) AS members '
                 'FROM workspaces w ORDER BY w.created_at, w.slug')]
 
-    def create(self, slug, name=None, owner=None):
+    def create(self, slug, name=None, owner=None, tx=None, *, plan='free', personal=0):
         validate_slug(slug)
         if not isinstance(name or slug, str) or not (name or slug).strip() or len(name or slug) > 256:
             raise ClientError('invalid workspace name')
-        with self.db.transaction(write=True) as tx:
-            tx.advisory_lock('users')
-            if self.get(slug, tx):
-                raise ClientError('workspace slug already exists')
-            account = AccountRepo(self.db).get(validate_login(owner), tx) if owner else None
-            if account is None:
-                raise ClientError('workspace needs an existing owner account')
-            wid = secrets.token_hex(16)
-            tx.execute('INSERT INTO workspaces (id, slug, name, status, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-                       (wid, slug, name or slug, 'active', account['id'], layout.format_timestamp()))
-            tx.execute('INSERT INTO workspace_usage (workspace_id) VALUES (?)', (wid,))
-            tx.execute('INSERT INTO memberships (workspace_id, account_id, role) VALUES (?, ?, ?)', (wid, account['id'], 'owner'))
-            return self.by_id(wid, tx)
+        if plan not in ('free', 'custom'):
+            raise ClientError('plan must be free or custom')
+        if tx is None:
+            with self.db.transaction(write=True) as tx:
+                return self.create(slug, name, owner, tx, plan=plan, personal=personal)
+        tx.advisory_lock('users')
+        if self.get(slug, tx):
+            raise ClientError('workspace slug already exists')
+        account = AccountRepo(self.db).get(validate_login(owner), tx) if owner else None
+        if account is None:
+            raise ClientError('workspace needs an existing owner account')
+        wid = secrets.token_hex(16)
+        tx.execute(
+            'INSERT INTO workspaces (id, slug, name, status, created_by, created_at, plan, personal) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            (wid, slug, name or slug, 'active', account['id'], layout.format_timestamp(),
+             plan, 1 if personal else 0))
+        tx.execute('INSERT INTO workspace_usage (workspace_id) VALUES (?)', (wid,))
+        tx.execute('INSERT INTO memberships (workspace_id, account_id, role) VALUES (?, ?, ?)',
+                   (wid, account['id'], 'owner'))
+        return self.by_id(wid, tx)
+
+    def allocate_slug(self, base, tx):
+        candidate, n = base or 'workspace', 2
+        while True:
+            try:
+                validate_slug(candidate)
+            except ClientError:
+                candidate = f'{base}-{n}'
+                n += 1
+                continue
+            if self.get(candidate, tx) is None:
+                return candidate
+            candidate = f'{base}-{n}'
+            n += 1
+
+    def owned_free_count(self, account_id, tx):
+        return tx.fetchone(
+            "SELECT COUNT(*) FROM workspaces w JOIN memberships m ON m.workspace_id=w.id "
+            "WHERE m.account_id=? AND m.role='owner' AND w.plan='free'",
+            (account_id,))[0]
 
     def update(self, slug, *, name=None, new_slug=None, status=None):
         if new_slug is not None:

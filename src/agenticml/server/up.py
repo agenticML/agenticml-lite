@@ -316,6 +316,10 @@ def ensure_funnel_443_free(port):
         raise UpError(_PORT_443_TAKEN)
 
 
+def _absolute_limits(limits):
+    return str(Path(limits).expanduser().resolve())
+
+
 def _systemd_quote(value):
     value = str(value)
     if any((ord(c) < 32 and c not in "\t\n\r") or ord(c) == 127 for c in value):
@@ -567,7 +571,8 @@ def _environment_file_assignment(name, value):
     return f'{name}="{escaped}"\n'
 
 
-def write_systemd_unit(data, port, *, home=None, force=False, database=None, firebase=None):
+def write_systemd_unit(data, port, *, home=None, force=False, database=None, firebase=None,
+                       open_signup=False, limits=None):
     home = Path(home or Path.home())
     path = systemd_unit_path(home)
     env_path = systemd_env_path(home)
@@ -587,6 +592,10 @@ def write_systemd_unit(data, port, *, home=None, force=False, database=None, fir
         exec_start += ' --firebase-project ' + _systemd_quote(firebase.project)
         exec_start += ' --firebase-api-key ' + _systemd_quote(firebase.api_key)
         exec_start += ' --firebase-auth-domain ' + _systemd_quote(firebase.auth_domain)
+    if open_signup:
+        exec_start += ' --open-signup'
+    if limits:
+        exec_start += ' --limits ' + _systemd_quote(_absolute_limits(limits))
     body = (
         f"{_UNIT_MARKER}\n"
         "[Unit]\n"
@@ -616,7 +625,8 @@ def write_systemd_unit(data, port, *, home=None, force=False, database=None, fir
     return path
 
 
-def write_launchd_plist(data, port, *, home=None, force=False, database=None, firebase=None):
+def write_launchd_plist(data, port, *, home=None, force=False, database=None, firebase=None,
+                        open_signup=False, limits=None):
     home = Path(home or Path.home())
     if database is not None:
         _require_single_line_database(database)
@@ -644,15 +654,24 @@ def write_launchd_plist(data, port, *, home=None, force=False, database=None, fi
             '--firebase-api-key', firebase.api_key,
             '--firebase-auth-domain', firebase.auth_domain,
         ])
+    if open_signup:
+        payload['ProgramArguments'].append('--open-signup')
+    if limits:
+        payload['ProgramArguments'].extend(['--limits', _absolute_limits(limits)])
     _atomic_write(path, plistlib.dumps(payload), home=home)
     print(f"launchctl load -w {path}")
     return path
 
 
-def install_unit(data, port, *, force=False, database=None, firebase=None):
+def install_unit(data, port, *, force=False, database=None, firebase=None, open_signup=False,
+                 limits=None):
     extra = {}
     if firebase is not None:
         extra['firebase'] = firebase
+    if open_signup:
+        extra['open_signup'] = True
+    if limits:
+        extra['limits'] = limits
     if sys.platform.startswith("linux"):
         return write_systemd_unit(data, port, force=force, database=database, **extra)
     if sys.platform == "darwin":
@@ -660,7 +679,17 @@ def install_unit(data, port, *, force=False, database=None, firebase=None):
     raise UpError(_INSTALL_PLATFORMS)
 
 
-def up(data=None, port=8080, *, install=False, force=False, database=None, firebase=None):
+def up(data=None, port=8080, *, install=False, force=False, database=None, firebase=None,
+       plans=None, limits=None, open_signup=False):
+    from .firebase import require_open_signup
+    from .limits import Plans
+
+    if plans is None and limits:
+        plans = Plans.load(limits)
+    require_open_signup(open_signup, firebase, plans)
+    if install and open_signup and not limits:
+        from .firebase import OPEN_SIGNUP_REQUIRES_LIMITS
+        raise ValueError(OPEN_SIGNUP_REQUIRES_LIMITS)
     if install and port == 0:
         raise UpError(_INSTALL_NEEDS_PORT)
     public_url = check_tailscale()
@@ -680,6 +709,10 @@ def up(data=None, port=8080, *, install=False, force=False, database=None, fireb
             install_extra['database'] = explicit_database
         if firebase is not None:
             install_extra['firebase'] = firebase
+        if open_signup:
+            install_extra['open_signup'] = True
+        if limits:
+            install_extra['limits'] = limits
         install_unit(data, port, force=force, **install_extra)
         if explicit_database is None and database is not None:
             print(_INSTALL_ENV_DATABASE)
@@ -707,6 +740,10 @@ def up(data=None, port=8080, *, install=False, force=False, database=None, fireb
             serve_extra["database"] = database
         if firebase is not None:
             serve_extra["firebase"] = firebase
+        if plans is not None:
+            serve_extra["plans"] = plans
+        if open_signup:
+            serve_extra["open_signup"] = True
         serve(data, "127.0.0.1", port, public_url, on_ready,
               trusted_proxies=("127.0.0.1", "::1"),
               **serve_extra)

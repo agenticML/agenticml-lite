@@ -307,10 +307,10 @@ class IngestHandler(DashboardHandler):
         elif route == 'object':
             growth = (0 if usage.has_object(args[0]) or objects.has(self.workspace.root, args[0])
                       else length)
-        # Pre-check without a lock for early refusal; re-check under the write
-        # lock after receipt so slow bodies never hold run/object locks.
-        # Final check, publish and accounting hold the workspace quota lock;
-        # receiving network bytes never holds that lock.
+        # Pre-check without a lock for early refusal; re-check under the
+        # per-workspace quota lock after receipt so slow bodies never hold
+        # run/object locks. Final check, publish and accounting hold that
+        # quota lock; receiving network bytes never holds it.
         self.server.plans.check_upload(limits, usage.get(), length, growth)
 
     def _method_not_allowed(self):

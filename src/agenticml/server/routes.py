@@ -6,10 +6,13 @@ enumerate everything.
 """
 from __future__ import annotations
 
+import logging
 import re
 
 from .access import WorkspaceNotFound, bind_dashboard
 from .users import allowed
+
+logger = logging.getLogger("agenticml.server.routes")
 
 _SLUG = r"(?P<slug>[a-z0-9][a-z0-9-]{0,39})"
 _RUN = r"(?P<run_id>[A-Za-z0-9][A-Za-z0-9._-]{0,127})"
@@ -87,6 +90,7 @@ _ROUTES.extend([
     _r("GET", r"/api/account/session", "account", None, "session", "account_session"),
     _r("POST", r"/api/account/password", "account", "password", "account_password", "account_password"),
     _r("GET", r"/api/account/workspaces", "account", None, "account_workspaces", "account_workspaces"),
+    _r("POST", r"/api/account/workspaces", "account", None, "account_workspaces_create", "account_workspaces_create"),
     _r("GET", r"/static/app.js", "account", "read", "static_file", "static_app_js", target="app.js"),
     _r("GET", r"/static/charts.js", "account", "read", "static_file", "static_charts_js", target="charts.js"),
     _r("GET", r"/static/code.js", "account", "read", "static_file", "static_code_js", target="code.js"),
@@ -230,6 +234,91 @@ def _account_password(webauth, handler, route, match):
 
 def _account_workspaces(webauth, handler, route, match):
     handler._json({"workspaces": webauth._account_workspaces(handler)}, headers=webauth._headers())
+
+
+def _account_workspaces_create(webauth, handler, route, match):
+    from .db import DatabaseError
+    from .db.workspaces import AccountRepo, WorkspaceRepo, validate_slug
+    from .keys import ClientError
+    from .keyspage import read_json
+    from .limits import LimitReached, free_workspace_limit_error
+    from .webauth import LOGIN_BODY_MAX
+    from .workspaces import prepare_store
+
+    if not webauth.open_signup:
+        handler.close_connection = True
+        handler._json({"error": "not found"}, 404, webauth._headers())
+        return
+    payload = read_json(handler, LOGIN_BODY_MAX)
+    if payload is None:
+        return
+    slug, name = payload.get("slug"), payload.get("name")
+    if not isinstance(slug, str) or not isinstance(name, str):
+        handler._json({"error": "invalid request"}, 400, webauth._headers())
+        return
+    account = AccountRepo(handler.server.db).get(handler.principal.user)
+    if account is None:
+        handler.close_connection = True
+        handler._json({"error": "not found"}, 404, webauth._headers())
+        return
+    if not account.get("email_verified"):
+        handler._json({"error": "verify your email"}, 403, webauth._headers())
+        return
+    try:
+        validate_slug(slug)
+    except ClientError as exc:
+        handler._json({"error": str(exc)}, 400, webauth._headers())
+        return
+    retry_after, ticket = webauth.throttle.begin("slug:" + account["id"])
+    if ticket is None:
+        handler.close_connection = True
+        handler._json(
+            {"error": "too many attempts; try again later"},
+            429, webauth._headers({"Retry-After": str(retry_after)}),
+        )
+        return
+    outcome = "ignored"
+    try:
+        repo = WorkspaceRepo(handler.server.db)
+        plans = getattr(handler.server, "plans", None)
+        try:
+            with handler.server.db.transaction(write=True) as tx:
+                tx.advisory_lock("users")
+                limit = None if plans is None else plans.free_workspaces_per_account
+                if limit is not None and repo.owned_free_count(account["id"], tx) >= limit:
+                    raise free_workspace_limit_error(limit)
+                row = repo.create(slug, name, account["login"], tx, plan="free", personal=0)
+        except LimitReached as exc:
+            handler._json({"error": str(exc)}, 403, webauth._headers())
+            return
+        except ClientError as exc:
+            message = str(exc)
+            status = 409 if message == "workspace slug already exists" else 400
+            if status == 409:
+                outcome = "failed"
+            handler._json({"error": message}, status, webauth._headers())
+            return
+        try:
+            prepare_store(handler.server.data_dir, row["id"])
+        except (OSError, DatabaseError):
+            logger.exception("could not create workspace store")
+            try:
+                repo.delete(row["slug"])
+            except Exception:
+                logger.exception("could not delete workspace after store failure")
+            handler._json({"error": "could not create workspace"}, 503, webauth._headers())
+            return
+        try:
+            webauth._audit(
+                handler, "workspace.create", row["id"],
+                {"slug": row["slug"], "name": row["name"]},
+                via="dashboard")
+        except Exception:
+            pass
+        outcome = "success"
+        handler._json({"slug": row["slug"], "name": row["name"]}, 201, webauth._headers())
+    finally:
+        webauth.throttle.finish(ticket, outcome)
 
 
 def _home(webauth, handler, route, match):
@@ -485,6 +574,7 @@ HANDLERS = {
     "session": _session,
     "account_password": _account_password,
     "account_workspaces": _account_workspaces,
+    "account_workspaces_create": _account_workspaces_create,
     "home": _home,
     "workspaces_page": _workspaces_page,
     "admin_workspaces": _admin_workspaces,

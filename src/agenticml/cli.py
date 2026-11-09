@@ -486,6 +486,10 @@ def cmd_ui(args):
     return 0
 
 
+def _env_flag(name):
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes"}
+
+
 def _firebase_from_args(args):
     from .server.firebase import parse_firebase_config
 
@@ -499,6 +503,24 @@ def _firebase_from_args(args):
     if auth_domain is None:
         auth_domain = os.environ.get("AGENTICML_SERVER_FIREBASE_AUTH_DOMAIN") or None
     return parse_firebase_config(project, api_key, auth_domain)
+
+
+def _limits_from_args(args):
+    from .server.limits import Plans
+
+    path = getattr(args, "limits", None) or os.environ.get("AGENTICML_SERVER_LIMITS")
+    if not path:
+        return None, None
+    path = str(Path(path).expanduser().resolve())
+    return path, Plans.load(path)
+
+
+def _open_signup_from_args(args, firebase, plans=None):
+    from .server.firebase import require_open_signup
+
+    open_signup = bool(getattr(args, "open_signup", False) or _env_flag("AGENTICML_SERVER_OPEN_SIGNUP"))
+    require_open_signup(open_signup, firebase, plans)
+    return open_signup
 
 
 def cmd_server_serve(args):
@@ -521,13 +543,14 @@ def cmd_server_serve(args):
     if args.database is not None:
         extra["database"] = args.database
     try:
-        from .server.limits import Plans
-        limits_file = args.limits or os.environ.get("AGENTICML_SERVER_LIMITS")
-        if limits_file:
-            extra["plans"] = Plans.load(limits_file)
+        _, plans = _limits_from_args(args)
+        if plans is not None:
+            extra["plans"] = plans
         firebase = _firebase_from_args(args)
         if firebase is not None:
             extra["firebase"] = firebase
+        if _open_signup_from_args(args, firebase, plans):
+            extra["open_signup"] = True
         serve(args.data, args.host, args.port, public_url,
               trusted_proxies=parse_trusted_proxies(proxies),
               identity_header=parse_identity_header(identity),
@@ -559,9 +582,16 @@ def cmd_server_up(args):
     if args.database is not None:
         extra["database"] = args.database
     try:
+        limits_file, plans = _limits_from_args(args)
+        if plans is not None:
+            extra["plans"] = plans
+        if limits_file is not None:
+            extra["limits"] = limits_file
         firebase = _firebase_from_args(args)
         if firebase is not None:
             extra["firebase"] = firebase
+        if _open_signup_from_args(args, firebase, plans):
+            extra["open_signup"] = True
         up(args.data, args.port, install=args.install, force=args.force, **extra)
     except KeyboardInterrupt:
         pass
@@ -1582,6 +1612,8 @@ def main(argv=None):
     p_serve.add_argument("--firebase-auth-domain", default=None, metavar="HOST",
                         help="Firebase auth domain (default: AGENTICML_SERVER_FIREBASE_AUTH_DOMAIN or <project>.firebaseapp.com)")
     p_serve.add_argument("--limits", default=None, metavar="FILE", help="Workspace limits JSON (default: AGENTICML_SERVER_LIMITS)")
+    p_serve.add_argument("--open-signup", action="store_true",
+                        help="Allow verified Firebase sign-in to create an account (default: AGENTICML_SERVER_OPEN_SIGNUP)")
     p_serve.set_defaults(func=cmd_server_serve)
     p_up = server_sub.add_parser("up", help="Serve on loopback through Tailscale Funnel")
     p_up.add_argument("--data", default=None, help="Data directory (default: AGENTICML_SERVER_DATA or ~/.agenticml-server)")
@@ -1595,6 +1627,10 @@ def main(argv=None):
                      help="Firebase web API key (default: AGENTICML_SERVER_FIREBASE_API_KEY)")
     p_up.add_argument("--firebase-auth-domain", default=None, metavar="HOST",
                      help="Firebase auth domain (default: AGENTICML_SERVER_FIREBASE_AUTH_DOMAIN or <project>.firebaseapp.com)")
+    p_up.add_argument("--limits", default=None, metavar="FILE",
+                     help="Workspace limits JSON (default: AGENTICML_SERVER_LIMITS)")
+    p_up.add_argument("--open-signup", action="store_true",
+                     help="Allow verified Firebase sign-in to create an account (default: AGENTICML_SERVER_OPEN_SIGNUP)")
     p_up.set_defaults(func=cmd_server_up)
     for action, func, help_text in (
             ("status", cmd_server_status, "Show runs, sizes, and key activity"),

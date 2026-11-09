@@ -16,6 +16,12 @@ class LimitReached(ClientError):
     pass
 
 
+def free_workspace_limit_error(limit):
+    if limit == 0:
+        return LimitReached('free workspaces are not available')
+    return LimitReached('you already have a free workspace')
+
+
 def _keys(value, expected, where):
     if not isinstance(value, dict):
         raise ValueError(f'{where} must be an object')

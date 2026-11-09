@@ -20,6 +20,17 @@ CERTS_URL = ('https://www.googleapis.com/robot/v1/metadata/x509/'
 FIREBASE_EXTRA = ("Firebase sign-in needs the [firebase] extra: "
                   "pip install 'agenticml-lite[firebase]'")
 FIREBASE_IDENTITY = "Firebase sign-in cannot be combined with --identity-header"
+OPEN_SIGNUP_REQUIRES_FIREBASE = "open sign-up requires --firebase-project"
+OPEN_SIGNUP_REQUIRES_LIMITS = "open sign-up requires --limits"
+
+
+def require_open_signup(open_signup, firebase=None, plans=None):
+    if not open_signup:
+        return
+    if firebase is None:
+        raise ValueError(OPEN_SIGNUP_REQUIRES_FIREBASE)
+    if plans is None:
+        raise ValueError(OPEN_SIGNUP_REQUIRES_LIMITS)
 LEEWAY = 60
 AUTH_MAX_AGE = 600
 MIN_MAX_AGE = 300

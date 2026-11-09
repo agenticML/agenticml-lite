@@ -130,6 +130,10 @@ EXAMPLES = {
         "body": {"new": "new-password-1"},
     },
     "account_workspaces": {"method": "GET", "path": "/api/account/workspaces"},
+    "account_workspaces_create": {
+        "method": "POST", "path": "/api/account/workspaces",
+        "body": {"slug": "nope", "name": "Nope"},
+    },
     "static_app_js": {"method": "GET", "path": "/static/app.js"},
     "static_charts_js": {"method": "GET", "path": "/static/charts.js"},
     "static_code_js": {"method": "GET", "path": "/static/code.js"},

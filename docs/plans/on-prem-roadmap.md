@@ -203,12 +203,12 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 18b.2 | Sign-in page with the vendored Firebase SDK, per-page CSP, UI tests | 18b.1 | Cursor | S | [plan](packages/18b-firebase-sign-in.md) | done (3.0 PR) |
 | 18c † | Self-serve sign-up and usage limits (free plan: storage, uploads, requests, people) | 18b | Codex | M | [plan](packages/18c-signup-and-limits.md) | in progress |
 | 18c.1 | Limits core: usage counters, limits file, storage/upload/request/people checks, CLI | 18b | Codex, Cursor | M | [plan](packages/18c-signup-and-limits.md) | done (3.0 PR) |
-| 18c.2 | Sign-up with a personal workspace, new workspace, free-workspace limit | 18c.1 | Codex | S | [plan](packages/18c-signup-and-limits.md) | plan ready |
-| 18c.3 | Usage page and banner, admin plan edit, `sync --follow` retry | 18c.2 | Codex | S | [plan](packages/18c-signup-and-limits.md) | plan ready |
+| 18c.2 | Sign-up with a personal workspace, new workspace, free-workspace limit | 18c.1 | Cursor | S | [plan](packages/18c-signup-and-limits.md) | done (3.0 PR) |
+| 18c.3 | Usage page and banner, admin plan edit, `sync --follow` retry | 18c.2 | Cursor | S | [plan](packages/18c-signup-and-limits.md) | in progress (`sync --follow` retry done) |
 | 19 † | Postgres backend, row-level security, CI on both backends | 18 | Codex, Cursor | M | [plan](packages/19-postgres.md) | in progress |
 | 19.1 | Postgres backend, dialect, portability audit, test harness, CI job | 18 | Codex, Cursor | M | [plan](packages/19-postgres.md) | done (3.0 PR) |
 | 19.2 | Row-level security policies and per-transaction workspace binding | 19.1, 18c | Cursor | S–M | [plan](packages/19-postgres.md) | plan ready |
-| 20 † | Many server processes: database locks, shared throttle and sessions | 19 | Cursor | M | [plan](packages/20-many-processes.md) | plan ready |
+| 20 † | Many server processes: database locks, shared throttle and sessions | 19 | Codex, Cursor | M | [plan](packages/20-many-processes.md) | in review (separate worktree) |
 | 21 | S3 object backend | 18 | Codex | M | – | not started |
 | 22 | Metric summaries; sort and filter runs by metric | 17, 18 | Cursor | M | – | not started |
 | 23 | Operator commands: end-to-end 2.x conversion test (the import itself landed in 16–18), `server backup`, `status`/`verify` on the database | 18 | Codex | S–M | – | not started |
