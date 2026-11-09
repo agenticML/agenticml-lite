@@ -106,6 +106,7 @@ for sub, name, target in _RUN_SUBS:
     _ROUTES.append(_ws("GET", r"runs/" + _RUN + sub, "read", "dashboard_get", name, target))
 _ROUTES.extend([
     _ws("GET", r"runs", "read", "dashboard_get", "runs_list", "/api/runs"),
+    _ws("GET", r"metrics", "read", "dashboard_get", "metrics_list", "/api/metrics"),
     _ws("PUT", r"runs/" + _RUN + r"/notes", "notes", "dashboard_put", "run_notes_put", "/api/runs/{run_id}/notes"),
     _ws("GET", r"compare/code", "read", "dashboard_get", "compare_code", "/api/compare/code"),
     _ws("GET", r"lineage", "read", "dashboard_get", "lineage_graph", "/api/lineage"),

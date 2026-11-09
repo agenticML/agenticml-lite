@@ -43,8 +43,9 @@ def make_run(data, rid, status="finished", owner="box", stamp=None, slug="defaul
         remote.update(status=status, last_sync_at=stamp or layout.format_timestamp(), sizes=sizes)
     if slug != "default":
         db = for_server_dir(data / "server", create=False)
-        adopt_directory(root, directory, RunRepo(db, WorkspaceRepo(db).require(slug)["id"]),
-                        remote=remote, overwrite=True)
+        index = RunRepo(db, WorkspaceRepo(db).require(slug)["id"])
+        adopt_directory(root, directory, index, remote=remote, overwrite=True)
+        index.rebuild_metrics(rid, root)
         return directory
     from server_db_helpers import index_if_open
     if index_if_open(default_store(data), directory, remote=remote) is None:
@@ -815,6 +816,41 @@ def test_s3_wrong_size_and_deep_hash(s3):
     assert cli.main(["server", "verify", "--data", str(data), "--deep", "--workspace", "acme"]) == 1
 
 
-# package 22: the wrong-metric-summary test goes here once run_metrics exists
-# (corrupt a summary row, expect a "metric_summary" problem naming
-# `server metrics rebuild`).
+def test_wrong_metric_summary_is_a_problem_until_rebuilt(store, capsys):
+    data, _ = store
+    db = for_server_dir(data / "server", create=False)
+    wid = default_workspace_id(db)
+    repo = RunRepo(db, wid)
+    assert repo.metrics("done") and admin.verify(data)["ok"]
+    with db.transaction(write=True) as tx:
+        tx.bind_workspace(wid)
+        tx.execute("UPDATE run_metrics SET count=99, last_value=1.5 "
+                   "WHERE workspace_id=? AND run_id='done' AND series_id=0", (wid,))
+    code, report, _ = command(data, "verify", capsys)
+    assert code == 1 and not report["ok"]
+    [problem] = report["problems"]
+    assert problem["kind"] == "metric_summary" and problem["path"].endswith("runs/done/scalars/0.bin")
+    assert "series 0" in problem["detail"] and "count" in problem["detail"]
+    assert "agenticml server metrics rebuild --workspace default --run done" in problem["detail"]
+    assert cli.main(["server", "metrics", "rebuild", "--data", str(data), "--run", "done"]) == 0
+    capsys.readouterr()
+    code, report, _ = command(data, "verify", capsys)
+    assert code == 0 and report["ok"] and not report["problems"]
+
+
+def test_missing_and_orphan_metric_rows_are_problems(store):
+    data, _ = store
+    db = for_server_dir(data / "server", create=False)
+    wid = default_workspace_id(db)
+    with db.transaction(write=True) as tx:
+        tx.bind_workspace(wid)
+        tx.execute("DELETE FROM run_metrics WHERE workspace_id=? AND run_id='done'", (wid,))
+    report = admin.verify(data)
+    [problem] = report["problems"]
+    assert problem["kind"] == "metric_summary" and "no summary" in problem["detail"]
+    RunRepo(db, wid).rebuild_metrics("done", default_store(data))
+    assert admin.verify(data)["ok"]
+    # A live append past the committed size is not a mismatch.
+    with (default_store(data) / "runs" / "live" / "scalars" / "0.bin").open("ab") as handle:
+        handle.write(b"\x01" * 16)
+    assert admin.verify(data)["ok"]

@@ -1828,10 +1828,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 listed = notes.list_notes(root, project)
             listed["writable"] = _notes_writable(self)
             return self._json(listed)
+        if path == "/api/metrics":
+            run_index = _ctx_run_index(self)
+            if run_index is None:
+                raise FileNotFoundError()
+            return self._json({"metrics": run_index.metric_names()})
         if path == "/api/runs":
             run_index = _ctx_run_index(self)
             if run_index is not None:
-                return self._json(run_index.dashboard_list())
+                from agenticml.server.metrics import RunsQueryError, parse_runs_query
+                try:
+                    metrics, sort, order, filters = parse_runs_query(query)
+                except RunsQueryError as exc:
+                    return self._json({"error": str(exc)}, 422)
+                return self._json(run_index.dashboard_list(
+                    metrics=metrics, sort=sort, order=order, filters=filters))
             runs = []
             for meta in reader.list_runs(root):
                 if not isinstance(meta, dict):

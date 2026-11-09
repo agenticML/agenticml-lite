@@ -1,9 +1,10 @@
 """One-time object inventory after the legacy store has been converted."""
+from contextlib import ExitStack, nullcontext
 import logging
 import stat
 
 from agenticml.store import layout
-from .repos import SettingsRepo
+from .repos import RunRepo, SettingsRepo
 from .usage import UsageRepo
 from .workspaces import WorkspaceRepo
 
@@ -83,3 +84,54 @@ def backfill_objects(db, data):
     with db.transaction(write=True) as tx:
         tx.advisory_lock('objects_backfill')
         settings.set('objects_backfilled', layout.format_timestamp(), tx)
+
+
+def lock_run(db, workspace_id, run_id, server=None):
+    """Same run lock ingest uses; CLI uses the Postgres session key."""
+    if server is not None:
+        return server.run_lock(run_id, workspace_id=workspace_id)
+    if db.dialect.name == 'postgres':
+        return db.session_lock('run:' + workspace_id + ':' + run_id)
+    return nullcontext()
+
+
+def backfill_metrics(server):
+    """Rebuild summaries for every run once after migration 0007."""
+    from ..workspaces import store_root
+
+    db = server.db
+    settings = SettingsRepo(db)
+    if settings.get('metrics_backfilled') is not None:
+        return
+    guard = ExitStack()
+    try:
+        if db.dialect.name == 'postgres':
+            guard.enter_context(db.session_lock('metrics-backfill', timeout=None))
+        with db.transaction(write=True) as tx:
+            tx.advisory_lock('metrics-backfill')
+            if settings.get('metrics_backfilled', tx) is not None:
+                return
+        jobs = []
+        for workspace in WorkspaceRepo(db).list():
+            wid = workspace['id']
+            root = store_root(server.data_dir, wid)
+            repo = RunRepo(db, wid)
+            for row in repo.all_rows():
+                jobs.append((repo, root, wid, row['run_id']))
+        if jobs:
+            logger.info('metrics backfill started: %s runs', len(jobs))
+        rebuilt = 0
+        for repo, root, wid, run_id in jobs:
+            try:
+                with lock_run(db, wid, run_id, server):
+                    repo.rebuild_metrics(run_id, root)
+            except OSError as exc:
+                logger.warning('metrics backfill skipped unreadable run %s: %s', run_id, exc)
+            rebuilt += 1
+            if rebuilt % 1000 == 0:
+                logger.info('metrics backfill: %s runs', rebuilt)
+        with db.transaction(write=True) as tx:
+            tx.advisory_lock('metrics-backfill')
+            settings.set('metrics_backfilled', layout.format_timestamp(), tx)
+    finally:
+        guard.close()

@@ -2,6 +2,7 @@
 import json
 import re
 import threading
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from agenticml.server.app import make_server
@@ -360,6 +361,135 @@ def test_invite_page_sets_password_and_overflow(page, tmp_path, monkeypatch):
         page.locator("#password2").fill("password1234")
         page.get_by_role("button", name="Save password", exact=True).click()
         expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+        assert_no_overflow(page)
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()
+
+
+def test_metric_picker_sort_filter_remembered_and_overflow(page, tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    data = tmp_path / "data"
+    httpd = make_server(data, port=0)
+    _, admin = httpd.keys.create("admin", "admin")
+    # Non-monotonic loss so last/min/max differ: 0.2, 3.0, 0.4 → last 0.4, min 0.2, max 3.0.
+    # gamma has no acc so it sorts last when acc is picked. Dotted config key lr.min
+    # must still match the comparison grammar, not the metric token.
+    fixtures = (
+        ("low-last", [0.2, 3.0, 0.4], [0.5, 0.8, 0.85], 0.1),
+        ("mid-last", [1.0, 0.5, 0.8], [0.9, 0.99, 0.95], 0.1),
+        ("high-last", [2.0, 0.1, 1.5], None, 0.2),
+    )
+    for name, losses, accs, lr_min in fixtures:
+        writer = RunWriter.create(
+            httpd.root, run_id=name,
+            meta={"project": "demo", "name": name, "task": "train",
+                  "config": {"lr.min": lr_min}})
+        points = []
+        for step, loss in enumerate(losses):
+            payload = {"loss": loss}
+            if accs is not None:
+                payload["acc"] = accs[step]
+            points.append((step, payload))
+        writer.write_scalars(points)
+        writer.finish("finished")
+        writer.close()
+        adopt_directory(httpd.root, httpd.root / "runs" / name, httpd.run_index, remote={
+            "owner": "admin", "status": "finished", "fingerprint": "a" * 64,
+            "last_sync_at": layout.format_timestamp(),
+        })
+        httpd.run_index.rebuild_metrics(name, httpd.root)
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
+    thread.start()
+    server = {"url": f"http://127.0.0.1:{httpd.server_address[1]}", "admin": admin}
+
+    def names():
+        return page.locator(".run-row .run-name").all_text_contents()
+
+    def metric_cell(run_name):
+        return page.locator(".run-row").filter(
+            has=page.get_by_role("link", name=run_name, exact=True)
+        ).locator(".run-metric")
+
+    try:
+        sign_in(page, server, admin)
+        expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+        picker = page.get_by_test_id("runs-metric")
+        stat = page.get_by_test_id("runs-metric-stat")
+        expect(picker).to_be_visible()
+        picker.select_option("loss")
+        stat.select_option("last")
+        expect(page.locator(".run-row.has-picked-metric")).to_have_count(3)
+        expect(page.locator(".run-row").first).to_contain_text("low-last")
+        assert names()[:3] == ["low-last", "mid-last", "high-last"]
+        expect(metric_cell("low-last")).to_have_text("0.4")
+        last_order = names()[:3]
+        last_value = metric_cell("low-last").inner_text()
+        stat.select_option("min")
+        expect(page.locator(".run-row").first).to_contain_text("high-last")
+        assert names()[:3] == ["high-last", "low-last", "mid-last"]
+        expect(metric_cell("high-last")).to_have_text("0.1")
+        expect(metric_cell("low-last")).to_have_text("0.2")
+        assert names()[:3] != last_order
+        expect(metric_cell("low-last")).not_to_have_text(last_value)
+        stat.select_option("last")
+        page.get_by_label("Filter runs").fill("loss.min<0.15")
+        expect(page.locator(".run-row")).to_have_count(1)
+        expect(page.get_by_role("link", name="high-last", exact=True)).to_be_visible()
+        page.get_by_label("Filter runs").fill("")
+        expect(page.locator(".run-row")).to_have_count(3)
+        picker.select_option("acc")
+        expect(page.locator(".run-row").first).to_contain_text("mid-last")
+        assert names()[:3] == ["mid-last", "low-last", "high-last"]
+        expect(metric_cell("mid-last")).to_have_text("0.95")
+        expect(metric_cell("low-last")).to_have_text("0.85")
+        expect(metric_cell("high-last")).to_have_text("—")
+        picker.select_option("loss")
+        page.get_by_label("Filter runs").fill("acc.max>0.9")
+        expect(page.locator(".run-row")).to_have_count(1)
+        expect(page.get_by_role("link", name="mid-last", exact=True)).to_be_visible()
+        page.get_by_label("Filter runs").fill("lr.min=0.1")
+        expect(page.locator(".run-row")).to_have_count(2)
+        expect(page.get_by_role("link", name="low-last", exact=True)).to_be_visible()
+        expect(page.get_by_role("link", name="mid-last", exact=True)).to_be_visible()
+        page.get_by_label("Filter runs").fill("")
+        expect(page.locator(".run-row")).to_have_count(3)
+        held = []
+
+        def hold_acc(route):
+            metrics = parse_qs(urlparse(route.request.url).query).get("metrics", [""])[0]
+            if metrics == "acc":
+                held.append(route)
+                return
+            route.continue_()
+
+        page.route("**/api/w/*/runs*", hold_acc)
+        try:
+            picker.select_option("acc")
+            picker.select_option("loss")
+            expect(picker).to_have_value("loss")
+            expect(page.locator(".run-row").first).to_contain_text("low-last")
+            assert names()[:3] == ["low-last", "mid-last", "high-last"]
+            expect(metric_cell("low-last")).to_have_text("0.4")
+            assert held, "older acc request should still be in flight"
+            for pending in held:
+                pending.continue_()
+            expect(page.locator(".run-row").first).to_contain_text("low-last")
+            assert names()[:3] == ["low-last", "mid-last", "high-last"]
+            expect(metric_cell("low-last")).to_have_text("0.4")
+        finally:
+            page.unroute("**/api/w/*/runs*")
+        page.set_viewport_size({"width": 375, "height": 812})
+        assert_no_overflow(page)
+        expect(page.locator(".run-picked-inline").first).to_be_visible()
+        expect(page.locator(".run-row .run-metric").first).to_be_hidden()
+        page.reload()
+        expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+        expect(page.get_by_test_id("runs-metric")).to_have_value("loss")
+        expect(page.get_by_test_id("runs-metric-stat")).to_have_value("last")
+        expect(page.locator(".run-picked-inline").first).to_be_visible()
+        expect(page.locator(".run-row .run-metric").first).to_be_hidden()
         assert_no_overflow(page)
     finally:
         httpd.shutdown()

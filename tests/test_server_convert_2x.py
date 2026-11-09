@@ -28,6 +28,25 @@ def converted_store(data):
     return next((data / 'workspaces').glob('*/store'))
 
 
+def assert_summaries_backfilled(db, wid, data):
+    """Every committed series .bin of every run has a summary matching its bytes."""
+    from agenticml.server.metrics import empty_summary, fold
+    checked = 0
+    repo = RunRepo(db, wid)
+    for row in repo.all_rows():
+        rows = {m['series_id']: m for m in repo.metrics(row['run_id'])}
+        for path, info in repo.files(row['run_id']).items():
+            if not (path.startswith('scalars/') and path.endswith('.bin') and path != 'scalars/_time.bin'):
+                continue
+            body = (default_store(data) / 'runs' / row['run_id'] / path).read_bytes()[:info['size']]
+            expected = fold(empty_summary(), body)
+            found = rows[int(path[8:-4])]
+            assert expected['count'] > 0
+            assert {k: found[k] for k in expected} == expected, (row['run_id'], path)
+            checked += 1
+    assert checked >= 2
+
+
 def open_db(data):
     db = for_server_dir(data / 'server', create=False)
     return db, default_workspace_id(db)
@@ -113,7 +132,7 @@ def test_conversion_end_to_end_and_sync(old, tmp_path, monkeypatch):
         assert {row['run_id'] for row in json.loads(body)} == {'old-1', 'old-2', 'new-1'}
         report = admin.verify(data)
         assert report['ok'] and not report['problems'], report
-    # package 22: assert metric summaries were backfilled for the imported runs.
+        assert_summaries_backfilled(server.db, wid, data)
 
 
 @pytest.mark.parametrize('name', ['users.json', 'keys.json', 'audit.jsonl'])
@@ -195,6 +214,7 @@ def test_interrupted_conversion_completes_without_importing_twice(old, stage, mo
                                                        if r['action'] == 'migration'])
     assert {row['run_id'] for row in RunRepo(db, wid).all_rows()} == {'old-1', 'old-2'}
     assert admin.verify(data)['ok']
+    assert_summaries_backfilled(db, wid, data)
     close_all(data)
     # A third start neither refuses nor changes anything.
     assert for_server_dir(data / 'server') is not None

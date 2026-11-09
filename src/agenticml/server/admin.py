@@ -24,6 +24,7 @@ from .db.inventory import InventoryRepo
 from .db.repos import RunRepo
 from .db.usage import UsageRepo
 from .db.workspaces import WorkspaceRepo
+from .metrics import series_id_from_path, summarize_file
 from .runs import is_run_file
 from .workspaces import store_root
 from .lineage import _git
@@ -415,9 +416,8 @@ def _verify_workspace(data, root, db, wid, backend, deep, progress, report, add)
         for sha in sorted(set(on_disk) - set(recorded)):
             add("object_orphan", objects / sha[:2] / sha,
                 "stored but not recorded in the database", warning=True)
-    # package 22: for every run_metrics row, recompute the summary from the
-    # committed run bytes and report mismatches as problems ("metric_summary",
-    # detail naming `agenticml server metrics rebuild` as the fix).
+    if db is not None:
+        _verify_metrics(root, db, wid, sorted({d.name for d in directories}), add)
 
     def lock_error(path, exc):
         add("lineage_lock", path, str(exc))
@@ -431,6 +431,56 @@ def _verify_workspace(data, root, db, wid, backend, deep, progress, report, add)
             rm = "rm -r --" if stat.S_ISDIR(info.st_mode) else "rm --"
             detail = f"not a regular file; stop the server, then run: {rm} {quoted}"
         add("lineage_lock", path, detail, warning=now - info.st_mtime < 600)
+
+
+_METRIC_FIELDS = ("last_value", "min_value", "max_value", "count", "last_step", "decoded_bytes")
+
+
+def _verify_metrics(root, db, wid, run_ids, add):
+    """Recompute every run_metrics summary from the committed bytes.
+
+    One short read transaction per run reads the file sizes and the stored rows
+    together; the folding happens after it ends, over the committed prefix only,
+    so a live append cannot cause a false mismatch.
+    """
+    index = RunRepo(db, wid)
+    indexed = InventoryRepo(db, wid).run_ids()
+    workspace = WorkspaceRepo(db).by_id(wid)
+    slug = workspace["slug"] if workspace else "default"
+    for run_id in run_ids:
+        if run_id not in indexed:
+            continue
+        with db.transaction() as tx:
+            files = index.files(run_id, tx)
+            rows = {row["series_id"]: row for row in index.metrics(run_id, tx)}
+        directory = layout.run_dir(root, run_id)
+        fix = f"run: agenticml server metrics rebuild --workspace {shlex.quote(slug)} --run {run_id}"
+        series = {}
+        for path, info in files.items():
+            series_id = series_id_from_path(path)
+            if series_id is not None:
+                series[series_id] = (path, info["size"])
+        for series_id in sorted(set(series) | set(rows)):
+            path, size = series.get(series_id, (f"scalars/{series_id}.bin", 0))
+            target = directory / path
+            row = rows.get(series_id)
+            if row is None:
+                if size > 0:
+                    add("metric_summary", target, f"series {series_id} has no summary; {fix}")
+                continue
+            if series_id not in series:
+                add("metric_summary", target, f"series {series_id} has a summary but no committed "
+                    f"file; {fix}")
+                continue
+            try:
+                found = summarize_file(target, size)
+            except (OSError, ValueError) as exc:
+                add("metric_summary", target, f"series {series_id} unreadable: {exc}")
+                continue
+            wrong = [name for name in _METRIC_FIELDS if row[name] != found[name]]
+            if wrong:
+                add("metric_summary", target, f"series {series_id} summary is wrong "
+                    f"({', '.join(wrong)}); {fix}")
 
 
 def _lineage_locks(directory, on_error):

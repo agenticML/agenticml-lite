@@ -212,8 +212,8 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 20.1 | Cross-process session locks, process start, database clock, reader freshness, write fencing (compare-and-swap, lock checks) | 19 | Codex, Cursor | M | [plan](packages/20-many-processes.md) | done (3.0 PR) |
 | 20.2 | Two-process end-to-end test with a kill mid-upload | 20.1 | Codex, Cursor | S | [plan](packages/20-many-processes.md) | done (3.0 PR) |
 | 21 | S3 object backend | 18 | Codex, Sonnet | M | [plan](packages/21-s3-objects.md) | done (3.0 PR; real S3 in Backlog) |
-| 22 | Metric summaries; sort and filter runs by metric | 17, 18 | Cursor | M | [plan](packages/22-metric-summaries.md) | in progress |
-| 23 | Operator commands: end-to-end 2.x conversion test (the import itself landed in 16–18), `server backup`, `status`/`verify` on the database | 18, 21, 22 | Sonnet (Codex at limit) | S–M | [plan](packages/23-operator-commands.md) | in progress (done except the metric-summary check in `verify`, which follows 22) |
+| 22 | Metric summaries; sort and filter runs by metric | 17, 18 | Cursor | M | [plan](packages/22-metric-summaries.md) | done (3.0 PR) |
+| 23 | Operator commands: end-to-end 2.x conversion test (the import itself landed in 16–18), `server backup`, `status`/`verify` on the database | 18, 21, 22 | Sonnet (Codex at limit) | S–M | [plan](packages/23-operator-commands.md) | done (3.0 PR) |
 | 24 | AWS hosted deployment (Dockerfile, Terraform, deploy workflow, runbook, real-EFS benchmark) | 18c, 19, 20, 21 | Codex, Sonnet; owner runs it | M | [plan](packages/24-aws-deployment.md) | done (code, 3.0 PR; owner checks in Backlog) |
 | 24.1 | Image: Dockerfile, entrypoint, limits file, local hosted smoke test | 21 | Codex, Sonnet | S | [plan](packages/24-aws-deployment.md) | done (3.0 PR) |
 | 24.2 | Terraform, deploy workflow, `deploy-check` CI job, runbook | 24.1 | Codex, Sonnet | M | [plan](packages/24-aws-deployment.md) | done (3.0 PR; `terraform validate` runs in CI) |

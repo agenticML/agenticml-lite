@@ -1083,6 +1083,74 @@ def cmd_server_reindex(args):
             handle.close()
 
 
+def cmd_server_metrics_rebuild(args):
+    from .server.app import acquire_server_lock
+    from .server.db import for_server_dir, resolve_url, _is_postgres
+    from .server.db.backfill import lock_run
+    from .server.db.errors import DatabaseBusy, DatabaseError, DatabaseUrlError, SchemaTooNew
+    from .server.db.repos import RunRepo
+    from .server.db.workspaces import WorkspaceRepo
+    from .server.workspaces import prepare_store
+
+    handle = None
+    try:
+        data, directory = _server_data_dir(args)
+        try:
+            if not _is_postgres(resolve_url(data, args.database)):
+                handle = acquire_server_lock(data / "server")
+        except ValueError as exc:
+            cause = exc.__cause__
+            if isinstance(cause, OSError) and cause.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                raise ValueError("stop the server first") from exc
+            raise
+        db = for_server_dir(directory, args.database)
+        workspaces = WorkspaceRepo(db)
+        selected = [workspaces.require(args.workspace)] if args.workspace else workspaces.list()
+        run_id = args.run_id
+        if run_id is not None and not valid_run_id(run_id):
+            raise ValueError("invalid run id")
+        rebuilt = 0
+        skipped = 0
+        found = False
+        for workspace in selected:
+            wid = workspace['id']
+            root = prepare_store(data, wid)
+            repo = RunRepo(db, wid)
+            if run_id is not None:
+                if repo.get(run_id) is None:
+                    continue
+                ids = [run_id]
+                found = True
+            else:
+                ids = [row['run_id'] for row in repo.all_rows()]
+            for current in ids:
+                try:
+                    with lock_run(db, wid, current):
+                        repo.rebuild_metrics(current, root)
+                except DatabaseBusy:
+                    print(f"agenticml server: warning: skipped locked run {current}",
+                          file=sys.stderr)
+                    skipped += 1
+                    continue
+                rebuilt += 1
+        if run_id is not None and not found:
+            raise ValueError("unknown run")
+        print(f"rebuilt {rebuilt}")
+        return 1 if skipped else 0
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+    except (DatabaseError, DatabaseUrlError, SchemaTooNew) as exc:
+        print(f"agenticml server: {exc}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, OverflowError) as exc:
+        print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
+        return 2
+    finally:
+        if handle is not None:
+            handle.close()
+
+
 def cmd_du(args):
     import json
     from .store.gc import _format_bytes, usage
@@ -1722,6 +1790,14 @@ def main(argv=None):
     p_reindex.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
     p_reindex.add_argument("--workspace", default=None, help="Workspace slug (default: every workspace)")
     p_reindex.set_defaults(func=cmd_server_reindex)
+    p_metrics = server_sub.add_parser("metrics", help="Rebuild metric summaries")
+    metrics_sub = p_metrics.add_subparsers(dest="metrics_action", required=True)
+    p_rebuild = metrics_sub.add_parser("rebuild", help="Recompute metric summaries from committed files")
+    p_rebuild.add_argument("--data", default=None)
+    p_rebuild.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_rebuild.add_argument("--workspace", default=None, help="Workspace slug (default: every workspace)")
+    p_rebuild.add_argument("--run", default=None, dest="run_id", help="Run id (default: every run)")
+    p_rebuild.set_defaults(func=cmd_server_metrics_rebuild)
     p_workspaces = server_sub.add_parser('workspaces', help='Manage server workspaces')
     ws_sub = p_workspaces.add_subparsers(dest='workspaces_action', required=True)
     for action in ('list', 'create', 'rename', 'suspend', 'resume', 'delete', 'set-owner', 'recount', 'usage', 'set-plan'):

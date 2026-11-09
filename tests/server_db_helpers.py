@@ -103,8 +103,12 @@ def index_if_open(root, directory, remote=None, note_body=None):
     db = for_server_dir(server_dir, create=False)
     if db is None:
         return None
-    return adopt_directory(root, directory, RunRepo(db, default_workspace_id(db)), remote=remote, note_body=note_body,
-                           overwrite=True)
+    index = RunRepo(db, default_workspace_id(db))
+    adopted = adopt_directory(root, directory, index, remote=remote, note_body=note_body,
+                              overwrite=True)
+    if adopted is not None:
+        index.rebuild_metrics(adopted, root)
+    return adopted
 
 
 def default_workspace_id(db):

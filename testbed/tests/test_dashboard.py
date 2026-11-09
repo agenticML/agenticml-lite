@@ -102,6 +102,7 @@ def home(page, server):
     page.goto(server.url)
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
     expect(page.locator(".poll-status")).not_to_be_empty()
+    expect(page.get_by_test_id("runs-metric")).to_be_hidden()
 
 
 def row(page, name):
@@ -215,6 +216,20 @@ def test_project_filter_and_search(page, ui_server):
     expect(page.locator(".run-row")).to_have_count(1)
     search.fill("")
     expect(page.locator(".run-row")).to_have_count(5)
+
+
+def test_dotted_config_filter_is_not_a_metric_token(page, tmp_path, ui_server_factory):
+    root = tmp_path / "dotted-config"
+    for name, lr_min in (("keep", 0.1), ("drop", 0.2)):
+        writer = RunWriter.create(
+            root, meta={"name": name, "project": "demo", "config": {"lr.min": lr_min}})
+        writer.finish("finished")
+        writer.close()
+    with ui_server_factory(root) as server:
+        home(page, server)
+        page.get_by_label("Filter runs").fill("lr.min=0.1")
+        expect(page.locator(".run-row")).to_have_count(1)
+        expect(page.get_by_role("link", name="keep", exact=True)).to_be_visible()
 
 
 @pytest.mark.parametrize("width", [375, 1400])

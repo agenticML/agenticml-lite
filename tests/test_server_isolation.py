@@ -45,6 +45,7 @@ EXAMPLES = {
     "run_code": {"method": "GET", "path": "/api/w/{slug}/runs/{run_id}/code"},
     "run_lineage": {"method": "GET", "path": "/api/w/{slug}/runs/{run_id}/lineage"},
     "runs_list": {"method": "GET", "path": "/api/w/{slug}/runs"},
+    "metrics_list": {"method": "GET", "path": "/api/w/{slug}/metrics"},
     "run_notes_put": {
         "method": "PUT", "path": "/api/w/{slug}/runs/{run_id}/notes",
         "body": {"text": "isolation note", "revision": None},
