@@ -633,13 +633,11 @@ def _count_emits(monkeypatch):
 
 def _count_attempts(monkeypatch):
     seen = []
-    real = sync.sync_run
 
-    def wrapped(reader, *args, **kwargs):
-        seen.append(reader.run_id)
-        return real(reader, *args, **kwargs)
+    def done(run_id):
+        seen.append(run_id)
 
-    monkeypatch.setattr(sync, "sync_run", wrapped)
+    monkeypatch.setattr(sync, "_follow_attempt_done", done)
     return seen
 
 

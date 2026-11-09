@@ -111,6 +111,7 @@ _ROUTES.extend([
     _ws("GET", r"lineage", "read", "dashboard_get", "lineage_graph", "/api/lineage"),
     _ws("GET", r"notes", "read", "dashboard_get", "notes_list", "/api/notes"),
     _ws("GET", r"objects/" + _SHA, "read", "dashboard_get", "object_get", "/api/objects/{sha}"),
+    _ws("GET", r"usage", "read", "usage", "workspace_usage"),
     _ws("GET", r"keys", "own_keys", "keys", "keys_list"),
     _ws("POST", r"keys", "own_keys", "keys", "keys_create"),
     _ws("DELETE", r"keys/" + _NAME, "own_keys", "keys", "keys_revoke"),
@@ -304,6 +305,8 @@ def _account_workspaces_create(webauth, handler, route, match):
             logger.exception("could not create workspace store")
             try:
                 repo.delete(row["slug"])
+                from .workspaces import discard_store
+                discard_store(handler.server.data_dir, row["id"])
             except Exception:
                 logger.exception("could not delete workspace after store failure")
             handler._json({"error": "could not create workspace"}, 503, webauth._headers())
@@ -319,6 +322,44 @@ def _account_workspaces_create(webauth, handler, route, match):
         handler._json({"slug": row["slug"], "name": row["name"]}, 201, webauth._headers())
     finally:
         webauth.throttle.finish(ticket, outcome)
+
+
+def _usage(webauth, handler, route, match):
+    from datetime import timedelta, timezone
+
+    from .db.usage import UsageRepo
+    from .db.workspaces import WorkspaceRepo
+
+    plans = getattr(handler.server, "plans", None)
+    if plans is None:
+        handler._json({"limits": None})
+        return
+    workspace = handler.workspace
+    row = WorkspaceRepo(handler.server.db).by_id(workspace.id)
+    if row is None:
+        from .access import WorkspaceNotFound
+        raise WorkspaceNotFound()
+    limits = plans.limits_for(row)
+    usage_repo = UsageRepo(handler.server.db, workspace.id)
+    counters = usage_repo.get()
+    now = plans.clock()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
+    day = now.date().isoformat()
+    resets = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    handler._json({
+        "plan": row["plan"],
+        "storage": {"used": int(counters.get("stored_bytes") or 0), "limit": limits["storage_bytes"]},
+        "uploads_today": {
+            "used": _uploads_today(counters, day),
+            "limit": limits["upload_bytes_per_day"],
+            "resets_at": resets.strftime("%Y-%m-%dT00:00:00Z"),
+        },
+        "requests_per_minute": {"limit": limits["requests_per_minute"]},
+        "people": {"used": usage_repo.people(now=now), "limit": limits["people"]},
+    })
 
 
 def _home(webauth, handler, route, match):
@@ -376,11 +417,65 @@ def _workspaces_page(webauth, handler, route, match):
     handler._send(body, "text/html; charset=utf-8", headers=webauth._headers())
 
 
-def _admin_public(row):
+def _uploads_today(usage, day):
+    if usage.get("upload_day") and usage["upload_day"] >= day:
+        return int(usage.get("upload_bytes") or 0)
+    return 0
+
+
+def _admin_usage_fields(handler, row):
+    from .db.usage import UsageRepo, utc_day
+
+    usage = UsageRepo(handler.server.db, row["id"])
+    counters = usage.get()
     return {
+        "plan": row.get("plan") or "free",
+        "stored_bytes": int(counters.get("stored_bytes") or 0),
+        "uploads_today": _uploads_today(counters, utc_day()),
+        "people": usage.people(),
+    }
+
+
+def _decoded_limits(row):
+    import json
+    raw = row.get("custom_limits") if row else None
+    return json.loads(raw) if raw else None
+
+
+def _admin_public(row, extra=None):
+    payload = {
         "slug": row["slug"], "name": row["name"], "status": row["status"],
         "members": row.get("members", 0), "created_at": row["created_at"],
+        "plan": row.get("plan") or "free",
+        "stored_bytes": 0, "uploads_today": 0, "people": 0,
+        "limits": _decoded_limits(row),
     }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _plan_values(row):
+    return {
+        "plan": row["plan"],
+        "limits": _decoded_limits(row),
+    }
+
+
+def _merged_custom_limits(handler, current, limits):
+    from .limits import UNLIMITED
+    decoded = _decoded_limits(current)
+    if current is not None and current.get("plan") == "custom" and decoded is not None:
+        merged = dict(decoded)
+    else:
+        plans = getattr(handler.server, "plans", None)
+        merged = dict(plans.free) if plans is not None else dict(UNLIMITED)
+    if limits is None:
+        return merged
+    if not isinstance(limits, dict):
+        raise ValueError("limits must be an object")
+    merged.update(limits)
+    return merged
 
 
 def _server_audit(handler):
@@ -398,7 +493,8 @@ def _admin_workspaces(webauth, handler, route, match):
     repo = WorkspaceRepo(handler.server.db)
     principal = handler.principal
     if handler.command == "GET":
-        handler._json({"workspaces": [_admin_public(row) for row in repo.list()]},
+        handler._json({"workspaces": [
+            _admin_public(row, _admin_usage_fields(handler, row)) for row in repo.list()]},
                       headers=webauth._headers())
         return
     if handler.command == "POST":
@@ -416,6 +512,8 @@ def _admin_workspaces(webauth, handler, route, match):
         except OSError:
             try:
                 repo.delete(row["slug"])
+                from .workspaces import discard_store
+                discard_store(handler.server.data_dir, row["id"])
             except ClientError:
                 pass
             handler._json({"error": "could not create workspace"}, 503, webauth._headers())
@@ -427,7 +525,8 @@ def _admin_workspaces(webauth, handler, route, match):
                 {"slug": row["slug"], "owner": owner, "name": row["name"]})
         except Exception:
             pass
-        handler._json({"workspace": _admin_public({**row, "members": 1})}, 201, webauth._headers())
+        handler._json({"workspace": _admin_public(
+            {**row, "members": 1}, _admin_usage_fields(handler, row))}, 201, webauth._headers())
         return
     if handler.command == "PATCH":
         payload = read_json(handler, LOGIN_BODY_MAX)
@@ -435,31 +534,74 @@ def _admin_workspaces(webauth, handler, route, match):
             return
         slug = match.groupdict()["slug"]
         name, new_slug, status = payload.get("name"), payload.get("slug"), payload.get("status")
-        if name is None and new_slug is None and status is None:
+        plan, limits = payload.get("plan"), payload.get("limits")
+        if (plan is not None or "limits" in payload) and (
+                name is not None or new_slug is not None or status is not None):
+            handler._json(
+                {"error": "cannot change plan or limits together with name, slug, or status"},
+                400, webauth._headers())
+            return
+        if name is None and new_slug is None and status is None and plan is None:
             handler._json({"error": "invalid request"}, 400, webauth._headers())
             return
-        try:
-            before = repo.get(slug)
-            row = repo.update(slug, name=name, new_slug=new_slug, status=status)
-        except ClientError as exc:
-            message = str(exc)
-            handler._json({"error": message}, 404 if message == "unknown workspace" else 400,
-                          webauth._headers())
+        if plan is None and "limits" in payload:
+            handler._json({"error": "invalid request"}, 400, webauth._headers())
             return
-        try:
-            log = _server_audit(handler)
-            client = webauth.client_address(handler)
-            if new_slug not in (None, slug) or name not in (None, before["name"] if before else name):
-                log.record(principal.user, principal.via, "workspace.rename", row["id"], client,
-                           {"slug": row["slug"], "name": row["name"]})
-            if status is not None and before is not None and status != before["status"]:
-                action = "workspace.suspend" if status == "suspended" else "workspace.resume"
-                log.record(principal.user, principal.via, action, row["id"], client,
-                           {"slug": row["slug"], "status": row["status"]})
-        except Exception:
-            pass
+        row = None
+        if plan is not None:
+            if plan == "free" and limits is not None:
+                handler._json({"error": "free plan cannot have custom limits"}, 400,
+                              webauth._headers())
+                return
+            try:
+                if plan == "custom":
+                    current = repo.get(slug)
+                    if current is None:
+                        raise ClientError("unknown workspace")
+                    limits = _merged_custom_limits(handler, current, limits)
+                old, row = repo.set_plan(slug, plan, None if plan == "free" else limits)
+            except ClientError as exc:
+                message = str(exc)
+                handler._json({"error": message}, 404 if message == "unknown workspace" else 400,
+                              webauth._headers())
+                return
+            except ValueError as exc:
+                handler._json({"error": str(exc)}, 400, webauth._headers())
+                return
+            try:
+                _server_audit(handler).record(
+                    principal.user, principal.via, "workspace.plan", row["id"],
+                    webauth.client_address(handler),
+                    {"slug": row["slug"], "old": _plan_values(old), "new": _plan_values(row)})
+            except Exception:
+                pass
+            slug = row["slug"]
+        if name is not None or new_slug is not None or status is not None:
+            try:
+                before = repo.get(slug)
+                row = repo.update(slug, name=name, new_slug=new_slug, status=status)
+            except ClientError as exc:
+                message = str(exc)
+                handler._json({"error": message}, 404 if message == "unknown workspace" else 400,
+                              webauth._headers())
+                return
+            try:
+                log = _server_audit(handler)
+                client = webauth.client_address(handler)
+                if new_slug not in (None, slug) or name not in (None, before["name"] if before else name):
+                    log.record(principal.user, principal.via, "workspace.rename", row["id"], client,
+                               {"slug": row["slug"], "name": row["name"]})
+                if status is not None and before is not None and status != before["status"]:
+                    action = "workspace.suspend" if status == "suspended" else "workspace.resume"
+                    log.record(principal.user, principal.via, action, row["id"], client,
+                               {"slug": row["slug"], "status": row["status"]})
+            except Exception:
+                pass
+        if row is None:
+            row = repo.get(slug)
         members = next((item.get("members", 0) for item in repo.list() if item["id"] == row["id"]), 0)
-        handler._json({"workspace": _admin_public({**row, "members": members})},
+        handler._json({"workspace": _admin_public(
+            {**row, "members": members}, _admin_usage_fields(handler, row))},
                       headers=webauth._headers())
         return
     handler.close_connection = True
@@ -580,6 +722,7 @@ HANDLERS = {
     "admin_workspaces": _admin_workspaces,
     "admin_audit": _admin_audit,
     "static_file": _static_file,
+    "usage": _usage,
 }
 
 

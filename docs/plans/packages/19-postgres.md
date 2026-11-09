@@ -168,12 +168,19 @@ with a `workspace_id` column (`memberships`, `invites`, `keys`, `runs`,
 ```sql
 ALTER TABLE t ENABLE ROW LEVEL SECURITY;
 ALTER TABLE t FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS t_workspace ON t;
 CREATE POLICY t_workspace ON t
   USING (workspace_id = current_setting('app.workspace_id', true)
          OR current_setting('app.workspace_id', true) = '*')
   WITH CHECK (workspace_id = current_setting('app.workspace_id', true)
               OR current_setting('app.workspace_id', true) = '*');
 ```
+
+`dialect.enable_workspace_rls(tx, table)` (no-op on SQLite) is **required**
+for any later migration that adds a workspace-scoped table. 0006 covers
+tables that exist at 19.2; it will not run again for tables added
+afterwards. A catalog helper flags any `workspace_id` table that lacks
+FORCE RLS plus `<table>_workspace`.
 
 `audit_events` and `sessions` rows with `workspace_id IS NULL`
 (server-level) are visible only in `'*'` scope. `FORCE` makes the policy
@@ -185,12 +192,18 @@ one fails CI.
 
 - `Tx.bind_workspace(wid)` → `SELECT set_config('app.workspace_id', %s,
   true)` (transaction-local); `Tx.cross_workspace(reason)` → sets `'*'`.
-  On SQLite both are no-ops.
+  On SQLite both are no-ops. `Tx.bound` records the current binding.
+- `with tx.cross_scope(reason):` sets `'*'` and restores the previous
+  binding on exit. Use it when a caller-supplied transaction needs a
+  brief cross-workspace query and then more work in the original scope.
+  Transactions opened solely for cross-workspace work keep
+  `cross_workspace`.
 - Workspace-scoped repositories (`UserRepo`, `KeyRepo`, `RunRepo`,
   `NoteRepo`, `AuditRepo(wid)`, `MembershipRepo`, `InviteRepo(wid)`,
   `UsageRepo`, ...) call `bind_workspace(self.workspace_id)` first in every
   transaction they open (one helper, e.g. `self._tx(write)`), and when
-  handed a `tx` they bind it too.
+  handed a `tx` they bind it too, then restore the caller's previous
+  binding.
 - Cross-workspace reads and writes are explicit and few, each calling
   `cross_workspace` with a reason string: key lookup by digest
   (`KeyStore.verify`), `InviteRepo.find_pending` by token, sessions,

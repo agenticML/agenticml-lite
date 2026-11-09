@@ -189,6 +189,7 @@ def test_env_key_default_admin_never_server_admin_and_no_default(tmp_path, caplo
         assert request(server, '/v2/whoami', key=env)[1]['workspace'] == 'default'
     db = for_server_dir(tmp_path / 'server')
     with db.transaction(write=True) as tx:
+        tx.cross_workspace('test delete default workspace')
         tx.execute("DELETE FROM workspaces WHERE slug='default'")
     db.close()
     with running(tmp_path, env) as server:
@@ -506,6 +507,7 @@ def test_cross_workspace_credentials_refused_except_operator_cli(tmp_path, monke
         token = secrets.token_urlsafe(32)
         digest = hashlib.sha256(token.encode('ascii')).hexdigest()
         with server.db.transaction(write=True) as tx:
+            tx.bind_workspace(server.users.workspace_id)
             tx.execute(
                 'INSERT INTO invites (workspace_id, login, role, sha256, expires_at, invited_by) '
                 'VALUES (?, ?, ?, ?, ?, ?)',
@@ -738,6 +740,7 @@ def test_convert_store_exdev_and_skips_flag_without_default(tmp_path, monkeypatc
         with pytest.raises(DatabaseError, match='server/tmp and workspaces must be on the same filesystem'):
             convert_store(db, data)
     with db.transaction(write=True) as tx:
+        tx.cross_workspace('test delete workspaces')
         tx.execute('DELETE FROM workspaces')
     convert_store(db, data)
     assert SettingsRepo(db).get('workspace_store_converted') is None

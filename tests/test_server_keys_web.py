@@ -620,6 +620,7 @@ def test_list_public_fields_runs_order_and_env(tmp_path):
         # Fix timestamps so the secondary name ordering is exercised.
         records = [replace(record, created_at=first.created_at) for record in httpd.keys.list() if record.name != "env"]
         with httpd.keys.db.transaction(write=True) as tx:
+            tx.bind_workspace(httpd.default_workspace_id)
             for record in records:
                 tx.execute('UPDATE keys SET created_at=? WHERE name=?', (record.created_at, record.name))
         from server_db_helpers import insert_run

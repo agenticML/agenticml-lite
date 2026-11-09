@@ -3253,6 +3253,34 @@ pre,
   gap: var(--s-2);
   min-width: 0;
 }
+.usage-banners {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  margin: var(--s-3) var(--s-5) 0;
+  min-width: 0;
+  max-width: 100%;
+}
+@media (max-width: 760px) {
+  .usage-banners {
+    margin-left: var(--s-4);
+    margin-right: var(--s-4);
+  }
+}
+.usage-banner {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.usage-section {
+  min-width: 0;
+}
+.usage-list {
+  min-width: 0;
+}
+.workspace-new {
+  min-width: 0;
+}
 .workspace-switcher {
   min-width: 0;
 }

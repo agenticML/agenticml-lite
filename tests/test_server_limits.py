@@ -59,6 +59,7 @@ def test_workspace_creation_and_cascade(server):
         usage.record_object('a' * 64, 9, tx)
     WorkspaceRepo(server.db).delete('second')
     with server.db.transaction() as tx:
+        tx.cross_workspace('test cascade delete')
         assert tx.fetchone('SELECT 1 FROM workspace_usage WHERE workspace_id=?', (row['id'],)) is None
         assert tx.fetchone('SELECT 1 FROM objects WHERE workspace_id=?', (row['id'],)) is None
 
@@ -360,6 +361,7 @@ def test_upload_requires_day_and_rolls_back_file(server, monkeypatch):
 def test_missing_usage_row_self_heals(server, operation):
     usage = UsageRepo(server.db, default_workspace_id(server.db), clock=lambda: '2026-11-09')
     with server.db.transaction(write=True) as tx:
+        tx.bind_workspace(usage.workspace_id)
         tx.execute('DELETE FROM workspace_usage WHERE workspace_id=?', (usage.workspace_id,))
     assert usage.get() == {'workspace_id': usage.workspace_id, 'stored_bytes': 0,
                            'upload_day': None, 'upload_bytes': 0,
@@ -564,10 +566,12 @@ def test_request_counter_atomic_concurrency_and_sqlite_fallback(server, monkeypa
 
 def test_no_limits_request_never_creates_usage_row(server):
     with server.db.transaction(write=True) as tx:
+        tx.bind_workspace(server.default_workspace_id)
         tx.execute('DELETE FROM workspace_usage WHERE workspace_id=?', (server.default_workspace_id,))
     for _ in range(3):
         assert request(server, '/v2/whoami')[0] == 200
     with server.db.transaction() as tx:
+        tx.bind_workspace(server.default_workspace_id)
         assert tx.fetchone('SELECT 1 FROM workspace_usage WHERE workspace_id=?', (server.default_workspace_id,)) is None
 
 
@@ -614,6 +618,7 @@ def test_people_expired_invites_do_not_count(server):
     repo = InviteRepo(server.db, server.default_workspace_id)
     repo.create('expired', 'viewer', 'cli')
     with server.db.transaction(write=True) as tx:
+        tx.bind_workspace(server.default_workspace_id)
         tx.execute('UPDATE invites SET expires_at=? WHERE workspace_id=?',
                    ('2026-11-09T00:00:00Z', server.default_workspace_id))
     assert usage.people(now=now) == 1
@@ -960,6 +965,7 @@ def test_invite_resend_at_people_limit_and_member_error(server):
         invites.create(member, 'viewer', 'admin', plans=server.plans)
     assert not isinstance(exc.value, LimitReached)
     with server.db.transaction(write=True) as tx:
+        tx.bind_workspace(server.default_workspace_id)
         tx.execute('UPDATE invites SET expires_at=? WHERE workspace_id=?',
                    ('2000-01-01T00:00:00Z', server.default_workspace_id))
     configure(server, people=1)
@@ -1176,3 +1182,163 @@ def test_set_free_ignores_unreadable_limits(server, monkeypatch, tmp_path):
     monkeypatch.setenv('AGENTICML_SERVER_LIMITS', str(tmp_path / 'missing.json'))
     assert cli.main(['server', 'workspaces', 'set-plan', 'default', 'free',
                      '--data', str(server.data_dir)]) == 0
+
+
+def _dash_cookie(server):
+    from test_server_web import login
+    _, key = server.keys.create('dash-admin', scope='admin')
+    status, _, headers = login(server, key)
+    assert status == 200
+    return headers['Set-Cookie']
+
+
+def test_usage_api_without_limits_and_non_member_404(server):
+    from test_server_signin import PASSWORD, password_login
+    from test_server_web import authed
+    from agenticml.server.users import UserStore
+    from agenticml.server.workspaces import prepare_store
+
+    cookie = _dash_cookie(server)
+    usage = UsageRepo(server.db, server.default_workspace_id)
+    before = usage.get()
+    status, _, body, _ = authed(server, '/api/w/default/usage', cookie=cookie)
+    assert status == 200
+    assert json.loads(body) == {'limits': None}
+    after = usage.get()
+    assert after['stored_bytes'] == before['stored_bytes']
+    assert after['upload_bytes'] == before['upload_bytes']
+    assert after['request_count'] == before['request_count']
+
+    other = WorkspaceRepo(server.db).create('other', owner='admin')
+    prepare_store(server.data_dir, other['id'])
+    UserStore(server.data_dir / 'server', db=server.db, workspace_id=other['id']).add(
+        'viewer-b', 'member')
+    UserStore(server.data_dir / 'server', db=server.db, workspace_id=other['id']).set_password(
+        'viewer-b', PASSWORD)
+    status, _, hdrs = password_login(server, 'viewer-b', PASSWORD)
+    assert status == 200
+    outsider = hdrs['Set-Cookie']
+    denied = authed(server, '/api/w/default/usage', cookie=outsider)
+    missing = authed(server, '/api/w/default/nope', cookie=outsider)
+    assert denied[0] == 404 and json.loads(denied[2]) == {'error': 'not found'}
+    assert (denied[0], json.loads(denied[2])) == (missing[0], json.loads(missing[2]))
+    status, _, body, _ = authed(server, '/api/w/other/usage', cookie=outsider)
+    assert status == 200
+    assert json.loads(body) == {'limits': None}
+
+
+def test_usage_api_with_limits(server):
+    from datetime import datetime, timezone
+    from test_server_web import authed
+
+    now = datetime(2026, 11, 9, 15, 0, tzinfo=timezone.utc)
+    usage = configure(server, clock=lambda: now, storage_bytes=5_000_000_000,
+                      upload_bytes_per_day=2_000_000_000, requests_per_minute=600, people=5)
+    with server.db.transaction(write=True) as tx:
+        usage.add_stored(1_500_000_000, tx)
+        usage.add_upload(400_000_000, tx)
+    cookie = _dash_cookie(server)
+    before = usage.get()
+    status, _, body, _ = authed(server, '/api/w/default/usage', cookie=cookie)
+    assert status == 200
+    payload = json.loads(body)
+    assert payload['plan'] == 'free'
+    assert payload['storage'] == {'used': 1_500_000_000, 'limit': 5_000_000_000}
+    assert payload['uploads_today'] == {
+        'used': 400_000_000, 'limit': 2_000_000_000, 'resets_at': '2026-11-10T00:00:00Z'}
+    assert payload['requests_per_minute'] == {'limit': 600}
+    assert payload['people']['limit'] == 5
+    assert isinstance(payload['people']['used'], int) and payload['people']['used'] >= 1
+    after = usage.get()
+    assert after['stored_bytes'] == before['stored_bytes']
+    assert after['upload_bytes'] == before['upload_bytes']
+    assert after['request_count'] >= before['request_count']
+
+
+def test_admin_patch_plan_limits_audit_and_non_admin_404(server):
+    from test_server_signin import PASSWORD, password_login
+    from test_server_web import authed, csrf
+    from agenticml.server.limits import UNLIMITED
+
+    cookie = _dash_cookie(server)
+    custom = {**UNLIMITED, 'storage_bytes': 1000, 'people': 2}
+    missing_csrf = csrf(server)
+    del missing_csrf['X-AgenticML-Request']
+    status, _, body, _ = authed(
+        server, '/api/admin/workspaces/default', 'PATCH',
+        json.dumps({'plan': 'custom', 'limits': custom}).encode(),
+        extra=missing_csrf, cookie=cookie)
+    assert status == 403
+    assert json.loads(body)['error'] == 'cross-site request refused'
+    assert WorkspaceRepo(server.db).get('default')['plan'] == 'free'
+
+    status, _, body, _ = authed(
+        server, '/api/admin/workspaces/default', 'PATCH',
+        json.dumps({'plan': 'custom', 'limits': custom, 'name': 'Nope'}).encode(),
+        extra=csrf(server), cookie=cookie)
+    assert status == 400
+    assert json.loads(body)['error'] == (
+        'cannot change plan or limits together with name, slug, or status')
+    stored = WorkspaceRepo(server.db).get('default')
+    assert stored['plan'] == 'free' and stored['name'] != 'Nope'
+
+    status, _, body, _ = authed(
+        server, '/api/admin/workspaces/default', 'PATCH',
+        json.dumps({'plan': 'custom', 'limits': custom}).encode(),
+        extra=csrf(server), cookie=cookie)
+    assert status == 200, body
+    row = json.loads(body)['workspace']
+    assert row['plan'] == 'custom'
+    assert row['limits'] == custom
+    assert row['stored_bytes'] >= 0 and row['uploads_today'] >= 0 and row['people'] >= 1
+    stored = WorkspaceRepo(server.db).get('default')
+    assert json.loads(stored['custom_limits']) == custom
+    event = next(e for e in AuditRepo(server.db, None).tail(100) if e['action'] == 'workspace.plan')
+    assert event['detail']['old'] == {'plan': 'free', 'limits': None}
+    assert event['detail']['new'] == {'plan': 'custom', 'limits': custom}
+
+    listed = authed(server, '/api/admin/workspaces', cookie=cookie)
+    assert listed[0] == 200
+    default = next(r for r in json.loads(listed[2])['workspaces'] if r['slug'] == 'default')
+    assert default['plan'] == 'custom' and default['limits'] == custom
+
+    status, _, body, _ = authed(
+        server, '/api/admin/workspaces/default', 'PATCH',
+        json.dumps({'plan': 'custom', 'limits': {'storage_bytes': 1}}).encode(),
+        extra=csrf(server), cookie=cookie)
+    assert status == 200, body
+    merged = dict(custom, storage_bytes=1)
+    assert json.loads(body)['workspace']['limits'] == merged
+    assert json.loads(WorkspaceRepo(server.db).get('default')['custom_limits']) == merged
+
+    status, _, body, _ = authed(
+        server, '/api/admin/workspaces/default', 'PATCH',
+        json.dumps({'plan': 'free', 'limits': custom}).encode(),
+        extra=csrf(server), cookie=cookie)
+    assert status == 400
+    assert json.loads(body)['error'] == 'free plan cannot have custom limits'
+
+    status, _, body, _ = authed(
+        server, '/api/admin/workspaces/default', 'PATCH',
+        json.dumps({'plan': 'free'}).encode(), extra=csrf(server), cookie=cookie)
+    assert status == 200
+    assert json.loads(body)['workspace']['plan'] == 'free'
+    assert json.loads(body)['workspace']['limits'] is None
+
+    listed = authed(server, '/api/admin/workspaces', cookie=cookie)
+    assert listed[0] == 200
+    default = next(r for r in json.loads(listed[2])['workspaces'] if r['slug'] == 'default')
+    assert default['plan'] == 'free' and default['limits'] is None
+    assert 'stored_bytes' in default and 'uploads_today' in default and 'people' in default
+
+    server.users.add('member', 'member')
+    server.users.set_password('member', PASSWORD)
+    status, _, hdrs = password_login(server, 'member', PASSWORD)
+    outsider = hdrs['Set-Cookie']
+    denied = authed(
+        server, '/api/admin/workspaces/default', 'PATCH',
+        json.dumps({'plan': 'custom', 'limits': custom}).encode(),
+        extra=csrf(server), cookie=outsider)
+    missing = authed(server, '/api/no-such', 'PATCH', b'{}', extra=csrf(server), cookie=outsider)
+    assert denied[0] == 404 and json.loads(denied[2]) == {'error': 'not found'}
+    assert denied[0] == missing[0]

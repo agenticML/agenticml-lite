@@ -18,7 +18,7 @@ from agenticml.server.firebase import (
 from agenticml.server.limits import Plans, UNLIMITED
 from agenticml.server.up import write_launchd_plist, write_systemd_unit
 from agenticml.server.webauth import LoginThrottle
-from agenticml.server.workspaces import prepare_store, store_root
+from agenticml.server.workspaces import discard_store, prepare_store, store_root
 from test_server_firebase import (
     FIREBASE_CFG, _live_token, _member_account, _post_firebase, _source,
     firebase_running)
@@ -411,6 +411,84 @@ def test_signup_prepare_store_databaseerror_drops_workspace(tmp_path, monkeypatc
             httpd, '/api/account/session', cookie=hdrs['Set-Cookie'])
         assert status == 200
         assert json.loads(session)['workspaces'] == []
+
+
+def _workspace_dir_ids(data):
+    parent = data / 'workspaces'
+    if not parent.is_dir():
+        return set()
+    return {p.name for p in parent.iterdir()}
+
+
+def test_session_includes_open_signup(tmp_path, monkeypatch):
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    with signup_running(tmp_path / 'data') as httpd:
+        status, hdrs, body = _post_firebase(
+            httpd, _live_token(sub='uid-flag', email='flag@example.com'))
+        assert status == 200
+        status, _, session, _ = authed(
+            httpd, '/api/account/session', cookie=hdrs['Set-Cookie'])
+        assert status == 200
+        assert json.loads(session)['open_signup'] is True
+
+
+def test_signup_prepare_store_failure_removes_workspace_directory(tmp_path, monkeypatch):
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    real = prepare_store
+
+    def boom(data, workspace_id):
+        real(data, workspace_id)
+        raise DatabaseError('workspace store path is a symlink or not a directory; fix or move it away')
+
+    with signup_running(tmp_path / 'data') as httpd:
+        before = _workspace_dir_ids(httpd.data_dir)
+        monkeypatch.setattr('agenticml.server.workspaces.prepare_store', boom)
+        status, hdrs, body = _post_firebase(
+            httpd, _live_token(sub='uid-leftover', email='leftover@example.com', name='Left'))
+        assert status == 200
+        assert WorkspaceRepo(httpd.db).get('leftover') is None
+        assert _workspace_dir_ids(httpd.data_dir) == before
+
+
+def test_account_workspaces_prepare_store_failure_removes_workspace_directory(tmp_path, monkeypatch):
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    real = prepare_store
+
+    def boom(data, workspace_id):
+        real(data, workspace_id)
+        raise OSError('disk full')
+
+    with signup_running(tmp_path / 'data', plans=_plans(2)) as httpd:
+        status, hdrs, body = _post_firebase(
+            httpd, _live_token(sub='uid-dir', email='dir@example.com', name='Dir'))
+        cookie = hdrs['Set-Cookie']
+        before = _workspace_dir_ids(httpd.data_dir)
+        monkeypatch.setattr('agenticml.server.workspaces.prepare_store', boom)
+        status, _, body, _ = authed(
+            httpd, '/api/account/workspaces', 'POST',
+            json.dumps({'slug': 'orphan-dir', 'name': 'Orphan'}).encode(), cookie=cookie)
+        assert status == 503 and json.loads(body) == {'error': 'could not create workspace'}
+        assert WorkspaceRepo(httpd.db).get('orphan-dir') is None
+        assert _workspace_dir_ids(httpd.data_dir) == before
+
+
+def test_discard_store_unlinks_symlink_without_following(tmp_path):
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    (outside / 'secret').write_text('keep')
+    data = tmp_path / 'data'
+    parent = data / 'workspaces'
+    parent.mkdir(parents=True)
+    wid = 'a' * 32
+    (parent / wid).symlink_to(outside)
+    nested = parent / ('b' * 32)
+    nested.mkdir()
+    (nested / 'store').symlink_to(outside, target_is_directory=True)
+    discard_store(data, wid)
+    discard_store(data, 'b' * 32)
+    assert not (parent / wid).exists()
+    assert not nested.exists()
+    assert (outside / 'secret').read_text() == 'keep'
 
 
 def test_account_workspaces_prepare_store_databaseerror_drops_row(tmp_path, monkeypatch):

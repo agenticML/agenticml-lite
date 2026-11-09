@@ -1,6 +1,9 @@
 """SQL variations kept outside repositories."""
 import hashlib
 import json
+import re
+
+_IDENT = re.compile(r'^[a-z_][a-z0-9_]*$')
 
 
 class SqliteDialect:
@@ -19,6 +22,15 @@ class SqliteDialect:
         pass
 
     def advisory_lock(self, tx, name):
+        pass
+
+    def enable_workspace_rls(self, tx, table):
+        """No-op on SQLite. Postgres enables FORCE RLS for ``table``.
+
+        REQUIRED for any later migration that adds a workspace-scoped table.
+        0006 covers tables that exist at 19.2; it will not run again for
+        tables added afterwards.
+        """
         pass
 
     def upsert(self, table, columns, conflict, updates):
@@ -55,3 +67,22 @@ class PostgresDialect(SqliteDialect):
 
     def advisory_lock(self, tx, name):
         self._lock(tx, 'name:' + name)
+
+    def enable_workspace_rls(self, tx, table):
+        """ENABLE/FORCE RLS and (re)create ``<table>_workspace``.
+
+        REQUIRED for any later migration that adds a workspace-scoped table.
+        0006 covers tables that exist at 19.2; it will not run again for
+        tables added afterwards.
+        """
+        if _IDENT.fullmatch(table) is None:
+            raise RuntimeError(f'refusing to enable RLS on {table!r}')
+        tx.execute(f'ALTER TABLE {table} ENABLE ROW LEVEL SECURITY')
+        tx.execute(f'ALTER TABLE {table} FORCE ROW LEVEL SECURITY')
+        tx.execute(f'DROP POLICY IF EXISTS {table}_workspace ON {table}')
+        tx.execute(
+            f'CREATE POLICY {table}_workspace ON {table} '
+            "USING (workspace_id = current_setting('app.workspace_id', true) "
+            "OR current_setting('app.workspace_id', true) = '*') "
+            "WITH CHECK (workspace_id = current_setting('app.workspace_id', true) "
+            "OR current_setting('app.workspace_id', true) = '*')")

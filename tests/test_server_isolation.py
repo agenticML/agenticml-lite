@@ -56,6 +56,7 @@ EXAMPLES = {
     "lineage_graph": {"method": "GET", "path": "/api/w/{slug}/lineage?project=demo"},
     "notes_list": {"method": "GET", "path": "/api/w/{slug}/notes"},
     "object_get": {"method": "GET", "path": "/api/w/{slug}/objects/{sha}"},
+    "workspace_usage": {"method": "GET", "path": "/api/w/{slug}/usage"},
     "keys_list": {"method": "GET", "path": "/api/w/{slug}/keys"},
     "keys_create": {
         "method": "POST", "path": "/api/w/{slug}/keys",

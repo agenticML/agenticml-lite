@@ -1116,6 +1116,10 @@ def _is_quota_limit(exc):
     return _error_detail(response).startswith(_QUOTA_PREFIXES)
 
 
+def _follow_attempt_done(run_id):
+    """Hook after a follow attempt has updated quota_until. Tests wait on this."""
+
+
 def _permanent_failure(exc):
     if isinstance(exc, RunMissingError):
         return False
@@ -1359,50 +1363,53 @@ def _follow(args, root, host, api_key):
                     results[run_id] = active
                     skip_emit = False
                     try:
-                        reader = RunReader(root, run_id)
                         try:
-                            if _effective(reader, reader.meta()) == "running":
-                                saw_running = True
-                        except Exception:
-                            pass
-                        sync_run(reader, host, client, active, prune=prune, artifacts=artifacts)
-                    except SyncStopped:
-                        raise
-                    except Exception as exc:
-                        if _is_unauthorized(exc):
-                            print(f"agenticml sync: {_short_error(exc)}", file=sys.stderr)
-                            return 3
-                        if _is_unreachable(exc):
-                            unreachable = exc
+                            reader = RunReader(root, run_id)
+                            try:
+                                if _effective(reader, reader.meta()) == "running":
+                                    saw_running = True
+                            except Exception:
+                                pass
+                            sync_run(reader, host, client, active, prune=prune, artifacts=artifacts)
+                        except SyncStopped:
+                            raise
+                        except Exception as exc:
+                            if _is_unauthorized(exc):
+                                print(f"agenticml sync: {_short_error(exc)}", file=sys.stderr)
+                                return 3
+                            if _is_unreachable(exc):
+                                unreachable = exc
+                                active.failed = True
+                                active.status = f"failed: {_short_error(exc)}"
+                                active = None
+                                break
                             active.failed = True
                             active.status = f"failed: {_short_error(exc)}"
-                            active = None
-                            break
-                        active.failed = True
-                        active.status = f"failed: {_short_error(exc)}"
-                        if _is_quota_limit(exc):
-                            quota_until[run_id] = _clock() + LIMIT_RETRY
-                            if run_id not in quota_announced:
-                                print(active.line(), flush=True)
-                                last_status[run_id] = active.status
-                                quota_announced.add(run_id)
-                            skip_emit = True
+                            if _is_quota_limit(exc):
+                                quota_until[run_id] = _clock() + LIMIT_RETRY
+                                if run_id not in quota_announced:
+                                    print(active.line(), flush=True)
+                                    last_status[run_id] = active.status
+                                    quota_announced.add(run_id)
+                                skip_emit = True
+                            else:
+                                quota_until.pop(run_id, None)
+                                quota_announced.discard(run_id)
+                                active.permanent = _permanent_failure(exc)
+                                if active.permanent:
+                                    permanent_ids.add(run_id)
                         else:
                             quota_until.pop(run_id, None)
                             quota_announced.discard(run_id)
-                            active.permanent = _permanent_failure(exc)
+                            if active.status == "partial (running)":
+                                saw_running = True
                             if active.permanent:
                                 permanent_ids.add(run_id)
-                    else:
-                        quota_until.pop(run_id, None)
-                        quota_announced.discard(run_id)
-                        if active.status == "partial (running)":
-                            saw_running = True
-                        if active.permanent:
-                            permanent_ids.add(run_id)
-                    if not skip_emit:
-                        _emit_follow(active, last_status, failure_log)
-                    active = None
+                        if not skip_emit:
+                            _emit_follow(active, last_status, failure_log)
+                        active = None
+                    finally:
+                        _follow_attempt_done(run_id)
             if unreachable is None and run_ids:
                 pending = False
                 failed = False

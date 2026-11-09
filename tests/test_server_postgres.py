@@ -389,6 +389,7 @@ def test_concurrent_file_records_ensure_same_missing_run(open_db):
     with ThreadPoolExecutor(2) as pool:
         list(pool.map(record, [(first, 'first'), (second, 'second')]))
     with first.transaction() as tx:
+        tx.bind_workspace(wid)
         assert tx.fetchone('SELECT COUNT(*) FROM runs WHERE run_id=?', ('new-run',))[0] == 1
         assert {row[0] for row in tx.fetchall('SELECT path FROM run_files WHERE run_id=?', ('new-run',))} == {'first', 'second'}
 

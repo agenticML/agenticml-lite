@@ -1155,6 +1155,7 @@ class WebAuth:
             unverified = False
             if account is None:
                 with self.keys.db.transaction(write=True) as tx:
+                    tx.cross_workspace("sign-up creation")
                     tx.advisory_lock("users")
                     account = self._firebase_find_or_claim(accounts, claims, tx)
                     plans = getattr(handler.server, "plans", None)
@@ -1300,7 +1301,7 @@ class WebAuth:
     def _prepare_created_workspace(self, handler, created_workspace, account):
         from .db.repos import SettingsRepo
         from .db.workspaces import WorkspaceRepo
-        from .workspaces import prepare_store
+        from .workspaces import discard_store, prepare_store
 
         if created_workspace is None:
             return None
@@ -1309,15 +1310,20 @@ class WebAuth:
             prepare_store(handler.server.data_dir, created_workspace["id"])
         except (OSError, DatabaseError):
             logger.exception("could not create workspace store")
+            dropped = False
             try:
                 with self.keys.db.transaction(write=True) as tx:
+                    tx.cross_workspace("signup workspace rollback")
                     tx.advisory_lock("users")
                     row = WorkspaceRepo(self.keys.db).get(created_workspace["slug"], tx)
                     if row is not None and row["slug"] != "default":
                         tx.execute("DELETE FROM workspaces WHERE id=?", (row["id"],))
+                        dropped = True
                     SettingsRepo(self.keys.db).set(marker, "1", tx)
             except Exception:
                 logger.exception("could not delete workspace after store failure")
+            if dropped:
+                discard_store(handler.server.data_dir, created_workspace["id"])
             return None
         SettingsRepo(self.keys.db).delete(marker)
         return created_workspace
@@ -1589,6 +1595,7 @@ class WebAuth:
             "identity_proxy": self.identity_header is not None,
             "workspaces": self._account_workspaces(handler),
             "server_admin": bool(principal.server_admin),
+            "open_signup": bool(self.open_signup),
         }
 
     def _session_info(self, handler):

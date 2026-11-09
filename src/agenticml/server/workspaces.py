@@ -44,6 +44,49 @@ def prepare_store(data, workspace_id):
     return root
 
 
+def discard_store(data, workspace_id):
+    """Remove workspaces/<id>/ without following symlinks. Missing is OK."""
+    wid = require_workspace_id(workspace_id)
+    parent = Path(data) / 'workspaces'
+    try:
+        parent_st = parent.lstat()
+    except OSError:
+        return
+    if stat.S_ISLNK(parent_st.st_mode) or not stat.S_ISDIR(parent_st.st_mode):
+        return
+    target = parent / wid
+    try:
+        st = target.lstat()
+    except OSError:
+        return
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        try:
+            os.unlink(target)
+        except OSError:
+            pass
+        return
+    for root, dirs, files in os.walk(target, topdown=False, followlinks=False):
+        for name in files:
+            try:
+                os.unlink(os.path.join(root, name))
+            except OSError:
+                pass
+        for name in dirs:
+            path = os.path.join(root, name)
+            try:
+                dst = os.lstat(path)
+                if stat.S_ISLNK(dst.st_mode):
+                    os.unlink(path)
+                else:
+                    os.rmdir(path)
+            except OSError:
+                pass
+    try:
+        os.rmdir(target)
+    except OSError:
+        pass
+
+
 def convert_store(db, data):
     """Rename first, then mark. A crash after rename is safe to resume."""
     data = Path(data)

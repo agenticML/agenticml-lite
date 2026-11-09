@@ -70,6 +70,7 @@ def backfill_objects(db, data):
                 continue
             usage = UsageRepo(db, wid)
             usage.lock(tx)
+            tx.bind_workspace(wid)
             inserted_size = 0
             for sha, size in rows:
                 result = tx.execute(

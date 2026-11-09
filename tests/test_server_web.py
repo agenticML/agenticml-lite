@@ -292,7 +292,7 @@ def test_session_endpoint_and_local_ui(server, tmp_path):
         "can": {"notes": True, "own_keys": True, "all_keys": True, "users": True, "audit": True},
         "password_set": False, "identity_proxy": False,
         "workspaces": [{"slug": "default", "name": "Default", "role": "owner"}],
-        "server_admin": True}
+        "server_admin": True, "open_signup": False}
 
     httpd = ui_server.make_server(tmp_path, "127.0.0.1", 0)
     thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
@@ -415,7 +415,7 @@ def test_env_key_signs_in(tmp_path, monkeypatch):
             "can": {"notes": True, "own_keys": True, "all_keys": True, "users": True, "audit": True},
             "password_set": False, "identity_proxy": False,
             "workspaces": [{"slug": "default", "name": "Default", "role": "admin"}],
-            "server_admin": False}
+            "server_admin": False, "open_signup": False}
 
 
 def test_current_matches_name_and_hash(server):
