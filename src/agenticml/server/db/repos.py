@@ -11,6 +11,10 @@ import time
 
 from agenticml.store import layout
 from agenticml.store import notes as note_store
+from ..metrics import (
+    merge_summary, read_index_names, series_id_from_path, stat_column,
+    summarize_file, op_sql,
+)
 from .errors import DatabaseBusy, DatabaseError
 from ..keys import (ClientError, KeyNameTaken, LastAdminError, SetupClosed,
                     UserRequired, KeyRecord, validate_name)
@@ -822,7 +826,8 @@ class RunRepo(WorkspaceBound):
 
     def record_file(self, run_id, path, size, sha256=None, last_step=None,
                     upload_bytes=None, upload_clock=None, *, expected_size=None,
-                    expected_sha256=None, publish=None):
+                    expected_sha256=None, publish=None, metric=None,
+                    metric_names=None, metric_replace=False, metric_path=None):
         now = layout.format_timestamp()
         self.db.confirm_session_locks()
         with self._tx(write=True) as tx:
@@ -853,6 +858,11 @@ class RunRepo(WorkspaceBound):
                            (last_step, now, self.workspace_id, run_id))
             else:
                 tx.execute('UPDATE runs SET updated_at=? WHERE workspace_id=? AND run_id=?', (now, self.workspace_id, run_id))
+            if metric is not None:
+                self._apply_metric(
+                    tx, run_id, metric, old_size, size, metric_replace, metric_path)
+            if metric_names is not None:
+                self._apply_metric_names(tx, run_id, metric_names)
 
     def commit_sync(self, run_id, status, fingerprint, last_sync_at, last_sync_key,
                     commit_sizes=None):
@@ -904,6 +914,7 @@ class RunRepo(WorkspaceBound):
             files = list(files)
             usage.add_stored(sum(size for _, size, _ in files) - old_size, tx)
             tx.execute('DELETE FROM run_files WHERE workspace_id=? AND run_id=?', (self.workspace_id, run_id))
+            tx.execute('DELETE FROM run_metrics WHERE workspace_id=? AND run_id=?', (self.workspace_id, run_id))
             for path, size, sha256 in files:
                 tx.execute('INSERT INTO run_files (workspace_id, run_id, path, size, sha256) VALUES (?, ?, ?, ?, ?)',
                            (self.workspace_id, run_id, path, size, sha256))
@@ -956,27 +967,203 @@ class RunRepo(WorkspaceBound):
                 'updated_at=? WHERE workspace_id=? AND run_id=?',
                 (json.dumps(list_row), project, created_at, launch_note, last_step, now, self.workspace_id, run_id))
 
-    def dashboard_list(self):
-        """One ``/api/runs`` row per indexed run. No file access."""
+    def rebuild_metrics(self, run_id, root, tx=None):
+        """Replace one run's ``run_metrics`` rows from committed ``.bin`` prefixes.
+
+        Folds outside any transaction. ``tx`` is ignored so a caller cannot
+        hold a write transaction across file I/O. A short write transaction
+        then replaces rows only if committed sizes are unchanged; otherwise
+        retry up to 3 times and leave the existing rows.
+        """
+        directory = layout.run_dir(root, run_id)
+        for _attempt in range(3):
+            with self._tx() as read_tx:
+                files = self.files(run_id, read_tx)
+            sizes = _metric_file_sizes(files)
+            names = {}
+            index = files.get('scalars/index.json')
+            if index is not None and index['size']:
+                names = read_index_names(directory / 'scalars' / 'index.json', index['size'])
+            folded = []
+            for path, info in files.items():
+                series_id = series_id_from_path(path)
+                if series_id is None:
+                    continue
+                folded.append((series_id, summarize_file(directory / path, info['size']),
+                               names.get(series_id)))
+            with self._tx(write=True) as write_tx:
+                write_tx.lock_row('runs', 'workspace_id=? AND run_id=?',
+                                  (self.workspace_id, run_id))
+                current = self.files(run_id, write_tx)
+                if _metric_file_sizes(current) != sizes:
+                    continue
+                write_tx.execute(
+                    'DELETE FROM run_metrics WHERE workspace_id=? AND run_id=?',
+                    (self.workspace_id, run_id))
+                for series_id, summary, name in folded:
+                    self._upsert_metric(write_tx, run_id, series_id, summary, name)
+                return
+        logger.warning(
+            'leaving metric summaries for run %s unchanged; committed sizes kept changing',
+            run_id)
+
+    def metric_names(self):
+        """Distinct non-NULL series names in this workspace, sorted, capped at 2000."""
+        with self._tx() as tx:
+            rows = tx.fetchall(
+                'SELECT DISTINCT name FROM run_metrics WHERE workspace_id=? AND name IS NOT NULL '
+                'ORDER BY name LIMIT 2000',
+                (self.workspace_id,))
+            return [row['name'] for row in rows]
+
+    def metrics(self, run_id, tx=None):
+        if tx is None:
+            with self._tx() as tx:
+                return self.metrics(run_id, tx)
+        with self._bind(tx):
+            return [dict(row) for row in tx.fetchall(
+                'SELECT * FROM run_metrics WHERE workspace_id=? AND run_id=? ORDER BY series_id',
+                (self.workspace_id, run_id))]
+
+    def dashboard_list(self, metrics=None, sort=None, order='asc', filters=None):
+        """One ``/api/runs`` row per indexed run. No file access.
+
+        With no extra arguments the payload is unchanged. ``metrics`` (up to
+        eight names) adds a ``metrics`` object per row from ``run_metrics``.
+        ``sort`` is ``(name, last|min|max)``; ``filters`` are
+        ``(name, stat, op, number)`` ANDed together. Sorting and filtering
+        join ``run_metrics`` by workspace and name and never open run files.
+        Non-finite last/min/max stay IEEE floats here (including inf); JSON
+        encoding maps them to null, matching the scalars API.
+        """
         from agenticml.store.reader import _remote_status
 
         now = time.time()
-        rows = []
-        for run in self.list_rows():
-            try:
-                list_row = json.loads(run['list_row'])
-            except (ValueError, TypeError, RecursionError):
-                list_row = {}
-            if not isinstance(list_row, dict):
-                list_row = {}
-            row = dict(list_row)
-            row['run_id'] = run['run_id']
-            row['status'] = _effective_status_from_run(run, list_row, now, _remote_status)
-            row['last_step'] = run['last_step']
-            row['last_sync_at'] = run['last_sync_at']
-            row['owner'] = run['owner_user']
-            rows.append(row)
-        return rows
+        metrics = list(metrics or ())
+        filters = list(filters or ())
+        if not metrics and sort is None and not filters:
+            runs = self.list_rows()
+            return [_dashboard_row(run, now, _remote_status) for run in runs]
+        with self._tx() as tx:
+            sql, params = self._dashboard_sql(metrics, sort, order, filters)
+            runs = [_run_dict(row) for row in tx.fetchall(sql, params)]
+            rows = [_dashboard_row(run, now, _remote_status) for run in runs]
+            if metrics:
+                self._attach_metrics(tx, rows, metrics)
+            return rows
+
+    def _dashboard_sql(self, metrics, sort, order, filters):
+        sql = [
+            'SELECT r.*, (SELECT login FROM accounts WHERE id=r.owner_account_id) AS owner_user ',
+            'FROM runs r',
+        ]
+        params = []
+        for index, item in enumerate(filters):
+            alias = 'f' + str(index)
+            column = stat_column(item[1])
+            sql.append(
+                ' INNER JOIN run_metrics ' + alias + ' ON ' + alias + '.workspace_id=r.workspace_id'
+                ' AND ' + alias + '.run_id=r.run_id AND ' + alias + '.name=?'
+                ' AND ' + alias + '.series_id=(SELECT MAX(x.series_id) FROM run_metrics x'
+                ' WHERE x.workspace_id=' + alias + '.workspace_id AND x.run_id=' + alias
+                + '.run_id AND x.name=' + alias + '.name)'
+                ' AND ' + alias + '.' + column + ' ' + op_sql(item[2]) + ' ?')
+            params.extend((item[0], item[3]))
+        if sort is not None:
+            sql.append(
+                ' LEFT JOIN run_metrics sm ON sm.workspace_id=r.workspace_id'
+                ' AND sm.run_id=r.run_id AND sm.name=?'
+                ' AND sm.series_id=(SELECT MAX(x.series_id) FROM run_metrics x'
+                ' WHERE x.workspace_id=sm.workspace_id AND x.run_id=sm.run_id AND x.name=sm.name)')
+            params.append(sort[0])
+        sql.append(' WHERE r.workspace_id=?')
+        params.append(self.workspace_id)
+        if sort is not None:
+            column = 'sm.' + stat_column(sort[1])
+            direction = 'ASC' if order == 'asc' else 'DESC'
+            sql.append(
+                ' ORDER BY (' + column + ' IS NULL), ' + column + ' ' + direction
+                + ", COALESCE(r.created_at, '') DESC, r.run_id DESC")
+        else:
+            sql.append(" ORDER BY COALESCE(r.created_at, '') DESC, r.run_id DESC")
+        return ''.join(sql), tuple(params)
+
+    def _attach_metrics(self, tx, rows, names):
+        if not rows:
+            return
+        placeholders = ','.join('?' * len(names))
+        found = tx.fetchall(
+            'SELECT run_id, series_id, name, last_value, min_value, max_value, count, last_step '
+            'FROM run_metrics WHERE workspace_id=? AND name IN (' + placeholders + ')',
+            (self.workspace_id, *names))
+        best = {}
+        for row in found:
+            key = (row['run_id'], row['name'])
+            prev = best.get(key)
+            if prev is None or row['series_id'] > prev['series_id']:
+                best[key] = row
+        by_run = {}
+        for (run_id, name), row in best.items():
+            by_run.setdefault(run_id, {})[name] = _metric_payload(row)
+        wanted = list(names)
+        for row in rows:
+            payload = by_run.get(row['run_id'], {})
+            row['metrics'] = {name: payload[name] for name in wanted if name in payload}
+
+    def _apply_metric(self, tx, run_id, metric, old_size, size, replace, metric_path):
+        series_id, summary = metric
+        current = tx.fetchone(
+            'SELECT * FROM run_metrics WHERE workspace_id=? AND run_id=? AND series_id=?',
+            (self.workspace_id, run_id, series_id))
+        mismatch = (
+            not replace
+            and ((current is not None and current['decoded_bytes'] != old_size)
+                 or (current is None and old_size)))
+        if mismatch and metric_path is not None:
+            summary = summarize_file(metric_path, size)
+            replace = True
+        if not replace and current is not None:
+            summary = merge_summary(_metric_summary(current), summary)
+        if current is not None and current['name'] is not None:
+            name = current['name']
+        elif metric_path is not None:
+            name = read_index_names(metric_path.parent / 'index.json').get(series_id)
+        else:
+            name = None
+        self._upsert_metric(tx, run_id, series_id, summary, name)
+
+    def _apply_metric_names(self, tx, run_id, metric_names):
+        ids = []
+        for series_id, name in metric_names.items():
+            ids.append(series_id)
+            tx.execute(
+                'UPDATE run_metrics SET name=? WHERE workspace_id=? AND run_id=? AND series_id=?',
+                (name, self.workspace_id, run_id, series_id))
+        if ids:
+            placeholders = ','.join('?' * len(ids))
+            tx.execute(
+                'UPDATE run_metrics SET name=NULL WHERE workspace_id=? AND run_id=? AND series_id NOT IN ('
+                + placeholders + ')',
+                (self.workspace_id, run_id, *ids))
+        else:
+            tx.execute(
+                'UPDATE run_metrics SET name=NULL WHERE workspace_id=? AND run_id=?',
+                (self.workspace_id, run_id))
+
+    def _upsert_metric(self, tx, run_id, series_id, summary, name):
+        tx.execute(self.db.dialect.upsert(
+            'run_metrics',
+            ('workspace_id', 'run_id', 'series_id', 'name', 'last_value', 'min_value',
+             'max_value', 'count', 'last_step', 'decoded_bytes'),
+            ('workspace_id', 'run_id', 'series_id'),
+            ('last_value', 'min_value', 'max_value', 'count', 'last_step', 'decoded_bytes')),
+            (self.workspace_id, run_id, series_id, name, summary['last_value'],
+             summary['min_value'], summary['max_value'], summary['count'],
+             summary['last_step'], summary['decoded_bytes']))
+        if name is not None:
+            tx.execute(
+                'UPDATE run_metrics SET name=COALESCE(name, ?) WHERE workspace_id=? AND run_id=? AND series_id=?',
+                (name, self.workspace_id, run_id, series_id))
 
     def effective_status(self, run_id):
         """Dashboard status for one run: same rule as ``dashboard_list``."""
@@ -1155,3 +1342,54 @@ def _effective_status_from_run(run, list_row, now, remote_status):
     if not isinstance(status, str):
         status = ''
     return 'stale' if status == 'running' else status
+
+
+def _dashboard_row(run, now, remote_status):
+    try:
+        list_row = json.loads(run['list_row'])
+    except (ValueError, TypeError, RecursionError):
+        list_row = {}
+    if not isinstance(list_row, dict):
+        list_row = {}
+    row = dict(list_row)
+    row['run_id'] = run['run_id']
+    row['status'] = _effective_status_from_run(run, list_row, now, remote_status)
+    row['last_step'] = run['last_step']
+    row['last_sync_at'] = run['last_sync_at']
+    row['owner'] = run['owner_user']
+    return row
+
+
+def _metric_payload(row):
+    return {
+        'last': row['last_value'],
+        'min': row['min_value'],
+        'max': row['max_value'],
+        'count': row['count'],
+        'last_step': row['last_step'],
+    }
+
+
+def _metric_summary(row):
+    return {
+        'last_value': row['last_value'],
+        'min_value': row['min_value'],
+        'max_value': row['max_value'],
+        'count': row['count'],
+        'last_step': row['last_step'],
+        'decoded_bytes': row['decoded_bytes'],
+    }
+
+
+def _metric_file_sizes(files):
+    """Committed sizes that affect summaries: series ``.bin`` files and the index.
+
+    The index is ``(size, sha256)`` so a same-size rewrite is still a change.
+    """
+    sizes = {}
+    for path, info in files.items():
+        if series_id_from_path(path) is not None:
+            sizes[path] = info['size']
+        elif path == 'scalars/index.json':
+            sizes[path] = (info['size'], info['sha256'])
+    return sizes

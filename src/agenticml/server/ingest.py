@@ -23,6 +23,10 @@ from .db.usage import UsageRepo
 from .access import WorkspaceNotFound
 from .limits import LimitReached
 from .keys import KeyStoreUnavailable
+from .metrics import (
+    empty_summary, fold, parse_index_obj, read_range,
+    series_id_from_path, summarize_file,
+)
 from .runs import APPEND as _APPEND, ATOMIC as _ATOMIC, list_row_from_bytes
 from .users import allowed, resolve
 
@@ -540,7 +544,8 @@ class IngestHandler(DashboardHandler):
                 upload_bytes=len(body) if self.server.plans is not None else None,
                 upload_clock=self._upload_clock(),
                 expected_size=committed, expected_sha256=committed_sha,
-                publish=publish)
+                publish=publish,
+                metric_names=parse_index_obj(obj) if name == "scalars/index.json" else None)
         except BaseException as exc:
             lock_lost = False
             try:
@@ -834,9 +839,13 @@ class IngestHandler(DashboardHandler):
             layout.fsync_dir(path.parent)
             self.server._after_append_write(run_id, name)
             last_step = self._time_step(path, length) if name == _TIME_PATH else None
+            metric, metric_replace, metric_path = self._series_metric(
+                directory, name, committed, length, truncate=True)
             self.workspace.run_index.record_file(run_id, name, length, last_step=last_step,
                                                  upload_bytes=length if self.server.plans is not None else None, upload_clock=self._upload_clock(),
-                                                 expected_size=committed)
+                                                 expected_size=committed,
+                                                 metric=metric, metric_replace=metric_replace,
+                                                 metric_path=metric_path)
             return {"size": length}, 200
         with layout.open_nofollow(path, "ab"):
             pass
@@ -916,9 +925,13 @@ class IngestHandler(DashboardHandler):
                 raise
         self.server._after_append_write(run_id, name)
         last_step = self._time_step(path, new_size) if name == _TIME_PATH else None
+        metric, metric_replace, metric_path = self._series_metric(
+            directory, name, committed, new_size, truncate=False)
         self.workspace.run_index.record_file(run_id, name, new_size, last_step=last_step,
                                              upload_bytes=length if self.server.plans is not None else None, upload_clock=self._upload_clock(),
-                                             expected_size=committed)
+                                             expected_size=committed,
+                                             metric=metric, metric_replace=metric_replace,
+                                             metric_path=metric_path)
         return {"size": new_size}, 200
 
     @staticmethod
@@ -927,6 +940,17 @@ class IngestHandler(DashboardHandler):
             return last_step_from_size(path, size)
         except (OSError, ValueError):
             return None
+
+    def _series_metric(self, directory, name, committed, new_size, *, truncate):
+        series_id = series_id_from_path(name)
+        if series_id is None:
+            return None, False, None
+        dest = self._target(directory, name)
+        if truncate:
+            summary = summarize_file(dest, new_size)
+        else:
+            summary = fold(empty_summary(), read_range(dest, committed, new_size))
+        return (series_id, summary), truncate, dest
 
     def _commit(self, run_id, directory, body, remote):
         obj = _json_object(body)

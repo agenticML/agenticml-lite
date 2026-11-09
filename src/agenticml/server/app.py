@@ -527,6 +527,8 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
         for workspace in server.workspaces.list():
             root = prepare_store(data, workspace['id'])
             reconcile(root, RunRepo(db, workspace['id']))
+        from .db.backfill import backfill_metrics
+        backfill_metrics(server)
         return server
     except BaseException:
         if db is not None:

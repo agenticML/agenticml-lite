@@ -223,6 +223,7 @@ def _import_runs(db, directory):
         prepared.append((run_dir, remote, note_body, files, fields, last_step,
                          rename_remote, rename_notes))
     renamed = []
+    imported = []
     with db.transaction(write=True) as tx:
         tx.advisory_lock('import_runs')
         if settings.get('imported_runs_2x', tx) is not None:
@@ -234,11 +235,14 @@ def _import_runs(db, directory):
                 files=files, fields=fields, last_step=last_step, tx=tx, overwrite=True)
             if adopted is None:
                 continue
+            imported.append(adopted)
             if rename_remote is not None:
                 renamed.append(rename_remote)
             if rename_notes is not None:
                 renamed.append(rename_notes)
         settings.set('imported_runs_2x', layout.format_timestamp(), tx)
+    for run_id in imported:
+        run_index.rebuild_metrics(run_id, root)
     for path in renamed:
         dest = path.with_name(path.name + '.2x')
         try:

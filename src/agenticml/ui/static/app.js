@@ -345,8 +345,34 @@ function changedLine(run, parent, isRoot, siblingKeys = []) {
 }
 // Runs filter. Words match name, id and tags; "task:x", "tag:x" and
 // "status:x" (with "failed" for crashed) narrow by task, tag and status; "key>n", "key<n", "key>=n",
-// "key<=n" and "key=v" test config, then summary, values. Every token must hold.
+// "key<=n" and "key=v" test config, then summary, values. "name.last|min|max<op><n>"
+// (e.g. loss.min<0.5) tests run.metrics when present. Every token must hold.
 const FILTER_COMPARISON = /^([^<>=:]+)(>=|<=|>|<|=)(.+)$/;
+const METRIC_FILTER = /^(.+)\.(last|min|max)(>=|<=|>|<|=)(.+)$/;
+function metricCompare(value, op, raw) {
+  const number = Number(raw);
+  if (op === "=")
+    return String(fmt(value)).toLowerCase() === raw || value === number;
+  if (!isNumber(value) || !Number.isFinite(number)) return false;
+  return op === ">"
+    ? value > number
+    : op === "<"
+      ? value < number
+      : op === ">="
+        ? value >= number
+        : value <= number;
+}
+function metricKey(run, name) {
+  if (!name || !run?.metrics) return undefined;
+  if (Object.prototype.hasOwnProperty.call(run.metrics, name)) return name;
+  return Object.keys(run.metrics).find(
+    (item) => item.toLowerCase() === String(name).toLowerCase(),
+  );
+}
+function metricStat(run, name, stat) {
+  const key = metricKey(run, name);
+  return key == null ? undefined : run.metrics[key]?.[stat];
+}
 function runMatches(run, query) {
   const text = `${run.name} ${run.run_id} ${(run.tags || []).join(" ")}`.toLowerCase();
   return query
@@ -366,6 +392,15 @@ function runMatches(run, query) {
           statusText(run.status, run).startsWith(wanted)
         );
       }
+      const metricToken = METRIC_FILTER.exec(token);
+      if (metricToken) {
+        const [, name, stat, op, raw] = metricToken;
+        // Only treat name.stat as a metric when this run actually has that
+        // series; otherwise fall through so dotted config keys like lr.min
+        // still use the comparison grammar.
+        if (metricKey(run, name) != null)
+          return metricCompare(metricStat(run, name, stat), op, raw);
+      }
       const compared = FILTER_COMPARISON.exec(token);
       if (compared) {
         const [, name, op, raw] = compared;
@@ -376,17 +411,7 @@ function runMatches(run, query) {
         if (configKey == null && summaryKey == null) return false;
         const value =
           configKey != null ? run.config[configKey] : run.summary[summaryKey];
-        const number = Number(raw);
-        if (op === "=")
-          return String(fmt(value)).toLowerCase() === raw || value === number;
-        if (!isNumber(value) || !Number.isFinite(number)) return false;
-        return op === ">"
-          ? value > number
-          : op === "<"
-            ? value < number
-            : op === ">="
-              ? value >= number
-              : value <= number;
+        return metricCompare(value, op, raw);
       }
       return text.includes(token);
     });
@@ -993,10 +1018,38 @@ async function home(version) {
           count,
         ),
         el(
-          "label",
-          { class: "runs-filter" },
-          el("span", { class: "field-label", text: "Filter runs" }),
-          search,
+          "div",
+          { class: "runs-controls" },
+          el(
+            "div",
+            { class: "runs-metric-picker", hidden: true },
+            el(
+              "label",
+              {},
+              el("span", { class: "field-label", text: "Metric" }),
+              el("select", {
+                class: "field",
+                "aria-label": "Metric",
+                "data-testid": "runs-metric",
+              }),
+            ),
+            el(
+              "label",
+              {},
+              el("span", { class: "field-label", text: "Stat" }),
+              el("select", {
+                class: "field",
+                "aria-label": "Metric statistic",
+                "data-testid": "runs-metric-stat",
+              }),
+            ),
+          ),
+          el(
+            "label",
+            { class: "runs-filter" },
+            el("span", { class: "field-label", text: "Filter runs" }),
+            search,
+          ),
         ),
       ),
       el(
@@ -1013,9 +1066,101 @@ async function home(version) {
       status,
     ),
   );
+  const metricSelect = content.parentElement.querySelector("[data-testid=runs-metric]");
+  const statSelect = content.parentElement.querySelector("[data-testid=runs-metric-stat]");
+  const metricControl = metricSelect.closest(".runs-metric-picker");
+  statSelect.replaceChildren(
+    ...["last", "min", "max"].map((stat) => el("option", { value: stat, text: stat })),
+  );
   let runs = [],
     project = null,
-    timer;
+    timer,
+    searchTimer,
+    seq = 0,
+    metricNames = [],
+    pickedMetric = "",
+    pickedStat = "last";
+  const requestedMetrics = new Set();
+  const rejectedMetrics = new Set();
+  const metricPrefKey = () =>
+    `agenticml-runs-metric:${currentWorkspaceSlug() || ""}`;
+  try {
+    const stored = JSON.parse(localStorage.getItem(metricPrefKey()) || "null");
+    if (stored && typeof stored.name === "string") pickedMetric = stored.name;
+    if (stored && ["last", "min", "max"].includes(stored.stat)) pickedStat = stored.stat;
+  } catch {}
+  function saveMetricPref() {
+    try {
+      localStorage.setItem(
+        metricPrefKey(),
+        JSON.stringify({ name: pickedMetric, stat: pickedStat }),
+      );
+    } catch {}
+  }
+  function fillMetricSelect() {
+    metricSelect.replaceChildren(
+      el("option", { value: "", text: "None" }),
+      ...metricNames.map((name) => el("option", { value: name, text: name })),
+    );
+    if (!metricNames.includes(pickedMetric)) pickedMetric = "";
+    metricSelect.value = pickedMetric;
+    statSelect.value = pickedStat;
+    metricControl.hidden = metricNames.length === 0;
+  }
+  metricSelect.onchange = () => {
+    pickedMetric = metricSelect.value;
+    saveMetricPref();
+    refresh();
+  };
+  statSelect.onchange = () => {
+    pickedStat = statSelect.value;
+    saveMetricPref();
+    draw();
+  };
+  function usableMetricName(name) {
+    return Boolean(name) && name.length <= 200 && !name.includes(",");
+  }
+  function metricQueryNames() {
+    const names = [];
+    const seen = new Set();
+    const add = (name) => {
+      if (
+        !usableMetricName(name) ||
+        seen.has(name) ||
+        rejectedMetrics.has(name) ||
+        names.length >= 8
+      )
+        return;
+      seen.add(name);
+      names.push(name);
+    };
+    add(pickedMetric);
+    for (const token of search.value.trim().toLowerCase().split(/\s+/).filter(Boolean)) {
+      const match = METRIC_FILTER.exec(token);
+      if (!match) continue;
+      add(metricNames.find((name) => name.toLowerCase() === match[1]) || match[1]);
+    }
+    return names;
+  }
+  function runsMetricsQuery(names) {
+    return names.length
+      ? `?metrics=${names.map(encodeURIComponent).join(",")}`
+      : "";
+  }
+  function sortTaskRuns(taskRuns) {
+    if (!pickedMetric) return taskRuns.slice().sort(newestFirst);
+    const lower = lowerBetter(pickedMetric);
+    return taskRuns.slice().sort((a, b) => {
+      const av = metricStat(a, pickedMetric, pickedStat);
+      const bv = metricStat(b, pickedMetric, pickedStat);
+      const aMissing = !isNumber(av);
+      const bMissing = !isNumber(bv);
+      if (aMissing !== bMissing) return aMissing ? 1 : -1;
+      if (aMissing) return newestFirst(a, b);
+      const cmp = lower ? av - bv : bv - av;
+      return cmp || newestFirst(a, b);
+    });
+  }
   const groupKey = (run) => `${run.project || ""}\u0000${taskName(run)}`;
   const EMPTY_SELECTION =
     "Select two or more runs to overlay their curves and diff their configs.";
@@ -1166,10 +1311,13 @@ async function home(version) {
       onkeydown: (event) => event.stopPropagation(),
     });
     const facts = parentFacts(run, metricKey, entry, keys);
+    const metricValue = pickedMetric
+      ? fmt(metricStat(run, pickedMetric, pickedStat))
+      : fmt(run.summary?.[metricKey]);
     return el(
       "div",
       {
-        class: "run-grid run-row",
+        class: `run-grid run-row${pickedMetric ? " has-picked-metric" : ""}`,
         "data-run-id": run.run_id,
         "data-picked": selected.has(run.run_id),
         "data-focus": `row:${run.run_id}`,
@@ -1207,6 +1355,12 @@ async function home(version) {
           text: facts.changed,
           title: facts.changed,
         }),
+        pickedMetric
+          ? el("span", {
+              class: "run-picked-inline muted",
+              text: `${pickedMetric} ${metricValue}`,
+            })
+          : null,
       ),
       el(
         "div",
@@ -1219,8 +1373,8 @@ async function home(version) {
       el("span", { class: "muted run-progress", text: stepText(run.last_step) }),
       el("span", {
         class: "run-number run-metric",
-        title: metricKey || "",
-        text: fmt(run.summary?.[metricKey]),
+        title: pickedMetric || metricKey || "",
+        text: metricValue,
       }),
       el("span", {
         class: `run-number run-delta ${facts.tone}`,
@@ -1233,15 +1387,19 @@ async function home(version) {
   const columns = (metricKey) =>
     el(
       "div",
-      { class: "run-grid run-columns" },
+      { class: `run-grid run-columns${pickedMetric ? " has-picked-metric" : ""}` },
       el("span"),
       el("span", { text: "Run · changed vs parent" }),
       el("span", { class: "run-status", text: "Status" }),
       el("span", { class: "run-progress", text: "Last step" }),
       el("span", {
         class: "run-number run-metric",
-        text: metricKey ? metricLabel(metricKey) : "Metric",
-        title: metricKey || "",
+        text: pickedMetric
+          ? `${pickedMetric} ${pickedStat}`
+          : metricKey
+            ? metricLabel(metricKey)
+            : "Metric",
+        title: pickedMetric || metricKey || "",
       }),
       el("span", { class: "run-number run-delta", text: "Δ vs parent" }),
       el("span", { class: "run-number run-duration", text: "Wall time" }),
@@ -1924,7 +2082,7 @@ async function home(version) {
     );
     const groups = [];
     for (const [task, taskRuns] of ordered) {
-      const visible = taskRuns.filter((run) => runMatches(run, query));
+      const visible = sortTaskRuns(taskRuns.filter((run) => runMatches(run, query)));
       if (query && !visible.length) continue;
       groups.push(taskGroup(key, task, taskRuns, visible, entry, keys));
     }
@@ -2057,11 +2215,39 @@ async function home(version) {
     restoreFocus(focused);
     lineageView?.render();
   }
-  search.oninput = draw;
+  search.oninput = () => {
+    clearTimeout(searchTimer);
+    const needed = metricQueryNames();
+    if (needed.some((name) => !requestedMetrics.has(name)))
+      searchTimer = setTimeout(refresh, 250);
+    else draw();
+  };
   async function refresh() {
+    const mine = ++seq;
+    clearTimeout(timer);
+    clearTimeout(searchTimer);
     try {
-      const result = await get(api("/runs"));
-      if (epoch !== version) return;
+      let names = metricQueryNames();
+      let result;
+      try {
+        result = await get(api(`/runs${runsMetricsQuery(names)}`));
+      } catch (error) {
+        if (epoch !== version || mine !== seq) return;
+        const fallback = names.filter((name) => name === pickedMetric);
+        if (
+          !String(error.message).startsWith("422:") ||
+          fallback.length === names.length
+        )
+          throw error;
+        for (const name of names) {
+          if (name !== pickedMetric) rejectedMetrics.add(name);
+        }
+        names = fallback;
+        result = await get(api(`/runs${runsMetricsQuery(names)}`));
+      }
+      if (epoch !== version || mine !== seq) return;
+      requestedMetrics.clear();
+      for (const name of names) requestedMetrics.add(name);
       runs = result;
       for (const id of selected)
         if (!runs.some((run) => run.run_id === id)) selected.delete(id);
@@ -2073,17 +2259,31 @@ async function home(version) {
       );
       if (live) timer = setTimeout(refresh, 5000);
     } catch (error) {
-      if (epoch === version) {
-        showError(content, error);
-        timer = setTimeout(refresh, 5000);
-      }
+      if (epoch !== version || mine !== seq) return;
+      showError(content, error);
+      timer = setTimeout(refresh, 5000);
     }
   }
   cleanup = () => {
     clearTimeout(timer);
+    clearTimeout(searchTimer);
     lineageView?.close(false);
     for (const key of [...lineage.keys()]) dropLineage(key);
   };
+  await sessionReady;
+  if (epoch !== version) return;
+  if (serverMode) {
+    try {
+      const response = await fetch(api("/metrics"), { credentials: "same-origin" });
+      if (response.ok) {
+        const data = await response.json();
+        if (Array.isArray(data.metrics))
+          metricNames = data.metrics.filter((name) => typeof name === "string" && name);
+      }
+    } catch {}
+  }
+  if (epoch !== version) return;
+  fillMetricSelect();
   await refresh();
 }
 
