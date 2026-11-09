@@ -998,7 +998,7 @@ def cmd_server_verify(args):
 def cmd_server_reindex(args):
     from .server.admin import _data_root
     from .server.app import acquire_server_lock
-    from .server.db import for_server_dir
+    from .server.db import for_server_dir, resolve_url, _is_postgres
     from .server.db.errors import DatabaseError, DatabaseUrlError, SchemaTooNew
     from .server.db.repos import RunRepo
     from .server.runs import reindex
@@ -1007,13 +1007,18 @@ def cmd_server_reindex(args):
     try:
         data, directory = _server_data_dir(args)
         try:
-            handle = acquire_server_lock(data / "server")
+            if not _is_postgres(resolve_url(data, args.database)):
+                handle = acquire_server_lock(data / "server")
         except ValueError as exc:
             cause = exc.__cause__
             if isinstance(cause, OSError) and cause.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
                 raise ValueError("stop the server first") from exc
             raise
         db = for_server_dir(data / "server", args.database)
+        if db.dialect.name == "postgres":
+            from contextlib import ExitStack
+            handle = ExitStack()
+            handle.enter_context(db.server_lock())
         from .server.db.workspaces import WorkspaceRepo
         from .server.workspaces import prepare_store
         workspaces = WorkspaceRepo(db)

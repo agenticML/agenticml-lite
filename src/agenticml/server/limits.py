@@ -57,9 +57,12 @@ class Plans:
         self.free_workspaces_per_account = _number(config['free_workspaces_per_account'], 'free_workspaces_per_account')
         _keys(config['plans'], ('free',), 'plans')
         self.free = validate_limits(config['plans']['free'])
-        # Period keys use the process UTC clock in 18c; package 20 moves them
-        # to the database clock so workers cannot disagree across a boundary.
+        self._clock_override = clock
         self.clock = clock or utc_now
+
+    @property
+    def has_clock_override(self):
+        return self._clock_override is not None
 
     @classmethod
     def load(cls, path):
@@ -78,12 +81,12 @@ class Plans:
             raise ValueError('unknown workspace plan')
         return validate_limits(json.loads(workspace_row['custom_limits']))
 
-    def check_upload(self, limits, usage, length, growth=None):
+    def check_upload(self, limits, usage, length, growth=None, *, now=None):
         maximum = limits['storage_bytes']
         stored = usage['stored_bytes']
         if growth is not None and growth > 0 and maximum is not None and stored + growth > maximum:
             raise LimitReached(f'storage limit reached: {stored / 1e9:.1f} GB of {maximum / 1e9:.1f} GB used; delete runs or ask for more')
-        now = self.clock()
+        now = now or self.clock()
         day = now.date().isoformat()
         uploaded = usage['upload_bytes'] if usage['upload_day'] and usage['upload_day'] >= day else 0
         maximum = limits['upload_bytes_per_day']
@@ -96,8 +99,9 @@ class Plans:
         from .db.usage import UsageRepo
         from .db.workspaces import WorkspaceRepo
         limits = self.limits_for(WorkspaceRepo(db).by_id(workspace_id))
-        now = self.clock().timestamp()
-        count = UsageRepo(db, workspace_id).count_request(int(now // 60))
+        usage = UsageRepo(db, workspace_id)
+        count, now = usage.count_request(now=self.clock() if self.has_clock_override else None)
+        now = now.timestamp()
         maximum = limits['requests_per_minute']
         return max(1, math.ceil((int(now // 60) + 1) * 60 - now)) if maximum is not None and count > maximum else None
 

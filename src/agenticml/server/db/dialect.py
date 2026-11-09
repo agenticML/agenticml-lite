@@ -57,8 +57,20 @@ class PostgresDialect(SqliteDialect):
         return sql
 
     @staticmethod
+    def _scope(tx):
+        connection = tx.connection
+        scope = getattr(connection, '_agenticml_lock_scope', None)
+        if scope is None:
+            row = tx.fetchone('SELECT current_database(), current_schema()')
+            scope = (row[0], row[1])
+            connection._agenticml_lock_scope = scope
+        return scope
+
+    @staticmethod
     def _lock(tx, name):
-        key = int.from_bytes(hashlib.sha256(name.encode()).digest()[:8],
+        kind, _, rest = name.partition(':')
+        salted = kind + ':' + str(PostgresDialect._scope(tx)) + ':' + rest
+        key = int.from_bytes(hashlib.sha256(salted.encode()).digest()[:8],
                              byteorder='big', signed=True)
         tx.execute('SELECT pg_advisory_xact_lock(?)', (key,))
 

@@ -1,5 +1,6 @@
 """Postgres transactions and a bounded idle connection pool."""
 from contextlib import contextmanager
+import hashlib
 import logging
 import threading
 import time
@@ -10,6 +11,12 @@ from .sqlite import Tx
 
 logger = logging.getLogger(__name__)
 _DEFAULT_CONNECT_TIMEOUT = '10'
+SESSION_LOCK_LIMIT = 64
+OUTER_LOCK_LIMIT = 48
+INNER_LOCK_LIMIT = 16
+_outer_slots = threading.BoundedSemaphore(OUTER_LOCK_LIMIT)
+_inner_slots = threading.BoundedSemaphore(INNER_LOCK_LIMIT)
+_held_lock_connections = threading.local()
 
 
 def _conninfo_with_timeout(url):
@@ -102,16 +109,35 @@ class PostgresDatabase:
             self.close()
             raise
 
-    def _new_connection(self):
+    def _new_connection(self, *, lock=False):
         connection = None
         try:
+            conninfo = _conninfo_with_timeout(self._url)
+            if lock:
+                from psycopg.conninfo import make_conninfo
+                conninfo = make_conninfo(conninfo, keepalives=1, keepalives_idle=30)
             connection = self._psycopg.connect(
-                _conninfo_with_timeout(self._url), autocommit=True,
+                conninfo, autocommit=True,
                 row_factory=_row_factory)
             for setting in ("lock_timeout = '5s'", "statement_timeout = '60s'",
                             "idle_in_transaction_session_timeout = '60s'",
                             "TIME ZONE 'UTC'", "application_name = 'agenticml-server'"):
                 connection.execute('SET ' + setting)
+            if lock:
+                # Advisory locks are held on idle autocommit sessions while the
+                # writer runs; never arm idle_session_timeout on these connections.
+                try:
+                    connection.execute('SET idle_session_timeout = 0')
+                except (self._psycopg.errors.UndefinedObject,
+                        self._psycopg.errors.FeatureNotSupported):
+                    pass
+                for setting in ("tcp_keepalives_idle=30", "tcp_keepalives_interval=10",
+                                "tcp_keepalives_count=3", "tcp_user_timeout='30s'"):
+                    try:
+                        connection.execute('SET ' + setting)
+                    except (self._psycopg.errors.UndefinedObject,
+                            self._psycopg.errors.FeatureNotSupported):
+                        logger.warning('Postgres SET %s is unsupported', setting)
         except self._psycopg.Error:
             if connection is not None:
                 self._close_connection(connection)
@@ -218,6 +244,112 @@ class PostgresDatabase:
                     self._close_connection(connection)
         if mapped is not None:
             _raise_plain(mapped)
+
+    @contextmanager
+    def session_lock(self, key_string, timeout=30, *, shared=False, try_lock=False,
+                     dedicated=False):
+        """Hold a session lock on a dedicated, process-bounded connection.
+
+        Lock connections never enter the transaction pool; closing them on
+        every exit also guarantees release when an unlock fails.
+        """
+        infinite = timeout is None or timeout < 0
+        deadline = None if infinite else time.monotonic() + timeout
+        slots = (_outer_slots if key_string.split(':', 1)[0] in ('run', 'object')
+                 else _inner_slots)
+        if not dedicated:
+            if try_lock:
+                slot_timeout = 0
+            elif infinite:
+                slot_timeout = None
+            else:
+                slot_timeout = max(0, timeout)
+            if not slots.acquire(timeout=slot_timeout):
+                raise DatabaseBusy('database is locked')
+        connection = None
+        acquired = False
+        mapped = None
+        pushed = False
+        stack = None
+        try:
+            if self.closed:
+                raise DatabaseError('database is closed')
+            connection = self._new_connection(lock=True)
+            if not try_lock:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise DatabaseBusy('database is locked')
+                    wait_ms = str(max(1, int(remaining * 1000))) + 'ms'
+                    connection.execute("SELECT set_config('lock_timeout', %s, false)", (wait_ms,))
+                    # The default 60s statement timeout must not shorten long import waits.
+                    statement_ms = str(max(60000, int(remaining * 1000) + 1000)) + 'ms'
+                    connection.execute("SELECT set_config('statement_timeout', %s, false)",
+                                       (statement_ms,))
+                else:
+                    connection.execute("SELECT set_config('lock_timeout', '0', false)")
+                    connection.execute("SELECT set_config('statement_timeout', '0', false)")
+            # Separate from row: and name: transaction keys. Independent
+            # installations in separate schemas must not contend.
+            scope = connection.execute('SELECT current_database(), current_schema()').fetchone()
+            name = 'session:' + str(tuple(scope)) + ':' + key_string
+            key = int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], 'big', signed=True)
+            suffix = '_shared' if shared else ''
+            if try_lock:
+                acquired = connection.execute(
+                    'SELECT pg_try_advisory_lock' + suffix + '(%s)', (key,)).fetchone()[0]
+                if not acquired:
+                    if key_string == 'server':
+                        raise ValueError('stop every agenticml server using this database first')
+                    raise DatabaseBusy('database is locked')
+            else:
+                connection.execute('SELECT pg_advisory_lock' + suffix + '(%s)', (key,))
+            acquired = True
+            stack = getattr(_held_lock_connections, 'stack', None)
+            if stack is None:
+                stack = []
+                _held_lock_connections.stack = stack
+            stack.append(connection)
+            pushed = True
+            yield connection
+        except self._psycopg.Error as exc:
+            mapped = (DatabaseBusy('database is locked') if exc.sqlstate in
+                      ('55P03', '40P01', '40001') else DatabaseError('could not acquire database lock'))
+        finally:
+            if pushed:
+                try:
+                    stack.remove(connection)
+                except ValueError:
+                    pass
+            if connection is not None:
+                try:
+                    if acquired:
+                        connection.execute('SELECT pg_advisory_unlock' + suffix + '(%s)', (key,))
+                except self._psycopg.Error:
+                    pass
+                finally:
+                    self._close_connection(connection)
+            if not dedicated:
+                slots.release()
+        if mapped is not None:
+            _raise_plain(mapped)
+
+    def confirm_session_locks(self):
+        """Abort if a session-lock connection held on this thread has died."""
+        for connection in getattr(_held_lock_connections, 'stack', ()):
+            try:
+                if connection.closed or connection.broken:
+                    raise DatabaseBusy('database is locked')
+                connection.execute('SELECT 1')
+            except DatabaseBusy:
+                raise
+            except Exception:
+                raise DatabaseBusy('database is locked') from None
+
+    def server_lock(self, *, shared=False):
+        # One lifetime connection per server, outside request lock budgets.
+        return self.session_lock('server', shared=shared, try_lock=not shared,
+                                 dedicated=shared)
 
     def _close_connection(self, connection):
         try:

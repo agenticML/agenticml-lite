@@ -47,6 +47,31 @@ def for_server_dir(server_dir, url=None, *, create=True, actor='server'):
                                                or 'sqlite:///' + str(directory.absolute() / 'agenticml.db'))
     path = None if _is_postgres(resolved) else _path(resolved)
     key = resolved if path is None else str(path)
+    if path is None:
+        # Network I/O and migration/import locks must not block the registry.
+        with _registry_lock:
+            db = _registry.get(key)
+        if db is None or db.closed:
+            if not create and not PostgresDatabase.exists(resolved):
+                return None
+            candidate = connect(resolved)
+            try:
+                from .import2x import import_state
+                import_state(candidate, directory, actor=actor)
+            except BaseException:
+                candidate.close()
+                raise
+            with _registry_lock:
+                db = _registry.get(key)
+                if db is None or db.closed:
+                    db = candidate
+                    _registry[key] = db
+            if db is not candidate:
+                candidate.close()
+        if create:
+            from .backfill import backfill_objects
+            backfill_objects(db, directory.parent)
+        return db
     with _registry_lock:
         db = _registry.get(key)
         if not create and path is None and (db is None or db.closed) and not PostgresDatabase.exists(resolved):

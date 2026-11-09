@@ -8,7 +8,7 @@ import traceback
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import pytest
-from server_db_helpers import migration_versions
+from server_db_helpers import migration_versions, postgres_url
 
 from agenticml.server.db import DatabaseBusy, DatabaseError, connect, for_server_dir
 from agenticml.server.db.dialect import PostgresDialect, SqliteDialect
@@ -163,13 +163,23 @@ def test_lock_timeout_maps_to_busy(open_db, kind):
 
 
 def test_lock_key_is_signed_sha256_and_namespaced():
+    class Connection:
+        _agenticml_lock_scope = ('db', 'schema')
+
     class Capture:
-        def execute(self, sql, params):
+        connection = Connection()
+
+        def execute(self, sql, params=()):
             self.sql, self.params = sql, params
+
+        def fetchone(self, sql, params=()):
+            raise AssertionError('scope should be cached on the connection')
 
     tx = Capture()
     dialect = PostgresDialect()
-    for namespace in ('name:migrate', 'row:runs:' + json.dumps(('wid', 'rid'))):
+    scope = str(('db', 'schema'))
+    for namespace in ('name:' + scope + ':migrate',
+                      'row:' + scope + ':runs:' + json.dumps(('wid', 'rid'))):
         if namespace.startswith('name:'):
             dialect.advisory_lock(tx, 'migrate')
         else:
@@ -177,6 +187,48 @@ def test_lock_key_is_signed_sha256_and_namespaced():
         assert tx.sql == 'SELECT pg_advisory_xact_lock(?)'
         assert tx.params == (int.from_bytes(hashlib.sha256(namespace.encode()).digest()[:8],
                                            'big', signed=True),)
+
+
+def test_unsupported_tcp_setting_warns(open_db, monkeypatch, caplog):
+    db = open_db()
+    caplog.set_level('WARNING', logger='agenticml.server.db.postgres')
+    real_connect = db._psycopg.connect
+
+    def connect(*args, **kwargs):
+        connection = real_connect(*args, **kwargs)
+        original = connection.execute
+
+        def execute(sql, *rest, **kw):
+            if isinstance(sql, str) and sql.startswith('SET tcp_'):
+                raise db._psycopg.errors.FeatureNotSupported('unsupported')
+            return original(sql, *rest, **kw)
+
+        connection.execute = execute
+        return connection
+
+    monkeypatch.setattr(db._psycopg, 'connect', connect)
+    with db.session_lock('tcp-warn-test', timeout=1):
+        pass
+    assert any('SET tcp_' in record.getMessage() and 'unsupported' in record.getMessage()
+               for record in caplog.records)
+
+
+def test_xact_locks_do_not_collide_across_schemas(open_db, postgres_admin):
+    import secrets
+    from psycopg import sql
+    schema = 't_' + secrets.token_hex(8)
+    postgres_admin.execute(sql.SQL('CREATE SCHEMA {} AUTHORIZATION agenticml_test').format(
+        sql.Identifier(schema)))
+    try:
+        other = open_db(postgres_url(os.environ['AGENTICML_TEST_DATABASE_URL'], schema))
+        first = open_db()
+        with first.transaction(write=True) as tx:
+            tx.advisory_lock('migrate')
+            with other.transaction(write=True) as held:
+                held.execute("SET LOCAL lock_timeout = '50ms'")
+                held.advisory_lock('migrate')
+    finally:
+        postgres_admin.execute(sql.SQL('DROP SCHEMA {} CASCADE').format(sql.Identifier(schema)))
 
 
 @pytest.mark.parametrize('failure', ['OperationalError', 'InterfaceError', 'DeadlockDetected',

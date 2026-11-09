@@ -226,6 +226,9 @@ class SqliteDatabase:
                     else:
                         self._idle.append(connection)
 
+    def confirm_session_locks(self):
+        return
+
     def close(self):
         with self._lock:
             self.closed = True

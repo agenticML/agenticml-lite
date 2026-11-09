@@ -208,7 +208,9 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 19 † | Postgres backend, row-level security, CI on both backends | 18 | Codex, Cursor | M | [plan](packages/19-postgres.md) | done (3.0 PR; 19.2 second review pending) |
 | 19.1 | Postgres backend, dialect, portability audit, test harness, CI job | 18 | Codex, Cursor | M | [plan](packages/19-postgres.md) | done (3.0 PR) |
 | 19.2 | Row-level security policies and per-transaction workspace binding | 19.1, 18c | Cursor | S–M | [plan](packages/19-postgres.md) | done (3.0 PR; second review pending) |
-| 20 † | Many server processes: database locks, shared throttle and sessions | 19 | Codex, Cursor | M | [plan](packages/20-many-processes.md) | in review (separate worktree) |
+| 20 † | Many server processes: database locks, shared throttle and sessions | 19 | Codex, Cursor | M | [plan](packages/20-many-processes.md) | done (3.0 PR; second review of the last fix rounds pending) |
+| 20.1 | Cross-process session locks, process start, database clock, reader freshness, write fencing (compare-and-swap, lock checks) | 19 | Codex, Cursor | M | [plan](packages/20-many-processes.md) | done (3.0 PR) |
+| 20.2 | Two-process end-to-end test with a kill mid-upload | 20.1 | Codex, Cursor | S | [plan](packages/20-many-processes.md) | done (3.0 PR) |
 | 21 | S3 object backend | 18 | Codex | M | – | not started |
 | 22 | Metric summaries; sort and filter runs by metric | 17, 18 | Cursor | M | – | not started |
 | 23 | Operator commands: end-to-end 2.x conversion test (the import itself landed in 16–18), `server backup`, `status`/`verify` on the database | 18 | Codex | S–M | – | not started |
@@ -277,6 +279,22 @@ Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
+- **Many-process follow-ups for package 24** (package 20 reviews, Nov 9,
+  2026).
+  - Where: `src/agenticml/server/db/postgres.py` (session locks),
+    `store/reader.py`, `server/routes.py` usage views.
+  - Problem: every session lock opens a fresh Postgres connection (slow on
+    TLS/RDS; pins connections under RDS Proxy or pgbouncer); dashboard reads
+    query the committed size per file call; the usage page computes "today"
+    from the process clock while enforcement uses the database clock; a
+    process paused longer than the keepalive window while holding a lock
+    can still write after losing it (checks narrow this to the time
+    between two checks; see the package 20 plan).
+  - Fix: pool lock connections; cache committed sizes per read; use the
+    database clock in the usage views; record the paused-process residual
+    in the package 25 threat model and measure the rest in package 24.
+  - Done when: package 24's benchmark shows acceptable lock latency and the
+    threat model names the residual.
 - **Admin plan edits: concurrent merge and free→custom defaults** (package
   18c.3 review, Nov 9, 2026).
   - Where: `src/agenticml/server/routes.py` admin PATCH; `ui/static/app.js`

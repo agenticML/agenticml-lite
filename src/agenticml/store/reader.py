@@ -605,13 +605,14 @@ class RunReader:
     ``remote()`` reads server-only ``remote.json`` when that file is present.
     """
 
-    def __init__(self, root, run_id: str, *, remote=None) -> None:
+    def __init__(self, root, run_id: str, *, remote=None, committed_size=None) -> None:
         if not valid_run_id(run_id):
             raise ValueError(f"invalid run id: {run_id!r}")
         self.root = Path(root).expanduser().resolve()
         self.run_dir = run_dir(self.root, run_id)
         self.run_id = run_id
         self._remote_provider = remote
+        self._committed_size = committed_size
         self._lock = threading.RLock()
         self._path_cache: dict[str, Path] = {}
         self._meta_path = self._c(self.run_dir / META_NAME)
@@ -632,6 +633,18 @@ class RunReader:
         self._meta_sig = None
         self._status = ""
         self._index_cache: tuple[tuple[int, int, int], dict] | None = None
+
+    def _file_size(self, path):
+        size = _file_size(path)
+        if self._committed_size is not None:
+            size = min(size, self._committed_size(self.run_id, path.relative_to(self.run_dir).as_posix()))
+        return size
+
+    def _read_append(self, path):
+        if self._committed_size is None:
+            return read_file_nofollow(path)
+        with open_nofollow(path) as handle:
+            return handle.read(self._file_size(path))
 
     def _c(self, path: Path) -> Path:
         """Resolved ``path`` inside the store root. Cached after the first check."""
@@ -695,13 +708,15 @@ class RunReader:
         """Snapshot complete scalar byte lengths for one bounded sync pass."""
         sizes = {}
         for key in self.keys():
-            size = _file_size(self._bin_path(_series_id(self._series_info(key))))
+            size = self._file_size(self._bin_path(_series_id(self._series_info(key))))
             sizes[key] = size - size % RECORD_SIZE
         return sizes
 
     def events(self) -> list:
         """Event objects. A torn last line is omitted; a bad earlier line is skipped."""
-        return load_events(self._c(self.run_dir / EVENTS_NAME))
+        path = self._c(self.run_dir / EVENTS_NAME)
+        maximum = self._file_size(path) if self._committed_size is not None else None
+        return load_events(path, maximum=maximum)
 
     def code_manifest(self) -> list:
         """Code files merged by path. A later ``code`` event replaces an earlier one."""
@@ -780,7 +795,7 @@ class RunReader:
         """``(step, seconds_since_created_at)`` from ``_time.bin``, torn tail dropped."""
         path = self._c(self.run_dir / SCALARS_DIRNAME / TIME_BIN_NAME)
         try:
-            data = read_file_nofollow(path)
+            data = self._read_append(path)
         except FileNotFoundError:
             return []
         except OSError as exc:
@@ -796,13 +811,24 @@ class RunReader:
     def last_step(self) -> int | None:
         """Last complete time record, without loading the time index."""
         path = self._c(self.run_dir / SCALARS_DIRNAME / TIME_BIN_NAME)
-        return _last_complete_step(path)
+        if self._committed_size is None:
+            return _last_complete_step(path)
+        complete = self._file_size(path) // RECORD_SIZE * RECORD_SIZE
+        if complete < RECORD_SIZE:
+            return None
+        try:
+            with open_nofollow(path) as handle:
+                handle.seek(complete - RECORD_SIZE)
+                data = handle.read(RECORD_SIZE)
+            return RECORD_STRUCT.unpack(data)[0] if len(data) == RECORD_SIZE else None
+        except FileNotFoundError:
+            return None
 
     def tail(self, key: str) -> dict | None:
         """Last complete ``.bin`` record for ``key``, or None if missing or empty."""
         info = self._series_info(key)
         path = self._bin_path(_series_id(info))
-        size = _file_size(path)
+        size = self._file_size(path)
         complete = size - (size % RECORD_SIZE)
         if complete < RECORD_SIZE:
             return None
@@ -840,7 +866,7 @@ class RunReader:
             return [], offset
         info = self._series_info(key)
         path = self._bin_path(_series_id(info))
-        size = _file_size(path)
+        size = self._file_size(path)
         complete = size - (size % RECORD_SIZE)
         if offset >= complete:
             return [], offset
@@ -901,7 +927,7 @@ class RunReader:
         # Stat the prefix before reading monotonic. The writer clears the
         # flag before it appends an out-of-order record, so a flag that is
         # still true applies to this size.
-        size = _file_size(path)
+        size = self._file_size(path)
         if not path.is_file() or path.is_symlink():
             # sync --prune deletes the series file after finish. The overview
             # is then the whole answer, including queries that would have
@@ -1064,7 +1090,7 @@ class RunReader:
         return None
 
     def _incremental(self, key: str, path: Path) -> Overview:
-        size = _file_size(path)
+        size = self._file_size(path)
         complete = size - (size % RECORD_SIZE)
         cached = self._cache.get(key)
         if cached and cached[0] == "inc" and cached[2] <= complete:

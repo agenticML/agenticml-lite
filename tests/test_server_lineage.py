@@ -876,7 +876,13 @@ def test_receive_concurrency_limit_after_body(remote, snapshots, tmp_path, monke
     server, client = remote
     parent, child = snapshots
     for writer in snapshots:
-        meta(client, writer)
+        # Same-project receives serialize on the lineage lock before receive().
+        # Exercise the global admission limit using two independent projects.
+        value = RunReader(writer.root, writer.run_id).meta()
+        value['project'] = writer.run_id
+        value['lineage'] = {**value['lineage'],
+                            'project_key': lineage.project_key(writer.run_id)}
+        client.put_file(writer.run_id, "meta.json", json.dumps(value).encode())
     data = [bundle(writer, tmp_path) for writer in snapshots]
     entered = [threading.Event(), threading.Event()]
     release = threading.Event()

@@ -324,6 +324,7 @@ def test_funnel_off_failure_warns_and_exits_0(tmp_path, monkeypatch):
     assert funnel_toggles(log)[-1] == ["funnel", "--https=443", "off"]
 
 
+@pytest.mark.sqlite_only
 def test_locked_data_dir_skips_funnel(tmp_path, monkeypatch, capsys):
     log = install_fake(tmp_path, monkeypatch)
     data = tmp_path / "data"

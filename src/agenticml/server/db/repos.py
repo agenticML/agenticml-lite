@@ -11,7 +11,7 @@ import time
 
 from agenticml.store import layout
 from agenticml.store import notes as note_store
-from .errors import DatabaseError
+from .errors import DatabaseBusy, DatabaseError
 from ..keys import (ClientError, KeyNameTaken, LastAdminError, SetupClosed,
                     UserRequired, KeyRecord, validate_name)
 from ..users import (UserRecord, UserNameTaken, UserNotFound, IdentityTaken, InviteInvalid,
@@ -487,24 +487,57 @@ class ThrottleRepo:
     def __init__(self, db):
         self.db = db
 
-    def load(self):
-        with self.db.transaction() as tx:
-            tx.advisory_lock('throttle')
-            return [(r['bucket'], r['failures'], r['last_failure']) for r in
-                    tx.fetchall('SELECT * FROM login_attempts ORDER BY last_failure, bucket')]
+    def load(self, bucket=None, tx=None):
+        if tx is None:
+            with self.db.transaction() as tx:
+                tx.advisory_lock('throttle')
+                return self.load(bucket, tx)
+        sql = 'SELECT * FROM login_attempts'
+        params = ()
+        if bucket is not None:
+            sql += ' WHERE bucket=?'
+            params = (bucket,)
+        return [(r['bucket'], r['failures'], r['last_failure']) for r in
+                tx.fetchall(sql + ' ORDER BY last_failure, bucket', params)]
 
-    def save(self, entries, previous):
+    def save(self, entries, previous, tx=None, *, touched=None, before_failures=None,
+             expire_before=None, keep=()):
         current = {bucket: (failures, last) for bucket, (failures, last, _) in entries.items()
                    if failures}
-        with self.db.transaction(write=True) as tx:
-            tx.advisory_lock('throttle')
-            for bucket in previous.keys() - current.keys():
+        if tx is None:
+            with self.db.transaction(write=True) as tx:
+                tx.advisory_lock('throttle')
+                return self.save(entries, previous, tx, touched=touched,
+                                 before_failures=before_failures,
+                                 expire_before=expire_before, keep=keep)
+        if touched is None:
+            touched = set(previous) | set(current)
+        before_failures = before_failures or {}
+        fn = 'GREATEST' if self.db.dialect.name == 'postgres' else 'MAX'
+        for bucket in touched:
+            value = current.get(bucket)
+            if value is None:
                 tx.execute('DELETE FROM login_attempts WHERE bucket=?', (bucket,))
-            for bucket, value in current.items():
-                if previous.get(bucket) != value:
-                    tx.execute(self.db.dialect.upsert(
-                        'login_attempts', ('bucket', 'failures', 'last_failure'), ('bucket',),
-                        ('failures', 'last_failure')), (bucket, *value))
+                continue
+            failures, last = value
+            db_failures = previous.get(bucket, (0, 0))[0]
+            increment = failures > before_failures.get(bucket, db_failures)
+            base = 'login_attempts.failures + 1' if increment else 'login_attempts.failures'
+            tx.execute(
+                'INSERT INTO login_attempts (bucket, failures, last_failure) VALUES (?, ?, ?) '
+                'ON CONFLICT (bucket) DO UPDATE SET '
+                f'failures={fn}({base}, excluded.failures), '
+                f'last_failure={fn}(login_attempts.last_failure, excluded.last_failure)',
+                (bucket, failures, last))
+        if expire_before is not None:
+            held = tuple(keep)
+            if held:
+                tx.execute(
+                    'DELETE FROM login_attempts WHERE last_failure < ? AND bucket NOT IN ('
+                    + ','.join('?' * len(held)) + ')',
+                    (expire_before,) + held)
+            else:
+                tx.execute('DELETE FROM login_attempts WHERE last_failure < ?', (expire_before,))
 
 
 class AuditRepo(WorkspaceBound):
@@ -787,15 +820,27 @@ class RunRepo(WorkspaceBound):
                         (project, created_at, encoded, launch_note, now, self.workspace_id, run_id))
 
     def record_file(self, run_id, path, size, sha256=None, last_step=None,
-                    upload_bytes=None, upload_clock=None):
+                    upload_bytes=None, upload_clock=None, *, expected_size=None,
+                    expected_sha256=None, publish=None):
         now = layout.format_timestamp()
+        self.db.confirm_session_locks()
         with self._tx(write=True) as tx:
             tx.lock_row('runs', 'workspace_id=? AND run_id=?', (self.workspace_id, run_id))
             tx.lock_row('run_files', 'workspace_id=? AND run_id=? AND path=?', (self.workspace_id, run_id, path))
             self._ensure(tx, run_id)
             usage = UsageRepo(self.db, self.workspace_id, clock=upload_clock)
             usage.lock(tx)
-            old_size = self.committed_size(run_id, path, tx)
+            row = tx.fetchone(
+                'SELECT size, sha256 FROM run_files WHERE workspace_id=? AND run_id=? AND path=?',
+                (self.workspace_id, run_id, path))
+            old_size = 0 if row is None else row['size']
+            old_sha = None if row is None else row['sha256']
+            if expected_size is not None and old_size != expected_size:
+                raise DatabaseBusy('database is locked')
+            if expected_sha256 is not None and old_sha != expected_sha256:
+                raise DatabaseBusy('database is locked')
+            if publish is not None:
+                publish()
             usage.add_stored(size - old_size, tx)
             if upload_bytes is not None:
                 usage.add_upload(upload_bytes, tx)

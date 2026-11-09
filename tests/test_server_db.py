@@ -428,7 +428,7 @@ def test_throttle_storage_failure_does_not_orphan_tickets(tmp_path, monkeypatch,
     from agenticml.server.db.repos import ThrottleRepo
     db = connect(url(tmp_path / 'state.db'))
     throttle = LoginThrottle(clock=lambda: 0, store=DbBuckets(db))
-    def fail(*args): raise DatabaseBusy('database is locked')
+    def fail(*args, **kwargs): raise DatabaseBusy('database is locked')
     with monkeypatch.context() as patch:
         patch.setattr(ThrottleRepo, operation, fail)
         with pytest.raises(DatabaseBusy): throttle.begin('a')

@@ -127,7 +127,7 @@ class MemoryBuckets:
     def __init__(self):
         self.entries = OrderedDict()
 
-    def transaction(self, expiry, now, released_ticket=None, outcome=None):
+    def transaction(self, expiry, now, released_ticket=None, outcome=None, bucket=None):
         from contextlib import nullcontext
         return nullcontext()
 
@@ -136,43 +136,61 @@ class DbBuckets(MemoryBuckets):
     def __init__(self, db):
         super().__init__()
         from .db.repos import ThrottleRepo
+        self.db = db
         self.repo = ThrottleRepo(db)
 
-    def transaction(self, expiry, now, released_ticket=None, outcome=None):
+    def transaction(self, expiry, now, released_ticket=None, outcome=None, bucket=None):
         from contextlib import contextmanager
 
         @contextmanager
         def manage():
-            # Single server process; tickets are process-local, counts durable.
-            # Unsaved failure counts stay in memory and are merged (max) with
-            # the database until a save succeeds, so a persistence failure
-            # never lowers the effective delay.
+            # Tickets (holds) stay process-local; durable counts are shared.
+            # Each begin/finish is one write transaction under
+            # advisory_lock('throttle') that writes the buckets it touches
+            # and deletes expired rows (skipping any bucket with a live hold
+            # in this process), so a success cannot erase another process's
+            # failures. Unsaved failure counts stay in memory and are merged
+            # (max) with the database until a save succeeds, so a persistence
+            # failure never lowers the effective delay.
             original = OrderedDict((k, (v[0], v[1], dict(v[2])))
                                    for k, v in self.entries.items())
             applied = False
             persisted = False
+            touched = set() if bucket is None else {bucket}
             try:
-                rows = self.repo.load()
-                holds = {k: dict(v[2]) for k, v in original.items() if v[2]}
-                unsaved = {k: (v[0], v[1]) for k, v in original.items() if v[0]}
-                self.entries.clear()
-                previous = {bucket: (failures, last) for bucket, failures, last in rows}
-                merged = {}
-                for bucket, failures, last in rows:
-                    mem = unsaved.pop(bucket, None)
-                    if mem is not None:
-                        failures, last = max(failures, mem[0]), max(last, mem[1])
-                    merged[bucket] = (failures, last)
-                merged.update(unsaved)
-                for bucket, (failures, last) in merged.items():
-                    if bucket in holds or now - last < expiry:
-                        self.entries[bucket] = (failures, last, holds.pop(bucket, {}))
-                for bucket, pending in holds.items():
-                    self.entries[bucket] = (0, 0, pending)
-                yield
-                applied = True
-                self.repo.save(self.entries, previous)
-                persisted = True
+                with self.db.transaction(write=True) as tx:
+                    tx.advisory_lock('throttle')
+                    rows = self.repo.load(tx=tx)
+                    holds = {k: dict(v[2]) for k, v in original.items() if v[2]}
+                    unsaved = {k: (v[0], v[1]) for k, v in original.items() if v[0]}
+                    self.entries.clear()
+                    previous = {key: (failures, last) for key, failures, last in rows}
+                    merged = {}
+                    for key, failures, last in rows:
+                        mem = unsaved.pop(key, None)
+                        if mem is not None:
+                            failures, last = max(failures, mem[0]), max(last, mem[1])
+                        merged[key] = (failures, last)
+                    merged.update(unsaved)
+                    for key, (failures, last) in merged.items():
+                        if key in holds or now - last < expiry:
+                            self.entries[key] = (failures, last, holds.pop(key, {}))
+                    for key, pending in holds.items():
+                        self.entries[key] = (0, 0, pending)
+                    before_failures = {key: self.entries[key][0] for key in self.entries}
+                    before_keys = set(self.entries)
+                    yield
+                    applied = True
+                    touched.update(before_keys - set(self.entries))
+                    touched.update(key for key, value in self.entries.items()
+                                   if before_failures.get(key) != value[0])
+                    if bucket is not None:
+                        touched.add(bucket)
+                    held = tuple(key for key, value in self.entries.items() if value[2])
+                    self.repo.save(self.entries, previous, tx, touched=touched,
+                                   before_failures=before_failures,
+                                   expire_before=now - expiry, keep=held)
+                    persisted = True
             except BaseException:
                 if not applied or released_ticket is None:
                     # Load failed, or begin() could not persist: the caller
@@ -199,12 +217,12 @@ class DbBuckets(MemoryBuckets):
                     entry = self.entries.get(released_ticket[0])
                     if entry is not None:
                         entry[2].pop(released_ticket, None)
-                for bucket in list(self.entries):
-                    failures, _, holds = self.entries[bucket]
+                for key in list(self.entries):
+                    failures, _, holds = self.entries[key]
                     if holds:
                         continue
-                    if persisted or not failures:
-                        del self.entries[bucket]
+                    if (not failures) or (persisted and key in touched):
+                        del self.entries[key]
         return manage()
 
 
@@ -249,7 +267,7 @@ class LoginThrottle:
         """Reserve a slot. Returns (retry_after, ticket); ticket is None if refused."""
         address = _bucket(address)
         now = self._clock()
-        with self._lock, self._store.transaction(self.EXPIRE_AFTER, now):
+        with self._lock, self._store.transaction(self.EXPIRE_AFTER, now, bucket=address):
             entry = self._live(address, now)
             if entry is None:
                 failures, last_failure, holds = 0, 0, {}
@@ -273,11 +291,14 @@ class LoginThrottle:
         if ticket is None:
             return
         now = self._clock()
+        try:
+            address = ticket[0]
+        except (TypeError, IndexError):
+            address = None
         with self._lock, self._store.transaction(
-                self.EXPIRE_AFTER, now, released_ticket=ticket, outcome=outcome):
-            try:
-                address = ticket[0]
-            except (TypeError, IndexError):
+                self.EXPIRE_AFTER, now, released_ticket=ticket, outcome=outcome,
+                bucket=address):
+            if address is None:
                 return
             entry = self._entries.get(address)
             if entry is None:

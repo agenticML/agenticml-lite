@@ -113,8 +113,12 @@ def test_sync_state_append_commit_objects_and_same_id_stay_separate(two):
         assert note.read('same')['text'] == owner
         assert {r['owner'] for r in index.dashboard_list()} == {owner}
     assert server.run_index.ids() == set()
-    assert server.run_lock('same', workspace_id=a['id']) is not server.run_lock('same', workspace_id=b['id'])
-    assert server.object_lock(sha, workspace_id=a['id']) is not server.object_lock(sha, workspace_id=b['id'])
+    run_a, run_b = (server.run_lock('same', workspace_id=ws['id']) for ws in (a, b))
+    object_a, object_b = (server.object_lock(sha, workspace_id=ws['id']) for ws in (a, b))
+    assert (getattr(run_a, '_lock', run_a), getattr(run_a, '_key', None)) != (
+        getattr(run_b, '_lock', run_b), getattr(run_b, '_key', None))
+    assert (getattr(object_a, '_lock', object_a), getattr(object_a, '_key', None)) != (
+        getattr(object_b, '_lock', object_b), getattr(object_b, '_key', None))
 
 
 def test_lineage_receive_and_state_are_scoped(two, tmp_path):

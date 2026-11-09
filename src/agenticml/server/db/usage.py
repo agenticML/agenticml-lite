@@ -15,6 +15,20 @@ class UsageRepo(WorkspaceBound):
         self.db = db
         self.workspace_id = require_workspace_id(workspace_id)
 
+    def now(self, tx=None):
+        """Use the database UTC clock for production Postgres periods."""
+        if self.db.dialect.name == 'postgres':
+            if tx is None:
+                with self._tx() as tx:
+                    return self.now(tx)
+            return tx.fetchone('SELECT clock_timestamp()')[0].astimezone(timezone.utc)
+        return datetime.now(timezone.utc)
+
+    def day(self, tx=None):
+        if self.clock is not None:
+            return self.clock()
+        return self.now(tx).date().isoformat() if self.db.dialect.name == 'postgres' else utc_day()
+
     def lock(self, tx):
         # Writers take this before changing files/objects. Recount takes only
         # this lock, so it cannot observe a counter between a row and its delta.
@@ -57,7 +71,7 @@ class UsageRepo(WorkspaceBound):
         with self._bind(tx):
             self.lock(tx)
             # Read the clock after acquiring the lock, including on midnight rollover.
-            day = (self.clock or utc_day)()
+            day = self.day(tx)
             if not isinstance(day, str) or datetime.strptime(day, '%Y-%m-%d').date().isoformat() != day:
                 raise ValueError('upload bytes require a UTC day')
             tx.execute('UPDATE workspace_usage SET upload_bytes=CASE '
@@ -99,7 +113,8 @@ class UsageRepo(WorkspaceBound):
                 'WHERE i.workspace_id=? AND i.expires_at>? AND m.account_id IS NULL)',
                 (self.workspace_id, self.workspace_id, stamp))[0])
 
-    def count_request(self, minute):
+    def count_request(self, minute=None, *, now=None):
+        """Return (count, UTC now), reading the clock in the counting transaction."""
         import sqlite3
         sql = ('INSERT INTO workspace_usage (workspace_id, request_minute, request_count) '
                'VALUES (?, ?, 1) ON CONFLICT (workspace_id) DO UPDATE SET '
@@ -107,8 +122,11 @@ class UsageRepo(WorkspaceBound):
                'THEN workspace_usage.request_count+1 ELSE 1 END, '
                'request_minute=excluded.request_minute')
         with self._tx(write=True) as tx:
+            now = now or self.now(tx)
+            if minute is None:
+                minute = int(now.timestamp() // 60)
             if self.db.dialect.name != 'sqlite' or sqlite3.sqlite_version_info >= (3, 35, 0):
-                return int(tx.fetchone(sql + ' RETURNING request_count', (self.workspace_id, minute))[0])
+                return int(tx.fetchone(sql + ' RETURNING request_count', (self.workspace_id, minute))[0]), now
             tx.execute(sql, (self.workspace_id, minute))
             return int(tx.fetchone('SELECT request_count FROM workspace_usage WHERE workspace_id=?',
-                                   (self.workspace_id,))[0])
+                                   (self.workspace_id,))[0]), now

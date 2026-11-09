@@ -351,9 +351,9 @@ def test_upload_clock_is_read_after_lock_and_never_regresses(server, monkeypatch
 
 
 def test_upload_requires_day_and_rolls_back_file(server, monkeypatch):
-    monkeypatch.setattr(usage_module, 'utc_day', lambda: None)
     with pytest.raises(ValueError, match='require a UTC day'):
-        server.run_index.record_file('one', 'meta.json', 20, upload_bytes=20)
+        server.run_index.record_file('one', 'meta.json', 20, upload_bytes=20,
+                                     upload_clock=lambda: None)
     assert server.run_index.get('one') is None
 
 
@@ -557,11 +557,11 @@ def test_request_counter_atomic_concurrency_and_sqlite_fallback(server, monkeypa
     import sqlite3
     usage = UsageRepo(server.db, server.default_workspace_id)
     with ThreadPoolExecutor(8) as pool:
-        counts = list(pool.map(lambda _: usage.count_request(100), range(24)))
+        counts = list(pool.map(lambda _: usage.count_request(100)[0], range(24)))
     assert sorted(counts) == list(range(1, 25))
     monkeypatch.setattr(sqlite3, 'sqlite_version_info', (3, 34, 0))
-    assert usage.count_request(100) == 25
-    assert usage.count_request(101) == 1
+    assert usage.count_request(100)[0] == 25
+    assert usage.count_request(101)[0] == 1
 
 
 def test_no_limits_request_never_creates_usage_row(server):
