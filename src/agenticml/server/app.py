@@ -166,13 +166,14 @@ class IngestServer(DashboardServer):
 
     def __init__(self, data, host, port, public_url=None, env_key=None,
                  trusted_proxies=(), identity_header=None, db=None,
-                 firebase=None, cert_source=None):
+                 firebase=None, cert_source=None, plans=None):
         from .ingest import IngestHandler
 
         self.data_dir = Path(data)
         self.tmp_dir = self.data_dir / "server" / "tmp"
         db = db if db is not None else for_server_dir(self.data_dir / "server")
         self.db = db
+        self.plans = plans
         self.workspaces = WorkspaceRepo(db)
         default = self.workspaces.get('default')
         self.default_workspace_id = default_workspace_id(db) if default else None
@@ -197,6 +198,8 @@ class IngestServer(DashboardServer):
             logger.warning("git is not installed; lineage code diffs are disabled")
         self.run_locks = weakref.WeakValueDictionary()
         self.run_locks_lock = threading.Lock()
+        self.quota_locks = weakref.WeakValueDictionary()
+        self.quota_locks_lock = threading.Lock()
         self.object_locks = weakref.WeakValueDictionary()
         self.object_locks_lock = threading.Lock()
         self._server_lock = None
@@ -289,6 +292,19 @@ class IngestServer(DashboardServer):
                 self.run_locks[run_id] = lock
             return lock
 
+    def quota_lock(self, workspace_id):
+        """Lock check, publish and accounting after the run/object lock.
+
+        Package 20 adds cross-process locking behind this method.
+        """
+        workspace_id = require_workspace_id(workspace_id)
+        with self.quota_locks_lock:
+            lock = self.quota_locks.get(workspace_id)
+            if lock is None:
+                lock = threading.Lock()
+                self.quota_locks[workspace_id] = lock
+            return lock
+
     def object_lock(self, sha, *, workspace_id):
         prefix = (require_workspace_id(workspace_id), sha[:2])
         with self.object_locks_lock:
@@ -353,8 +369,11 @@ class IPv6IngestServer(IngestServer):
 
 def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None,
                 trusted_proxies=(), identity_header=None, database=None,
-                firebase=None, cert_source=None):
+                firebase=None, cert_source=None, plans=None):
     """Prepare and lock the data directory; port=0 chooses a free port."""
+    from .limits import Plans
+    if plans is not None and not isinstance(plans, Plans):
+        plans = Plans.load(plans)
     validate_env_key(env_key)
     if env_key is not None and env_key_looks_weak(env_key):
         logger.warning(
@@ -372,7 +391,7 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
         _clean_tmp(data / "server" / "tmp")
         cls = IPv6IngestServer if ":" in host else IngestServer
         server = cls(data, host, port, public_url, env_key, trusted_proxies, identity_header, db=db,
-                     firebase=firebase, cert_source=cert_source)
+                     firebase=firebase, cert_source=cert_source, plans=plans)
         server._server_lock = handle
         for workspace in server.workspaces.list():
             root = prepare_store(data, workspace['id'])
@@ -387,9 +406,11 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
 
 def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None,
           trusted_proxies=(), identity_header=None, database=None,
-          firebase=None, cert_source=None):
+          firebase=None, cert_source=None, plans=None):
     """Run until interrupted, with an optional environment admin key."""
     extra = {}
+    if plans is not None:
+        extra["plans"] = plans
     if database is not None:
         extra["database"] = database
     if firebase is not None:

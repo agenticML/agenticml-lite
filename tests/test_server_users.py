@@ -120,7 +120,7 @@ def test_discard_removes_only_matching_id(tmp_path):
     "duplicate_identity_case", "duplicate_id", "id_bad",
     "generation_bool", "generation_negative",
 ])
-def test_userstore_strict_parse_rejects(tmp_path, change):
+def test_userstore_strict_parse_rejects(tmp_path, change, monkeypatch):
     users = UserStore(server_dir(tmp_path), workspace_id=default_workspace_id(server_dir(tmp_path)))
     users.add("alice", role="admin", identity="a@x.com")
     users.add("bob", role="admin", identity="b@x.com")
@@ -147,7 +147,7 @@ def test_userstore_strict_parse_rejects(tmp_path, change):
         obj["users"][0]["generation"] = -1
     legacy = tmp_path / 'legacy'
     legacy.mkdir()
-    isolate_server_dir(legacy)
+    isolate_server_dir(legacy, monkeypatch)
     (legacy / 'users.json').write_text(json.dumps(obj))
     with pytest.raises(DatabaseError, match='could not import users.json'):
         UserStore(legacy, workspace_id=default_workspace_id(legacy))
@@ -301,7 +301,7 @@ def test_migration_v1_keys_runs_and_idempotent(tmp_path, caplog):
     assert "migrated 2.0 keys" not in caplog.text
 
 
-def test_migration_crash_and_empty(tmp_path):
+def test_migration_crash_and_empty(tmp_path, monkeypatch):
     data = tmp_path / 'data'
     prepare_data_dir(data)
     write_v1_keys(data / 'server' / 'keys.json', ['alpha'])
@@ -318,7 +318,7 @@ def test_migration_crash_and_empty(tmp_path):
     assert KeyStore(data / 'server', workspace_id=default_workspace_id(data / 'server')).list()[0].user == 'admin'
     empty = tmp_path / 'empty'
     prepare_data_dir(empty)
-    isolate_server_dir(empty / "server")
+    isolate_server_dir(empty / "server", monkeypatch)
     assert migrate(empty)
     assert UserStore(empty / 'server', workspace_id=default_workspace_id(empty / 'server')).list() == []
     assert not (empty / 'server' / 'users.json').exists()
@@ -394,7 +394,7 @@ def test_make_server_and_cli_keys_list_migrate(tmp_path, capsys, monkeypatch):
 
     other = tmp_path / "cli"
     prepare_data_dir(other)
-    isolate_server_dir(other / "server")
+    isolate_server_dir(other / "server", monkeypatch)
     write_v1_keys(other / "server" / "keys.json", ["alpha"])
     assert cli.main(["server", "keys", "list", "--data", str(other), "--json"]) == 0
     capsys.readouterr()
@@ -583,7 +583,7 @@ def test_users_cli_and_keys_create_user(tmp_path, capsys, monkeypatch):
 
 # --- 11. server status v1 and v2 ---
 
-def test_status_v1_and_v2_owner_key(tmp_path):
+def test_status_v1_and_v2_owner_key(tmp_path, monkeypatch):
     data = tmp_path / "v1"
     prepare_data_dir(data)
     write_v1_keys(data / "server" / "keys.json", ["box"])
@@ -599,7 +599,7 @@ def test_status_v1_and_v2_owner_key(tmp_path):
     assert report['users'][0]['name'] == 'admin'
 
     data = tmp_path / "v2"
-    isolate_server_dir(data / "server")
+    isolate_server_dir(data / "server", monkeypatch)
     prepare_data_dir(data)
     keys = KeyStore(data / "server", workspace_id=default_workspace_id(data / "server"))
     keys.create("box")
@@ -882,7 +882,7 @@ def test_login_demoted_admin_key_message(tmp_path, monkeypatch):
         assert "Set-Cookie" not in hdrs
 
 
-def test_migrate_refuses_v2_non_admin_users(tmp_path, caplog):
+def test_migrate_refuses_v2_non_admin_users(tmp_path, caplog, monkeypatch):
     source = tmp_path / 'source'
     source.mkdir()
     keys = KeyStore(source, workspace_id=default_workspace_id(source))
@@ -893,7 +893,7 @@ def test_migrate_refuses_v2_non_admin_users(tmp_path, caplog):
     prepare_data_dir(data)
     path = data / 'server' / 'keys.json'
     path.write_text(json.dumps(key_object(keys)))
-    isolate_server_dir(data / "server")
+    isolate_server_dir(data / "server", monkeypatch)
     before = path.read_bytes()
     assert not migrate(data)
     assert 'non-admin users' in caplog.text

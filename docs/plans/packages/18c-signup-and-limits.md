@@ -99,13 +99,13 @@ known from `Content-Length`.
 | Free workspaces per account | self-serve "New workspace" and sign-up | owned workspaces on `free` ≥ limit → refuse | 403 `{"error": "you already have a free workspace"}` |
 
 - Storage and upload counters are updated after a successful write, in the
-  transaction that records it (`record_file` / object insert gain an
-  optional usage delta). The check reads the counter in the run lock (or
-  object lock) before writing, so a single upload that would cross the
-  limit writes nothing. Concurrent uploads to *different* runs of one
-  workspace can overshoot by at most the in-flight bodies; this is
-  accepted and documented (package 20 keeps the same bound across
-  processes).
+  transaction that records it (`record_file` / object insert gain an optional
+  usage delta). Receive bodies in parallel, then take the run/object lock
+  followed by `server.quota_lock(workspace_id)` for the fresh check, publish
+  and recording. Without limits, skip quota locking and upload counters.
+  Package 20 adds cross-process quota locking behind that method. Repair an
+  on-disk object missing inventory without a storage check; remove a newly
+  published object if recording fails.
 - Reads, deletes, `/state`, `/missing`, `whoami`, `commit` and note edits
   are never refused for storage or uploads. Requests per minute applies to
   all of them (that is the point), except `GET /healthz` and sign-in.

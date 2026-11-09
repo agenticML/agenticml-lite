@@ -252,6 +252,23 @@ class WorkspaceRepo:
                         status or row['status'], row['id']))
             return self.by_id(row['id'], tx)
 
+    def set_plan(self, slug, plan, custom_limits=None):
+        import json
+        from ..limits import validate_limits
+        if plan not in ('free', 'custom'):
+            raise ClientError('plan must be free or custom')
+        if plan == 'free' and custom_limits is not None:
+            raise ClientError('free plan cannot have custom limits')
+        encoded = json.dumps(validate_limits(custom_limits)) if plan == 'custom' else None
+        with self.db.transaction(write=True) as tx:
+            tx.advisory_lock('users')
+            old = self.get(slug, tx)
+            if old is None:
+                raise ClientError('unknown workspace')
+            tx.execute('UPDATE workspaces SET plan=?, custom_limits=? WHERE id=?',
+                       (plan, encoded, old['id']))
+            return old, self.by_id(old['id'], tx)
+
     def delete(self, slug):
         with self.db.transaction(write=True) as tx:
             tx.advisory_lock('users')
@@ -335,7 +352,7 @@ class InviteRepo:
                 'SELECT login, role, expires_at, invited_by FROM invites WHERE workspace_id=? ORDER BY login',
                 (self.workspace_id,))]
 
-    def create(self, login, role, invited_by):
+    def create(self, login, role, invited_by, *, plans=None):
         from datetime import datetime, timedelta, timezone
         import hashlib
         login = validate_login(login)
@@ -346,6 +363,14 @@ class InviteRepo:
         with self.db.transaction(write=True) as tx:
             tx.advisory_lock('users')
             account = AccountRepo(self.db).get(login, tx)
+            if account and MembershipRepo(self.db, self.workspace_id).get(account['id'], tx):
+                raise ClientError('membership already exists')
+            if plans is not None:
+                pending = tx.fetchone(
+                    'SELECT 1 FROM invites WHERE workspace_id=? AND login=? AND expires_at>?',
+                    (self.workspace_id, login, layout.format_timestamp(plans.clock())))
+                if not (account is None and pending is not None):
+                    plans.check_people(self.db, self.workspace_id, tx)
             if account:
                 MembershipRepo(self.db, self.workspace_id).add(account['id'], role, tx)
                 return None

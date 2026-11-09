@@ -312,8 +312,8 @@ class UserStore:
     def by_identity(self, value):
         return self._call('by_identity', value)
 
-    def add(self, name, role="member", identity=None, created_by="cli", *, reclaim_runs=False):
-        return self._call('add', name, role, identity, created_by, reclaim_runs=reclaim_runs)
+    def add(self, name, role="member", identity=None, created_by="cli", *, reclaim_runs=False, plans=None):
+        return self._call('add', name, role, identity, created_by, reclaim_runs=reclaim_runs, plans=plans)
 
     def remove(self, name):
         return self._call('remove', name)

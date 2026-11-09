@@ -432,9 +432,10 @@ def _invites(webauth, handler, route, match):
             return
         login, role = payload.get("login", payload.get("name")), payload.get("role", "member")
         try:
-            token = repo.create(login, role, principal.user)
+            token = repo.create(login, role, principal.user, plans=getattr(handler.server, "plans", None))
         except ClientError as exc:
-            handler._json({"error": str(exc)}, 400)
+            from .limits import LimitReached
+            handler._json({"error": str(exc)}, 403 if isinstance(exc, LimitReached) else 400)
             return
         rows = [row for row in repo.list() if row["login"] == login]
         expires_at = rows[0]["expires_at"] if rows else None
@@ -513,6 +514,16 @@ def dispatch_dashboard(webauth, handler, path):
     if workspace_matches:
         if _bind_membership(webauth, handler, workspace_matches[0][1]) is None:
             return _not_found(handler)
+        plans = getattr(handler.server, 'plans', None)
+        if plans is not None:
+            try:
+                retry = plans.request(handler.server.db, handler.workspace.id)
+            except WorkspaceNotFound:
+                return _not_found(handler)
+            if retry is not None:
+                handler.close_connection = True
+                handler._json({'error': 'too many requests'}, 429, {'Retry-After': str(retry)})
+                return True
     allowed_methods = [route.method for route, _ in dashboard]
     chosen = next(((route, matched) for route, matched in dashboard if route.method == handler.command), None)
     if chosen is None:

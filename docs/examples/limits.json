@@ -1,0 +1,12 @@
+{
+  "default_plan": "free",
+  "free_workspaces_per_account": 1,
+  "plans": {
+    "free": {
+      "storage_bytes": 5000000000,
+      "upload_bytes_per_day": 2000000000,
+      "requests_per_minute": 600,
+      "people": 5
+    }
+  }
+}

@@ -2,6 +2,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+try:
+    import grp
+    import pwd
+except ImportError:
+    grp = None
+    pwd = None
 import json
 import os
 from pathlib import Path
@@ -10,6 +16,7 @@ import re
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -49,7 +56,24 @@ _INSTALL_ENV_DATABASE = (
     "AGENTICML_SERVER_DATABASE_URL is set in its environment")
 _INSTALL_NEEDS_PORT = "--install needs a fixed --port (1..65535)"
 _SYSTEMD_CONTROL = "systemd unit path contains a control character"
+_ENV_PATH_CONTROL = "environment file path contains a control character"
+_ENV_PATH_GLOB_CHARS = "*?[]\\"
+_ENV_PATH_GLOB = (
+    "environment file path contains a systemd glob character "
+    "(asterisk, question mark, brackets, or backslash); "
+    "use a different home or config directory")
+_UNSAFE_DIR_SYMLINK = "directory is a symlink"
+_UNSAFE_DIR_NOT_DIR = "not a directory"
+_UNSAFE_DIR_OWNER = "not owned by the current user"
+_UNSAFE_DIR_WRITABLE = (
+    "directory is world-writable, or group-writable by a group that is "
+    "not the current user's private group")
 _FUNNEL_STATUS_WARN = "warning: could not read Tailscale Funnel status; continuing"
+_DATABASE_URL_NEWLINE = "database URL must not contain a newline or NUL"
+_ENV_DATABASE_KEY = "AGENTICML_SERVER_DATABASE_URL"
+_ENV_FILE_MARKER = (
+    "# agenticml-server environment; written by agenticml server up --install")
+_SHELL_NEED_ESCAPE = '"\\`$'
 
 
 class UpError(ValueError):
@@ -305,23 +329,146 @@ def _systemd_quote(value):
     return value.replace("%", "%%").replace("$", "$$")
 
 
-def _atomic_write(path, data, mode=0o644):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
-    payload = data if isinstance(data, bytes) else data.encode("utf-8")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-    fd = os.open(tmp, flags, mode)
+def _refuse_untrusted_dir(path, reason):
+    raise UpError(f"refusing to use {path}: {reason}")
+
+
+def _is_user_private_group(gid):
+    """True if *gid* is the current user's private group.
+
+    Ubuntu's default umask 002 with user-private groups creates directories
+    0775 owned by a group named after the user, with no other listed
+    members. Those directories are as private as 0755 under umask 022.
+    Shared groups (staff, users, ...) stay refused even when gid matches.
+    """
+    if pwd is None or grp is None:
+        return False
+    if gid != os.getgid():
+        return False
     try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(tmp, mode)
-        os.replace(tmp, path)
+        user = pwd.getpwuid(os.geteuid())
+        group = grp.getgrgid(gid)
+    except (KeyError, OSError):
+        return False
+    if group.gr_name != user.pw_name:
+        return False
+    return all(name == user.pw_name for name in group.gr_mem)
+
+
+def _require_private_dir(path, st):
+    if stat.S_ISLNK(st.st_mode):
+        _refuse_untrusted_dir(path, _UNSAFE_DIR_SYMLINK)
+    if not stat.S_ISDIR(st.st_mode):
+        _refuse_untrusted_dir(path, _UNSAFE_DIR_NOT_DIR)
+    if st.st_uid != os.geteuid():
+        _refuse_untrusted_dir(path, _UNSAFE_DIR_OWNER)
+    mode = stat.S_IMODE(st.st_mode)
+    # World-writable is always refused. Group-writable is allowed only for
+    # the user's private group (see _is_user_private_group).
+    if mode & 0o002:
+        _refuse_untrusted_dir(path, _UNSAFE_DIR_WRITABLE)
+    if mode & 0o020 and not _is_user_private_group(st.st_gid):
+        _refuse_untrusted_dir(path, _UNSAFE_DIR_WRITABLE)
+
+
+def _lineage_from_home(path, home):
+    """Yield each component from $HOME (inclusive) down to path."""
+    path = Path(os.path.abspath(os.fspath(path)))
+    home = Path(os.path.abspath(os.fspath(home)))
+    if path != home and home not in path.parents:
+        _refuse_untrusted_dir(path, "not under the home directory")
+    yield home
+    if path == home:
+        return
+    current = home
+    for part in path.relative_to(home).parts:
+        current = current / part
+        yield current
+
+
+def _ensure_private_directory(path, home):
+    """Create missing components at 0700; refuse symlink / foreign / writable dirs.
+
+    Every component from $HOME (inclusive) through *path* is lstat'd and
+    must be a real directory owned by the current user, not world-writable,
+    and not group-writable unless the directory's group is the current
+    user's private group (gid == os.getgid(), group name equals the user
+    name, and grp.getgrgid(gid).gr_mem is empty or only that user).
+    Ancestors of $HOME are not walked (they may be root-owned).
+    """
+    for component in _lineage_from_home(path, home):
+        try:
+            st = os.lstat(component)
+        except FileNotFoundError:
+            try:
+                os.mkdir(component, 0o700)
+            except FileExistsError:
+                pass
+            st = os.lstat(component)
+        _require_private_dir(component, st)
+
+
+def _require_private_lineage(path, home):
+    """Same lstat checks as _ensure_private_directory, without creating."""
+    for component in _lineage_from_home(path, home):
+        _require_private_dir(component, os.lstat(component))
+
+
+def _open_private_dir(path):
+    # Residual: the check-then-open window is only exploitable by someone
+    # who can already write to the user's own directories, which these
+    # checks refuse.
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        dir_fd = os.open(path, flags)
+    except OSError as exc:
+        try:
+            st = os.lstat(path)
+        except OSError:
+            raise UpError(f"refusing to use {path}: not a private directory") from exc
+        _require_private_dir(path, st)
+        raise UpError(f"refusing to use {path}: not a private directory") from exc
+    try:
+        _require_private_dir(path, os.fstat(dir_fd))
     except BaseException:
-        tmp.unlink(missing_ok=True)
+        os.close(dir_fd)
         raise
+    return dir_fd
+
+
+def _atomic_write(path, data, mode=0o600, *, home=None):
+    path = Path(path)
+    parent = path.parent
+    home = Path(home or Path.home())
+    _ensure_private_directory(parent, home)
+    payload = data if isinstance(data, bytes) else data.encode("utf-8")
+    tmp_name = f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    dir_fd = _open_private_dir(parent)
+    created = False
+    try:
+        fd = os.open(tmp_name, flags, mode, dir_fd=dir_fd)
+        created = True
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fsync(fd)
+            os.fchmod(fd, mode)
+        finally:
+            os.close(fd)
+        os.replace(tmp_name, path.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        created = False
+    except BaseException:
+        if created:
+            try:
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            except OSError:
+                pass
+        raise
+    finally:
+        os.close(dir_fd)
 
 
 def _refuse_overwrite(path, ours, force):
@@ -345,25 +492,97 @@ def _ours_plist(path):
     return isinstance(data, dict) and data.get("Label") == _LAUNCHD_LABEL
 
 
+def _ours_env(path):
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            first = handle.readline()
+    except OSError:
+        return False
+    return first.rstrip("\n\r") == _ENV_FILE_MARKER
+
+
+def _remove_our_env_file(path, home=None):
+    path = Path(path)
+    home = Path(home or Path.home())
+    try:
+        _require_private_lineage(path.parent, home)
+    except FileNotFoundError:
+        return
+    dir_fd = _open_private_dir(path.parent)
+    try:
+        try:
+            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+        except OSError:
+            return
+        try:
+            raw = os.read(fd, 512)
+        finally:
+            os.close(fd)
+        first = raw.split(b"\n", 1)[0].rstrip(b"\r")
+        if first != _ENV_FILE_MARKER.encode("utf-8"):
+            return
+        os.unlink(path.name, dir_fd=dir_fd)
+    except OSError:
+        return
+    finally:
+        os.close(dir_fd)
+
+
 def systemd_unit_path(home=None):
     return Path(home or Path.home()) / ".config/systemd/user" / f"{_UNIT_NAME}.service"
+
+
+def systemd_env_path(home=None):
+    return Path(home or Path.home()) / ".config/agenticml/server.env"
 
 
 def launchd_plist_path(home=None):
     return Path(home or Path.home()) / "Library/LaunchAgents" / f"{_LAUNCHD_LABEL}.plist"
 
 
+def _require_single_line_database(url):
+    if "\n" in url or "\r" in url or "\0" in url:
+        raise UpError(_DATABASE_URL_NEWLINE)
+
+
+def _environment_file_line(path):
+    # EnvironmentFile= takes an unquoted absolute path. ExecStart quoting
+    # (double quotes, $$) makes systemd reject the path as not absolute.
+    # systemd 249 globs the path (* ? [ ] \\), so refuse those rather than
+    # trying to escape them.
+    path = str(path)
+    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in path):
+        raise UpError(_ENV_PATH_CONTROL)
+    if any(char in _ENV_PATH_GLOB_CHARS for char in path):
+        raise UpError(_ENV_PATH_GLOB)
+    return "EnvironmentFile=" + path.replace("%", "%%") + "\n"
+
+
+def _environment_file_assignment(name, value):
+    # systemd 249 EnvironmentFile: double-quote and escape SHELL_NEED_ESCAPE
+    # (" \ ` $) so the assignment is one line; refuse newline/NUL first.
+    _require_single_line_database(value)
+    escaped = "".join("\\" + char if char in _SHELL_NEED_ESCAPE else char
+                      for char in value)
+    return f'{name}="{escaped}"\n'
+
+
 def write_systemd_unit(data, port, *, home=None, force=False, database=None, firebase=None):
+    home = Path(home or Path.home())
     path = systemd_unit_path(home)
+    env_path = systemd_env_path(home)
+    env_line = ""
+    if database is not None:
+        # Passwords belong in a 0600 EnvironmentFile, never ExecStart/argv.
+        _require_single_line_database(database)
+        env_line = _environment_file_line(env_path)
     _refuse_overwrite(path, _ours_systemd, force)
+    if database is not None:
+        _refuse_overwrite(env_path, _ours_env, force)
     exec_start = " ".join([
         _systemd_quote(sys.executable), "-m", "agenticml", "server", "up",
         "--data", _systemd_quote(data), "--port", str(port),
     ])
-    if database is not None:
-        # Package 19 URLs can hold passwords; callers pass only an explicit
-        # --database, never AGENTICML_SERVER_DATABASE_URL.
-        exec_start += ' --database ' + _systemd_quote(database)
     if firebase is not None:
         exec_start += ' --firebase-project ' + _systemd_quote(firebase.project)
         exec_start += ' --firebase-api-key ' + _systemd_quote(firebase.api_key)
@@ -374,6 +593,7 @@ def write_systemd_unit(data, port, *, home=None, force=False, database=None, fir
         "Description=AgenticML server up\n"
         "\n"
         "[Service]\n"
+        f"{env_line}"
         f"ExecStart={exec_start}\n"
         "Restart=on-failure\n"
         "RestartSec=30\n"
@@ -381,7 +601,15 @@ def write_systemd_unit(data, port, *, home=None, force=False, database=None, fir
         "[Install]\n"
         "WantedBy=default.target\n"
     )
-    _atomic_write(path, body)
+    _atomic_write(path, body, home=home)
+    if database is not None:
+        _atomic_write(
+            env_path,
+            f"{_ENV_FILE_MARKER}\n"
+            f"{_environment_file_assignment(_ENV_DATABASE_KEY, database)}",
+            home=home)
+    else:
+        _remove_our_env_file(env_path, home=home)
     print("systemctl --user daemon-reload && systemctl --user enable --now "
           f"{_UNIT_NAME}")
     print("loginctl enable-linger $USER")
@@ -390,6 +618,8 @@ def write_systemd_unit(data, port, *, home=None, force=False, database=None, fir
 
 def write_launchd_plist(data, port, *, home=None, force=False, database=None, firebase=None):
     home = Path(home or Path.home())
+    if database is not None:
+        _require_single_line_database(database)
     path = launchd_plist_path(home)
     _refuse_overwrite(path, _ours_plist, force)
     log_dir = home / "Library/Logs"
@@ -407,16 +637,14 @@ def write_launchd_plist(data, port, *, home=None, force=False, database=None, fi
         "StandardErrorPath": log_path,
     }
     if database is not None:
-        # Package 19 URLs can hold passwords; callers pass only an explicit
-        # --database, never AGENTICML_SERVER_DATABASE_URL.
-        payload['ProgramArguments'].extend(['--database', database])
+        payload["EnvironmentVariables"] = {_ENV_DATABASE_KEY: database}
     if firebase is not None:
         payload['ProgramArguments'].extend([
             '--firebase-project', firebase.project,
             '--firebase-api-key', firebase.api_key,
             '--firebase-auth-domain', firebase.auth_domain,
         ])
-    _atomic_write(path, plistlib.dumps(payload))
+    _atomic_write(path, plistlib.dumps(payload), home=home)
     print(f"launchctl load -w {path}")
     return path
 
@@ -445,8 +673,8 @@ def up(data=None, port=8080, *, install=False, force=False, database=None, fireb
         extra_bootstrap["firebase"] = firebase
     data = bootstrap_admin(data, public_url, install=install, **extra_bootstrap)
     if install:
-        # Package 19 URLs can hold passwords; write --database into the unit
-        # only when the operator passed it explicitly, never AGENTICML_SERVER_DATABASE_URL.
+        # Package 19 URLs can hold passwords; persist an explicit --database
+        # in the service environment, never argv or AGENTICML_SERVER_DATABASE_URL.
         install_extra = {}
         if explicit_database is not None:
             install_extra['database'] = explicit_database

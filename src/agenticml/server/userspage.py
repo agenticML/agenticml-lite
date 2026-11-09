@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 
+from .limits import LimitReached
 from .db import DatabaseError
 from .keys import ClientError, KeyStoreUnavailable, LastAdminError, _NAME, validate_name
 from .keyspage import command_host, read_json
@@ -99,7 +100,8 @@ def handle(webauth, handler, path, *, show_owner=False):
             existing_account = AccountRepo(keys.db).get(name)
             try:
                 record = users.add(
-                    name, role=role, identity=identity, created_by=principal.user)
+                    name, role=role, identity=identity, created_by=principal.user,
+                    plans=getattr(handler.server, "plans", None))
             except UserNameTaken:
                 handler._json({"error": "user name already exists"}, 409)
                 return
@@ -259,6 +261,8 @@ def handle(webauth, handler, path, *, show_owner=False):
         else:
             handler.close_connection = True
             handler._json({"error": "method not allowed"}, 405)
+    except LimitReached as exc:
+        handler._error({"error": str(exc)}, 403)
     except KeyStoreUnavailable:
         if not getattr(handler, "_started", False):
             handler._error({"error": "key store unavailable"}, 503)

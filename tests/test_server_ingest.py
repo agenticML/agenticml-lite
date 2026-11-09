@@ -125,11 +125,11 @@ def test_health_auth_scopes_and_revocation(server):
     assert request(server, "/v2/whoami")[0] == 401
 
 
-def test_zero_keys_and_environment(tmp_path):
+def test_zero_keys_and_environment(tmp_path, monkeypatch):
     with running(tmp_path / "empty") as httpd:
         assert raw(httpd, "GET", "/healthz")[0] == 200
         assert raw(httpd, "GET", "/v2/whoami")[0] == 401
-    isolate_server_dir((tmp_path / 'env') / 'server')
+    isolate_server_dir((tmp_path / 'env') / 'server', monkeypatch)
     with running(tmp_path / "env", "a" * 32) as httpd:
         assert raw(httpd, "GET", "/v2/whoami", [("Authorization", "Bearer " + "a" * 32)])[1] == {
             "key": "env", "scope": "admin", "user": "env", "role": "admin", "protocol": 2, "workspace": "default",

@@ -1,7 +1,7 @@
 """Authenticated protocol v2 writes, with bounded bodies and serialized apply."""
 from __future__ import annotations
 
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 import hashlib
 import json
 import logging
@@ -19,6 +19,8 @@ from agenticml.ui.server import DashboardHandler
 from . import lineage
 from .db import DatabaseError
 from .db.usage import UsageRepo
+from .access import WorkspaceNotFound
+from .limits import LimitReached
 from .keys import KeyStoreUnavailable
 from .runs import APPEND as _APPEND, ATOMIC as _ATOMIC, list_row_from_bytes
 from .users import allowed, resolve
@@ -149,6 +151,10 @@ class IngestHandler(DashboardHandler):
                 return
             record, principal = self._authenticate()
             self.principal = principal
+            if self.server.plans is not None:
+                retry = self.server.plans.request(self.server.db, self.workspace.id)
+                if retry is not None:
+                    raise _RequestError(429, {"error": "too many requests"}, {"Retry-After": str(retry)})
             self.server.keys.touch(record)
             if route == "whoami":
                 self._json({"key": record.name, "scope": record.scope, "user": principal.user,
@@ -185,8 +191,18 @@ class IngestHandler(DashboardHandler):
             if route in ("atomic", "append", "commit", "lineage"):
                 # Reject obvious conflicts without receiving a large upload.
                 # Ownership is checked authoritatively again under the lock.
-                self._ownership(self._run_dir(run_id), principal,
-                                route == "atomic" and args[1] == "meta.json")
+                with self.workspace.run_lock(run_id) if route == "append" else nullcontext():
+                    self._ownership(self._run_dir(run_id), principal,
+                                    route == "atomic" and args[1] == "meta.json")
+                    if route == "append":
+                        offset, _ = self._append_query(query)
+                        if args[1].endswith('.bin') and (offset % layout.RECORD_SIZE or length % layout.RECORD_SIZE):
+                            _fail(422, "torn record")
+                        committed = self.workspace.run_index.committed_size(run_id, args[1])
+                        if offset > committed:
+                            raise _RequestError(409, {"size": committed})
+            if self.server.plans is not None and route in ('atomic', 'append', 'object', 'lineage'):
+                self._check_quota(route, args, query, length)
             if not self.server._admit_body(self.connection, self.server.limits.concurrent_bodies):
                 self.close_connection = True
                 raise _RequestError(503, {"error": "server busy"}, {"Retry-After": "5"})
@@ -212,9 +228,11 @@ class IngestHandler(DashboardHandler):
                 self._json(payload, status)
             else:
                 pending = None
-                with self.workspace.run_lock(run_id):
+                with self.workspace.run_lock(run_id), self._quota_lock(route):
                     directory = self._run_dir(run_id)
                     remote = self._ownership(directory, principal, route == "atomic" and args[1] == "meta.json")
+                    if self.server.plans is not None and route in ("atomic", "append", "lineage"):
+                        self._check_quota(route, args, query, length)
                     if route == "atomic":
                         payload, status, pending = self._atomic(run_id, args[1], body, record, principal, remote)
                     elif route == "append":
@@ -222,13 +240,20 @@ class IngestHandler(DashboardHandler):
                     elif route == "lineage":
                         meta = _json_object(layout.read_file_nofollow(self._target(directory, "meta.json")))
                         payload, status = lineage.receive(self.workspace.root, run_id, meta, tmp)
-                        with self.server.db.transaction(write=True) as tx:
-                            UsageRepo(self.server.db, self.workspace.run_index.workspace_id).add_upload(length, tx)
+                        if self.server.plans is not None:
+                            with self.server.db.transaction(write=True) as tx:
+                                self._usage().add_upload(length, tx)
                     else:
                         payload, status, pending = self._commit(run_id, directory, body, remote)
                 if pending is not None:
                     self._audit_run(run_id, pending)
                 self._json(payload, status)
+        except WorkspaceNotFound:
+            self.close_connection = True
+            self._json({"error": "not found"}, 404)
+        except LimitReached as exc:
+            self.close_connection = True
+            self._json({"error": str(exc)}, 403)
         except (_RequestError, lineage.LineageError) as exc:
             # A rejected request may leave an announced body unread.
             if self.headers.get_all("Content-Length") or self.headers.get_all("Transfer-Encoding"):
@@ -254,6 +279,39 @@ class IngestHandler(DashboardHandler):
                 tmp.unlink(missing_ok=True)
 
     do_GET = do_PUT = do_POST = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = do_TRACE = do_CONNECT = _dispatch
+
+    def _quota_lock(self, route):
+        if self.server.plans is not None and route in ('atomic', 'append', 'object', 'lineage'):
+            return self.server.quota_lock(self.workspace.id)
+        return nullcontext()
+
+    def _upload_clock(self):
+        plans = self.server.plans
+        return (lambda: plans.clock().date().isoformat()) if plans is not None else None
+
+    def _usage(self):
+        return UsageRepo(self.server.db, self.workspace.id, clock=self._upload_clock())
+
+    def _check_quota(self, route, args, query, length):
+        usage = self._usage()
+        limits = self.server.plans.limits_for(self.server.workspaces.by_id(self.workspace.id))
+        growth = None
+        if route in ('atomic', 'append'):
+            committed = self.workspace.run_index.committed_size(args[0], args[1])
+            if route == 'append':
+                offset, truncate = self._append_query(query)
+                if offset <= committed:
+                    growth = length - committed if truncate else max(0, offset + length - committed)
+            else:
+                growth = length - committed
+        elif route == 'object':
+            growth = (0 if usage.has_object(args[0]) or objects.has(self.workspace.root, args[0])
+                      else length)
+        # Pre-check without a lock for early refusal; re-check under the write
+        # lock after receipt so slow bodies never hold run/object locks.
+        # Final check, publish and accounting hold the workspace quota lock;
+        # receiving network bytes never holds that lock.
+        self.server.plans.check_upload(limits, usage.get(), length, growth)
 
     def _method_not_allowed(self):
         """Dashboard PUTs must not recurse; ingest unknown methods still 405."""
@@ -438,13 +496,13 @@ class IngestHandler(DashboardHandler):
             layout.fsync_dir(path.parent)
             self.server._after_atomic_write(run_id, name)
             self.workspace.run_index.record_file(run_id, name, len(body), sha256=digest,
-                                                 upload_bytes=len(body))
+                                                 upload_bytes=len(body) if self.server.plans is not None else None, upload_clock=self._upload_clock())
         else:
             layout.atomic_write(path, body, fsync=True)
             layout.fsync_dir(path.parent)
             self.server._after_atomic_write(run_id, name)
             self.workspace.run_index.record_file(run_id, name, len(body), sha256=digest,
-                                                 upload_bytes=len(body))
+                                                 upload_bytes=len(body) if self.server.plans is not None else None, upload_clock=self._upload_clock())
         pending = ("run.create", obj) if name == "meta.json" and not exists else None
         return {"size": len(body)}, 200, pending
 
@@ -572,7 +630,9 @@ class IngestHandler(DashboardHandler):
         with layout.open_nofollow(tmp, "r+b") as handle:
             os.fchmod(handle.fileno(), self.server.store_file_mode)
             os.fsync(handle.fileno())
-        with self.workspace.object_lock(sha):
+        with self.workspace.object_lock(sha), self._quota_lock("object"):
+            if self.server.plans is not None:
+                self._check_quota("object", (sha,), "", tmp.stat().st_size)
             dest = layout.object_path(self.workspace.root, sha)
             if (dest.exists() or dest.is_symlink()) and not _regular(dest):
                 raise ValueError("unsafe object destination")
@@ -590,14 +650,19 @@ class IngestHandler(DashboardHandler):
                 layout.fsync_dir(dest.parent.parent)
             os.replace(tmp, dest)
             layout.fsync_dir(dest.parent)
-            self._record_object(sha, dest.lstat().st_size, created=True)
+            try:
+                self._record_object(sha, dest.lstat().st_size, created=True)
+            except Exception:
+                dest.unlink()
+                layout.fsync_dir(dest.parent)
+                raise
             return {"sha256": sha, "created": True}, 201
 
     def _record_object(self, sha, size, *, created):
         with self.server.db.transaction(write=True) as tx:
-            usage = UsageRepo(self.server.db, self.workspace.run_index.workspace_id)
-            inserted = usage.record_object(sha, size, tx)
-            if created and inserted:
+            usage = self._usage()
+            usage.record_object(sha, size, tx)
+            if self.server.plans is not None:
                 usage.add_upload(size, tx)
 
     @staticmethod
@@ -661,7 +726,7 @@ class IngestHandler(DashboardHandler):
             self.server._after_append_write(run_id, name)
             last_step = self._time_step(path, length) if name == _TIME_PATH else None
             self.workspace.run_index.record_file(run_id, name, length, last_step=last_step,
-                                                 upload_bytes=length)
+                                                 upload_bytes=length if self.server.plans is not None else None, upload_clock=self._upload_clock())
             return {"size": length}, 200
         with layout.open_nofollow(path, "ab"):
             pass
@@ -717,7 +782,7 @@ class IngestHandler(DashboardHandler):
         self.server._after_append_write(run_id, name)
         last_step = self._time_step(path, new_size) if name == _TIME_PATH else None
         self.workspace.run_index.record_file(run_id, name, new_size, last_step=last_step,
-                                             upload_bytes=length)
+                                             upload_bytes=length if self.server.plans is not None else None, upload_clock=self._upload_clock())
         return {"size": new_size}, 200
 
     @staticmethod

@@ -470,7 +470,7 @@ def test_setup_corrupt_at_startup_stays_disabled(tmp_path, caplog, nested):
 
 
 @pytest.mark.parametrize('field', ['created_at', 'last_used_at'])
-def test_timestamp_overflow_fails_closed_and_disarms_setup(tmp_path, caplog, field):
+def test_timestamp_overflow_fails_closed_and_disarms_setup(tmp_path, caplog, field, monkeypatch):
     directory = tmp_path / 'source'
     directory.mkdir()
     keys = KeyStore(directory, workspace_id=default_workspace_id(directory))
@@ -480,7 +480,7 @@ def test_timestamp_overflow_fails_closed_and_disarms_setup(tmp_path, caplog, fie
     data = tmp_path / 'legacy'
     prepare_data_dir(data)
     users = user_object(UserStore(directory, workspace_id=default_workspace_id(directory)))
-    isolate_server_dir(data / "server")
+    isolate_server_dir(data / "server", monkeypatch)
     (data / 'server' / 'users.json').write_text(json.dumps(users))
     (data / 'server' / 'keys.json').write_text(json.dumps(obj))
     with pytest.raises(DatabaseError, match='could not import keys.json'):

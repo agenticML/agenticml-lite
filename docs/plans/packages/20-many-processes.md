@@ -94,6 +94,20 @@ process), sharing the setup token across processes (Firebase/hosted has no
   lock and updated in the recording transaction; the overshoot bound from
   18c (in-flight bodies to different runs) holds across processes.
 
+### Carried over from 18c and 19.1 reviews (Nov 9, 2026)
+
+- 18c added an in-process per-workspace quota lock (`app.quota_lock`)
+  around the final limit check, publish and counter update when a limits
+  file is set. In Postgres mode it must also take a session advisory lock
+  (`quota:<wid>`), after the run/object lock, like the run and object
+  locks above.
+- Lineage `receive` (git work) currently runs inside the quota lock; give
+  lineage a narrow lock around just the daily check and `add_upload`.
+- Writes within one workspace are serialized while limits are on; note the
+  throughput cost in the package 24 benchmark.
+- `for_server_dir` holds its registry lock across Postgres network I/O;
+  open outside the lock (roadmap Backlog).
+
 ## Test (`tests/test_server_many_processes.py`, Postgres only)
 
 Skipped without `AGENTICML_TEST_DATABASE_URL`. Uses real subprocesses

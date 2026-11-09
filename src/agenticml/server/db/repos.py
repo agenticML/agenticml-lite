@@ -136,12 +136,14 @@ class UserRepo:
             row = tx.fetchone(self._select() + 'AND a.identity=?', (self.workspace_id, value))
             return self.decode(row) if row else None
 
-    def add(self, name, role='member', identity=None, created_by='cli', *, reclaim_runs=False):
+    def add(self, name, role='member', identity=None, created_by='cli', *, reclaim_runs=False, plans=None):
         record = self._new(name, role, identity, created_by)
         with self.db.transaction(write=True) as tx:
             tx.advisory_lock('users')
             if self.get(record.name, tx):
                 raise UserNameTaken('user name already exists')
+            if plans is not None:
+                plans.check_people(self.db, self.workspace_id, tx)
             existing = self.accounts.get(record.name, tx)
             if not reclaim_runs:
                 if existing is not None and existing['created_by'] == 'legacy run owner':
@@ -741,13 +743,13 @@ class RunRepo:
                         (project, created_at, encoded, launch_note, now, self.workspace_id, run_id))
 
     def record_file(self, run_id, path, size, sha256=None, last_step=None,
-                    upload_bytes=None):
+                    upload_bytes=None, upload_clock=None):
         now = layout.format_timestamp()
         with self.db.transaction(write=True) as tx:
             tx.lock_row('runs', 'workspace_id=? AND run_id=?', (self.workspace_id, run_id))
             tx.lock_row('run_files', 'workspace_id=? AND run_id=? AND path=?', (self.workspace_id, run_id, path))
             self._ensure(tx, run_id)
-            usage = UsageRepo(self.db, self.workspace_id)
+            usage = UsageRepo(self.db, self.workspace_id, clock=upload_clock)
             usage.lock(tx)
             old_size = self.committed_size(run_id, path, tx)
             usage.add_stored(size - old_size, tx)

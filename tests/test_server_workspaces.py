@@ -744,7 +744,7 @@ def test_convert_store_exdev_and_skips_flag_without_default(tmp_path, monkeypatc
     db.close()
 
 
-def test_legacy_run_owner_not_attached_without_reclaim_runs(two, tmp_path, capsys):
+def test_legacy_run_owner_not_attached_without_reclaim_runs(two, tmp_path, capsys, monkeypatch):
     from agenticml.server.keys import ClientError
 
     server, a, b, _, _, _, _ = two
@@ -767,7 +767,7 @@ def test_legacy_run_owner_not_attached_without_reclaim_runs(two, tmp_path, capsy
     users_a.add('ghost')
     assert users_a.get('ghost').id == aid
     data = tmp_path / 'other'
-    isolate_server_dir(data / "server")
+    isolate_server_dir(data / "server", monkeypatch)
     with running(data) as other:
         other.users.add('alice', 'admin')
         with other.db.transaction(write=True) as tx:

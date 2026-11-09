@@ -34,6 +34,7 @@ def server_database(request, monkeypatch, postgres_admin):
     from agenticml.server import db
     from server_db_helpers import postgres_url
     if postgres_admin is None:
+        monkeypatch.delenv('AGENTICML_SERVER_DATABASE_URL', raising=False)
         yield None
         return
     if request.node.get_closest_marker('sqlite_only'):

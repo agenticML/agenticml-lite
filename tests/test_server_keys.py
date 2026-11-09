@@ -111,7 +111,7 @@ def test_reload_and_corruption(keys, monkeypatch):
 
 
 @pytest.mark.parametrize("change", ["version", "keys", "name", "duplicate", "hash", "scope", "timestamp", "type"])
-def test_invalid_records_fail_closed(keys, change):
+def test_invalid_records_fail_closed(keys, change, monkeypatch):
     keys.create('one')
     obj = key_object(keys)
     if change == 'version': obj['version'] = True
@@ -126,7 +126,7 @@ def test_invalid_records_fail_closed(keys, change):
     legacy.mkdir()
     (legacy / 'users.json').write_text(json.dumps(user_object(UserStore(keys.server_dir, workspace_id=default_workspace_id(keys.server_dir)))))
     (legacy / 'keys.json').write_text(json.dumps(obj))
-    isolate_server_dir(legacy)
+    isolate_server_dir(legacy, monkeypatch)
     with pytest.raises(DatabaseError, match='could not import keys.json'):
         KeyStore(legacy, workspace_id=default_workspace_id(legacy))
 
@@ -139,14 +139,10 @@ def test_symlink_unreadable_and_env_survives(keys, monkeypatch):
     outside.write_text(json.dumps(key_object(keys)))
     (legacy / 'keys.json').symlink_to(outside)
     before = outside.read_bytes()
-    previous = os.environ.get('AGENTICML_SERVER_DATABASE_URL')
-    isolate_server_dir(legacy)
-    try:
+    with monkeypatch.context() as nested:
+        isolate_server_dir(legacy, nested)
         with pytest.raises(DatabaseError, match='could not import keys.json'):
             KeyStore(legacy, 'a'*32, workspace_id=default_workspace_id(legacy))
-    finally:
-        if previous is not None:
-            os.environ['AGENTICML_SERVER_DATABASE_URL'] = previous
     assert outside.read_bytes() == before
     store = KeyStore(keys.server_dir, 'a'*32, workspace_id=default_workspace_id(keys.server_dir))
     store.touch(store.verify('a'*32))

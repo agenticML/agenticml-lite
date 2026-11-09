@@ -192,6 +192,7 @@ def test_private_errors_and_broken_connections(open_db, failure):
             connection = tx.connection
             raise error_type('private host password details')
     assert 'private host password details' not in ''.join(traceback.format_exception(error.value))
+    assert error.value.__cause__ is None and error.value.__context__ is None
     if failure in ('OperationalError', 'InterfaceError'):
         assert connection.closed
         assert connection not in db._idle and connection not in db._connections
@@ -217,7 +218,34 @@ def test_connection_errors_do_not_leak_secrets(pg_url, caplog, failure):
         connect(bad_url)
     rendered = ''.join(traceback.format_exception(error.value)) + caplog.text
     assert bad_url not in rendered and password not in rendered and host not in rendered
-    assert error.value.__suppress_context__
+    assert error.value.__cause__ is None and error.value.__context__ is None
+
+
+def test_connect_timeout_defaults_when_unset(pg_url, monkeypatch):
+    import psycopg
+    from psycopg.conninfo import conninfo_to_dict
+    from agenticml.server.db.postgres import _conninfo_with_timeout, _DEFAULT_CONNECT_TIMEOUT
+    from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+
+    parts = urlsplit(pg_url)
+    query = {key: value for key, value in parse_qsl(parts.query) if key != 'connect_timeout'}
+    unset = urlunsplit(parts._replace(query=urlencode(query, quote_via=quote)))
+    params = conninfo_to_dict(_conninfo_with_timeout(unset))
+    assert params.get('connect_timeout') == _DEFAULT_CONNECT_TIMEOUT
+    seen = []
+    original = psycopg.connect
+
+    def spy(conninfo, *args, **kwargs):
+        seen.append(conninfo_to_dict(conninfo))
+        return original(conninfo, *args, **kwargs)
+
+    monkeypatch.setattr(psycopg, 'connect', spy)
+    db = connect(unset)
+    db.close()
+    assert seen and all(item.get('connect_timeout') == _DEFAULT_CONNECT_TIMEOUT for item in seen)
+    kept = dict(parse_qsl(parts.query), connect_timeout='7')
+    with_timeout = urlunsplit(parts._replace(query=urlencode(kept, quote_via=quote)))
+    assert conninfo_to_dict(_conninfo_with_timeout(with_timeout)).get('connect_timeout') == '7'
 
 
 def test_superuser_warning_names_only_role(open_db, pg_url, caplog):
@@ -275,6 +303,7 @@ def test_failed_rollback_discards_connection(open_db, monkeypatch, stage):
             if stage == 'body':
                 tx.execute('SELECT 1 / 0')
     assert 'private' not in str(error.value)
+    assert error.value.__cause__ is None and error.value.__context__ is None
     assert broken.closed and broken not in db._connections and broken not in db._idle
     with db.transaction() as tx:
         assert tx.fetchone('SELECT 1')[0] == 1

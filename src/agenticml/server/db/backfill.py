@@ -22,6 +22,10 @@ def _scan(root):
     try:
         safe = all(stat.S_ISDIR(p.lstat().st_mode)
                    for p in (root.parent.parent, root.parent, root, objects))
+    except FileNotFoundError as exc:
+        log = logger.debug if exc.filename == str(objects) else logger.warning
+        log('Skipping unsafe or missing workspace store %s: %s', root, exc)
+        return []
     except OSError as exc:
         logger.warning('Skipping unsafe or missing workspace store %s: %s', root, exc)
         return []

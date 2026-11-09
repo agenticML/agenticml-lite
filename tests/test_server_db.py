@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import plistlib
 import stat
 import threading
 
@@ -139,8 +140,19 @@ def test_postgres_url_reports_connection_failure(tmp_path, capsys):
     with pytest.raises(DatabaseError, match='^could not connect to Postgres$') as error:
         connect(bad)
     assert 'private-password' not in str(error.value) and '127.0.0.1' not in str(error.value)
+    assert error.value.__cause__ is None and error.value.__context__ is None
     assert cli.main(['server', 'keys', 'list', '--data', str(tmp_path), '--database', bad]) == 1
     assert 'private-password' not in capsys.readouterr().err
+
+
+def test_postgres_conninfo_default_connect_timeout():
+    pytest.importorskip('psycopg')
+    from agenticml.server.db.postgres import _DEFAULT_CONNECT_TIMEOUT, _conninfo_with_timeout
+    from psycopg.conninfo import conninfo_to_dict
+    unset = conninfo_to_dict(_conninfo_with_timeout('postgresql://u:p@127.0.0.1:1/db'))
+    assert unset.get('connect_timeout') == _DEFAULT_CONNECT_TIMEOUT
+    kept = conninfo_to_dict(_conninfo_with_timeout('postgresql://u:p@127.0.0.1:1/db?connect_timeout=3'))
+    assert kept.get('connect_timeout') == '3'
 
 
 def test_postgres_dependency_is_lazy_and_missing_extra_is_clear(monkeypatch):
@@ -291,7 +303,7 @@ def test_import_v1_once_including_run_owners_and_audit(tmp_path):
     assert len(AuditRepo(db, default_workspace_id(db)).tail(10)) == 2
 
 
-def test_import_22_password_invite_and_rollback_on_bad_keys(tmp_path):
+def test_import_22_password_invite_and_rollback_on_bad_keys(tmp_path, monkeypatch):
     source = tmp_path / 'source'
     source.mkdir()
     users = UserStore(source, workspace_id=default_workspace_id(source))
@@ -302,7 +314,7 @@ def test_import_22_password_invite_and_rollback_on_bad_keys(tmp_path):
     key, secret = KeyStore(source, workspace_id=default_workspace_id(source)).create('laptop',user='alice')
     legacy = tmp_path / 'legacy'
     legacy.mkdir()
-    isolate_server_dir(legacy)
+    isolate_server_dir(legacy, monkeypatch)
     (legacy / 'users.json').write_text(json.dumps({'version':1,'users':[dict(asdict(r), role='admin' if r.role == 'owner' else r.role) for r in users.list()]}))
     (legacy / 'keys.json').write_text('{')
     with pytest.raises(DatabaseError, match='could not import keys.json'): KeyStore(legacy, workspace_id=default_workspace_id(legacy))
@@ -361,8 +373,8 @@ def test_sessions_and_throttle_survive_restart_and_no_old_files(tmp_path, monkey
 def test_custom_database_cli_live_server_audit_and_env_precedence(tmp_path, monkeypatch, capsys):
     data = tmp_path / 'data'
     if on_postgres():
-        custom = isolate_server_dir(tmp_path / 'custom')
-        isolate_server_dir(tmp_path / 'unused')
+        custom = isolate_server_dir(tmp_path / 'custom', monkeypatch)
+        isolate_server_dir(tmp_path / 'unused', monkeypatch)
     else:
         custom = url(tmp_path / 'custom.db')
         monkeypatch.setenv('AGENTICML_SERVER_DATABASE_URL', url(tmp_path / 'unused.db'))
@@ -512,11 +524,44 @@ def test_bearer_database_failure_is_private_503(tmp_path, monkeypatch, failure, 
 
 def test_installed_unit_keeps_custom_database_without_printing_it(tmp_path, capsys, monkeypatch):
     monkeypatch.delenv('AGENTICML_SERVER_DATABASE_URL', raising=False)
-    from agenticml.server.up import write_systemd_unit
-    database = 'sqlite:///' + str(tmp_path / 'private state.db')
-    path = write_systemd_unit(tmp_path / 'data', 8080, home=tmp_path, database=database)
-    assert '--database' in path.read_text() and database in path.read_text()
-    assert database not in capsys.readouterr().out
+    from agenticml.server.up import (
+        _ENV_FILE_MARKER, launchd_plist_path, systemd_env_path, systemd_unit_path,
+        write_launchd_plist, write_systemd_unit,
+    )
+    previous = os.umask(0o022)
+    try:
+        os.chmod(tmp_path, 0o755)
+        database = 'sqlite:///' + str(tmp_path / 'private state.db')
+        unit_path = systemd_unit_path(tmp_path)
+        env_path = systemd_env_path(tmp_path)
+        plist_path = launchd_plist_path(tmp_path)
+        for stub in (unit_path, env_path, plist_path):
+            stub.parent.mkdir(parents=True, exist_ok=True)
+            stub.write_bytes(b'placeholder\n')
+            stub.chmod(0o644)
+        path = write_systemd_unit(
+            tmp_path / 'data', 8080, home=tmp_path, force=True, database=database)
+        text = path.read_text()
+        assert '--database' not in text and database not in text
+        env_line = 'EnvironmentFile=' + str(env_path).replace('%', '%%') + '\n'
+        assert env_line in text
+        assert f'EnvironmentFile="{env_path}"' not in text
+        env_text = env_path.read_text()
+        assert env_text.startswith(_ENV_FILE_MARKER + '\n')
+        assert 'AGENTICML_SERVER_DATABASE_URL=' in env_text and database in env_text
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
+        assert database not in capsys.readouterr().out
+        plist_path = write_launchd_plist(
+            tmp_path / 'data', 8080, home=tmp_path, force=True, database=database)
+        payload = plistlib.loads(plist_path.read_bytes())
+        argv = payload['ProgramArguments']
+        assert '--database' not in argv and database not in argv
+        assert payload['EnvironmentVariables']['AGENTICML_SERVER_DATABASE_URL'] == database
+        assert stat.S_IMODE(plist_path.stat().st_mode) == 0o600
+        assert database not in capsys.readouterr().out
+    finally:
+        os.umask(previous)
 
 
 @pytest.mark.parametrize('stage', ['body', 'commit'])
@@ -586,7 +631,7 @@ def test_discard_cascades_keys_without_deleting_reused_name(tmp_path):
     assert users.get('alice') == replacement and len(keys.list()) == 1
 
 
-def test_import_skips_orphan_keys_and_logs_count(tmp_path, caplog):
+def test_import_skips_orphan_keys_and_logs_count(tmp_path, caplog, monkeypatch):
     from dataclasses import replace
     source = tmp_path / 'source'
     source.mkdir()
@@ -596,7 +641,7 @@ def test_import_skips_orphan_keys_and_logs_count(tmp_path, caplog):
     orphan = replace(key, name='orphan', sha256='a' * 64, prefix='orphaned', user='missing')
     legacy = tmp_path / 'legacy'
     legacy.mkdir()
-    isolate_server_dir(legacy)
+    isolate_server_dir(legacy, monkeypatch)
     (legacy / 'users.json').write_text(json.dumps({'version': 1, 'users': [dict(asdict(r), role='admin' if r.role == 'owner' else r.role) for r in users.list()]}))
     (legacy / 'keys.json').write_text(json.dumps({'version': 2, 'keys': [{k: v for k, v in asdict(key).items() if k not in ('workspace_id', 'account_id')}, {k: v for k, v in asdict(orphan).items() if k not in ('workspace_id', 'account_id')}]}))
     imported = KeyStore(legacy, workspace_id=default_workspace_id(legacy))
@@ -619,7 +664,7 @@ def test_import_does_not_overwrite_existing_2x_archive(tmp_path, caplog):
     assert 'already exists' in caplog.text
 
 
-def test_import_refuses_expensive_scrypt_params(tmp_path):
+def test_import_refuses_expensive_scrypt_params(tmp_path, monkeypatch):
     from agenticml.server.users import _password_record
     source = tmp_path / 'source'
     source.mkdir()
@@ -630,7 +675,7 @@ def test_import_refuses_expensive_scrypt_params(tmp_path):
     record['password'] = hostile
     legacy = tmp_path / 'legacy'
     legacy.mkdir()
-    isolate_server_dir(legacy)
+    isolate_server_dir(legacy, monkeypatch)
     (legacy / 'users.json').write_text(json.dumps({'version': 1, 'users': [record]}))
     with pytest.raises(DatabaseError, match='could not import users.json'):
         UserStore(legacy, workspace_id=default_workspace_id(legacy))

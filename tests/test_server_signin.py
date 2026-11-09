@@ -353,7 +353,7 @@ def test_proxy_identity_trusted_untrusted_unknown_funnel_and_match(tmp_path, mon
             headers={"Tailscale-User-Login": "Alice@Example.com"})
         assert json.loads(body)["user"] == "alice"
 
-    isolate_server_dir((tmp_path / 'alb') / 'server')
+    isolate_server_dir((tmp_path / 'alb') / 'server', monkeypatch)
     with running(tmp_path / "alb", trusted_proxies=("127.0.0.1",),
                  identity_header="alb") as httpd:
         httpd.users.add("alice", role="member", identity="Alice@Example.com")
@@ -366,7 +366,7 @@ def test_proxy_identity_trusted_untrusted_unknown_funnel_and_match(tmp_path, mon
             headers={"X-Amzn-Oidc-Identity": "alice@example.com"})
         assert status == 403
 
-    isolate_server_dir((tmp_path / 'untrusted') / 'server')
+    isolate_server_dir((tmp_path / 'untrusted') / 'server', monkeypatch)
     with running(tmp_path / "untrusted", trusted_proxies=("10.0.0.1",),
                  identity_header="tailscale") as httpd:
         httpd.users.add("alice", role="member", identity="alice@example.com")
@@ -393,7 +393,7 @@ def test_forwarded_throttle_two_clients_and_untrusted_xff(tmp_path, monkeypatch)
         freeze_throttle(httpd)
         # Untrusted peer: X-Forwarded-For ignored. This process is 127.0.0.1,
         # which is trusted, so use a server that does not trust loopback.
-    isolate_server_dir((tmp_path / 'plain') / 'server')
+    isolate_server_dir((tmp_path / 'plain') / 'server', monkeypatch)
     with running(tmp_path / "plain") as httpd:
         freeze_throttle(httpd)
         _, httpd.admin_key = httpd.keys.create("admin", "admin")
@@ -404,7 +404,7 @@ def test_forwarded_throttle_two_clients_and_untrusted_xff(tmp_path, monkeypatch)
         # Same TCP peer, different spoofed address, still one bucket.
         assert login(httpd, wrong, **{"X-Forwarded-For": "10.8.8.8"})[0] == 429
 
-    isolate_server_dir((tmp_path / 'hops') / 'server')
+    isolate_server_dir((tmp_path / 'hops') / 'server', monkeypatch)
     with running(tmp_path / "hops", trusted_proxies=("127.0.0.1", "10.1.0.0/16")) as httpd:
         freeze_throttle(httpd)
         _, httpd.admin_key = httpd.keys.create("admin", "admin")
@@ -422,7 +422,7 @@ def test_forwarded_throttle_two_clients_and_untrusted_xff(tmp_path, monkeypatch)
             assert login(httpd, "bad", **bad)[0] == 401
         assert login(httpd, "bad")[0] == 429
 
-    isolate_server_dir((tmp_path / 'v2') / 'server')
+    isolate_server_dir((tmp_path / 'v2') / 'server', monkeypatch)
     with running(tmp_path / "v2", trusted_proxies=("127.0.0.1",)) as httpd:
         freeze_throttle(httpd)
         _, httpd.admin_key = httpd.keys.create("admin", "admin")
@@ -548,7 +548,7 @@ def test_account_password_rules(tmp_path, monkeypatch):
             json.dumps({"new": "newer-pass12"}).encode(), cookie=cookie)
         assert status == 401
 
-    isolate_server_dir((tmp_path / 'env') / 'server')
+    isolate_server_dir((tmp_path / 'env') / 'server', monkeypatch)
     with running(tmp_path / "env", env_key="e" * 32) as httpd:
         httpd.admin_key = "e" * 32
         status, _, hdrs = login(httpd, "e" * 32)
@@ -695,7 +695,7 @@ def test_reinvite_between_verify_and_session_is_401(tmp_path, monkeypatch):
         assert status == 401 and json.loads(body) == {"error": "invalid user name or password"}
         assert "Set-Cookie" not in hdrs
 
-    isolate_server_dir((tmp_path / 'setup') / 'server')
+    isolate_server_dir((tmp_path / 'setup') / 'server', monkeypatch)
     with running(tmp_path / "setup") as httpd:
         setup_token = httpd.web.setup_token
 
@@ -788,7 +788,7 @@ def test_scrypt_lone_surrogate_is_invalid_password_and_failed_login(tmp_path, mo
     users.set_password("alice", PASSWORD)
     with pytest.raises(ClientError, match="invalid password"):
         users.verify_password("alice", PASSWORD[:-1] + "\ud800")
-    isolate_server_dir(tmp_path / 'data' / 'server')
+    isolate_server_dir(tmp_path / 'data' / 'server', monkeypatch)
     with running(tmp_path / "data") as httpd:
         freeze_throttle(httpd)
         httpd.users.add("alice", role="member")

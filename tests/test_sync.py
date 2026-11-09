@@ -299,7 +299,7 @@ def test_server_backup_recovery(remote, tmp_path):
         writer.close()
 
 
-def test_prune_preserves_remote_and_gc_synced(remote, tmp_path, capsys):
+def test_prune_preserves_remote_and_gc_synced(remote, tmp_path, capsys, monkeypatch):
     writer = writer_at(tmp_path, count=OVERVIEW_MIN_POINTS + 1)
     assert command(remote, writer, writer.run_id, "--prune") == 0
     assert not (writer.run_dir / "scalars/0.bin").exists()
@@ -311,7 +311,7 @@ def test_prune_preserves_remote_and_gc_synced(remote, tmp_path, capsys):
     assert push(remote, writer).complete
     assert remote_bin.read_bytes() == content
     assert "scalars/0.bin" not in remote[0].run_index.as_remote(writer.run_id)["sizes"]
-    isolate_server_dir(tmp_path / "second" / "server")
+    isolate_server_dir(tmp_path / "second" / "server", monkeypatch)
     with running(tmp_path / "second") as server:
         _, key = server.keys.create("box")
         with Client("http://127.0.0.1:%d" % server.server_address[1], key) as client:

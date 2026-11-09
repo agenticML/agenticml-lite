@@ -145,17 +145,17 @@ def postgres_url(base, schema, *, role='agenticml_test', password='agenticml-tes
 _schema_url = None
 
 
-def isolate_server_dir(directory):
+def isolate_server_dir(directory, monkeypatch):
     """Give an independent server directory its own schema in this test.
 
     Select before opening its repositories or starting a subprocess server.
     SQLite already isolates directories and needs no override. Returns the
-    URL now selected on Postgres; None on SQLite.
+    URL now selected on Postgres; None on SQLite. Uses monkeypatch so the
+    env change is undone when the test ends.
     """
-    import os
     if on_postgres():
         url = _schema_url(str(directory.resolve()))
-        os.environ['AGENTICML_SERVER_DATABASE_URL'] = url
+        monkeypatch.setenv('AGENTICML_SERVER_DATABASE_URL', url)
         return url
     return None
 

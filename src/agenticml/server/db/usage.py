@@ -74,3 +74,34 @@ class UsageRepo:
         tx.execute('UPDATE workspace_usage SET stored_bytes=? WHERE workspace_id=?',
                    (size, self.workspace_id))
         return size
+
+    def has_object(self, sha):
+        with self.db.transaction() as tx:
+            return tx.fetchone('SELECT 1 FROM objects WHERE workspace_id=? AND sha256=?',
+                               (self.workspace_id, sha)) is not None
+
+    def people(self, tx=None, *, now=None):
+        if tx is None:
+            with self.db.transaction() as tx:
+                return self.people(tx, now=now)
+        stamp = layout.format_timestamp(now or datetime.now(timezone.utc))
+        return int(tx.fetchone(
+            'SELECT (SELECT COUNT(*) FROM memberships WHERE workspace_id=?) + '
+            '(SELECT COUNT(*) FROM invites i LEFT JOIN accounts a ON a.login=i.login '
+            'LEFT JOIN memberships m ON m.account_id=a.id AND m.workspace_id=i.workspace_id '
+            'WHERE i.workspace_id=? AND i.expires_at>? AND m.account_id IS NULL)',
+            (self.workspace_id, self.workspace_id, stamp))[0])
+
+    def count_request(self, minute):
+        import sqlite3
+        sql = ('INSERT INTO workspace_usage (workspace_id, request_minute, request_count) '
+               'VALUES (?, ?, 1) ON CONFLICT (workspace_id) DO UPDATE SET '
+               'request_count=CASE WHEN workspace_usage.request_minute=excluded.request_minute '
+               'THEN workspace_usage.request_count+1 ELSE 1 END, '
+               'request_minute=excluded.request_minute')
+        with self.db.transaction(write=True) as tx:
+            if self.db.dialect.name != 'sqlite' or sqlite3.sqlite_version_info >= (3, 35, 0):
+                return int(tx.fetchone(sql + ' RETURNING request_count', (self.workspace_id, minute))[0])
+            tx.execute(sql, (self.workspace_id, minute))
+            return int(tx.fetchone('SELECT request_count FROM workspace_usage WHERE workspace_id=?',
+                                   (self.workspace_id,))[0])

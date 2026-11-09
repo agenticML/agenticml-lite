@@ -9,6 +9,27 @@ from .errors import DatabaseBusy, DatabaseError
 from .sqlite import Tx
 
 logger = logging.getLogger(__name__)
+_DEFAULT_CONNECT_TIMEOUT = '10'
+
+
+def _conninfo_with_timeout(url):
+    """Add connect_timeout=10 unless the URL already sets one. Never logs the URL."""
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+    params = conninfo_to_dict(url)
+    if 'connect_timeout' not in params:
+        params['connect_timeout'] = _DEFAULT_CONNECT_TIMEOUT
+    return make_conninfo(**params)
+
+
+def _raise_plain(exc):
+    """Raise ``exc`` with neither ``__cause__`` nor ``__context__`` (no driver message)."""
+    try:
+        raise exc
+    except type(exc) as mapped:
+        mapped.__cause__ = None
+        mapped.__context__ = None
+        mapped.__suppress_context__ = True
+        raise mapped
 
 
 class Row:
@@ -84,8 +105,9 @@ class PostgresDatabase:
     def _new_connection(self):
         connection = None
         try:
-            connection = self._psycopg.connect(self._url, autocommit=True,
-                                                row_factory=_row_factory)
+            connection = self._psycopg.connect(
+                _conninfo_with_timeout(self._url), autocommit=True,
+                row_factory=_row_factory)
             for setting in ("lock_timeout = '5s'", "statement_timeout = '60s'",
                             "idle_in_transaction_session_timeout = '60s'",
                             "TIME ZONE 'UTC'", "application_name = 'agenticml-server'"):
@@ -93,12 +115,13 @@ class PostgresDatabase:
         except self._psycopg.Error:
             if connection is not None:
                 self._close_connection(connection)
-            raise DatabaseError('could not connect to Postgres') from None
         except BaseException:
             if connection is not None:
                 self._close_connection(connection)
             raise
-        return connection
+        else:
+            return connection
+        _raise_plain(DatabaseError('could not connect to Postgres'))
 
     @staticmethod
     def _connection_error(exc):
@@ -114,10 +137,13 @@ class PostgresDatabase:
             raise DatabaseError("Postgres needs the [postgres] extra: pip install "
                                 "'agenticml-lite[postgres]'") from None
         try:
-            with psycopg.connect(url, autocommit=True) as connection:
-                return connection.execute("SELECT to_regclass('schema_migrations')").fetchone()[0] is not None
+            with psycopg.connect(_conninfo_with_timeout(url), autocommit=True) as connection:
+                found = connection.execute("SELECT to_regclass('schema_migrations')").fetchone()[0] is not None
         except psycopg.Error:
-            raise DatabaseError('could not connect to Postgres') from None
+            pass
+        else:
+            return found
+        _raise_plain(DatabaseError('could not connect to Postgres'))
 
     @contextmanager
     def transaction(self, write=False):
@@ -126,6 +152,7 @@ class PostgresDatabase:
         self._local.active = True
         connection = None
         discard = False
+        mapped = None
         try:
             while True:
                 with self._lock:
@@ -171,9 +198,11 @@ class PostgresDatabase:
                     discard = True
             if isinstance(exc, self._psycopg.Error):
                 if exc.sqlstate in ('55P03', '40P01', '40001'):
-                    raise DatabaseBusy('database is locked') from None
-                raise DatabaseError('could not read or write database') from None
-            raise
+                    mapped = DatabaseBusy('database is locked')
+                else:
+                    mapped = DatabaseError('could not read or write database')
+            else:
+                raise
         finally:
             self._local.active = False
             if connection is not None:
@@ -187,6 +216,8 @@ class PostgresDatabase:
                         self._idle.append(connection)
                 if discard:
                     self._close_connection(connection)
+        if mapped is not None:
+            _raise_plain(mapped)
 
     def _close_connection(self, connection):
         try:

@@ -202,7 +202,7 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 18b.1 | Token verification, account linking, `/auth/firebase`, invites, CLI, extras | 18 | Cursor | M | [plan](packages/18b-firebase-sign-in.md) | done (3.0 PR) |
 | 18b.2 | Sign-in page with the vendored Firebase SDK, per-page CSP, UI tests | 18b.1 | Cursor | S | [plan](packages/18b-firebase-sign-in.md) | done (3.0 PR) |
 | 18c † | Self-serve sign-up and usage limits (free plan: storage, uploads, requests, people) | 18b | Codex | M | [plan](packages/18c-signup-and-limits.md) | in progress |
-| 18c.1 | Limits core: usage counters, limits file, storage/upload/request/people checks, CLI | 18b | Codex | M | [plan](packages/18c-signup-and-limits.md) | in progress (18c.1a usage accounting done; 18c.1b limit checks next) |
+| 18c.1 | Limits core: usage counters, limits file, storage/upload/request/people checks, CLI | 18b | Codex, Cursor | M | [plan](packages/18c-signup-and-limits.md) | done (3.0 PR) |
 | 18c.2 | Sign-up with a personal workspace, new workspace, free-workspace limit | 18c.1 | Codex | S | [plan](packages/18c-signup-and-limits.md) | plan ready |
 | 18c.3 | Usage page and banner, admin plan edit, `sync --follow` retry | 18c.2 | Codex | S | [plan](packages/18c-signup-and-limits.md) | plan ready |
 | 19 † | Postgres backend, row-level security, CI on both backends | 18 | Codex, Cursor | M | [plan](packages/19-postgres.md) | in progress |
@@ -277,33 +277,15 @@ Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
-- **Database password in `server up --install` files and argv** (package
-  19.1 second review, Nov 8, 2026). Fix before release.
-  - Where: `src/agenticml/server/up.py` (systemd ExecStart, launchd
-    ProgramArguments, `_atomic_write` mode 0644).
-  - Problem: `--database <URL>` is written into the unit or plist (mode
-    0644) and passed on the command line, so a Postgres password is readable
-    by other local users and visible in `ps`.
-  - Fix: write `AGENTICML_SERVER_DATABASE_URL` to a 0600 EnvironmentFile
-    (systemd) or the plist's EnvironmentVariables (launchd, plist 0600);
-    never put the URL in argv; write unit files 0600. Partial work was saved
-    in the worktree's git directory (`wip-saves/`).
-  - Done when: a test shows the URL is in neither the unit/plist body nor
-    argv, the env file and plist are 0600, and the server still starts.
-- **Other package 19.1 second-review follow-ups** (Nov 8, 2026).
-  - Where: `tests/server_db_helpers.py` `isolate_server_dir`,
-    `tests/conftest.py`, `src/agenticml/server/db/postgres.py`,
-    `src/agenticml/server/db/__init__.py`.
-  - Problem: `isolate_server_dir` writes `os.environ` directly and an
-    inherited `AGENTICML_SERVER_DATABASE_URL` can point SQLite test runs at
-    Postgres; Postgres connects have no default `connect_timeout`, and the
-    registry lock is held across network I/O; driver exceptions stay in
-    `__context__`; advisory lock keys are database-wide (parallel test
-    schemas share them); total connections are not capped.
-  - Fix: monkeypatch-based isolation and `delenv` in conftest; default
-    `connect_timeout=10`; open outside the registry lock; raise the
-    constant error outside the `except`; consider salting keys per schema
-    and a connection cap.
+- **Remaining package 19.1 second-review notes** (Nov 9, 2026; the
+  password, test-isolation, connect-timeout and exception-chain items were
+  fixed in the 3.0 PR).
+  - Where: `src/agenticml/server/db/__init__.py`, `db/postgres.py`.
+  - Problem: the registry lock is held across Postgres network I/O; advisory
+    lock keys are database-wide (parallel test schemas share them); total
+    connections are not capped (only idle ones).
+  - Fix: open outside the registry lock; consider salting keys per schema
+    and a connection cap. Revisit in package 20.
   - Done when: each has a test or a recorded decision.
 - **Check Firebase sign-in against the real Firebase project** (package 18b
   caveat, Nov 8, 2026).

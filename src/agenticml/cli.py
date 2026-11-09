@@ -521,6 +521,10 @@ def cmd_server_serve(args):
     if args.database is not None:
         extra["database"] = args.database
     try:
+        from .server.limits import Plans
+        limits_file = args.limits or os.environ.get("AGENTICML_SERVER_LIMITS")
+        if limits_file:
+            extra["plans"] = Plans.load(limits_file)
         firebase = _firebase_from_args(args)
         if firebase is not None:
             extra["firebase"] = firebase
@@ -783,6 +787,58 @@ def cmd_server_workspaces(args):
             else:
                 fields = ('slug', 'name', 'status', 'members', 'created_at')
                 _print_table([list(fields)] + [[str(r[k]) for k in fields] for r in rows])
+        elif action == 'usage':
+            from .server.limits import Plans
+            from .server.db.usage import UsageRepo, utc_day
+            limits_file = args.limits or os.environ.get('AGENTICML_SERVER_LIMITS')
+            plans = Plans.load(limits_file) if limits_file else None
+            rows = []
+            for workspace in repo.list():
+                usage = UsageRepo(db, workspace['id'])
+                counters = usage.get()
+                limits = (plans.limits_for(workspace) if plans else
+                          json.loads(workspace['custom_limits']) if workspace['plan'] == 'custom' else None)
+                rows.append({'slug': workspace['slug'], 'plan': workspace['plan'],
+                             'stored_bytes': counters['stored_bytes'], 'limits': limits,
+                             'upload_bytes': counters['upload_bytes'] if counters['upload_day'] and counters['upload_day'] >= utc_day() else 0,
+                             'people': usage.people()})
+            rows.sort(key=lambda row: (-row['stored_bytes'], row['slug']))
+            if args.json:
+                print(json.dumps(rows))
+            else:
+                def maximum(value):
+                    return 'unlimited' if value is None else str(value)
+                fields = ('slug', 'plan', 'storage used/limit (bytes)', 'uploads today (bytes)', 'people')
+                _print_table([list(fields)] + [[row['slug'], row['plan'],
+                    str(row['stored_bytes']) + '/' + (maximum(row['limits']['storage_bytes']) if row['limits'] is not None else 'no limits file'),
+                    str(row['upload_bytes']), str(row['people'])] for row in rows])
+        elif action == 'set-plan':
+            from .server.limits import Plans, UNLIMITED, parse_size, parse_count
+            raw = (args.storage, args.uploads_per_day, args.requests_per_minute, args.people)
+            if args.plan == 'free' and any(value is not None for value in raw):
+                raise ValueError('free plan cannot have custom limits')
+            current = repo.require(args.slug)
+            custom = None
+            if args.plan == 'custom':
+                limits_file = args.limits or os.environ.get('AGENTICML_SERVER_LIMITS')
+                if current['plan'] == 'custom':
+                    custom = json.loads(current['custom_limits'])
+                elif limits_file:
+                    custom = dict(Plans.load(limits_file).free)
+                else:
+                    if all(value is None for value in raw):
+                        raise ValueError('custom plan requires at least one limit flag without a limits file')
+                    custom = dict(UNLIMITED)
+                keys = ('storage_bytes', 'upload_bytes_per_day', 'requests_per_minute', 'people')
+                for key, value, parse in zip(keys, raw, (parse_size, parse_size, parse_count, parse_count)):
+                    if value is not None:
+                        custom[key] = parse(value)
+            old, new = repo.set_plan(args.slug, args.plan, custom if args.plan == 'custom' else None)
+            def plan_values(row):
+                return {'plan': row['plan'], 'limits': json.loads(row['custom_limits']) if row['custom_limits'] else None}
+            log.record(actor, 'cli', 'workspace.plan', new['id'],
+                       detail={'slug': new['slug'], 'old': plan_values(old), 'new': plan_values(new)})
+            print(json.dumps(plan_values(new)))
         elif action == 'create':
             owner = args.owner
             if owner is None:
@@ -1525,6 +1581,7 @@ def main(argv=None):
                         help="Firebase web API key (default: AGENTICML_SERVER_FIREBASE_API_KEY)")
     p_serve.add_argument("--firebase-auth-domain", default=None, metavar="HOST",
                         help="Firebase auth domain (default: AGENTICML_SERVER_FIREBASE_AUTH_DOMAIN or <project>.firebaseapp.com)")
+    p_serve.add_argument("--limits", default=None, metavar="FILE", help="Workspace limits JSON (default: AGENTICML_SERVER_LIMITS)")
     p_serve.set_defaults(func=cmd_server_serve)
     p_up = server_sub.add_parser("up", help="Serve on loopback through Tailscale Funnel")
     p_up.add_argument("--data", default=None, help="Data directory (default: AGENTICML_SERVER_DATA or ~/.agenticml-server)")
@@ -1554,12 +1611,15 @@ def main(argv=None):
     p_reindex.set_defaults(func=cmd_server_reindex)
     p_workspaces = server_sub.add_parser('workspaces', help='Manage server workspaces')
     ws_sub = p_workspaces.add_subparsers(dest='workspaces_action', required=True)
-    for action in ('list', 'create', 'rename', 'suspend', 'resume', 'delete', 'set-owner', 'recount'):
+    for action in ('list', 'create', 'rename', 'suspend', 'resume', 'delete', 'set-owner', 'recount', 'usage', 'set-plan'):
         child = ws_sub.add_parser(action)
         child.add_argument('--data', default=None)
         child.add_argument('--database', default=None, metavar='URL')
         child.set_defaults(func=cmd_server_workspaces)
-        if action == 'list':
+        if action in ('list', 'usage'):
+            if action == 'usage':
+                child.add_argument('--limits', default=None, metavar='FILE',
+                                   help='Workspace limits JSON (default: AGENTICML_SERVER_LIMITS)')
             child.add_argument('--json', action='store_true')
             continue
         if action == 'recount':
@@ -1567,7 +1627,15 @@ def main(argv=None):
             child.add_argument('--all', action='store_true')
             continue
         child.add_argument('slug')
-        if action == 'create':
+        if action == 'set-plan':
+            child.add_argument('--limits', default=None, metavar='FILE',
+                               help='Base free plan limits JSON (default: AGENTICML_SERVER_LIMITS)')
+            child.add_argument('plan', choices=('free', 'custom'))
+            child.add_argument('--storage', default=None)
+            child.add_argument('--uploads-per-day', default=None)
+            child.add_argument('--requests-per-minute', default=None)
+            child.add_argument('--people', default=None)
+        elif action == 'create':
             child.add_argument('--name', default=None)
             child.add_argument('--owner', default=None)
         elif action == 'rename':
