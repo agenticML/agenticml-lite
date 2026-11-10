@@ -35,9 +35,10 @@ anything against AWS (billed resources, public endpoint).
 | 0.3 | Check for an existing GitHub OIDC provider (agenticml-server may have one): `aws iam list-open-id-connect-providers` | ARN noted, or "none" |
 | 0.4 | Set an AWS Budgets alert (for example $150/month) | Budget email confirmed |
 
-## Phase 1: CloudFormation code (agents, package 24.4)
+## Phase 1: CloudFormation code (agents)
 
-The detailed plan is [packages/24.4-cloudformation.md](packages/24.4-cloudformation.md).
+Replaces the Terraform half of package 24.2. Needs its own package plan in
+`docs/plans/packages/` before any coding starts.
 
 | # | Step | Done when |
 | --- | --- | --- |
