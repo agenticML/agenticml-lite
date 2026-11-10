@@ -217,11 +217,13 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 24 | AWS hosted deployment (Dockerfile, Terraform, deploy workflow, runbook, real-EFS benchmark) | 18c, 19, 20, 21 | Codex, Sonnet; owner runs it | M | [plan](packages/24-aws-deployment.md) | done (code, 3.0 PR; owner checks in Backlog) |
 | 24.1 | Image: Dockerfile, entrypoint, limits file, local hosted smoke test | 21 | Codex, Sonnet | S | [plan](packages/24-aws-deployment.md) | done (3.0 PR) |
 | 24.2 | Terraform, deploy workflow, `deploy-check` CI job, runbook | 24.1 | Codex, Sonnet | M | [plan](packages/24-aws-deployment.md) | done (3.0 PR; `terraform validate` runs in CI) |
-| 24.3 | Apply, first deploy, restore drill, real-EFS benchmark, exit criterion 6 | 24.2 | Owner | S | [plan](packages/24-aws-deployment.md) | not started (Backlog) |
+| 24.3 | Apply, first deploy, restore drill, real-EFS benchmark, exit criterion 6 | 24.2 | Owner | S | [AWS roadmap](aws-deployment-roadmap.md) | not started (Backlog) |
 | 25 | Docs, threat model, version 3.0.0 | 16–24 | Sonnet (Codex at limit); prose Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR; tag and PyPI release by the owner) |
 | 25.1 | Client support window (426), version 3.0.0, base-install smoke, 2.2 client check | 16–24 | Sonnet (Codex at limit) | S | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
 | 25.2 | SERVER.md, HOSTED.md, threat model, PROTOCOL.md, README, website, SECURITY.md | 25.1 | Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
 | 26 | Retire agenticml-server | 24 live | Owner | S | – | not started |
+
+Getting the hosted service live on AWS, step by step: [AWS deployment roadmap](aws-deployment-roadmap.md).
 
 - **16–17** move everything the server keeps outside run files into tables
   behind one repository layer, with SQLite (standard library) as the
