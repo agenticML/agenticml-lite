@@ -224,6 +224,8 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 25.2 | SERVER.md, HOSTED.md, threat model, PROTOCOL.md, README, website, SECURITY.md | 25.1 | Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
 | 26 | Retire agenticml-server | 24 live | Owner | S | – | not started |
 
+Getting the hosted service live on AWS, step by step: [AWS deployment roadmap](aws-deployment-roadmap.md).
+
 - **16–17** move everything the server keeps outside run files into tables
   behind one repository layer, with SQLite (standard library) as the
   self-hosted backend. The database records how many bytes of each run file
