@@ -214,10 +214,11 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 21 | S3 object backend | 18 | Codex, Sonnet | M | [plan](packages/21-s3-objects.md) | done (3.0 PR; real S3 in Backlog) |
 | 22 | Metric summaries; sort and filter runs by metric | 17, 18 | Cursor | M | [plan](packages/22-metric-summaries.md) | done (3.0 PR) |
 | 23 | Operator commands: end-to-end 2.x conversion test (the import itself landed in 16–18), `server backup`, `status`/`verify` on the database | 18, 21, 22 | Sonnet (Codex at limit) | S–M | [plan](packages/23-operator-commands.md) | done (3.0 PR) |
-| 24 | AWS hosted deployment (Dockerfile, Terraform, deploy workflow, runbook, real-EFS benchmark) | 18c, 19, 20, 21 | Codex, Sonnet; owner runs it | M | [plan](packages/24-aws-deployment.md) | done (code, 3.0 PR; owner checks in Backlog) |
+| 24 | AWS hosted deployment (Dockerfile, CloudFormation, deploy workflow, runbook, real-EFS benchmark) | 18c, 19, 20, 21 | Codex, Sonnet; owner runs it | M | [plan](packages/24-aws-deployment.md) | done (code, 3.0 PR; owner checks in Backlog) |
 | 24.1 | Image: Dockerfile, entrypoint, limits file, local hosted smoke test | 21 | Codex, Sonnet | S | [plan](packages/24-aws-deployment.md) | done (3.0 PR) |
-| 24.2 | Terraform, deploy workflow, `deploy-check` CI job, runbook | 24.1 | Codex, Sonnet | M | [plan](packages/24-aws-deployment.md) | done (3.0 PR; `terraform validate` runs in CI) |
-| 24.3 | Apply, first deploy, restore drill, real-EFS benchmark, exit criterion 6 | 24.2 | Owner | S | [plan](packages/24-aws-deployment.md) | not started (Backlog) |
+| 24.2 | Terraform, deploy workflow, `deploy-check` CI job, runbook | 24.1 | Codex, Sonnet | M | [plan](packages/24-aws-deployment.md) | done (3.0 PR; superseded by 24.4 CloudFormation checks) |
+| 24.3 | First deploy, restore drill, real-EFS benchmark, exit criterion 6 | 24.4 | Owner | S | [plan](packages/24-aws-deployment.md) | not started (Backlog; CloudFormation runbook in `deploy/aws/README.md`) |
+| 24.4 † | CloudFormation replaces Terraform (bootstrap + hosted stacks, us-east-2, no NAT, deploy workflow updates the stack) | 24.2 | Codex; second review Cursor | M | [plan](packages/24.4-cloudformation.md) | in review (implementation and static checks; independent reviews and docs pending) |
 | 25 | Docs, threat model, version 3.0.0 | 16–24 | Sonnet (Codex at limit); prose Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR; tag and PyPI release by the owner) |
 | 25.1 | Client support window (426), version 3.0.0, base-install smoke, 2.2 client check | 16–24 | Sonnet (Codex at limit) | S | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
 | 25.2 | SERVER.md, HOSTED.md, threat model, PROTOCOL.md, README, website, SECURITY.md | 25.1 | Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
@@ -284,21 +285,32 @@ Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
+- **CloudFormation independent reviews and runbook handoff** (package 24.4).
+  - Where: `deploy/aws/cloudformation/`, `.github/workflows/deploy.yml`,
+    `deploy/aws/README.md`, `docs/HOSTED.md`.
+  - Problem: implementation has offline checks, but the required Sonnet and
+    Cursor read-only reviews and the separately assigned docs rewrite remain.
+  - Fix: review the templates/workflow and reported deviations, then write the
+    CloudFormation runbook from the implementation report's Runbook facts.
+  - Done when: both independent reviews are clean, docs match the templates,
+    and the supervisor marks 24.4 done. No agent AWS calls.
 - **Hosted launch and rolling-upload verification** (package 24.3, owner).
   - Where: `deploy/aws/README.md`, sections Prerequisites through Upgrades.
   - Problem: the infrastructure and deployment code have not run in our AWS
     account; exit criterion 6 needs a real deployment.
-  - Fix: owner reviews Terraform and action pins, applies with zero tasks,
-    pushes the private SHA image, dispatches the protected hosted workflow,
-    scales to two tasks, configures Firebase, and creates two customer
+  - Fix: owner follows the CloudFormation runbook in `deploy/aws/README.md`,
+    reviews templates and action pins, creates the bootstrap stack, and
+    dispatches the protected hosted workflow (pushes the SHA image before
+    creating the hosted stack with two tasks). Configure Firebase later
+    through environment variables and create two customer
     workspaces with admin/member accounts and workspace-bound sync keys.
     Sync through both tasks and roll while uploading; verify acknowledged
     sizes/hashes and dashboard parity, membership isolation, and client retry.
   - Done when: `app.agenticml.xyz` serves both workspaces and evidence shows
-    a rolling deployment loses no uploads; record apply/deploy revisions and
+    a rolling deployment loses no uploads; record stack/deploy revisions and
     sign-in, isolation and upload results. Owner only; no agent AWS calls.
 - **Hosted backup restore drill** (package 24.3, owner).
-  - Where: `deploy/aws/README.md`, Restore drill.
+  - Where: `deploy/aws/README.md`, CloudFormation restore drill.
   - Problem: configured backups have not been restored; exit criterion 6
     requires one real restore.
   - Fix: restore RDS PITR to a new private instance, EFS from AWS Backup to
@@ -316,7 +328,7 @@ priority.
     test falls back to commit `bd0d499` until it exists.
   - Fix: after merging, tag `v2.2.0` at `bd0d499` and `v3.0.0` at the
     merge, publish 3.0.0 to PyPI (`publish.yml`), and publish the three
-    policies before setting `open_signup = true` in Terraform.
+    policies before setting `HOSTED_OPEN_SIGNUP=true` in the GitHub `hosted` environment.
   - Done when: `pip install agenticml-lite==3.0.0` works and the policies
     are linked from the sign-in page.
 - **Metric picker polish** (package 22 review, Nov 9, 2026).
@@ -333,14 +345,15 @@ priority.
     without a reload, with a test.
 - **Stand up the hosted service on AWS (package 24.3, owner)** (Nov 9,
   2026).
-  - Where: `deploy/aws/` (Terraform, `README.md` runbook),
+  - Where: `deploy/aws/` (CloudFormation templates, `README.md` runbook),
     `.github/workflows/deploy.yml`.
   - Problem: agents wrote and statically checked the stack (image build,
     `scripts/hosted_smoke.sh` against local Postgres and moto,
-    `terraform fmt`, `terraform validate` in CI) but never ran it in AWS:
+    `cfn-lint` in CI) but never ran it in AWS:
     creating billed resources and a public endpoint is the owner's call.
-  - Fix: follow `deploy/aws/README.md`: state bucket, `terraform apply`,
-    GitHub environment `hosted` with `AWS_DEPLOY_ROLE_ARN`, first deploy,
+  - Fix: follow the CloudFormation runbook in `deploy/aws/README.md`: bootstrap
+    stack with the zone ID and optional existing OIDC provider, GitHub
+    environment `hosted` with the bootstrap role outputs, first workflow deploy,
     first server admin, two customer workspaces, a rolling deploy during a
     sync, an RDS + EFS restore drill, and the real-EFS benchmark (replaces
     the "Run the server benchmark on real EFS" entry below).
