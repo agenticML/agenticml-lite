@@ -19,16 +19,18 @@ Decisions (owner, Nov 10, 2026):
   invite links.
 - **DNS stays at Namecheap** (no Route 53). The owner adds the certificate
   validation CNAME once and a CNAME `app` → the load balancer.
-- **Cost alerts:** a $50 monthly budget and an email for every $10 spent,
+- **Cost alerts:** a $100 monthly budget and an email for every $10 spent,
   with a per-service breakdown, to two addresses (given only when the
   bootstrap stack is deployed, never committed). Ops alarms go to the same
   addresses.
 
-Estimated cost: about **$89/month**. That is ALB ~$20, two Fargate tasks
-~$36, RDS `db.t4g.small` ~$25 plus storage, two task IPv4 addresses ~$7,
-cost alerts ~$0.60, plus EFS and S3 by usage. Data transfer, backups and
-logs are extra. This is above the $50 budget, so the budget alert will fire
-each month at this size.
+Estimated cost: about **$100–110/month**: two Fargate tasks ~$36, RDS
+`db.t4g.small` with 20 GB ~$26, ALB ~$18–22, public IPv4 for the two tasks
+~$7 and for the ALB ~$7, Container Insights, logs and alarms ~$5–8,
+backups, EFS, S3 and ECR ~$3–9, Secrets Manager $0.40, cost alerts ~$0.60.
+Data transfer under 100 GB/month is free. Savings to revisit after launch:
+one task (~$22), no Container Insights (~$5), ARM image (~$7),
+`db.t4g.micro` (~$12).
 
 Who does what: **agents** write and check code; only the **owner** runs
 anything against AWS (billed resources, public endpoint).
