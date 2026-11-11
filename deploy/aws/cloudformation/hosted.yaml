@@ -1,0 +1,945 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  AgenticML hosted service, stack 2 of 2. Created and updated only by the
+  deploy workflow, through the role from the bootstrap stack: network, load
+  balancer, ECS service, database, file system, buckets, backups and alarms.
+
+Parameters:
+  ImageTag:
+    Type: String
+    AllowedPattern: ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$
+    Description: Tag of the image in the bootstrap stack's repository (the commit SHA).
+  Hostname:
+    Type: String
+    Default: app.agenticml.xyz
+    AllowedPattern: ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$
+    Description: Must match the bootstrap stack's certificate.
+  DesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 0
+  MultiAZ:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: RDS Multi-AZ.
+  FirebaseProject:
+    Type: String
+    Default: ""
+    Description: Firebase project ID; empty leaves Firebase sign-in off.
+  FirebaseApiKey:
+    Type: String
+    Default: ""
+    Description: Public Firebase web API key; not a secret.
+  OpenSignup:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Enable only after the owner verified Firebase and the free limits.
+  VpcCidr:
+    Type: String
+    Default: 10.42.0.0/16
+    AllowedPattern: ^(\d{1,3}\.){2}0\.0/16$
+    Description: Dedicated /16; proxy trust is limited to the load balancer subnets.
+
+Rules:
+  OpenSignupNeedsFirebase:
+    RuleCondition: !Equals [!Ref OpenSignup, "true"]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref FirebaseProject, ""]]
+        AssertDescription: OpenSignup=true needs a non-empty FirebaseProject.
+  SupportedRegion:
+    Assertions:
+      - Assert: !Contains [[us-east-2], !Ref AWS::Region]
+        AssertDescription: This template supports us-east-2 only (see the ElbAccount mapping).
+
+Mappings:
+  # ELB account that writes access logs, per region:
+  # https://docs.aws.amazon.com/elasticloadbalancing/latest/application/enable-access-logging.html
+  ElbAccount:
+    us-east-2:
+      Id: "033677994240"
+
+Conditions:
+  HasFirebase: !Not [!Equals [!Ref FirebaseProject, ""]]
+  HasTasks: !Not [!Equals [!Ref DesiredCount, 0]]
+
+Resources:
+  # ---- Network ----------------------------------------------------------
+  # ALB subnets are public, task subnets reach the internet through the
+  # gateway with a public IPv4 address (no NAT), data subnets have no
+  # internet route. Subnet i is the /24 numbered i inside VpcCidr.
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+
+  VpcIpv6:
+    Type: AWS::EC2::VPCCidrBlock
+    Properties:
+      VpcId: !Ref Vpc
+      AmazonProvidedIpv6CidrBlock: true
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  AlbSubnetA:
+    Type: AWS::EC2::Subnet
+    DependsOn: VpcIpv6
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 32, 8]]
+      Ipv6CidrBlock: !Select [0, !Cidr [!Select [0, !GetAtt Vpc.Ipv6CidrBlocks], 2, 64]]
+  AlbSubnetB:
+    Type: AWS::EC2::Subnet
+    DependsOn: VpcIpv6
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 32, 8]]
+      Ipv6CidrBlock: !Select [1, !Cidr [!Select [0, !GetAtt Vpc.Ipv6CidrBlocks], 2, 64]]
+  DataSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [10, !Cidr [!Ref VpcCidr, 32, 8]]
+  DataSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [11, !Cidr [!Ref VpcCidr, 32, 8]]
+  TaskSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [20, !Cidr [!Ref VpcCidr, 32, 8]]
+  TaskSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [21, !Cidr [!Ref VpcCidr, 32, 8]]
+
+  AlbRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+  AlbRouteIpv4:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref AlbRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  AlbRouteIpv6:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref AlbRouteTable
+      DestinationIpv6CidrBlock: ::/0
+      GatewayId: !Ref InternetGateway
+  AlbSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AlbSubnetA
+      RouteTableId: !Ref AlbRouteTable
+  AlbSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AlbSubnetB
+      RouteTableId: !Ref AlbRouteTable
+
+  TaskRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+  TaskRouteIpv4:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref TaskRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  TaskSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref TaskSubnetA
+      RouteTableId: !Ref TaskRouteTable
+  TaskSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref TaskSubnetB
+      RouteTableId: !Ref TaskRouteTable
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref TaskRouteTable]
+
+  DataRouteTable: # local routes only
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+  DataSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DataSubnetA
+      RouteTableId: !Ref DataRouteTable
+  DataSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DataSubnetB
+      RouteTableId: !Ref DataRouteTable
+
+  # Changing a security group's GroupDescription replaces it, and the fixed
+  # name would then collide: leave the descriptions alone.
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: agenticml-hosted-alb
+      GroupDescription: Load balancer
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0}
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIpv6: "::/0"}
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIpv6: "::/0"}
+      SecurityGroupEgress:
+        - {IpProtocol: tcp, FromPort: 8080, ToPort: 8080, DestinationSecurityGroupId: !Ref TaskSecurityGroup}
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: agenticml-hosted-task
+      GroupDescription: Service tasks
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - {IpProtocol: "-1", CidrIp: 0.0.0.0/0}
+  # Separate resource: the load balancer group already points at this one.
+  TaskIngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref TaskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+  # The placeholder egress rule (ICMP to loopback, matches nothing) replaces
+  # the default allow-all egress.
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: agenticml-hosted-rds
+      GroupDescription: Database
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref TaskSecurityGroup}
+      SecurityGroupEgress:
+        - {IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 127.0.0.1/32}
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: agenticml-hosted-efs
+      GroupDescription: File system
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 2049, ToPort: 2049, SourceSecurityGroupId: !Ref TaskSecurityGroup}
+      SecurityGroupEgress:
+        - {IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 127.0.0.1/32}
+
+  # ---- Buckets ----------------------------------------------------------
+  # No BucketName: CloudFormation names them agenticml-hosted-<id>-<random>
+  # (the CloudFormation role's S3 permissions rely on that prefix), and a
+  # retry after a failed create does not collide with the retained buckets.
+  ObjectsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: old-versions-and-incomplete-uploads
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-logs
+            Status: Enabled
+            ExpirationInDays: 90
+
+  ObjectsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ObjectsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt ObjectsBucket.Arn
+              - !Sub ${ObjectsBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  LogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LogsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowAlbLogDelivery
+            Effect: Allow
+            Principal:
+              AWS: !Sub
+                - arn:${AWS::Partition}:iam::${ElbAccountId}:root
+                - ElbAccountId: !FindInMap [ElbAccount, !Ref "AWS::Region", Id]
+            Action: s3:PutObject
+            Resource: !Sub ${LogsBucket.Arn}/alb/AWSLogs/${AWS::AccountId}/*
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt LogsBucket.Arn
+              - !Sub ${LogsBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ---- Database ---------------------------------------------------------
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: agenticml-hosted
+      DBSubnetGroupDescription: Data subnets
+      SubnetIds: [!Ref DataSubnetA, !Ref DataSubnetB]
+
+  DbParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: Postgres 16, TLS only
+      Family: postgres16
+      Parameters:
+        rds.force_ssl: "1"
+
+  # The master password lives in an RDS-managed secret (MasterUserSecret).
+  # Deletion protection stays on, so deleting this stack needs it switched
+  # off first; a final snapshot is taken either way.
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Metadata:
+      cfn-lint:
+        config:
+          # The major-only version "16" makes RDS pick
+          # its current default minor; cfn-lint's list flags the bare major.
+          ignore_checks: [W3691]
+    Properties:
+      DBInstanceIdentifier: agenticml-hosted
+      Engine: postgres
+      EngineVersion: "16"
+      DBInstanceClass: db.t4g.small
+      DBName: agenticml
+      MasterUsername: agenticml
+      ManageMasterUserPassword: true
+      MultiAZ: !Ref MultiAZ
+      AllocatedStorage: "20"
+      MaxAllocatedStorage: 100
+      StorageType: gp3
+      StorageEncrypted: true
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref RdsSecurityGroup]
+      DBParameterGroupName: !Ref DbParameterGroup
+      BackupRetentionPeriod: 7
+      DeletionProtection: true
+      EnablePerformanceInsights: false
+      CopyTagsToSnapshot: true
+      AutoMinorVersionUpgrade: true
+
+  # ---- File system ------------------------------------------------------
+  # The policy is a property of the file system, which the access point
+  # depends on, so it cannot name the access point or the file system:
+  # the access-point conditions match any access point in this account and
+  # region, and Resource is left out (EFS applies the policy to this file
+  # system). Only the task role is allowed, and it holds no
+  # elasticfilesystem:CreateAccessPoint.
+  FileSystem:
+    Type: AWS::EFS::FileSystem
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: elastic
+      FileSystemPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowTaskRoleViaAccessPoint
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt TaskRole.Arn
+            Action:
+              - elasticfilesystem:ClientMount
+              - elasticfilesystem:ClientWrite
+            Condition:
+              Bool:
+                aws:SecureTransport: "true"
+              ArnLike:
+                elasticfilesystem:AccessPointArn: !Sub arn:${AWS::Partition}:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:access-point/*
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: elasticfilesystem:Client*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+          - Sid: DenyOutsideAccessPoint
+            Effect: Deny
+            Principal: "*"
+            Action: elasticfilesystem:Client*
+            Condition:
+              ArnNotLike:
+                elasticfilesystem:AccessPointArn: !Sub arn:${AWS::Partition}:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:access-point/*
+
+  MountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Ref DataSubnetA
+      SecurityGroups: [!Ref EfsSecurityGroup]
+  MountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Ref DataSubnetB
+      SecurityGroups: [!Ref EfsSecurityGroup]
+
+  AccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref FileSystem
+      PosixUser:
+        Uid: "10001"
+        Gid: "10001"
+      RootDirectory:
+        Path: /agenticml
+        CreationInfo:
+          OwnerUid: "10001"
+          OwnerGid: "10001"
+          Permissions: "0700"
+
+  # ---- IAM --------------------------------------------------------------
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agenticml-hosted-execution
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*
+      Policies:
+        - PolicyName: execution
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                # Repository name is fixed in the bootstrap stack.
+                Resource: !Sub arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/agenticml/lite-server
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub ${LogGroup.Arn}:*
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !GetAtt DbInstance.MasterUserSecret.SecretArn
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agenticml-hosted-task
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*
+
+  # Not inline in the role: the file system policy names the role, and this
+  # policy names the file system and the access point.
+  TaskPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: task
+      Roles: [!Ref TaskRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+            Resource: !Sub ${ObjectsBucket.Arn}/hosted/*
+          - Effect: Allow
+            Action: s3:ListBucket
+            Resource: !GetAtt ObjectsBucket.Arn
+            Condition:
+              StringLike:
+                s3:prefix: ["hosted/*"]
+          # HeadBucket uses ListBucket authorization without a prefix. Permit only
+          # that prefix-less request as well; it necessarily permits an unprefixed listing.
+          - Effect: Allow
+            Action: s3:ListBucket
+            Resource: !GetAtt ObjectsBucket.Arn
+            Condition:
+              "Null":
+                s3:prefix: "true"
+          - Effect: Allow
+            Action:
+              - elasticfilesystem:ClientMount
+              - elasticfilesystem:ClientWrite
+            Resource: !GetAtt FileSystem.Arn
+            Condition:
+              StringEquals:
+                elasticfilesystem:AccessPointArn: !Sub arn:${AWS::Partition}:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:access-point/${AccessPoint}
+              Bool:
+                aws:SecureTransport: "true"
+          # SSM message channel APIs do not support resource-level permissions.
+          - Effect: Allow
+            Action:
+              - ssmmessages:CreateControlChannel
+              - ssmmessages:CreateDataChannel
+              - ssmmessages:OpenControlChannel
+              - ssmmessages:OpenDataChannel
+            Resource: "*"
+
+  # ---- Load balancer ----------------------------------------------------
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn:
+      - LogsBucketPolicy
+      - GatewayAttachment
+      - AlbRouteIpv4
+      - AlbRouteIpv6
+      - AlbSubnetARoutes
+      - AlbSubnetBRoutes
+    Properties:
+      Name: agenticml-hosted
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: dualstack
+      Subnets: [!Ref AlbSubnetA, !Ref AlbSubnetB]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      LoadBalancerAttributes:
+        - {Key: idle_timeout.timeout_seconds, Value: "300"}
+        - {Key: routing.http.drop_invalid_header_fields.enabled, Value: "true"}
+        - {Key: access_logs.s3.enabled, Value: "true"}
+        - {Key: access_logs.s3.bucket, Value: !Ref LogsBucket}
+        - {Key: access_logs.s3.prefix, Value: alb}
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: agenticml-hosted
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref Vpc
+      HealthCheckPath: /healthz
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - {Key: deregistration_delay.timeout_seconds, Value: "120"}
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !ImportValue agenticml-hosted-bootstrap-CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Port: "443"
+            Protocol: HTTPS
+            StatusCode: HTTP_301
+
+  # ---- Service ----------------------------------------------------------
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: agenticml-hosted
+      ClusterSettings:
+        - {Name: containerInsights, Value: enabled}
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/agenticml-hosted
+      RetentionInDays: 30
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: agenticml-hosted
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "512"
+      Memory: "1024"
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      Volumes:
+        - Name: data
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref FileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref AccessPoint
+              IAM: ENABLED
+      ContainerDefinitions:
+        - Name: server
+          Image: !Sub
+            - ${RepositoryUri}:${ImageTag}
+            - RepositoryUri: !ImportValue agenticml-hosted-bootstrap-EcrRepositoryUri
+          Essential: true
+          StopTimeout: 120
+          PortMappings:
+            - {ContainerPort: 8080, Protocol: tcp}
+          MountPoints:
+            - {SourceVolume: data, ContainerPath: /data, ReadOnly: false}
+          Environment:
+            - Name: AGENTICML_SERVER_DATABASE_URL
+              Value: !Sub postgresql://agenticml@${DbInstance.Endpoint.Address}:5432/agenticml?sslmode=verify-full&sslrootcert=/etc/agenticml/rds-ca.pem
+            - Name: AGENTICML_SERVER_OBJECTS
+              Value: !Sub s3://${ObjectsBucket}/hosted
+            - Name: AGENTICML_SERVER_PUBLIC_URL
+              Value: !Sub https://${Hostname}
+            - !If
+              - HasFirebase
+              - {Name: AGENTICML_SERVER_FIREBASE_PROJECT, Value: !Ref FirebaseProject}
+              - !Ref AWS::NoValue
+            - !If
+              - HasFirebase
+              - {Name: AGENTICML_SERVER_FIREBASE_API_KEY, Value: !Ref FirebaseApiKey}
+              - !Ref AWS::NoValue
+            - Name: AGENTICML_SERVER_OPEN_SIGNUP
+              Value: !Ref OpenSignup
+            - Name: AGENTICML_SERVER_LIMITS
+              Value: /etc/agenticml/limits.json
+            - Name: AGENTICML_SERVER_TRUSTED_PROXY
+              Value: !Join [",", [!GetAtt AlbSubnetA.CidrBlock, !GetAtt AlbSubnetB.CidrBlock]]
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+          Secrets:
+            - Name: PGPASSWORD
+              ValueFrom: !Sub "${DbInstance.MasterUserSecret.SecretArn}:password::"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: server
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - HttpsListener
+      - MountTargetA
+      - MountTargetB
+      - TaskPolicy
+    Properties:
+      ServiceName: agenticml-hosted
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: 1.4.0
+      EnableExecuteCommand: true
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED # outbound only: the task group accepts traffic from the load balancer alone
+          Subnets: [!Ref TaskSubnetA, !Ref TaskSubnetB]
+          SecurityGroups: [!Ref TaskSecurityGroup]
+      LoadBalancers:
+        - {TargetGroupArn: !Ref TargetGroup, ContainerName: server, ContainerPort: 8080}
+
+  # ---- Backups ----------------------------------------------------------
+  # The vault name is fixed (required), so after a failed first create the
+  # retained vault must be deleted before a retry.
+  BackupVault:
+    Type: AWS::Backup::BackupVault
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BackupVaultName: agenticml-hosted
+
+  BackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: agenticml-hosted
+        BackupPlanRule:
+          - RuleName: daily
+            TargetBackupVault: !Ref BackupVault
+            ScheduleExpression: cron(0 5 * * ? *)
+            Lifecycle:
+              DeleteAfterDays: 35
+
+  BackupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agenticml-hosted-backup
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: backup.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores
+
+  BackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Properties:
+      BackupPlanId: !Ref BackupPlan
+      BackupSelection:
+        SelectionName: agenticml-hosted
+        IamRoleArn: !GetAtt BackupRole.Arn
+        Resources:
+          - !GetAtt FileSystem.Arn
+          - !GetAtt DbInstance.DBInstanceArn
+
+  # ---- Alarms (to the bootstrap stack's alerts topic) ------------------
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: agenticml-hosted-alb_5xx
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_ELB_5XX_Count
+      Statistic: Sum
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName}
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 5
+      Period: 300
+      EvaluationPeriods: 1
+      TreatMissingData: notBreaching
+      AlarmActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
+      OKActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
+
+  UnhealthyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: agenticml-hosted-unhealthy
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Statistic: Maximum
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName}
+        - {Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName}
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      Period: 60
+      EvaluationPeriods: 5
+      TreatMissingData: notBreaching
+      AlarmActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
+      OKActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
+
+  RdsStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: agenticml-hosted-rds_storage
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Statistic: Minimum
+      Dimensions:
+        - {Name: DBInstanceIdentifier, Value: !Ref DbInstance}
+      ComparisonOperator: LessThanThreshold
+      Threshold: 2000000000
+      Period: 300
+      EvaluationPeriods: 1
+      TreatMissingData: notBreaching
+      AlarmActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
+      OKActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
+
+  RdsCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: agenticml-hosted-rds_cpu
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Statistic: Average
+      Dimensions:
+        - {Name: DBInstanceIdentifier, Value: !Ref DbInstance}
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 80
+      Period: 300
+      EvaluationPeriods: 1
+      TreatMissingData: notBreaching
+      AlarmActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
+      OKActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
+
+  # Threshold follows DesiredCount; no alarm while the service is scaled to zero.
+  RunningTasksAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasTasks
+    Properties:
+      AlarmName: agenticml-hosted-running_tasks
+      Namespace: ECS/ContainerInsights
+      MetricName: RunningTaskCount
+      Statistic: Minimum
+      Dimensions:
+        - {Name: ClusterName, Value: !Ref Cluster}
+        - {Name: ServiceName, Value: !GetAtt Service.Name}
+      ComparisonOperator: LessThanThreshold
+      Threshold: !Ref DesiredCount
+      Period: 300
+      EvaluationPeriods: 1
+      TreatMissingData: breaching
+      AlarmActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
+      OKActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
+
+  LatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: agenticml-hosted-latency-p95
+      Namespace: AWS/ApplicationELB
+      MetricName: TargetResponseTime
+      ExtendedStatistic: p95
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName}
+        - {Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName}
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 5
+      Period: 300
+      EvaluationPeriods: 1
+      TreatMissingData: notBreaching
+      AlarmActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
+      OKActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
+
+Outputs:
+  ServiceUrl:
+    Value: !Sub https://${Hostname}
+  AlbDnsName:
+    Description: Target of the app CNAME record at the DNS provider.
+    Value: !GetAtt LoadBalancer.DNSName
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !GetAtt Service.Name
+  LogGroup:
+    Value: !Ref LogGroup
+  ObjectsBucket:
+    Value: !Ref ObjectsBucket
+  LogsBucket:
+    Value: !Ref LogsBucket
+  EfsId:
+    Value: !Ref FileSystem
+  DbInstanceId:
+    Value: !Ref DbInstance
+  TaskSecurityGroup:
+    Value: !Ref TaskSecurityGroup
+  TaskSubnets:
+    Value: !Join [",", [!Ref TaskSubnetA, !Ref TaskSubnetB]]

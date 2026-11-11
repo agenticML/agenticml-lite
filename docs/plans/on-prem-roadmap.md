@@ -217,7 +217,12 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 24 | AWS hosted deployment (Dockerfile, Terraform, deploy workflow, runbook, real-EFS benchmark) | 18c, 19, 20, 21 | Codex, Sonnet; owner runs it | M | [plan](packages/24-aws-deployment.md) | done (code, 3.0 PR; owner checks in Backlog) |
 | 24.1 | Image: Dockerfile, entrypoint, limits file, local hosted smoke test | 21 | Codex, Sonnet | S | [plan](packages/24-aws-deployment.md) | done (3.0 PR) |
 | 24.2 | Terraform, deploy workflow, `deploy-check` CI job, runbook | 24.1 | Codex, Sonnet | M | [plan](packages/24-aws-deployment.md) | done (3.0 PR; `terraform validate` runs in CI) |
-| 24.3 | Apply, first deploy, restore drill, real-EFS benchmark, exit criterion 6 | 24.2 | Owner | S | [AWS roadmap](aws-deployment-roadmap.md) | not started (Backlog) |
+| 24.3 | Apply, first deploy, restore drill, real-EFS benchmark, exit criterion 6 | 24.4 | Owner | S | [AWS roadmap](aws-deployment-roadmap.md) | not started (Backlog) |
+| 24.4 † | CloudFormation replaces Terraform; Namecheap DNS; cost alerts | 24.2 | Sonnet; prose Antigravity | M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49); second review by the supervisor) |
+| 24.4a | `bootstrap.yaml`: ECR, OIDC, roles, certificate, alerts topic, budget, cost-step function | – | Sonnet | S–M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
+| 24.4b | `hosted.yaml` and its tests | 24.4a | Sonnet | M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
+| 24.4c | `deploy.yml`, CI `cfn-lint`, remove Terraform and `swap_image.py` | 24.4b | Sonnet | S | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
+| 24.4d | Runbook for CloudFormation (`deploy/aws/README.md`, `docs/HOSTED.md`) | 24.4c | Antigravity | S | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
 | 25 | Docs, threat model, version 3.0.0 | 16–24 | Sonnet (Codex at limit); prose Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR; tag and PyPI release by the owner) |
 | 25.1 | Client support window (426), version 3.0.0, base-install smoke, 2.2 client check | 16–24 | Sonnet (Codex at limit) | S | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
 | 25.2 | SERVER.md, HOSTED.md, threat model, PROTOCOL.md, README, website, SECURITY.md | 25.1 | Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
@@ -290,9 +295,10 @@ priority.
   - Where: `deploy/aws/README.md`, sections Prerequisites through Upgrades.
   - Problem: the infrastructure and deployment code have not run in our AWS
     account; exit criterion 6 needs a real deployment.
-  - Fix: owner reviews Terraform and action pins, applies with zero tasks,
-    pushes the private SHA image, dispatches the protected hosted workflow,
-    scales to two tasks, configures Firebase, and creates two customer
+  - Fix: owner follows the AWS deployment roadmap Phases 2–5 and the
+    CloudFormation runbook: bootstrap stack, GitHub `hosted` environment,
+    first workflow deploy with two tasks, the Namecheap `app` CNAME, then
+    Firebase (later) and two customer
     workspaces with admin/member accounts and workspace-bound sync keys.
     Sync through both tasks and roll while uploading; verify acknowledged
     sizes/hashes and dashboard parity, membership isolation, and client retry.
@@ -318,9 +324,34 @@ priority.
     test falls back to commit `bd0d499` until it exists.
   - Fix: after merging, tag `v2.2.0` at `bd0d499` and `v3.0.0` at the
     merge, publish 3.0.0 to PyPI (`publish.yml`), and publish the three
-    policies before setting `open_signup = true` in Terraform.
+    policies before setting `HOSTED_OPEN_SIGNUP=true` in the `hosted`
+    environment.
   - Done when: `pip install agenticml-lite==3.0.0` works and the policies
     are linked from the sign-in page.
+- **Permissions boundary for the hosted stack's roles** (package 24.4a
+  review, Nov 11, 2026).
+  - Where: `deploy/aws/cloudformation/bootstrap.yaml` (`CloudFormationRole`,
+    Sid `HostedRoles`).
+  - Problem: the CloudFormation role can create `agenticml-hosted-*` roles
+    and give them any inline policy, then pass them to ECS tasks. Only a
+    reviewed template run through the protected `hosted` workflow can use
+    it, but nothing caps what those roles may do.
+  - Fix: a managed policy `agenticml-hosted-boundary` in the bootstrap stack
+    that denies IAM, Organizations and account actions and allows only the
+    services the hosted roles use; require it with an
+    `iam:PermissionsBoundary` condition on `CreateRole`/`PutRolePolicy`/
+    `AttachRolePolicy`, and deny removing it.
+  - Also (24.4 second review): the role's ec2, elasticloadbalancing, ecs,
+    rds, elasticfilesystem and backup write actions are scoped by region
+    only, and the account runs other services in us-east-2. A malicious
+    template could import their resources (an `IMPORT` change set) and
+    delete them. Limit those writes to resources tagged
+    `Project=agenticml-hosted` (`aws:ResourceTag` / `aws:RequestTag`), and
+    deny `cloudformation:CreateChangeSet` with
+    `cloudformation:ImportResourceTypes` in the deploy role.
+  - Done when: a template test asserts the boundary condition, the tag
+    conditions and the import deny, and a hosted role without the boundary
+    cannot be created (checked on the next real deploy).
 - **Metric picker polish** (package 22 review, Nov 9, 2026).
   - Where: `src/agenticml/ui/static/app.js` runs page;
     `testbed/tests/test_server_dashboard.py`.
@@ -335,14 +366,16 @@ priority.
     without a reload, with a test.
 - **Stand up the hosted service on AWS (package 24.3, owner)** (Nov 9,
   2026).
-  - Where: `deploy/aws/` (Terraform, `README.md` runbook),
-    `.github/workflows/deploy.yml`.
+  - Where: `deploy/aws/cloudformation/` (bootstrap and hosted stacks),
+    `deploy/aws/README.md` runbook, `.github/workflows/deploy.yml`,
+    [AWS deployment roadmap](aws-deployment-roadmap.md) Phases 2–6.
   - Problem: agents wrote and statically checked the stack (image build,
-    `scripts/hosted_smoke.sh` against local Postgres and moto,
-    `terraform fmt`, `terraform validate` in CI) but never ran it in AWS:
-    creating billed resources and a public endpoint is the owner's call.
-  - Fix: follow `deploy/aws/README.md`: state bucket, `terraform apply`,
-    GitHub environment `hosted` with `AWS_DEPLOY_ROLE_ARN`, first deploy,
+    `scripts/hosted_smoke.sh` against local Postgres and moto, `cfn-lint`
+    and template tests in CI) but never ran it in AWS: creating billed
+    resources and a public endpoint is the owner's call.
+  - Fix: follow `deploy/aws/README.md`: bootstrap stack (with the Namecheap
+    validation record), GitHub environment `hosted` with the role
+    variables, first deploy, the `app` CNAME,
     first server admin, two customer workspaces, a rolling deploy during a
     sync, an RDS + EFS restore drill, and the real-EFS benchmark (replaces
     the "Run the server benchmark on real EFS" entry below).

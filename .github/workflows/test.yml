@@ -138,17 +138,15 @@ jobs:
           if [[ "$EVENT_NAME" != pull_request ]] || grep -Eq '^(deploy/aws/|\.github/workflows/(deploy|test)\.yml$|pyproject\.toml$|\.dockerignore$)' /tmp/deploy-changed-files; then
             echo 'run=true' >> "$GITHUB_OUTPUT"
           fi
-      - uses: hashicorp/setup-terraform@v3
+      - uses: actions/setup-python@v7
         if: steps.changes.outputs.run == 'true'
         with:
-          terraform_version: 1.6.6
-      - name: Terraform format and validate
+          python-version: "3.12"
+      - name: Lint CloudFormation templates
         if: steps.changes.outputs.run == 'true'
-        working-directory: deploy/aws/terraform
         run: |
-          terraform fmt -check -recursive
-          terraform init -backend=false
-          terraform validate
+          python -m pip install cfn-lint==1.60.0
+          cfn-lint deploy/aws/cloudformation/*.yaml
       - name: Build and check hosted image
         if: steps.changes.outputs.run == 'true'
         run: |
