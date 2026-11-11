@@ -14,10 +14,6 @@ website
 build
 dist
 .coverage
-**/.terraform
-**/*.tfstate*
-**/*.tfvars
-!**/terraform.tfvars.example
 .agenticml
 .env
 .env.*

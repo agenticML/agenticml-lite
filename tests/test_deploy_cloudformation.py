@@ -741,7 +741,7 @@ def test_hosted_alarms_notify_the_imported_topic(hosted):
         'running_tasks': ('ECS/ContainerInsights', 'RunningTaskCount', 'Minimum', None, 'LessThanThreshold', {'Ref': 'DesiredCount'}, 300, 1, 'breaching'),
         'latency-p95': ('AWS/ApplicationELB', 'TargetResponseTime', None, 'p95', 'GreaterThanThreshold', 5, 300, 1, 'notBreaching'),
     }
-    # Intentionally differs from monitoring.tf: running_tasks follows DesiredCount (not a fixed 2) and only exists
+    # running_tasks follows DesiredCount (not a fixed 2) and only exists
     # while DesiredCount is not 0, so scaling to 1 or 0 does not leave it in ALARM.
     assert hosted['Conditions']['HasTasks'] == {'Fn::Not': [{'Fn::Equals': [{'Ref': 'DesiredCount'}, 0]}]}
     conditions = {r['Properties']['AlarmName']: r.get('Condition')
@@ -765,3 +765,78 @@ def test_hosted_outputs(hosted):
                                       'ObjectsBucket', 'LogsBucket', 'EfsId', 'DbInstanceId',
                                       'TaskSecurityGroup', 'TaskSubnets'}
     assert hosted['Outputs']['AlbDnsName']['Value'] == {'Fn::GetAtt': 'LoadBalancer.DNSName'}
+
+
+# ------------------------------------------------------------------ workflows
+
+def load_workflow(name):
+    return yaml.safe_load((ROOT / '.github/workflows' / name).read_text())
+
+
+def run_blocks(workflow):
+    return [step['run'] for job in workflow['jobs'].values() for step in job.get('steps', []) if 'run' in step]
+
+
+def test_deploy_workflow_runs_the_hosted_template_through_the_cloudformation_role():
+    workflow = load_workflow('deploy.yml')
+    text = (ROOT / '.github/workflows/deploy.yml').read_text()
+    job = workflow['jobs']['deploy']
+    assert job['environment'] == 'hosted'
+    assert workflow['permissions'] == {'contents': 'read', 'id-token': 'write'}
+    assert workflow['concurrency'] == {'group': 'hosted-deploy', 'cancel-in-progress': False}
+    assert 'deploy/aws/cloudformation/hosted.yaml' in text
+    assert '--role-arn' in text
+    assert 'CAPABILITY_NAMED_IAM' in text
+    assert 'agenticml/lite-server' in text
+    assert 'terraform' not in text.lower()
+    assert 'swap_image' not in text
+
+
+def test_deploy_workflow_run_blocks_take_values_from_env_only():
+    workflow = load_workflow('deploy.yml')
+    blocks = run_blocks(workflow)
+    assert blocks
+    for block in blocks:
+        assert '${{' not in block, block
+
+
+def test_deploy_workflow_fails_early_on_missing_role_variables_and_prints_events():
+    workflow = load_workflow('deploy.yml')
+    steps = workflow['jobs']['deploy']['steps']
+    assert 'AWS_DEPLOY_ROLE_ARN' in steps[0]['run'] and 'AWS_CFN_ROLE_ARN' in steps[0]['run']
+    events = [s for s in steps if 'describe-stack-events' in s.get('run', '')]
+    assert len(events) == 1 and events[0]['if'].startswith('failure()')
+
+
+def test_deploy_workflow_timeout_covers_a_first_create():
+    assert load_workflow('deploy.yml')['jobs']['deploy']['timeout-minutes'] == 60
+
+
+def test_deploy_workflow_only_deploys_commits_on_the_dispatching_ref():
+    steps = load_workflow('deploy.yml')['jobs']['deploy']['steps']
+    checkout = next(s for s in steps if s.get('uses', '').startswith('actions/checkout'))
+    assert checkout['with']['fetch-depth'] == 0
+    assert checkout['with']['persist-credentials'] is False
+    guard = [i for i, s in enumerate(steps) if 'git merge-base --is-ancestor' in s.get('run', '')]
+    assert len(guard) == 1
+    creds = [i for i, s in enumerate(steps) if s.get('uses', '').startswith('aws-actions/configure-aws-credentials')]
+    assert len(creds) == 1
+    assert steps.index(checkout) < guard[0] < creds[0]
+    assert steps[guard[0]]['env']['INPUT_REF'] == '${{ inputs.ref }}'
+
+
+def test_deploy_check_job_lints_templates_instead_of_terraform():
+    workflow = load_workflow('test.yml')
+    steps = workflow['jobs']['deploy-check']['steps']
+    text = (ROOT / '.github/workflows/test.yml').read_text()
+    assert 'terraform' not in text.lower()
+    runs = '\n'.join(s.get('run', '') for s in steps)
+    assert re.search(r'cfn-lint==\d+\.\d+\.\d+', runs)
+    assert 'cfn-lint deploy/aws/cloudformation/*.yaml' in runs
+
+
+def test_nothing_under_deploy_aws_mentions_terraform():
+    for path in (ROOT / 'deploy/aws').rglob('*'):
+        # TODO(24.4d): drop the README exclusion once the runbook is rewritten for CloudFormation.
+        if path.is_file() and path.name != 'README.md':
+            assert 'terraform' not in path.read_text(errors='ignore').lower(), path

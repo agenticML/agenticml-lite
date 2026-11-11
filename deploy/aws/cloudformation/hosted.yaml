@@ -238,7 +238,7 @@ Resources:
       ToPort: 8080
       SourceSecurityGroupId: !Ref AlbSecurityGroup
   # The placeholder egress rule (ICMP to loopback, matches nothing) replaces
-  # the default allow-all egress, as in the Terraform stack.
+  # the default allow-all egress.
   RdsSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -385,7 +385,7 @@ Resources:
     Metadata:
       cfn-lint:
         config:
-          # The major-only version "16" (as in the Terraform stack) makes RDS pick
+          # The major-only version "16" makes RDS pick
           # its current default minor; cfn-lint's list flags the bare major.
           ignore_checks: [W3691]
     Properties:

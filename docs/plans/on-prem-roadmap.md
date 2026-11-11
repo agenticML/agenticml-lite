@@ -221,8 +221,8 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 24.4 † | CloudFormation replaces Terraform; Namecheap DNS; cost alerts | 24.2 | Sonnet; prose Antigravity | M | [plan](packages/24.4-cloudformation.md) | in progress |
 | 24.4a | `bootstrap.yaml`: ECR, OIDC, roles, certificate, alerts topic, budget, cost-step function | – | Sonnet | S–M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
 | 24.4b | `hosted.yaml` and its tests | 24.4a | Sonnet | M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
-| 24.4c | `deploy.yml`, CI `cfn-lint`, remove Terraform and `swap_image.py` | 24.4b | Sonnet | S | [plan](packages/24.4-cloudformation.md) | in progress |
-| 24.4d | Runbook for CloudFormation (`deploy/aws/README.md`, `docs/HOSTED.md`) | 24.4c | Antigravity | S | [plan](packages/24.4-cloudformation.md) | plan ready |
+| 24.4c | `deploy.yml`, CI `cfn-lint`, remove Terraform and `swap_image.py` | 24.4b | Sonnet | S | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
+| 24.4d | Runbook for CloudFormation (`deploy/aws/README.md`, `docs/HOSTED.md`) | 24.4c | Antigravity | S | [plan](packages/24.4-cloudformation.md) | in progress |
 | 25 | Docs, threat model, version 3.0.0 | 16–24 | Sonnet (Codex at limit); prose Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR; tag and PyPI release by the owner) |
 | 25.1 | Client support window (426), version 3.0.0, base-install smoke, 2.2 client check | 16–24 | Sonnet (Codex at limit) | S | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
 | 25.2 | SERVER.md, HOSTED.md, threat model, PROTOCOL.md, README, website, SECURITY.md | 25.1 | Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
@@ -339,9 +339,17 @@ priority.
     services the hosted roles use; require it with an
     `iam:PermissionsBoundary` condition on `CreateRole`/`PutRolePolicy`/
     `AttachRolePolicy`, and deny removing it.
-  - Done when: a template test asserts the condition, and a hosted role
-    without the boundary cannot be created (checked on the next real
-    deploy).
+  - Also (24.4 second review): the role's ec2, elasticloadbalancing, ecs,
+    rds, elasticfilesystem and backup write actions are scoped by region
+    only, and the account runs other services in us-east-2. A malicious
+    template could import their resources (an `IMPORT` change set) and
+    delete them. Limit those writes to resources tagged
+    `Project=agenticml-hosted` (`aws:ResourceTag` / `aws:RequestTag`), and
+    deny `cloudformation:CreateChangeSet` with
+    `cloudformation:ImportResourceTypes` in the deploy role.
+  - Done when: a template test asserts the boundary condition, the tag
+    conditions and the import deny, and a hosted role without the boundary
+    cannot be created (checked on the next real deploy).
 - **Metric picker polish** (package 22 review, Nov 9, 2026).
   - Where: `src/agenticml/ui/static/app.js` runs page;
     `testbed/tests/test_server_dashboard.py`.
