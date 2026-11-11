@@ -49,6 +49,10 @@ anything against AWS (billed resources, public endpoint).
 Package 24.4, replacing the Terraform half of package 24.2. Plan:
 [24.4-cloudformation.md](packages/24.4-cloudformation.md).
 
+**Status: done** in [#49](https://github.com/agenticML/agenticml-lite/pull/49)
+(Nov 11, 2026). Phase 0 checks found an existing GitHub OIDC provider in the
+account, used by other roles: always pass its ARN to the bootstrap stack.
+
 | # | Step | Done when |
 | --- | --- | --- |
 | 1.1 | `bootstrap.yaml`: ECR repository, GitHub OIDC provider (optional), deploy role, CloudFormation role, ACM certificate, alerts topic, $50 budget, $10-step cost emails | `cfn-lint` clean; tests pass |

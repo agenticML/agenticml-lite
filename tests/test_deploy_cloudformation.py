@@ -837,6 +837,5 @@ def test_deploy_check_job_lints_templates_instead_of_terraform():
 
 def test_nothing_under_deploy_aws_mentions_terraform():
     for path in (ROOT / 'deploy/aws').rglob('*'):
-        # TODO(24.4d): drop the README exclusion once the runbook is rewritten for CloudFormation.
-        if path.is_file() and path.name != 'README.md':
+        if path.is_file():
             assert 'terraform' not in path.read_text(errors='ignore').lower(), path

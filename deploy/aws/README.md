@@ -5,101 +5,259 @@ This stack is for our private hosted service. Customers continue to install
 create billed resources and a public hostname. Package 24.3 remains open until
 all launch checks below have recorded evidence.
 
+Two CloudFormation stacks run in us-east-2:
+- `agenticml-hosted-bootstrap`: deployed once from a laptop with admin credentials.
+- `agenticml-hosted`: deployed and updated only by the GitHub Actions workflow.
+
 ## Prerequisites and configuration
 
-Use Terraform >=1.6, <2 (CI uses 1.6.6), AWS CLI v2 with Session Manager plugin,
-Docker with an x86_64 builder, and GitHub CLI. Authenticate to the intended AWS
-account in us-east-2. The existing public Route 53 zone must delegate
-`agenticml.xyz`. Confirm the SNS subscription when its email arrives.
+Tools needed on your laptop:
+- AWS CLI v2 with the Session Manager plugin installed.
+- Docker with an x86_64 builder.
+- GitHub CLI (`gh`).
+- An IAM admin user (not the account root user). Configure a local profile such
+  as `export AWS_PROFILE=agenticml-account`.
+- Region: `us-east-2`.
 
-Create an encrypted, versioned, private S3 state bucket separately, and a
-DynamoDB state lock table (string partition key `LockID`). These must outlive
-the service. Do not put credentials in backend files or tfvars. Terraform 1.6
-uses DynamoDB locking; if upgrading to a version supporting native S3 lockfiles,
-coordinate that migration across all operators before replacing DynamoDB.
+CloudFormation stores and manages stack state directly in AWS. There is no
+remote state bucket or DynamoDB lock table.
+
+DNS for `agenticml.xyz` stays at Namecheap. No Route 53 hosted zones or records
+are created.
+
+Enable Cost Explorer once in the AWS Billing console before deploying the
+bootstrap stack (Billing → Cost Explorer → Launch Cost Explorer). Cost Explorer
+data takes up to 24 hours to appear. Until data is available, the daily cost
+function's `Errors` alarm may fire once on day one.
+
+## Bootstrap stack (once)
+
+The bootstrap stack (`deploy/aws/cloudformation/bootstrap.yaml`) creates the
+foundation that must exist before the deploy workflow can run:
+- **ECR repository** `agenticml/lite-server`: immutable tags, scan on push,
+  lifecycle policy keeping the last 30 images, `DeletionPolicy: Retain`.
+- **Deploy role** `agenticml-hosted-deploy`: trusted only by
+  `repo:agenticML/agenticml-lite:environment:hosted` with audience
+  `sts.amazonaws.com`. Has permissions to push images to ECR, describe images,
+  initiate and execute change sets on the hosted stack, and pass the
+  CloudFormation role.
+- **CloudFormation role** `agenticml-hosted-cloudformation`: assumed by the
+  CloudFormation service to create and update resources in the hosted stack.
+- **ACM certificate** for `app.agenticml.xyz`: uses DNS validation with
+  `DeletionPolicy: Retain`.
+- **Alerts topic** `agenticml-alerts`: unencrypted SNS topic (AWS Budgets cannot
+  publish to encrypted topics) with an email subscription for each address.
+- **Monthly budget** `agenticml-monthly`: $100 monthly budget limit. Excludes
+  credits and refunds so real spend is visible. Notifies the alerts topic when
+  actual spend or forecasted spend exceeds 100%.
+- **Daily cost-step function** `agenticml-cost-steps`: Lambda function running
+  daily at 06:00 UTC via EventBridge rule `agenticml-cost-steps-daily`. Sends an
+  email each time month-to-date spend crosses another $10 milestone, reporting
+  a per-service breakdown and month-end forecast (`GetCostForecast`). On the 2nd
+  of each month, emails the previous month's final total. Skips queries on the
+  1st because Cost Explorer data lags by a day.
+
+Deploy the bootstrap stack:
 
 ```sh
-cd deploy/aws/terraform
-cp terraform.tfvars.example terraform.tfvars
-# Edit every REPLACE_ME; choose globally unique bucket names and final snapshot ID.
-# Keep desired_count=0 and open_signup=false for the bootstrap apply.
-terraform init \
-  -backend-config='bucket=YOUR-STATE-BUCKET' \
-  -backend-config='key=agenticml-hosted/terraform.tfstate' \
-  -backend-config='region=us-east-2' \
-  -backend-config='encrypt=true' \
-  -backend-config='dynamodb_table=YOUR-STATE-LOCK-TABLE'
-terraform fmt -check -recursive
-terraform validate
-terraform plan -out=/tmp/agenticml-hosted.tfplan
-terraform apply /tmp/agenticml-hosted.tfplan
-rm /tmp/agenticml-hosted.tfplan
-terraform output
+export AWS_PROFILE=agenticml-account AWS_REGION=us-east-2 AWS_PAGER=""
+aws cloudformation deploy \
+  --stack-name agenticml-hosted-bootstrap \
+  --template-file deploy/aws/cloudformation/bootstrap.yaml \
+  --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+  --parameter-overrides \
+    AlertEmails='first@example.com,second@example.com' \
+    GitHubOidcProviderArn=arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com
 ```
 
-Ignore local `terraform.tfvars`, `.terraform/`, state, and plan files; never
-commit them. The RDS-managed password is referenced by secret ARN and is not
-read by Terraform. ECS injects only its `password` field as `PGPASSWORD`;
-the URL has `sslmode=verify-full` and the pinned RDS CA bundle. Rotating the
-managed secret requires a new task deployment to refresh the injected value.
-The image runs uid/gid 10001, matching the EFS access point. Outbound task
-traffic uses one NAT; this is a cost-conscious single-AZ egress dependency.
-ALB is dualstack; private tasks and dependencies use IPv4.
+Our AWS account already has an OIDC provider for GitHub Actions used by other
+roles. Always pass its ARN in `GitHubOidcProviderArn` (find it with
+`aws iam list-open-id-connect-providers`). Leaving this parameter empty makes
+CloudFormation attempt to create a new provider, which fails if one already
+exists and would delete the provider if the stack is ever deleted.
 
-## First image and first deploy
+Optional parameters: `MonthlyBudget` (default 100), `CostStep` (default 10),
+`Hostname` (default `app.agenticml.xyz`). Never commit real alert email
+addresses. `CAPABILITY_AUTO_EXPAND` is required for the `AWS::LanguageExtensions`
+transform used to create subscriptions for each email address.
 
-Before dispatch, create the GitHub environment `hosted`, **require reviewers**,
-and restrict its permitted deployment branches/tags to trusted release refs.
-YAML cannot configure required reviewers. An optional workflow `ref` can select
-code; reviewers must verify that commit before granting the OIDC role. Set
-repository/environment variables `AWS_DEPLOY_ROLE_ARN` from Terraform's
-`deploy_role_arn` and `AWS_REGION=us-east-2`. The role trusts only
-`repo:agenticML/agenticml-lite:environment:hosted`.
-
-The workflow actions use major version tags, like the repository's other
-workflows. The ECR repo is private, immutable, scans pushes, and retains 30 images. Preserve known-good
-release images separately before lifecycle expiry if a long rollback window
-is needed.
-
-From the repository root, the owner can push the first image explicitly:
+Certificate validation while the deploy command waits:
+In a second terminal:
 
 ```sh
-export AWS_REGION=us-east-2
-sha=$(git rev-parse HEAD)
-registry="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com"
-aws ecr get-login-password | docker login --username AWS --password-stdin "$registry"
-docker build -f deploy/aws/Dockerfile -t "$registry/agenticml/lite-server:$sha" .
-docker push "$registry/agenticml/lite-server:$sha"
-gh workflow run deploy.yml -f ref="$sha"
-# Approve hosted environment after reviewing the selected SHA; wait for success.
+arn=$(aws acm list-certificates --query "CertificateSummaryList[?DomainName=='app.agenticml.xyz'].CertificateArn" --output text)
+aws acm describe-certificate --certificate-arn "$arn" --query 'Certificate.DomainValidationOptions[0].ResourceRecord'
 ```
 
-The workflow reuses an existing immutable SHA tag, changes only the `server`
-container image in the current task definition, registers a revision, updates
-the service, waits for stability, and detects circuit-breaker rollback. Its
-concurrency group serializes deploys. With bootstrap desired count zero it
-registers the real image before tasks start. Then change desired_count to 2 in
-tfvars and apply a reviewed Terraform plan. Terraform ignores the service's
-workflow-managed task_definition; it does not revert the image revision.
+The validation CNAME record also appears in the CloudFormation stack events for
+`Certificate`.
+
+In Namecheap: Domain List → agenticml.xyz → Advanced DNS → Add New Record → CNAME.
+- Host: the record name without `.agenticml.xyz.` (for example `_abc123.app`).
+- Value: the record value.
+- TTL: Automatic.
+
+Certificate validation usually completes 5–30 minutes later. Keep this record
+permanently; ACM uses it to automatically renew the certificate. If
+`aws cloudformation deploy` times out while waiting, resume waiting with:
 
 ```sh
-aws ecs wait services-stable --cluster agenticml-hosted --services agenticml-hosted
+aws cloudformation wait stack-create-complete --stack-name agenticml-hosted-bootstrap
+```
+
+Each alert address receives an AWS SNS subscription confirmation email and must
+click the confirmation link. Alerts sent before confirmation are dropped.
+
+Read the stack outputs:
+
+```sh
+aws cloudformation describe-stacks --stack-name agenticml-hosted-bootstrap --query 'Stacks[0].Outputs' --output table
+```
+
+Outputs include `DeployRoleArn`, `CloudFormationRoleArn`, `EcrRepositoryUri`,
+`CertificateArn`, and `AlertsTopicArn`. These are exported as
+`agenticml-hosted-bootstrap-<Output>` and imported by the hosted stack. The
+bootstrap stack cannot be deleted while the hosted stack exists.
+
+To change budget thresholds or alert email addresses later, re-run the same
+`aws cloudformation deploy` command with updated parameters.
+
+## GitHub environment `hosted`
+
+In GitHub repository Settings → Environments, create the `hosted` environment.
+
+1. **Require reviewers**: Enable required reviewers and assign team members.
+   Workflow files cannot configure reviewers; this must be set in the UI.
+2. **Deployment branches and tags**: Restrict permitted branches/tags to `main`,
+   `dev`, and tags matching `v*`.
+3. **Environment variables**: Set the following variables with `gh`:
+
+```sh
+gh variable set AWS_DEPLOY_ROLE_ARN --env hosted --body "<DeployRoleArn>"
+gh variable set AWS_CFN_ROLE_ARN --env hosted --body "<CloudFormationRoleArn>"
+gh variable set AWS_REGION --env hosted --body "us-east-2"
+gh variable set HOSTED_DESIRED_COUNT --env hosted --body "2"
+gh variable set HOSTED_MULTI_AZ --env hosted --body "false"
+gh variable set HOSTED_OPEN_SIGNUP --env hosted --body "false"
+```
+
+Leave `HOSTED_FIREBASE_PROJECT` and `HOSTED_FIREBASE_API_KEY` unset until Firebase is
+ready; the workflow passes unset variables to the template as empty strings.
+
+| Variable | Value | Default |
+| --- | --- | --- |
+| `AWS_DEPLOY_ROLE_ARN` | Bootstrap output `DeployRoleArn` | (Required) |
+| `AWS_CFN_ROLE_ARN` | Bootstrap output `CloudFormationRoleArn` | (Required) |
+| `AWS_REGION` | `us-east-2` | `us-east-2` |
+| `HOSTED_DESIRED_COUNT` | Running task count | `2` |
+| `HOSTED_MULTI_AZ` | `true` or `false` | `false` |
+| `HOSTED_FIREBASE_PROJECT` | Firebase project ID (empty = Firebase off) | (empty) |
+| `HOSTED_FIREBASE_API_KEY` | Public Firebase web API key | (empty) |
+| `HOSTED_OPEN_SIGNUP` | `true` or `false` | `false` |
+
+`HOSTED_OPEN_SIGNUP=true` requires a non-empty `HOSTED_FIREBASE_PROJECT`;
+otherwise CloudFormation template assertions fail before any resource changes.
+No secrets are needed. The database password is generated and stored in an
+RDS-managed secret.
+
+## First deploy
+
+Trigger the deployment workflow using GitHub CLI. Run it only after the
+CloudFormation workflow is merged into the branch you dispatch from (for example
+`dev`).
+
+```sh
+gh workflow run deploy.yml --ref dev
+```
+
+You can also run against `main` or a `v*` tag. An optional commit SHA passed
+via `-f ref=<sha>` must be an ancestor already present on the selected branch
+or tag; the workflow checks `git merge-base --is-ancestor` and refuses other
+commits.
+
+Approve the run in GitHub Actions.
+
+The workflow:
+1. Assumes the deploy role via GitHub OIDC.
+2. Checks if an image for the commit SHA exists in ECR. If not, builds the
+   image from `deploy/aws/Dockerfile` and pushes it with the commit SHA tag.
+3. Runs `aws cloudformation deploy` for `deploy/aws/cloudformation/hosted.yaml`
+   passing the image tag and environment configuration, using the CloudFormation
+   role.
+4. Waits for stack stability. The first create takes 20–40 minutes (RDS
+   instance creation takes 10–20 minutes; workflow timeout is 60 minutes).
+5. On failure, outputs the last 30 CloudFormation stack events.
+6. On success, prints the outputs `AlbDnsName` and `ServiceUrl` and verifies
+   that running ECS tasks match `HOSTED_DESIRED_COUNT`.
+
+After the workflow finishes, add the application CNAME record in Namecheap:
+- Domain List → agenticml.xyz → Advanced DNS → Add New Record → CNAME.
+- Host: `app`.
+- Value: `AlbDnsName` output (e.g. `agenticml-hosted-123456789.us-east-2.elb.amazonaws.com`).
+- TTL: Automatic.
+
+Verify DNS and service health:
+
+```sh
+dig +short app.agenticml.xyz
 curl --fail https://app.agenticml.xyz/healthz
 aws logs tail /ecs/agenticml-hosted --since 10m
 ```
 
+The stack configures six CloudWatch alarms (described in detail under Incidents,
+launch evidence and cost below).
+
+## If the first create fails
+
+If the initial stack creation fails, CloudFormation rolls back and deletes the
+stack, except for retained resources:
+- The EFS file system (`FileSystem`, `DeletionPolicy: Retain`).
+- The two S3 buckets (`ObjectsBucket` and `LogsBucket`, with generated names
+  starting with `agenticml-hosted-`, `DeletionPolicy: Retain`).
+- The AWS Backup vault (`BackupVault`, named `agenticml-hosted`,
+  `DeletionPolicy: Retain`).
+- A final RDS snapshot (`DbInstance` has `DeletionPolicy: Snapshot`).
+
+The RDS instance has deletion protection enabled (`DeletionProtection: true`).
+If rollback occurs after the database instance was created, the rollback halts
+in `ROLLBACK_FAILED` or `DELETE_FAILED`. Disable deletion protection to let
+deletion proceed:
+
+```sh
+aws rds modify-db-instance --db-instance-identifier agenticml-hosted --no-deletion-protection --apply-immediately
+```
+
+Then delete or continue rollback on the stack.
+
+Before retrying the first deploy, delete the empty retained backup vault because
+its fixed name `agenticml-hosted` will collide on recreation:
+
+```sh
+aws backup delete-backup-vault --backup-vault-name agenticml-hosted
+```
+
+Delete unused retained EFS filesystems or S3 buckets by hand if you want a clean
+account. S3 bucket names include random suffixes and will not collide on retry.
+
+Do not rename fixed-name resources or change security group descriptions in
+place. Modifying a security group description causes CloudFormation to replace
+the security group, triggering a name collision on the fixed group name.
+
 ## Accounts, Firebase and customers
 
 In Firebase, enable Google and email/password sign-in and add
-`app.agenticml.xyz` to Authentication's authorized domains. Configure the project
-ID and its public web API key in tfvars. Verify actual Google and verified
-email/password sign-in, invite acceptance, and browser CSP before enabling
-open signup. The baked limits are decimal 5 GB storage, 2 GB uploads/day,
-600 requests/minute, 5 people, 1 free workspace per account.
+`app.agenticml.xyz` to Authentication's authorized domains. Configure
+`HOSTED_FIREBASE_PROJECT` and `HOSTED_FIREBASE_API_KEY` in the GitHub `hosted`
+environment variables and re-run the deploy workflow.
+
+Verify actual Google and verified email/password sign-in, invite acceptance,
+and browser CSP before enabling open signup. The baked free limits are decimal
+5 GB storage, 2 GB uploads/day, 600 requests/minute, 5 people, and 1 free
+workspace per account.
 
 Select a running task, then run each operator command through ECS Exec. The
-operator's own IAM identity needs ECS ExecuteCommand/SSM session permissions;
-the GitHub deploy role deliberately does not have those permissions.
+operator's own IAM identity needs ECS `ExecuteCommand` and SSM session
+permissions; the GitHub deploy role deliberately lacks these permissions.
 
 ```sh
 cluster=agenticml-hosted
@@ -113,171 +271,299 @@ aws ecs execute-command --cluster "$cluster" --task "$task" --container server -
   --command 'agenticml server users invite owner@example.com --workspace customer-one --data /data'
 ```
 
-For another customer, use `accounts add customer@example.com`, then
-`workspaces create customer-two --owner customer@example.com`. Invite that
-account with `users invite customer@example.com --workspace customer-two`.
-To add another person to an existing workspace use
-`agenticml server users add member@example.com --role member --workspace customer-one --data /data`.
-Admin role for a member is `--role admin`. To issue a machine key:
+For another customer:
+
+```sh
+aws ecs execute-command --cluster "$cluster" --task "$task" --container server --interactive \
+  --command 'agenticml server accounts add customer@example.com --data /data'
+aws ecs execute-command --cluster "$cluster" --task "$task" --container server --interactive \
+  --command 'agenticml server workspaces create customer-two --owner customer@example.com --data /data'
+aws ecs execute-command --cluster "$cluster" --task "$task" --container server --interactive \
+  --command 'agenticml server users invite customer@example.com --workspace customer-two --data /data'
+```
+
+To add another person to an existing workspace:
+
+```sh
+aws ecs execute-command --cluster "$cluster" --task "$task" --container server --interactive \
+  --command 'agenticml server users add member@example.com --role member --workspace customer-one --data /data'
+```
+
+Admin role for a member is `--role admin`. To issue a machine sync key:
 
 ```sh
 aws ecs execute-command --cluster "$cluster" --task "$task" --container server --interactive \
   --command 'agenticml server keys create --name training --scope sync --user owner@example.com --workspace customer-one --data /data'
 ```
 
-Keys/invite links are printed once: handle the session output as a credential
-and do not paste it into CI logs or tickets. A server admin is a global account;
-workspace membership/roles still control workspace access. Sign in through the
-normal invite/Firebase path. Keep public signup disabled until setup is complete.
+Keys and invite links are printed once: handle the session output as a
+credential and do not paste it into CI logs or tickets. A server admin is a
+global account; workspace memberships and roles control workspace access. Sign
+in through the normal invite or Firebase path. Keep public signup disabled until
+setup is complete.
 
 ## Upgrades, rollback and config
 
-Deploy a reviewed SHA with the manual workflow. Migrations/imports run at server
-startup under database advisory migrate locks, including concurrent starts.
-The old task drains on SIGTERM; ALB deregistration delay and ECS stop timeout
-are both 120 seconds. Watch uploads and client retries during the roll.
+Deploy a reviewed commit SHA with the manual GitHub workflow. Database
+migrations and imports run at server startup under PostgreSQL advisory locks
+(`pg_advisory_xact_lock`), safely coordinating concurrent task starts. The old
+task drains on SIGTERM; ALB deregistration delay and ECS stop timeout are both
+120 seconds. Watch uploads and client retries during the rolling deployment.
 
-Rollback by dispatching the workflow with the previous SHA (ensure its immutable
-ECR tag still exists). This does **not** undo migrations. A rollback is safe only
-if that server supports the new database schema and on-disk format. Otherwise
-roll forward, or restore a matched database/files/object recovery point into an
-isolated stack before moving traffic. Never guess at downgrade compatibility.
+Roll back by dispatching the workflow with the previous commit SHA (ensure its
+immutable ECR image tag still exists). Rolling back does **not** undo database
+migrations. A rollback is safe only if that server version supports the current
+database schema and on-disk format. Otherwise roll forward, or restore a
+matched database, files, and object recovery point into an isolated stack before
+moving traffic. Never guess at downgrade compatibility.
 
-For Terraform-owned infrastructure/config changes, review/apply a plan. Since
-the service ignores task_definition, applying new environment settings creates
-a revision but does not select it automatically. Merge those settings into the
-**current deployed** definition and register/select it; do not select an older
-Terraform revision that could revert the running image.
+To make configuration changes (task count, Multi-AZ, Firebase settings, or
+open sign-up):
+1. Update the corresponding variable in the GitHub `hosted` environment.
+2. Re-run the deploy workflow with the currently deployed commit ref or SHA.
 
-To turn signup off immediately without building a new image:
+The workflow reuses the existing container image in ECR, CloudFormation
+updates the task definition or stack resources, and ECS performs a rolling
+service update in a few minutes.
+
+To turn open sign-up off immediately, set `HOSTED_OPEN_SIGNUP=false` in the
+GitHub environment and re-run the workflow.
+
+Do not modify the ECS service directly with `aws ecs update-service`: the next
+workflow deploy will overwrite direct changes. Use manual updates only in an
+emergency, and update the GitHub environment variable immediately afterward.
+
+Rotating the RDS-managed database password in Secrets Manager requires forcing
+a new ECS task deployment so tasks fetch the new secret:
 
 ```sh
-current=$(aws ecs describe-services --cluster "$cluster" --services "$service" --query 'services[0].taskDefinition' --output text)
-aws ecs describe-task-definition --task-definition "$current" > /tmp/current-task.json
-python3 - <<'PY' > /tmp/config-task.json
-import json
-import importlib.util
-spec=importlib.util.spec_from_file_location('swap', 'deploy/aws/swap_image.py')
-m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-d=json.load(open('/tmp/current-task.json'))['taskDefinition']
-image=next(c['image'] for c in d['containerDefinitions'] if c['name']=='server')
-d=m.swap_image(d,image)
-env=next(c['environment'] for c in d['containerDefinitions'] if c['name']=='server')
-for item in env:
-    if item['name']=='AGENTICML_SERVER_OPEN_SIGNUP': item['value']='false'; break
-else: env.append({'name':'AGENTICML_SERVER_OPEN_SIGNUP','value':'false'})
-print(json.dumps(d))
-PY
-next=$(aws ecs register-task-definition --cli-input-json file:///tmp/config-task.json --query 'taskDefinition.taskDefinitionArn' --output text)
-aws ecs update-service --cluster "$cluster" --service "$service" --task-definition "$next"
-aws ecs wait services-stable --cluster "$cluster" --services "$service"
-rm /tmp/current-task.json /tmp/config-task.json
+aws ecs update-service --cluster agenticml-hosted --service agenticml-hosted --force-new-deployment
 ```
 
-Set `open_signup=false` in tfvars as well. Use the same current-definition
-procedure for other environment changes, preserving the image and all other
-fields. The image validates comma-separated trusted proxy CIDRs; Terraform
-trusts only the public ALB subnet CIDRs, and task ingress allows only ALB SG.
-No identity header is enabled implicitly.
+Trusted proxies are configured via `AGENTICML_SERVER_TRUSTED_PROXY` using the
+ALB subnet CIDRs only. Task security group ingress accepts traffic only from
+the ALB security group on port 8080.
 
-## Restore drill (owner, isolated test service only)
+## Restore drill and Real EFS benchmark
+
+### Restore drill (owner, isolated test service only)
 
 1. Record a database recovery timestamp, EFS recovery point, and S3 versions
    before a fixture sync and after it. Quiesce writers for a coordinated
    recovery point when exact cross-store consistency is required. Daily AWS
    Backup retention is 35 days for EFS and RDS; native RDS PITR is 7 days.
-2. Restore RDS to a **new** instance, for example:
-   `aws rds restore-db-instance-to-point-in-time --source-db-instance-identifier agenticml-hosted --target-db-instance-identifier agenticml-restore-drill --restore-time YOUR-UTC-TIMESTAMP --db-subnet-group-name agenticml-hosted --vpc-security-group-ids YOUR-RDS-SG --no-publicly-accessible`.
+2. Restore RDS to a **new** instance:
+   ```sh
+   rds_sg=$(aws ec2 describe-security-groups --filters Name=group-name,Values=agenticml-hosted-rds --query 'SecurityGroups[0].GroupId' --output text)
+   aws rds restore-db-instance-to-point-in-time \
+     --source-db-instance-identifier agenticml-hosted \
+     --target-db-instance-identifier agenticml-restore-drill \
+     --restore-time YOUR-UTC-TIMESTAMP \
+     --db-subnet-group-name agenticml-hosted \
+     --vpc-security-group-ids "$rds_sg" \
+     --no-publicly-accessible
+   ```
    Wait with `aws rds wait db-instance-available --db-instance-identifier agenticml-restore-drill`.
-   Check encryption, TLS parameter group and a managed master secret before use.
+   Check encryption, TLS parameter group, and managed master secret before use.
 3. In AWS Backup, restore the chosen EFS recovery point to a new encrypted
-   filesystem. Inspect recovery metadata with `aws backup get-recovery-point-restore-metadata`
-   using the vault and recovery-point ARN; pass the reviewed metadata and a
+   filesystem. Inspect recovery metadata with
+   `aws backup get-recovery-point-restore-metadata` using the vault
+   `agenticml-hosted` and recovery-point ARN; pass the reviewed metadata and a
    restore-capable operator role to `aws backup start-restore-job`. Create
-   private mount targets and an access point with uid/gid 10001. AWS Backup
-   may restore into a recovery directory: verify its contents and place the
-   restored store at the test access point's root before starting the server.
-4. Restore S3 object versions (including objects hidden by delete markers)
-   into a **separate test bucket**, selecting versions matching the recovery
-   point. Never remove production delete markers for a drill. Noncurrent
-   versions expire after 30 days; versioning is not an indefinite backup.
+   mount targets in the data subnets and an access point with uid/gid 10001.
+   AWS Backup may restore into a recovery subfolder: verify its contents and
+   place the restored store at the test access point root before starting the
+   server.
+4. Restore S3 object versions (including objects hidden by delete markers) into
+   a **separate test bucket**, selecting versions matching the recovery point.
+   Never remove production delete markers for a drill. Noncurrent versions
+   expire after 30 days; versioning is not an indefinite backup.
 5. Copy the current task definition into a separate test service, replacing
    EFS IDs, database host/managed-secret ARN, S3 URL, public URL, and disabling
-   signup. Give it a separate least-privilege task/execution role for the
-   restored resources. Keep it off production DNS/target group. Verify login,
+   signup. Networking: tasks run in the public task subnets with a public IPv4
+   address for outbound traffic only (no NAT). Use the hosted stack outputs
+   `TaskSubnets` and `TaskSecurityGroup` with `assignPublicIp=ENABLED`. Give it
+   a separate least-privilege task/execution role for the restored resources.
+   Keep it off production DNS and the production target group. Verify login,
    both workspaces, metrics, artifacts/code diffs, usage, and a new sync.
 6. Record recovery point age, recovery duration, commands, and integrity
    results. Remove only drill resources after review. Do not overwrite live
-   database/files to test recovery. Record any cross-store inconsistency.
+   database or files to test recovery. Record any cross-store inconsistency.
 
-## Real EFS benchmark (owner)
+### Real EFS benchmark (owner)
 
 Run the repository's `scripts/bench_server.py` on a one-off Fargate task with
 the same EFS access point, network/roles, and image. The production image
 intentionally contains only the installed wheel: create a temporary private
-benchmark image `FROM <deployed-image>` and `COPY scripts/bench_server.py
-/opt/bench_server.py`, then push it to a separate operator-owned private ECR
-repo (not a public image). Register a copy of the current task definition,
-substitute that image, and set entryPoint to `["python"]`, command to
-`["/opt/bench_server.py","--data","/data/benchmark-1","--clients","1"]`.
-Remove production database/S3/public-URL/Firebase/limits variables and secrets
-from this benchmark definition: the script runs its own local server and
-measures EFS file operations, not the live customer database. Give it a
-separate EFS directory, never `/data` itself. Use `aws ecs run-task --launch-type
-FARGATE --cluster agenticml-hosted --task-definition YOUR-BENCH-REVISION
---network-configuration file://YOUR-PRIVATE-NETWORK.json`. Repeat with
-`/data/benchmark-8` and `--clients 8`, without `--fsync-delay-ms`. Inspect task
-exit codes and collect awslogs output. The local embedded benchmark is distinct
-from a production ALB/Postgres throughput test.
+benchmark image `FROM <deployed-image>` and `COPY scripts/bench_server.py /opt/bench_server.py`,
+then push it to a separate operator-owned private ECR repo (not a public image).
+Register a copy of the current task definition, substitute that image, and set
+entryPoint to `["python"]`, command to
+`["/opt/bench_server.py", "--data", "/data/benchmark-1", "--clients", "1"]`.
+Remove production database, S3, public-URL, Firebase, and limits variables and
+secrets from this benchmark definition: the script runs its own local server
+and measures EFS file operations, not the live customer database. Give it a
+separate EFS directory, never `/data` itself.
+
+Fetch the network settings from stack outputs:
+
+```sh
+subnets=$(aws cloudformation describe-stacks --stack-name agenticml-hosted --query "Stacks[0].Outputs[?OutputKey=='TaskSubnets'].OutputValue" --output text)
+task_sg=$(aws cloudformation describe-stacks --stack-name agenticml-hosted --query "Stacks[0].Outputs[?OutputKey=='TaskSecurityGroup'].OutputValue" --output text)
+aws ecs run-task --launch-type FARGATE \
+  --cluster agenticml-hosted \
+  --task-definition YOUR-BENCH-REVISION \
+  --network-configuration "awsvpcConfiguration={subnets=[$subnets],securityGroups=[$task_sg],assignPublicIp=ENABLED}"
+```
+
+Repeat with `/data/benchmark-8` and `--clients 8`, without `--fsync-delay-ms`.
+Inspect task exit codes and collect awslogs output. The local embedded benchmark
+is distinct from a production ALB/Postgres throughput test.
 
 Record real EFS throughput/latency for 1 and 8 clients, region/AZ, task size,
-EFS elastic/generalPurpose settings and NFS mount details in `docs/SERVER.md`.
+EFS elastic/generalPurpose settings, and NFS mount details in `docs/SERVER.md`.
 Confirm or revise `--follow --interval` and `APPEND_CHUNK` recommendations;
-remove only the isolated benchmark directories/images/tasks afterwards.
+remove only the isolated benchmark directories, images, and tasks afterwards.
 
 ## Incidents, launch evidence and cost
 
-Use `aws logs tail /ecs/agenticml-hosted --follow`, ECS service events and
-CloudWatch alarms. ALB access logs expire in 90 days; app logs in 30 days.
-Alarms cover ALB 5xx >5/5min, any unhealthy host over a 5-minute period, p95
-latency >5 seconds, RDS free storage <2 GB, CPU >80%, and running tasks <2.
-Missing running-task metrics also alarm. Confirm the email subscription and
-exercise one alarm. Scale temporarily with `aws ecs update-service --cluster
-agenticml-hosted --service agenticml-hosted --desired-count 4`; also update
-Terraform desired_count before the next apply. Suspend abuse with ECS Exec:
-`agenticml server workspaces suspend customer-one --data /data`.
-Inspect `agenticml server workspaces usage --data /data`; signup can be disabled
-using the configuration procedure above.
+Monitor the service with `aws logs tail /ecs/agenticml-hosted --follow`, ECS
+service events, and CloudWatch alarms. ALB access logs expire in 90 days (stored
+in the logs bucket); application logs in CloudWatch expire in 30 days.
 
-Owner launch checklist (24.3): two real customer workspaces; sign-in/invite
-verification; sync and dashboard parity; denied cross-workspace requests;
-a rolling deploy during uploads with eventual byte/hash parity and no lost
-uploads; restore drill; real-EFS benchmark; and every 3.0 plan exit criterion 6.
+### Alarms
+
+Alarms publish to the `agenticml-alerts` SNS topic:
+1. `agenticml-hosted-alb_5xx`: ALB 5xx error count > 5 in 5 minutes (period
+   300 s, statistic `Sum`).
+2. `agenticml-hosted-unhealthy`: Any unhealthy target host for 5 minutes
+   (`UnHealthyHostCount` ≥ 1 across 5 consecutive 60 s periods). Fed by ALB
+   target group health checks on `/healthz`.
+3. `agenticml-hosted-latency-p95`: Target response time p95 > 5 seconds over
+   5 minutes (period 300 s, extended statistic `p95`).
+4. `agenticml-hosted-rds_storage`: RDS free storage < 2 GB (`FreeStorageSpace`
+   < 2,000,000,000 bytes over 300 s).
+5. `agenticml-hosted-rds_cpu`: RDS CPU utilization > 80% over 5 minutes (period
+   300 s, statistic `Average`).
+6. `agenticml-hosted-running_tasks`: Running task count below
+   `HOSTED_DESIRED_COUNT` over 5 minutes (period 300 s, statistic `Minimum`,
+   missing data treated as breaching). This alarm exists only when
+   `DesiredCount` is greater than 0.
+
+Additional bootstrap alarms:
+- `agenticml-cost-steps-errors`: CloudWatch alarm on the `agenticml-cost-steps`
+  Lambda function errors (≥ 1 failure in 24 hours).
+- `agenticml-monthly`: AWS Budget notification when actual spend or forecasted
+  spend exceeds 100% of the monthly budget.
+
+Confirm the email subscriptions and exercise one alarm to verify alerting.
+
+### Operations and scaling
+
+To scale tasks, update `HOSTED_DESIRED_COUNT` in the GitHub `hosted` environment
+variables and re-run the deploy workflow.
+
+To suspend an abusive workspace using ECS Exec:
+
+```sh
+aws ecs execute-command --cluster agenticml-hosted --task "$task" --container server --interactive \
+  --command 'agenticml server workspaces suspend customer-one --data /data'
+```
+
+To inspect aggregate workspace usage:
+
+```sh
+aws ecs execute-command --cluster agenticml-hosted --task "$task" --container server --interactive \
+  --command 'agenticml server workspaces usage --data /data'
+```
+
+### Launch checklist (package 24.3)
+
+Before considering the hosted service live:
+- Create two real customer workspaces.
+- Verify sign-in and invite links.
+- Confirm sync and dashboard parity.
+- Confirm denied cross-workspace requests (membership isolation).
+- Verify a rolling deployment during an active upload with eventual byte and
+  hash parity and no lost uploads.
+- Complete one restore drill.
+- Complete the real-EFS benchmark.
+- Satisfy every exit criterion 6 of the 3.0 plan.
 Attach evidence to roadmap Backlog entries before closing them.
 
-Approximate monthly us-east-2 planning estimate from the 3.0 plan (not a quote):
-ALB ~$20, two 0.5-vCPU/1-GB Fargate tasks ~$36, single-AZ db.t4g.small ~$25
-plus storage, one NAT ~$35, Route 53 ~$1, EFS/S3 by usage: about **$120 total**
-before transfer, storage growth, Backup, logs, alarms and Container Insights.
-Multi-AZ RDS adds roughly $25. Confirm current account pricing before apply.
+### Cost estimate
+
+Estimated monthly cost in `us-east-2` is about **$100–110/month** total:
+- Two Fargate tasks (0.5 vCPU, 1 GB RAM): ~$36
+- RDS PostgreSQL `db.t4g.small` with 20 GB gp3 storage: ~$26
+- Application Load Balancer: ~$18–22
+- Public IPv4 addresses (two tasks ~$7, ALB ~$7; no NAT gateway): ~$14
+- Container Insights, CloudWatch logs, and alarms: ~$5–8
+- Backups, EFS, S3, and ECR: ~$3–9
+- Secrets Manager: ~$0.40
+- Cost alerts (Cost Explorer API queries): ~$0.60
+Data transfer under 100 GB/month is free. DNS at Namecheap avoids Route 53
+zone fees.
+
+Savings to revisit after launch:
+- Scale to one task (~$22 savings)
+- Disable Container Insights (~$5 savings)
+- Build ARM64 images (~$7 savings)
+- Downsize RDS to `db.t4g.micro` (~$12 savings)
 
 ## Teardown
 
-Disable signup, quiesce sync, export recovery evidence, and verify backups.
-Remove RDS deletion protection only in a reviewed Terraform change; keep
-skip_final_snapshot=false and use a new unique final_snapshot_identifier.
-`terraform plan -destroy` then owner-reviewed `terraform destroy` preserves the
-final RDS snapshot. Versioned object/log buckets must be deliberately emptied
-(including versions/delete markers) or retained; no force_destroy is set.
-Nonempty backup vaults also block deletion. Decide retention explicitly before
-removing EFS/backup recovery points; never delete the remote state/lock backend
-as part of stack teardown.
+Tear down the hosted stack first, then the bootstrap stack.
+
+1. **Hosted stack teardown**:
+   Disable open signup, quiesce sync traffic, export recovery evidence, and
+   verify backups.
+
+   Turn off RDS deletion protection:
+   ```sh
+   aws rds modify-db-instance --db-instance-identifier agenticml-hosted --no-deletion-protection --apply-immediately
+   ```
+
+   Delete the stack using the CloudFormation role:
+   ```sh
+   cfn_role=$(aws cloudformation describe-stacks --stack-name agenticml-hosted-bootstrap --query "Stacks[0].Outputs[?OutputKey=='CloudFormationRoleArn'].OutputValue" --output text)
+   aws cloudformation delete-stack --stack-name agenticml-hosted --role-arn "$cfn_role"
+   ```
+
+   Retained resources:
+   - S3 objects bucket and logs bucket (`DeletionPolicy: Retain`). Versioned
+     buckets must be emptied deliberately (including versions and delete
+     markers) if deleting them.
+   - EFS file system (`DeletionPolicy: Retain`).
+   - Backup vault `agenticml-hosted` (`DeletionPolicy: Retain`).
+   - Final RDS snapshot (`DeletionPolicy: Snapshot`).
+
+2. **Bootstrap stack teardown**:
+   Once the hosted stack deletion is complete:
+   ```sh
+   aws cloudformation delete-stack --stack-name agenticml-hosted-bootstrap
+   ```
+
+   Retained resources:
+   - ECR repository `agenticml/lite-server` (`DeletionPolicy: Retain`).
+   - ACM certificate for `app.agenticml.xyz` (`DeletionPolicy: Retain`).
+   - SSM parameter `/agenticml/cost-alerts/state` (created by Lambda runtime).
+   - Shared GitHub OIDC provider is untouched when its ARN was passed via
+     `GitHubOidcProviderArn`.
+
+3. **DNS cleanup**:
+   Remove the Namecheap CNAME records (for `app` and certificate validation)
+   only after the certificate is deleted.
 
 ## Local validation
 
+Run the test suite and lint CloudFormation templates:
+
 ```sh
-testbed/.venv/bin/python -m pytest -q tests/test_deploy_swap_image.py
+testbed/.venv/bin/python -m pytest -q tests/test_deploy_cloudformation.py tests/test_cost_alerts.py
 testbed/.venv/bin/python -m pytest -q tests
+python3 -m venv /tmp/cfnlint && /tmp/cfnlint/bin/pip install cfn-lint==1.60.0
+/tmp/cfnlint/bin/cfn-lint deploy/aws/cloudformation/*.yaml
 BUILDX_CONFIG=/tmp/agenticml-buildx docker build -f deploy/aws/Dockerfile -t agenticml-hosted-check .
 docker run --rm --entrypoint agenticml agenticml-hosted-check --version
 docker run --rm --entrypoint python agenticml-hosted-check -c 'import psycopg, boto3, jwt'
@@ -285,21 +571,27 @@ AGENTICML_TEST_DATABASE_URL=postgresql://postgres:pw@127.0.0.1:55432/postgres \
   bash scripts/hosted_smoke.sh
 ```
 
+CI pins `cfn-lint` 1.60.0.
+
 The smoke test uses Linux host networking and port 8080 (must be free), creates
 and drops an isolated database, and checks a real sync, the dashboard API, S3
-object bytes and a clean SIGTERM. The S3 stand-in is a moto server: on the host
+object bytes, and a clean SIGTERM. The S3 stand-in is a moto server: on the host
 when `moto[server]` is installed in the venv, otherwise in a disposable
 `python:3.12.12-slim-bookworm` container (pinned moto 5.2.2) on the host network.
 `SMOKE_S3_BACKEND=host` or `SMOKE_S3_BACKEND=moto-container` forces one of them.
 If the default local Postgres is unavailable the script starts a disposable
-postgres:16 container on 55432. No real AWS credentials are used; every
+`postgres:16` container on port 55432. No real AWS credentials are used; every
 container and database it creates is removed on exit, also on failure.
+
+## IAM caveats and references
 
 IAM caveat: there is no `s3:HeadBucket` IAM action; it uses `s3:ListBucket`.
 The task has prefixed ListBucket plus permission when `s3:prefix` is absent to
 permit HeadBucket; this also permits an unprefixed listing in this dedicated
-bucket. Object reads/writes/deletes remain restricted to `hosted/*`. ECR auth,
-SSM channels, and ECS task registration/description need resource `*`; other
-deployment permissions are scoped to the repository, service and two roles.
+bucket. Object reads/writes/deletes remain restricted to `hosted/*`. ECR
+authorization and the SSM message channels need resource `*`. The GitHub deploy
+role can only push to the ECR repository, run change sets on the
+`agenticml-hosted` stack, pass the CloudFormation role to CloudFormation, and
+describe the one ECS service; CloudFormation itself registers task definitions.
 
-Authorization references: [AWS HeadBucket](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadBucket.html) documents ListBucket authorization; [AWS provider change](https://github.com/hashicorp/terraform-provider-aws/issues/35112) dates optional OIDC thumbprints to 5.81.0 (the configured provider floor).
+Authorization references: [AWS HeadBucket](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadBucket.html) documents ListBucket authorization.
