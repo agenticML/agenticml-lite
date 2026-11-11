@@ -1,0 +1,758 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::LanguageExtensions
+Description: >-
+  AgenticML hosted service, stack 1 of 2. Created once by the owner with admin
+  credentials: image repository, GitHub deploy roles, TLS certificate and
+  account cost alerts. The deploy workflow manages the other stack.
+
+Parameters:
+  AlertEmails:
+    Type: CommaDelimitedList
+    Description: >-
+      Addresses for cost and ops alerts, comma separated, one to five. Each
+      must click the confirmation link SNS emails to it. Give them only at
+      deploy time; they are not stored in the repository.
+    AllowedPattern: ^[^@\s,]+@[^@\s,]+\.[^@\s,]+$
+    ConstraintDescription: each entry must be an email address
+  MonthlyBudget:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    Description: Monthly budget in USD.
+  CostStep:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    Description: An email is sent each time month-to-date spend passes another multiple of this many USD.
+  Hostname:
+    Type: String
+    Default: app.agenticml.xyz
+    AllowedPattern: ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$
+  GitHubOidcProviderArn:
+    Type: String
+    Default: ""
+    Description: >-
+      ARN of the account's existing GitHub OIDC provider. Leave empty to create
+      it (an account can hold only one for token.actions.githubusercontent.com).
+  GitHubRepo:
+    Type: String
+    Default: agenticML/agenticml-lite
+    AllowedPattern: ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$
+
+Conditions:
+  CreateOidcProvider: !Equals [!Ref GitHubOidcProviderArn, ""]
+
+Resources:
+  # ---- Image repository -------------------------------------------------
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: agenticml/lite-server
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules": [{"rulePriority": 1, "description": "Keep the last 30 images",
+            "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 30},
+            "action": {"type": "expire"}}]}
+
+  # ---- GitHub deploy access ---------------------------------------------
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agenticml-hosted-deploy
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If [CreateOidcProvider, !Ref GitHubOidcProvider, !Ref GitHubOidcProviderArn]
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepo}:environment:hosted
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EcrLogin
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*" # the token call has no resource ARN
+              - Sid: EcrPush
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !GetAtt EcrRepository.Arn
+              - Sid: HostedStack
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStacks
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:GetTemplateSummary
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/agenticml-hosted/*
+              - Sid: ValidateTemplate
+                Effect: Allow
+                Action: cloudformation:ValidateTemplate
+                Resource: "*" # this call has no resource ARN
+              - Sid: PassCloudFormationRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CloudFormationRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+              - Sid: CheckRunningCount
+                Effect: Allow
+                Action: ecs:DescribeServices
+                Resource: !Sub arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:service/agenticml-hosted/agenticml-hosted
+
+  # Everything CloudFormation does to the hosted stack runs as this role, so
+  # the deploy role itself can only start and watch change sets.
+  CloudFormationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agenticml-hosted-cloudformation
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: hosted-stack
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Resource "*" below: these services cannot scope create or describe
+              # calls to a resource that does not exist yet. The region condition
+              # limits them to the stack's region.
+              - Sid: Network
+                Effect: Allow
+                Action:
+                  - ec2:AssociateRouteTable
+                  - ec2:AssociateSubnetCidrBlock
+                  - ec2:AssociateVpcCidrBlock
+                  - ec2:AttachInternetGateway
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:CreateInternetGateway
+                  - ec2:CreateNetworkInterface
+                  - ec2:CreateRoute
+                  - ec2:CreateRouteTable
+                  - ec2:CreateSecurityGroup
+                  - ec2:CreateSubnet
+                  - ec2:CreateTags
+                  - ec2:CreateVpc
+                  - ec2:CreateVpcEndpoint
+                  - ec2:DeleteInternetGateway
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DeleteRoute
+                  - ec2:DeleteRouteTable
+                  - ec2:DeleteSecurityGroup
+                  - ec2:DeleteSubnet
+                  - ec2:DeleteTags
+                  - ec2:DeleteVpc
+                  - ec2:DeleteVpcEndpoints
+                  - ec2:Describe*
+                  - ec2:DetachInternetGateway
+                  - ec2:DisassociateRouteTable
+                  - ec2:DisassociateSubnetCidrBlock
+                  - ec2:DisassociateVpcCidrBlock
+                  - ec2:ModifyNetworkInterfaceAttribute
+                  - ec2:ModifySubnetAttribute
+                  - ec2:ModifyVpcAttribute
+                  - ec2:ModifyVpcEndpoint
+                  - ec2:ReplaceRoute
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:UpdateSecurityGroupRuleDescriptionsEgress
+                  - ec2:UpdateSecurityGroupRuleDescriptionsIngress
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              - Sid: LoadBalancer
+                Effect: Allow
+                Action:
+                  - elasticloadbalancing:AddListenerCertificates
+                  - elasticloadbalancing:AddTags
+                  - elasticloadbalancing:CreateListener
+                  - elasticloadbalancing:CreateLoadBalancer
+                  - elasticloadbalancing:CreateTargetGroup
+                  - elasticloadbalancing:DeleteListener
+                  - elasticloadbalancing:DeleteLoadBalancer
+                  - elasticloadbalancing:DeleteTargetGroup
+                  - elasticloadbalancing:Describe*
+                  - elasticloadbalancing:ModifyListener
+                  - elasticloadbalancing:ModifyLoadBalancerAttributes
+                  - elasticloadbalancing:ModifyTargetGroup
+                  - elasticloadbalancing:ModifyTargetGroupAttributes
+                  - elasticloadbalancing:RemoveListenerCertificates
+                  - elasticloadbalancing:RemoveTags
+                  - elasticloadbalancing:SetIpAddressType
+                  - elasticloadbalancing:SetSecurityGroups
+                  - elasticloadbalancing:SetSubnets
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              - Sid: Containers
+                Effect: Allow
+                Action:
+                  - ecs:CreateCluster
+                  - ecs:CreateService
+                  - ecs:DeleteCluster
+                  - ecs:DeleteService
+                  - ecs:DeleteTaskDefinitions
+                  - ecs:DeregisterTaskDefinition
+                  - ecs:Describe*
+                  - ecs:List*
+                  - ecs:PutClusterCapacityProviders
+                  - ecs:RegisterTaskDefinition
+                  - ecs:TagResource
+                  - ecs:UntagResource
+                  - ecs:UpdateCluster
+                  - ecs:UpdateClusterSettings
+                  - ecs:UpdateService
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              - Sid: Database
+                Effect: Allow
+                Action:
+                  - rds:AddTagsToResource
+                  - rds:CreateDBInstance
+                  - rds:CreateDBParameterGroup
+                  - rds:CreateDBSnapshot
+                  - rds:CreateDBSubnetGroup
+                  - rds:DeleteDBInstance
+                  - rds:DeleteDBParameterGroup
+                  - rds:DeleteDBSubnetGroup
+                  - rds:Describe*
+                  - rds:ListTagsForResource
+                  - rds:ModifyDBInstance
+                  - rds:ModifyDBParameterGroup
+                  - rds:ModifyDBSubnetGroup
+                  - rds:RemoveTagsFromResource
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              - Sid: FileSystem
+                Effect: Allow
+                Action:
+                  - elasticfilesystem:CreateAccessPoint
+                  - elasticfilesystem:CreateFileSystem
+                  - elasticfilesystem:CreateMountTarget
+                  - elasticfilesystem:DeleteAccessPoint
+                  - elasticfilesystem:DeleteFileSystem
+                  - elasticfilesystem:DeleteFileSystemPolicy
+                  - elasticfilesystem:DeleteMountTarget
+                  - elasticfilesystem:Describe*
+                  - elasticfilesystem:ListTagsForResource
+                  - elasticfilesystem:ModifyMountTargetSecurityGroups
+                  - elasticfilesystem:PutBackupPolicy
+                  - elasticfilesystem:PutFileSystemPolicy
+                  - elasticfilesystem:PutLifecycleConfiguration
+                  - elasticfilesystem:TagResource
+                  - elasticfilesystem:UntagResource
+                  - elasticfilesystem:UpdateFileSystem
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              - Sid: Buckets
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                  - s3:DeleteBucketPolicy
+                  - s3:GetBucket*
+                  - s3:GetEncryptionConfiguration
+                  - s3:GetLifecycleConfiguration
+                  - s3:ListBucket
+                  - s3:PutBucket*
+                  - s3:PutEncryptionConfiguration
+                  - s3:PutLifecycleConfiguration
+                Resource: !Sub arn:${AWS::Partition}:s3:::agenticml-hosted-* # CloudFormation names buckets <stack>-<logical id>-<random>
+              - Sid: CertificateRead
+                Effect: Allow
+                Action: acm:DescribeCertificate
+                Resource: !Sub arn:${AWS::Partition}:acm:${AWS::Region}:${AWS::AccountId}:certificate/*
+              - Sid: CertificateList
+                Effect: Allow
+                Action: acm:ListCertificates
+                Resource: "*" # list calls have no resource ARN
+              - Sid: LogGroups
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:DeleteRetentionPolicy
+                  - logs:ListTagsForResource
+                  - logs:ListTagsLogGroup
+                  - logs:PutRetentionPolicy
+                  - logs:TagLogGroup
+                  - logs:TagResource
+                  - logs:UntagLogGroup
+                  - logs:UntagResource
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/agenticml-hosted*
+              - Sid: LogGroupsDescribe
+                Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: "*" # list calls have no resource ARN
+              - Sid: Alarms
+                Effect: Allow
+                Action:
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:ListTagsForResource
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:TagResource
+                  - cloudwatch:UntagResource
+                Resource: !Sub arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:agenticml-hosted-*
+              - Sid: AlarmsDescribe
+                Effect: Allow
+                Action: cloudwatch:DescribeAlarms
+                Resource: "*" # describe calls have no resource ARN
+              - Sid: Backup
+                Effect: Allow
+                Action:
+                  - backup:CreateBackupPlan
+                  - backup:CreateBackupSelection
+                  - backup:CreateBackupVault
+                  - backup:DeleteBackupPlan
+                  - backup:DeleteBackupSelection
+                  - backup:DeleteBackupVault
+                  - backup:Describe*
+                  - backup:Get*
+                  - backup:List*
+                  - backup:PutBackupVaultAccessPolicy
+                  - backup:TagResource
+                  - backup:UntagResource
+                  - backup:UpdateBackupPlan
+                  - backup-storage:MountCapsule
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              - Sid: ManagedDatabaseSecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:DeleteSecret
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:RotateSecret
+                  - secretsmanager:TagResource
+                Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:rds!*
+              - Sid: EncryptionKeys
+                Effect: Allow
+                Action:
+                  - kms:CreateGrant
+                  - kms:DescribeKey
+                Resource: "*" # the AWS-managed keys for RDS, EFS and Backup; the ViaService condition limits their use
+                Condition:
+                  StringEquals:
+                    kms:ViaService:
+                      - !Sub rds.${AWS::Region}.amazonaws.com
+                      - !Sub elasticfilesystem.${AWS::Region}.amazonaws.com
+                      - !Sub backup.${AWS::Region}.amazonaws.com
+                      - !Sub secretsmanager.${AWS::Region}.amazonaws.com
+              - Sid: ParameterRead
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}::parameter/aws/service/*
+              # The hosted stack's own roles only. The deploy and CloudFormation
+              # roles are denied below so this role cannot widen itself.
+              - Sid: HostedRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:DeleteRolePolicy
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListRolePolicies
+                  - iam:PutRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:UpdateAssumeRolePolicy
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/agenticml-hosted-*
+              - Sid: HostedRolePolicies
+                Effect: Allow
+                Action:
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/agenticml-hosted-*
+                Condition:
+                  ArnEquals:
+                    iam:PolicyARN:
+                      - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
+                      - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores
+              - Sid: PassHostedRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/agenticml-hosted-*
+                Condition:
+                  StringEquals:
+                    iam:PassedToService:
+                      - ecs-tasks.amazonaws.com
+                      - backup.amazonaws.com
+              - Sid: ServiceLinkedRoles
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/*
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName:
+                      - ecs.amazonaws.com
+                      - elasticloadbalancing.amazonaws.com
+                      - rds.amazonaws.com
+                      - backup.amazonaws.com
+              - Sid: NotTheBootstrapRoles
+                Effect: Deny
+                Action:
+                  - iam:AttachRolePolicy
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:DeleteRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PassRole
+                  - iam:PutRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:UpdateAssumeRolePolicy
+                Resource:
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/agenticml-hosted-deploy
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/agenticml-hosted-cloudformation
+
+  # ---- TLS certificate --------------------------------------------------
+  # DNS is at Namecheap, so there is no HostedZoneId: this resource waits
+  # until the owner adds the validation CNAME (shown in the stack events and
+  # by `aws acm describe-certificate`). It lives here so the hosted stack
+  # never waits on a manual step.
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      DomainName: !Ref Hostname
+      ValidationMethod: DNS
+
+  # ---- Alerts -----------------------------------------------------------
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: agenticml-alerts # no KMS key: Budgets cannot publish to an encrypted topic
+
+  AlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlertsTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Budgets
+            Effect: Allow
+            Principal:
+              Service: budgets.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlertsTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: CloudWatchAlarms
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlertsTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: AccountPrincipals
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: sns:Publish
+            Resource: !Ref AlertsTopic
+
+  # One subscription per address. The "&" strips characters that are not
+  # allowed in a logical ID.
+  Fn::ForEach::AlertSubscriptions:
+    - Email
+    - !Ref AlertEmails
+    - AlertEmail&{Email}:
+        Type: AWS::SNS::Subscription
+        Properties:
+          TopicArn: !Ref AlertsTopic
+          Protocol: email
+          Endpoint: !Ref Email
+
+  MonthlyBudgetAlert:
+    Type: AWS::Budgets::Budget
+    DependsOn: AlertsTopicPolicy # Budgets checks it can publish when the budget is created
+    Properties:
+      Budget:
+        BudgetName: agenticml-monthly
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudget
+          Unit: USD
+        CostTypes: # credits and refunds would hide real spend
+          IncludeCredit: false
+          IncludeRefund: false
+          IncludeDiscount: true
+          IncludeOtherSubscription: true
+          IncludeRecurring: true
+          IncludeSubscription: true
+          IncludeSupport: true
+          IncludeTax: true
+          IncludeUpfront: true
+          UseAmortized: false
+          UseBlended: false
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref AlertsTopic
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref AlertsTopic
+
+  # ---- Cost steps: one email each time spend passes another CostStep ----
+  # The state parameter /agenticml/cost-alerts/state is created by the function
+  # on its first run, not by this template, so redeploying never resets it.
+  CostStepsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/agenticml-cost-steps
+      RetentionInDays: 14
+
+  CostStepsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agenticml-cost-steps
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: cost-steps
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub ${CostStepsLogGroup.Arn}:*
+              - Effect: Allow
+                Action:
+                  - ce:GetCostAndUsage
+                  - ce:GetCostForecast
+                Resource: "*" # Cost Explorer has no resource ARNs
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/agenticml/cost-alerts/state
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertsTopic
+
+  CostStepsFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: CostStepsLogGroup
+    Properties:
+      FunctionName: agenticml-cost-steps
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 60
+      Role: !GetAtt CostStepsRole.Arn
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref AlertsTopic
+          STEP: !Ref CostStep
+          BUDGET: !Ref MonthlyBudget
+          STATE_PARAM: /agenticml/cost-alerts/state
+      Code:
+        ZipFile: |
+          import os, json, datetime as dt, boto3
+          E = os.environ
+          URL = 'https://console.aws.amazon.com/cost-management/home#/cost-explorer'
+          # Credits and refunds would hide real spend, so leave them out.
+          F = {'Not': {'Dimensions': {'Key': 'RECORD_TYPE', 'Values': ['Credit', 'Refund']}}}
+
+
+          def today():
+              return dt.datetime.now(dt.timezone.utc).date()
+
+
+          def nxt(d):
+              return (d + dt.timedelta(days=32)).replace(day=1)
+
+
+          def spend(ce, a, b):
+              out, kw = {}, {}
+              while True:
+                  r = ce.get_cost_and_usage(
+                      TimePeriod={'Start': str(a), 'End': str(b)}, Granularity='MONTHLY',
+                      Metrics=['UnblendedCost'], Filter=F,
+                      GroupBy=[{'Type': 'DIMENSION', 'Key': 'SERVICE'}], **kw)
+                  for t in r['ResultsByTime']:
+                      for g in t['Groups']:
+                          k = g['Keys'][0]
+                          out[k] = out.get(k, 0) + float(g['Metrics']['UnblendedCost']['Amount'])
+                  if not r.get('NextPageToken'):
+                      return out
+                  kw = {'NextPageToken': r['NextPageToken']}
+
+
+          def rows(d):
+              return [f'${v:.2f}  {k}' for k, v in sorted(d.items(), key=lambda i: -i[1]) if v >= 0.01]
+
+
+          def handler(event, context):
+              t = today()
+              if t.day == 1:
+                  return  # Cost Explorer lags up to a day: the last month is summed on the 2nd, when it is complete
+              ce, ssm, sns = (boto3.client(n, **kw) for n, kw in (
+                  ('ce', {'region_name': 'us-east-1'}), ('ssm', {}), ('sns', {})))  # Cost Explorer lives only in us-east-1
+              first, m = t.replace(day=1), t.strftime('%Y-%m')
+              step, budget, name = float(E['STEP']), float(E['BUDGET']), E['STATE_PARAM']
+              pub = lambda s, b: sns.publish(TopicArn=E['TOPIC_ARN'], Subject=s, Message=b)
+              put = lambda v: ssm.put_parameter(Name=name, Value=json.dumps(v), Type='String', Overwrite=True)
+              try:
+                  old = json.loads(ssm.get_parameter(Name=name)['Parameter']['Value'])
+              except ssm.exceptions.ParameterNotFound:
+                  old = None
+              st = dict(old or {'month': m, 'step': 0})
+              if st['month'] != m:
+                  a = dt.date.fromisoformat(st['month'] + '-01')
+                  d = spend(ce, a, nxt(a))
+                  pub(f'AWS spend for {st["month"]}: ${sum(d.values()):.2f}',
+                      '\n'.join([f'Total for {st["month"]}: ${sum(d.values()):.2f}'] + rows(d)))
+                  st = old = {'month': m, 'step': 0}
+                  put(st)  # saved now so a later error does not resend this summary
+                  st = dict(st)
+              d = spend(ce, first, t)
+              tot = sum(d.values())
+              n = int(round(tot, 2) // step)
+              if n > st['step']:
+                  body = [f'Month to date: ${tot:.2f}', f'Budget: ${budget:g} ({tot / budget:.0%} used)']
+                  try:
+                      f = ce.get_cost_forecast(
+                          TimePeriod={'Start': str(t), 'End': str(nxt(t))}, Metric='UNBLENDED_COST',
+                          Granularity='MONTHLY', Filter=F)
+                      body.append(f'Forecast for month end: ${tot + float(f["Total"]["Amount"]):.2f}')
+                  except ce.exceptions.DataUnavailableException:
+                      pass  # too early in the month for a forecast
+                  pub(f'AWS spend passed ${n * step:g} this month (${tot:.2f})',
+                      '\n'.join(body + ['By service:'] + rows(d) + [URL]))
+                  st['step'] = n
+              if st != old:
+                  put(st)
+
+  # EventBridge rule rather than EventBridge Scheduler: no extra role needed.
+  CostStepsSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: agenticml-cost-steps-daily
+      ScheduleExpression: cron(0 6 * * ? *)
+      State: ENABLED
+      Targets:
+        - Id: cost-steps
+          Arn: !GetAtt CostStepsFunction.Arn
+
+  CostStepsInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CostStepsFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CostStepsSchedule.Arn
+
+  CostStepsErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: agenticml-cost-steps-errors
+      AlarmDescription: The daily cost reporter failed; spend emails may be missing.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CostStepsFunction
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+      OKActions: [!Ref AlertsTopic]
+
+Outputs:
+  DeployRoleArn:
+    Value: !GetAtt DeployRole.Arn
+    Export:
+      Name: agenticml-hosted-bootstrap-DeployRoleArn
+  CloudFormationRoleArn:
+    Value: !GetAtt CloudFormationRole.Arn
+    Export:
+      Name: agenticml-hosted-bootstrap-CloudFormationRoleArn
+  EcrRepositoryUri:
+    Value: !GetAtt EcrRepository.RepositoryUri
+    Export:
+      Name: agenticml-hosted-bootstrap-EcrRepositoryUri
+  CertificateArn:
+    Value: !Ref Certificate
+    Export:
+      Name: agenticml-hosted-bootstrap-CertificateArn
+  AlertsTopicArn:
+    Value: !Ref AlertsTopic
+    Export:
+      Name: agenticml-hosted-bootstrap-AlertsTopicArn
