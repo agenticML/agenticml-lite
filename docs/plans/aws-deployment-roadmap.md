@@ -40,7 +40,29 @@ a second task (~$18; dispatch with `desired_count=2` once `deploy.yml` is on
 `main`), `db.t4g.small` (~$12).
 
 Who does what: **agents** write and check code; only the **owner** runs
-anything against AWS (billed resources, public endpoint).
+anything against AWS (billed resources, public endpoint). Exception: on
+Nov 12, 2026 the owner had the supervisor run Phase 3 with the owner's
+`agenticml-account` profile (bootstrap redeploys, approving the deploy run).
+
+## Current state (Nov 12, 2026)
+
+Where things stand after the first deploy; update this section when it
+changes.
+
+| What | State |
+| --- | --- |
+| Bootstrap stack `agenticml-hosted-bootstrap` | `UPDATE_COMPLETE`; redeployed twice on Nov 12 with the [24.5](packages/24.5-lean-hosted.md) fixes (immutable OIDC subject, `ecr:BatchGetImage`, EFS service-linked role) |
+| Hosted stack `agenticml-hosted` | `CREATE_COMPLETE` from deploy run 43206113226 (`dev` at `23dcb7c`), image `23dcb7c43f2309d89cd5731a1f4afda84a669e0b-arm64` |
+| Service | 1 of 1 ARM64 task (0.5 vCPU / 1 GB) running, task definition `agenticml-hosted:1` |
+| Database | `agenticml-hosted`, `db.t4g.micro`, single-AZ, 20 GB, available |
+| Alarms | all six OK; Container Insights off |
+| Load balancer | `agenticml-hosted-1705349735.us-east-2.elb.amazonaws.com`; `/healthz` 200 with the `app.agenticml.xyz` host |
+| DNS | **not yet**: no `app` CNAME at Namecheap (step 3.2) |
+| Admin account | **not yet**: the server logged a one-time setup link (search `/ecs/agenticml-hosted` for "No admin user yet"; the token is a secret, never copy it into the repo) |
+| GitHub `hosted` environment | `HOSTED_DESIRED_COUNT=2` is still set but unused since 24.5; delete it when convenient |
+
+Next, in order: 3.2 (CNAME), the public `/healthz` check from 3.3, create
+the admin account through the setup link, then Phase 4.
 
 ## Phase 0: Account checks (owner, ~30 min)
 
