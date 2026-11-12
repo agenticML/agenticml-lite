@@ -379,6 +379,7 @@ def test_hosted_parameters(hosted):
     assert params['Hostname']['Default'] == 'app.agenticml.xyz'
     # Lean default (package 24.5): one task; rolling deploys still start the new one first.
     assert params['DesiredCount']['Default'] == 1 and params['DesiredCount']['MinValue'] == 0
+    assert params['DesiredCount']['MaxValue'] == 2
     assert params['MultiAZ']['Default'] == 'false'
     assert params['FirebaseProject']['Default'] == '' and params['FirebaseApiKey']['Default'] == ''
     assert params['OpenSignup']['Default'] == 'false'

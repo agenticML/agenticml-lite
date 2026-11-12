@@ -103,12 +103,12 @@ account, used by other roles: always pass its ARN to the bootstrap stack.
 
 **Status: in progress.** A pre-flight check on Nov 12, 2026 found two
 prerequisites, 3.0a and 3.0b. 3.0a is done in package 24.5 (deploys run on
-pushes to `dev`); 3.0b is the owner's, before approving the first run.
+pushes to `dev`); 3.0b is done (the role already existed on Nov 12, 2026).
 
 | # | Step | Done when |
 | --- | --- | --- |
 | 3.0a | Make the deploy workflow runnable without `main`. GitHub only runs a `workflow_dispatch` workflow whose file is on the default branch, so `deploy.yml` also runs on pushes to `dev` that change `src/`, `pyproject.toml`, `deploy/aws/` or the workflow (package 24.5). **Done**: merging 24.5 into `dev` queues the first run | A "Deploy hosted service" run waits for approval in GitHub Actions |
-| 3.0b | Create the EFS service-linked role once with admin credentials: `aws iam create-service-linked-role --aws-service-name elasticfilesystem.amazonaws.com`. The account has none yet, and the bootstrap CloudFormation role may create service-linked roles only for ECS, Elastic Load Balancing, RDS and Backup, so the first create would likely fail at the EFS mount targets and roll back | `aws iam get-role --role-name AWSServiceRoleForAmazonElasticFileSystem` succeeds |
+| 3.0b | Create the EFS service-linked role once with admin credentials: `aws iam create-service-linked-role --aws-service-name elasticfilesystem.amazonaws.com`. The account has none yet, and the bootstrap CloudFormation role may create service-linked roles only for ECS, Elastic Load Balancing, RDS and Backup, so the first create would likely fail at the EFS mount targets and roll back. **Done**: the role already existed when checked on Nov 12, 2026 | `aws iam get-role --role-name AWSServiceRoleForAmazonElasticFileSystem` succeeds |
 | 3.1 | After 3.0b, approve the waiting deploy run (the 24.5 merge into `dev`) in GitHub Actions; `desired_count` defaults to 1 | Workflow green; stack `CREATE_COMPLETE` (RDS takes the longest) |
 | 3.2 | In Namecheap, add a CNAME `app` → the `AlbDnsName` output | `dig +short app.agenticml.xyz` shows the load balancer |
 | 3.3 | Check the service; optionally delete the unused `HOSTED_DESIRED_COUNT` variable from the `hosted` environment | `curl https://app.agenticml.xyz/healthz` returns 200; one task running; logs clean |

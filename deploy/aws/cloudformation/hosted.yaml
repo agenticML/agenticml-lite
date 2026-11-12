@@ -18,6 +18,7 @@ Parameters:
     Type: Number
     Default: 1
     MinValue: 0
+    MaxValue: 2
     Description: Service tasks; rolling deploys start the new task before stopping the old one.
   MultiAZ:
     Type: String
