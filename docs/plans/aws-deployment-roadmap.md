@@ -37,6 +37,9 @@ anything against AWS (billed resources, public endpoint).
 
 ## Phase 0: Account checks (owner, ~30 min)
 
+**Status: done** (Nov 11, 2026). The account already has a GitHub OIDC
+provider used by other roles; its ARN is passed to the bootstrap stack.
+
 | # | Step | Done when |
 | --- | --- | --- |
 | 0.1 | Install AWS CLI v2 and the Session Manager plugin; sign in to the target account in `us-east-2` | `aws sts get-caller-identity` shows the right account |
@@ -55,7 +58,7 @@ account, used by other roles: always pass its ARN to the bootstrap stack.
 
 | # | Step | Done when |
 | --- | --- | --- |
-| 1.1 | `bootstrap.yaml`: ECR repository, GitHub OIDC provider (optional), deploy role, CloudFormation role, ACM certificate, alerts topic, $50 budget, $10-step cost emails | `cfn-lint` clean; tests pass |
+| 1.1 | `bootstrap.yaml`: ECR repository, GitHub OIDC provider (optional), deploy role, CloudFormation role, ACM certificate, alerts topic, $100 budget, $10-step cost emails | `cfn-lint` clean; tests pass |
 | 1.2 | `hosted.yaml`: VPC (ALB, task and data subnets, no NAT), ALB with the bootstrap certificate, ECS Fargate, RDS Postgres 16, EFS, S3, Backup, alarms | `cfn-lint` clean; invariant test passes |
 | 1.3 | `deploy.yml` builds or reuses the SHA image, then runs `aws cloudformation deploy`; CI runs `cfn-lint` in place of Terraform | Full test suite passes |
 | 1.4 | Remove `deploy/aws/terraform/` and `swap_image.py` | Gone; no Terraform in CI |
@@ -63,6 +66,24 @@ account, used by other roles: always pass its ARN to the bootstrap stack.
 | 1.6 | Rewrite the runbook (`deploy/aws/README.md`, `docs/HOSTED.md`) for CloudFormation | Supervisor checked it against the templates |
 
 ## Phase 2: Bootstrap (owner, ~15 min)
+
+**Status: done** (checked against the account on Nov 12, 2026).
+
+- Stack `agenticml-hosted-bootstrap` is `CREATE_COMPLETE` (Nov 11) with the
+  existing OIDC provider ARN, a $100 budget and $10 cost steps. All five
+  outputs are present.
+- The certificate for `app.agenticml.xyz` is `ISSUED`. Keep its validation
+  CNAME in Namecheap: ACM needs it to renew.
+- The GitHub `hosted` environment requires the owner's review and allows only
+  `dev`, `main` and `v*` tags. All six variables are set, and both role ARNs
+  match the stack outputs.
+- A hand-made $10 console budget was deleted, so `agenticml-monthly` is the
+  only budget.
+- Open: on Nov 12 the second alert address had not yet confirmed its SNS
+  subscription. It must click the AWS confirmation email; the link expires
+  three days after the stack was created (about Nov 14). If it has expired,
+  re-subscribe the address to the `AlertsTopicArn` output with
+  `aws sns subscribe --protocol email`. This does not block Phase 3.
 
 | # | Step | Done when |
 | --- | --- | --- |
@@ -73,8 +94,13 @@ account, used by other roles: always pass its ARN to the bootstrap stack.
 
 ## Phase 3: First deploy (owner, ~30 min, mostly waiting)
 
+**Status: not started.** A pre-flight check on Nov 12, 2026 found two
+prerequisites, steps 3.0a and 3.0b, that must be done before 3.1.
+
 | # | Step | Done when |
 | --- | --- | --- |
+| 3.0a | Make the deploy workflow dispatchable. GitHub only runs a `workflow_dispatch` workflow whose file exists on the default branch (`main`), and `deploy.yml` is only on `dev`, so `gh workflow run deploy.yml --ref dev` answers 404. Open a PR to `main` that adds an identical copy of `.github/workflows/deploy.yml` (a run dispatched with `--ref dev` still uses the `dev` copy and templates), or merge `dev` into `main` | `gh workflow list` shows "Deploy hosted service"; `gh workflow run deploy.yml --ref dev` starts a run |
+| 3.0b | Create the EFS service-linked role once with admin credentials: `aws iam create-service-linked-role --aws-service-name elasticfilesystem.amazonaws.com`. The account has none yet, and the bootstrap CloudFormation role may create service-linked roles only for ECS, Elastic Load Balancing, RDS and Backup, so the first create would likely fail at the EFS mount targets and roll back | `aws iam get-role --role-name AWSServiceRoleForAmazonElasticFileSystem` succeeds |
 | 3.1 | Run the deploy workflow with a reviewed commit SHA and approve it | Workflow green; stack `CREATE_COMPLETE` (RDS takes the longest) |
 | 3.2 | In Namecheap, add a CNAME `app` → the `AlbDnsName` output | `dig +short app.agenticml.xyz` shows the load balancer |
 | 3.3 | Check the service | `curl https://app.agenticml.xyz/healthz` returns 200; two tasks running; logs clean |
