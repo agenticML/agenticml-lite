@@ -11,8 +11,10 @@ Decisions (owner, Nov 10, 2026):
 - **CloudFormation**, not Terraform. AWS keeps the stack state, so there is
   no state bucket or lock table.
 - **One region:** `us-east-2`.
-- **Deploys run from a GitHub workflow**: manual dispatch, a protected
-  `hosted` environment, and an OIDC role.
+- **Deploys run from a GitHub workflow**: a protected `hosted` environment
+  and an OIDC role. Changed Nov 12, 2026: a push to `dev` that changes the
+  image or the stack queues a deploy for the owner's approval, so nothing has
+  to reach `main` first; manual dispatch stays for later.
 - **No NAT gateway.** Tasks run in public subnets with public IPs for
   outbound traffic only; RDS and EFS stay private.
 - **No Firebase at first.** People sign in with passwords set through
@@ -24,13 +26,18 @@ Decisions (owner, Nov 10, 2026):
   bootstrap stack is deployed, never committed). Ops alarms go to the same
   addresses.
 
-Estimated cost: about **$100–110/month**: two Fargate tasks ~$36, RDS
-`db.t4g.small` with 20 GB ~$26, ALB ~$18–22, public IPv4 for the two tasks
-~$7 and for the ALB ~$7, Container Insights, logs and alarms ~$5–8,
-backups, EFS, S3 and ECR ~$3–9, Secrets Manager $0.40, cost alerts ~$0.60.
-Data transfer under 100 GB/month is free. Savings to revisit after launch:
-one task (~$22), no Container Insights (~$5), ARM image (~$7),
-`db.t4g.micro` (~$12).
+- **Lean setup, about $60/month** (owner, Nov 12, 2026; package
+  [24.5](packages/24.5-lean-hosted.md)): one ARM64 Fargate task by default,
+  RDS `db.t4g.micro`, Container Insights off.
+
+Estimated cost: about **$62–66/month**: one ARM64 Fargate task (0.5 vCPU,
+1 GB) ~$14.40, ALB ~$17–18, public IPv4 for the ALB (2) and the task (1)
+~$11, RDS `db.t4g.micro` with 20 GB ~$14, EFS ~$1–2, S3 and ECR ~$1–2, logs
+and 6 alarms ~$1–2, backups ~$1, Secrets Manager $0.40, cost alerts ~$0.60.
+Data transfer under 100 GB/month is free. The earlier design (two x86 tasks,
+`db.t4g.small`, Container Insights) was about $100–110. To scale up later:
+a second task (~$18; dispatch with `desired_count=2` once `deploy.yml` is on
+`main`), `db.t4g.small` (~$12).
 
 Who does what: **agents** write and check code; only the **owner** runs
 anything against AWS (billed resources, public endpoint).
@@ -94,16 +101,17 @@ account, used by other roles: always pass its ARN to the bootstrap stack.
 
 ## Phase 3: First deploy (owner, ~30 min, mostly waiting)
 
-**Status: not started.** A pre-flight check on Nov 12, 2026 found two
-prerequisites, steps 3.0a and 3.0b, that must be done before 3.1.
+**Status: in progress.** A pre-flight check on Nov 12, 2026 found two
+prerequisites, 3.0a and 3.0b. 3.0a is done in package 24.5 (deploys run on
+pushes to `dev`); 3.0b is the owner's, before approving the first run.
 
 | # | Step | Done when |
 | --- | --- | --- |
-| 3.0a | Make the deploy workflow dispatchable. GitHub only runs a `workflow_dispatch` workflow whose file exists on the default branch (`main`), and `deploy.yml` is only on `dev`, so `gh workflow run deploy.yml --ref dev` answers 404. Open a PR to `main` that adds an identical copy of `.github/workflows/deploy.yml` (a run dispatched with `--ref dev` still uses the `dev` copy and templates), or merge `dev` into `main` | `gh workflow list` shows "Deploy hosted service"; `gh workflow run deploy.yml --ref dev` starts a run |
+| 3.0a | Make the deploy workflow runnable without `main`. GitHub only runs a `workflow_dispatch` workflow whose file is on the default branch, so `deploy.yml` also runs on pushes to `dev` that change `src/`, `pyproject.toml`, `deploy/aws/` or the workflow (package 24.5). **Done**: merging 24.5 into `dev` queues the first run | A "Deploy hosted service" run waits for approval in GitHub Actions |
 | 3.0b | Create the EFS service-linked role once with admin credentials: `aws iam create-service-linked-role --aws-service-name elasticfilesystem.amazonaws.com`. The account has none yet, and the bootstrap CloudFormation role may create service-linked roles only for ECS, Elastic Load Balancing, RDS and Backup, so the first create would likely fail at the EFS mount targets and roll back | `aws iam get-role --role-name AWSServiceRoleForAmazonElasticFileSystem` succeeds |
-| 3.1 | Run the deploy workflow with a reviewed commit SHA and approve it | Workflow green; stack `CREATE_COMPLETE` (RDS takes the longest) |
+| 3.1 | After 3.0b, approve the waiting deploy run (the 24.5 merge into `dev`) in GitHub Actions; `desired_count` defaults to 1 | Workflow green; stack `CREATE_COMPLETE` (RDS takes the longest) |
 | 3.2 | In Namecheap, add a CNAME `app` → the `AlbDnsName` output | `dig +short app.agenticml.xyz` shows the load balancer |
-| 3.3 | Check the service | `curl https://app.agenticml.xyz/healthz` returns 200; two tasks running; logs clean |
+| 3.3 | Check the service; optionally delete the unused `HOSTED_DESIRED_COUNT` variable from the `hosted` environment | `curl https://app.agenticml.xyz/healthz` returns 200; one task running; logs clean |
 
 ## Phase 4: First accounts and data (owner)
 

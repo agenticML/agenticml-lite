@@ -438,6 +438,7 @@ Resources:
                       - elasticloadbalancing.amazonaws.com
                       - rds.amazonaws.com
                       - backup.amazonaws.com
+                      - elasticfilesystem.amazonaws.com
               - Sid: NotTheBootstrapRoles
                 Effect: Deny
                 Action:

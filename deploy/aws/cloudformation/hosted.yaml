@@ -16,8 +16,9 @@ Parameters:
     Description: Must match the bootstrap stack's certificate.
   DesiredCount:
     Type: Number
-    Default: 2
+    Default: 1
     MinValue: 0
+    Description: Service tasks; rolling deploys start the new task before stopping the old one.
   MultiAZ:
     Type: String
     Default: "false"
@@ -392,7 +393,7 @@ Resources:
       DBInstanceIdentifier: agenticml-hosted
       Engine: postgres
       EngineVersion: "16"
-      DBInstanceClass: db.t4g.small
+      DBInstanceClass: db.t4g.micro
       DBName: agenticml
       MasterUsername: agenticml
       ManageMasterUserPassword: true
@@ -660,7 +661,7 @@ Resources:
     Properties:
       ClusterName: agenticml-hosted
       ClusterSettings:
-        - {Name: containerInsights, Value: enabled}
+        - {Name: containerInsights, Value: disabled}
 
   LogGroup:
     Type: AWS::Logs::LogGroup
@@ -679,7 +680,7 @@ Resources:
       ExecutionRoleArn: !GetAtt ExecutionRole.Arn
       TaskRoleArn: !GetAtt TaskRole.Arn
       RuntimePlatform:
-        CpuArchitecture: X86_64
+        CpuArchitecture: ARM64 # the deploy workflow builds the image for linux/arm64
         OperatingSystemFamily: LINUX
       Volumes:
         - Name: data
@@ -881,22 +882,26 @@ Resources:
       AlarmActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
       OKActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
 
-  # Threshold follows DesiredCount; no alarm while the service is scaled to zero.
-  RunningTasksAlarm:
+  # No healthy target for 5 minutes means the service is down. Uses the free
+  # load balancer metric (Container Insights is off); no alarm while the
+  # service is scaled to zero. Created after the service is stable, so a
+  # first create or a scale-up from zero does not alarm while tasks start.
+  HealthyHostsAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HasTasks
+    DependsOn: Service
     Properties:
-      AlarmName: agenticml-hosted-running_tasks
-      Namespace: ECS/ContainerInsights
-      MetricName: RunningTaskCount
+      AlarmName: agenticml-hosted-healthy_hosts
+      Namespace: AWS/ApplicationELB
+      MetricName: HealthyHostCount
       Statistic: Minimum
       Dimensions:
-        - {Name: ClusterName, Value: !Ref Cluster}
-        - {Name: ServiceName, Value: !GetAtt Service.Name}
+        - {Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName}
+        - {Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName}
       ComparisonOperator: LessThanThreshold
-      Threshold: !Ref DesiredCount
-      Period: 300
-      EvaluationPeriods: 1
+      Threshold: 1
+      Period: 60
+      EvaluationPeriods: 5
       TreatMissingData: breaching
       AlarmActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
       OKActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]

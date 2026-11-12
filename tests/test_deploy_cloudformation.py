@@ -116,7 +116,7 @@ def test_no_email_address_in_template(name):
 def test_no_email_address_in_deploy_workflow():
     workflow = ROOT / '.github/workflows/deploy.yml'
     if workflow.exists():
-        assert '@' not in re.sub(r'actions/[\w-]+@v\d+|aws-actions/[\w-]+@v\d+', '', workflow.read_text())
+        assert '@' not in re.sub(r'(?:aws-actions|actions|docker)/[\w-]+@v\d+|\[@\]', '', workflow.read_text())
 
 
 # -------------------------------------------------------------------- bootstrap
@@ -233,6 +233,17 @@ def test_cloudformation_role_covers_subnet_cidrs_and_managed_secret_rotation(boo
     # RDS ManageMasterUserPassword needs the caller to hold these three.
     assert {'secretsmanager:CreateSecret', 'secretsmanager:RotateSecret', 'secretsmanager:TagResource'} <= set(
         actions_of(stmts['ManagedDatabaseSecret']))
+
+
+def test_cloudformation_role_creates_only_the_stacks_service_linked_roles(bootstrap):
+    stmts = {s['Sid']: s for s in role_statements(bootstrap['Resources']['CloudFormationRole']) if 'Sid' in s}
+    linked = stmts['ServiceLinkedRoles']
+    assert actions_of(linked) == ['iam:CreateServiceLinkedRole']
+    assert linked['Resource']['Fn::Sub'].endswith(':role/aws-service-role/*')
+    # EFS mount targets need the EFS one in a fresh account.
+    assert set(linked['Condition']['StringEquals']['iam:AWSServiceName']) == {
+        'ecs.amazonaws.com', 'elasticloadbalancing.amazonaws.com', 'rds.amazonaws.com',
+        'backup.amazonaws.com', 'elasticfilesystem.amazonaws.com'}
 
 
 def test_certificate_is_dns_validated_without_hosted_zone(bootstrap):
@@ -366,7 +377,8 @@ def test_hosted_parameters(hosted):
                            'FirebaseApiKey', 'OpenSignup', 'VpcCidr'}
     assert 'Default' not in params['ImageTag']
     assert params['Hostname']['Default'] == 'app.agenticml.xyz'
-    assert params['DesiredCount']['Default'] == 2 and params['DesiredCount']['MinValue'] == 0
+    # Lean default (package 24.5): one task; rolling deploys still start the new one first.
+    assert params['DesiredCount']['Default'] == 1 and params['DesiredCount']['MinValue'] == 0
     assert params['MultiAZ']['Default'] == 'false'
     assert params['FirebaseProject']['Default'] == '' and params['FirebaseApiKey']['Default'] == ''
     assert params['OpenSignup']['Default'] == 'false'
@@ -409,7 +421,7 @@ def test_hosted_database_is_protected(hosted):
     assert props['ManageMasterUserPassword'] is True
     assert 'MasterUserPassword' not in props
     assert props['MultiAZ'] == {'Ref': 'MultiAZ'}
-    assert (props['Engine'], props['EngineVersion'], props['DBInstanceClass']) == ('postgres', '16', 'db.t4g.small')
+    assert (props['Engine'], props['EngineVersion'], props['DBInstanceClass']) == ('postgres', '16', 'db.t4g.micro')
     assert (props['StorageType'], props['AllocatedStorage'], props['MaxAllocatedStorage']) == ('gp3', '20', 100)
     assert props['BackupRetentionPeriod'] == 7
     group = only(hosted, 'AWS::RDS::DBParameterGroup')['Properties']
@@ -559,7 +571,11 @@ def test_hosted_service_runs_in_task_subnets_with_public_ip(hosted):
         'MinimumHealthyPercent': 100, 'MaximumPercent': 200,
         'DeploymentCircuitBreaker': {'Enable': True, 'Rollback': True}}
     assert service['ServiceName'] == 'agenticml-hosted'
-    assert hosted['Resources']['Cluster']['Properties']['ClusterName'] == 'agenticml-hosted'
+    cluster = hosted['Resources']['Cluster']['Properties']
+    assert cluster['ClusterName'] == 'agenticml-hosted'
+    # Container Insights costs extra; the alarms use free ALB and RDS metrics.
+    assert cluster['ClusterSettings'] == [{'Name': 'containerInsights', 'Value': 'disabled'}]
+    assert not [n for n in walk(hosted) if isinstance(n, dict) and n.get('Namespace') == 'ECS/ContainerInsights']
     assert hosted['Resources']['LogGroup']['Properties'] == {
         'LogGroupName': '/ecs/agenticml-hosted', 'RetentionInDays': 30}
 
@@ -622,7 +638,7 @@ def test_hosted_image_comes_from_the_imported_repository(hosted):
     assert template == '${RepositoryUri}:${ImageTag}'
     assert variables == {'RepositoryUri': {'Fn::ImportValue': 'agenticml-hosted-bootstrap-EcrRepositoryUri'}}
     assert (props['Cpu'], props['Memory'], props['NetworkMode']) == ('512', '1024', 'awsvpc')
-    assert props['RuntimePlatform'] == {'CpuArchitecture': 'X86_64', 'OperatingSystemFamily': 'LINUX'}
+    assert props['RuntimePlatform'] == {'CpuArchitecture': 'ARM64', 'OperatingSystemFamily': 'LINUX'}
     assert container['StopTimeout'] == 120
     (volume,) = props['Volumes']
     assert volume['EFSVolumeConfiguration']['TransitEncryption'] == 'ENABLED'
@@ -724,7 +740,7 @@ def test_hosted_alarms_notify_the_imported_topic(hosted):
     topic = {'Fn::ImportValue': 'agenticml-hosted-bootstrap-AlertsTopicArn'}
     alarms = alarms_of(hosted)
     assert set(alarms) == {'agenticml-hosted-alb_5xx', 'agenticml-hosted-unhealthy', 'agenticml-hosted-rds_storage',
-                           'agenticml-hosted-rds_cpu', 'agenticml-hosted-running_tasks',
+                           'agenticml-hosted-rds_cpu', 'agenticml-hosted-healthy_hosts',
                            'agenticml-hosted-latency-p95'}
     for alarm in alarms.values():
         assert alarm['AlarmActions'] == [topic] and alarm['OKActions'] == [topic]
@@ -738,15 +754,21 @@ def test_hosted_alarms_notify_the_imported_topic(hosted):
         'unhealthy': ('AWS/ApplicationELB', 'UnHealthyHostCount', 'Maximum', None, 'GreaterThanOrEqualToThreshold', 1, 60, 5, 'notBreaching'),
         'rds_storage': ('AWS/RDS', 'FreeStorageSpace', 'Minimum', None, 'LessThanThreshold', 2000000000, 300, 1, 'notBreaching'),
         'rds_cpu': ('AWS/RDS', 'CPUUtilization', 'Average', None, 'GreaterThanThreshold', 80, 300, 1, 'notBreaching'),
-        'running_tasks': ('ECS/ContainerInsights', 'RunningTaskCount', 'Minimum', None, 'LessThanThreshold', {'Ref': 'DesiredCount'}, 300, 1, 'breaching'),
+        'healthy_hosts': ('AWS/ApplicationELB', 'HealthyHostCount', 'Minimum', None, 'LessThanThreshold', 1, 60, 5, 'breaching'),
         'latency-p95': ('AWS/ApplicationELB', 'TargetResponseTime', None, 'p95', 'GreaterThanThreshold', 5, 300, 1, 'notBreaching'),
     }
-    # running_tasks follows DesiredCount (not a fixed 2) and only exists
-    # while DesiredCount is not 0, so scaling to 1 or 0 does not leave it in ALARM.
+    # healthy_hosts (no healthy target for 5 minutes) only exists while
+    # DesiredCount is not 0, so scaling to 0 does not leave it in ALARM.
     assert hosted['Conditions']['HasTasks'] == {'Fn::Not': [{'Fn::Equals': [{'Ref': 'DesiredCount'}, 0]}]}
     conditions = {r['Properties']['AlarmName']: r.get('Condition')
                   for r in resources_of(hosted, 'AWS::CloudWatch::Alarm').values()}
-    assert conditions.pop('agenticml-hosted-running_tasks') == 'HasTasks'
+    assert conditions.pop('agenticml-hosted-healthy_hosts') == 'HasTasks'
+    # Created after the service is stable: no false alarm while the first tasks start.
+    assert hosted['Resources']['HealthyHostsAlarm']['DependsOn'] == 'Service'
+    healthy = alarms['agenticml-hosted-healthy_hosts']
+    assert healthy['Dimensions'] == [
+        {'Name': 'LoadBalancer', 'Value': {'Fn::GetAtt': 'LoadBalancer.LoadBalancerFullName'}},
+        {'Name': 'TargetGroup', 'Value': {'Fn::GetAtt': 'TargetGroup.TargetGroupFullName'}}]
     assert not any(conditions.values())
 
 
@@ -823,6 +845,48 @@ def test_deploy_workflow_only_deploys_commits_on_the_dispatching_ref():
     assert len(creds) == 1
     assert steps.index(checkout) < guard[0] < creds[0]
     assert steps[guard[0]]['env']['INPUT_REF'] == '${{ inputs.ref }}'
+
+
+def test_deploy_workflow_runs_on_dev_pushes_and_on_dispatch():
+    workflow = load_workflow('deploy.yml')
+    # PyYAML reads the bare `on` key as True.
+    triggers = workflow[True]
+    assert set(triggers) == {'push', 'workflow_dispatch'}
+    assert triggers['push']['branches'] == ['dev']
+    # Docs and the bootstrap template (deployed by hand) do not queue a deploy.
+    assert triggers['push']['paths'] == [
+        'src/**', 'pyproject.toml', 'deploy/aws/**', '!deploy/aws/**/*.md',
+        '!deploy/aws/cloudformation/bootstrap.yaml', '.github/workflows/deploy.yml']
+    count = triggers['workflow_dispatch']['inputs']['desired_count']
+    assert count['type'] == 'choice' and count['default'] == '1' and set(count['options']) == {'0', '1', '2'}
+
+
+def test_deploy_workflow_desired_count_comes_from_the_input_not_a_variable():
+    text = (ROOT / '.github/workflows/deploy.yml').read_text()
+    assert 'HOSTED_DESIRED_COUNT' not in text
+    steps = load_workflow('deploy.yml')['jobs']['deploy']['steps']
+    (deploy,) = [s for s in steps if 'DESIRED_COUNT' in s.get('env', {})]
+    assert deploy['env']['DESIRED_COUNT'] == '${{ inputs.desired_count }}'
+    # Push runs (no input) leave the parameter out, so the stack keeps its count.
+    assert 'if [ -n "$DESIRED_COUNT" ]; then\n  overrides+=(DesiredCount="$DESIRED_COUNT")' in deploy['run']
+    assert '--parameter-overrides "${overrides[@]}"' in deploy['run']
+    # The final check compares against the service's own desired count.
+    (check,) = [s for s in steps if 'runningCount' in s.get('run', '')]
+    assert "'services[0].[runningCount,desiredCount]'" in check['run']
+
+
+def test_deploy_workflow_builds_an_arm64_image_with_an_arch_tag():
+    steps = load_workflow('deploy.yml')['jobs']['deploy']['steps']
+    qemu = [i for i, s in enumerate(steps) if s.get('uses', '').startswith('docker/setup-qemu-action@')]
+    build = [i for i, s in enumerate(steps) if 'docker build' in s.get('run', '')]
+    assert len(qemu) == 1 and len(build) == 1 and qemu[0] < build[0]
+    assert steps[qemu[0]]['with']['platforms'] == 'arm64'
+    run = steps[build[0]]['run']
+    assert 'docker build --platform linux/arm64 ' in run
+    assert 'tag="$(git rev-parse HEAD)-arm64"' in run
+    assert 'imageTag="$tag"' in run and 'IMAGE_TAG=$tag' in run
+    dockerfile = (ROOT / 'deploy/aws/Dockerfile').read_text()
+    assert 'FROM --platform=$BUILDPLATFORM python:' in dockerfile
 
 
 def test_deploy_check_job_lints_templates_instead_of_terraform():
