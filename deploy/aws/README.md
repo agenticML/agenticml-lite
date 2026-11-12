@@ -13,7 +13,10 @@ Two CloudFormation stacks run in us-east-2:
 
 Tools needed on your laptop:
 - AWS CLI v2 with the Session Manager plugin installed.
-- Docker with an x86_64 builder.
+- Docker with BuildKit, only for local builds (for example
+  `scripts/hosted_smoke.sh`). The deploy workflow builds the image itself. The
+  service runs on ARM64 (Graviton); on an x86 machine, `--platform linux/arm64`
+  needs QEMU/binfmt.
 - GitHub CLI (`gh`).
 - An IAM admin user (not the account root user). Configure a local profile such
   as `export AWS_PROFILE=agenticml-account`.
@@ -136,7 +139,6 @@ In GitHub repository Settings → Environments, create the `hosted` environment.
 gh variable set AWS_DEPLOY_ROLE_ARN --env hosted --body "<DeployRoleArn>"
 gh variable set AWS_CFN_ROLE_ARN --env hosted --body "<CloudFormationRoleArn>"
 gh variable set AWS_REGION --env hosted --body "us-east-2"
-gh variable set HOSTED_DESIRED_COUNT --env hosted --body "2"
 gh variable set HOSTED_MULTI_AZ --env hosted --body "false"
 gh variable set HOSTED_OPEN_SIGNUP --env hosted --body "false"
 ```
@@ -149,7 +151,6 @@ ready; the workflow passes unset variables to the template as empty strings.
 | `AWS_DEPLOY_ROLE_ARN` | Bootstrap output `DeployRoleArn` | (Required) |
 | `AWS_CFN_ROLE_ARN` | Bootstrap output `CloudFormationRoleArn` | (Required) |
 | `AWS_REGION` | `us-east-2` | `us-east-2` |
-| `HOSTED_DESIRED_COUNT` | Running task count | `2` |
 | `HOSTED_MULTI_AZ` | `true` or `false` | `false` |
 | `HOSTED_FIREBASE_PROJECT` | Firebase project ID (empty = Firebase off) | (empty) |
 | `HOSTED_FIREBASE_API_KEY` | Public Firebase web API key | (empty) |
@@ -157,30 +158,55 @@ ready; the workflow passes unset variables to the template as empty strings.
 
 `HOSTED_OPEN_SIGNUP=true` requires a non-empty `HOSTED_FIREBASE_PROJECT`;
 otherwise CloudFormation template assertions fail before any resource changes.
-No secrets are needed. The database password is generated and stored in an
+The task count is no longer a variable: it comes from the deploy workflow's
+`desired_count` input (see First deploy). Delete `HOSTED_DESIRED_COUNT` if it
+is already set; nothing reads it. No secrets are needed. The database password is generated and stored in an
 RDS-managed secret.
 
 ## First deploy
 
-Trigger the deployment workflow using GitHub CLI. Run it only after the
-CloudFormation workflow is merged into the branch you dispatch from (for example
-`dev`).
+Before approving the first deploy, create the EFS service-linked role once
+(the bootstrap stack's CloudFormation role can also create it now, because
+`elasticfilesystem.amazonaws.com` is in its service-linked-role list, but that
+only applies after the bootstrap stack is redeployed):
+
+```sh
+aws iam create-service-linked-role --aws-service-name elasticfilesystem.amazonaws.com
+```
+
+The deploy workflow runs automatically on every push to `dev` that changes
+`src/**`, `pyproject.toml`, `deploy/aws/**` (except Markdown files and
+`bootstrap.yaml`) or `.github/workflows/deploy.yml`. Each run waits for the
+required reviewer on the `hosted` environment. So the first deploy is: merge
+to `dev`, then approve the waiting "Deploy hosted service" run in GitHub
+Actions. Push runs keep the stack's current task count (one on the first
+create).
+
+Before approving, read the commit the run deploys: anyone who can push to
+`dev` controls what it runs, so keep `dev` protected. The first waiting run
+holds the deploy slot, and later pushes queue behind it (only the newest one
+is kept). If a newer commit is waiting, reject the older run instead of
+approving it, then approve the newer one.
+
+You can also start a run by hand with GitHub CLI, but GitHub only allows
+`workflow_dispatch` for workflows on the default branch, so this works only
+once `deploy.yml` is also on `main`:
 
 ```sh
 gh workflow run deploy.yml --ref dev
+gh workflow run deploy.yml --ref dev -f ref=<sha> -f desired_count=1
 ```
 
 You can also run against `main` or a `v*` tag. An optional commit SHA passed
 via `-f ref=<sha>` must be an ancestor already present on the selected branch
 or tag; the workflow checks `git merge-base --is-ancestor` and refuses other
-commits.
-
-Approve the run in GitHub Actions.
+commits. `desired_count` accepts `1` (default), `0` or `2`.
 
 The workflow:
 1. Assumes the deploy role via GitHub OIDC.
 2. Checks if an image for the commit SHA exists in ECR. If not, builds the
-   image from `deploy/aws/Dockerfile` and pushes it with the commit SHA tag.
+   image from `deploy/aws/Dockerfile` for `linux/arm64` under QEMU and pushes
+   it with the tag `<commit sha>-arm64`.
 3. Runs `aws cloudformation deploy` for `deploy/aws/cloudformation/hosted.yaml`
    passing the image tag and environment configuration, using the CloudFormation
    role.
@@ -188,7 +214,7 @@ The workflow:
    instance creation takes 10–20 minutes; workflow timeout is 60 minutes).
 5. On failure, outputs the last 30 CloudFormation stack events.
 6. On success, prints the outputs `AlbDnsName` and `ServiceUrl` and verifies
-   that running ECS tasks match `HOSTED_DESIRED_COUNT`.
+   that the running ECS task count matches the service's desired count.
 
 After the workflow finishes, add the application CNAME record in Namecheap:
 - Domain List → agenticml.xyz → Advanced DNS → Add New Record → CNAME.
@@ -304,23 +330,34 @@ setup is complete.
 
 ## Upgrades, rollback and config
 
-Deploy a reviewed commit SHA with the manual GitHub workflow. Database
+Every push to `dev` that changes the image or the stack queues a deploy of
+that commit; approve it in GitHub Actions. Once `deploy.yml` is on `main`, you
+can also dispatch a reviewed commit SHA by hand. Database
 migrations and imports run at server startup under PostgreSQL advisory locks
-(`pg_advisory_xact_lock`), safely coordinating concurrent task starts. The old
-task drains on SIGTERM; ALB deregistration delay and ECS stop timeout are both
-120 seconds. Watch uploads and client retries during the rolling deployment.
+(`pg_advisory_xact_lock`), safely coordinating concurrent task starts. Rolling
+deploys start the new task before stopping the old one
+(`minimumHealthyPercent=100`, `maximumPercent=200`), so a single task still
+deploys without downtime. The old task drains on SIGTERM; ALB deregistration
+delay and ECS stop timeout are both 120 seconds. Watch uploads and client
+retries during the rolling deployment.
 
-Roll back by dispatching the workflow with the previous commit SHA (ensure its
-immutable ECR image tag still exists). Rolling back does **not** undo database
+Until dispatch is available, roll back by reverting on `dev`: the push of the
+revert triggers a deploy. With dispatch, run the workflow with
+`-f ref=<previous sha>` (ensure its immutable ECR image tag still exists).
+Rolling back does **not** undo database
 migrations. A rollback is safe only if that server version supports the current
 database schema and on-disk format. Otherwise roll forward, or restore a
 matched database, files, and object recovery point into an isolated stack before
 moving traffic. Never guess at downgrade compatibility.
 
-To make configuration changes (task count, Multi-AZ, Firebase settings, or
-open sign-up):
+To make configuration changes (Multi-AZ, Firebase settings, or open sign-up):
 1. Update the corresponding variable in the GitHub `hosted` environment.
-2. Re-run the deploy workflow with the currently deployed commit ref or SHA.
+2. Re-run the deploy workflow with the currently deployed commit ref or SHA
+   (this needs dispatch; until then, use "Re-run all jobs" on the last
+   deploy run, which reads the variables again and needs approval again).
+
+The task count is set per run with the `desired_count` input instead (see
+Operations and scaling).
 
 The workflow reuses the existing container image in ECR, CloudFormation
 updates the task definition or stack resources, and ECS performs a rolling
@@ -331,7 +368,9 @@ GitHub environment and re-run the workflow.
 
 Do not modify the ECS service directly with `aws ecs update-service`: the next
 workflow deploy will overwrite direct changes. Use manual updates only in an
-emergency, and update the GitHub environment variable immediately afterward.
+emergency or for the temporary task count described under Operations and
+scaling, and put any lasting change into the workflow or the GitHub
+environment.
 
 Rotating the RDS-managed database password in Secrets Manager requires forcing
 a new ECS task deployment so tasks fetch the new secret:
@@ -445,10 +484,11 @@ Alarms publish to the `agenticml-alerts` SNS topic:
    < 2,000,000,000 bytes over 300 s).
 5. `agenticml-hosted-rds_cpu`: RDS CPU utilization > 80% over 5 minutes (period
    300 s, statistic `Average`).
-6. `agenticml-hosted-running_tasks`: Running task count below
-   `HOSTED_DESIRED_COUNT` over 5 minutes (period 300 s, statistic `Minimum`,
-   missing data treated as breaching). This alarm exists only when
-   `DesiredCount` is greater than 0.
+6. `agenticml-hosted-healthy_hosts`: ALB `HealthyHostCount` for the target
+   group, statistic `Minimum`, below 1 for 5 periods of 60 s, missing data
+   treated as breaching. This alarm exists only while `DesiredCount` is
+   greater than 0. (It replaces `agenticml-hosted-running_tasks`, which needed
+   Container Insights; Container Insights is off.)
 
 Additional bootstrap alarms:
 - `agenticml-cost-steps-errors`: CloudWatch alarm on the `agenticml-cost-steps`
@@ -460,8 +500,23 @@ Confirm the email subscriptions and exercise one alarm to verify alerting.
 
 ### Operations and scaling
 
-To scale tasks, update `HOSTED_DESIRED_COUNT` in the GitHub `hosted` environment
-variables and re-run the deploy workflow.
+The service runs one Fargate task by default. To change the task count, run the
+deploy workflow with the `desired_count` input (choices `1`, `0`, `2`; default
+`1`; push-triggered runs keep the current count):
+
+```sh
+gh workflow run deploy.yml --ref dev -f ref=<deployed sha> -f desired_count=2
+```
+
+This needs `deploy.yml` on `main` (see First deploy). Until then, to run two
+tasks temporarily:
+
+```sh
+aws ecs update-service --cluster agenticml-hosted --service agenticml-hosted --desired-count 2
+```
+
+The next deploy that updates the service sets the count back to the stack's
+value.
 
 To suspend an abusive workspace using ECS Exec:
 
@@ -493,23 +548,27 @@ Attach evidence to roadmap Backlog entries before closing them.
 
 ### Cost estimate
 
-Estimated monthly cost in `us-east-2` is about **$100–110/month** total:
-- Two Fargate tasks (0.5 vCPU, 1 GB RAM): ~$36
-- RDS PostgreSQL `db.t4g.small` with 20 GB gp3 storage: ~$26
-- Application Load Balancer: ~$18–22
-- Public IPv4 addresses (two tasks ~$7, ALB ~$7; no NAT gateway): ~$14
-- Container Insights, CloudWatch logs, and alarms: ~$5–8
-- Backups, EFS, S3, and ECR: ~$3–9
+Estimated monthly cost in `us-east-2` (on demand) is about **$62–66/month**
+total:
+- One ARM64 Fargate task (0.5 vCPU, 1 GB RAM): ~$14.40
+- Application Load Balancer: ~$17–18
+- Public IPv4 addresses (ALB ×2, task ×1; no NAT gateway): ~$11
+- RDS PostgreSQL `db.t4g.micro` with 20 GB gp3 storage: ~$14
+- EFS: ~$1–2
+- S3 and ECR: ~$1–2
+- CloudWatch logs and the six alarms: ~$1–2
+- AWS Backup: ~$1
 - Secrets Manager: ~$0.40
 - Cost alerts (Cost Explorer API queries): ~$0.60
-Data transfer under 100 GB/month is free. DNS at Namecheap avoids Route 53
-zone fees.
 
-Savings to revisit after launch:
-- Scale to one task (~$22 savings)
-- Disable Container Insights (~$5 savings)
-- Build ARM64 images (~$7 savings)
-- Downsize RDS to `db.t4g.micro` (~$12 savings)
+Data transfer under 100 GB/month is free. DNS at Namecheap avoids Route 53
+zone fees. The bootstrap budget stays at $100 with $10 steps; to alert earlier,
+lower `MonthlyBudget` to 75 by redeploying the bootstrap stack.
+
+Ways to scale up later:
+- A second task (~$18)
+- `db.t4g.small` (~$12)
+- Multi-AZ RDS (roughly doubles the RDS cost)
 
 ## Teardown
 

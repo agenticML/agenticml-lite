@@ -15,13 +15,13 @@ The hosted service runs the standard `agenticml-lite` server image across multip
             Application Load Balancer (ALB)
                  [ACM TLS Certificate]
                           │
-              ┌───────────┴───────────┐
-              ▼                       ▼
-      ECS Fargate Task 1      ECS Fargate Task 2
-      (agenticml server)      (agenticml server)
-              │                       │
-      ┌───────┼───────────────────────┼───────┐
-      │       ▼                       ▼       │
+                          ▼
+                 ECS Fargate Task
+                 (agenticml server)
+              (one by default; ARM64)
+                          │
+      ┌───────────────────┼───────────────────┐
+      │                   ▼                   │
       │  Amazon RDS PostgreSQL (Single-AZ)    │
       │  - Accounts, workspaces, keys,        │
       │    sessions, runs, metrics summaries  │
@@ -36,9 +36,9 @@ The hosted service runs the standard `agenticml-lite` server image across multip
       └───────────────────────────────────────┘
 ```
 
-- **Application Load Balancer (ALB)**: Public dualstack endpoint with AWS Certificate Manager (ACM) TLS termination for `app.agenticml.xyz` using the certificate from the bootstrap stack. DNS is configured as a CNAME at Namecheap. Routes traffic to ECS tasks with a 120-second deregistration delay.
-- **ECS Fargate Tasks**: Containerized server instances running `agenticml server serve` as a non-root user (uid/gid 10001). Tasks run across multiple Availability Zones in public task subnets with a public IPv4 address for outbound traffic only (no NAT gateway) and accept incoming traffic only from the ALB security group. Tasks have a 120-second stop timeout to allow active uploads to finish during deployments.
-- **Amazon RDS PostgreSQL**: Managed PostgreSQL database in private data subnets with no internet route, storing accounts, workspaces, team memberships, API keys, sessions, audit events, committed run file sizes, and metric summaries. Single-AZ by default (Multi-AZ is optional via `HOSTED_MULTI_AZ`). Passwords are managed via AWS Secrets Manager and injected into ECS task environments at runtime.
+- **Application Load Balancer (ALB)**: Public dualstack endpoint with AWS Certificate Manager (ACM) TLS termination for `app.agenticml.xyz` using the certificate from the bootstrap stack. DNS is configured as a CNAME at Namecheap. Routes traffic to the ECS task with a 120-second deregistration delay.
+- **ECS Fargate Tasks**: Containerized server running `agenticml server serve` as a non-root user (uid/gid 10001). The service runs one task by default (0.5 vCPU, 1 GB, ARM64/Graviton; Container Insights is off); a second can be added for capacity. Tasks run in public task subnets with a public IPv4 address for outbound traffic only (no NAT gateway) and accept incoming traffic only from the ALB security group. Tasks have a 120-second stop timeout to allow active uploads to finish during deployments.
+- **Amazon RDS PostgreSQL**: Managed PostgreSQL 16 (`db.t4g.micro`, 20 GB gp3) in private data subnets with no internet route, storing accounts, workspaces, team memberships, API keys, sessions, audit events, committed run file sizes, and metric summaries. Single-AZ by default (Multi-AZ is optional via `HOSTED_MULTI_AZ`). Passwords are managed via AWS Secrets Manager and injected into ECS task environments at runtime.
 - **Amazon EFS**: General Purpose encrypted filesystem in private data subnets with no internet route, mounted at `/data` via an EFS Access Point matching uid/gid 10001. Holds raw experiment files and lineage shadow Git repositories. Protected by daily AWS Backup with 35-day retention.
 - **Amazon S3**: Encrypted, versioned private bucket storing content-addressed objects under `{workspace_id}/objects/{hh}/{sha256}`. Public access is blocked at the bucket and account levels. Protected by object versioning (noncurrent versions kept 30 days). AWS Backup covers EFS and RDS only.
 
@@ -46,10 +46,11 @@ The hosted service runs the standard `agenticml-lite` server image across multip
 
 Deploys are automated through GitHub Actions ([.github/workflows/deploy.yml](../.github/workflows/deploy.yml)) using AWS IAM OpenID Connect (OIDC) roles with required reviewer approvals:
 
-1. **Image build and push**: The Dockerfile at [deploy/aws/Dockerfile](../deploy/aws/Dockerfile) builds an image containing `agenticml-lite[hosted]` pinned to the target commit. Images are pushed to private Amazon ECR with immutable Git SHA tags.
-2. **Rolling CloudFormation deployment**: The deploy workflow deploys the hosted CloudFormation stack with the new image tag. CloudFormation registers the task definition revision and triggers a rolling service update (`minimumHealthyPercent=100`, `maximumPercent=200`); the ECS deployment circuit breaker automatically rolls back if a bad image fails to start.
+1. **Image build and push**: The Dockerfile at [deploy/aws/Dockerfile](../deploy/aws/Dockerfile) builds an image containing `agenticml-lite[hosted]` pinned to the target commit. The workflow builds it for `linux/arm64` under QEMU and pushes it to private Amazon ECR with the immutable tag `<commit sha>-arm64`.
+2. **Rolling CloudFormation deployment**: The deploy workflow deploys the hosted CloudFormation stack with the new image tag. CloudFormation registers the task definition revision and triggers a rolling service update (`minimumHealthyPercent=100`, `maximumPercent=200`, so the new task starts before the old one stops and a single task deploys without downtime); the ECS deployment circuit breaker automatically rolls back if a bad image fails to start.
 3. **Database migrations**: Migrations run automatically during server process startup under PostgreSQL advisory migration locks (`pg_advisory_xact_lock`), safely coordinating concurrent starts.
-4. **Initial deploy and config updates**: The first deploy creates the entire hosted CloudFormation stack with the configured task count in one go (no `desired_count=0` step). Infrastructure and environment configuration changes (such as task count, Multi-AZ, Firebase settings, or open sign-up) are made by updating GitHub environment variables and re-running the deploy workflow.
+4. **Initial deploy and config updates**: The first deploy creates the entire hosted CloudFormation stack in one go (no `desired_count=0` step). Environment configuration changes (Multi-AZ, Firebase settings, or open sign-up) are made by updating GitHub environment variables and re-running the deploy workflow. The task count is not a variable: it comes from the workflow's `desired_count` input (`1`, `0` or `2`; default `1`; push runs keep the current count).
+5. **How deploys start**: The workflow runs automatically on every push to `dev` that changes `src/**`, `pyproject.toml`, `deploy/aws/**` (except Markdown and `bootstrap.yaml`) or `.github/workflows/deploy.yml`. Each run waits for the required reviewer on the `hosted` environment; the reviewer reads the commit first and rejects an older waiting run when a newer one is queued. Manual dispatch (`gh workflow run deploy.yml`) works only once `deploy.yml` is on `main`. Until then, roll back by reverting on `dev`.
 
 For deployment commands and runbook procedures, see [deploy/aws/README.md](../deploy/aws/README.md#first-deploy).
 
@@ -182,7 +183,7 @@ CloudWatch alarms monitor core service health and deliver notifications to the `
 - **p95 target latency**: Alerts when target response time p95 exceeds 5 seconds over 5 minutes (`agenticml-hosted-latency-p95`).
 - **RDS free storage space**: Alerts when free storage falls below 2 GB (`agenticml-hosted-rds_storage`).
 - **RDS CPU utilization**: Alerts when database CPU utilization exceeds 80% over 5 minutes (`agenticml-hosted-rds_cpu`).
-- **Running task count**: Alerts when running tasks fall below `HOSTED_DESIRED_COUNT` over 5 minutes, treating missing data as breaching (`agenticml-hosted-running_tasks`; active only when desired task count is greater than zero).
+- **Healthy target count**: Alerts when the ALB `HealthyHostCount` minimum is below 1 for 5 consecutive 60-second periods, treating missing data as breaching (`agenticml-hosted-healthy_hosts`; active only when desired task count is greater than zero).
 - **Cost and budget alerts**: The daily cost-step function (`agenticml-cost-steps`) emails spend summaries each time month-to-date spend passes another $10 milestone against a $100 monthly budget (with an error alarm on function execution failures), while an AWS Budget alert monitors actual and forecasted monthly spend exceeding 100%.
 
 ### Emergency procedures

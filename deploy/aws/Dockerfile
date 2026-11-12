@@ -1,5 +1,6 @@
 # Update both patch tags together; rebuild and run hosted_smoke.sh before deploying.
-FROM python:3.12.12-slim-bookworm AS builder
+# The wheel is pure Python: build it natively, even when the image targets arm64 under QEMU.
+FROM --platform=$BUILDPLATFORM python:3.12.12-slim-bookworm AS builder
 WORKDIR /build
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src

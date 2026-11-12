@@ -1,11 +1,30 @@
 name: Deploy hosted service
+# A push to dev that changes the image or the stack queues a deploy of that
+# commit; like every run it waits for the hosted environment's reviewer.
+# Push runs use the workflow file of the pushed commit, so this works before
+# the file reaches the default branch (which workflow_dispatch needs).
 on:
+  push:
+    branches: [dev]
+    paths:
+      - src/**
+      - pyproject.toml
+      - deploy/aws/**
+      - '!deploy/aws/**/*.md'
+      - '!deploy/aws/cloudformation/bootstrap.yaml'
+      - .github/workflows/deploy.yml
   workflow_dispatch:
     inputs:
       ref:
         description: Commit SHA, tag or branch to deploy (blank uses workflow ref)
         required: false
         type: string
+      desired_count:
+        description: Service tasks (0 stops the service; push runs keep the current count)
+        required: false
+        type: choice
+        options: ['1', '0', '2']
+        default: '1'
 permissions:
   contents: read
   id-token: write
@@ -61,6 +80,10 @@ jobs:
             echo "::error::ref $INPUT_REF is not an ancestor of $GITHUB_REF_NAME ($GITHUB_SHA); deploy only commits already on the branch or tag the workflow runs from."
             exit 1
           fi
+      # Fargate runs the tasks on ARM64 (Graviton); build that image under QEMU.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
@@ -73,25 +96,27 @@ jobs:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
         run: |
           set -euo pipefail
-          sha=$(git rev-parse HEAD)
-          image="${REGISTRY}/${ECR_REPOSITORY}:${sha}"
+          # The architecture is part of the tag, so an image of the same commit
+          # for another architecture is never reused.
+          tag="$(git rev-parse HEAD)-arm64"
+          image="${REGISTRY}/${ECR_REPOSITORY}:${tag}"
           # Distinguish a missing tag from authentication/network failures.
-          if aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$sha" > /tmp/image.json 2>/tmp/ecr-error; then
-            echo "Reusing existing immutable image $sha"
+          if aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$tag" > /tmp/image.json 2>/tmp/ecr-error; then
+            echo "Reusing existing immutable image $tag"
           elif grep -q ImageNotFoundException /tmp/ecr-error; then
-            docker build -f deploy/aws/Dockerfile -t "$image" .
+            docker build --platform linux/arm64 -f deploy/aws/Dockerfile -t "$image" .
             docker push "$image"
           else
             cat /tmp/ecr-error >&2
             exit 1
           fi
-          echo "IMAGE_TAG=$sha" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=$tag" >> "$GITHUB_ENV"
       - id: deploy
         name: Deploy hosted stack
         shell: bash
         env:
           CFN_ROLE_ARN: ${{ vars.AWS_CFN_ROLE_ARN }}
-          DESIRED_COUNT: ${{ vars.HOSTED_DESIRED_COUNT || '2' }}
+          DESIRED_COUNT: ${{ inputs.desired_count }}
           MULTI_AZ: ${{ vars.HOSTED_MULTI_AZ || 'false' }}
           FIREBASE_PROJECT: ${{ vars.HOSTED_FIREBASE_PROJECT }}
           FIREBASE_API_KEY: ${{ vars.HOSTED_FIREBASE_API_KEY }}
@@ -100,6 +125,18 @@ jobs:
           set -euo pipefail
           # Each Key="$value" is one argument, so an empty value reaches the
           # template as an empty string ("FirebaseProject=").
+          overrides=(
+            ImageTag="$IMAGE_TAG"
+            MultiAZ="$MULTI_AZ"
+            FirebaseProject="$FIREBASE_PROJECT"
+            FirebaseApiKey="$FIREBASE_API_KEY"
+            OpenSignup="$OPEN_SIGNUP"
+          )
+          # Push runs leave DesiredCount out: an existing stack keeps its
+          # current count, and a new one gets the template default (1).
+          if [ -n "$DESIRED_COUNT" ]; then
+            overrides+=(DesiredCount="$DESIRED_COUNT")
+          fi
           aws cloudformation deploy \
             --stack-name "$STACK_NAME" \
             --template-file deploy/aws/cloudformation/hosted.yaml \
@@ -107,13 +144,7 @@ jobs:
             --capabilities CAPABILITY_NAMED_IAM \
             --no-fail-on-empty-changeset \
             --tags Project=agenticml-hosted \
-            --parameter-overrides \
-              ImageTag="$IMAGE_TAG" \
-              DesiredCount="$DESIRED_COUNT" \
-              MultiAZ="$MULTI_AZ" \
-              FirebaseProject="$FIREBASE_PROJECT" \
-              FirebaseApiKey="$FIREBASE_API_KEY" \
-              OpenSignup="$OPEN_SIGNUP"
+            --parameter-overrides "${overrides[@]}"
       - name: Show recent stack events
         if: failure() && steps.deploy.outcome == 'failure'
         shell: bash
@@ -127,8 +158,6 @@ jobs:
           exit 0
       - name: Show outputs and check running count
         shell: bash
-        env:
-          DESIRED_COUNT: ${{ vars.HOSTED_DESIRED_COUNT || '2' }}
         run: |
           set -euo pipefail
           for key in AlbDnsName ServiceUrl; do
@@ -138,14 +167,19 @@ jobs:
           done
           # CloudFormation already waits for the service to stabilise; retry briefly in case of a lag.
           running=''
+          desired=''
           for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
-            running=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
-              --query 'services[0].runningCount' --output text)
-            if [ "$running" = "$DESIRED_COUNT" ]; then
-              echo "Service $ECS_SERVICE is running $running of $DESIRED_COUNT tasks."
+            if ! counts=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+              --query 'services[0].[runningCount,desiredCount]' --output text); then
+              sleep 10
+              continue
+            fi
+            read -r running desired <<< "$counts"
+            if [ "$running" = "$desired" ]; then
+              echo "Service $ECS_SERVICE is running $running of $desired tasks."
               exit 0
             fi
             sleep 10
           done
-          echo "::error::Service $ECS_SERVICE runs $running tasks, expected $DESIRED_COUNT."
+          echo "::error::Service $ECS_SERVICE runs $running tasks, expected $desired."
           exit 1
