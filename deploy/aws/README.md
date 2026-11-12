@@ -39,9 +39,10 @@ The bootstrap stack (`deploy/aws/cloudformation/bootstrap.yaml`) creates the
 foundation that must exist before the deploy workflow can run:
 - **ECR repository** `agenticml/lite-server`: immutable tags, scan on push,
   lifecycle policy keeping the last 30 images, `DeletionPolicy: Retain`.
-- **Deploy role** `agenticml-hosted-deploy`: trusted only by
-  `repo:agenticML/agenticml-lite:environment:hosted` with audience
-  `sts.amazonaws.com`. Has permissions to push images to ECR, describe images,
+- **Deploy role** `agenticml-hosted-deploy`: trusted only by the OIDC subject
+  `repo:agenticML@279794012/agenticml-lite@1435335342:environment:hosted`
+  (GitHub's immutable subject; `repo:${GitHubRepo}:environment:hosted` when
+  `GitHubSubjectPrefix` is empty) with audience `sts.amazonaws.com`. Has permissions to push images to ECR, describe images,
   initiate and execute change sets on the hosted stack, and pass the
   CloudFormation role.
 - **CloudFormation role** `agenticml-hosted-cloudformation`: assumed by the
@@ -78,6 +79,16 @@ roles. Always pass its ARN in `GitHubOidcProviderArn` (find it with
 `aws iam list-open-id-connect-providers`). Leaving this parameter empty makes
 CloudFormation attempt to create a new provider, which fails if one already
 exists and would delete the provider if the stack is ever deleted.
+
+The deploy role trusts only the `hosted` environment of this repository.
+This repository uses GitHub's immutable OIDC subjects, which carry the owner
+and repository IDs, so `GitHubSubjectPrefix` defaults to
+`repo:agenticML@279794012/agenticml-lite@1435335342`, and `GitHubRepo` is
+then ignored. For a fork or another repository, pass the `sub_claim_prefix` from
+`gh api repos/OWNER/REPO/actions/oidc/customization/sub`, or an empty value
+(with `GitHubRepo=OWNER/REPO`) if it sends the default `repo:OWNER/REPO`
+subject. A mismatch shows up in the deploy run as `Not authorized to perform
+sts:AssumeRoleWithWebIdentity`.
 
 Optional parameters: `MonthlyBudget` (default 100), `CostStep` (default 10),
 `Hostname` (default `app.agenticml.xyz`). Never commit real alert email
