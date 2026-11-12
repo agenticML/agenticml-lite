@@ -217,7 +217,7 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 24 | AWS hosted deployment (Dockerfile, Terraform, deploy workflow, runbook, real-EFS benchmark) | 18c, 19, 20, 21 | Codex, Sonnet; owner runs it | M | [plan](packages/24-aws-deployment.md) | done (code, 3.0 PR; owner checks in Backlog) |
 | 24.1 | Image: Dockerfile, entrypoint, limits file, local hosted smoke test | 21 | Codex, Sonnet | S | [plan](packages/24-aws-deployment.md) | done (3.0 PR) |
 | 24.2 | Terraform, deploy workflow, `deploy-check` CI job, runbook | 24.1 | Codex, Sonnet | M | [plan](packages/24-aws-deployment.md) | done (3.0 PR; `terraform validate` runs in CI) |
-| 24.3 | Apply, first deploy, restore drill, real-EFS benchmark, exit criterion 6 | 24.4 | Owner | S | [AWS roadmap](aws-deployment-roadmap.md) | not started (Backlog) |
+| 24.3 | Apply, first deploy, restore drill, real-EFS benchmark, exit criterion 6 | 24.4 | Owner | S | [AWS roadmap](aws-deployment-roadmap.md) | in progress (AWS roadmap Phases 0–2 done Nov 12, 2026; Phase 3 needs steps 3.0a and 3.0b first) |
 | 24.4 † | CloudFormation replaces Terraform; Namecheap DNS; cost alerts | 24.2 | Sonnet; prose Antigravity | M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49); second review by the supervisor) |
 | 24.4a | `bootstrap.yaml`: ECR, OIDC, roles, certificate, alerts topic, budget, cost-step function | – | Sonnet | S–M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
 | 24.4b | `hosted.yaml` and its tests | 24.4a | Sonnet | M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
@@ -291,6 +291,26 @@ Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
+- **Two prerequisites before the first hosted deploy** (AWS roadmap Phase 3
+  pre-flight, Nov 12, 2026). Blocks package 24.3.
+  - Where: `.github/workflows/deploy.yml` (missing on `main`);
+    `deploy/aws/cloudformation/bootstrap.yaml`, CloudFormation role
+    statement `ServiceLinkedRoles`.
+  - Problem: GitHub runs a `workflow_dispatch` workflow only if its file is
+    on the default branch, so the deploy workflow cannot be started. The
+    account also has no EFS service-linked role, and the CloudFormation role
+    cannot create one, so the first stack create would likely fail at the EFS
+    mount targets.
+  - Fix: owner merges a PR to `main` that adds an identical copy of
+    `deploy.yml` (or merges `dev` into `main`), and runs
+    `aws iam create-service-linked-role --aws-service-name
+    elasticfilesystem.amazonaws.com` once. In the template, add
+    `elasticfilesystem.amazonaws.com` to the `iam:AWSServiceName` list so a
+    fresh account does not need the manual step; redeploy the bootstrap stack
+    to apply it.
+  - Done when: `gh workflow run deploy.yml --ref dev` starts a run, the EFS
+    service-linked role exists, and the template change is merged with its
+    test updated.
 - **Hosted launch and rolling-upload verification** (package 24.3, owner).
   - Where: `deploy/aws/README.md`, sections Prerequisites through Upgrades.
   - Problem: the infrastructure and deployment code have not run in our AWS
@@ -373,6 +393,9 @@ priority.
     `scripts/hosted_smoke.sh` against local Postgres and moto, `cfn-lint`
     and template tests in CI) but never ran it in AWS: creating billed
     resources and a public endpoint is the owner's call.
+  - Progress (Nov 12, 2026): bootstrap stack, certificate, budget and the
+    GitHub `hosted` environment are done (AWS roadmap Phases 0–2). Next is
+    the first deploy, after the two prerequisites in the entry above.
   - Fix: follow `deploy/aws/README.md`: bootstrap stack (with the Namecheap
     validation record), GitHub environment `hosted` with the role
     variables, first deploy, the `app` CNAME,
