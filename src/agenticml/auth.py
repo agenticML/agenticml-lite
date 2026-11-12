@@ -352,6 +352,8 @@ def cmd_whoami(args):
         )
         if isinstance(info.get("user"), str) and isinstance(info.get("role"), str):
             print(f"user: {_clean_detail(info['user'])} ({_clean_detail(info['role'])})")
+        if isinstance(info.get("workspace"), str):
+            print(f"workspace: {_clean_detail(info['workspace'])}")
         return 0
     except KeyboardInterrupt:
         return 130

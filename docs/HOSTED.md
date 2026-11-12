@@ -56,14 +56,38 @@ For deployment commands and runbook procedures, see [deploy/aws/README.md](../de
 
 ## First server administrator
 
-The first server administrator account must be provisioned via ECS Exec on a running server task before enabling public sign-ups:
+When the server starts without an administrator, it logs a one-time `/setup` link. Find the newest setup link in CloudWatch:
 
-```bash
-# Execute within a running ECS task (via deploy/aws/README.md commands):
-agenticml server accounts add admin@example.com --server-admin --data /data
+```sh
+aws logs filter-log-events \
+  --log-group-name /ecs/agenticml-hosted \
+  --filter-pattern '"No admin user yet"' \
+  --region us-east-2 \
+  --profile agenticml-account \
+  --query 'events[].message' \
+  --output text
 ```
 
-Once provisioned, the administrator can generate an invite or sign in using Firebase Authentication.
+Events are listed oldest first; use the newest (last) line. A fresh single-use token is logged at every task start until an admin exists.
+
+Open the printed URL (`https://app.agenticml.xyz/setup?token=...`) in a browser:
+- The link works only on `https://app.agenticml.xyz` (session cookies are `__Host-` and Secure; the Origin check requires the public URL, so the raw ALB hostname will not work).
+- Enter a login name that does not contain `@` (default `admin`).
+- Choose a password of at least 12 characters.
+- Submitting makes the account the owner of the `default` workspace with `server_admin=1`, logs you in, and closes `/setup` permanently (subsequent visits return 404).
+
+Server administration is available at `https://app.agenticml.xyz/admin/`.
+
+### Break-glass CLI alternative
+
+If the setup link cannot be used, open an interactive ECS Exec shell (see [deploy/aws/README.md](../deploy/aws/README.md#accounts-firebase-and-customers)) and add the admin user directly:
+
+```sh
+agenticml server users add admin2 --role admin --workspace default \
+  --public-url https://app.agenticml.xyz --data /data
+```
+
+While `default` has no owner yet, this makes `admin2` its owner with `server_admin=1` and prints a one-time invite link. Open the invite link to set a password (≥ 12 characters).
 
 ## Customer workspaces
 
