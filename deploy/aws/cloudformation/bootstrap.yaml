@@ -38,9 +38,20 @@ Parameters:
     Type: String
     Default: agenticML/agenticml-lite
     AllowedPattern: ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$
+    Description: OWNER/REPO; used only when GitHubSubjectPrefix is empty.
+  GitHubSubjectPrefix:
+    Type: String
+    Default: repo:agenticML@279794012/agenticml-lite@1435335342
+    AllowedPattern: ^(repo:[A-Za-z0-9_.-]+@[0-9]+/[A-Za-z0-9_.-]+@[0-9]+)?$
+    Description: >-
+      OIDC subject prefix for a repository that uses GitHub's immutable
+      subjects (sub_claim_prefix from
+      gh api repos/OWNER/REPO/actions/oidc/customization/sub). Leave empty
+      for a repository that sends the default repo:OWNER/REPO subject.
 
 Conditions:
   CreateOidcProvider: !Equals [!Ref GitHubOidcProviderArn, ""]
+  DefaultSubject: !Equals [!Ref GitHubSubjectPrefix, ""]
 
 Resources:
   # ---- Image repository -------------------------------------------------
@@ -81,7 +92,10 @@ Resources:
             Condition:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
-                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepo}:environment:hosted
+                token.actions.githubusercontent.com:sub: !If
+                  - DefaultSubject
+                  - !Sub repo:${GitHubRepo}:environment:hosted
+                  - !Sub ${GitHubSubjectPrefix}:environment:hosted
       Policies:
         - PolicyName: deploy
           PolicyDocument:
@@ -95,6 +109,7 @@ Resources:
                 Effect: Allow
                 Action:
                   - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage # docker push checks pushed manifests by digest (HEAD)
                   - ecr:CompleteLayerUpload
                   - ecr:DescribeImages
                   - ecr:InitiateLayerUpload

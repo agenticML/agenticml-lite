@@ -125,7 +125,7 @@ def test_bootstrap_parameters(bootstrap):
     assert bootstrap['Transform'] == 'AWS::LanguageExtensions'
     params = bootstrap['Parameters']
     assert set(params) == {'AlertEmails', 'MonthlyBudget', 'CostStep', 'Hostname',
-                           'GitHubOidcProviderArn', 'GitHubRepo'}
+                           'GitHubOidcProviderArn', 'GitHubRepo', 'GitHubSubjectPrefix'}
     assert params['AlertEmails']['Type'] == 'CommaDelimitedList'
     assert 'Default' not in params['AlertEmails']
     assert params['MonthlyBudget']['Default'] == 100
@@ -133,6 +133,9 @@ def test_bootstrap_parameters(bootstrap):
     assert params['Hostname']['Default'] == 'app.agenticml.xyz'
     assert params['GitHubOidcProviderArn']['Default'] == ''
     assert params['GitHubRepo']['Default'] == 'agenticML/agenticml-lite'
+    # The repository uses GitHub's immutable OIDC subjects (owner and repo IDs).
+    assert params['GitHubSubjectPrefix']['Default'] == (
+        'repo:agenticML@279794012/agenticml-lite@1435335342')
 
 
 def test_oidc_provider_only_when_arn_not_given(bootstrap):
@@ -163,9 +166,22 @@ def test_deploy_role_trust_is_one_repo_environment(bootstrap):
     assert list(trust['Principal']) == ['Federated']
     assert trust['Condition'] == {'StringEquals': {
         'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
-        'token.actions.githubusercontent.com:sub': {
-            'Fn::Sub': 'repo:${GitHubRepo}:environment:hosted'},
+        'token.actions.githubusercontent.com:sub': {'Fn::If': [
+            'DefaultSubject',
+            {'Fn::Sub': 'repo:${GitHubRepo}:environment:hosted'},
+            {'Fn::Sub': '${GitHubSubjectPrefix}:environment:hosted'}]},
     }}
+    assert bootstrap['Conditions']['DefaultSubject'] == {
+        'Fn::Equals': [{'Ref': 'GitHubSubjectPrefix'}, '']}
+
+
+def test_github_subject_prefix_pattern(bootstrap):
+    pattern = re.compile(bootstrap['Parameters']['GitHubSubjectPrefix']['AllowedPattern'])
+    assert pattern.fullmatch('')
+    assert pattern.fullmatch('repo:agenticML@279794012/agenticml-lite@1435335342')
+    for bad in ('repo:agenticML/agenticml-lite', 'repo:*', 'repo:a@1/b@2:environment:x',
+                'repo:a@1/b@2*'):
+        assert not pattern.fullmatch(bad)
 
 
 def test_deploy_role_passrole_only_to_cloudformation_role(bootstrap):
@@ -183,6 +199,21 @@ def test_deploy_role_passrole_only_to_cloudformation_role(bootstrap):
             if action.startswith('ecs:'):
                 assert action == 'ecs:DescribeServices'
             assert 'ExecuteCommand' not in action
+
+
+def test_deploy_role_ecr_push_is_one_repository(bootstrap):
+    stmts = role_statements(bootstrap['Resources']['DeployRole'])
+    (push,) = [s for s in stmts if s.get('Sid') == 'EcrPush']
+    assert push['Resource'] == {'Fn::GetAtt': 'EcrRepository.Arn'}
+    # docker push sends HEAD requests for manifests by digest, which need BatchGetImage.
+    assert set(actions_of(push)) == {
+        'ecr:BatchCheckLayerAvailability', 'ecr:BatchGetImage', 'ecr:CompleteLayerUpload',
+        'ecr:DescribeImages', 'ecr:InitiateLayerUpload', 'ecr:PutImage', 'ecr:UploadLayerPart'}
+    # Only EcrLogin (the token call, which has no resource ARN) and EcrPush grant ECR actions.
+    ecr_stmts = [s for s in stmts if any(a.startswith('ecr:') for a in actions_of(s))]
+    assert sorted(s['Sid'] for s in ecr_stmts) == ['EcrLogin', 'EcrPush']
+    (login,) = [s for s in ecr_stmts if s['Sid'] == 'EcrLogin']
+    assert actions_of(login) == ['ecr:GetAuthorizationToken'] and login['Resource'] == '*'
 
 
 def test_deploy_role_cloudformation_scope(bootstrap):
