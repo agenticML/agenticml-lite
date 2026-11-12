@@ -272,6 +272,43 @@ def test_login_and_whoami_strip_ansi_and_missing_scope(credentials, capsys):
     assert "scope=?" in output.out
 
 
+def _whoami_body(**extra):
+    return json.dumps({"protocol": 2, "key": "one", "scope": "sync", "features": [], **extra}).encode()
+
+
+def test_whoami_prints_workspace(credentials, capsys):
+    body = _whoami_body(user="ada", role="admin", workspace="acme")
+    with fake_http(status=200, body=body) as url:
+        saved(host=url)
+        assert main(["whoami"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[-2:] == ["user: ada (admin)", "workspace: acme"]
+
+
+def test_whoami_prints_workspace_from_real_server(server, capsys):
+    saved(key=server.test_key, host=origin(server))
+    assert main(["whoami"]) == 0
+    assert "workspace: default" in capsys.readouterr().out.splitlines()
+
+
+def test_whoami_without_workspace_prints_no_workspace_line(credentials, capsys):
+    with fake_http(status=200, body=_whoami_body(workspace=None)) as url:
+        saved(host=url)
+        assert main(["whoami"]) == 0
+    assert "workspace" not in capsys.readouterr().out
+
+
+def test_whoami_workspace_strips_ansi(credentials, capsys):
+    with fake_http(status=200, body=_whoami_body(workspace="\x1b[31macme\x07")) as url:
+        saved(host=url)
+        assert main(["whoami"]) == 0
+    output = capsys.readouterr().out
+    assert "\x1b" not in output
+    assert "\x07" not in output
+    assert "workspace: " in output
+    assert output.rstrip().endswith("acme")
+
+
 def test_whoami_offline_and_no_credentials(capsys, monkeypatch):
     assert main(["whoami", "--offline"]) == 1
     saved()

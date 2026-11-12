@@ -292,52 +292,275 @@ and browser CSP before enabling open signup. The baked free limits are decimal
 5 GB storage, 2 GB uploads/day, 600 requests/minute, 5 people, and 1 free
 workspace per account.
 
-Select a running task, then run each operator command through ECS Exec. The
-operator's own IAM identity needs ECS `ExecuteCommand` and SSM session
+### First server administrator
+
+The server logs a one-time `/setup` link at startup while no administrator
+exists. Retrieve the link from CloudWatch:
+
+```sh
+aws logs filter-log-events \
+  --log-group-name /ecs/agenticml-hosted \
+  --filter-pattern '"No admin user yet"' \
+  --region us-east-2 \
+  --profile agenticml-account \
+  --query 'events[].message' \
+  --output text
+```
+
+Events are returned oldest first; use the newest (last) line. A new token is
+logged at every task start until an admin exists.
+
+Open the printed URL (`https://app.agenticml.xyz/setup?token=...`) in a browser:
+- The setup form works only on `https://app.agenticml.xyz` (session cookies are
+  `__Host-` and Secure, and CSRF origin validation pins to the public URL).
+- The login name must not contain `@` (default `admin`).
+- Choose a password of at least 12 characters.
+- Submitting makes the account the owner of the `default` workspace and a server
+  admin (`server_admin=1`), signs you in, and closes `/setup` permanently.
+
+Server administration pages are located at `https://app.agenticml.xyz/admin/`.
+
+Break-glass alternative: if `/setup` is unreachable, open an ECS Exec shell
+(below) and create the admin account directly:
+
+```sh
+agenticml server users add admin2 --role admin --workspace default \
+  --public-url https://app.agenticml.xyz --data /data
+```
+
+While `default` has no owner yet, this makes `admin2` its owner and a server
+admin, and prints a one-time invite link to set the password.
+
+### Connecting via ECS Exec
+
+Export AWS credentials and region once in your terminal session:
+
+```sh
+export AWS_PROFILE=agenticml-account AWS_REGION=us-east-2
+```
+
+The operator's own IAM identity needs ECS `ExecuteCommand` and SSM session
 permissions; the GitHub deploy role deliberately lacks these permissions.
 
-```sh
-cluster=agenticml-hosted
-service=agenticml-hosted
-task=$(aws ecs list-tasks --cluster "$cluster" --service-name "$service" --query 'taskArns[0]' --output text)
-aws ecs execute-command --cluster "$cluster" --task "$task" --container server --interactive \
-  --command 'agenticml server accounts add owner@example.com --server-admin --data /data'
-aws ecs execute-command --cluster "$cluster" --task "$task" --container server --interactive \
-  --command 'agenticml server workspaces create customer-one --owner owner@example.com --data /data'
-aws ecs execute-command --cluster "$cluster" --task "$task" --container server --interactive \
-  --command 'agenticml server users invite owner@example.com --workspace customer-one --data /data'
-```
-
-For another customer:
+Find the running task and guard against `None`:
 
 ```sh
-aws ecs execute-command --cluster "$cluster" --task "$task" --container server --interactive \
-  --command 'agenticml server accounts add customer@example.com --data /data'
-aws ecs execute-command --cluster "$cluster" --task "$task" --container server --interactive \
-  --command 'agenticml server workspaces create customer-two --owner customer@example.com --data /data'
-aws ecs execute-command --cluster "$cluster" --task "$task" --container server --interactive \
-  --command 'agenticml server users invite customer@example.com --workspace customer-two --data /data'
+task=$(aws ecs list-tasks --cluster agenticml-hosted --service-name agenticml-hosted --desired-status RUNNING --query 'taskArns[0]' --output text)
+[ "$task" = "None" ] && echo "No running task"
 ```
 
-To add another person to an existing workspace:
+Verify that ECS Exec and the management agent are ready:
 
 ```sh
-aws ecs execute-command --cluster "$cluster" --task "$task" --container server --interactive \
-  --command 'agenticml server users add member@example.com --role member --workspace customer-one --data /data'
+aws ecs describe-tasks --cluster agenticml-hosted --tasks "$task" \
+  --query 'tasks[0].{status:lastStatus,exec:enableExecuteCommand,agents:containers[?name==`server`].managedAgents[].{name:name,status:lastStatus}}'
 ```
 
-Admin role for a member is `--role admin`. To issue a machine sync key:
+Output should show `status: RUNNING`, `exec: true`, and the `ExecuteCommandAgent`
+with status `RUNNING`.
+
+Open an interactive shell in the container:
 
 ```sh
-aws ecs execute-command --cluster "$cluster" --task "$task" --container server --interactive \
-  --command 'agenticml server keys create --name training --scope sync --user owner@example.com --workspace customer-one --data /data'
+aws ecs execute-command --cluster agenticml-hosted --task "$task" --container server --interactive --command /bin/sh
 ```
 
-Keys and invite links are printed once: handle the session output as a
-credential and do not paste it into CI logs or tickets. A server admin is a
-global account; workspace memberships and roles control workspace access. Sign
-in through the normal invite or Firebase path. Keep public signup disabled until
-setup is complete.
+Inside the shell, verify the database and object environment before running CLI
+commands:
+
+```sh
+printenv AGENTICML_SERVER_PUBLIC_URL
+printenv AGENTICML_SERVER_DATABASE_URL | cut -d@ -f2-
+printenv AGENTICML_SERVER_OBJECTS
+test -n "$PGPASSWORD" && echo PGPASSWORD set
+ls /data/server
+```
+
+Check that `ls /data/server` shows no `agenticml.db`. If
+`AGENTICML_SERVER_DATABASE_URL` is missing, the CLI silently falls back to a
+SQLite database on EFS at `/data/server/agenticml.db` instead of the hosted
+PostgreSQL instance.
+
+Keys and invite links print once. Exec sessions are not logged (the cluster has
+no `ExecuteCommandConfiguration`; only CloudTrail records the `ExecuteCommand`
+call and its `--command` string). Never put secrets on `--command` strings and
+never pass passwords with `--stdin` there.
+
+### Customer workspaces and users
+
+All `users` and `keys` commands default to `--workspace default`, so always pass
+`--workspace <slug>` explicitly. All server commands require `--data /data`.
+
+To provision the first customer workspace (`customer-one`):
+
+1. Create the customer account:
+   ```sh
+   agenticml server accounts add alice@example.com --data /data
+   ```
+2. Create the workspace with that owner:
+   ```sh
+   agenticml server workspaces create customer-one --name "Customer One" --owner alice@example.com --data /data
+   ```
+3. Generate an invite link for the owner:
+   ```sh
+   agenticml server users invite alice@example.com --workspace customer-one \
+     --public-url https://app.agenticml.xyz --data /data
+   ```
+4. Add team members:
+   ```sh
+   agenticml server users add bob@example.com --role member --workspace customer-one \
+     --public-url https://app.agenticml.xyz --data /data
+   ```
+   `users add` prints an invite only when creating a new account. For an existing
+   account, it adds the workspace membership and prints nothing.
+5. Create a sync API key:
+   ```sh
+   agenticml server keys create --name training --scope sync --user alice@example.com --workspace customer-one --data /data
+   ```
+   The `--user` must be a non-viewer member of that workspace. Key names are
+   unique per workspace. Plaintext keys and invite links are printed once: record
+   them immediately.
+
+To provision a second customer workspace (`customer-two`):
+
+```sh
+agenticml server accounts add carol@example.com --data /data
+agenticml server workspaces create customer-two --name "Customer Two" --owner carol@example.com --data /data
+agenticml server users invite carol@example.com --workspace customer-two \
+  --public-url https://app.agenticml.xyz --data /data
+agenticml server keys create --name training --scope sync --user carol@example.com --workspace customer-two --data /data
+```
+
+**Order rule for multi-workspace accounts:**
+A person must open their invite link and set their password in the browser
+BEFORE being added to a second workspace. Once an account belongs to more than
+one workspace, redeeming an invite link is refused by the browser flow.
+If an account is added to a second workspace before setting a password, the
+operator must set it in an interactive shell:
+
+```sh
+agenticml server users set-password alice@example.com --workspace customer-one --data /data
+```
+
+This prompts for the new password via `getpass`. Running `users invite` on an
+account that already has a password resets it to NULL.
+
+After Alice has set her password, add her to `customer-two` as a member:
+
+```sh
+agenticml server users add alice@example.com --role member --workspace customer-two --data /data
+```
+
+A server admin account sees a customer workspace only if explicitly added as a
+workspace member. The `/admin/` portal lists and creates workspaces across the
+server. Keep public signup disabled until setup is complete.
+
+## Sync from a training machine
+
+### Installation
+
+Version 3.0.0 is not yet published on PyPI. Install `agenticml-lite` with
+system metrics support directly from the `dev` branch:
+
+```sh
+pip install 'agenticml-lite[system] @ git+https://github.com/agenticML/agenticml-lite@dev'
+```
+
+### Environment configuration
+
+`agenticml login` keeps only one key per server host, so logging in for a second
+workspace overwrites the first. When working with multiple workspaces on the
+same host, configure each workspace in a separate shell or subshell:
+
+```sh
+export AGENTICML_HOST=https://app.agenticml.xyz
+export AGENTICML_DIR=$HOME/.agenticml-customer-one
+read -rsp 'customer-one sync key: ' AGENTICML_API_KEY; export AGENTICML_API_KEY; echo
+```
+
+Setting `AGENTICML_HOST` avoids warnings about sending keys to default hosts.
+Reading `AGENTICML_API_KEY` via `read -rsp` keeps the key out of shell history.
+
+Verify key binding and identity:
+
+```sh
+agenticml whoami
+```
+
+This prints the host, key prefix, key name, scope, user account, role, and the
+bound workspace (`workspace: customer-one`).
+
+### Smoke test
+
+Run test scripts from an otherwise empty directory (e.g. `~/aml-smoke`),
+because run lineage snapshots the script's project directory and uploads it with
+the run.
+
+Create `smoke.py`:
+
+```sh
+mkdir -p ~/aml-smoke && cd ~/aml-smoke
+cat > smoke.py <<'EOF'
+import sys
+import agenticml
+
+ws = sys.argv[1]
+run = agenticml.init(project=f"smoke-{ws}", name=f"smoke-{ws}", config={"lr": 0.01, "workspace": ws}, tags=["smoke"], verbose=True)
+for step in range(20):
+    agenticml.log({"loss": 1 / (step + 1), "acc": step / 20}, step=step)
+with open("model.txt", "w") as f:
+    f.write(f"tiny model for {ws}\n")
+agenticml.log_artifact("model.txt", name="checkpoint", copy=True)
+agenticml.summary["best_loss"] = 1 / 20
+agenticml.finish()
+print("RUN_ID", run.run_id)
+EOF
+```
+
+Execute the run and sync to the workspace:
+
+```sh
+python smoke.py customer-one
+agenticml sync --all
+```
+
+A subsequent `agenticml sync --all` reports `up to date`.
+
+To stream metrics continuously during a live training run:
+
+```sh
+agenticml sync --follow --interval 5
+```
+
+### Dashboard verification
+
+View uploaded runs in the workspace dashboard:
+- `https://app.agenticml.xyz/w/customer-one/`
+- `https://app.agenticml.xyz/w/customer-two/`
+
+Verify that the `smoke-customer-one` project, 20 metric steps, `checkpoint`
+artifact, and summary appear. Users without membership in a workspace receive
+an HTTP 404 response when attempting to access its dashboard.
+
+### Sync state isolation between workspaces
+
+Sync state (`runs/<id>/sync.json`) is keyed by server hostname, not by
+workspace. If a single local store (`AGENTICML_DIR`) attempts to sync the same
+run to two workspaces on the same host, the second sync reports "up to date" and
+uploads nothing.
+
+Always maintain one `AGENTICML_DIR` per workspace (e.g.
+`$HOME/.agenticml-customer-one` and `$HOME/.agenticml-customer-two`).
+
+If you need to push a single local run to a second workspace from the same store,
+switch the shell to the second workspace's key (read with `read -rsp` as above,
+so the key stays out of shell history), then reset the run's cursor for this
+host and sync it again:
+
+```sh
+agenticml sync <RUN_ID> --reset
+agenticml sync <RUN_ID>
+```
 
 ## Upgrades, rollback and config
 

@@ -57,12 +57,13 @@ changes.
 | Database | `agenticml-hosted`, `db.t4g.micro`, single-AZ, 20 GB, available |
 | Alarms | all six OK; Container Insights off |
 | Load balancer | `agenticml-hosted-1705349735.us-east-2.elb.amazonaws.com`; `/healthz` 200 with the `app.agenticml.xyz` host |
-| DNS | **not yet**: no `app` CNAME at Namecheap (step 3.2) |
-| Admin account | **not yet**: the server logged a one-time setup link (search `/ecs/agenticml-hosted` for "No admin user yet"; the token is a secret, never copy it into the repo) |
+| DNS | `app` CNAME at Namecheap → the load balancer (step 3.2, Nov 12); `https://app.agenticml.xyz/healthz` returns 200 with a valid certificate |
+| Admin account | **not yet**: the server logged a one-time setup link (search `/ecs/agenticml-hosted` for "No admin user yet"; the token is a secret, never copy it into the repo). Step 4.2 uses it |
 | GitHub `hosted` environment | `HOSTED_DESIRED_COUNT=2` is still set but unused since 24.5; delete it when convenient |
 
-Next, in order: 3.2 (CNAME), the public `/healthz` check from 3.3, create
-the admin account through the setup link, then Phase 4.
+Next: Phase 4, starting with the admin account through the setup link
+(4.2). The runbook commands for Phase 4 were checked against the code in
+package [24.6](packages/24.6-phase-4-runbook.md).
 
 ## Phase 0: Account checks (owner, ~30 min)
 
@@ -123,8 +124,7 @@ account, used by other roles: always pass its ARN to the bootstrap stack.
 
 ## Phase 3: First deploy (owner, ~30 min, mostly waiting)
 
-**Status: in progress; only 3.2 (the Namecheap CNAME) is left.** A
-pre-flight check on Nov 12, 2026 found two prerequisites, 3.0a and 3.0b.
+**Status: done** (Nov 12, 2026). A pre-flight check on Nov 12, 2026 found two prerequisites, 3.0a and 3.0b.
 3.0a is done in package 24.5 (deploys run on pushes to `dev`); 3.0b is done
 (the role already existed on Nov 12, 2026). The first deploy (Nov 12, 2026)
 needed two bootstrap fixes, applied by redeploying the bootstrap stack: the
@@ -137,17 +137,23 @@ needs (see the 24.5 plan).
 | 3.0a | Make the deploy workflow runnable without `main`. GitHub only runs a `workflow_dispatch` workflow whose file is on the default branch, so `deploy.yml` also runs on pushes to `dev` that change `src/`, `pyproject.toml`, `deploy/aws/` or the workflow (package 24.5). **Done**: merging 24.5 into `dev` queues the first run | A "Deploy hosted service" run waits for approval in GitHub Actions |
 | 3.0b | Create the EFS service-linked role once with admin credentials: `aws iam create-service-linked-role --aws-service-name elasticfilesystem.amazonaws.com`. The account has none yet, and the bootstrap CloudFormation role may create service-linked roles only for ECS, Elastic Load Balancing, RDS and Backup, so the first create would likely fail at the EFS mount targets and roll back. **Done**: the role already existed when checked on Nov 12, 2026 | `aws iam get-role --role-name AWSServiceRoleForAmazonElasticFileSystem` succeeds |
 | 3.1 | After 3.0b, approve the waiting deploy run (the 24.5 merge into `dev`) in GitHub Actions; `desired_count` defaults to 1. **Done** Nov 12, 2026 (run 43206113226, image `23dcb7c…-arm64`) | Workflow green; stack `CREATE_COMPLETE` (RDS takes the longest) |
-| 3.2 | In Namecheap, add a CNAME `app` → the `AlbDnsName` output | `dig +short app.agenticml.xyz` shows the load balancer |
-| 3.3 | Check the service; optionally delete the unused `HOSTED_DESIRED_COUNT` variable from the `hosted` environment. Checked through the load balancer on Nov 12, 2026: `/healthz` 200, one ARM64 task, six alarms OK, logs clean; the public-name check waits for 3.2 | `curl https://app.agenticml.xyz/healthz` returns 200; one task running; logs clean |
+| 3.2 | In Namecheap, add a CNAME `app` → the `AlbDnsName` output. **Done** Nov 12, 2026 (`agenticml-hosted-1705349735.us-east-2.elb.amazonaws.com`) | `dig +short app.agenticml.xyz` shows the load balancer |
+| 3.3 | Check the service; optionally delete the unused `HOSTED_DESIRED_COUNT` variable from the `hosted` environment. Checked through the load balancer on Nov 12, 2026: `/healthz` 200, one ARM64 task, six alarms OK, logs clean. **Done** Nov 12, 2026: `curl --fail https://app.agenticml.xyz/healthz` returns `{"ok":true}` | `curl https://app.agenticml.xyz/healthz` returns 200; one task running; logs clean |
 
 ## Phase 4: First accounts and data (owner)
 
+**Status: next.** Commands are in `deploy/aws/README.md`, sections
+"Accounts, Firebase and customers" and "Sync from a training machine"
+(rewritten in package [24.6](packages/24.6-phase-4-runbook.md) after a check
+against the code). Keep one task running until the admin exists: each task
+logs its own setup token.
+
 | # | Step | Done when |
 | --- | --- | --- |
-| 4.1 | Give your own IAM user ECS Exec permissions | `aws ecs execute-command` opens a shell |
-| 4.2 | Through ECS Exec, create the server admin account and an invite; set a password through the invite link | You can sign in to the dashboard |
-| 4.3 | Create two customer workspaces, each with an admin, a member and a sync key; one account belongs to both with different roles | Both workspaces visible to the right people only |
-| 4.4 | From a training machine, sync a run to each workspace | Runs, metrics and artifacts show in the dashboard |
+| 4.1 | ECS Exec access. The `agenticml-account` admin user already has `ecs:ExecuteCommand`, and the service and task role allow it; install the Session Manager plugin if `session-manager-plugin --version` fails | `aws ecs execute-command ... --command /bin/sh` opens a shell, and the environment check (database URL, `PGPASSWORD`, no `/data/server/agenticml.db`) passes |
+| 4.2 | Create the first admin through the `/setup` link logged at startup (newest "No admin user yet" line in `/ecs/agenticml-hosted`), on `https://app.agenticml.xyz` only; login without `@`, password of 12+ characters. This makes the account owner of `default` and server admin and closes `/setup` | You can sign in at `/login`; `/setup` returns 404 |
+| 4.3 | Through ECS Exec, create two customer workspaces, each with an admin, a member and a sync key. Every person sets a password through their invite **before** any account is added to a second workspace; then add one account to the other workspace with a different role (`users add`, no invite) | Each person sees only their own workspaces, with the right roles |
+| 4.4 | On a training machine with 3.0.0 installed from `dev`, sync one smoke run per workspace, each from its own `AGENTICML_DIR` with that workspace's key (sync state is kept per host, not per workspace) | Runs, metrics and artifacts show in the right dashboard and nowhere else |
 
 ## Phase 5: Launch checks (owner, exit criterion 6)
 

@@ -228,7 +228,7 @@ Authorization: Bearer aml_...
 - **Automatic workspace resolution**: The server resolves the workspace directly from the bearer key on incoming `/v2` requests. Sync clients do not need to specify a workspace slug or URL prefix.
 - **Run ownership**: Runs synced with an API key are owned by the account associated with that key. Only keys belonging to the run's owner can write or append to that run.
 - **Identity verification**: `GET /v2/whoami` reports the calling key name, user account, role, protocol version, and the bound workspace slug (`"workspace": "<slug>"`).
-- **Multiple workspaces on one machine**: `agenticml login` saves one key per server hostname. To sync runs to different workspaces on the same server from one machine, override the key per command or training run using the `AGENTICML_API_KEY` environment variable.
+- **Multiple workspaces on one machine**: `agenticml login` saves only one key per server hostname, so running login for a second workspace replaces the first. For multiple workspaces on the same host, keep credentials and sync cursors separate using environment variables in each workspace's shell: set `AGENTICML_HOST` (e.g. `https://app.agenticml.xyz`), read `AGENTICML_API_KEY` without echo (`read -rsp 'API key: ' AGENTICML_API_KEY; export AGENTICML_API_KEY`), and set a distinct local store directory via `AGENTICML_DIR=$HOME/.agenticml-<slug>`. Sync state is keyed by host, so using separate `AGENTICML_DIR` directories prevents runs from being skipped as "up to date" in the second workspace (or use `agenticml sync RUN_ID --reset` with the second key).
 
 ### Managing API keys via CLI
 
@@ -515,8 +515,8 @@ The sync client is running an older `agenticml-lite` version below `--min-client
 pip install -U agenticml-lite
 ```
 
-### `agenticml sync` exits with status 3 (`401 Unauthorized`)
-The client's API key is missing, invalid, or has been revoked. Run `agenticml login --host https://...` to enter a new key, or check key status on the server with `agenticml server keys list --workspace <slug>`.
+### `agenticml sync --follow` exits with status 3 (`401 Unauthorized`)
+Under `agenticml sync --follow`, authentication failure (401) exits with status 3. A one-shot `agenticml sync` prints `agenticml sync: API key rejected - run agenticml login` and exits with status 1. In either case, the client's API key is missing, invalid, or has been revoked. Run `agenticml login --host https://...` to enter a new key, or check key status on the server with `agenticml server keys list --workspace <slug>`.
 
 ### HTTP 403 ("storage limit reached")
 The workspace has reached its storage quota (committed run files plus objects). Additional uploads are rejected until an administrator raises the quota using `agenticml server workspaces set-plan <slug> custom --storage <size>` or removes unnecessary runs. Existing runs remain readable. Under `sync --follow`, the client automatically retries every 10 minutes and resumes once the limit is raised.

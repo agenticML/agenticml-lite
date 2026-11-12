@@ -217,13 +217,14 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 24 | AWS hosted deployment (Dockerfile, Terraform, deploy workflow, runbook, real-EFS benchmark) | 18c, 19, 20, 21 | Codex, Sonnet; owner runs it | M | [plan](packages/24-aws-deployment.md) | done (code, 3.0 PR; owner checks in Backlog) |
 | 24.1 | Image: Dockerfile, entrypoint, limits file, local hosted smoke test | 21 | Codex, Sonnet | S | [plan](packages/24-aws-deployment.md) | done (3.0 PR) |
 | 24.2 | Terraform, deploy workflow, `deploy-check` CI job, runbook | 24.1 | Codex, Sonnet | M | [plan](packages/24-aws-deployment.md) | done (3.0 PR; `terraform validate` runs in CI) |
-| 24.3 | Apply, first deploy, restore drill, real-EFS benchmark, exit criterion 6 | 24.5 | Owner | S | [AWS roadmap](aws-deployment-roadmap.md) | in progress (AWS roadmap Phases 0–2 done Nov 12, 2026; Phase 3: 3.0a done in 24.5, 3.0b and 3.1 done: stack deployed from `dev` Nov 12, 2026; next: the Namecheap `app` CNAME) |
+| 24.3 | Apply, first deploy, restore drill, real-EFS benchmark, exit criterion 6 | 24.5 | Owner | S | [AWS roadmap](aws-deployment-roadmap.md) | in progress (AWS roadmap Phases 0–3 done Nov 12, 2026: stack deployed from `dev`, `https://app.agenticml.xyz/healthz` 200; next: Phase 4 accounts, with the runbook from 24.6) |
 | 24.4 † | CloudFormation replaces Terraform; Namecheap DNS; cost alerts | 24.2 | Sonnet; prose Antigravity | M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49); second review by the supervisor) |
 | 24.4a | `bootstrap.yaml`: ECR, OIDC, roles, certificate, alerts topic, budget, cost-step function | – | Sonnet | S–M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
 | 24.4b | `hosted.yaml` and its tests | 24.4a | Sonnet | M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
 | 24.4c | `deploy.yml`, CI `cfn-lint`, remove Terraform and `swap_image.py` | 24.4b | Sonnet | S | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
 | 24.4d | Runbook for CloudFormation (`deploy/aws/README.md`, `docs/HOSTED.md`) | 24.4c | Antigravity | S | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
 | 24.5 † | Lean hosted setup (~$60/month: one ARM64 task, `db.t4g.micro`, no Container Insights); deploys on pushes to `dev` | 24.4 | Supervisor; prose Antigravity | S | [plan](packages/24.5-lean-hosted.md) | done ([#52](https://github.com/agenticML/agenticml-lite/pull/52)) |
+| 24.6 | Phase 4 runbook fixes: first admin through `/setup`, workspace/invite order, ECS Exec checks, training-machine sync section; `whoami` prints the workspace | 24.5 | Sonnet; prose Antigravity | S | [plan](packages/24.6-phase-4-runbook.md) | done (this PR) |
 | 25 | Docs, threat model, version 3.0.0 | 16–24 | Sonnet (Codex at limit); prose Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR; tag and PyPI release by the owner) |
 | 25.1 | Client support window (426), version 3.0.0, base-install smoke, 2.2 client check | 16–24 | Sonnet (Codex at limit) | S | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
 | 25.2 | SERVER.md, HOSTED.md, threat model, PROTOCOL.md, README, website, SECURITY.md | 25.1 | Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
@@ -377,9 +378,11 @@ priority.
     `scripts/hosted_smoke.sh` against local Postgres and moto, `cfn-lint`
     and template tests in CI) but never ran it in AWS: creating billed
     resources and a public endpoint is the owner's call.
-  - Progress (Nov 12, 2026): bootstrap stack, certificate, budget and the
-    GitHub `hosted` environment are done (AWS roadmap Phases 0–2). Next is
-    the first deploy, after the two prerequisites in the entry above.
+  - Progress (Nov 12, 2026): AWS roadmap Phases 0–3 are done: bootstrap
+    stack, `hosted` environment, first deploy from `dev`, the Namecheap
+    `app` CNAME, and `https://app.agenticml.xyz/healthz` returns 200. Next
+    is Phase 4 (first admin, two workspaces, a sync to each), with the
+    runbook checked in package 24.6.
   - Fix: follow `deploy/aws/README.md`: bootstrap stack (with the Namecheap
     validation record), GitHub environment `hosted` with the role
     variables, first deploy, the `app` CNAME,
@@ -388,6 +391,22 @@ priority.
     the "Run the server benchmark on real EFS" entry below).
   - Done when: exit criterion 6 of the 3.0 plan holds and `docs/SERVER.md`
     shows real-EFS numbers.
+- **Sync state per workspace, not per host** (package 24.6 check, Nov 12,
+  2026).
+  - Where: `src/agenticml/sync.py` (`_host_state`, `_save_state`,
+    `_sync_idle`, `_selected_ids`); `runs/<id>/sync.json`.
+  - Problem: the client keeps each run's sync cursor per host. Every hosted
+    workspace shares `app.agenticml.xyz`, so a store that synced a run to one
+    workspace reports `up to date` (exit 0) when the same run is synced with
+    another workspace's key, and nothing is uploaded. `sync --all` with the
+    second key skips those runs the same way. Phase 4 works around it with
+    one `AGENTICML_DIR` per workspace, or `sync RUN_ID --reset`.
+  - Fix: key the cursor by host and workspace (`/v2/whoami` returns
+    `workspace`), migrating existing host-only entries to the workspace the
+    current key resolves to; keep 2.x servers (no `workspace`) on the host
+    key.
+  - Done when: a test syncs one run to two workspaces on one host with two
+    keys and both receive it, and an old `sync.json` still resumes.
 - **Many-process follow-ups for package 24** (package 20 reviews, Nov 9,
   2026).
   - Where: `src/agenticml/server/db/postgres.py` (session locks),
@@ -538,6 +557,20 @@ priority.
     labelled as such with mount details, and the recommendations are
     confirmed or updated.
   - Scheduled: done as part of 3.0 package 24, on the hosted stack's EFS.
+- **ECS Exec hardening** (package 24.6 check, Nov 12, 2026). Low priority.
+  - Where: `deploy/aws/cloudformation/hosted.yaml` (container `server`,
+    `Cluster`).
+  - Problem: PID 1 is the Python server, which does not reap the processes
+    ECS Exec sessions leave behind (AWS recommends `InitProcessEnabled`), and
+    exec sessions are not logged anywhere; only CloudTrail records the
+    `ExecuteCommand` call.
+  - Fix: set `LinuxParameters: {InitProcessEnabled: true}` and check that
+    SIGTERM still reaches the server within `StopTimeout`. Decide whether to
+    log sessions (`ExecuteCommandConfiguration` to a CloudWatch group); if
+    yes, note that invite links and keys printed in a session then land in
+    that log.
+  - Done when: template tests check the init process (and the logging
+    choice), and cfn-lint is clean.
 - **Hosted alarm and action pinning follow-ups** (Cursor's review of 24.5,
   Nov 12, 2026). Low priority.
   - Where: `deploy/aws/cloudformation/hosted.yaml`, `HealthyHostsAlarm`;
