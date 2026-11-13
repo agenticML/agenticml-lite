@@ -1253,3 +1253,103 @@ def test_server_up_firebase_skips_admin_and_writes_install_flags(
     assert args[args.index('--firebase-project') + 1] == FIREBASE_CFG.project
     assert args[args.index('--firebase-api-key') + 1] == FIREBASE_CFG.api_key
     assert args[args.index('--firebase-auth-domain') + 1] == FIREBASE_CFG.auth_domain
+
+
+def _email_admin(httpd, login='boss@example.com', uid='uid-boss'):
+    """An email admin signed in with Firebase; returns the session cookie."""
+    account = AccountRepo(httpd.db).create(login)
+    MembershipRepo(httpd.db, httpd.default_workspace_id).add(account['id'], 'admin')
+    with httpd.db.transaction(write=True) as tx:
+        AccountRepo(httpd.db).link_firebase(account['id'], uid, login, True, tx)
+    status, hdrs, _ = _post_firebase(httpd, _live_token(sub=uid, email=login))
+    assert status == 200
+    return hdrs['Set-Cookie']
+
+
+def _api(httpd, cookie, path, method='GET', payload=None):
+    body = None if payload is None else json.dumps(payload).encode()
+    extra = csrf(httpd) if method != 'GET' else None
+    status, _, raw, _ = authed(httpd, path, method, body, extra=extra, cookie=cookie)
+    return status, (json.loads(raw) if raw else None)
+
+
+def test_email_admin_creates_key_for_self(tmp_path, monkeypatch):
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    with firebase_running(tmp_path / 'data') as httpd:
+        cookie = _email_admin(httpd)
+        status, data = _api(httpd, cookie, '/api/w/default/keys', 'POST',
+                            {'name': 'laptop', 'scope': 'sync'})
+        assert status == 201 and data['record']['user'] == 'boss@example.com'
+        status, data = _api(httpd, cookie, '/api/w/default/keys', 'POST',
+                            {'name': 'desktop', 'scope': 'sync', 'user': 'Boss@Example.com'})
+        assert status == 201 and data['record']['user'] == 'boss@example.com'
+        status, data = _api(httpd, cookie, '/api/w/default/keys?user=boss%40example.com')
+        assert status == 200
+        assert {row['name'] for row in data['keys']} == {'laptop', 'desktop'}
+
+
+def test_email_admin_key_user_and_name_validation(tmp_path, monkeypatch):
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    with firebase_running(tmp_path / 'data') as httpd:
+        cookie = _email_admin(httpd)
+        status, data = _api(httpd, cookie, '/api/w/default/keys', 'POST',
+                            {'name': 'a@b.com', 'scope': 'sync'})
+        assert status == 400 and data == {'error': 'invalid or reserved key name'}
+        for user in ('a@b', 'env', '..', '', 'x' * 255 + '@example.com', 7):
+            status, data = _api(httpd, cookie, '/api/w/default/keys', 'POST',
+                                {'name': 'ok', 'scope': 'sync', 'user': user})
+            assert status == 400, user
+            assert data == {'error': 'invalid or reserved user name'}, user
+        status, data = _api(httpd, cookie, '/api/w/default/keys', 'POST',
+                            {'name': 'ok', 'scope': 'sync', 'user': 'ghost@example.com'})
+        assert status == 404 and data == {'error': 'unknown user'}
+
+
+def test_email_admin_changes_role_and_removes_member(tmp_path, monkeypatch):
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    with firebase_running(tmp_path / 'data') as httpd:
+        cookie = _email_admin(httpd)
+        _member_account(httpd, 'bob@example.com')
+        path = '/api/w/default/members/bob%40example.com'
+        status, data = _api(httpd, cookie, path, 'PATCH', {'role': 'viewer'})
+        assert status == 200 and data['user']['role'] == 'viewer'
+        status, data = _api(httpd, cookie, '/api/w/default/members/Bob%40Example.com',
+                            'PATCH', {'role': 'member'})
+        assert status == 200 and data['user']['name'] == 'bob@example.com'
+        status, data = _api(httpd, cookie, '/api/w/default/members/ghost%40example.com',
+                            'PATCH', {'role': 'member'})
+        assert status == 404 and data == {'error': 'not found'}
+        status, data = _api(httpd, cookie, path, 'DELETE')
+        assert status == 200 and data['removed'] == 'bob@example.com'
+        status, data = _api(httpd, cookie, path, 'DELETE')
+        assert status == 404
+
+
+def test_email_admin_invite_link_and_self_checks(tmp_path, monkeypatch):
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    with firebase_running(tmp_path / 'data') as httpd:
+        cookie = _email_admin(httpd)
+        _member_account(httpd, 'bob@example.com')
+        status, data = _api(httpd, cookie, '/api/w/default/members/Bob%40Example.com/invite',
+                            'POST', {})
+        assert status == 200 and '/invite?token=' in data['invite_url']
+        status, data = _api(httpd, cookie, '/api/w/default/members/Boss%40Example.com/invite',
+                            'POST', {})
+        assert status == 409 and 'yourself' in data['error']
+        status, data = _api(httpd, cookie, '/api/w/default/members/Boss%40Example.com',
+                            'DELETE')
+        assert status == 409 and data == {'error': 'you cannot remove yourself'}
+
+
+def test_email_admin_member_path_validation(tmp_path, monkeypatch):
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    with firebase_running(tmp_path / 'data') as httpd:
+        cookie = _email_admin(httpd)
+        for login in ('a%40b', 'env', '..'):
+            for method, suffix, payload in (
+                    ('PATCH', '', {'role': 'member'}), ('DELETE', '', None),
+                    ('POST', '/invite', {})):
+                status, data = _api(httpd, cookie, f'/api/w/default/members/{login}{suffix}',
+                                    method, payload)
+                assert status == 400, (login, method)
+                assert data == {'error': 'invalid or reserved user name'}, (login, method)
