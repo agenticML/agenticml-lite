@@ -317,19 +317,128 @@ def test_invite_redemption_by_listed_email_grants_admin(tmp_path):
         assert member['role'] == 'member'
 
 
+def _personal_ws(httpd, login):
+    account_id = _account(httpd, login)['id']
+    return [w for w in WorkspaceRepo(httpd.db).list()
+            if w['personal'] and w['created_by'] == account_id]
+
+
+def _workspace_creates(httpd):
+    return [e for e in _actions(httpd) if e['action'] == 'workspace.create']
+
+
 def test_open_signup_with_listed_email_uses_list_path(tmp_path):
     from test_server_signup import signup_running
 
     with signup_running(tmp_path / 'data', admin_emails=_admins()) as httpd:
-        status, _, _ = _signin(httpd, sub='uid-owner', email=OWNER)
+        status, hdrs, _ = _signin(httpd, sub='uid-owner', email=OWNER)
         assert status == 200
         account = _account(httpd, OWNER)
         assert account['created_by'] == 'admin-emails' and account['server_admin'] == 1
-        assert [w for w in WorkspaceRepo(httpd.db).list() if w['personal']] == []
+        personal = _personal_ws(httpd, OWNER)
+        assert len(personal) == 1
+        assert personal[0]['slug'] == 'owner' and personal[0]['plan'] == 'free'
+        assert AccountRepo(httpd.db).workspaces(OWNER) != []
+        status, _, page, _ = authed(httpd, '/workspaces', cookie=hdrs['Set-Cookie'])
+        assert status == 200 and b'href="/admin/"' in page and b'owner' in page
+        events = _actions(httpd)
+        assert any(e['action'] == 'account.create' and e['target'] == OWNER
+                   and e['via'] == 'admin-emails' for e in events)
+        created = _workspace_creates(httpd)
+        assert len(created) == 1 and created[0]['via'] == 'signup'
+        assert created[0]['actor'] == OWNER and created[0]['target'] == personal[0]['id']
         # an unlisted address still signs up normally
         assert _signin(httpd, sub='uid-ada', email='ada@example.com')[0] == 200
         assert _account(httpd, 'ada@example.com')['created_by'] == 'signup'
         assert _account(httpd, 'ada@example.com')['server_admin'] == 0
+        assert len(_personal_ws(httpd, 'ada@example.com')) == 1
+
+
+def test_listed_admin_without_workspace_gets_one_once_open_signup_is_on(tmp_path):
+    from test_server_signup import signup_running
+
+    data = tmp_path / 'data'
+    with firebase_running(data, admin_emails=_admins()) as httpd:
+        assert _signin(httpd, sub='uid-owner', email=OWNER)[0] == 200
+        assert AccountRepo(httpd.db).workspaces(OWNER) == []
+    with signup_running(data, admin_emails=_admins()) as httpd:
+        assert _signin(httpd, sub='uid-owner', email=OWNER)[0] == 200
+        assert len(_personal_ws(httpd, OWNER)) == 1
+        assert len(_workspace_creates(httpd)) == 1
+        assert _signin(httpd, sub='uid-owner', email=OWNER)[0] == 200
+        assert len(_personal_ws(httpd, OWNER)) == 1
+        assert len(_workspace_creates(httpd)) == 1
+
+
+def test_listed_admin_workspace_deleted_is_not_recreated(tmp_path):
+    from test_server_signup import signup_running
+
+    with signup_running(tmp_path / 'data', admin_emails=_admins()) as httpd:
+        assert _signin(httpd, sub='uid-owner', email=OWNER)[0] == 200
+        personal = _personal_ws(httpd, OWNER)
+        assert len(personal) == 1
+        WorkspaceRepo(httpd.db).delete(personal[0]['slug'])
+        assert _signin(httpd, sub='uid-owner', email=OWNER)[0] == 200
+        assert _personal_ws(httpd, OWNER) == []
+        assert len(_workspace_creates(httpd)) == 1
+
+
+def test_listed_admin_store_failure_clears_marker_and_retries(tmp_path, monkeypatch):
+    from agenticml.server.db.errors import DatabaseError
+    from agenticml.server.db.repos import SettingsRepo
+    from agenticml.server.workspaces import prepare_store
+    from test_server_signup import signup_running
+
+    def boom(*args, **kwargs):
+        raise DatabaseError('workspace store path is a symlink or not a directory; fix or move it away')
+
+    with signup_running(tmp_path / 'data', admin_emails=_admins()) as httpd:
+        monkeypatch.setattr('agenticml.server.workspaces.prepare_store', boom)
+        assert _signin(httpd, sub='uid-owner', email=OWNER)[0] == 200
+        account = _account(httpd, OWNER)
+        assert account['server_admin'] == 1
+        assert _personal_ws(httpd, OWNER) == []
+        assert SettingsRepo(httpd.db).get(f'personal_workspace:{account["id"]}') is None
+        assert _workspace_creates(httpd) == []
+        monkeypatch.setattr('agenticml.server.workspaces.prepare_store', prepare_store)
+        assert _signin(httpd, sub='uid-owner', email=OWNER)[0] == 200
+        assert len(_personal_ws(httpd, OWNER)) == 1
+        assert SettingsRepo(httpd.db).get(f'personal_workspace:{account["id"]}') == '1'
+        assert len(_workspace_creates(httpd)) == 1
+
+
+def test_listed_email_open_signup_free_limit_zero_creates_no_workspace(tmp_path):
+    from test_server_signup import _plans, signup_running
+
+    with signup_running(tmp_path / 'data', admin_emails=_admins(), plans=_plans(0)) as httpd:
+        assert _signin(httpd, sub='uid-owner', email=OWNER)[0] == 200
+        assert _account(httpd, OWNER)['server_admin'] == 1
+        assert _personal_ws(httpd, OWNER) == []
+        assert _workspace_creates(httpd) == []
+
+
+def test_listed_admin_with_membership_gets_no_personal_workspace(tmp_path):
+    from test_server_signup import signup_running
+
+    with signup_running(tmp_path / 'data', admin_emails=_admins()) as httpd:
+        _member_account(httpd, OWNER, uid='uid-owner')
+        assert _signin(httpd, sub='uid-owner', email=OWNER)[0] == 200
+        assert _account(httpd, OWNER)['server_admin'] == 1
+        assert _personal_ws(httpd, OWNER) == []
+        assert _workspace_creates(httpd) == []
+
+
+def test_listed_admin_unverified_sign_in_gets_no_workspace(tmp_path):
+    from test_server_signup import signup_running
+
+    data = tmp_path / 'data'
+    with firebase_running(data, admin_emails=_admins()) as httpd:
+        assert _signin(httpd, sub='uid-owner', email=OWNER)[0] == 200
+    with signup_running(data, admin_emails=_admins()) as httpd:
+        status, _, _ = _signin(httpd, sub='uid-owner', email=OWNER, email_verified=False)
+        assert status == 200
+        assert _personal_ws(httpd, OWNER) == []
+        assert _workspace_creates(httpd) == []
 
 
 def test_firebase_off_ignores_list_with_warning(tmp_path, caplog):
