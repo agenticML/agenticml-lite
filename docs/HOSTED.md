@@ -172,7 +172,7 @@ agenticml server workspaces set-plan acme-corp custom \
 
 ### Suspending a workspace
 
-If an account violates terms of service or payment lapses, suspend the workspace:
+If an account violates terms of service or payment lapses, suspend the workspace. On `/admin`, click **Suspend** on its row, or over ECS Exec:
 
 ```bash
 agenticml server workspaces suspend acme-corp --data /data
@@ -186,9 +186,13 @@ To resume service:
 agenticml server workspaces resume acme-corp --data /data
 ```
 
+### Archiving a workspace
+
+On `/admin`, **Archive** suspends a workspace (not `default`) and moves it to the Archived table. Its data is kept, nobody can open or sync to it, and it no longer counts toward its owner's free workspace limit. **Restore** brings it back as suspended; click **Resume** to reopen it. Restore is refused if the owner already has their free workspace again.
+
 ### Deleting a workspace
 
-Deleting a workspace removes all database records, deletes on-disk files on EFS, and purges all objects under that workspace's prefix in S3. It requires typing the workspace slug to confirm:
+Deleting a workspace removes all database records, deletes on-disk files on EFS, and purges all objects under that workspace's prefix in S3. It cannot be undone, so it is a server CLI step only; the `default` workspace can never be deleted. The CLI asks for the slug:
 
 ```bash
 agenticml server workspaces delete acme-corp --yes-delete acme-corp --data /data

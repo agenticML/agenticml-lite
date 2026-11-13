@@ -92,6 +92,12 @@ EXAMPLES = {
         "method": "PATCH", "path": "/api/admin/workspaces/{slug}",
         "body": {"name": "Renamed"},
     },
+    "admin_workspaces_archive": {
+        "method": "POST", "path": "/api/admin/workspaces/{slug}/archive", "body": {},
+    },
+    "admin_workspaces_restore": {
+        "method": "POST", "path": "/api/admin/workspaces/{slug}/restore", "body": {},
+    },
     "admin_server_admins_list": {"method": "GET", "path": "/api/admin/server-admins"},
     "admin_server_admins_add": {
         "method": "POST", "path": "/api/admin/server-admins",

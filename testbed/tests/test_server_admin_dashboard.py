@@ -210,3 +210,56 @@ def test_new_workspace_dialog_hint(page, admin_server):
     expect(create.get_by_label("Owner login", exact=True)).to_be_visible()
     expect(create).to_contain_text(
         "If no account exists for this email, one is created; it is linked when they first sign in.")
+
+
+def test_archive_and_restore_a_workspace(page, admin_server):
+    """Package 24.10: Archive moves a workspace to the Archived table; Restore brings it back suspended."""
+    open_admin(page, admin_server)
+    status = page.get_by_role("status")
+    expect(page.get_by_role("table", name="Archived workspaces", exact=True)).to_have_count(0)
+    expect(page.get_by_role("heading", name="Archived", exact=True)).to_be_hidden()
+    default = workspace_row(page, "default")
+    expect(default.get_by_role("button", name="Archive", exact=True)).to_have_count(0)
+    shared = workspace_row(page, "shared")
+    shared.get_by_role("button", name="Archive", exact=True).click()
+    dialog = page.get_by_role("dialog", name="Archive shared?", exact=True)
+    expect(dialog).to_contain_text(
+        "Nobody can open or sync to it until it is restored. Its data is kept.")
+    dialog.get_by_role("button", name="Cancel", exact=True).click()
+    expect(shared).to_be_visible()
+    shared.get_by_role("button", name="Archive", exact=True).click()
+    page.get_by_role("dialog", name="Archive shared?", exact=True).get_by_role(
+        "button", name="Archive", exact=True).click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    expect(status).to_have_text("Archived shared.")
+    expect(workspace_row(page, "shared").locator('td[data-label="Status"]')).to_have_count(0)
+    archived = page.get_by_role("table", name="Archived workspaces", exact=True)
+    expect(archived).to_be_visible()
+    expect(page.get_by_role("heading", name="Archived", exact=True)).to_be_visible()
+    row = archived.get_by_role("row").filter(has=page.locator('td[data-label="Slug"]').filter(
+        has_text=re.compile("^shared$")))
+    expect(row).to_be_visible()
+    for label in ("Name", "Plan", "Storage", "Archived", "Actions"):
+        expect(row.locator(f'td[data-label="{label}"]')).to_have_count(1)
+    expect(page.get_by_role("table", name="Workspaces", exact=True)).not_to_contain_text("shared")
+    expect(page.get_by_role("table", name="Activity", exact=True)).to_contain_text("workspace.archive")
+    row.get_by_role("button", name="Restore", exact=True).click()
+    expect(status).to_have_text("Restored shared; it is suspended until you resume it.")
+    expect(page.get_by_role("table", name="Archived workspaces", exact=True)).to_have_count(0)
+    restored = workspace_row(page, "shared")
+    expect(restored.locator('td[data-label="Status"]')).to_have_text("suspended")
+    restored.get_by_role("button", name="Resume", exact=True).click()
+    expect(restored.locator('td[data-label="Status"]')).to_have_text("active")
+
+
+def test_no_overflow_with_archive_dialog_and_archived_table(page, admin_server):
+    page.set_viewport_size({"width": 375, "height": 812})
+    open_admin(page, admin_server)
+    shared = workspace_row(page, "shared")
+    shared.get_by_role("button", name="Archive", exact=True).click()
+    dialog = page.get_by_role("dialog", name="Archive shared?", exact=True)
+    expect(dialog).to_be_visible()
+    assert_no_overflow(page)
+    dialog.get_by_role("button", name="Archive", exact=True).click()
+    expect(page.get_by_role("table", name="Archived workspaces", exact=True)).to_be_visible()
+    assert_no_overflow(page)

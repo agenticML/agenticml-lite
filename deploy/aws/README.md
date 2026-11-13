@@ -818,7 +818,9 @@ aws ecs update-service --cluster agenticml-hosted --service agenticml-hosted --d
 The next deploy that updates the service sets the count back to the stack's
 value.
 
-To suspend an abusive workspace using ECS Exec:
+To suspend an abusive workspace, click **Suspend** on its row on `/admin`. **Archive**
+there suspends it and moves it to the Archived table (data kept; Restore brings it back).
+Permanent deletion is a CLI step. Using ECS Exec instead:
 
 ```sh
 aws ecs execute-command --cluster agenticml-hosted --task "$task" --container server --interactive \

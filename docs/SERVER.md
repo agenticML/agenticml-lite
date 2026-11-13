@@ -128,7 +128,7 @@ Every member of a workspace holds one of four roles within that workspace:
 ### Server administrators
 
 A global account can have the `server_admin` flag set. Server administrators:
-- Manage workspaces: create, rename, suspend, resume, and delete workspaces.
+- Manage workspaces: create, rename, suspend, resume, and delete workspaces. On `/admin`, **Archive** suspends a workspace (not `default`), keeps its data and stops it counting toward the owner's free workspace limit; **Restore** brings it back as suspended. Permanent deletion is the CLI `workspaces delete` only.
 - Manage accounts: list accounts, create accounts, and grant or revoke server administrator privileges.
 - View global storage and usage across all workspaces.
 - Configure workspace plans and limits.

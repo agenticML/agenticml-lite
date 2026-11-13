@@ -80,6 +80,10 @@ class WorkspaceBound:
                 tx._set_binding(previous)
 
 
+class WorkspaceStateError(ClientError):
+    """Refused: the workspace is not in a state that allows this change."""
+
+
 class LastServerAdminError(ClientError):
     """Refused: the change would leave the server without a server admin."""
 
@@ -349,7 +353,7 @@ class WorkspaceRepo:
         with tx.cross_scope('owned free workspace count'):
             return tx.fetchone(
                 "SELECT COUNT(*) FROM workspaces w JOIN memberships m ON m.workspace_id=w.id "
-                "WHERE m.account_id=? AND m.role='owner' AND w.plan='free'",
+                "WHERE m.account_id=? AND m.role='owner' AND w.plan='free' AND w.archived_at IS NULL",
                 (account_id,))[0]
 
     def update(self, slug, *, name=None, new_slug=None, status=None):
@@ -368,6 +372,8 @@ class WorkspaceRepo:
                 raise ClientError('cannot change the default workspace slug; the env key and the self-hosted default depend on it')
             if row['slug'] == 'default' and status == 'suspended':
                 raise ClientError('cannot suspend the default workspace; the env key and the self-hosted default depend on it')
+            if status == 'active' and row.get('archived_at'):
+                raise WorkspaceStateError('restore the workspace first')
             if new_slug != slug and new_slug is not None and self.get(new_slug, tx):
                 raise ClientError('workspace slug already exists')
             tx.execute('UPDATE workspaces SET slug=?, name=?, status=? WHERE id=?',
@@ -403,6 +409,46 @@ class WorkspaceRepo:
                 raise ClientError('cannot delete the default workspace; the env key and the self-hosted default depend on it')
             tx.execute('DELETE FROM workspaces WHERE id=?', (row['id'],))
             return row
+
+    def archive(self, slug):
+        """Suspend the workspace and mark it archived; its data is kept."""
+        with self.db.transaction(write=True) as tx:
+            tx.cross_workspace('workspace archive')
+            tx.advisory_lock('users')
+            row = self.get(slug, tx)
+            if row is None:
+                raise ClientError('unknown workspace')
+            if row['slug'] == 'default':
+                raise ClientError('cannot archive the default workspace; the env key and the self-hosted default depend on it')
+            if row.get('archived_at'):
+                raise WorkspaceStateError('workspace is already archived')
+            tx.execute('UPDATE workspaces SET status=?, archived_at=? WHERE id=?',
+                       ('suspended', layout.format_timestamp(), row['id']))
+            return self.by_id(row['id'], tx)
+
+    def restore(self, slug, plans=None):
+        """Clear the archived mark; the workspace stays suspended."""
+        with self.db.transaction(write=True) as tx:
+            tx.cross_workspace('workspace restore')
+            tx.advisory_lock('users')
+            row = self.get(slug, tx)
+            if row is None:
+                raise ClientError('unknown workspace')
+            if not row.get('archived_at'):
+                raise WorkspaceStateError('workspace is not archived')
+            limit = None if plans is None else plans.free_workspaces_per_account
+            if limit is not None and row['plan'] == 'free':
+                owners = tx.fetchall(
+                    "SELECT account_id FROM memberships WHERE workspace_id=? AND role='owner'",
+                    (row['id'],))
+                if any(self.owned_free_count(owner[0], tx) >= limit for owner in owners):
+                    raise WorkspaceStateError(
+                        'free workspaces are not available; change the plan to custom first'
+                        if limit == 0 else
+                        'the owner already has a free workspace; change the plan to custom '
+                        'or archive the other one first')
+            tx.execute('UPDATE workspaces SET archived_at=NULL WHERE id=?', (row['id'],))
+            return self.by_id(row['id'], tx)
 
     def set_owner(self, slug, login):
         with self.db.transaction(write=True) as tx:

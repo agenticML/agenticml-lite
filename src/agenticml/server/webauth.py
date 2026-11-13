@@ -1372,7 +1372,11 @@ class WebAuth:
 
         if not email_verified_for_link(claims):
             return None
-        if tx.fetchone("SELECT 1 FROM memberships WHERE account_id=?", (account["id"],)):
+        # A membership in an archived workspace does not count: the workspace
+        # is out of the owner's way, so they may get the free personal one.
+        if tx.fetchone(
+                "SELECT 1 FROM memberships m JOIN workspaces w ON w.id=m.workspace_id "
+                "WHERE m.account_id=? AND w.archived_at IS NULL", (account["id"],)):
             return None
         settings = SettingsRepo(self.keys.db)
         if account.get("created_by") == "signup":
