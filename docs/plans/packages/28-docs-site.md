@@ -412,3 +412,20 @@ the index page) so D1 flips it once.
   "Release 3.0.0: tag, publish, legal pages" is updated.
 - 28.8: home page Sign in action and banner live, still 0 overflow at 375px.
 - 28.9: `pip install agenticml-lite==3.0.0` works and no git install remains.
+
+## Resume notes (Nov 13, 2026)
+
+Work stopped here at the owner's request; the branch and a draft PR to `dev` hold the state.
+
+- **Built:** 28.0 (plan), 28.1, 28.2a, 28.3, 28.4 and 28.7. 28.1, 28.2a and 28.3 passed their verifier. 28.4's verifier was stopped before it finished, so run it again. 28.7 passed its verifier after two fix rounds.
+- **Not started:** 28.5 (home page and navigation), 28.2b (375px check over every page in `docs.yml`), 28.2c (`tests/test_website_facts.py`) and 28.8 (promotion). 28.6 and 28.9 stay owner-gated.
+- **Open findings:**
+  - `website/src/content/docs/server/sync.md` ~line 94: the curl URL now points at `main`, but the next line still says to use the tag that matches the installed version. Make the two agree.
+  - 28.4: D5 names a `hosted` label for GitHub Issues, but the repository has none. The pages say "put 'hosted' in the title". Create the label, or keep that wording.
+  - For D1, the open-sign-up sentence also appears in the dated Nov 13 entry on the status page and in `releases.md` (~line 55).
+  - 28.7 (low): the terms and privacy drafts promise that a failed S3 cleanup "is retried by the operator". No runbook step does that yet.
+- **Still to do before ready:**
+  - The supervisor reviews the whole diff (this is also the † second review for 28.7).
+  - Run `pytest -q tests`, then `-m ui` from `testbed/`, the Node 22 site build and the 375px check.
+  - Update these rows and mark the PR ready.
+- **Build note:** the site build needs Node 22 (`website/.nvmrc`); Node 20 fails.

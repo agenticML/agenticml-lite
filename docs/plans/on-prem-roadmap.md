@@ -237,17 +237,17 @@ after 24.7 and 27, beside 24.3 (28.7 and 28.9 wait on the owner).
 | 25.2 | SERVER.md, HOSTED.md, threat model, PROTOCOL.md, README, website, SECURITY.md | 25.1 | Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
 | 26 | Retire agenticml-server | 24 live | Owner | S | – | not started |
 | 27 | Sign-in pages redesigned like agenticml-server (brand panel, logo, Sign in / Sign up tabs) | 18b | Sonnet | S | [plan](packages/27-sign-in-redesign.md) | merged ([#57](https://github.com/agenticML/agenticml-lite/pull/57), Nov 13, 2026); second review pending |
-| 28 | Docs site: Releases page (1.0–3.0), hosted service section with status, home page, truth fixes, docs CI, policies and sign-in links | 24.7, 27 | Sonnet; prose Antigravity | M | [plan](packages/28-docs-site.md) | plan ready (owner decisions D1–D9 in the plan; 28.7–28.9 wait on the owner) |
+| 28 | Docs site: Releases page (1.0–3.0), hosted service section with status, home page, truth fixes, docs CI, policies and sign-in links | 24.7, 27 | Sonnet; prose Antigravity | M | [plan](packages/28-docs-site.md) | in progress: 28.0, 28.1, 28.2a, 28.3, 28.4, 28.7 built; 28.5, 28.2b, 28.2c, 28.8 next (see the plan's "Resume notes") |
 | 28.0 | Plan, roadmap rows, AWS roadmap Phase 7, Backlog entries | – | Supervisor | S | [plan](packages/28-docs-site.md) | done (this PR) |
-| 28.1 | Truth fixes in existing pages and README | 28.0 | Sonnet | S | [plan](packages/28-docs-site.md) | plan ready |
-| 28.2a | Docs CI: PR builds, link validator, Node pin, job permissions and concurrency | 28.1 | Sonnet | S | [plan](packages/28-docs-site.md) | plan ready |
-| 28.3 | Releases page (1.0, 2.0, 2.1, 2.2, 3.0) | 28.2a | Antigravity; Sonnet | S | [plan](packages/28-docs-site.md) | plan ready |
-| 28.4 | Hosted service section: overview and limits, quickstart, workspaces, service status | 28.3 | Antigravity; Sonnet | M | [plan](packages/28-docs-site.md) | plan ready |
+| 28.1 | Truth fixes in existing pages and README | 28.0 | Sonnet | S | [plan](packages/28-docs-site.md) | built, verifier passed; supervisor review pending |
+| 28.2a | Docs CI: PR builds, link validator, Node pin, job permissions and concurrency | 28.1 | Sonnet | S | [plan](packages/28-docs-site.md) | built, verifier passed; supervisor review pending |
+| 28.3 | Releases page (1.0, 2.0, 2.1, 2.2, 3.0) | 28.2a | Antigravity; Sonnet | S | [plan](packages/28-docs-site.md) | built, verifier passed after one fix round; supervisor review pending |
+| 28.4 | Hosted service section: overview and limits, quickstart, workspaces, service status | 28.3 | Antigravity; Sonnet | M | [plan](packages/28-docs-site.md) | built; verifier review stopped before it finished; review pending |
 | 28.5 | Home page and navigation | 28.4 | Sonnet | S | [plan](packages/28-docs-site.md) | plan ready |
 | 28.2b | 375px overflow check over every built page, in `docs.yml` | 28.5 | Sonnet | S | [plan](packages/28-docs-site.md) | plan ready |
 | 28.2c | Facts test: limits, minimum client, no unpublished tag URLs, no `login --key` | 28.4 | Sonnet | S | [plan](packages/28-docs-site.md) | plan ready |
 | 28.6 | Publish: docs-only PR to `main`; Pages HTTPS, repo description and homepage | 28.1–28.5, 28.2a–c, D3 | git agent; owner | S | [plan](packages/28-docs-site.md) | not started |
-| 28.7 † | Terms, acceptable use and privacy policy on the site; links on the sign-in and invite pages | 28.6 | Antigravity; owner and lawyer approve; Sonnet | M | [plan](packages/28-docs-site.md) | blocked: owner decisions D1, D2, D4, D6 |
+| 28.7 † | Terms, acceptable use and privacy policy on the site; links on the sign-in and invite pages | 28.6 | Antigravity; owner and lawyer approve; Sonnet | M | [plan](packages/28-docs-site.md) | built: draft policies on the site, opt-in links (`HOSTED_LEGAL_BASE_URL` unset); drafts await owner and lawyer; supervisor † review pending |
 | 28.8 | Promotion: Sign in action, banner, header link | 28.7 | Sonnet | S | [plan](packages/28-docs-site.md) | not started |
 | 28.9 | After PyPI 3.0.0: `pip install`, tag URLs, release dates, `pyproject.toml` URLs | owner release | Sonnet | S | [plan](packages/28-docs-site.md) | blocked: 3.0.0 not on PyPI |
 
