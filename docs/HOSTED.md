@@ -49,14 +49,16 @@ Deploys are automated through GitHub Actions ([.github/workflows/deploy.yml](../
 1. **Image build and push**: The Dockerfile at [deploy/aws/Dockerfile](../deploy/aws/Dockerfile) builds an image containing `agenticml-lite[hosted]` pinned to the target commit. The workflow builds it for `linux/arm64` under QEMU and pushes it to private Amazon ECR with the immutable tag `<commit sha>-arm64`.
 2. **Rolling CloudFormation deployment**: The deploy workflow deploys the hosted CloudFormation stack with the new image tag. CloudFormation registers the task definition revision and triggers a rolling service update (`minimumHealthyPercent=100`, `maximumPercent=200`, so the new task starts before the old one stops and a single task deploys without downtime); the ECS deployment circuit breaker automatically rolls back if a bad image fails to start.
 3. **Database migrations**: Migrations run automatically during server process startup under PostgreSQL advisory migration locks (`pg_advisory_xact_lock`), safely coordinating concurrent starts.
-4. **Initial deploy and config updates**: The first deploy creates the entire hosted CloudFormation stack in one go (no `desired_count=0` step). Environment configuration changes (Multi-AZ, Firebase settings, or open sign-up) are made by updating GitHub environment variables and re-running the deploy workflow. The task count is not a variable: it comes from the workflow's `desired_count` input (`1`, `0` or `2`; default `1`; push runs keep the current count).
+4. **Initial deploy and config updates**: The first deploy creates the entire hosted CloudFormation stack in one go (no `desired_count=0` step). Environment configuration changes (Multi-AZ, Firebase settings, open sign-up, or admin emails) are made by updating GitHub environment variables and re-running the deploy workflow. The task count is not a variable: it comes from the workflow's `desired_count` input (`1`, `0` or `2`; default `1`; push runs keep the current count).
 5. **How deploys start**: The workflow runs automatically on every push to `dev` that changes `src/**`, `pyproject.toml`, `deploy/aws/**` (except Markdown and `bootstrap.yaml`) or `.github/workflows/deploy.yml`. Each run waits for the required reviewer on the `hosted` environment; the reviewer reads the commit first and rejects an older waiting run when a newer one is queued. Manual dispatch (`gh workflow run deploy.yml`) works only once `deploy.yml` is on `main`. Until then, roll back by reverting on `dev`.
 
 For deployment commands and runbook procedures, see [deploy/aws/README.md](../deploy/aws/README.md#first-deploy).
 
 ## First server administrator
 
-When the server starts without an administrator, it logs a one-time `/setup` link. Find the newest setup link in CloudWatch:
+With Firebase on, `/setup` returns 404; the first server administrator is provisioned via the `HOSTED_ADMIN_EMAILS` GitHub environment variable (and `AGENTICML_SERVER_ADMIN_EMAILS` server setting). Set `HOSTED_ADMIN_EMAILS` to your Google email, deploy, sign in at `https://app.agenticml.xyz/login` with "Continue with Google", and open `/admin`. A server admin without workspace memberships lands on `/workspaces` with an **Admin** button and sees no customer workspace data.
+
+The `/setup` endpoint only exists with Firebase off. When the server starts without an administrator and Firebase is disabled, it logs a one-time `/setup` link. Find the newest setup link in CloudWatch:
 
 ```sh
 aws logs filter-log-events \
@@ -80,14 +82,18 @@ Server administration is available at `https://app.agenticml.xyz/admin/`.
 
 ### Break-glass CLI alternative
 
-If the setup link cannot be used, open an interactive ECS Exec shell (see [deploy/aws/README.md](../deploy/aws/README.md#accounts-firebase-and-customers)) and add the admin user directly:
+If `/setup` is unreachable (with Firebase off) or if granting server admin via ECS Exec is needed with Firebase on, open an interactive ECS Exec shell (see [deploy/aws/README.md](../deploy/aws/README.md#connecting-via-ecs-exec)):
 
 ```sh
+# With Firebase on (linking on first verified sign-in):
+agenticml server accounts add you@example.com --server-admin --data /data
+
+# With Firebase off:
 agenticml server users add admin2 --role admin --workspace default \
   --public-url https://app.agenticml.xyz --data /data
 ```
 
-While `default` has no owner yet, this makes `admin2` its owner with `server_admin=1` and prints a one-time invite link. Open the invite link to set a password (≥ 12 characters).
+While `default` has no owner yet, `users add admin2` makes `admin2` its owner with `server_admin=1` and prints a one-time invite link to set the password (≥ 12 characters). `agenticml server accounts list` shows a `source` column (`list`, `manual`, or `-`). The last server admin who can sign in cannot be removed.
 
 ## Customer workspaces
 
@@ -95,7 +101,18 @@ Customers interact with the hosted service as isolated workspaces on `app.agenti
 
 ### Manual workspace creation
 
-To provision a customer workspace manually:
+The standard path is self-serve administration from `/admin` and the workspace dashboard:
+
+1. **Create workspace**: On `/admin`, click **New workspace** and enter the slug, name, and owner email (e.g. `customer@example.com`). If no account exists for that email yet, a credential-less account is created.
+2. **Owner sign-in**: The owner signs in with a verified Firebase sign-in (Google or verified email/password using that email). The first verified sign-in links the account and places them in the workspace as owner.
+3. **Invite team members**: The workspace owner invites team members from the workspace **Team** page. An invite generates a one-time link (valid 72 hours). The invitee signs in with Google or email/password using that exact email, which must be verified. Inviting someone who already has an account adds the membership directly without generating an invite link.
+4. **Issue sync keys**: A workspace admin creates sync API keys on the workspace **Keys** page for any member (the person must already be a workspace member).
+5. **Multi-workspace accounts**: With Firebase on, there are no passwords to set; adding an account to additional workspaces attaches the membership directly. (The order rule requiring a user to set their password before being added to a second workspace applies to password sign-in only.)
+
+### Break-glass CLI workspace creation
+
+Workspaces can also be provisioned over ECS Exec using the server CLI:
+
 1. Create the customer account:
    ```bash
    agenticml server accounts add customer@example.com --data /data

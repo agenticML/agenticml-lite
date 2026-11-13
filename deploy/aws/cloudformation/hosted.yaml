@@ -38,6 +38,12 @@ Parameters:
     Default: "false"
     AllowedValues: ["true", "false"]
     Description: Enable only after the owner verified Firebase and the free limits.
+  AdminEmails:
+    Type: String
+    Default: ""
+    MaxLength: 2048
+    AllowedPattern: ^\S*$
+    Description: Comma-separated sign-in emails of server administrators, without spaces; empty means none. Needs Firebase sign-in.
   VpcCidr:
     Type: String
     Default: 10.42.0.0/16
@@ -719,6 +725,8 @@ Resources:
               - !Ref AWS::NoValue
             - Name: AGENTICML_SERVER_OPEN_SIGNUP
               Value: !Ref OpenSignup
+            - Name: AGENTICML_SERVER_ADMIN_EMAILS
+              Value: !Ref AdminEmails
             - Name: AGENTICML_SERVER_LIMITS
               Value: /etc/agenticml/limits.json
             - Name: AGENTICML_SERVER_TRUSTED_PROXY

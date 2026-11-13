@@ -572,7 +572,7 @@ def _environment_file_assignment(name, value):
 
 
 def write_systemd_unit(data, port, *, home=None, force=False, database=None, firebase=None,
-                       open_signup=False, limits=None):
+                       open_signup=False, limits=None, admin_emails=frozenset()):
     home = Path(home or Path.home())
     path = systemd_unit_path(home)
     env_path = systemd_env_path(home)
@@ -594,6 +594,8 @@ def write_systemd_unit(data, port, *, home=None, force=False, database=None, fir
         exec_start += ' --firebase-auth-domain ' + _systemd_quote(firebase.auth_domain)
     if open_signup:
         exec_start += ' --open-signup'
+    if admin_emails:
+        exec_start += ' --admin-emails ' + _systemd_quote(','.join(sorted(admin_emails)))
     if limits:
         exec_start += ' --limits ' + _systemd_quote(_absolute_limits(limits))
     body = (
@@ -626,7 +628,7 @@ def write_systemd_unit(data, port, *, home=None, force=False, database=None, fir
 
 
 def write_launchd_plist(data, port, *, home=None, force=False, database=None, firebase=None,
-                        open_signup=False, limits=None):
+                        open_signup=False, limits=None, admin_emails=frozenset()):
     home = Path(home or Path.home())
     if database is not None:
         _require_single_line_database(database)
@@ -656,6 +658,8 @@ def write_launchd_plist(data, port, *, home=None, force=False, database=None, fi
         ])
     if open_signup:
         payload['ProgramArguments'].append('--open-signup')
+    if admin_emails:
+        payload['ProgramArguments'].extend(['--admin-emails', ','.join(sorted(admin_emails))])
     if limits:
         payload['ProgramArguments'].extend(['--limits', _absolute_limits(limits)])
     _atomic_write(path, plistlib.dumps(payload), home=home)
@@ -664,7 +668,7 @@ def write_launchd_plist(data, port, *, home=None, force=False, database=None, fi
 
 
 def install_unit(data, port, *, force=False, database=None, firebase=None, open_signup=False,
-                 limits=None):
+                 limits=None, admin_emails=frozenset()):
     extra = {}
     if firebase is not None:
         extra['firebase'] = firebase
@@ -672,6 +676,8 @@ def install_unit(data, port, *, force=False, database=None, firebase=None, open_
         extra['open_signup'] = True
     if limits:
         extra['limits'] = limits
+    if admin_emails:
+        extra['admin_emails'] = frozenset(admin_emails)
     if sys.platform.startswith("linux"):
         return write_systemd_unit(data, port, force=force, database=database, **extra)
     if sys.platform == "darwin":
@@ -680,7 +686,7 @@ def install_unit(data, port, *, force=False, database=None, firebase=None, open_
 
 
 def up(data=None, port=8080, *, install=False, force=False, database=None, firebase=None,
-       plans=None, limits=None, open_signup=False):
+       plans=None, limits=None, open_signup=False, admin_emails=frozenset()):
     from .firebase import require_open_signup
     from .limits import Plans
 
@@ -713,6 +719,8 @@ def up(data=None, port=8080, *, install=False, force=False, database=None, fireb
             install_extra['open_signup'] = True
         if limits:
             install_extra['limits'] = limits
+        if admin_emails:
+            install_extra['admin_emails'] = frozenset(admin_emails)
         install_unit(data, port, force=force, **install_extra)
         if explicit_database is None and database is not None:
             print(_INSTALL_ENV_DATABASE)
@@ -744,6 +752,8 @@ def up(data=None, port=8080, *, install=False, force=False, database=None, fireb
             serve_extra["plans"] = plans
         if open_signup:
             serve_extra["open_signup"] = True
+        if admin_emails:
+            serve_extra["admin_emails"] = frozenset(admin_emails)
         serve(data, "127.0.0.1", port, public_url, on_ready,
               trusted_proxies=("127.0.0.1", "::1"),
               **serve_extra)

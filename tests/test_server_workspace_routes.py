@@ -65,6 +65,12 @@ def test_route_table_lists_workspace_and_sync():
     assert any(route.name == "account_session" for route in table)
     assert any(route.name == "home" and route.pattern == r"/" for route in table)
     assert any(route.scope == "server_admin" and "/api/admin/workspaces" in route.pattern for route in table)
+    admins = {route.name: route for route in table if "/api/admin/server-admins" in route.pattern}
+    assert {name: route.method for name, route in admins.items()} == {
+        "admin_server_admins_list": "GET", "admin_server_admins_add": "POST",
+        "admin_server_admins_remove": "DELETE"}
+    assert all(route.scope == "server_admin" and route.handler == "admin_server_admins"
+               for route in admins.values())
 
 
 def test_second_workspace_routes_and_identical_404s(two):

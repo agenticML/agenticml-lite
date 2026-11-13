@@ -523,6 +523,29 @@ def _open_signup_from_args(args, firebase, plans=None):
     return open_signup
 
 
+def _admin_emails_from_args(args):
+    """Server-admin emails from ``--admin-emails`` or the environment (flag wins).
+
+    Invalid entries are dropped with a warning: a typo in a deploy variable
+    must not take the service down.
+    """
+    from .server.db.workspaces import is_email_login
+
+    raw = getattr(args, "admin_emails", None)
+    if raw is None:
+        raw = os.environ.get("AGENTICML_SERVER_ADMIN_EMAILS", "")
+    emails = set()
+    for part in raw.split(","):
+        entry = part.strip().lower()
+        if not entry:
+            continue
+        if not is_email_login(entry):
+            logger.warning("ignoring admin email entry %r: not an email address", entry)
+            continue
+        emails.add(entry)
+    return frozenset(emails)
+
+
 def cmd_server_serve(args):
     from .server import serve
     from .server.db.errors import DatabaseError
@@ -553,6 +576,9 @@ def cmd_server_serve(args):
             extra["firebase"] = firebase
         if _open_signup_from_args(args, firebase, plans):
             extra["open_signup"] = True
+        admin_emails = _admin_emails_from_args(args)
+        if admin_emails:
+            extra["admin_emails"] = admin_emails
         min_client = args.min_client_version
         if min_client is None:
             min_client = os.environ.get("AGENTICML_SERVER_MIN_CLIENT_VERSION") or None
@@ -599,6 +625,9 @@ def cmd_server_up(args):
             extra["firebase"] = firebase
         if _open_signup_from_args(args, firebase, plans):
             extra["open_signup"] = True
+        admin_emails = _admin_emails_from_args(args)
+        if admin_emails:
+            extra["admin_emails"] = admin_emails
         up(args.data, args.port, install=args.install, force=args.force, **extra)
     except KeyboardInterrupt:
         pass
@@ -938,12 +967,13 @@ def cmd_server_accounts(args):
             if args.json:
                 print(json.dumps(rows))
             else:
-                fields = ('login', 'display_name', 'server_admin', 'firebase', 'email_verified', 'created_at')
+                fields = ('login', 'display_name', 'server_admin', 'source', 'firebase', 'email_verified', 'created_at')
                 table = [list(fields)]
                 for row in rows:
                     table.append([
                         row['login'], row['display_name'] or '',
                         str(row['server_admin']),
+                        (row.get('server_admin_source') or 'manual') if row['server_admin'] else '-',
                         'yes' if row.get('firebase_uid') else 'no',
                         str(row.get('email_verified') or 0),
                         row['created_at'] or '',
@@ -952,14 +982,14 @@ def cmd_server_accounts(args):
         elif args.accounts_action == 'add':
             account = repo.create(args.login, display_name=args.display_name, created_by='cli')
             if args.server_admin:
-                repo.set_server_admin(account['login'], True)
+                repo.set_server_admin(account['login'], True, source='manual')
                 account = repo.get(account['login'])
             AuditLog(directory, db=db, workspace_id=None).record(
                 cli_actor(), 'cli', 'account.create', account['login'],
                 detail={'server_admin': bool(args.server_admin),
                         'display_name': account['display_name']})
         else:
-            repo.set_server_admin(args.login, args.value == 'on')
+            repo.set_server_admin(args.login, args.value == 'on', source='manual')
             AuditLog(directory, db=db, workspace_id=None).record(
                 cli_actor(), 'cli', 'account.server_admin', args.login, detail={'enabled': args.value == 'on'})
         return 0
@@ -1729,6 +1759,9 @@ def main(argv=None):
     p_serve.add_argument("--limits", default=None, metavar="FILE", help="Workspace limits JSON (default: AGENTICML_SERVER_LIMITS)")
     p_serve.add_argument("--open-signup", action="store_true",
                         help="Allow verified Firebase sign-in to create an account (default: AGENTICML_SERVER_OPEN_SIGNUP)")
+    p_serve.add_argument("--admin-emails", default=None, metavar="LIST",
+                        help="Comma-separated emails that become server admins at their next verified "
+                             "Firebase sign-in (default: AGENTICML_SERVER_ADMIN_EMAILS)")
     p_serve.add_argument("--min-client-version", default=None, metavar="X.Y",
                          help="Reject agenticml-lite clients older than this on /v2 "
                               "(default: AGENTICML_SERVER_MIN_CLIENT_VERSION or 2.2)")
@@ -1749,6 +1782,9 @@ def main(argv=None):
                      help="Workspace limits JSON (default: AGENTICML_SERVER_LIMITS)")
     p_up.add_argument("--open-signup", action="store_true",
                      help="Allow verified Firebase sign-in to create an account (default: AGENTICML_SERVER_OPEN_SIGNUP)")
+    p_up.add_argument("--admin-emails", default=None, metavar="LIST",
+                     help="Comma-separated emails that become server admins at their next verified "
+                          "Firebase sign-in (default: AGENTICML_SERVER_ADMIN_EMAILS)")
     p_up.set_defaults(func=cmd_server_up)
     for action, func, help_text in (
             ("status", cmd_server_status, "Show runs, sizes, and key activity per workspace"),

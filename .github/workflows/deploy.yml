@@ -121,6 +121,7 @@ jobs:
           FIREBASE_PROJECT: ${{ vars.HOSTED_FIREBASE_PROJECT }}
           FIREBASE_API_KEY: ${{ vars.HOSTED_FIREBASE_API_KEY }}
           OPEN_SIGNUP: ${{ vars.HOSTED_OPEN_SIGNUP || 'false' }}
+          ADMIN_EMAILS: ${{ vars.HOSTED_ADMIN_EMAILS }}
         run: |
           set -euo pipefail
           # Each Key="$value" is one argument, so an empty value reaches the
@@ -131,6 +132,7 @@ jobs:
             FirebaseProject="$FIREBASE_PROJECT"
             FirebaseApiKey="$FIREBASE_API_KEY"
             OpenSignup="$OPEN_SIGNUP"
+            AdminEmails="$ADMIN_EMAILS"
           )
           # Push runs leave DesiredCount out: an existing stack keeps its
           # current count, and a new one gets the template default (1).

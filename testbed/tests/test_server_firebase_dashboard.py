@@ -365,6 +365,62 @@ def test_firebase_sign_in_no_overflow_at_375(page, firebase_ui):
     assert_no_overflow(page)
 
 
+def test_team_page_uses_firebase_copy(page, firebase_ui):
+    httpd = firebase_ui["httpd"]
+    httpd.users.add("admin", role="admin")
+    httpd.users.add("alice", role="member")
+    stub_vendor(page)
+    # Password and key sign-in are off with Firebase: mint the session directly.
+    token, _ = httpd.web._session_cookie_for("admin", "firebase")
+    page.context.add_cookies([{
+        "name": httpd.web._cookie_name(), "value": token, "url": firebase_ui["url"]}])
+    page.goto(firebase_ui["url"])
+    expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+    page.get_by_role("link", name="Team", exact=True).click()
+    expect(page.get_by_role("heading", name="Team", exact=True)).to_be_visible()
+    page.get_by_role("button", name="Invite", exact=True).click()
+    dialog = page.get_by_role("dialog", name="Invite", exact=True)
+    dialog.get_by_label("Login or email", exact=True).fill("cara@example.com")
+    dialog.get_by_role("button", name="Invite", exact=True).click()
+    expect(dialog.get_by_text(
+        "This invite link is shown once. They sign in with Google or email and password, "
+        "using this email; the email must be verified.")).to_be_visible()
+    expect(dialog).not_to_contain_text("choose their own password")
+    dialog.get_by_role("button", name="Close", exact=True).click()
+    page.get_by_role("row").filter(has_text="alice").get_by_role(
+        "button", name="Invite link", exact=True).click()
+    relink = page.get_by_role("dialog", name="Invite alice?", exact=True)
+    expect(relink).to_contain_text("This signs them out and gives them a new sign-in link.")
+    expect(relink).not_to_contain_text("clears their password")
+
+
+def test_admin_adds_new_email_as_pending_server_admin(page, firebase_ui):
+    from agenticml.server.db.workspaces import AccountRepo
+
+    httpd = firebase_ui["httpd"]
+    httpd.users.add("admin", role="admin")
+    AccountRepo(httpd.db).set_server_admin("admin", True)
+    stub_vendor(page)
+    token, _ = httpd.web._session_cookie_for("admin", "firebase")
+    page.context.add_cookies([{
+        "name": httpd.web._cookie_name(), "value": token, "url": firebase_ui["url"]}])
+    page.goto(f"{firebase_ui['url']}/admin/")
+    expect(page.get_by_role("heading", name="Server admins", exact=True)).to_be_visible()
+    page.get_by_role("button", name="Add server admin", exact=True).click()
+    dialog = page.get_by_role("dialog", name="Add server admin", exact=True)
+    expect(dialog).to_contain_text(
+        "If no account exists for this email, one is created; it is linked when they first sign in.")
+    dialog.get_by_label("Email or login", exact=True).fill("fresh@example.com")
+    dialog.get_by_role("button", name="Add", exact=True).click()
+    table = page.get_by_role("table", name="Server admins", exact=True)
+    row = table.get_by_role("row").filter(has=page.locator('td[data-label="Login"]').filter(
+        has_text=re.compile(r"^fresh@example\.com$")))
+    expect(row).to_be_visible()
+    expect(row.locator('td[data-label="Sign-in"]')).to_have_text("pending")
+    expect(row.locator('td[data-label="Source"]')).to_have_text("manual")
+    expect(page.get_by_role("status").filter(has_text="Created an account for fresh@example.com")).to_be_visible()
+
+
 SIGN_IN_TITLE = "Sign in to your workspace"
 SIGN_IN_SUB = "Pick up your runs and comparisons where you left them."
 SIGN_UP_TITLE = "Create your workspace"

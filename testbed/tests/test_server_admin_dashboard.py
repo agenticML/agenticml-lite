@@ -125,7 +125,88 @@ def test_no_overflow_admin_and_picker(page, admin_server):
     page.get_by_role("link", name="Admin", exact=True).click()
     expect(page.get_by_role("heading", name="Admin", exact=True)).to_be_visible()
     expect(page.get_by_role("table", name="Workspaces", exact=True)).to_be_visible()
+    expect(page.get_by_role("table", name="Server admins", exact=True)).to_be_visible()
     assert_no_overflow(page)
+    page.get_by_role("button", name="Add server admin", exact=True).click()
+    dialog = page.get_by_role("dialog", name="Add server admin", exact=True)
+    expect(dialog).to_be_visible()
+    assert_no_overflow(page)
+    dialog.get_by_role("button", name="Close", exact=True).click()
     page.get_by_role("link", name="Workspaces", exact=True).click()
     expect(page.get_by_role("heading", name="Workspaces", exact=True)).to_be_visible()
     assert_no_overflow(page)
+
+
+def admin_row(page, login):
+    table = page.get_by_role("table", name="Server admins", exact=True)
+    return table.get_by_role("row").filter(has=page.locator('td[data-label="Login"]').filter(
+        has_text=re.compile(f"^{re.escape(login)}$")))
+
+
+def test_server_admins_section_add_remove_and_last_admin(page, admin_server):
+    page.allow_http_errors = True  # the unknown account (404) and last admin (409) answers
+    open_admin(page, admin_server)
+    expect(page.get_by_role("heading", name="Server admins", exact=True)).to_be_visible()
+    table = page.get_by_role("table", name="Server admins", exact=True)
+    for label in ("Login", "Source", "Sign-in", "Actions"):
+        expect(table.get_by_role("columnheader", name=label, exact=True)).to_be_visible()
+    first = admin_row(page, "admin")
+    expect(first).to_be_visible()
+    expect(first.locator('td[data-label="Source"]')).to_have_text("manual")
+    expect(first.locator('td[data-label="Sign-in"]')).to_have_text("Password")
+
+    # Without Firebase an unknown email is refused and the hint says so.
+    page.get_by_role("button", name="Add server admin", exact=True).click()
+    dialog = page.get_by_role("dialog", name="Add server admin", exact=True)
+    expect(dialog).to_contain_text("The account must already exist.")
+    expect(dialog).not_to_contain_text("one is created")
+    dialog.get_by_label("Email or login", exact=True).fill("no-such@example.com")
+    dialog.get_by_role("button", name="Add", exact=True).click()
+    expect(dialog.get_by_role("alert")).to_have_text("unknown account")
+    dialog.get_by_label("Email or login", exact=True).fill("alice")
+    dialog.get_by_role("button", name="Add", exact=True).click()
+    added = admin_row(page, "alice")
+    expect(added).to_be_visible()
+    expect(added.locator('td[data-label="Sign-in"]')).to_have_text("Password")
+    expect(page.get_by_role("status").filter(has_text="alice is now a server admin")).to_be_visible()
+    expect(page.get_by_role("table", name="Activity", exact=True)).to_contain_text("account.server_admin")
+
+    added.get_by_role("button", name="Remove", exact=True).click()
+    confirm = page.get_by_role("dialog", name="Remove alice?", exact=True)
+    expect(confirm).to_contain_text("next sign-in")
+    confirm.get_by_role("button", name="Remove", exact=True).click()
+    expect(admin_row(page, "alice")).to_have_count(0)
+
+    admin_row(page, "admin").get_by_role("button", name="Remove", exact=True).click()
+    confirm = page.get_by_role("dialog", name="Remove admin?", exact=True)
+    confirm.get_by_role("button", name="Remove", exact=True).click()
+    expect(confirm.get_by_role("alert")).to_have_text("cannot remove the last server admin")
+    confirm.get_by_role("button", name="Close", exact=True).click()
+    expect(admin_row(page, "admin")).to_be_visible()
+
+
+def test_server_admin_removing_themselves_leaves_the_admin_page(page, admin_server):
+    page.allow_http_errors = True  # /admin/ is an unknown page for a non-admin
+    open_admin(page, admin_server)
+    page.get_by_role("button", name="Add server admin", exact=True).click()
+    dialog = page.get_by_role("dialog", name="Add server admin", exact=True)
+    dialog.get_by_label("Email or login", exact=True).fill("alice")
+    dialog.get_by_role("button", name="Add", exact=True).click()
+    expect(admin_row(page, "alice")).to_be_visible()
+    admin_row(page, "admin").get_by_role("button", name="Remove", exact=True).click()
+    confirm = page.get_by_role("dialog", name="Remove admin?", exact=True)
+    confirm.get_by_role("button", name="Remove", exact=True).click()
+    expect(page).not_to_have_url(re.compile(r"/admin"))
+    expect(page).to_have_url(re.compile(r"/(workspaces|w/default/)"))
+    expect(page.get_by_role("alert")).to_have_count(0)
+    response = page.goto(f"{admin_server['url']}/admin/")
+    assert response is not None and response.status == 404
+
+
+def test_new_workspace_dialog_hint(page, admin_server):
+    open_admin(page, admin_server)
+    page.get_by_role("button", name="New workspace", exact=True).click()
+    create = page.get_by_role("dialog", name="New workspace", exact=True)
+    expect(create.get_by_label("Owner login", exact=True)).to_be_visible()
+    expect(create).to_contain_text(
+        "If no account exists for this email, one is created; it is linked when they first sign in.")

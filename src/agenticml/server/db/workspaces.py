@@ -80,6 +80,10 @@ class WorkspaceBound:
                 tx._set_binding(previous)
 
 
+class LastServerAdminError(ClientError):
+    """Refused: the change would leave the server without a server admin."""
+
+
 class AccountRepo:
     def __init__(self, db):
         self.db = db
@@ -148,8 +152,9 @@ class AccountRepo:
     def list(self):
         with self.db.transaction() as tx:
             return [dict(r) for r in tx.fetchall(
-                'SELECT id, login, display_name, identity, server_admin, generation, created_at, created_by, '
-                'firebase_uid, email, email_verified FROM accounts ORDER BY created_at, login')]
+                'SELECT id, login, display_name, identity, server_admin, server_admin_source, generation, '
+                'created_at, created_by, firebase_uid, email, email_verified '
+                'FROM accounts ORDER BY created_at, login')]
 
     def create(self, login, display_name=None, created_by='cli', tx=None):
         login = validate_login(login)
@@ -190,13 +195,48 @@ class AccountRepo:
         tx.execute('UPDATE accounts SET email=?, email_verified=? WHERE id=?',
                    (email.lower() if isinstance(email, str) else email, 1 if verified else 0, account_id))
 
-    def set_server_admin(self, login, enabled):
-        with self.db.transaction(write=True) as tx:
-            tx.advisory_lock('users')
-            account = self.get(login, tx)
-            if account is None:
-                raise ClientError('unknown account')
-            tx.execute('UPDATE accounts SET server_admin=? WHERE id=?', (int(enabled), account['id']))
+    def set_server_admin(self, login, enabled, *, source='manual', tx=None):
+        """Grant or revoke server admin; returns the updated account row.
+
+        ``source`` records who granted it: ``'manual'`` (CLI or web) overwrites
+        anything, ``'list'`` (deploy config) never downgrades a manual grant.
+        Revoking the only server admin raises ``LastServerAdminError``.
+        """
+        if source not in ('list', 'manual'):
+            raise ValueError('source must be list or manual')
+        if tx is None:
+            with self.db.transaction(write=True) as tx:
+                return self.set_server_admin(login, enabled, source=source, tx=tx)
+        tx.advisory_lock('users')
+        account = self.get(login, tx)
+        if account is None:
+            raise ClientError('unknown account')
+        if enabled:
+            if source == 'manual' or not account['server_admin']:
+                tx.execute('UPDATE accounts SET server_admin=1, server_admin_source=? WHERE id=?',
+                           (source, account['id']))
+        else:
+            # Only admins that can sign in count: a pending (credential-less)
+            # admin neither satisfies the guard nor is protected by it.
+            if (account['server_admin'] and self.can_sign_in(account) and not tx.fetchone(
+                    'SELECT 1 FROM accounts WHERE server_admin=1 AND id<>? AND '
+                    '(password IS NOT NULL OR identity IS NOT NULL OR firebase_uid IS NOT NULL)',
+                    (account['id'],))):
+                raise LastServerAdminError('cannot remove the last server admin')
+            tx.execute('UPDATE accounts SET server_admin=0, server_admin_source=NULL WHERE id=?',
+                       (account['id'],))
+        return dict(tx.fetchone('SELECT * FROM accounts WHERE id=?', (account['id'],)))
+
+    @staticmethod
+    def can_sign_in(account):
+        return any(account.get(key) is not None for key in ('password', 'identity', 'firebase_uid'))
+
+    def server_admins(self, tx=None):
+        if tx is None:
+            with self.db.transaction() as tx:
+                return self.server_admins(tx)
+        return [dict(r) for r in tx.fetchall(
+            'SELECT * FROM accounts WHERE server_admin=1 ORDER BY login')]
 
     def discard_unreferenced(self, account_id, login, tx):
         with tx.cross_scope('discard unreferenced account'):
@@ -251,7 +291,16 @@ class WorkspaceRepo:
                 'SELECT w.*, (SELECT COUNT(*) FROM memberships m WHERE m.workspace_id=w.id) AS members '
                 'FROM workspaces w ORDER BY w.created_at, w.slug')]
 
-    def create(self, slug, name=None, owner=None, tx=None, *, plan='free', personal=0):
+    def create(self, slug, name=None, owner=None, tx=None, *, plan='free', personal=0,
+               create_owner=None):
+        """Create a workspace owned by an existing account.
+
+        ``create_owner`` is the ``created_by`` value for a credential-less owner
+        account to create in the same transaction when ``owner`` is an email
+        with no account yet; the account is never left behind if the workspace
+        is refused. The created account is not returned; read it with
+        ``AccountRepo.get``.
+        """
         validate_slug(slug)
         if not isinstance(name or slug, str) or not (name or slug).strip() or len(name or slug) > 256:
             raise ClientError('invalid workspace name')
@@ -259,12 +308,16 @@ class WorkspaceRepo:
             raise ClientError('plan must be free or custom')
         if tx is None:
             with self.db.transaction(write=True) as tx:
-                return self.create(slug, name, owner, tx, plan=plan, personal=personal)
+                return self.create(slug, name, owner, tx, plan=plan, personal=personal,
+                                   create_owner=create_owner)
         tx.cross_workspace('workspace create')
         tx.advisory_lock('users')
         if self.get(slug, tx):
             raise ClientError('workspace slug already exists')
-        account = AccountRepo(self.db).get(validate_login(owner), tx) if owner else None
+        accounts = AccountRepo(self.db)
+        account = accounts.get(validate_login(owner), tx) if owner else None
+        if account is None and create_owner and is_email_login(owner):
+            account = accounts.create(owner, None, create_owner, tx)
         if account is None:
             raise ClientError('workspace needs an existing owner account')
         wid = secrets.token_hex(16)

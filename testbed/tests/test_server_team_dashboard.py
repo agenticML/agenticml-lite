@@ -269,3 +269,19 @@ def test_load_older_activity(page, team_server):
     expect(older).to_be_enabled()
     older.click()
     expect(page.get_by_role("table", name="Activity", exact=True)).to_contain_text("u000")
+
+
+def test_team_copy_for_password_server(page, team_server):
+    sign_in(page, team_server, team_server["admin"])
+    page.get_by_role("link", name="Team", exact=True).click()
+    expect(page.get_by_role("heading", name="Team", exact=True)).to_be_visible()
+    user_row(page, "alice").get_by_role("button", name="Invite link", exact=True).click()
+    dialog = page.get_by_role("dialog", name="Invite alice?", exact=True)
+    expect(dialog).to_contain_text("This signs them out and clears their password.")
+    dialog.get_by_role("button", name="Close", exact=True).click()
+    page.get_by_role("button", name="Invite", exact=True).click()
+    invite = page.get_by_role("dialog", name="Invite", exact=True)
+    invite.get_by_label("Login or email", exact=True).fill("cara")
+    invite.get_by_role("button", name="Invite", exact=True).click()
+    expect(invite).to_contain_text("This invite link is shown once. They choose their own password.")
+    expect(invite).not_to_contain_text("They sign in with Google or email and password")

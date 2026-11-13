@@ -132,7 +132,17 @@ A global account can have the `server_admin` flag set. Server administrators:
 - Manage accounts: list accounts, create accounts, and grant or revoke server administrator privileges.
 - View global storage and usage across all workspaces.
 - Configure workspace plans and limits.
-- **Isolation boundary**: Server administrators cannot view, list, or download runs or files within a workspace unless they are explicitly added as a member of that workspace.
+- **Isolation boundary**: Server administrators cannot view, list, or download runs or files within a workspace unless they are explicitly added as a member of that workspace. An admin without workspace membership lands on `/workspaces` with an Admin button and sees no customer workspace data.
+
+Server administrator privileges can be granted through three paths:
+
+- **Admin emails (`--admin-emails` / `AGENTICML_SERVER_ADMIN_EMAILS`)**: Comma-separated list of emails, matched case-insensitively. Requires Firebase authentication (`--firebase-project`). Without Firebase, the list is ignored with a startup warning. Invalid entries are dropped with a warning. When a user completes a verified Firebase sign-in (Google OAuth or email/password with verified email) matching the list, their account is created if none exists (without creating a personal workspace) and granted server admin with source `list`. If an email is removed from the list, list-granted server admin is revoked at that person's next sign-in.
+- **Web administration (`/admin`)**: The "Server admins" section lists all server administrators (login, source, and sign-in state). Administrators can add server admins by email or login. Adding an email without an existing account creates a credential-less account that links on its first verified Firebase sign-in (`source` is `manual`). Administrators can remove server admins immediately; an email still in `--admin-emails` will regain server admin at its next sign-in.
+- **Server CLI (`agenticml server accounts set-server-admin`)**: `set-server-admin LOGIN on|off` and `accounts add LOGIN --server-admin` grant or revoke server admin with source `manual`. Manual grants survive removal of an email from `--admin-emails`.
+
+**Last server admin rule**: The last server administrator who can sign in (has a password, an identity, or a linked Firebase account) can never be removed through the list, the web interface, or the CLI; a pending admin that has never signed in does not count and can always be removed (`agenticml server accounts set-server-admin LOGIN off` fails with "cannot remove the last server admin").
+
+**CLI source column**: `agenticml server accounts list` displays a `source` column (`list`, `manual`, or `-`). The JSON output (`--json`) includes `server_admin_source`.
 
 ### Workspace management CLI
 
@@ -427,6 +437,7 @@ Sync clients on version 2.2 continue to sync to a 3.0 server without modificatio
 | `--firebase-api-key KEY` | `AGENTICML_SERVER_FIREBASE_API_KEY` | unset | Firebase web API key for dashboard sign-in. |
 | `--firebase-auth-domain HOST` | `AGENTICML_SERVER_FIREBASE_AUTH_DOMAIN` | unset | Firebase auth domain (defaults to `<project>.firebaseapp.com`). |
 | `--limits FILE` | `AGENTICML_SERVER_LIMITS` | unset | Path to JSON file defining workspace usage limits and plans. |
+| `--admin-emails LIST` | `AGENTICML_SERVER_ADMIN_EMAILS` | unset | Comma-separated emails granted server admin on verified Firebase sign-in. Ignored without Firebase. |
 | `--open-signup` | `AGENTICML_SERVER_OPEN_SIGNUP` | off | Allow verified Firebase sign-in to create an account and personal workspace. |
 | `--min-client-version X.Y` | `AGENTICML_SERVER_MIN_CLIENT_VERSION` | `2.2` | Reject `agenticml-lite` clients older than `X.Y` on `/v2` requests with HTTP 426. |
 
