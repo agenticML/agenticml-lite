@@ -305,10 +305,11 @@ web and `/setup` return 404.
 
 1. **Sign in as first admin**: Open `https://app.agenticml.xyz/login` and click
    "Continue with Google". Because your email is in `HOSTED_ADMIN_EMAILS`, the
-   first verified sign-in creates your account if it has none (no workspace is
-   created for it) and grants server admin privileges (`source` is `list`). A
-   server admin with no workspace membership lands on `/workspaces` with an
-   Admin button and sees no customer workspace data.
+   first verified sign-in creates your account if it has none and grants
+   server admin privileges (`source` is `list`). With open sign-up on, the
+   account also gets the free personal workspace (once); with it off, a server
+   admin with no workspace membership lands on `/workspaces` with an Admin
+   button. Server admins see no customer workspace data without membership.
 2. **Open `/admin`**: Click Admin or open `https://app.agenticml.xyz/admin/`.
    The "Server admins" section lists all server administrators (login, grant
    source, and sign-in state).

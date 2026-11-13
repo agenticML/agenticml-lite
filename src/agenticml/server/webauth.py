@@ -1197,6 +1197,10 @@ class WebAuth:
                     if account is None and listed:
                         account = self._firebase_admin_create(accounts, claims, tx)
                         admin_created = account is not None
+                        if admin_created and self.open_signup:
+                            created_workspace = self._create_signup_workspace(
+                                account, claims, tx, plans)
+                            self._mark_personal_workspace(account, created_workspace, tx)
                     elif account is None and self.open_signup:
                         if email_verified_for_link(claims) and claims.email:
                             account, created_workspace = self._firebase_open_signup(
@@ -1205,7 +1209,7 @@ class WebAuth:
                         else:
                             unverified = True
                     elif account is not None and self.open_signup:
-                        created_workspace = self._recover_signup_workspace(
+                        created_workspace = self._personal_workspace_if_none(
                             account, claims, tx, plans)
             if unverified:
                 logger.info("login failed")
@@ -1310,7 +1314,7 @@ class WebAuth:
         return account, self._create_signup_workspace(account, claims, tx, plans)
 
     def _firebase_admin_create(self, accounts, claims, tx):
-        """Create the account of a listed, verified email; no workspace."""
+        """Create the account of a listed, verified email (the caller adds the workspace)."""
         if accounts.get(claims.email, tx) is not None:
             return None
         display = claims.name if isinstance(claims.name, str) and claims.name.strip() else (
@@ -1344,19 +1348,42 @@ class WebAuth:
     def _signup_pending_key(self, account_id):
         return f"signup_pending:{account_id}"
 
-    def _recover_signup_workspace(self, account, claims, tx, plans):
+    def _personal_workspace_key(self, account_id):
+        return f"personal_workspace:{account_id}"
+
+    def _mark_personal_workspace(self, account, workspace, tx):
+        from .db.repos import SettingsRepo
+
+        if workspace is not None:
+            SettingsRepo(self.keys.db).set(
+                self._personal_workspace_key(account["id"]), "1", tx)
+
+    def _personal_workspace_if_none(self, account, claims, tx, plans):
+        """Open sign-up: a verified sign-in of an account without any membership
+        may get the free personal workspace (the limit still applies).
+
+        Sign-up accounts only recover after a failed store preparation (the
+        signup_pending marker), so a workspace an admin deleted stays deleted.
+        Other accounts (list admins, CLI or /admin created) get one at most once
+        (the personal_workspace marker).
+        """
         from .db.repos import SettingsRepo
         from .firebase import email_verified_for_link
 
-        if account.get("created_by") != "signup":
-            return None
         if not email_verified_for_link(claims):
             return None
         if tx.fetchone("SELECT 1 FROM memberships WHERE account_id=?", (account["id"],)):
             return None
-        if SettingsRepo(self.keys.db).get(self._signup_pending_key(account["id"]), tx) is None:
+        settings = SettingsRepo(self.keys.db)
+        if account.get("created_by") == "signup":
+            if settings.get(self._signup_pending_key(account["id"]), tx) is None:
+                return None
+            return self._create_signup_workspace(account, claims, tx, plans)
+        if settings.get(self._personal_workspace_key(account["id"]), tx) is not None:
             return None
-        return self._create_signup_workspace(account, claims, tx, plans)
+        workspace = self._create_signup_workspace(account, claims, tx, plans)
+        self._mark_personal_workspace(account, workspace, tx)
+        return workspace
 
     def _create_signup_workspace(self, account, claims, tx, plans):
         from .db.workspaces import WorkspaceRepo, slug_from_email_local
@@ -1400,6 +1427,8 @@ class WebAuth:
                         tx.execute("DELETE FROM workspaces WHERE id=?", (row["id"],))
                         dropped = True
                     SettingsRepo(self.keys.db).set(marker, "1", tx)
+                    SettingsRepo(self.keys.db).delete(
+                        self._personal_workspace_key(account["id"]), tx)
             except Exception:
                 logger.exception("could not delete workspace after store failure")
             if dropped:

@@ -554,6 +554,123 @@ def test_admin_delete_does_not_recover_signup_workspace(tmp_path, monkeypatch):
         assert json.loads(session)['workspaces'] == []
 
 
+def test_signup_account_with_removed_membership_gets_no_workspace(tmp_path, monkeypatch):
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    with signup_running(tmp_path / 'data', plans=_plans(2)) as httpd:
+        assert _post_firebase(
+            httpd, _live_token(sub='uid-rm', email='rm@example.com', name='Rm'))[0] == 200
+        account = AccountRepo(httpd.db).get('rm@example.com')
+        with httpd.db.transaction(write=True) as tx:
+            tx.cross_workspace('test: remove membership')
+            tx.execute('DELETE FROM memberships WHERE account_id=?', (account['id'],))
+        assert AccountRepo(httpd.db).workspace_slugs('rm@example.com') == []
+        assert _post_firebase(
+            httpd, _live_token(sub='uid-rm', email='rm@example.com', name='Rm'))[0] == 200
+        assert AccountRepo(httpd.db).workspace_slugs('rm@example.com') == []
+        assert len(_personal(httpd, 'rm@example.com')) == 1
+        assert len(_workspace_create_events(httpd)) == 1
+
+
+def _linked_cli_account(httpd, login, uid):
+    repo = AccountRepo(httpd.db)
+    repo.create(login, created_by='cli')
+    with httpd.db.transaction(write=True) as tx:
+        repo.link_firebase(repo.get(login, tx)['id'], uid, login, True, tx)
+
+
+def _personal_marker(httpd, login):
+    account = AccountRepo(httpd.db).get(login)
+    return SettingsRepo(httpd.db).get(f'personal_workspace:{account["id"]}')
+
+
+def test_non_signup_account_without_workspace_gets_one_once(tmp_path, monkeypatch):
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    login = 'cliacct@example.com'
+    with signup_running(tmp_path / 'data') as httpd:
+        _linked_cli_account(httpd, login, 'uid-cli')
+        assert _personal_marker(httpd, login) is None
+        assert _post_firebase(httpd, _live_token(sub='uid-cli', email=login))[0] == 200
+        made = _personal(httpd, login)
+        assert len(made) == 1 and made[0]['slug'] == 'cliacct'
+        assert _personal_marker(httpd, login) == '1'
+        assert len(_workspace_create_events(httpd)) == 1
+        # a later sign-in does not create a second one
+        assert _post_firebase(httpd, _live_token(sub='uid-cli', email=login))[0] == 200
+        assert len(_personal(httpd, login)) == 1
+        # an admin deletes it: the next sign-in does not bring it back
+        WorkspaceRepo(httpd.db).delete(made[0]['slug'])
+        assert AccountRepo(httpd.db).workspace_slugs(login) == []
+        assert _post_firebase(httpd, _live_token(sub='uid-cli', email=login))[0] == 200
+        assert _personal(httpd, login) == []
+        assert len(_workspace_create_events(httpd)) == 1
+
+
+def test_non_signup_account_store_failure_clears_marker_and_retries(tmp_path, monkeypatch):
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    login = 'cliretry@example.com'
+
+    def boom(*args, **kwargs):
+        raise DatabaseError('workspace store path is a symlink or not a directory; fix or move it away')
+
+    with signup_running(tmp_path / 'data') as httpd:
+        _linked_cli_account(httpd, login, 'uid-retry')
+        monkeypatch.setattr('agenticml.server.workspaces.prepare_store', boom)
+        status, _, body = _post_firebase(httpd, _live_token(sub='uid-retry', email=login))
+        assert status == 200 and json.loads(body)['user'] == login
+        assert _personal(httpd, login) == []
+        assert _personal_marker(httpd, login) is None
+        assert _workspace_create_events(httpd) == []
+        monkeypatch.setattr('agenticml.server.workspaces.prepare_store', prepare_store)
+        assert _post_firebase(httpd, _live_token(sub='uid-retry', email=login))[0] == 200
+        assert len(_personal(httpd, login)) == 1
+        assert _personal_marker(httpd, login) == '1'
+        assert len(_workspace_create_events(httpd)) == 1
+
+
+def test_account_with_membership_gets_no_personal_workspace(tmp_path, monkeypatch):
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    with signup_running(tmp_path / 'data') as httpd:
+        _member_account(httpd, 'member@example.com', uid='uid-member')
+        status, _, body = _post_firebase(
+            httpd, _live_token(sub='uid-member', email='member@example.com'))
+        assert status == 200 and json.loads(body)['user'] == 'member@example.com'
+        assert _personal(httpd, 'member@example.com') == []
+        assert _workspace_create_events(httpd) == []
+
+
+def test_free_workspaces_zero_gives_existing_account_no_workspace(tmp_path, monkeypatch):
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    with signup_running(tmp_path / 'data', plans=_plans(0)) as httpd:
+        AccountRepo(httpd.db).create('nolimit@example.com', created_by='cli')
+        with httpd.db.transaction(write=True) as tx:
+            repo = AccountRepo(httpd.db)
+            repo.link_firebase(
+                repo.get('nolimit@example.com', tx)['id'], 'uid-nolimit',
+                'nolimit@example.com', True, tx)
+        status, _, body = _post_firebase(
+            httpd, _live_token(sub='uid-nolimit', email='nolimit@example.com'))
+        assert status == 200 and json.loads(body)['user'] == 'nolimit@example.com'
+        assert _personal(httpd, 'nolimit@example.com') == []
+        assert _workspace_create_events(httpd) == []
+
+
+def test_unverified_sign_in_of_account_without_workspace_creates_none(tmp_path, monkeypatch):
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    with signup_running(tmp_path / 'data') as httpd:
+        AccountRepo(httpd.db).create('unv-none@example.com', created_by='cli')
+        with httpd.db.transaction(write=True) as tx:
+            repo = AccountRepo(httpd.db)
+            repo.link_firebase(
+                repo.get('unv-none@example.com', tx)['id'], 'uid-unv-none',
+                'unv-none@example.com', True, tx)
+        status, _, _ = _post_firebase(
+            httpd, _live_token(sub='uid-unv-none', email='unv-none@example.com',
+                               email_verified=False))
+        assert status == 200
+        assert _personal(httpd, 'unv-none@example.com') == []
+        assert _workspace_create_events(httpd) == []
+
+
 def test_signup_recovers_after_prepare_failure_and_clears_marker(tmp_path, monkeypatch):
     monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
 
