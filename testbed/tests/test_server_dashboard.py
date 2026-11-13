@@ -192,6 +192,23 @@ def test_lineage_inspector_shows_server_code_diff_message(page, tmp_path, monkey
         httpd.server_close()
 
 
+def test_login_layout_wide_and_narrow(page, server_ui):
+    page.set_viewport_size({"width": 1280, "height": 800})
+    page.goto(server_ui["url"])
+    expect(page.get_by_role("heading", name="Sign in", exact=True)).to_be_visible()
+    expect(page.locator(".auth-brand")).to_be_visible()
+    expect(page.locator(".auth-brand .auth-logo")).to_be_visible()
+    expect(page.locator(".auth-compact-logo")).to_be_hidden()
+    assert_no_overflow(page)
+    page.set_viewport_size({"width": 375, "height": 812})
+    expect(page.locator(".auth-brand")).to_be_hidden()
+    expect(page.locator(".auth-compact-logo .auth-logo")).to_be_visible()
+    assert_no_overflow(page)
+    page.get_by_role("button", name="Sign in with an admin key", exact=True).click()
+    expect(page.locator("#key")).to_be_visible()
+    assert_no_overflow(page)
+
+
 def test_no_overflow_login_list_and_detail(page, server_ui):
     page.set_viewport_size({"width": 375, "height": 812})
     page.goto(server_ui["url"])

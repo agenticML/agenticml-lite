@@ -591,6 +591,355 @@ kbd {
 .login-card .error[hidden] {
   display: none;
 }
+
+/* Sign-in pages (package 27): two panels, brand left and form right,
+   after the agenticml-server sign-in screen. setup.html and invite.html
+   keep .login-page / .login-card above. */
+.auth-page {
+  margin: 0;
+}
+.auth-shell {
+  display: grid;
+  grid-template-columns: minmax(420px, 44%) 1fr;
+  min-height: 100vh;
+  background: var(--surface);
+}
+
+/* Brand panel: always dark, whatever the page theme. */
+.auth-brand {
+  --bg: #0b0e0f;
+  --surface: #14181a;
+  --text: #f7f8f8;
+  --text-2: #cbd0d3;
+  --text-3: #9aa2a8;
+  --hairline: #1c2022;
+  --border-strong: #363c41;
+  --accent: #8ab0fa;
+  --s1: #8ab0fa;
+  --s3: #4fc79b;
+  --s5: #6d757c;
+  color-scheme: dark;
+  color: var(--text);
+  background: var(--bg);
+  padding: 48px 56px;
+  display: flex;
+  flex-direction: column;
+  gap: 40px;
+  overflow: hidden;
+  min-width: 0;
+}
+.auth-brand-logo {
+  align-self: flex-start;
+}
+.auth-brand-logo .auth-logo {
+  height: 24px;
+}
+.auth-brand-chart {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-width: 520px;
+}
+.auth-brand-chart-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+.auth-eyebrow {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.auth-brand-count {
+  font: 11px var(--font-mono-stack);
+  color: var(--text-3);
+}
+.auth-chart {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.auth-chart-grid {
+  stroke: var(--hairline);
+  stroke-width: 1;
+}
+.auth-chart-ghost {
+  fill: none;
+  stroke: var(--border-strong);
+  stroke-opacity: 0.7;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+}
+.auth-chart-best {
+  fill: none;
+  stroke: var(--s1);
+  stroke-width: 2.25;
+  stroke-linecap: round;
+}
+.auth-chart-dot {
+  fill: var(--s1);
+}
+.auth-chart-halo {
+  fill: none;
+  stroke: var(--s1);
+  stroke-opacity: 0.22;
+  stroke-width: 1.5;
+}
+.auth-chart-label {
+  font: 9.5px var(--font-mono-stack);
+  fill: var(--s1);
+}
+.auth-runs {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border-top: 1px solid var(--hairline);
+}
+.auth-runs li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--hairline);
+}
+.auth-run-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-pill);
+}
+.auth-run-dot-1 {
+  background: var(--s3);
+}
+.auth-run-dot-2 {
+  background: var(--s1);
+}
+.auth-run-dot-3 {
+  background: var(--s5);
+}
+.auth-run-name {
+  font: 11px var(--font-mono-stack);
+  color: var(--text-2);
+}
+.auth-run-status {
+  margin-left: auto;
+  font: 11px var(--font-mono-stack);
+  color: var(--text-3);
+}
+.auth-brand-pitch {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 480px;
+}
+.auth-pitch-title {
+  margin: 0;
+  font-size: 28px;
+  font-weight: 500;
+  line-height: 1.28;
+  letter-spacing: -0.025em;
+  color: var(--text);
+}
+.auth-pitch-body {
+  margin: 0;
+  font-size: 14.5px;
+  line-height: 1.6;
+  color: var(--text-3);
+}
+
+/* Logo: the mark takes --accent and the wordmark --text of whichever
+   panel it sits in. */
+.auth-logo {
+  display: block;
+  width: auto;
+}
+.auth-logo-mark {
+  fill: var(--accent);
+}
+.auth-logo-word {
+  fill: var(--text);
+}
+
+/* Form side */
+.auth-form-side {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 32px 40px 40px;
+  background: var(--surface);
+}
+.auth-compact-logo {
+  display: none;
+}
+.auth-compact-logo .auth-logo {
+  height: 22px;
+}
+.auth-center {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 0;
+  min-width: 0;
+}
+.auth-main {
+  width: 100%;
+  max-width: 384px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+.auth-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  min-width: 0;
+}
+.auth-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 3px;
+  border-radius: 7px;
+  background: var(--surface-3);
+}
+.auth-tab {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 10px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-3);
+  font: 500 13px var(--font-sans-stack);
+  cursor: pointer;
+  transition: all 140ms ease;
+}
+.auth-tab[aria-selected="true"] {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow-1);
+}
+.auth-tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.auth-heading {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.auth-title {
+  margin: 0;
+  font-size: 30px;
+  font-weight: 500;
+  line-height: 1.16;
+  letter-spacing: -0.03em;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.auth-sub {
+  margin: 0;
+  font-size: 14.5px;
+  line-height: 1.55;
+  color: var(--text-3);
+}
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  min-width: 0;
+}
+.auth-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.auth-field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+}
+.auth-label {
+  font: 10.5px var(--font-mono-stack);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.auth-show-password {
+  align-self: flex-start;
+  padding: 2px 0;
+  border: none;
+  background: none;
+  font: 10.5px var(--font-mono-stack);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.auth-buttons {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.auth-btn {
+  min-height: 40px;
+  gap: 10px;
+}
+.auth-links {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13.5px;
+}
+.link-button {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+.link-button:hover {
+  color: var(--accent-hover);
+}
+.auth-error {
+  margin: 0;
+  font-size: 13.5px;
+  color: var(--danger-text);
+  overflow-wrap: anywhere;
+}
+.auth-extras {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+}
+.auth-extras .btn {
+  max-width: 100%;
+  white-space: normal;
+}
+
+@media (max-width: 960px) {
+  .auth-shell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .auth-brand {
+    display: none;
+  }
+  .auth-compact-logo {
+    display: block;
+  }
+}
+@media (max-width: 560px) {
+  .auth-form-side {
+    padding: 24px 20px 28px;
+  }
+}
 #theme {
   flex: none;
   font-family: var(--font-mono-stack);

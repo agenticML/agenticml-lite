@@ -234,6 +234,7 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 25.1 | Client support window (426), version 3.0.0, base-install smoke, 2.2 client check | 16–24 | Sonnet (Codex at limit) | S | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
 | 25.2 | SERVER.md, HOSTED.md, threat model, PROTOCOL.md, README, website, SECURITY.md | 25.1 | Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
 | 26 | Retire agenticml-server | 24 live | Owner | S | – | not started |
+| 27 | Sign-in pages redesigned like agenticml-server (brand panel, logo, Sign in / Sign up tabs) | 18b | Sonnet | S | [plan](packages/27-sign-in-redesign.md) | in review ([#57](https://github.com/agenticML/agenticml-lite/pull/57); second review pending) |
 
 Getting the hosted service live on AWS, step by step: [AWS deployment roadmap](aws-deployment-roadmap.md).
 
@@ -344,6 +345,25 @@ priority.
     environment.
   - Done when: `pip install agenticml-lite==3.0.0` works and the policies
     are linked from the sign-in page.
+- **Setup and invite pages in the new sign-in style** (package 27, Nov 13,
+  2026).
+  - Where: `src/agenticml/server/static/setup.html`, `invite.html`.
+  - Problem: package 27 restyled `/login` (hosted and self-hosted) like
+    agenticml-server; `/setup` and the self-hosted invite page still use
+    the old centred card.
+  - Fix: move both pages onto the `.auth-*` shell (brand panel, logo,
+    underline fields), keeping their ids and behaviour.
+  - Done when: both pages use the shell, their UI tests pass, and there is
+    no overflow at 375px.
+- **Theme on the sign-in pages** (package 27, Nov 13, 2026).
+  - Where: `src/agenticml/server/static/*.html`, `app.css`.
+  - Problem: the sign-in pages are always light; agenticml-server has a
+    light/dark toggle and the dashboard follows the saved theme.
+  - Fix: apply the dashboard's saved theme (or the system preference) on
+    the sign-in pages with a same-origin script, and add the compact
+    toggle.
+  - Done when: a user with the dark theme sees a dark sign-in page, with a
+    UI test.
 - **Permissions boundary for the hosted stack's roles** (package 24.4a
   review, Nov 11, 2026).
   - Where: `deploy/aws/cloudformation/bootstrap.yaml` (`CloudFormationRole`,
