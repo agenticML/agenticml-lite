@@ -421,6 +421,38 @@ def test_admin_adds_new_email_as_pending_server_admin(page, firebase_ui):
     expect(page.get_by_role("status").filter(has_text="Created an account for fresh@example.com")).to_be_visible()
 
 
+def test_email_admin_creates_key_and_changes_role(page, firebase_ui):
+    httpd = firebase_ui["httpd"]
+    httpd.users.add("boss@example.com", role="admin")
+    httpd.users.add("bob@example.com", role="member")
+    stub_vendor(page)
+    token, _ = httpd.web._session_cookie_for("boss@example.com", "firebase")
+    page.context.add_cookies([{
+        "name": httpd.web._cookie_name(), "value": token, "url": firebase_ui["url"]}])
+    page.goto(firebase_ui["url"])
+    expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+    page.get_by_role("link", name="Keys", exact=True).click()
+    expect(page.get_by_role("table", name="Keys", exact=True)).to_be_visible()
+    page.get_by_role("button", name="New key", exact=True).click()
+    dialog = page.get_by_role("dialog", name="New key", exact=True)
+    dialog.get_by_label("Name", exact=True).fill("laptop")
+    dialog.get_by_role("button", name="Create", exact=True).click()
+    expect(dialog.locator(".key-value")).to_have_text(re.compile(r"aml_[A-Za-z0-9_-]+"))
+    expect(page.get_by_role("alert")).to_have_count(0)
+    dialog.get_by_role("button", name="Close", exact=True).click()
+    assert [(key.name, key.user) for key in httpd.keys.list() if key.name == "laptop"] == [
+        ("laptop", "boss@example.com")]
+    page.get_by_role("link", name="Team", exact=True).click()
+    expect(page.get_by_role("heading", name="Team", exact=True)).to_be_visible()
+    row = page.get_by_role("row").filter(has_text="bob@example.com")
+    with page.expect_response(lambda r: r.request.method == "PATCH") as patched:
+        row.get_by_label("Role for bob@example.com", exact=True).select_option("viewer")
+    assert patched.value.status == 200
+    expect(row.get_by_label("Role for bob@example.com", exact=True)).to_have_value("viewer")
+    expect(page.get_by_role("alert")).to_have_count(0)
+    assert httpd.users.get("bob@example.com").role == "viewer"
+
+
 SIGN_IN_TITLE = "Sign in to your workspace"
 SIGN_IN_SUB = "Pick up your runs and comparisons where you left them."
 SIGN_UP_TITLE = "Create your workspace"
