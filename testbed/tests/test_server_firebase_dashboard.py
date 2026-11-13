@@ -10,7 +10,7 @@ from agenticml.server.firebase import CertificateSource, FirebaseConfig
 pytest.importorskip("playwright.sync_api")
 from playwright.sync_api import expect
 
-from test_server_dashboard import assert_no_overflow, browser, context, page
+from test_server_dashboard import assert_no_overflow, browser, context, open_settings, page
 
 pytestmark = [pytest.mark.browser, pytest.mark.ui]
 
@@ -376,17 +376,14 @@ def test_team_page_uses_firebase_copy(page, firebase_ui):
         "name": httpd.web._cookie_name(), "value": token, "url": firebase_ui["url"]}])
     page.goto(firebase_ui["url"])
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
-    page.get_by_role("link", name="Team", exact=True).click()
-    expect(page.get_by_role("heading", name="Team", exact=True)).to_be_visible()
-    page.get_by_role("button", name="Invite", exact=True).click()
-    dialog = page.get_by_role("dialog", name="Invite", exact=True)
-    dialog.get_by_label("Login or email", exact=True).fill("cara@example.com")
-    dialog.get_by_role("button", name="Invite", exact=True).click()
-    expect(dialog.get_by_text(
+    members = open_settings(page, "members")
+    form = members.get_by_role("form", name="Invite someone", exact=True)
+    form.get_by_label("Login or email", exact=True).fill("cara@example.com")
+    form.get_by_role("button", name="Send invite", exact=True).click()
+    expect(form.get_by_text(
         "This invite link is shown once. They sign in with Google or email and password, "
         "using this email; the email must be verified.")).to_be_visible()
-    expect(dialog).not_to_contain_text("choose their own password")
-    dialog.get_by_role("button", name="Close", exact=True).click()
+    expect(form).not_to_contain_text("choose their own password")
     page.get_by_role("row").filter(has_text="alice").get_by_role(
         "button", name="Invite link", exact=True).click()
     relink = page.get_by_role("dialog", name="Invite alice?", exact=True)

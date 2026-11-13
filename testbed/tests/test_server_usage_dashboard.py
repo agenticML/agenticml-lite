@@ -12,7 +12,10 @@ from agenticml.server.limits import Plans
 pytest.importorskip("playwright.sync_api")
 from playwright.sync_api import expect
 
-from test_server_dashboard import assert_no_overflow, browser, context, page, sign_in, sign_in_password
+from test_server_dashboard import (
+    assert_no_overflow, browser, context, open_settings, page, settings_card, sign_in,
+    sign_in_password,
+)
 
 pytestmark = [pytest.mark.browser, pytest.mark.ui]
 
@@ -91,9 +94,13 @@ def test_team_usage_section_values_and_hidden_without_limits(page, usage_server,
     set_usage(usage_server["httpd"], stored=1_500_000_000, uploaded=400_000_000)
     sign_in_password(page, usage_server, "admin", PASSWORD)
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
-    page.get_by_role("link", name="Team", exact=True).click()
+    open_settings(page, "workspace")
     section = page.get_by_role("region", name="Usage", exact=True)
     expect(section).to_be_visible()
+    expect(settings_card(page, "workspace")).to_contain_text("plan: free")
+    expect(section.get_by_role("meter", name="Storage used")).to_have_attribute("aria-valuenow", "30")
+    expect(section.get_by_role("meter", name="Daily uploads used")).to_have_attribute("aria-valuenow", "20")
+    expect(section.get_by_role("meter")).to_have_count(3)
     expect(section.get_by_role("heading", name="Usage", exact=True)).to_be_visible()
     expect(section).to_contain_text("1.5 GB of 5.0 GB")
     expect(section).to_contain_text("0.4 GB of 2.0 GB")
@@ -110,8 +117,8 @@ def test_team_usage_section_values_and_hidden_without_limits(page, usage_server,
         page.goto(url)
         sign_in_password(page, {"url": url}, "admin", PASSWORD)
         expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
-        page.get_by_role("link", name="Team", exact=True).click()
-        expect(page.get_by_role("heading", name="Team", exact=True)).to_be_visible()
+        card = open_settings(page, "workspace")
+        expect(card.get_by_text("slug default")).to_be_visible()
         expect(page.get_by_role("region", name="Usage", exact=True)).to_be_hidden()
         assert_no_overflow(page)
     finally:
@@ -156,22 +163,21 @@ def test_new_workspace_form_success_and_error(page, signup_ui):
     page.set_viewport_size({"width": 375, "height": 812})
     sign_in_password(page, signup_ui, "admin", PASSWORD)
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
-    page.get_by_role("button", name="Account", exact=True).click()
-    dialog = page.get_by_role("dialog", name="Account", exact=True)
-    expect(dialog.get_by_role("heading", name="New workspace", exact=True)).to_be_visible()
-    dialog.get_by_label("Slug", exact=True).fill("lab")
-    dialog.get_by_label("Name", exact=True).fill("Lab")
-    dialog.get_by_role("button", name="Create", exact=True).click()
+    card = open_settings(page)
+    card.get_by_text("New workspace", exact=True).click()
+    card.get_by_label("Slug", exact=True).fill("lab")
+    card.get_by_label("Name", exact=True).fill("Lab")
+    card.get_by_role("button", name="Create", exact=True).click()
     expect(page).to_have_url(re.compile(r"/w/lab/"))
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
     assert_no_overflow(page)
 
-    page.get_by_role("button", name="Account", exact=True).click()
-    dialog = page.get_by_role("dialog", name="Account", exact=True)
-    dialog.get_by_label("Slug", exact=True).fill("lab-two")
-    dialog.get_by_label("Name", exact=True).fill("Lab Two")
-    dialog.get_by_role("button", name="Create", exact=True).click()
-    expect(dialog.get_by_role("alert")).to_have_text("you already have a free workspace")
+    card = open_settings(page)
+    card.get_by_text("New workspace", exact=True).click()
+    card.get_by_label("Slug", exact=True).fill("lab-two")
+    card.get_by_label("Name", exact=True).fill("Lab Two")
+    card.get_by_role("button", name="Create", exact=True).click()
+    expect(card.get_by_role("alert")).to_have_text("you already have a free workspace")
     assert_no_overflow(page)
 
 
@@ -179,10 +185,9 @@ def test_new_workspace_item_hidden_when_signup_closed(page, usage_server):
     page.set_viewport_size({"width": 375, "height": 812})
     sign_in_password(page, usage_server, "admin", PASSWORD)
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
-    page.get_by_role("button", name="Account", exact=True).click()
-    dialog = page.get_by_role("dialog", name="Account", exact=True)
-    expect(dialog.get_by_role("heading", name="Workspaces", exact=True)).to_be_visible()
-    expect(dialog.get_by_role("heading", name="New workspace", exact=True)).to_have_count(0)
+    card = open_settings(page)
+    expect(card.get_by_role("heading", name="Workspaces", exact=True)).to_be_visible()
+    expect(card.get_by_text("New workspace", exact=True)).to_have_count(0)
     assert_no_overflow(page)
 
 
@@ -190,8 +195,8 @@ def test_admin_plan_edit_columns_and_form(page, usage_server):
     page.set_viewport_size({"width": 375, "height": 812})
     sign_in_password(page, usage_server, "admin", PASSWORD)
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
-    page.get_by_role("button", name="Account", exact=True).click()
-    page.get_by_role("dialog", name="Account", exact=True).get_by_role("link", name="Admin", exact=True).click()
+    open_settings(page)
+    page.get_by_role("link", name="Admin", exact=True).click()
     expect(page.get_by_role("heading", name="Admin", exact=True)).to_be_visible()
     table = page.get_by_role("table", name="Workspaces", exact=True)
     expect(table.get_by_role("columnheader", name="Plan", exact=True)).to_be_visible()
