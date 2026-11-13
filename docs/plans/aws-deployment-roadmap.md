@@ -63,13 +63,14 @@ changes.
 | Load balancer | `agenticml-hosted-1705349735.us-east-2.elb.amazonaws.com`; `/healthz` 200 with the `app.agenticml.xyz` host |
 | DNS | `app` CNAME at Namecheap → the load balancer (step 3.2, Nov 12); `https://app.agenticml.xyz/healthz` returns 200 with a valid certificate |
 | Admin account | The first admin, created through `/setup` on Nov 13 (step 4.2): owner of `default`, server admin, password login. With Firebase on, it can no longer sign in on the web; it stays as the break-glass account for the server CLI over ECS Exec |
-| Sign-in | **Firebase**, project `agenticml-hosted` (Google and email/password; `app.agenticml.xyz` is an authorized domain). `/login` serves the Firebase page with no console or CSP errors; password `POST /login` and `/setup` return 404. Open sign-up is off |
-| Email admin account | **not yet**: no account can sign in on the web until step 4.2b creates one |
-| GitHub `hosted` environment | `HOSTED_FIREBASE_PROJECT=agenticml-hosted` and `HOSTED_FIREBASE_API_KEY` set Nov 13; `HOSTED_OPEN_SIGNUP=false`. `HOSTED_DESIRED_COUNT=2` is still set but unused since 24.5; delete it when convenient |
+| Sign-in | **Firebase**, project `agenticml-hosted` (Google and email/password; `app.agenticml.xyz` is an authorized domain). `/login` serves the Firebase page with no console or CSP errors; password `POST /login` and `/setup` return 404. **Open sign-up is on** since Nov 13, 2026 (owner's choice, before the policies are published; see the roadmap Backlog): a verified sign-in with no account gets a free personal workspace |
+| Email admin account | Through `HOSTED_ADMIN_EMAILS` (package [24.7](packages/24.7-self-serve-admins.md), [#58](https://github.com/agenticML/agenticml-lite/pull/58), task definition `agenticml-hosted:4`; the server logs one admin email configured). The owner's first Google sign-in creates the account as server admin (step 4.2b) |
+| GitHub `hosted` environment | `HOSTED_FIREBASE_PROJECT=agenticml-hosted` and `HOSTED_FIREBASE_API_KEY` set Nov 13; `HOSTED_ADMIN_EMAILS` (the owner's Google email) and `HOSTED_OPEN_SIGNUP=true` set Nov 13. `HOSTED_DESIRED_COUNT=2` is still set but unused since 24.5; delete it when convenient |
 
-Next: package 24.7 (self-serve server admins; see the
-[roadmap](on-prem-roadmap.md)), then step 4.2b through it (the owner's email
-admin account and the first real Google sign-in), then 4.3. The runbook commands for Phase 4 were checked against the
+Next: step 4.2b (the owner signs in with Google; package 24.7 is live), then
+4.3 on `/admin`, the Team and Keys pages, then 4.4. Open sign-up was turned on
+early (Nov 13, 2026); the terms, acceptable use and privacy policies and their
+sign-in page links are still open. The runbook commands for Phase 4 were checked against the
 code in package [24.6](packages/24.6-phase-4-runbook.md), before Firebase was
 turned on.
 
@@ -197,6 +198,8 @@ At this point the AWS deployment is live and package 24.3 is done.
   2026.
 - Terms of service, acceptable use and privacy policies, linked from the
   sign-in page (needs a small code change).
-- Open sign-up (exit criterion 7).
+- Open sign-up (exit criterion 7): turned on Nov 13, 2026 (owner's choice) by
+  setting `HOSTED_OPEN_SIGNUP=true` and re-running deploy run 43417765936.
+  Exit criterion 7's storage-limit walk-through is still to do.
 - Merge `dev` → `main`, tag `v2.2.0` and `v3.0.0`, publish to PyPI.
 - Package 26: retire agenticml-server.
