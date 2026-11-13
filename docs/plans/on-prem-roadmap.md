@@ -231,12 +231,14 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 24.7c | Deploy wiring: GitHub variable `HOSTED_ADMIN_EMAILS` → `deploy.yml` → `hosted.yaml` parameter → task environment; `cfn-lint` and template tests | 24.7a | Sonnet | S | [plan](packages/24.7-self-serve-admins.md) | done ([#58](https://github.com/agenticML/agenticml-lite/pull/58)) |
 | 24.7d | Runbook and docs: steps 4.2b and 4.3 through the web; re-check the Team page and `users add` on the Firebase path (24.6 checked only passwords); `deploy/aws/README.md`, `docs/HOSTED.md`, `docs/SERVER.md`, threat model | 24.7c | Sonnet (checks); prose Antigravity | S | [plan](packages/24.7-self-serve-admins.md) | done ([#58](https://github.com/agenticML/agenticml-lite/pull/58)) |
 | 24.8 | Personal workspace for every verified sign-in without one when open sign-up is on (list admins included) | 24.7 | Sonnet | S | [plan](packages/24.8-personal-workspace-for-admins.md) | done (PR to `dev`; owner's request, Nov 13, 2026) |
+| 24.9 † | Email logins on the Keys and Team pages: key create, member role change, removal and invite link accept email logins (hosted mode); key names stay strict | 24.8 | Sonnet | S | [plan](packages/24.9-email-login-keys-team.md) | in review (PR to `dev`; second review pending; found by the design-board capture, Nov 13, 2026) |
 | 24.10 † | Archive and restore a workspace on `/admin` (data kept; frees the owner's free workspace; audited); permanent delete stays CLI-only | 24.7 | Sonnet | S | [plan](packages/24.10-admin-archive-workspace.md) | done (PR to `dev`; second review by the supervisor; owner's request, Nov 13, 2026) |
 | 25 | Docs, threat model, version 3.0.0 | 16–24 | Sonnet (Codex at limit); prose Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR; tag and PyPI release by the owner) |
 | 25.1 | Client support window (426), version 3.0.0, base-install smoke, 2.2 client check | 16–24 | Sonnet (Codex at limit) | S | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
 | 25.2 | SERVER.md, HOSTED.md, threat model, PROTOCOL.md, README, website, SECURITY.md | 25.1 | Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
 | 26 | Retire agenticml-server | 24 live | Owner | S | – | not started |
-| 27 | Sign-in pages redesigned like agenticml-server (brand panel, logo, Sign in / Sign up tabs) | 18b | Sonnet | S | [plan](packages/27-sign-in-redesign.md) | in review ([#57](https://github.com/agenticML/agenticml-lite/pull/57); second review pending) |
+| 27 | Sign-in pages redesigned like agenticml-server (brand panel, logo, Sign in / Sign up tabs) | 18b | Sonnet | S | [plan](packages/27-sign-in-redesign.md) | done ([#57](https://github.com/agenticML/agenticml-lite/pull/57)) |
+| 28 | One Settings page: Account, Workspace, Members, API keys and Activity replace the Keys, Team and Account entries (like agenticml-server) | 27 | Sonnet | M | [plan](packages/28-settings-page.md) | in review ([#63](https://github.com/agenticML/agenticml-lite/pull/63)) |
 
 Getting the hosted service live on AWS, step by step: [AWS deployment roadmap](aws-deployment-roadmap.md).
 
@@ -351,6 +353,22 @@ priority.
     policies were published (`HOSTED_OPEN_SIGNUP=true`, deploy run
     43417765936). The policies and the sign-in page links are now the most
     urgent part of this entry.
+- **Invite link for Firebase members with other workspaces** (package
+  24.9, Nov 13, 2026).
+  - Where: `src/agenticml/server/db/repos.py` (`UserRepo.create_invite`,
+    `_reject_cross_workspace_credentials`); Team page "Invite link".
+  - Problem: the member re-invite link clears the account's password and
+    is refused with 403 ("this account belongs to other workspaces") when
+    the account is a member of another workspace. With open sign-up on,
+    everyone who signed up on their own owns a personal workspace (18c,
+    24.8), so in hosted mode "Invite link" fails for many members, although
+    the dialog promises "a new sign-in link".
+  - Fix: decide whether hosted mode needs it at all (Firebase members sign
+    in with Firebase and have no password to reset). Either hide the button
+    when `auth` is `firebase`, or issue a sign-in-only invite there that
+    signs the member out without touching credentials.
+  - Done when: the Team page on a Firebase server never offers an action
+    that answers 403 for a normal member, with an API and a UI test.
 - **Setup and invite pages in the new sign-in style** (package 27, Nov 13,
   2026).
   - Where: `src/agenticml/server/static/setup.html`, `invite.html`.
@@ -628,3 +646,13 @@ priority.
     commit SHA with the tag in a comment, and update the workflow tests.
   - Done when: the template and workflow tests check both, and cfn-lint is
     clean.
+- **Workspace rename by its owner** (package 28, Nov 13, 2026). Low priority.
+  - Where: `src/agenticml/server/routes.py` (workspace routes),
+    `src/agenticml/ui/static/app.js` (Settings, Workspace card).
+  - Problem: only server admins can rename a workspace (on `/admin`);
+    agenticml-server lets a workspace owner or admin rename it from
+    Settings, and the design board's Settings proposal shows a Rename button.
+  - Fix: add `PATCH /api/w/<slug>` (name only, role `admin`, audited) and a
+    Rename action on the Workspace card.
+  - Done when: API and UI tests cover owner/admin allowed, member denied,
+    and the audit entry.

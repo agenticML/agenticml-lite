@@ -10,7 +10,10 @@ from agenticml.server.workspaces import prepare_store
 pytest.importorskip("playwright.sync_api")
 from playwright.sync_api import expect
 
-from test_server_dashboard import assert_no_overflow, browser, context, page, sign_in_password
+from test_server_dashboard import (
+    assert_no_overflow, browser, context, open_settings, page, sign_in_password,
+)
+from test_server_keys_dashboard import assert_dialog_fits
 
 pytestmark = [pytest.mark.browser, pytest.mark.ui]
 
@@ -112,9 +115,30 @@ def test_picker_lists_workspaces_owner_label_and_admin_link(page, admin_server):
     expect(page).to_have_url(re.compile(r"/w/default/"))
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
     expect(page.get_by_text("Signed in as admin · owner")).to_be_visible()
+    card = open_settings(page)
+    expect(card.locator("dd").filter(has_text=re.compile(r"^owner$"))).to_be_visible()
+
+
+def test_admin_page_keeps_account_dialog_and_workspace_pages_get_admin_link(page, admin_server):
+    sign_in_password(page, admin_server, "admin", PASSWORD)
+    expect(page.get_by_role("heading", name="Workspaces", exact=True)).to_be_visible()
+    page.locator('a[href="/w/default/"]').click()
+    expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+    # Server admins get Admin in the top bar; the Account button is for /admin only.
+    expect(page.locator("#nav-admin")).to_be_visible()
+    expect(page.locator("#account")).to_be_hidden()
+    page.locator("#nav-admin").click()
+    expect(page).to_have_url(re.compile(r"/admin/?"))
+    expect(page.get_by_role("heading", name="Admin", exact=True)).to_be_visible()
+    expect(page.locator("#nav-settings")).to_be_hidden()
+    expect(page.locator("#nav-admin")).to_be_hidden()
     page.get_by_role("button", name="Account", exact=True).click()
     dialog = page.get_by_role("dialog", name="Account", exact=True)
-    expect(dialog.locator("dd").filter(has_text=re.compile(r"^owner$"))).to_be_visible()
+    expect(dialog.get_by_role("heading", name="Workspaces", exact=True)).to_be_visible()
+    expect(dialog.get_by_role("link", name="Admin", exact=True)).to_be_visible()
+    expect(dialog.get_by_label("New password", exact=True)).to_be_visible()
+    dialog.get_by_role("button", name="Close", exact=True).click()
+    expect(dialog).to_have_count(0)
 
 
 def test_no_overflow_admin_and_picker(page, admin_server):
@@ -132,6 +156,12 @@ def test_no_overflow_admin_and_picker(page, admin_server):
     expect(dialog).to_be_visible()
     assert_no_overflow(page)
     dialog.get_by_role("button", name="Close", exact=True).click()
+    page.get_by_role("button", name="Account", exact=True).click()
+    account = page.get_by_role("dialog", name="Account", exact=True)
+    expect(account).to_be_visible()
+    assert_no_overflow(page)
+    assert_dialog_fits(page, account)
+    account.get_by_role("button", name="Close", exact=True).click()
     page.get_by_role("link", name="Workspaces", exact=True).click()
     expect(page.get_by_role("heading", name="Workspaces", exact=True)).to_be_visible()
     assert_no_overflow(page)

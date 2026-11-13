@@ -152,7 +152,7 @@ async function loadUsageBanner() {
     host.hidden = true;
   }
 }
-function newWorkspaceForm(session) {
+function newWorkspaceForm(session, { card = false } = {}) {
   if (!session.open_signup) return null;
   const error = el("p", { class: "error", role: "alert", hidden: true });
   const slug = el("input", {
@@ -165,7 +165,7 @@ function newWorkspaceForm(session) {
   });
   const save = el("button", { type: "submit", class: "btn btn-primary btn-sm", text: "Create" });
   const form = el("form", { class: "stack workspace-new" },
-    el("h3", { class: "eyebrow", text: "New workspace" }),
+    card ? null : el("h3", { class: "eyebrow", text: "New workspace" }),
     el("label", { class: "field-label", htmlFor: slug.id, text: "Slug" }), slug,
     el("label", { class: "field-label", htmlFor: name.id, text: "Name" }), name,
     save, error);
@@ -192,9 +192,11 @@ function newWorkspaceForm(session) {
       save.disabled = false;
     }
   });
-  return form;
+  if (!card) return form;
+  return el("details", { class: "settings-details" },
+    el("summary", { text: "New workspace" }), form);
 }
-function workspaceSwitcher(session) {
+function workspaceSwitcher(session, { card = false } = {}) {
   const workspaces = sessionWorkspaces(session);
   if (workspaces.length <= 1 && !session.server_admin && !session.open_signup) return null;
   const current = currentWorkspaceSlug();
@@ -202,6 +204,21 @@ function workspaceSwitcher(session) {
     const name = typeof row.name === "string" && row.name ? row.name : row.slug;
     const role = typeof row.role === "string" ? row.role : "";
     const isCurrent = row.slug === current;
+    if (card) {
+      return el("li", {},
+        el("span", { class: "settings-row-name", text: name }),
+        role ? el("span", { class: "settings-row-role", text: role }) : null,
+        el("span", { class: "settings-row-slot" },
+          isCurrent
+            ? el("span", { class: "chip ok", "aria-current": "true", text: "current" })
+            : el("button", {
+                type: "button",
+                class: "btn btn-ghost btn-sm",
+                "aria-label": `Switch to ${name}`,
+                text: "Switch",
+                onclick: () => switchWorkspace(row.slug),
+              })));
+    }
     return el(
       "li",
       {},
@@ -231,11 +248,14 @@ function workspaceSwitcher(session) {
   });
   return el(
     "div",
-    { class: "workspace-switcher stack" },
+    { class: `workspace-switcher stack${card ? " settings-section" : ""}` },
     el("h3", { class: "eyebrow", text: "Workspaces" }),
-    el("ul", { class: "workspace-switcher-list", "aria-label": "Workspaces" }, ...items),
-    newWorkspaceForm(session),
-    session.server_admin
+    el("ul", {
+      class: card ? "settings-rows" : "workspace-switcher-list", "aria-label": "Workspaces",
+    }, ...items),
+    newWorkspaceForm(session, { card }),
+    // On workspace pages the Admin link is in the top bar and the Settings nav.
+    !card && session.server_admin
       ? el("a", { class: "btn btn-ghost btn-sm", href: "/admin/", text: "Admin" })
       : null,
   );
@@ -554,6 +574,14 @@ function viaLabel(via) {
       ? "admin key"
       : via || "—";
 }
+async function signOut() {
+  await fetch("/logout", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "X-AgenticML-Request": "1" },
+  });
+  location.assign("/login");
+}
 const sessionReady = fetch(api("/account/session"), { credentials: "same-origin" })
   .then(async (response) => {
     let data = null;
@@ -569,26 +597,24 @@ const sessionReady = fetch(api("/account/session"), { credentials: "same-origin"
     serverMode = true;
     serverSession = data;
     const adminPath = isAdminPath();
-    const can = workspaceCan(data);
-    document.querySelector("#nav-keys").hidden = adminPath || !can.own_keys;
-    document.querySelector("#nav-team").hidden = adminPath || !can.users;
+    // Workspace pages get one Settings entry (Keys, Team and Account live there);
+    // the Account dialog stays only on /admin, which has no Settings page.
+    const onWorkspace = !adminPath && currentWorkspaceSlug() !== null;
+    document.querySelector("#nav-settings").hidden = !onWorkspace;
+    document.querySelector("#nav-admin").hidden = !onWorkspace || !data.server_admin;
+    // The empty label keeps its auto margin, which right-aligns the bar's buttons.
+    document.querySelector("#host").textContent = "";
     const box = document.querySelector("#session");
     const label = document.querySelector("#session-label");
     label.textContent = `Signed in as ${data.user} · ${currentWorkspaceRole(data)}`;
     box.title = label.textContent;
     box.hidden = false;
-    document.querySelector("#account").hidden = false;
-    const signOut = document.querySelector("#sign-out");
-    signOut.hidden = data.via === "proxy";
-    signOut.onclick = async () => {
-      await fetch("/logout", {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "X-AgenticML-Request": "1" },
-      });
-      location.assign("/login");
-    };
-    document.querySelector("#account").onclick = () => openAccountDialog();
+    const account = document.querySelector("#account");
+    account.hidden = !adminPath;
+    const signOutButton = document.querySelector("#sign-out");
+    signOutButton.hidden = data.via === "proxy";
+    signOutButton.onclick = signOut;
+    account.onclick = () => openAccountDialog();
     loadUsageBanner();
   })
   .catch(() => {});
@@ -621,24 +647,21 @@ function trapTab(host, event) {
     (event.shiftKey ? targets.at(-1) : targets[0])?.focus();
   }
 }
-function openAccountDialog() {
-  const session = serverSession;
-  if (!session) return;
-  const previous = document.activeElement;
-  const host = el("dialog", { class: "key-dialog", "aria-label": "Account" });
+// The signed-in user's identity, workspaces and password form. The Account
+// dialog (admin path) and the Settings Account card share it.
+function accountDetails(session, { card = false } = {}) {
   const error = el("p", { class: "error", role: "alert", hidden: true });
   const status = el("p", { class: "muted", role: "status", hidden: true });
   const firebaseAuth = session.auth === "firebase";
   let current = null;
   let next = null;
   let form = null;
+  const currentInput = () => el("input", {
+    id: "account-current", class: "field", type: "password",
+    autocomplete: "current-password", required: true,
+  });
   if (!firebaseAuth) {
-    current = session.password_set
-      ? el("input", {
-          id: "account-current", class: "field", type: "password",
-          autocomplete: "current-password", required: true,
-        })
-      : null;
+    current = session.password_set ? currentInput() : null;
     next = el("input", {
       id: "account-new", class: "field", type: "password",
       minLength: 12, maxLength: 1024, autocomplete: "new-password", required: true,
@@ -686,6 +709,13 @@ function openAccountDialog() {
         status.textContent = "Password updated";
         status.hidden = false;
         form.reset();
+        if (!current) {
+          // A password now exists, so the next change must give the current one.
+          current = currentInput();
+          form.prepend(
+            el("label", { class: "field-label", htmlFor: current.id, text: "Current password" }),
+            current);
+        }
       } catch (reason) {
         error.textContent = reason.message;
         error.hidden = false;
@@ -694,16 +724,34 @@ function openAccountDialog() {
       }
     });
   }
+  const identity = el("dl", { class: "kv-list identity" },
+    el("div", {}, el("dt", { text: "User" }), el("dd", { text: session.user })),
+    el("div", {}, el("dt", { text: "Role" }), el("dd", { text: currentWorkspaceRole(session) })),
+    el("div", {}, el("dt", { text: "Sign-in" }), el("dd", { text: viaLabel(session.via) })));
+  const password = firebaseAuth ? [] : [form, error, status];
+  return {
+    identity,
+    switcher: workspaceSwitcher(session, { card }),
+    password: card && password.length
+      ? [el("details", { class: "settings-details" },
+          el("summary", { text: "Change password" }), ...password)]
+      : password,
+    focusTarget: firebaseAuth ? null : (current || next),
+  };
+}
+function openAccountDialog() {
+  const session = serverSession;
+  if (!session) return;
+  const previous = document.activeElement;
+  const host = el("dialog", { class: "key-dialog", "aria-label": "Account" });
+  const details = accountDetails(session);
   host.append(
     el("div", { class: "heading" },
       el("h2", { text: "Account" }),
       button("Close", () => host.close(), "secondary")),
-    el("dl", { class: "kv-list identity" },
-      el("div", {}, el("dt", { text: "User" }), el("dd", { text: session.user })),
-      el("div", {}, el("dt", { text: "Role" }), el("dd", { text: currentWorkspaceRole(session) })),
-      el("div", {}, el("dt", { text: "Sign-in" }), el("dd", { text: viaLabel(session.via) }))),
-    workspaceSwitcher(session),
-    ...(firebaseAuth ? [] : [form, error, status]),
+    details.identity,
+    details.switcher,
+    ...details.password,
   );
   host.addEventListener("keydown", (event) => {
     if (event.key === "Tab") trapTab(host, event);
@@ -714,7 +762,7 @@ function openAccountDialog() {
   }, { once: true });
   document.body.append(host);
   host.showModal();
-  (firebaseAuth ? host.querySelector("button") : (current || next))?.focus();
+  (details.focusTarget || host.querySelector("button"))?.focus();
 }
 // Focus hosts own their keyboard handler so nested focus views close independently.
 function focus(title, subtitle, className = "", onClose = () => {}) {
@@ -4167,7 +4215,9 @@ function shellQuote(value) {
   return "'" + value.replaceAll("'", "'\\''") + "'";
 }
 
-async function keysPage(version) {
+// API keys card: "New key" and the user filter in its header, the keys table in
+// its body. Returns the section's dispose function.
+async function mountKeys(card, version, disposers = []) {
   const signal = controller.signal;
   let activeDialog;
   let refreshSequence = 0;
@@ -4175,6 +4225,7 @@ async function keysPage(version) {
   const closeDialog = () => {
     const current = activeDialog;
     if (!current) return;
+    current.leave();
     current.wipe();
     current.host.close();
   };
@@ -4189,7 +4240,8 @@ async function keysPage(version) {
     window.removeEventListener("pageshow", restorePage);
     closeDialog();
   };
-  cleanup = dispose;
+  dispose.closeDialog = closeDialog;
+  disposers.push(dispose);
   const content = el("div", { class: "table-scroll" });
   const allKeys = Boolean(workspaceCan(serverSession).all_keys);
   const columns = [
@@ -4230,6 +4282,7 @@ async function keysPage(version) {
 
   function dialog(title) {
     let copyTimer;
+    let leaving = false;
     const copies = [];
     const previous = document.activeElement;
     const host = el("dialog", { class: "key-dialog", "aria-label": title });
@@ -4294,11 +4347,12 @@ async function keysPage(version) {
         } catch (reason) {
           if (epoch === version) showError(content, reason);
         }
-        if (epoch === version && !activeDialog)
+        // Closed by navigation: the page already moved on, so keep focus and scroll there.
+        if (epoch === version && !activeDialog && !leaving)
           (previous?.isConnected ? previous : newKeyButton).focus();
       }
     }, { once: true });
-    activeDialog = { host, wipe };
+    activeDialog = { host, wipe, leave: () => { leaving = true; } };
     app.append(host);
     return { host, body, error, copyCode, wipe };
   }
@@ -4435,10 +4489,7 @@ async function keysPage(version) {
     const response = await fetch(api("/keys") + query, { signal, credentials: "same-origin" });
     if (epoch !== version || sequence !== refreshSequence || disposed) return;
     if (response.status === 404) {
-      dispose();
-      cleanup = () => {};
-      await home(version);
-      return;
+      throw new Error("API keys are no longer available to you.");
     }
     if (response.status === 401) {
       dispose();
@@ -4490,33 +4541,39 @@ async function keysPage(version) {
   }
 
   const newKeyButton = button("New key", newKey, "primary");
-  app.replaceChildren(el("div", { class: "workspace stack" },
-    el("div", { class: "heading" },
-      el("h1", { text: "Keys" }),
-      userFilter
-        ? el("div", { class: "runs-filter" },
-            el("span", { class: "field-label", text: "User" }), userFilter)
-        : null,
-      newKeyButton),
-    content));
+  card.aside.append(
+    ...(userFilter
+      ? [el("div", { class: "runs-filter" },
+          el("span", { class: "field-label", text: "User" }), userFilter)]
+      : []),
+    newKeyButton);
+  card.body.append(content);
   try {
     await refresh();
   } catch (reason) {
-    dispose();
-    if (epoch === version) cleanup = () => {};
-    throw reason;
+    if (epoch === version) showError(content, reason);
   }
+  return dispose;
 }
 
-async function teamPage(version) {
+// Workspace, Members and Activity cards (all need the admin role). `cards` holds
+// the {aside, body} parts of each card. Returns the section's dispose function.
+async function mountTeam(cards, version, disposers = []) {
   const signal = controller.signal;
   let activeDialog;
   let refreshSequence = 0;
   let activitySequence = 0;
   let disposed = false;
+  let wipeInvite = () => {};
+  // Counts navigations away from the section, so a response that arrives after one
+  // cannot show its one-time link, take focus or open a dialog.
+  let leftCount = 0;
   const closeDialog = () => {
+    leftCount += 1;
+    wipeInvite();
     const current = activeDialog;
     if (!current) return;
+    current.leave();
     current.wipe();
     current.host.close();
   };
@@ -4531,7 +4588,8 @@ async function teamPage(version) {
     window.removeEventListener("pageshow", restorePage);
     closeDialog();
   };
-  cleanup = dispose;
+  dispose.closeDialog = closeDialog;
+  disposers.push(dispose);
   const content = el("div", { class: "table-scroll" });
   const usageBox = el("section", { class: "stack usage-section", hidden: true, "aria-label": "Usage" });
   const invitesContent = el("div", { class: "table-scroll" });
@@ -4566,6 +4624,7 @@ async function teamPage(version) {
 
   function dialog(title) {
     let copyTimer;
+    let leaving = false;
     const copies = [];
     const previous = document.activeElement;
     const host = el("dialog", { class: "key-dialog", "aria-label": title });
@@ -4630,11 +4689,12 @@ async function teamPage(version) {
         } catch (reason) {
           if (epoch === version) showError(content, reason);
         }
-        if (epoch === version && !activeDialog)
-          (previous?.isConnected ? previous : inviteButton).focus();
+        // Closed by navigation: the page already moved on, so keep focus and scroll there.
+        if (epoch === version && !activeDialog && !leaving)
+          (previous?.isConnected ? previous : inviteLogin).focus();
       }
     }, { once: true });
-    activeDialog = { host, wipe };
+    activeDialog = { host, wipe, leave: () => { leaving = true; } };
     app.append(host);
     return { host, body, error, copyCode, wipe };
   }
@@ -4693,42 +4753,132 @@ async function teamPage(version) {
     shown.host.showModal();
   }
 
-  function invite() {
-    const { host, body, error, copyCode } = dialog("Invite");
-    const login = el("input", {
-      id: "invite-login", class: "field", required: true, maxLength: 254,
-      autocomplete: "off",
-    });
-    const role = el("select", { id: "invite-role", class: "field" },
-      el("option", { value: "viewer", text: "viewer" }),
-      el("option", { value: "member", text: "member" }),
-      el("option", { value: "admin", text: "admin" }));
-    role.value = "member";
-    const create = el("button", { type: "submit", class: "btn btn-primary", text: "Invite" });
-    const form = el("form", { class: "stack" },
-      el("label", { class: "field-label", htmlFor: login.id, text: "Login or email" }), login,
-      el("label", { class: "field-label", htmlFor: role.id, text: "Role" }), role,
-      create);
-    form.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      if (!form.reportValidity()) return;
-      error.hidden = true;
-      create.disabled = true;
-      try {
-        const data = await request(api("/invites"), "POST", {
-          login: login.value, role: role.value,
-        });
-        if (epoch !== version) return;
-        presentInvite(data, host, body, copyCode);
-      } catch (reason) {
-        if (epoch === version && host.open) failure(error, reason);
-        if (reason.name !== "AbortError") create.disabled = false;
+  const ROLE_NOTES = {
+    viewer: "Viewers can read runs and notes. They cannot sync or hold keys.",
+    member: "Members can sync runs, add notes and manage their own keys.",
+    admin: "Admins also manage all keys, people and activity.",
+  };
+  const inviteLogin = el("input", {
+    id: "invite-login", class: "field settings-grow", required: true, maxLength: 254,
+    autocomplete: "off", placeholder: "Login or email", "aria-label": "Login or email",
+  });
+  const inviteRole = el("select", {
+    id: "invite-role", class: "field settings-select", "aria-label": "Role",
+  },
+    el("option", { value: "viewer", text: "viewer" }),
+    el("option", { value: "member", text: "member" }),
+    el("option", { value: "admin", text: "admin" }));
+  inviteRole.value = "member";
+  const roleNote = el("span", { class: "settings-note", text: ROLE_NOTES.member });
+  inviteRole.addEventListener("change", () => { roleNote.textContent = ROLE_NOTES[inviteRole.value]; });
+  const inviteSend = el("button", { type: "submit", class: "btn btn-primary", text: "Send invite" });
+  const inviteError = el("p", { class: "error", role: "alert", hidden: true });
+  const inviteResult = el("div", { class: "settings-result stack", hidden: true });
+  // A live region that stays in the page, so the result is announced when it appears.
+  const inviteLive = el("div", { role: "status", "aria-live": "polite" }, inviteResult);
+  const inviteStatus = el("span", { class: "key-copy-status", role: "status", "aria-live": "polite" });
+  let inviteCopyTimer;
+  const inviteCopies = [];
+  // The one-time invite link is wiped when another invite is sent or the section goes away.
+  wipeInvite = () => {
+    clearTimeout(inviteCopyTimer);
+    const selection = window.getSelection();
+    for (let index = 0; index < (selection?.rangeCount || 0); index++) {
+      if (selection.getRangeAt(index).intersectsNode(inviteResult)) {
+        selection.removeAllRanges();
+        break;
       }
-    });
-    body.append(form);
-    host.showModal();
-    login.focus();
+    }
+    inviteResult.querySelectorAll("code").forEach((node) => { node.textContent = ""; });
+    inviteCopies.length = 0;
+    inviteStatus.textContent = "";
+    inviteResult.replaceChildren();
+    inviteResult.hidden = true;
+  };
+  function showInviteResult(data) {
+    wipeInvite();
+    if (data?.added) {
+      inviteResult.append(el("p", {
+        text: "This login already has an account and was added to the workspace.",
+      }));
+    } else {
+      if (typeof data?.invite_url !== "string" || !data.invite_url)
+        throw new Error("Invite did not return a link");
+      const value = el("code", { class: "key-value", text: data.invite_url });
+      const copy = button("Copy invite link", async () => {
+        try {
+          await navigator.clipboard.writeText(value.textContent);
+          if (!value.isConnected) return;
+          copy.textContent = "Copied";
+        } catch {
+          if (!value.isConnected) return;
+          const range = document.createRange();
+          range.selectNodeContents(value);
+          const selection = window.getSelection();
+          selection.removeAllRanges();
+          selection.addRange(range);
+          copy.textContent = /Mac|iPhone|iPad/.test(navigator.platform)
+            ? "Press ⌘C to copy" : "Press Ctrl+C to copy";
+        }
+        inviteStatus.textContent = copy.textContent;
+        clearTimeout(inviteCopyTimer);
+        inviteCopyTimer = setTimeout(() => {
+          inviteCopies.forEach(([node, text]) => { node.textContent = text; });
+          inviteStatus.textContent = "";
+        }, 2000);
+      }, "secondary");
+      inviteCopies.push([copy, "Copy invite link"]);
+      inviteResult.append(
+        el("p", {
+          text: serverSession?.auth === "firebase"
+            ? "This invite link is shown once. They sign in with Google or email and password, using this email; the email must be verified."
+            : "This invite link is shown once. They choose their own password.",
+        }),
+        value, copy,
+        el("p", {
+          class: "muted",
+          text: data.expires_at ? `Expires ${date(data.expires_at)}` : "",
+        }),
+      );
+    }
+    inviteResult.hidden = false;
+    (inviteResult.querySelector("button") || inviteLogin).focus();
   }
+  const inviteForm = el("form", { class: "settings-form", "aria-label": "Invite someone" },
+    el("span", { class: "settings-label", text: "Invite someone" }),
+    el("div", { class: "settings-row" }, inviteLogin, inviteRole, inviteSend),
+    roleNote, inviteError, inviteLive, inviteStatus);
+  inviteForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!inviteForm.reportValidity()) return;
+    inviteError.hidden = true;
+    wipeInvite();
+    inviteSend.disabled = true;
+    const left = leftCount;
+    try {
+      const data = await request(api("/invites"), "POST", {
+        login: inviteLogin.value, role: inviteRole.value,
+      });
+      if (epoch !== version) return;
+      if (left !== leftCount) {
+        // The user left the section while this was sending: drop the link, just refresh.
+        data.invite_url = null;
+        await refresh();
+        return;
+      }
+      showInviteResult(data);
+      inviteLogin.value = "";
+      try {
+        await refresh();
+      } catch (reason) {
+        if (epoch === version) showError(content, reason);
+      }
+    } catch (reason) {
+      if (epoch === version) failure(inviteError, reason);
+    } finally {
+      inviteSend.disabled = false;
+    }
+  });
 
   function confirmAction(title, text, actionLabel, onConfirm) {
     const { host, body, error } = dialog(title);
@@ -4891,17 +5041,36 @@ async function teamPage(version) {
     if (!data || data.limits === null) {
       usageBox.hidden = true;
       usageBox.replaceChildren();
+      planNote.hidden = true;
       return;
     }
-    const pair = (label, value) => el("div", {}, el("dt", { text: label }), el("dd", { text: value }));
+    planNote.hidden = typeof data.plan !== "string" || !data.plan;
+    planNote.textContent = planNote.hidden ? "" : `plan: ${data.plan}`;
+    // Meters are visual only; they warn at the same 80% and 100% as the usage banners.
+    const meter = (label, used, limit) => {
+      if (!isNumber(used) || !isNumber(limit) || limit <= 0) return null;
+      const share = Math.min(100, Math.max(0, Math.round((100 * used) / limit)));
+      const tone = used >= limit ? " danger" : used >= 0.8 * limit ? " warn" : "";
+      const fill = el("span");
+      fill.style.width = `${share}%`;
+      return el("div", {
+        class: `usage-meter${tone}`, role: "meter", "aria-label": `${label} used`,
+        "aria-valuemin": "0", "aria-valuemax": "100", "aria-valuenow": String(share),
+      }, fill);
+    };
+    const pair = (label, value, bar) =>
+      el("div", {}, el("dt", { text: label }), el("dd", {}, value, bar));
     usageBox.hidden = false;
     usageBox.replaceChildren(
-      el("div", { class: "heading" }, el("h2", { text: "Usage" })),
-      el("dl", { class: "kv-list identity usage-list" },
-        pair("Storage", `${formatGb(data.storage?.used)} of ${formatGb(data.storage?.limit)}`),
-        pair("Daily uploads", `${formatGb(data.uploads_today?.used)} of ${formatGb(data.uploads_today?.limit)}`),
+      el("h3", { class: "eyebrow", text: "Usage" }),
+      el("dl", { class: "usage-tiles" },
+        pair("Storage", `${formatGb(data.storage?.used)} of ${formatGb(data.storage?.limit)}`,
+          meter("Storage", data.storage?.used, data.storage?.limit)),
+        pair("Daily uploads", `${formatGb(data.uploads_today?.used)} of ${formatGb(data.uploads_today?.limit)}`,
+          meter("Daily uploads", data.uploads_today?.used, data.uploads_today?.limit)),
         pair("Requests per minute", formatLimitCount(data.requests_per_minute?.limit)),
-        pair("People", `${data.people?.used ?? "—"} of ${formatLimitCount(data.people?.limit)}`),
+        pair("People", `${data.people?.used ?? "—"} of ${formatLimitCount(data.people?.limit)}`,
+          meter("People", data.people?.used, data.people?.limit)),
       ),
     );
   }
@@ -4915,10 +5084,7 @@ async function teamPage(version) {
     ]);
     if (epoch !== version || sequence !== refreshSequence || disposed) return;
     if (response.status === 404) {
-      dispose();
-      cleanup = () => {};
-      await home(version);
-      return;
+      throw new Error("This workspace's people are no longer available to you.");
     }
     if (response.status === 401 || invitesResponse.status === 401) {
       dispose();
@@ -4964,6 +5130,10 @@ async function teamPage(version) {
     }
     if (epoch !== version || sequence !== refreshSequence || disposed) return;
     renderInvites(invites);
+    cards.members.aside.replaceChildren(el("span", {
+      class: "settings-meta",
+      text: `${data.users.length} member${data.users.length === 1 ? "" : "s"} · ${invites.length} invited`,
+    }));
     if (usageResponse.ok) {
       const usage = await usageResponse.json().catch(() => null);
       if (epoch !== version || sequence !== refreshSequence || disposed) return;
@@ -5058,10 +5228,17 @@ async function teamPage(version) {
     const confirm = button("Create invite link", async () => {
       error.hidden = true;
       confirm.disabled = true;
+      const left = leftCount;
       try {
         const data = await request(
           `${api("/members")}/${encodeURIComponent(user.name)}/invite`, "POST", {});
         if (epoch !== version) return;
+        if (left !== leftCount) {
+          // The user left the section while this was sending: drop the link, just refresh.
+          data.invite_url = null;
+          await refresh();
+          return;
+        }
         presentInvite(data, host, body, copyCode);
       } catch (reason) {
         if (epoch === version && host.open) failure(error, reason);
@@ -5079,25 +5256,24 @@ async function teamPage(version) {
     body.querySelector("button").focus();
   }
 
-  const inviteButton = button("Invite", invite, "primary");
-  app.replaceChildren(el("div", { class: "workspace stack" },
-    el("div", { class: "heading" }, el("h1", { text: "Team" }), inviteButton),
+  const planNote = el("span", { class: "settings-meta", hidden: true });
+  cards.workspace.aside.append(planNote);
+  cards.workspace.body.append(usageBox);
+  cards.members.body.append(
+    inviteForm,
     content,
-    usageBox,
-    el("div", { class: "stack" },
-      el("div", { class: "heading" }, el("h2", { text: "Pending invites" })),
-      invitesContent),
-    el("div", { class: "stack" },
-      el("div", { class: "heading" }, el("h2", { text: "Activity" })),
-      activity,
-      el("div", { class: "activity-toolbar" }, loadOlder, activityStatus))));
+    el("div", { class: "settings-section" },
+      el("h3", { text: "Pending invites" }),
+      invitesContent));
+  cards.activity.body.append(
+    activity,
+    el("div", { class: "activity-toolbar" }, loadOlder, activityStatus));
   try {
     await refresh();
   } catch (reason) {
-    dispose();
-    if (epoch === version) cleanup = () => {};
-    throw reason;
+    if (epoch === version) showError(content, reason);
   }
+  return dispose;
 }
 
 async function adminPage(version) {
@@ -5113,8 +5289,6 @@ async function adminPage(version) {
     closeDialog();
   };
   cleanup = dispose;
-  document.querySelector("#nav-keys").hidden = true;
-  document.querySelector("#nav-team").hidden = true;
   const crumb = document.querySelector(".breadcrumb");
   crumb.setAttribute("href", "/admin/");
   crumb.textContent = "agenticml / admin";
@@ -5659,14 +5833,192 @@ async function adminPage(version) {
   }
 }
 
+const SETTINGS_PATH = /^\/settings(?:\/([^/?#]*))?\/?$/;
+// A malformed % sequence in the hash must not throw; it just names no section.
+function sectionName(raw) {
+  try {
+    return decodeURIComponent(raw || "");
+  } catch {
+    return "";
+  }
+}
+// Cards the signed-in role can open, in page order.
+function settingsSections(session) {
+  const can = workspaceCan(session);
+  return [
+    { id: "account", label: "Account", title: "Your account", allowed: true },
+    { id: "workspace", label: "Workspace", title: "Workspace", allowed: can.users },
+    { id: "members", label: "Members", title: "Members", allowed: can.users },
+    { id: "keys", label: "API keys", title: "API keys", allowed: can.own_keys },
+    { id: "activity", label: "Activity", title: "Activity", allowed: can.audit },
+  ].filter((section) => section.allowed);
+}
+function settingsCard(id, title) {
+  const heading = el("h2", { id: `settings-h-${id}`, tabindex: "-1", text: title });
+  const aside = el("div", { class: "settings-aside" });
+  const body = el("div", { class: "settings-body" });
+  const section = el("section", {
+    id: `settings-${id}`, class: "settings-card", "aria-labelledby": heading.id,
+  }, el("div", { class: "settings-head" }, heading, aside), body);
+  return { section, heading, aside, body };
+}
+// The mounted Settings page, so a section change only scrolls instead of refetching.
+let settingsView = null;
+async function settingsPage(version, requested) {
+  await sessionReady;
+  if (version !== epoch) return;
+  if (!serverMode || !currentWorkspaceSlug()) {
+    // Local `agenticml ui` has no accounts, so no Settings.
+    history.replaceState(null, "", "#/");
+    markRoute("/");
+    await home(version);
+    return;
+  }
+  const session = serverSession;
+  const sections = settingsSections(session);
+  const ids = sections.map((section) => section.id);
+  const cards = {};
+  for (const section of sections) cards[section.id] = settingsCard(section.id, section.title);
+  const links = sections.map((section) => el("a", {
+    href: `#/settings/${section.id}`, "data-section": section.id, text: section.label,
+    // The hash does not change on the current item, so scroll to its card here.
+    onclick: (event) => {
+      // Modified clicks (new tab, new window) keep their browser behaviour.
+      if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey)
+        return;
+      if (event.currentTarget.hasAttribute("aria-current")) {
+        event.preventDefault();
+        show(section.id);
+      }
+    },
+  }));
+  const navItems = [...links];
+  if (session.server_admin)
+    navItems.push(el("a", {
+      class: "settings-nav-admin", href: "/admin/", text: "Server admin ↗",
+    }));
+  const workspaceRow = sessionWorkspaces(session).find((row) => row.slug === currentWorkspaceSlug());
+  const workspaceName = typeof workspaceRow?.name === "string" && workspaceRow.name
+    ? workspaceRow.name : currentWorkspaceSlug();
+
+  // Account: today's Account dialog body.
+  const account = accountDetails(session, { card: true });
+  cards.account.body.append(
+    ...[account.identity, account.switcher, ...account.password].filter(Boolean));
+  if (session.via !== "proxy")
+    cards.account.aside.append(button("Sign out", signOut, "secondary"));
+  // Workspace: name and slug here, the plan and usage tiles from the team mount.
+  if (cards.workspace)
+    cards.workspace.body.append(el("div", { class: "settings-row" },
+      el("span", { class: "settings-ws-name", text: workspaceName }),
+      el("span", { class: "settings-meta", text: `slug ${currentWorkspaceSlug()}` })));
+
+  const page = el("div", { class: "settings-page" },
+    el("div", { class: "settings-header" },
+      el("span", { class: "eyebrow", text: `Workspace · ${workspaceName}` }),
+      el("h1", { text: "Settings" }),
+      el("p", { text: "Your account, this workspace's people and its API keys." })),
+    el("div", { class: "settings-layout" },
+      el("nav", { class: "settings-nav", "aria-label": "Settings" },
+        el("div", {}, ...navItems)),
+      el("div", { class: "settings-col" }, ...sections.map((section) => cards[section.id].section))));
+
+  let active = "account";
+  // Set by any pointer, key, wheel or touch input; cleared when a section is chosen.
+  let moved = false;
+  const markMoved = () => { moved = true; };
+  const movedEvents = ["pointerdown", "keydown", "wheel", "touchmove"];
+  movedEvents.forEach((type) => window.addEventListener(type, markMoved, { capture: true, passive: true }));
+  // Marks the section in the nav at once; the scroll waits until the cards are loaded.
+  function select(id) {
+    moved = false;
+    active = ids.includes(id) ? id : "account";
+    if (id && active !== id) history.replaceState(null, "", `#/settings/${active}`);
+    for (const link of links) {
+      if (link.dataset.section === active) link.setAttribute("aria-current", "true");
+      else link.removeAttribute("aria-current");
+    }
+  }
+  function reveal() {
+    const card = cards[active];
+    card.heading.focus({ preventScroll: true });
+    if (active === "account") {
+      window.scrollTo(0, 0);
+      return;
+    }
+    // Clear the sticky top bar, which wraps to several rows on narrow screens.
+    const bar = document.querySelector(".topbar")?.offsetHeight || 0;
+    window.scrollTo(0, window.scrollY + card.section.getBoundingClientRect().top - bar - 16);
+  }
+  function show(id) {
+    select(id);
+    reveal();
+  }
+
+  const disposers = [];
+  const dispose = () => {
+    if (settingsView?.page === page) settingsView = null;
+    movedEvents.forEach((type) => window.removeEventListener(type, markMoved, { capture: true }));
+    disposers.splice(0).forEach((fn) => fn());
+  };
+  cleanup = dispose;
+  app.replaceChildren(page);
+  settingsView = {
+    page, show,
+    // A one-time key or invite link must not survive navigation inside Settings.
+    closeDialogs: () => disposers.forEach((fn) => fn.closeDialog?.()),
+  };
+  select(requested);
+  // A section whose request fails shows its error in place; the other cards keep working.
+  const mounts = [];
+  if (cards.keys) mounts.push(mountKeys(cards.keys, version, disposers));
+  if (cards.workspace)
+    mounts.push(mountTeam(
+      { workspace: cards.workspace, members: cards.members, activity: cards.activity },
+      version, disposers));
+  await Promise.all(mounts);
+  if (epoch !== version) dispose();
+  else if (settingsView?.page === page) {
+    if (active !== "account" && !moved && !document.querySelector("dialog[open]")) reveal();
+    // Every card has loaded and the deferred scroll is done.
+    page.dataset.loaded = "true";
+  }
+}
+
+// Top bar state: the breadcrumb and the Settings link follow the current page.
+function markRoute(hash) {
+  const settings = SETTINGS_PATH.test(hash);
+  const crumb = document.querySelector(".breadcrumb");
+  crumb.setAttribute("href", "#/");
+  crumb.textContent = settings ? "agenticml / settings" : "agenticml / runs";
+  const link = document.querySelector("#nav-settings");
+  if (settings) link.setAttribute("aria-current", "page");
+  else link.removeAttribute("aria-current");
+}
+const LEGACY_ROUTES = { "/keys": "/settings/keys", "/team": "/settings/members" };
 async function route() {
+  let hash = location.hash.slice(1) || "/";
+  if (LEGACY_ROUTES[hash] && !isAdminPath()) {
+    // Old Keys and Team links keep working.
+    hash = LEGACY_ROUTES[hash];
+    history.replaceState(null, "", `#${hash}`);
+  }
+  const settings = isAdminPath() ? null : SETTINGS_PATH.exec(hash);
+  if (settings && settingsView?.page.isConnected) {
+    // Only the section changed: scroll to its card, no re-render or refetch.
+    settingsView.closeDialogs();
+    settingsView.show(sectionName(settings[1]));
+    return;
+  }
   const version = ++epoch;
   controller?.abort();
   cleanup();
   cleanup = () => {};
+  settingsView = null;
   document.querySelector("#lightbox").close();
   controller = new AbortController();
-  app.replaceChildren(loading(isAdminPath() ? "Loading…" : "Loading runs…"));
+  app.replaceChildren(loading(
+    isAdminPath() ? "Loading…" : settings ? "Loading settings…" : "Loading runs…"));
   try {
     if (isAdminPath()) {
       await sessionReady;
@@ -5676,9 +6028,8 @@ async function route() {
         return;
       }
     }
-    const hash = location.hash.slice(1) || "/";
-    if (hash === "/keys") await keysPage(version);
-    else if (hash === "/team") await teamPage(version);
+    markRoute(hash);
+    if (settings) await settingsPage(version, sectionName(settings[1]));
     else if (hash.startsWith("/run/"))
       await runPage(decodeURIComponent(hash.slice(5)), version);
     else if (hash.startsWith("/compare")) {
