@@ -192,12 +192,29 @@ off; the server CLI over ECS Exec still works.
 
 At this point the AWS deployment is live and package 24.3 is done.
 
+## Phase 7: Public launch (owner and agents)
+
+**Status: planned** (Nov 13, 2026) in package
+[28](packages/28-docs-site.md). The service has taken sign-ups since
+Nov 13, but nothing public points to it, and there are no policies yet.
+This phase makes the docs site the way people find and use it. 7.1 and 7.2
+can start now, beside Phases 4–6.
+
+| # | Step | Who | Done when |
+| --- | --- | --- | --- |
+| 7.1 | Docs site: Releases page, hosted section (overview, quickstart, workspaces) and a public "Service status and roadmap" page that mirrors this roadmap without AWS identifiers (packages 28.1–28.5 and 28.2a–c) | Sonnet, Antigravity | Merged to `dev` with the build, link and 375px checks green |
+| 7.2 | Publish the site through a docs-only PR to `main`; enforce HTTPS on Pages; set the repo description and homepage (28.6) | git agent; owner merges and sets them | The live site shows the hosted pages and status page |
+| 7.3 | Owner decides open sign-up until the policies exist (package 28, D1), and supplies the policy facts (D4) | Owner | Decisions recorded in the 28 plan |
+| 7.4 | Terms, acceptable use and privacy policy on the docs site, linked from `/login` and the invite page (28.7); email existing sign-ups (D6) | Antigravity drafts; owner and lawyer approve; Sonnet links; owner approves the deploy | `/login` and `/invite` show the three links in a browser, and they return 200 |
+| 7.5 | Promote: Sign in action, banner and header link on the docs site (28.8) | Sonnet | Live, with no overflow at 375px |
+| 7.6 | Keep the status page current: the PR that records a result in Phases 4–6 also updates the docs status page, then the git agent opens the docs-only PR to `main` | Supervisor; owner merges | The live status page shows the result and a new "last updated" date |
+
 ## After AWS is live (separate work, not in this roadmap)
 
 - Firebase sign-in moved into Phase 4 (steps 4.2a and 4.2b) on Nov 13,
   2026.
 - Terms of service, acceptable use and privacy policies, linked from the
-  sign-in page (needs a small code change).
+  sign-in page: moved into Phase 7 (step 7.4) on Nov 13, 2026.
 - Open sign-up (exit criterion 7): turned on Nov 13, 2026 (owner's choice) by
   setting `HOSTED_OPEN_SIGNUP=true` and re-running deploy run 43417765936.
   Exit criterion 7's storage-limit walk-through is still to do.

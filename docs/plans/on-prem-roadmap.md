@@ -188,7 +188,8 @@ and decisions D1–D9. Each package plan is written before its package
 starts. Order:
 16 → 17 → 18, then 18b and 21 in parallel, then 18c → 19 → 20 (19.1,
 the Postgres backend, runs beside 18b; 19.2 needs 18c's tables); 22 and 23
-after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
+after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live; 28
+after 24.7 and 27, beside 24.3 (28.7 and 28.9 wait on the owner).
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -235,7 +236,20 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 25.1 | Client support window (426), version 3.0.0, base-install smoke, 2.2 client check | 16–24 | Sonnet (Codex at limit) | S | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
 | 25.2 | SERVER.md, HOSTED.md, threat model, PROTOCOL.md, README, website, SECURITY.md | 25.1 | Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
 | 26 | Retire agenticml-server | 24 live | Owner | S | – | not started |
-| 27 | Sign-in pages redesigned like agenticml-server (brand panel, logo, Sign in / Sign up tabs) | 18b | Sonnet | S | [plan](packages/27-sign-in-redesign.md) | in review ([#57](https://github.com/agenticML/agenticml-lite/pull/57); second review pending) |
+| 27 | Sign-in pages redesigned like agenticml-server (brand panel, logo, Sign in / Sign up tabs) | 18b | Sonnet | S | [plan](packages/27-sign-in-redesign.md) | merged ([#57](https://github.com/agenticML/agenticml-lite/pull/57), Nov 13, 2026); second review pending |
+| 28 | Docs site: Releases page (1.0–3.0), hosted service section with status, home page, truth fixes, docs CI, policies and sign-in links | 24.7, 27 | Sonnet; prose Antigravity | M | [plan](packages/28-docs-site.md) | plan ready (owner decisions D1–D9 in the plan; 28.7–28.9 wait on the owner) |
+| 28.0 | Plan, roadmap rows, AWS roadmap Phase 7, Backlog entries | – | Supervisor | S | [plan](packages/28-docs-site.md) | done (this PR) |
+| 28.1 | Truth fixes in existing pages and README | 28.0 | Sonnet | S | [plan](packages/28-docs-site.md) | plan ready |
+| 28.2a | Docs CI: PR builds, link validator, Node pin, job permissions and concurrency | 28.1 | Sonnet | S | [plan](packages/28-docs-site.md) | plan ready |
+| 28.3 | Releases page (1.0, 2.0, 2.1, 2.2, 3.0) | 28.2a | Antigravity; Sonnet | S | [plan](packages/28-docs-site.md) | plan ready |
+| 28.4 | Hosted service section: overview and limits, quickstart, workspaces, service status | 28.3 | Antigravity; Sonnet | M | [plan](packages/28-docs-site.md) | plan ready |
+| 28.5 | Home page and navigation | 28.4 | Sonnet | S | [plan](packages/28-docs-site.md) | plan ready |
+| 28.2b | 375px overflow check over every built page, in `docs.yml` | 28.5 | Sonnet | S | [plan](packages/28-docs-site.md) | plan ready |
+| 28.2c | Facts test: limits, minimum client, no unpublished tag URLs, no `login --key` | 28.4 | Sonnet | S | [plan](packages/28-docs-site.md) | plan ready |
+| 28.6 | Publish: docs-only PR to `main`; Pages HTTPS, repo description and homepage | 28.1–28.5, 28.2a–c, D3 | git agent; owner | S | [plan](packages/28-docs-site.md) | not started |
+| 28.7 † | Terms, acceptable use and privacy policy on the site; links on the sign-in and invite pages | 28.6 | Antigravity; owner and lawyer approve; Sonnet | M | [plan](packages/28-docs-site.md) | blocked: owner decisions D1, D2, D4, D6 |
+| 28.8 | Promotion: Sign in action, banner, header link | 28.7 | Sonnet | S | [plan](packages/28-docs-site.md) | not started |
+| 28.9 | After PyPI 3.0.0: `pip install`, tag URLs, release dates, `pyproject.toml` URLs | owner release | Sonnet | S | [plan](packages/28-docs-site.md) | blocked: 3.0.0 not on PyPI |
 
 Getting the hosted service live on AWS, step by step: [AWS deployment roadmap](aws-deployment-roadmap.md).
 
@@ -274,6 +288,14 @@ Getting the hosted service live on AWS, step by step: [AWS deployment roadmap](a
   admin and create customer workspaces on `/admin`. ECS Exec stays as the
   break-glass path. **26** shuts down agenticml-server,
   which has no customers, after 24 is live.
+- **28** (owner, Nov 13, 2026) makes the GitHub Pages site the front door:
+  a Releases page for 1.0, 2.0–2.2 and 3.0, a hosted section that takes a
+  new user from sign-up at `app.agenticml.xyz` to a synced run, a public
+  status page that mirrors the AWS deployment roadmap, and the policies the
+  open sign-up needs. The live site is built from `main` (2.2) and already
+  says things that are wrong, so truth fixes come first. Sign-up is not
+  promoted on the site until the policies are live (28.7). It runs beside
+  24.3; only 28.7 and 28.9 touch code or `pyproject.toml`.
 
 ### Maintenance fixes
 
@@ -349,7 +371,42 @@ priority.
   - Progress (Nov 13, 2026): the owner turned open sign-up on before the
     policies were published (`HOSTED_OPEN_SIGNUP=true`, deploy run
     43417765936). The policies and the sign-in page links are now the most
-    urgent part of this entry.
+    urgent part of this entry. Planned as package 28.7 (AWS roadmap step
+    7.4); PyPI has only 1.0.0, so package 28 documents the git install
+    until this entry is done.
+- **Keys page copies the key onto the command line** (package 28 plan, Nov
+  13, 2026).
+  - Where: `src/agenticml/ui/static/app.js`, new-key dialog (the
+    `key-command` element).
+  - Problem: "Copy command" copies `agenticml login --host <host> --key
+    <key>`, which leaves the key in shell history; the docs (and the hosted
+    quickstart in package 28.4) say to paste the key at the prompt.
+  - Fix: copy `agenticml login --host <host>` only; keep the separate "Copy
+    key" button.
+  - Done when: a UI test asserts the copied command has no `--key`, and
+    there is no overflow at 375px.
+- **Docs custom domain** (package 28, decision D8, Nov 13, 2026).
+  - Where: `website/astro.config.mjs` (`site`, `base`), `website/public/CNAME`,
+    every `/agenticml-lite/` link in `website/src/content/docs`; Namecheap;
+    Pages settings.
+  - Problem: the docs live at `agenticml.github.io/agenticml-lite/`, and
+    `agenticml.xyz` has no DNS record.
+  - Fix: after PyPI 3.0.0, owner adds a Namecheap CNAME `docs` →
+    `agenticml.github.io.` and sets the Pages custom domain; Sonnet drops
+    `base`, rewrites the internal links and sets `pyproject.toml`
+    `Documentation`. Never touch the `app` record.
+  - Done when: `https://docs.agenticml.xyz` serves the site with HTTPS
+    enforced, old github.io URLs redirect, and the link check passes.
+- **Hosted service monitoring for the public** (package 28, Nov 13, 2026).
+  Low priority.
+  - Where: `.github/workflows/`, the docs status page.
+  - Problem: the status page is updated by hand; nothing checks
+    `/healthz` or the site's external links on a schedule.
+  - Fix: a scheduled workflow that checks `https://app.agenticml.xyz/healthz`
+    and the site's external links weekly (opens an issue on failure);
+    self-serve account deletion later.
+  - Done when: the workflow runs on a schedule and a failing check opens an
+    issue.
 - **Setup and invite pages in the new sign-in style** (package 27, Nov 13,
   2026).
   - Where: `src/agenticml/server/static/setup.html`, `invite.html`.
