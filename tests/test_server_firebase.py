@@ -769,7 +769,7 @@ def test_password_and_key_login_and_setup_404_when_firebase_on(tmp_path, monkeyp
             csrf(httpd))
         assert status == 404 and json.loads(body) == {'error': 'not found'}
         status, _, page = call(httpd, '/login')
-        assert status == 200 and b'<h1>Sign in</h1>' in page
+        assert status == 200 and b'Sign in to your workspace</h1>' in page
         assert b'/static/firebase-login.js' in page
         assert b'/static/vendor/firebase/firebase-app-compat.js' in page
         assert b'/static/vendor/firebase/firebase-auth-compat.js' in page

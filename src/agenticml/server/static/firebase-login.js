@@ -7,8 +7,12 @@
   const submit = form.querySelector('button[type="submit"]');
   const emailInput = document.querySelector("#email");
   const passwordInput = document.querySelector("#password");
-  const createAccount = document.querySelector("#create-account");
   const forgot = document.querySelector("#forgot");
+  const tabSignIn = document.querySelector("#tab-signin");
+  const tabSignUp = document.querySelector("#tab-signup");
+  const title = document.querySelector("#auth-title");
+  const sub = document.querySelector("#auth-sub");
+  const showPassword = document.querySelector("#show-password");
 
   const NO_ACCOUNT =
     "Your account has no access to this server. Ask a workspace admin for an invite.";
@@ -30,8 +34,24 @@
     "auth/cancelled-popup-request": true,
   };
 
+  const COPY = {
+    signin: {
+      title: "Sign in to your workspace",
+      sub: "Pick up your runs and comparisons where you left them.",
+      submit: "Sign in",
+      autocomplete: "current-password",
+    },
+    signup: {
+      title: "Create your workspace",
+      sub: "Start logging experiments in minutes.",
+      submit: "Sign up",
+      autocomplete: "new-password",
+    },
+  };
+
   let invite = null;
   let busy = false;
+  let mode = "signin";
   if (location.pathname === "/invite") {
     invite = new URLSearchParams(location.search).get("token") || null;
     if (location.search) history.replaceState(null, "", "/invite");
@@ -53,6 +73,45 @@
     error.hidden = true;
     error.textContent = "";
     hideExtras();
+  }
+
+  function setMode(next) {
+    mode = next;
+    const copy = COPY[next];
+    const signingIn = next === "signin";
+    tabSignIn.setAttribute("aria-selected", String(signingIn));
+    tabSignIn.tabIndex = signingIn ? 0 : -1;
+    tabSignUp.setAttribute("aria-selected", String(!signingIn));
+    tabSignUp.tabIndex = signingIn ? -1 : 0;
+    title.textContent = copy.title;
+    sub.textContent = copy.sub;
+    submit.textContent = copy.submit;
+    forgot.hidden = !signingIn;
+    passwordInput.autocomplete = copy.autocomplete;
+    clearError();
+  }
+
+  function bindTabs() {
+    // Never let the browser submit the form natively (a GET would put the
+    // password in the URL), even before or without Firebase starting.
+    form.addEventListener("submit", (event) => event.preventDefault());
+    tabSignIn.addEventListener("click", () => setMode("signin"));
+    tabSignUp.addEventListener("click", () => setMode("signup"));
+    for (const tab of [tabSignIn, tabSignUp]) {
+      tab.addEventListener("keydown", (event) => {
+        if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+        event.preventDefault();
+        const other = tab === tabSignIn ? tabSignUp : tabSignIn;
+        setMode(other === tabSignIn ? "signin" : "signup");
+        other.focus();
+      });
+    }
+    showPassword.addEventListener("click", () => {
+      const reveal = passwordInput.type === "password";
+      passwordInput.type = reveal ? "text" : "password";
+      showPassword.textContent = reveal ? "hide password" : "show password";
+      showPassword.setAttribute("aria-pressed", String(reveal));
+    });
   }
 
   function firebaseError(err) {
@@ -198,6 +257,20 @@
     return afterSignIn();
   }
 
+  async function createAccountWithEmail() {
+    clearError();
+    try {
+      const cred = await firebase.auth().createUserWithEmailAndPassword(
+        emailInput.value, passwordInput.value);
+      await cred.user.sendEmailVerification();
+    } catch (err) {
+      showFirebaseError(err);
+      return false;
+    }
+    showError(VERIFY_EMAIL, "resend");
+    return false;
+  }
+
   async function submitEmail() {
     clearError();
     try {
@@ -216,16 +289,7 @@
     });
     form.addEventListener("submit", (event) => {
       event.preventDefault();
-      void runExclusive(submitEmail);
-    });
-    createAccount.addEventListener("click", () => {
-      if (busy || !form.reportValidity()) return;
-      clearError();
-      firebase.auth()
-        .createUserWithEmailAndPassword(emailInput.value, passwordInput.value)
-        .then((cred) => cred.user.sendEmailVerification())
-        .then(() => showError(VERIFY_EMAIL, "resend"))
-        .catch((err) => showFirebaseError(err));
+      void runExclusive(mode === "signup" ? createAccountWithEmail : submitEmail);
     });
     forgot.addEventListener("click", () => {
       if (busy || !emailInput.reportValidity()) return;
@@ -315,5 +379,6 @@
     }
   });
 
+  bindTabs();
   start();
 })();
