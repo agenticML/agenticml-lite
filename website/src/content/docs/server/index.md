@@ -5,7 +5,7 @@ sidebar:
   order: 1
 ---
 
-`agenticml server` provides a central synchronization target and shared web dashboard for AgenticML experiments. It runs self-hosted on your own infrastructure or as our managed multi-workspace service on AWS.
+`agenticml server` provides a central synchronization target and shared web dashboard for AgenticML experiments. It runs self-hosted on your own infrastructure or as our managed multi-workspace service on AWS. To use the hosted service instead of running your own server, start with the [Hosted service](/agenticml-lite/hosted/) section.
 
 ## Architecture
 

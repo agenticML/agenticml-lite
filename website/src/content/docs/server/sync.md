@@ -15,6 +15,14 @@ Install `agenticml-lite` on the training machine:
 pip install agenticml-lite
 ```
 
+PyPI has only 1.0.0, which cannot sync to a server. 3.0 is not on PyPI yet, so until it is, install the client from GitHub (this follows the `dev` branch, so it moves as development continues):
+
+```bash
+pip install 'agenticml-lite @ git+https://github.com/agenticML/agenticml-lite@dev'
+```
+
+Using the hosted service at `app.agenticml.xyz`? Follow the [hosted quickstart](/agenticml-lite/hosted/quickstart/) instead.
+
 Log in with your server URL:
 
 ```bash
@@ -82,7 +90,7 @@ On Linux machines, run `sync --follow` as a user-level systemd service:
 
 ```bash
 mkdir -p ~/.config/systemd/user
-curl -fsSL -o ~/.config/systemd/user/agenticml-sync.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v3.0.0/deploy/systemd/agenticml-sync.service
+curl -fsSL -o ~/.config/systemd/user/agenticml-sync.service https://raw.githubusercontent.com/agenticML/agenticml-lite/main/deploy/systemd/agenticml-sync.service
 ```
 
 Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`).

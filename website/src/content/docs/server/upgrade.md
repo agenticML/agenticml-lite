@@ -17,6 +17,10 @@ To upgrade a self-hosted server:
    ```bash
    sudo /opt/agenticml/bin/pip install -U agenticml-lite
    ```
+   3.0 is not on PyPI yet. Until it is, upgrade from GitHub instead (this follows the `dev` branch, so it moves as development continues):
+   ```bash
+   sudo /opt/agenticml/bin/pip install -U 'agenticml-lite @ git+https://github.com/agenticML/agenticml-lite@dev'
+   ```
 2. Restart the server service:
    ```bash
    sudo systemctl restart agenticml-server
@@ -60,6 +64,7 @@ The sync client is running an older `agenticml-lite` version below `--min-client
 ```bash
 pip install -U agenticml-lite
 ```
+3.0 is not on PyPI yet, and PyPI has only 1.0.0, which cannot sync to a server. Until 3.0 is published, install the client from GitHub: `pip install -U 'agenticml-lite @ git+https://github.com/agenticML/agenticml-lite@dev'`.
 
 ### `agenticml sync` exits with status 3 (`401 Unauthorized`)
 
