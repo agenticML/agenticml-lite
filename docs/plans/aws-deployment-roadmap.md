@@ -3,8 +3,9 @@
 Nov 10, 2026 · Supervisor plan · Release 3.0
 
 The steps, in order, to put the 3.0 hosted service live at
-`https://app.agenticml.xyz` in our AWS account. Firebase, open sign-up and
-retiring agenticml-server come after the service is up and checked.
+`https://app.agenticml.xyz` in our AWS account. Open sign-up and retiring
+agenticml-server come after the service is up and checked. Firebase sign-in
+moved ahead of step 4.3 on Nov 13, 2026 (see Phase 4).
 
 Decisions (owner, Nov 10, 2026):
 
@@ -18,7 +19,10 @@ Decisions (owner, Nov 10, 2026):
 - **No NAT gateway.** Tasks run in public subnets with public IPs for
   outbound traffic only; RDS and EFS stay private.
 - **No Firebase at first.** People sign in with passwords set through
-  invite links.
+  invite links. Changed Nov 13, 2026 (owner): Firebase sign-in is turned on
+  before step 4.3, with a new Firebase project `agenticml-hosted` that the
+  owner administers. The owner has no access to agenticml-server's project
+  (`agenticml-auth`), so 3.0 plan decision D9 changed too.
 - **DNS stays at Namecheap** (no Route 53). The owner adds the certificate
   validation CNAME once and a CNAME `app` → the load balancer.
 - **Cost alerts:** a $100 monthly budget and an email for every $10 spent,
@@ -44,7 +48,7 @@ anything against AWS (billed resources, public endpoint). Exception: on
 Nov 12, 2026 the owner had the supervisor run Phase 3 with the owner's
 `agenticml-account` profile (bootstrap redeploys, approving the deploy run).
 
-## Current state (Nov 12, 2026)
+## Current state (Nov 13, 2026)
 
 Where things stand after the first deploy; update this section when it
 changes.
@@ -52,18 +56,21 @@ changes.
 | What | State |
 | --- | --- |
 | Bootstrap stack `agenticml-hosted-bootstrap` | `UPDATE_COMPLETE`; redeployed twice on Nov 12 with the [24.5](packages/24.5-lean-hosted.md) fixes (immutable OIDC subject, `ecr:BatchGetImage`, EFS service-linked role) |
-| Hosted stack `agenticml-hosted` | `CREATE_COMPLETE` from deploy run 43206113226 (`dev` at `23dcb7c`), image `23dcb7c43f2309d89cd5731a1f4afda84a669e0b-arm64` |
-| Service | 1 of 1 ARM64 task (0.5 vCPU / 1 GB) running, task definition `agenticml-hosted:1` |
+| Hosted stack `agenticml-hosted` | `UPDATE_COMPLETE` from deploy run 43269670813 (`dev` at `41fd384`, the [#55](https://github.com/agenticML/agenticml-lite/pull/55) merge), image `41fd384ed44b66801fb9d7f8620d01ce07e63561-arm64`. Attempt 1 (Nov 12) shipped the 24.6 `whoami` change; attempt 2 (Nov 13) re-ran it to pick up the Firebase variables |
+| Service | 1 of 1 ARM64 task (0.5 vCPU / 1 GB) running, task definition `agenticml-hosted:3` |
 | Database | `agenticml-hosted`, `db.t4g.micro`, single-AZ, 20 GB, available |
 | Alarms | all six OK; Container Insights off |
 | Load balancer | `agenticml-hosted-1705349735.us-east-2.elb.amazonaws.com`; `/healthz` 200 with the `app.agenticml.xyz` host |
 | DNS | `app` CNAME at Namecheap → the load balancer (step 3.2, Nov 12); `https://app.agenticml.xyz/healthz` returns 200 with a valid certificate |
-| Admin account | **not yet**: the server logged a one-time setup link (search `/ecs/agenticml-hosted` for "No admin user yet"; the token is a secret, never copy it into the repo). Step 4.2 uses it |
-| GitHub `hosted` environment | `HOSTED_DESIRED_COUNT=2` is still set but unused since 24.5; delete it when convenient |
+| Admin account | The first admin, created through `/setup` on Nov 13 (step 4.2): owner of `default`, server admin, password login. With Firebase on, it can no longer sign in on the web; it stays as the break-glass account for the server CLI over ECS Exec |
+| Sign-in | **Firebase**, project `agenticml-hosted` (Google and email/password; `app.agenticml.xyz` is an authorized domain). `/login` serves the Firebase page with no console or CSP errors; password `POST /login` and `/setup` return 404. Open sign-up is off |
+| Email admin account | **not yet**: no account can sign in on the web until step 4.2b creates one |
+| GitHub `hosted` environment | `HOSTED_FIREBASE_PROJECT=agenticml-hosted` and `HOSTED_FIREBASE_API_KEY` set Nov 13; `HOSTED_OPEN_SIGNUP=false`. `HOSTED_DESIRED_COUNT=2` is still set but unused since 24.5; delete it when convenient |
 
-Next: Phase 4, starting with the admin account through the setup link
-(4.2). The runbook commands for Phase 4 were checked against the code in
-package [24.6](packages/24.6-phase-4-runbook.md).
+Next: step 4.2b (the owner's email admin account and the first real Google
+sign-in), then 4.3. The runbook commands for Phase 4 were checked against the
+code in package [24.6](packages/24.6-phase-4-runbook.md), before Firebase was
+turned on.
 
 ## Phase 0: Account checks (owner, ~30 min)
 
@@ -142,17 +149,24 @@ needs (see the 24.5 plan).
 
 ## Phase 4: First accounts and data (owner)
 
-**Status: next.** Commands are in `deploy/aws/README.md`, sections
-"Accounts, Firebase and customers" and "Sync from a training machine"
-(rewritten in package [24.6](packages/24.6-phase-4-runbook.md) after a check
-against the code). Keep one task running until the admin exists: each task
-logs its own setup token.
+**Status: in progress** (Nov 13, 2026): 4.1, 4.2 and 4.2a done; next is
+4.2b. Commands are in `deploy/aws/README.md`, sections "Accounts, Firebase
+and customers" and "Sync from a training machine" (rewritten in package
+[24.6](packages/24.6-phase-4-runbook.md) after a check against the code).
+
+Firebase sign-in moved here from "After AWS is live" (owner, Nov 13, 2026),
+so 4.3 creates email accounts that sign in with Google or Firebase
+email/password instead of setting passwords through invite links. With
+Firebase on, password sign-in on the web, `/setup` and password invites are
+off; the server CLI over ECS Exec still works.
 
 | # | Step | Done when |
 | --- | --- | --- |
-| 4.1 | ECS Exec access. The `agenticml-account` admin user already has `ecs:ExecuteCommand`, and the service and task role allow it; install the Session Manager plugin if `session-manager-plugin --version` fails | `aws ecs execute-command ... --command /bin/sh` opens a shell, and the environment check (database URL, `PGPASSWORD`, no `/data/server/agenticml.db`) passes |
-| 4.2 | Create the first admin through the `/setup` link logged at startup (newest "No admin user yet" line in `/ecs/agenticml-hosted`), on `https://app.agenticml.xyz` only; login without `@`, password of 12+ characters. This makes the account owner of `default` and server admin and closes `/setup` | You can sign in at `/login`; `/setup` returns 404 |
-| 4.3 | Through ECS Exec, create two customer workspaces, each with an admin, a member and a sync key. Every person sets a password through their invite **before** any account is added to a second workspace; then add one account to the other workspace with a different role (`users add`, no invite) | Each person sees only their own workspaces, with the right roles |
+| 4.1 | ECS Exec access. The `agenticml-account` admin user already has `ecs:ExecuteCommand`, and the service and task role allow it; install the Session Manager plugin if `session-manager-plugin --version` fails. **Done** Nov 13, 2026: Session Manager plugin 1.2.896.0; the environment check showed the public URL, the RDS host with `sslmode=verify-full`, the S3 objects bucket, `PGPASSWORD` set and no `agenticml.db` | `aws ecs execute-command ... --command /bin/sh` opens a shell, and the environment check (database URL, `PGPASSWORD`, no `/data/server/agenticml.db`) passes |
+| 4.2 | Create the first admin through the `/setup` link logged at startup (newest "No admin user yet" line in `/ecs/agenticml-hosted`), on `https://app.agenticml.xyz` only; login without `@`, password of 12+ characters. This makes the account owner of `default` and server admin and closes `/setup`. **Done** Nov 13, 2026: `server users list` shows the account as `owner`, created by `setup` | You can sign in at `/login`; `/setup` returns 404 |
+| 4.2a | Turn on Firebase sign-in. Firebase console: create a project the owner administers, enable Email/Password (not email link) and Google, add `app.agenticml.xyz` to the authorized domains, register a web app (no Hosting). GitHub `hosted` environment: set `HOSTED_FIREBASE_PROJECT` and `HOSTED_FIREBASE_API_KEY`, keep `HOSTED_OPEN_SIGNUP=false`. Re-run the deploy and approve it. **Done** Nov 13, 2026: project `agenticml-hosted`, deploy run 43269670813 attempt 2, task definition `agenticml-hosted:3` | The task has `AGENTICML_SERVER_FIREBASE_PROJECT`; `/login` shows "Continue with Google" with no console errors; `POST /login` with a password and `/setup` return 404 |
+| 4.2b | Create the owner's web admin account, named after the exact email of the Google account they sign in with: in ECS Exec, `agenticml server accounts add <email> --server-admin --data /data`, then `agenticml server users add <email> --role admin --workspace default --public-url https://app.agenticml.xyz --data /data`. The account has no password, so the first verified Google sign-in with that email links to it. Then sign in at `/login` with "Continue with Google" | The owner lands in `default` as server admin; `server users list` shows the email account |
+| 4.3 | Through ECS Exec, create two customer workspaces, each with an admin, a member and a sync key, using email logins (`users add <email>`). People accept their invite or sign in with "Continue with Google" or Firebase email/password; the email must be verified and match the login. Then add one account to the other workspace with a different role (`users add`, no invite). Before running, re-check these commands against the code's Firebase path: package 24.6 checked the password path only | Each person sees only their own workspaces, with the right roles |
 | 4.4 | On a training machine with 3.0.0 installed from `dev`, sync one smoke run per workspace, each from its own `AGENTICML_DIR` with that workspace's key (sync state is kept per host, not per workspace) | Runs, metrics and artifacts show in the right dashboard and nowhere else |
 
 ## Phase 5: Launch checks (owner, exit criterion 6)
@@ -176,7 +190,8 @@ At this point the AWS deployment is live and package 24.3 is done.
 
 ## After AWS is live (separate work, not in this roadmap)
 
-- Firebase sign-in: real Google and email sign-in, invites, and CSP.
+- Firebase sign-in moved into Phase 4 (steps 4.2a and 4.2b) on Nov 13,
+  2026.
 - Terms of service, acceptable use and privacy policies, linked from the
   sign-in page (needs a small code change).
 - Open sign-up (exit criterion 7).
