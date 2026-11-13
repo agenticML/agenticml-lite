@@ -235,7 +235,8 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 25.1 | Client support window (426), version 3.0.0, base-install smoke, 2.2 client check | 16–24 | Sonnet (Codex at limit) | S | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
 | 25.2 | SERVER.md, HOSTED.md, threat model, PROTOCOL.md, README, website, SECURITY.md | 25.1 | Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
 | 26 | Retire agenticml-server | 24 live | Owner | S | – | not started |
-| 27 | Sign-in pages redesigned like agenticml-server (brand panel, logo, Sign in / Sign up tabs) | 18b | Sonnet | S | [plan](packages/27-sign-in-redesign.md) | in review ([#57](https://github.com/agenticML/agenticml-lite/pull/57); second review pending) |
+| 27 | Sign-in pages redesigned like agenticml-server (brand panel, logo, Sign in / Sign up tabs) | 18b | Sonnet | S | [plan](packages/27-sign-in-redesign.md) | done ([#57](https://github.com/agenticML/agenticml-lite/pull/57)) |
+| 28 | One Settings page: Account, Workspace, Members, API keys and Activity replace the Keys, Team and Account entries (like agenticml-server) | 27 | Sonnet | M | [plan](packages/28-settings-page.md) | in review (PR to `dev`) |
 
 Getting the hosted service live on AWS, step by step: [AWS deployment roadmap](aws-deployment-roadmap.md).
 
@@ -627,3 +628,13 @@ priority.
     commit SHA with the tag in a comment, and update the workflow tests.
   - Done when: the template and workflow tests check both, and cfn-lint is
     clean.
+- **Workspace rename by its owner** (package 28, Nov 13, 2026). Low priority.
+  - Where: `src/agenticml/server/routes.py` (workspace routes),
+    `src/agenticml/ui/static/app.js` (Settings, Workspace card).
+  - Problem: only server admins can rename a workspace (on `/admin`);
+    agenticml-server lets a workspace owner or admin rename it from
+    Settings, and the design board's Settings proposal shows a Rename button.
+  - Fix: add `PATCH /api/w/<slug>` (name only, role `admin`, audited) and a
+    Rename action on the Workspace card.
+  - Done when: API and UI tests cover owner/admin allowed, member denied,
+    and the audit entry.

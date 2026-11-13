@@ -137,6 +137,11 @@ def painted(canvas):
 def test_home_lists_every_run(page, ui_server):
     home(page, ui_server)
     expect(page.get_by_role("button", name="Account", exact=True)).to_have_count(0)
+    # The local dashboard has no accounts: no Settings or Admin entries, and the host label stays.
+    for name in ("Settings", "Admin", "Keys", "Team"):
+        expect(page.get_by_role("link", name=name, exact=True)).to_have_count(0)
+    expect(page.locator("#host")).to_contain_text("local · ")
+    expect(page.locator(".breadcrumb")).to_have_text("agenticml / runs")
     expect(page.get_by_role("list", name="Workspaces", exact=True)).to_have_count(0)
     expect(page.locator(".run-row")).to_have_count(5)
     expect(page.locator(".poll-status")).to_have_text("5 runs")

@@ -3782,3 +3782,448 @@ pre,
     flex: none;
   }
 }
+
+/* Settings page (package 28): one page for account, workspace, people, keys
+   and activity. Cards stack in a column beside a section nav. */
+.settings-page {
+  max-width: 1152px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-5);
+  min-width: 0;
+}
+.settings-header {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.settings-header h1 {
+  font-size: 28px;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+}
+.settings-header p {
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--text-3);
+}
+.settings-layout {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  gap: 32px;
+  align-items: start;
+  min-width: 0;
+}
+.settings-nav {
+  position: sticky;
+  top: calc(var(--topbar-h) + var(--s-4));
+  min-width: 0;
+}
+.settings-nav > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.settings-nav a {
+  display: block;
+  box-sizing: border-box;
+  padding: 7px 10px;
+  border-radius: var(--r-sm);
+  font-size: var(--fs-md);
+  line-height: 1.45;
+  color: var(--text-2);
+  white-space: nowrap;
+  transition: background var(--dur) var(--ease);
+}
+.settings-nav a:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+.settings-nav a[aria-current] {
+  background: var(--surface-3);
+  color: var(--text);
+  font-weight: 500;
+}
+.settings-nav .settings-nav-admin {
+  position: relative;
+  margin-top: 10px;
+}
+.settings-nav .settings-nav-admin::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -6px;
+  border-top: 1px solid var(--border);
+}
+.settings-col {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  max-width: 960px;
+  min-width: 0;
+}
+.settings-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+  padding: 20px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  scroll-margin-top: calc(var(--topbar-h) + var(--s-4));
+}
+.settings-card .error,
+.settings-card .muted,
+.settings-card p {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.settings-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-3);
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.settings-head h2 {
+  font-size: var(--fs-lg);
+  font-weight: 600;
+  color: var(--text);
+}
+.settings-card h2:focus-visible {
+  outline-offset: 4px;
+  border-radius: var(--r-xs);
+}
+.settings-aside {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.settings-aside .runs-filter {
+  flex: 0 1 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  min-width: 0;
+}
+.settings-aside .runs-filter .field {
+  width: auto;
+  min-width: 0;
+  max-width: 100%;
+}
+.settings-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  min-width: 0;
+  padding-top: 14px;
+  border-top: 1px solid var(--hairline);
+}
+.settings-section > h3:not(.eyebrow) {
+  font-size: var(--fs-md);
+}
+.settings-meta {
+  font: 400 11.5px var(--font-mono-stack);
+  color: var(--text-3);
+  overflow-wrap: anywhere;
+}
+.settings-ws-name {
+  font-size: var(--fs-md);
+  font-weight: 500;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.settings-label {
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  color: var(--text-2);
+}
+.settings-note {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-3);
+}
+.settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  margin: 0;
+}
+.settings-row {
+  display: flex;
+  gap: var(--s-2);
+  flex-wrap: wrap;
+  align-items: center;
+  min-width: 0;
+}
+.settings-grow {
+  flex: 1 1 220px;
+  min-width: 0;
+  width: auto;
+}
+.settings-select {
+  flex: none;
+  width: 130px;
+}
+.settings-result {
+  padding: var(--s-3);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  gap: var(--s-2);
+}
+.settings-result code {
+  display: block;
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: var(--fs-sm) / 1.6 var(--font-mono-stack);
+}
+.settings-result .btn {
+  align-self: flex-start;
+}
+.settings-details {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface-2);
+}
+.settings-details > summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 32px;
+  padding: 4px 12px;
+  cursor: pointer;
+  font-size: var(--fs-md);
+  font-weight: 500;
+  color: var(--text-2);
+}
+.settings-details > summary {
+  list-style: none;
+}
+.settings-details > summary::-webkit-details-marker {
+  display: none;
+}
+/* Chevron: points right when closed, down when open. */
+.settings-details > summary::before {
+  content: "";
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform var(--dur) var(--ease);
+}
+.settings-details[open] > summary::before {
+  transform: rotate(45deg);
+}
+.settings-details > summary:hover {
+  color: var(--text);
+}
+.settings-details[open] > summary {
+  border-bottom: 1px solid var(--border);
+}
+.settings-details > :not(summary) {
+  margin: var(--s-3);
+}
+.settings-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.settings-rows li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+  min-height: 36px;
+  padding: 4px 0;
+  border-top: 1px solid var(--hairline);
+}
+.settings-rows li:first-child {
+  border-top: 0;
+}
+.settings-row-name {
+  flex: 1 1 140px;
+  min-width: 0;
+  font-size: var(--fs-md);
+  overflow-wrap: anywhere;
+}
+.settings-row-role {
+  font: 400 var(--fs-sm) var(--font-mono-stack);
+  color: var(--text-3);
+}
+.settings-row-slot {
+  display: inline-flex;
+  justify-content: flex-end;
+  min-width: 64px;
+}
+.settings-card .kv-list.identity {
+  gap: var(--s-3);
+  border: 0;
+  border-radius: 0;
+  background: none;
+  overflow: visible;
+}
+.settings-card .kv-list.identity > div {
+  padding: 10px 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  box-shadow: none;
+}
+.usage-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(190px, 100%), 1fr));
+  gap: var(--s-3);
+  margin: 0;
+  min-width: 0;
+}
+.usage-tiles > div {
+  min-width: 0;
+  padding: 10px 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+}
+.usage-tiles dt {
+  margin-bottom: 2px;
+  color: var(--text-3);
+  font-size: var(--fs-xs);
+}
+.usage-tiles dd {
+  margin: 0;
+  font: 500 var(--fs-sm) var(--font-mono-stack);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.usage-meter {
+  height: 4px;
+  margin-top: var(--s-2);
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+  overflow: hidden;
+}
+.usage-meter > span {
+  display: block;
+  height: 100%;
+  border-radius: var(--r-pill);
+  background: var(--accent);
+}
+.usage-meter.warn > span {
+  background: var(--warn);
+}
+.usage-meter.danger > span {
+  background: var(--danger);
+}
+.settings-card .table-scroll {
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+}
+@media (min-width: 600px) {
+  .settings-card .team-actions {
+    flex-wrap: nowrap;
+  }
+}
+.settings-card .keys-table tbody tr:last-child > td {
+  border-bottom: 0;
+}
+.settings-card .activity-toolbar {
+  margin: 0;
+}
+@media (max-width: 760px) {
+  .settings-page {
+    gap: var(--s-4);
+  }
+  .settings-layout {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--s-4);
+  }
+  .settings-nav {
+    position: static;
+    overflow-x: auto;
+    max-width: 100%;
+    padding: 6px;
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    background: var(--surface);
+  }
+  .settings-nav > div {
+    flex-direction: row;
+    gap: 6px;
+    width: max-content;
+  }
+  .settings-nav a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 36px;
+    padding: 0 12px;
+    border: 1px solid var(--border);
+  }
+  .settings-nav a[aria-current] {
+    border-color: var(--border-strong);
+  }
+  .settings-nav .settings-nav-admin {
+    margin: 0 0 0 6px;
+    border-style: dashed;
+    border-color: var(--border-strong);
+  }
+  .settings-nav .settings-nav-admin::before {
+    display: none;
+  }
+  .settings-card {
+    padding: var(--s-4);
+    scroll-margin-top: var(--s-4);
+  }
+  .settings-select {
+    width: 100%;
+  }
+  .settings-row > .btn-primary {
+    width: 100%;
+  }
+  .settings-grow {
+    flex-basis: 100%;
+  }
+  .settings-aside .runs-filter {
+    flex: 1 1 100%;
+  }
+}
+@media (max-width: 599px) {
+  .settings-card .table-scroll {
+    border: 0;
+    border-radius: 0;
+    overflow: visible;
+  }
+  .settings-card .keys-table td {
+    grid-template-columns: 92px minmax(0, 1fr);
+  }
+  .settings-card .keys-table .btn,
+  .settings-card .keys-table .team-actions {
+    width: 100%;
+  }
+  .settings-card .keys-table .team-actions {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
