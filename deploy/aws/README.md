@@ -152,6 +152,7 @@ gh variable set AWS_CFN_ROLE_ARN --env hosted --body "<CloudFormationRoleArn>"
 gh variable set AWS_REGION --env hosted --body "us-east-2"
 gh variable set HOSTED_MULTI_AZ --env hosted --body "false"
 gh variable set HOSTED_OPEN_SIGNUP --env hosted --body "false"
+gh variable set HOSTED_ADMIN_EMAILS --env hosted --body "you@example.com"
 ```
 
 Leave `HOSTED_FIREBASE_PROJECT` and `HOSTED_FIREBASE_API_KEY` unset until Firebase is
@@ -166,6 +167,7 @@ ready; the workflow passes unset variables to the template as empty strings.
 | `HOSTED_FIREBASE_PROJECT` | Firebase project ID (empty = Firebase off) | (empty) |
 | `HOSTED_FIREBASE_API_KEY` | Public Firebase web API key | (empty) |
 | `HOSTED_OPEN_SIGNUP` | `true` or `false` | `false` |
+| `HOSTED_ADMIN_EMAILS` | Comma-separated admin emails (no spaces; empty = none) | (empty) |
 
 `HOSTED_OPEN_SIGNUP=true` requires a non-empty `HOSTED_FIREBASE_PROJECT`;
 otherwise CloudFormation template assertions fail before any resource changes.
@@ -289,23 +291,56 @@ The hosted service uses its own Firebase project, `agenticml-hosted`
    (not the email-link option) and Google. Add `app.agenticml.xyz` to
    Authentication → Settings → Authorized domains. Register a web app
    (without Firebase Hosting) and note its `projectId` and `apiKey`.
-2. Set `HOSTED_FIREBASE_PROJECT` and `HOSTED_FIREBASE_API_KEY` in the GitHub
-   `hosted` environment variables. Keep `HOSTED_OPEN_SIGNUP=false`.
+2. Set `HOSTED_FIREBASE_PROJECT`, `HOSTED_FIREBASE_API_KEY`, and
+   `HOSTED_ADMIN_EMAILS` (comma-separated, no spaces; your Google email
+   address, e.g. `you@example.com`) in the GitHub `hosted` environment
+   variables. Keep `HOSTED_OPEN_SIGNUP=false`.
 3. Re-run the deploy workflow and approve it. The variables are read when the
    job runs, so re-running the latest deploy run picks them up.
 
-With Firebase on, `/login` serves the Firebase page; password sign-in on the
-web and `/setup` return 404. An account that has a password, such as the
-first admin from `/setup`, can then only be used through the server CLI. For
-web access, create an account named after the exact email of the Google
-account you sign in with, with no password, so that the first verified
-sign-in with that email links to it:
+### Self-serve administration and customer workspaces (main path)
 
-```sh
-agenticml server accounts add you@example.com --server-admin --data /data
-agenticml server users add you@example.com --role admin --workspace default \
-  --public-url https://app.agenticml.xyz --data /data
-```
+With Firebase on, `/login` serves the Firebase page; password sign-in on the
+web and `/setup` return 404.
+
+1. **Sign in as first admin**: Open `https://app.agenticml.xyz/login` and click
+   "Continue with Google". Because your email is in `HOSTED_ADMIN_EMAILS`, the
+   first verified sign-in creates your account if it has none (no workspace is
+   created for it) and grants server admin privileges (`source` is `list`). A
+   server admin with no workspace membership lands on `/workspaces` with an
+   Admin button and sees no customer workspace data.
+2. **Open `/admin`**: Click Admin or open `https://app.agenticml.xyz/admin/`.
+   The "Server admins" section lists all server administrators (login, grant
+   source, and sign-in state).
+   - **Add server admin**: Enter an email or login. If an email has no account,
+     a credential-less account is created; its first verified Firebase sign-in
+     links it with source `manual`.
+   - **Remove server admin**: Revoking on `/admin` takes effect immediately.
+     Refused for the last server admin who can sign in. If an email is still in
+     `HOSTED_ADMIN_EMAILS`, it will regain server admin at its next sign-in.
+   - **List removal vs `/admin` Remove**: Removing an email from
+     `HOSTED_ADMIN_EMAILS` revokes list-granted privileges at that person's next
+     sign-in (after the next deploy). Server admin granted on `/admin` or with
+     the CLI is kept.
+   - **Last admin guard**: The last server admin who can sign in is never removed (by the list,
+     `/admin`, or the CLI).
+3. **Customer workspaces**: In `/admin`, click "New workspace" and enter the
+   slug, name, and owner email (e.g. `alice@example.com`). If the owner has no
+   account yet, a credential-less account is created. At their first verified
+   Firebase sign-in (Google or email/password), the account is linked and they
+   land in the workspace as owner.
+4. **Invite team members**: The workspace owner invites team members from the
+   workspace **Team** page. An invite produces a one-time link (72 hours). The
+   person opens it and signs in with Google or email/password using that same
+   email, which must be verified. Inviting someone who already has an account
+   adds the membership directly (no link).
+5. **Issue sync keys**: A workspace admin creates sync keys on the workspace
+   **Keys** page for any member (the person must be a member, i.e. has redeemed
+   their invite or been added directly).
+6. **Multi-workspace accounts**: With Firebase on, there are no passwords to set;
+   adding an existing account to another workspace adds the membership
+   directly. (The order rule requiring a user to set their password before being
+   added to a second workspace applies to password sign-in only.)
 
 Firebase links accounts by uid, which differs per Firebase project, and there
 is no unlink command; do not switch projects once people have signed in.
@@ -317,8 +352,12 @@ workspace per account.
 
 ### First server administrator
 
-The server logs a one-time `/setup` link at startup while no administrator
-exists. Retrieve the link from CloudWatch:
+The `/setup` endpoint only exists with Firebase off. With Firebase on, `/setup`
+returns 404, and the first server admin comes from `HOSTED_ADMIN_EMAILS` (set the
+variable, deploy, and sign in with Google as described above).
+
+When running with Firebase off, the server logs a one-time `/setup` link at
+startup while no administrator exists. Retrieve the link from CloudWatch:
 
 ```sh
 aws logs filter-log-events \
@@ -343,16 +382,22 @@ Open the printed URL (`https://app.agenticml.xyz/setup?token=...`) in a browser:
 
 Server administration pages are located at `https://app.agenticml.xyz/admin/`.
 
-Break-glass alternative: if `/setup` is unreachable, open an ECS Exec shell
-(below) and create the admin account directly:
+Break-glass alternative: if `/setup` is unreachable (with Firebase off) or if
+granting server admin via ECS Exec is needed with Firebase on, open an ECS Exec
+shell (below) and run:
 
 ```sh
+# With Firebase on (linking on first verified sign-in):
+agenticml server accounts add you@example.com --server-admin --data /data
+
+# With Firebase off:
 agenticml server users add admin2 --role admin --workspace default \
   --public-url https://app.agenticml.xyz --data /data
 ```
 
-While `default` has no owner yet, this makes `admin2` its owner and a server
-admin, and prints a one-time invite link to set the password.
+While `default` has no owner yet, `users add admin2` makes `admin2` its owner and
+a server admin, and prints a one-time invite link to set the password.
+`agenticml server accounts list` shows a `source` column (`list`, `manual`, or `-`).
 
 ### Connecting via ECS Exec
 
@@ -409,7 +454,11 @@ no `ExecuteCommandConfiguration`; only CloudTrail records the `ExecuteCommand`
 call and its `--command` string). Never put secrets on `--command` strings and
 never pass passwords with `--stdin` there.
 
-### Customer workspaces and users
+### Customer workspaces and users (break-glass CLI)
+
+Creating customer workspaces on `/admin`, inviting members from the Team page,
+and issuing sync keys from the Keys page is the standard path. The CLI commands
+below remain available over ECS Exec as the break-glass path.
 
 All `users` and `keys` commands default to `--workspace default`, so always pass
 `--workspace <slug>` explicitly. All server commands require `--data /data`.
@@ -454,25 +503,18 @@ agenticml server users invite carol@example.com --workspace customer-two \
 agenticml server keys create --name training --scope sync --user carol@example.com --workspace customer-two --data /data
 ```
 
-**Order rule for multi-workspace accounts:**
-A person must open their invite link and set their password in the browser
-BEFORE being added to a second workspace. Once an account belongs to more than
-one workspace, redeeming an invite link is refused by the browser flow.
-If an account is added to a second workspace before setting a password, the
-operator must set it in an interactive shell:
-
-```sh
-agenticml server users set-password alice@example.com --workspace customer-one --data /data
-```
-
-This prompts for the new password via `getpass`. Running `users invite` on an
-account that already has a password resets it to NULL.
-
-After Alice has set her password, add her to `customer-two` as a member:
+**Multi-workspace accounts:**
+With Firebase on, there are no passwords to set. When an account belongs to more
+than one workspace, adding them to another workspace adds the membership
+directly:
 
 ```sh
 agenticml server users add alice@example.com --role member --workspace customer-two --data /data
 ```
+
+(The order rule requiring a person to open their invite link and set their
+password in the browser before being added to a second workspace applies to
+password sign-in only.)
 
 A server admin account sees a customer workspace only if explicitly added as a
 workspace member. The `/admin/` portal lists and creates workspaces across the
@@ -607,7 +649,7 @@ database schema and on-disk format. Otherwise roll forward, or restore a
 matched database, files, and object recovery point into an isolated stack before
 moving traffic. Never guess at downgrade compatibility.
 
-To make configuration changes (Multi-AZ, Firebase settings, or open sign-up):
+To make configuration changes (Multi-AZ, Firebase settings, open sign-up, or admin emails):
 1. Update the corresponding variable in the GitHub `hosted` environment.
 2. Re-run the deploy workflow with the currently deployed commit ref or SHA
    (this needs dispatch; until then, use "Re-run all jobs" on the last

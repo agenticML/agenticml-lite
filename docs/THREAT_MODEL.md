@@ -78,7 +78,7 @@ Trust boundaries define the isolation model across single-tenant and multi-tenan
 - **Threat**: An attacker presents a forged, expired, or tampered Firebase ID token to gain unauthorized access.
 - **Controls**:
   - **Cryptographic verification**: Tokens are verified locally using RS256 signature validation against Google's public keys. Expiry, issuer (`https://securetoken.google.com/<project>`), audience, and `auth_time` are validated.
-  - **Immutable UID linkage**: Server accounts are linked to the token's immutable Firebase `uid`, never by email address alone.
+  - **UID linkage**: The first link of a credential-less account (created by an admin, an invite, or the list) is by verified email; after that by Firebase uid.
   - **No token pass-through**: The client sends the Firebase token once to exchange it for an AgenticML session cookie. Subsequent requests rely on the server's own session management.
 
 ### 7. S3 object security
@@ -105,6 +105,17 @@ Trust boundaries define the isolation model across single-tenant and multi-tenan
   - **AWS Secrets Manager**: The PostgreSQL password is stored in Secrets Manager and injected directly into task environments as `PGPASSWORD`. The database URL does not contain credentials.
   - **No secrets in logs or diagnostics**: Database connection strings with passwords are never logged and never printed by `agenticml server status` or `verify`.
   - **One-way hashing**: API keys, session tokens, and invite tokens are stored exclusively as SHA-256 digests. Passwords use `scrypt`.
+
+### 10. Admin emails and server administrator provisioning
+
+- **Threat**: An attacker attempts to escalate privileges to server administrator through email spoofing, account takeover, or unauthorised list modification.
+- **Controls**:
+  - **Protected configuration**: The admin email list lives in the protected GitHub `hosted` environment (requiring manual reviewer approval) and the stack parameter (`AdminEmails` / `AGENTICML_SERVER_ADMIN_EMAILS`).
+  - **Verified email matching**: Only a Firebase-verified email address (Google OAuth or email/password with email verified) matches the list (compared case-insensitively). Unverified emails and untrusted identity providers are rejected.
+  - **No account takeover**: The list never takes over an account that has a password or another identity. Credential-less accounts created by the list receive no personal workspace.
+  - **Scoped revocation**: List removal revokes only list-granted rights, at the next sign-in (use `/admin` Remove to revoke at once). Rights granted on `/admin` or via the CLI are kept.
+  - **Last server admin guard**: The last server admin who can sign in (password, identity proxy or Firebase) is never removed by the list, web, or CLI; a pending admin that has never signed in does not count.
+  - **No ambient workspace access**: Server administrators see no workspace data without membership. An admin without workspace membership lands on `/workspaces` with an Admin button and cannot access customer runs, files, or objects.
 
 ## Out of scope
 

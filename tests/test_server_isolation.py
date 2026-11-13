@@ -92,6 +92,12 @@ EXAMPLES = {
         "method": "PATCH", "path": "/api/admin/workspaces/{slug}",
         "body": {"name": "Renamed"},
     },
+    "admin_server_admins_list": {"method": "GET", "path": "/api/admin/server-admins"},
+    "admin_server_admins_add": {
+        "method": "POST", "path": "/api/admin/server-admins",
+        "body": {"login": "isolation-admin@example.com"},
+    },
+    "admin_server_admins_remove": {"method": "DELETE", "path": "/api/admin/server-admins/{login}"},
     "admin_audit": {"method": "GET", "path": "/api/admin/audit"},
     "healthz": {"method": "GET", "path": "/healthz"},
     "login_get": {"method": "GET", "path": "/login"},

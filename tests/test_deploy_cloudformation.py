@@ -405,7 +405,7 @@ def test_hosted_template_fits_the_deploy_upload_limit():
 def test_hosted_parameters(hosted):
     params = hosted['Parameters']
     assert set(params) == {'ImageTag', 'Hostname', 'DesiredCount', 'MultiAZ', 'FirebaseProject',
-                           'FirebaseApiKey', 'OpenSignup', 'VpcCidr'}
+                           'FirebaseApiKey', 'OpenSignup', 'AdminEmails', 'VpcCidr'}
     assert 'Default' not in params['ImageTag']
     assert params['Hostname']['Default'] == 'app.agenticml.xyz'
     # Lean default (package 24.5): one task; rolling deploys still start the new one first.
@@ -415,6 +415,9 @@ def test_hosted_parameters(hosted):
     assert params['FirebaseProject']['Default'] == '' and params['FirebaseApiKey']['Default'] == ''
     assert params['OpenSignup']['Default'] == 'false'
     assert params['OpenSignup']['AllowedValues'] == ['true', 'false']
+    assert params['AdminEmails']['Default'] == ''
+    assert params['AdminEmails']['MaxLength'] == 2048
+    assert params['AdminEmails']['AllowedPattern'] == r'^\S*$'
     assert params['VpcCidr']['Default'] == '10.42.0.0/16'
     # No hosted zone, e-mail address or bucket name is a parameter.
     assert not {'HostedZoneId', 'AlarmEmail', 'ObjectsBucketName', 'LogsBucketName'} & set(params)
@@ -629,6 +632,7 @@ def test_hosted_trusted_proxy_is_the_alb_subnets_only(hosted):
         {'Fn::GetAtt': 'AlbSubnetA.CidrBlock'}, {'Fn::GetAtt': 'AlbSubnetB.CidrBlock'}]]}
     assert env['AGENTICML_SERVER_LIMITS'] == '/etc/agenticml/limits.json'
     assert env['AGENTICML_SERVER_OPEN_SIGNUP'] == {'Ref': 'OpenSignup'}
+    assert env['AGENTICML_SERVER_ADMIN_EMAILS'] == {'Ref': 'AdminEmails'}
     assert env['AGENTICML_SERVER_PUBLIC_URL'] == {'Fn::Sub': 'https://${Hostname}'}
     assert env['AGENTICML_SERVER_OBJECTS'] == {'Fn::Sub': 's3://${ObjectsBucket}/hosted'}
     assert env['AWS_REGION'] == {'Ref': 'AWS::Region'}
@@ -852,6 +856,14 @@ def test_deploy_workflow_run_blocks_take_values_from_env_only():
     assert blocks
     for block in blocks:
         assert '${{' not in block, block
+
+
+def test_deploy_workflow_passes_the_admin_emails_variable_as_a_parameter_override():
+    steps = load_workflow('deploy.yml')['jobs']['deploy']['steps']
+    (deploy,) = [s for s in steps if 'ADMIN_EMAILS' in s.get('env', {})]
+    assert deploy['env']['ADMIN_EMAILS'] == '${{ vars.HOSTED_ADMIN_EMAILS }}'
+    assert 'AdminEmails="$ADMIN_EMAILS"' in deploy['run']
+    assert '${{' not in deploy['run']
 
 
 def test_deploy_workflow_fails_early_on_missing_role_variables_and_prints_events():

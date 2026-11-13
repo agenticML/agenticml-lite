@@ -386,7 +386,8 @@ class WebAuth:
 
     def __init__(self, keys, public_url=None, clock=time.time, throttle_clock=time.time,
                  users=None, trusted_proxies=(), identity_header=None,
-                 firebase=None, cert_source=None, plans=None, open_signup=False):
+                 firebase=None, cert_source=None, plans=None, open_signup=False,
+                 admin_emails=frozenset()):
         self.keys = keys
         self.users = users if users is not None else UserStore(keys.server_dir, db=keys.db, workspace_id=keys.workspace_id or '0' * 32)
         self.public_url = public_url
@@ -401,6 +402,13 @@ class WebAuth:
         self.firebase = firebase
         self.cert_source = cert_source
         self.open_signup = bool(open_signup)
+        self.admin_emails = frozenset(
+            email.lower() for email in (admin_emails or ()) if isinstance(email, str) and email)
+        if self.admin_emails and self.firebase is None:
+            logger.warning("--admin-emails is ignored without --firebase-project")
+            self.admin_emails = frozenset()
+        if self.admin_emails:
+            logger.info("server admin emails configured: %d", len(self.admin_emails))
         if self.firebase is not None:
             from .firebase import FIREBASE_EXTRA, FIREBASE_IDENTITY, firebase_available
             if self.identity_header is not None:
@@ -1176,13 +1184,20 @@ class WebAuth:
             signed_up = False
             created_workspace = None
             unverified = False
+            listed = bool(
+                self.admin_emails and email_verified_for_link(claims) and claims.email
+                and claims.email.lower() in self.admin_emails)
+            admin_created = False
             if account is None:
                 with self.keys.db.transaction(write=True) as tx:
                     tx.cross_workspace("sign-up creation")
                     tx.advisory_lock("users")
                     account = self._firebase_find_or_claim(accounts, claims, tx)
                     plans = getattr(handler.server, "plans", None)
-                    if account is None and self.open_signup:
+                    if account is None and listed:
+                        account = self._firebase_admin_create(accounts, claims, tx)
+                        admin_created = account is not None
+                    elif account is None and self.open_signup:
                         if email_verified_for_link(claims) and claims.email:
                             account, created_workspace = self._firebase_open_signup(
                                 accounts, claims, tx, plans)
@@ -1218,12 +1233,22 @@ class WebAuth:
                     handler, "workspace.create", created_workspace["id"],
                     {"slug": created_workspace["slug"], "name": created_workspace["name"]},
                     actor=account["login"], via="signup")
+            if admin_created:
+                self._audit(handler, "account.create", account["login"],
+                            {"created_by": "admin-emails"},
+                            actor=account["login"], via="admin-emails")
+            admin_change = None
             with self.keys.db.transaction(write=True) as tx:
                 tx.advisory_lock("users")
                 accounts.refresh_firebase_email(
                     account["id"], claims.email, email_verified_for_link(claims), tx)
+                admin_change = self._apply_admin_list(accounts, account, listed, tx)
                 account = dict(tx.fetchone(
                     "SELECT * FROM accounts WHERE id=?", (account["id"],)))
+            if admin_change is not None:
+                self._audit(handler, "account.server_admin", account["login"],
+                            {"enabled": admin_change, "source": "admin-emails"},
+                            actor=account["login"], via="admin-emails")
             self._between_verify_and_session(account)
             cookie, entry = self._session_cookie_for(
                 account["login"], "firebase",
@@ -1283,6 +1308,38 @@ class WebAuth:
         accounts.link_firebase(account["id"], claims.uid, claims.email, True, tx)
         account = accounts.by_firebase_uid(claims.uid, tx) or accounts.get(claims.email, tx)
         return account, self._create_signup_workspace(account, claims, tx, plans)
+
+    def _firebase_admin_create(self, accounts, claims, tx):
+        """Create the account of a listed, verified email; no workspace."""
+        if accounts.get(claims.email, tx) is not None:
+            return None
+        display = claims.name if isinstance(claims.name, str) and claims.name.strip() else (
+            claims.email.split("@", 1)[0] or "workspace")
+        account = accounts.create(claims.email, display, "admin-emails", tx)
+        accounts.link_firebase(account["id"], claims.uid, claims.email, True, tx)
+        return accounts.by_firebase_uid(claims.uid, tx) or accounts.get(claims.email, tx)
+
+    def _apply_admin_list(self, accounts, account, listed, tx):
+        """Grant or revoke list-sourced server admin; return the new state or None."""
+        from .db.workspaces import LastServerAdminError
+
+        row = tx.fetchone(
+            "SELECT login, server_admin, server_admin_source FROM accounts WHERE id=?",
+            (account["id"],))
+        if row is None:
+            return None
+        if listed and not row["server_admin"]:
+            accounts.set_server_admin(row["login"], True, source="list", tx=tx)
+            return True
+        if not listed and row["server_admin"] and row["server_admin_source"] == "list":
+            try:
+                accounts.set_server_admin(row["login"], False, tx=tx)
+            except LastServerAdminError:
+                logger.warning(
+                    "kept server admin that left the admin email list: it is the last one")
+                return None
+            return False
+        return None
 
     def _signup_pending_key(self, account_id):
         return f"signup_pending:{account_id}"

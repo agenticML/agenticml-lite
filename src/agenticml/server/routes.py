@@ -100,6 +100,12 @@ _ROUTES.extend([
     _r("GET", r"/api/admin/workspaces", "server_admin", None, "admin_workspaces", "admin_workspaces_list"),
     _r("POST", r"/api/admin/workspaces", "server_admin", None, "admin_workspaces", "admin_workspaces_create"),
     _r("PATCH", r"/api/admin/workspaces/" + _SLUG, "server_admin", None, "admin_workspaces", "admin_workspaces_patch"),
+    _r("GET", r"/api/admin/server-admins", "server_admin", None,
+       "admin_server_admins", "admin_server_admins_list"),
+    _r("POST", r"/api/admin/server-admins", "server_admin", None,
+       "admin_server_admins", "admin_server_admins_add"),
+    _r("DELETE", r"/api/admin/server-admins/" + _LOGIN, "server_admin", None,
+       "admin_server_admins", "admin_server_admins_remove"),
     _r("GET", r"/api/admin/audit", "server_admin", None, "admin_audit", "admin_audit"),
 ])
 for sub, name, target in _RUN_SUBS:
@@ -484,8 +490,22 @@ def _server_audit(handler):
     return AuditLog(handler.server.data_dir / "server", db=handler.server.db, workspace_id=None)
 
 
+def _discard_pending_owner(handler, accounts, login):
+    """Remove an owner account this request created, if it is still unused."""
+    from .db import DatabaseError
+
+    try:
+        with handler.server.db.transaction(write=True) as tx:
+            tx.advisory_lock("users")
+            account = accounts.get(login, tx)
+            if account is not None and not accounts.can_sign_in(account):
+                accounts.discard_unreferenced(account["id"], account["login"], tx)
+    except (DatabaseError, OSError):
+        logger.warning("could not remove the unused owner account after a failed workspace create")
+
+
 def _admin_workspaces(webauth, handler, route, match):
-    from .db.workspaces import WorkspaceRepo
+    from .db.workspaces import AccountRepo, WorkspaceRepo, is_email_login
     from .keys import ClientError
     from .keyspage import read_json
     from .webauth import LOGIN_BODY_MAX
@@ -503,8 +523,23 @@ def _admin_workspaces(webauth, handler, route, match):
         if payload is None:
             return
         slug, name, owner = payload.get("slug"), payload.get("name"), payload.get("owner")
+        accounts = AccountRepo(handler.server.db)
+        owner_created = False
+        owner_login = owner
         try:
-            row = repo.create(slug, name, owner)
+            # One transaction: a refused workspace never leaves a new owner
+            # account behind. A new owner is created only for an email, and
+            # only when Firebase can later link it.
+            with handler.server.db.transaction(write=True) as tx:
+                tx.advisory_lock("users")
+                owner_created = (
+                    webauth.firebase is not None and is_email_login(owner)
+                    and accounts.get(owner, tx) is None)
+                row = repo.create(
+                    slug, name, owner, tx,
+                    create_owner=principal.user if owner_created else None)
+                owner_account = accounts.get(owner, tx)
+                owner_login = owner_account["login"] if owner_account else owner
         except ClientError as exc:
             handler._json({"error": str(exc)}, 400, webauth._headers())
             return
@@ -517,17 +552,23 @@ def _admin_workspaces(webauth, handler, route, match):
                 discard_store(handler.server.data_dir, row["id"])
             except ClientError:
                 pass
+            if owner_created:
+                _discard_pending_owner(handler, accounts, owner_login)
             handler._json({"error": "could not create workspace"}, 503, webauth._headers())
             return
         try:
-            _server_audit(handler).record(
-                principal.user, principal.via, "workspace.create", row["id"],
-                webauth.client_address(handler),
-                {"slug": row["slug"], "owner": owner, "name": row["name"]})
+            log = _server_audit(handler)
+            client = webauth.client_address(handler)
+            if owner_created:
+                log.record(principal.user, principal.via, "account.create", owner_login,
+                           client, {"pending": True})
+            log.record(principal.user, principal.via, "workspace.create", row["id"], client,
+                       {"slug": row["slug"], "owner": owner_login, "name": row["name"]})
         except Exception:
             pass
         handler._json({"workspace": _admin_public(
-            {**row, "members": 1}, _admin_usage_fields(handler, row))}, 201, webauth._headers())
+            {**row, "members": 1}, _admin_usage_fields(handler, row)),
+            "owner_created": owner_created}, 201, webauth._headers())
         return
     if handler.command == "PATCH":
         payload = read_json(handler, LOGIN_BODY_MAX)
@@ -607,6 +648,112 @@ def _admin_workspaces(webauth, handler, route, match):
         return
     handler.close_connection = True
     handler._json({"error": "method not allowed"}, 405, webauth._headers())
+
+
+_LIST_RETURN_NOTE = (
+    "An email still on the admin email list gets server admin back at its next sign-in.")
+
+
+def _server_admin_public(row):
+    from .db.workspaces import is_email_login
+
+    login = row["login"]
+    email = row.get("email") or (login if is_email_login(login) else None)
+    return {
+        "login": login,
+        "display_name": row.get("display_name") or login,
+        "email": email,
+        "source": "list" if row.get("server_admin_source") == "list" else "manual",
+        "signin": ("firebase" if row.get("firebase_uid") is not None
+                   else "identity" if row.get("identity") is not None
+                   else "password" if row.get("password") is not None else "pending"),
+        "firebase": row.get("firebase_uid") is not None,
+        "pending": (row.get("password") is None and row.get("identity") is None
+                    and row.get("firebase_uid") is None),
+        "created_at": row["created_at"],
+    }
+
+
+def _admin_server_admins(webauth, handler, route, match):
+    from .db.workspaces import AccountRepo, LastServerAdminError, is_email_login
+    from .keys import ClientError
+    from .keyspage import read_json
+    from .webauth import LOGIN_BODY_MAX
+
+    headers = webauth._headers()
+    accounts = AccountRepo(handler.server.db)
+    principal = handler.principal
+    if handler.command == "GET":
+        handler._json({"server_admins": [
+            _server_admin_public(row) for row in accounts.server_admins()]}, headers=headers)
+        return
+    if handler.command == "POST":
+        payload = read_json(handler, LOGIN_BODY_MAX)
+        if payload is None:
+            return
+        login = payload.get("login")
+        if not isinstance(login, str) or not login.strip() or len(login) > 254:
+            handler._json({"error": "invalid request"}, 400, headers)
+            return
+        login = login.strip()
+        created = False
+        try:
+            with handler.server.db.transaction(write=True) as tx:
+                tx.advisory_lock("users")
+                account = accounts.get(login, tx)
+                if account is None:
+                    if webauth.firebase is None or not is_email_login(login):
+                        raise ClientError("unknown account")
+                    account = accounts.create(login, None, principal.user, tx)
+                    created = True
+                row = accounts.set_server_admin(account["login"], True, source="manual", tx=tx)
+        except ClientError as exc:
+            message = str(exc)
+            handler._json({"error": message}, 404 if message == "unknown account" else 400,
+                          headers)
+            return
+        try:
+            log = _server_audit(handler)
+            client = webauth.client_address(handler)
+            if created:
+                log.record(principal.user, principal.via, "account.create", row["login"],
+                           client, {"pending": True})
+            log.record(principal.user, principal.via, "account.server_admin", row["login"],
+                       client, {"enabled": True, "source": "web"})
+        except Exception:
+            pass
+        handler._json({"server_admin": _server_admin_public(row), "account_created": created},
+                      201 if created else 200, headers)
+        return
+    if handler.command == "DELETE":
+        if not handler._csrf_ok():
+            handler.close_connection = True
+            handler._error({"error": "cross-site request refused"}, 403)
+            return
+        login = match.groupdict().get("name")
+        try:
+            with handler.server.db.transaction(write=True) as tx:
+                tx.advisory_lock("users")
+                account = accounts.get(login, tx)
+                if account is None or not account["server_admin"]:
+                    raise ClientError("unknown account")
+                row = accounts.set_server_admin(account["login"], False, tx=tx)
+        except LastServerAdminError as exc:
+            handler._json({"error": str(exc)}, 409, headers)
+            return
+        except ClientError as exc:
+            handler._json({"error": str(exc)}, 404, headers)
+            return
+        try:
+            _server_audit(handler).record(
+                principal.user, principal.via, "account.server_admin", row["login"],
+                webauth.client_address(handler), {"enabled": False, "source": "web"})
+        except Exception:
+            pass
+        handler._json({"removed": row["login"], "note": _LIST_RETURN_NOTE}, headers=headers)
+        return
+    handler.close_connection = True
+    handler._json({"error": "method not allowed"}, 405, headers)
 
 
 def _admin_audit(webauth, handler, route, match):
@@ -721,6 +868,7 @@ HANDLERS = {
     "home": _home,
     "workspaces_page": _workspaces_page,
     "admin_workspaces": _admin_workspaces,
+    "admin_server_admins": _admin_server_admins,
     "admin_audit": _admin_audit,
     "static_file": _static_file,
     "usage": _usage,

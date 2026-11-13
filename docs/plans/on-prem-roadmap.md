@@ -217,7 +217,7 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 24 | AWS hosted deployment (Dockerfile, Terraform, deploy workflow, runbook, real-EFS benchmark) | 18c, 19, 20, 21 | Codex, Sonnet; owner runs it | M | [plan](packages/24-aws-deployment.md) | done (code, 3.0 PR; owner checks in Backlog) |
 | 24.1 | Image: Dockerfile, entrypoint, limits file, local hosted smoke test | 21 | Codex, Sonnet | S | [plan](packages/24-aws-deployment.md) | done (3.0 PR) |
 | 24.2 | Terraform, deploy workflow, `deploy-check` CI job, runbook | 24.1 | Codex, Sonnet | M | [plan](packages/24-aws-deployment.md) | done (3.0 PR; `terraform validate` runs in CI) |
-| 24.3 | Apply, first deploy, restore drill, real-EFS benchmark, exit criterion 6 | 24.5 | Owner | S | [AWS roadmap](aws-deployment-roadmap.md) | in progress (AWS roadmap Phases 0–3 done Nov 12, 2026; Phase 4 steps 4.1, 4.2 and 4.2a done Nov 13: first admin through `/setup`, Firebase sign-in on with project `agenticml-hosted`; next: 4.2b, the owner's email admin account and first Google sign-in) |
+| 24.3 | Apply, first deploy, restore drill, real-EFS benchmark, exit criterion 6 | 24.5 | Owner | S | [AWS roadmap](aws-deployment-roadmap.md) | in progress (AWS roadmap Phases 0–3 done Nov 12, 2026; Phase 4 steps 4.1, 4.2 and 4.2a done Nov 13: first admin through `/setup`, Firebase sign-in on with project `agenticml-hosted`; next: package 24.7 so that admins need no ECS Exec, then 4.2b through it: the owner's email admin account and first Google sign-in) |
 | 24.4 † | CloudFormation replaces Terraform; Namecheap DNS; cost alerts | 24.2 | Sonnet; prose Antigravity | M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49); second review by the supervisor) |
 | 24.4a | `bootstrap.yaml`: ECR, OIDC, roles, certificate, alerts topic, budget, cost-step function | – | Sonnet | S–M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
 | 24.4b | `hosted.yaml` and its tests | 24.4a | Sonnet | M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
@@ -225,6 +225,11 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 24.4d | Runbook for CloudFormation (`deploy/aws/README.md`, `docs/HOSTED.md`) | 24.4c | Antigravity | S | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
 | 24.5 † | Lean hosted setup (~$60/month: one ARM64 task, `db.t4g.micro`, no Container Insights); deploys on pushes to `dev` | 24.4 | Supervisor; prose Antigravity | S | [plan](packages/24.5-lean-hosted.md) | done ([#52](https://github.com/agenticML/agenticml-lite/pull/52)) |
 | 24.6 | Phase 4 runbook fixes: first admin through `/setup`, workspace/invite order, ECS Exec checks, training-machine sync section; `whoami` prints the workspace | 24.5 | Sonnet; prose Antigravity | S | [plan](packages/24.6-phase-4-runbook.md) | done ([#55](https://github.com/agenticML/agenticml-lite/pull/55)) |
+| 24.7 † | Self-serve server admins: admin emails from the deploy config, server-admin management and workspace creation for new emails on `/admin`, Phase 4 through the web | 24.6 | Sonnet; prose Antigravity | M | [plan](packages/24.7-self-serve-admins.md) | done (PR to `dev`; second review by the supervisor; owner sign-in check after the deploy) |
+| 24.7a † | `--admin-emails` / `AGENTICML_SERVER_ADMIN_EMAILS`: a verified Firebase sign-in whose email is on the list gets an account if it has none and becomes server admin, with an audit entry; the list is ignored, with a startup warning, when Firebase is off | 24.6 | Sonnet | S–M | [plan](packages/24.7-self-serve-admins.md) | done (PR to `dev`) |
+| 24.7b † | `/admin` page: "Server admins" section (list server admins, add by email or login, remove; never remove the last admin who can sign in; audited); creating a workspace for an owner email with no account yet (linked on its first verified sign-in); API and UI tests, 375px | 24.7a | Sonnet | M | [plan](packages/24.7-self-serve-admins.md) | done (PR to `dev`) |
+| 24.7c | Deploy wiring: GitHub variable `HOSTED_ADMIN_EMAILS` → `deploy.yml` → `hosted.yaml` parameter → task environment; `cfn-lint` and template tests | 24.7a | Sonnet | S | [plan](packages/24.7-self-serve-admins.md) | done (PR to `dev`) |
+| 24.7d | Runbook and docs: steps 4.2b and 4.3 through the web; re-check the Team page and `users add` on the Firebase path (24.6 checked only passwords); `deploy/aws/README.md`, `docs/HOSTED.md`, `docs/SERVER.md`, threat model | 24.7c | Sonnet (checks); prose Antigravity | S | [plan](packages/24.7-self-serve-admins.md) | done (PR to `dev`) |
 | 25 | Docs, threat model, version 3.0.0 | 16–24 | Sonnet (Codex at limit); prose Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR; tag and PyPI release by the owner) |
 | 25.1 | Client support window (426), version 3.0.0, base-install smoke, 2.2 client check | 16–24 | Sonnet (Codex at limit) | S | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
 | 25.2 | SERVER.md, HOSTED.md, threat model, PROTOCOL.md, README, website, SECURITY.md | 25.1 | Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
@@ -259,7 +264,13 @@ Getting the hosted service live on AWS, step by step: [AWS deployment roadmap](a
 - **22** stores last/min/max/count per run and metric at ingest, so the
   runs list sorts and filters by metric without reading files.
 - **24** stands the service up in our AWS account (about $120/month for all
-  workspaces together; see the plan). **26** shuts down agenticml-server,
+  workspaces together; see the plan). **24.7** (owner, Nov 13, 2026) makes
+  running the hosted service self-serve: with Firebase on, `/setup` is
+  closed and server admin could only be granted with the server CLI over
+  ECS Exec. Emails listed in the deploy config become server admins on
+  their first verified sign-in, and server admins grant and revoke server
+  admin and create customer workspaces on `/admin`. ECS Exec stays as the
+  break-glass path. **26** shuts down agenticml-server,
   which has no customers, after 24 is live.
 
 ### Maintenance fixes
@@ -382,9 +393,10 @@ priority.
     stack, `hosted` environment, first deploy from `dev`, the Namecheap
     `app` CNAME, and `https://app.agenticml.xyz/healthz` returns 200. In
     Phase 4, ECS Exec works (4.1), the first admin exists (4.2) and Firebase
-    sign-in is on with project `agenticml-hosted` (4.2a). Next is 4.2b (the
-    owner's email admin account and first Google sign-in), then two
-    workspaces and a sync to each.
+    sign-in is on with project `agenticml-hosted` (4.2a). Next is package
+    24.7 (server admins and customer workspaces without ECS Exec), then
+    4.2b through it (the owner's email admin account and first Google
+    sign-in), then two workspaces and a sync to each.
   - Fix: follow `deploy/aws/README.md`: bootstrap stack (with the Namecheap
     validation record), GitHub environment `hosted` with the role
     variables, first deploy, the `app` CNAME,

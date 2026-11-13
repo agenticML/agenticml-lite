@@ -4648,7 +4648,11 @@ async function teamPage(version) {
   function showInvite(host, body, copyCode, data) {
     const value = el("code", { class: "key-value", text: data.invite_url });
     body.replaceChildren(
-      el("p", { text: "This invite link is shown once. They choose their own password." }),
+      el("p", {
+        text: serverSession?.auth === "firebase"
+          ? "This invite link is shown once. They sign in with Google or email and password, using this email; the email must be verified."
+          : "This invite link is shown once. They choose their own password.",
+      }),
       value, copyCode("Copy invite link", value),
       el("p", {
         class: "muted",
@@ -5065,7 +5069,11 @@ async function teamPage(version) {
       }
     }, "primary");
     body.append(
-      el("p", { text: "This signs them out and clears their password." }),
+      el("p", {
+        text: serverSession?.auth === "firebase"
+          ? "This signs them out and gives them a new sign-in link."
+          : "This signs them out and clears their password.",
+      }),
       el("div", { class: "inline" }, button("Cancel", () => host.close(), "secondary"), confirm));
     host.showModal();
     body.querySelector("button").focus();
@@ -5111,8 +5119,11 @@ async function adminPage(version) {
   crumb.setAttribute("href", "/admin/");
   crumb.textContent = "agenticml / admin";
   const content = el("div", { class: "table-scroll" });
+  const admins = el("div", { class: "table-scroll" });
   const activity = el("div", { class: "table-scroll" });
+  const notice = el("p", { class: "muted", role: "status", "aria-live": "polite", hidden: true });
   const columns = ["Slug", "Name", "Status", "Plan", "Storage", "Uploads today", "People", "Members", "Created", "Actions"];
+  const adminColumns = ["Login", "Source", "Sign-in", "Actions"];
   const activityColumns = ["Time", "Actor", "Action", "Target", "Client"];
 
   async function write(url, method, payload) {
@@ -5297,6 +5308,123 @@ async function adminPage(version) {
     name.focus();
   }
 
+  function say(text) {
+    notice.textContent = text || "";
+    notice.hidden = !text;
+  }
+
+  // After an action succeeded its dialog is closed: report a failed reload on the page.
+  async function refreshAfterAction() {
+    try {
+      await refresh();
+    } catch (reason) {
+      if (epoch === version && !disposed) showError(content, reason);
+    }
+  }
+
+  function addServerAdmin() {
+    const { host, body, error } = dialog("Add server admin");
+    const login = el("input", {
+      id: "new-admin-login", class: "field", required: true, maxLength: 254,
+      autocomplete: "off",
+    });
+    const save = el("button", { type: "submit", class: "btn btn-primary", text: "Add" });
+    const form = el("form", { class: "stack" },
+      el("label", { class: "field-label", htmlFor: login.id, text: "Email or login" }), login,
+      el("p", {
+        class: "muted",
+        text: serverSession?.auth === "firebase"
+          ? "If no account exists for this email, one is created; it is linked when they first sign in."
+          : "The account must already exist.",
+      }),
+      save);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      error.hidden = true;
+      save.disabled = true;
+      let data;
+      try {
+        data = await write(api("/admin/server-admins"), "POST", { login: login.value.trim() });
+      } catch (reason) {
+        failure(error, reason);
+        if (reason.name !== "AbortError") save.disabled = false;
+        return;
+      }
+      host.close();
+      say(data?.account_created
+        ? `Created an account for ${data.server_admin?.login} and made it a server admin; it is linked when they first sign in.`
+        : `${data?.server_admin?.login} is now a server admin.`);
+      await refreshAfterAction();
+    });
+    body.append(form);
+    host.showModal();
+    login.focus();
+  }
+
+  function removeServerAdmin(admin) {
+    const { host, body, error } = dialog(`Remove ${admin.login}?`);
+    const confirm = button("Remove", async () => {
+      error.hidden = true;
+      confirm.disabled = true;
+      let data;
+      try {
+        data = await write(
+          `${api("/admin/server-admins")}/${encodeURIComponent(admin.login)}`, "DELETE");
+      } catch (reason) {
+        failure(error, reason);
+        if (reason.name !== "AbortError") confirm.disabled = false;
+        return;
+      }
+      host.close();
+      if (admin.login === serverSession?.user) {
+        // The page can no longer load: this account is not a server admin now.
+        dispose();
+        location.assign("/workspaces");
+        return;
+      }
+      say(`${data?.removed ?? admin.login} is no longer a server admin.`);
+      await refreshAfterAction();
+    }, "primary");
+    body.append(
+      el("p", {
+        text: "They lose server admin on their next request. An email still on the admin email list gets it back at its next sign-in.",
+      }),
+      el("div", { class: "inline" }, button("Cancel", () => host.close(), "secondary"), confirm));
+    host.showModal();
+    body.querySelector("button")?.focus();
+  }
+
+  function signinCell(admin) {
+    switch (admin.signin) {
+      case "firebase": return "Firebase";
+      case "identity": return "Identity proxy";
+      case "password": return "Password";
+      default: return chip("pending", "warn");
+    }
+  }
+
+  function renderServerAdmins(rows) {
+    if (!rows.length) {
+      admins.replaceChildren(el("p", { class: "muted", text: "No server admins." }));
+      return;
+    }
+    const lines = rows.map((admin) => {
+      const values = [
+        admin.login,
+        chip(admin.source === "list" ? "list" : "manual", admin.source === "list" ? "ok" : ""),
+        signinCell(admin),
+        el("div", { class: "team-actions" },
+          button("Remove", () => removeServerAdmin(admin), "secondary")),
+      ];
+      return el("tr", { role: "row" }, ...values.map((value, index) =>
+        el("td", { role: "cell", "data-label": adminColumns[index] }, value)));
+    });
+    admins.replaceChildren(el("table", { class: "keys-table", role: "table", "aria-label": "Server admins" },
+      el("thead", { role: "rowgroup" }, el("tr", { role: "row" },
+        ...adminColumns.map((text) => el("th", { role: "columnheader", scope: "col", text })))),
+      el("tbody", { role: "rowgroup" }, ...lines)));
+  }
+
   function createWorkspace() {
     const { host, body, error } = dialog("New workspace");
     const slug = el("input", {
@@ -5316,16 +5444,23 @@ async function adminPage(version) {
       el("label", { class: "field-label", htmlFor: slug.id, text: "Slug" }), slug,
       el("label", { class: "field-label", htmlFor: name.id, text: "Name" }), name,
       el("label", { class: "field-label", htmlFor: owner.id, text: "Owner login" }), owner,
+      el("p", {
+        class: "muted",
+        text: "If no account exists for this email, one is created; it is linked when they first sign in.",
+      }),
       save);
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       error.hidden = true;
       save.disabled = true;
       try {
-        await write(api("/admin/workspaces"), "POST", {
+        const data = await write(api("/admin/workspaces"), "POST", {
           slug: slug.value.trim(), name: name.value.trim(), owner: owner.value.trim(),
         });
         host.close();
+        say(data?.owner_created
+          ? `Created an account for ${owner.value.trim().toLowerCase()}; it is linked when they first sign in.`
+          : "");
         await refresh();
       } catch (reason) {
         failure(error, reason);
@@ -5359,14 +5494,15 @@ async function adminPage(version) {
 
   async function refresh() {
     const sequence = ++refreshSequence;
-    const [listResponse, auditResponse] = await Promise.all([
+    const [listResponse, auditResponse, adminsResponse] = await Promise.all([
       fetch(api("/admin/workspaces"), { signal, credentials: "same-origin" }),
       fetch(`${api("/admin/audit")}?${new URLSearchParams({ limit: "200" })}`, {
         signal, credentials: "same-origin",
       }),
+      fetch(api("/admin/server-admins"), { signal, credentials: "same-origin" }),
     ]);
     if (epoch !== version || sequence !== refreshSequence || disposed) return;
-    if (listResponse.status === 401 || auditResponse.status === 401) {
+    if (listResponse.status === 401 || auditResponse.status === 401 || adminsResponse.status === 401) {
       dispose();
       location.assign("/login");
       return;
@@ -5410,6 +5546,15 @@ async function adminPage(version) {
       el("thead", { role: "rowgroup" }, el("tr", { role: "row" },
         ...columns.map((text) => el("th", { role: "columnheader", scope: "col", text })))),
       el("tbody", { role: "rowgroup" }, ...rows)));
+    const adminData = await adminsResponse.json().catch(() => null);
+    if (epoch !== version || sequence !== refreshSequence || disposed) return;
+    if (adminsResponse.ok && Array.isArray(adminData?.server_admins) &&
+        adminData.server_admins.every((row) => row !== null && typeof row === "object" &&
+          typeof row.login === "string"))
+      renderServerAdmins(adminData.server_admins);
+    else showError(admins, new Error(
+      (typeof adminData?.error === "string" && adminData.error) ||
+      `Could not load server admins (${adminsResponse.status})`));
     if (auditResponse.ok) {
       const audit = await auditResponse.json().catch(() => null);
       if (epoch !== version || sequence !== refreshSequence || disposed) return;
@@ -5430,7 +5575,13 @@ async function adminPage(version) {
       el("div", { class: "inline" },
         el("a", { class: "btn btn-ghost btn-sm", href: "/workspaces", text: "Workspaces" }),
         createButton)),
+    notice,
     content,
+    el("div", { class: "stack" },
+      el("div", { class: "heading" },
+        el("h2", { text: "Server admins" }),
+        button("Add server admin", addServerAdmin, "primary")),
+      admins),
     el("div", { class: "stack" },
       el("div", { class: "heading" }, el("h2", { text: "Activity" })),
       activity)));
