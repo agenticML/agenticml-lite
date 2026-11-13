@@ -133,8 +133,13 @@ Recommended by the supervisor and approved by the owner on Nov 7, 2026
 - **D9 Accounts and sign-in.** An account is global and the same account
   can be in many workspaces. The hosted service signs people in with
   **Firebase**, as agenticml-server does (Google and email/password, with
-  Firebase handling password resets and email verification); reuse
-  agenticml-server's Firebase project, which has no customers. Self-hosted
+  Firebase handling password resets and email verification). Changed Nov
+  13, 2026 (owner): the hosted service uses its own Firebase project,
+  `agenticml-hosted`, which the owner administers, instead of reusing
+  agenticml-server's `agenticml-auth` (no access to it). Nothing in the code
+  names a project; it is the `HOSTED_FIREBASE_PROJECT` deploy variable.
+  Accounts link by Firebase uid, which differs per project and has no unlink
+  command, so do not switch projects once people have signed in. Self-hosted
   servers keep 2.2 sign-in, because an open-source install must not depend
   on our Firebase project; Firebase is an option a self-hoster can turn on
   with their own project. Server admin is a separate flag on the account,

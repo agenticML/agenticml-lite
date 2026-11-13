@@ -217,7 +217,7 @@ after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live.
 | 24 | AWS hosted deployment (Dockerfile, Terraform, deploy workflow, runbook, real-EFS benchmark) | 18c, 19, 20, 21 | Codex, Sonnet; owner runs it | M | [plan](packages/24-aws-deployment.md) | done (code, 3.0 PR; owner checks in Backlog) |
 | 24.1 | Image: Dockerfile, entrypoint, limits file, local hosted smoke test | 21 | Codex, Sonnet | S | [plan](packages/24-aws-deployment.md) | done (3.0 PR) |
 | 24.2 | Terraform, deploy workflow, `deploy-check` CI job, runbook | 24.1 | Codex, Sonnet | M | [plan](packages/24-aws-deployment.md) | done (3.0 PR; `terraform validate` runs in CI) |
-| 24.3 | Apply, first deploy, restore drill, real-EFS benchmark, exit criterion 6 | 24.5 | Owner | S | [AWS roadmap](aws-deployment-roadmap.md) | in progress (AWS roadmap Phases 0–3 done Nov 12, 2026: stack deployed from `dev`, `https://app.agenticml.xyz/healthz` 200; next: Phase 4 accounts, with the runbook from 24.6) |
+| 24.3 | Apply, first deploy, restore drill, real-EFS benchmark, exit criterion 6 | 24.5 | Owner | S | [AWS roadmap](aws-deployment-roadmap.md) | in progress (AWS roadmap Phases 0–3 done Nov 12, 2026; Phase 4 steps 4.1, 4.2 and 4.2a done Nov 13: first admin through `/setup`, Firebase sign-in on with project `agenticml-hosted`; next: 4.2b, the owner's email admin account and first Google sign-in) |
 | 24.4 † | CloudFormation replaces Terraform; Namecheap DNS; cost alerts | 24.2 | Sonnet; prose Antigravity | M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49); second review by the supervisor) |
 | 24.4a | `bootstrap.yaml`: ECR, OIDC, roles, certificate, alerts topic, budget, cost-step function | – | Sonnet | S–M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
 | 24.4b | `hosted.yaml` and its tests | 24.4a | Sonnet | M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
@@ -378,11 +378,13 @@ priority.
     `scripts/hosted_smoke.sh` against local Postgres and moto, `cfn-lint`
     and template tests in CI) but never ran it in AWS: creating billed
     resources and a public endpoint is the owner's call.
-  - Progress (Nov 12, 2026): AWS roadmap Phases 0–3 are done: bootstrap
+  - Progress (Nov 13, 2026): AWS roadmap Phases 0–3 are done: bootstrap
     stack, `hosted` environment, first deploy from `dev`, the Namecheap
-    `app` CNAME, and `https://app.agenticml.xyz/healthz` returns 200. Next
-    is Phase 4 (first admin, two workspaces, a sync to each), with the
-    runbook checked in package 24.6.
+    `app` CNAME, and `https://app.agenticml.xyz/healthz` returns 200. In
+    Phase 4, ECS Exec works (4.1), the first admin exists (4.2) and Firebase
+    sign-in is on with project `agenticml-hosted` (4.2a). Next is 4.2b (the
+    owner's email admin account and first Google sign-in), then two
+    workspaces and a sync to each.
   - Fix: follow `deploy/aws/README.md`: bootstrap stack (with the Namecheap
     validation record), GitHub environment `hosted` with the role
     variables, first deploy, the `app` CNAME,
@@ -473,6 +475,10 @@ priority.
     authorized domains, sign in once with Google and once with email and
     password, accept one invite, and watch the browser console for CSP
     violations.
+  - Progress (Nov 13, 2026): the hosted service now runs with Firebase
+    project `agenticml-hosted` (not agenticml-server's). `/login` loads the
+    real SDK with no console or CSP errors. Real Google sign-in comes with
+    AWS roadmap step 4.2b, an invite with 4.3.
   - Done when: those steps pass, or each mismatch is fixed with a test.
 - **Firebase sign-in page test gaps** (package 18b.2 second review, Nov 8,
   2026).

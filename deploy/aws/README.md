@@ -282,10 +282,33 @@ the security group, triggering a name collision on the fixed group name.
 
 ## Accounts, Firebase and customers
 
-In Firebase, enable Google and email/password sign-in and add
-`app.agenticml.xyz` to Authentication's authorized domains. Configure
-`HOSTED_FIREBASE_PROJECT` and `HOSTED_FIREBASE_API_KEY` in the GitHub `hosted`
-environment variables and re-run the deploy workflow.
+The hosted service uses its own Firebase project, `agenticml-hosted`
+(administered by the owner), not agenticml-server's.
+
+1. In the Firebase console, open Authentication and enable Email/Password
+   (not the email-link option) and Google. Add `app.agenticml.xyz` to
+   Authentication → Settings → Authorized domains. Register a web app
+   (without Firebase Hosting) and note its `projectId` and `apiKey`.
+2. Set `HOSTED_FIREBASE_PROJECT` and `HOSTED_FIREBASE_API_KEY` in the GitHub
+   `hosted` environment variables. Keep `HOSTED_OPEN_SIGNUP=false`.
+3. Re-run the deploy workflow and approve it. The variables are read when the
+   job runs, so re-running the latest deploy run picks them up.
+
+With Firebase on, `/login` serves the Firebase page; password sign-in on the
+web and `/setup` return 404. An account that has a password, such as the
+first admin from `/setup`, can then only be used through the server CLI. For
+web access, create an account named after the exact email of the Google
+account you sign in with, with no password, so that the first verified
+sign-in with that email links to it:
+
+```sh
+agenticml server accounts add you@example.com --server-admin --data /data
+agenticml server users add you@example.com --role admin --workspace default \
+  --public-url https://app.agenticml.xyz --data /data
+```
+
+Firebase links accounts by uid, which differs per Firebase project, and there
+is no unlink command; do not switch projects once people have signed in.
 
 Verify actual Google and verified email/password sign-in, invite acceptance,
 and browser CSP before enabling open signup. The baked free limits are decimal
