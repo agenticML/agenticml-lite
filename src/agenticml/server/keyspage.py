@@ -8,9 +8,18 @@ from urllib.parse import parse_qs, urlsplit
 from agenticml.ui.server import _reject_nonfinite
 from .keys import ClientError, KeyNameTaken, KeyStoreUnavailable, LastAdminError, UserRequired, _NAME, validate_name
 from .db import DatabaseError
+from .db.workspaces import validate_login
 from .users import UserNotFound, allowed, resolve
 
 logger = logging.getLogger("agenticml.server.keyspage")
+
+
+def _login(user):
+    """Normalize a user login (email or key-style name); key names keep validate_name."""
+    try:
+        return validate_login(user)
+    except ClientError:
+        raise ClientError("invalid or reserved user name")
 
 
 def can_see(principal, record) -> bool:
@@ -128,7 +137,7 @@ def handle(webauth, handler, path):
             query = parse_qs(urlsplit(handler.path).query, keep_blank_values=True)
             user = query.get("user", [None])[0]
             if user is not None:
-                validate_name(user)
+                user = _login(user)
             records = sorted(keys.list(), key=lambda record: (
                 record.name == "env", record.created_at, record.name))
             counts = _run_counts(handler)
@@ -156,7 +165,7 @@ def handle(webauth, handler, path):
                 return
             env_default = principal.user == "env" and "user" not in payload
             if not env_default:
-                validate_name(user)
+                user = _login(user)
             try:
                 actor = principal.user
                 # The env user is not stored; fall through to the default-user rule.

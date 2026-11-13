@@ -5,7 +5,8 @@ import logging
 
 from .limits import LimitReached
 from .db import DatabaseError
-from .keys import ClientError, KeyStoreUnavailable, LastAdminError, _NAME, validate_name
+from .keys import ClientError, KeyStoreUnavailable, LastAdminError, validate_name
+from .db.workspaces import validate_login
 from .keyspage import command_host, read_json
 from .users import (
     CROSS_WORKSPACE_CREDENTIALS, IdentityTaken, ROLES, UserNameTaken, UserNotFound, allowed,
@@ -18,6 +19,14 @@ _SELF_INVITE = "you cannot re-invite yourself; change your password from the Acc
 def _user_name(name):
     try:
         validate_name(name)
+    except ClientError:
+        raise ClientError("invalid or reserved user name")
+
+
+def _login(name):
+    """Normalize a login (email or key-style name) from a path or payload."""
+    try:
+        return validate_login(name)
     except ClientError:
         raise ClientError("invalid or reserved user name")
 
@@ -140,8 +149,7 @@ def handle(webauth, handler, path, *, show_owner=False):
                     handler.close_connection = True
                     handler._json({"error": "method not allowed"}, 405)
                     return
-                if not _NAME.fullmatch(name) or name in (".", ".."):
-                    raise ClientError("invalid or reserved user name")
+                name = _login(name)
                 payload = read_json(handler, LOGIN_BODY_MAX)
                 if payload is None:
                     return
@@ -169,9 +177,7 @@ def handle(webauth, handler, path, *, show_owner=False):
                     "expires_at": expires_at,
                 })
                 return
-            name = rest
-            if not _NAME.fullmatch(name) or name in (".", ".."):
-                raise ClientError("invalid or reserved user name")
+            name = _login(rest)
             if handler.command == "PATCH":
                 payload = read_json(handler, LOGIN_BODY_MAX)
                 if payload is None:

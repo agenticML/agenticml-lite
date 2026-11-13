@@ -14,7 +14,7 @@ pytest.importorskip("playwright.sync_api")
 from playwright.sync_api import expect
 
 from test_server_dashboard import (
-    assert_no_overflow, browser, context, page, server_ui, sign_in,
+    assert_no_overflow, browser, context, open_settings, page, server_ui, sign_in,
 )
 
 pytestmark = [pytest.mark.browser, pytest.mark.ui]
@@ -38,8 +38,8 @@ def fresh_server(tmp_path, monkeypatch, request):
 
 def open_keys(page, server):
     sign_in(page, server, server["admin"])
-    page.get_by_role("link", name="Keys", exact=True).click()
-    expect(page.get_by_role("heading", name="Keys", exact=True)).to_be_visible()
+    open_settings(page, "keys")
+    expect(page.get_by_role("heading", name="API keys", exact=True)).to_be_visible()
     expect(page.get_by_role("table", name="Keys", exact=True)).to_be_visible()
 
 
@@ -247,7 +247,7 @@ def test_copy_fallback_selects_text_and_announces_feedback(page, server_ui, clip
 def test_closing_key_dialog_preserves_outside_selection(page, server_ui):
     open_keys(page, server_ui)
     dialog, value = create_key(page, "worker")
-    page.get_by_role("heading", name="Keys", exact=True).evaluate("""node => {
+    page.get_by_role("heading", name="API keys", exact=True).evaluate("""node => {
         const range = document.createRange();
         range.selectNodeContents(node);
         const selection = window.getSelection();
@@ -255,11 +255,11 @@ def test_closing_key_dialog_preserves_outside_selection(page, server_ui):
         selection.addRange(range);
     }""")
     assert page.evaluate("window.getSelection().rangeCount") == 1
-    assert page.evaluate("window.getSelection().getRangeAt(0).toString()") == "Keys"
+    assert page.evaluate("window.getSelection().getRangeAt(0).toString()") == "API keys"
     dialog.evaluate("node => node.close()")
     assert_key_cleared(page, value)
     assert page.evaluate("window.getSelection().rangeCount") == 1
-    assert page.evaluate("window.getSelection().toString()") == "Keys"
+    assert page.evaluate("window.getSelection().toString()") == "API keys"
 
 
 def test_revoke_own_admin_signs_out(page, server_ui):
@@ -356,7 +356,7 @@ def test_keys_no_overflow_and_dialog_focus_on_narrow_screens(page, server_ui, wi
         assert table.locator("thead").bounding_box()["width"] <= 1
         expect(table).to_have_css("display", "block")
         expect(table.locator("td").first).to_have_css("display", "grid")
-        assert page.locator(".table-scroll").evaluate("node => node.scrollWidth <= node.clientWidth")
+        assert page.locator("#settings-keys .table-scroll").evaluate("node => node.scrollWidth <= node.clientWidth")
     else:
         expect(table).to_have_css("display", "table")
         expect(table.locator("thead")).to_have_css("display", "table-header-group")
@@ -521,7 +521,7 @@ def test_unusable_key_responses_show_readable_status(page, server_ui, method, st
     if method == "GET":
         page.locator(".breadcrumb").click()
         expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
-        page.get_by_role("link", name="Keys", exact=True).click()
+        open_settings(page, "keys")
         expect(page.get_by_role("alert")).to_have_text(f"Could not load keys ({status})")
         expect(page.locator(".key-value")).to_have_count(0)
         expect(page.locator(".key-command")).to_have_count(0)
@@ -647,8 +647,10 @@ def test_route_change_clears_secret_and_ignores_late_response(page, server_ui, s
             }) : original(url, options);
         };
     }""", status)
-    page.get_by_role("link", name="Keys", exact=True).click()
-    expect(page.get_by_role("heading", name="Keys", exact=True)).to_be_visible()
+    page.get_by_role("link", name="Settings", exact=True).click()
+    page.get_by_role("navigation", name="Settings", exact=True).get_by_role(
+        "link", name="API keys", exact=True).click()
+    expect(page.get_by_role("heading", name="API keys", exact=True)).to_be_visible()
     page.wait_for_function("() => typeof window.resolveKeys === 'function'")
     page.locator(".breadcrumb").click()
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
@@ -666,9 +668,9 @@ def test_route_change_clears_secret_and_ignores_late_response(page, server_ui, s
 def test_keys_401_redirects_to_login(page, context, server_ui):
     page.allow_http_errors = True
     sign_in(page, server_ui, server_ui["admin"])
-    expect(page.get_by_role("link", name="Keys", exact=True)).to_be_visible()
+    expect(page.get_by_role("link", name="Settings", exact=True)).to_be_visible()
     context.clear_cookies()
-    page.get_by_role("link", name="Keys", exact=True).click()
+    page.get_by_role("link", name="Settings", exact=True).click()
     expect(page).to_have_url(f"{server_ui['url']}/login")
 
 
@@ -698,10 +700,11 @@ def test_keys_failure_removes_navigation_listeners(page, server_ui, failure):
     track_keys_listeners(page)
     # A 204 keeps the current document available for checking disposal before navigation.
     page.route("**/login", lambda route: route.fulfill(status=204))
+    # The owner's Settings page mounts the keys and the team sections: two listeners each.
     if failure == "request-401":
-        page.get_by_role("link", name="Keys", exact=True).click()
+        open_settings(page, "keys")
         expect(page.get_by_role("table", name="Keys", exact=True)).to_be_visible()
-        assert page.evaluate("Object.values(window.keysListeners).every(listeners => listeners.size === 1)")
+        assert page.evaluate("Object.values(window.keysListeners).every(listeners => listeners.size === 2)")
         page.route("**/api/w/default/keys", lambda route: route.fulfill(status=401, json={}))
         page.get_by_role("button", name="New key", exact=True).click()
         dialog = page.get_by_role("dialog", name="New key", exact=True)
@@ -714,26 +717,34 @@ def test_keys_failure_removes_navigation_listeners(page, server_ui, failure):
             status=401 if failure == "refresh-401" else 200, json={}))
         if failure == "refresh-401":
             with page.expect_request(f"{server_ui['url']}/login"):
-                page.get_by_role("link", name="Keys", exact=True).click()
+                page.get_by_role("link", name="Settings", exact=True).click()
         else:
-            page.get_by_role("link", name="Keys", exact=True).click()
+            open_settings(page, "keys")
             expect(page.get_by_text("Could not load keys (200)", exact=True)).to_be_visible()
-    assert page.evaluate("window.keysListenerAdds") == 2
+    assert page.evaluate("window.keysListenerAdds") == 4
+    if failure != "bad-body":
+        # The keys section disposed itself; only the team section's listeners remain.
+        assert page.evaluate("Object.values(window.keysListeners).every(listeners => listeners.size === 1)")
+    # Leaving Settings removes every listener, however the keys section ended.
+    page.locator(".breadcrumb").click()
+    expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
     assert page.evaluate("Object.values(window.keysListeners).every(listeners => listeners.size === 0)")
 
 
-def test_local_ui_hides_keys_and_falls_back_to_runs(page, tmp_path, ui_server_factory):
+def test_local_ui_hides_settings_and_falls_back_to_runs(page, tmp_path, ui_server_factory):
     page.allow_http_errors = True
     with ui_server_factory(tmp_path / "local") as server:
         page.goto(server.url)
         expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
-        expect(page.locator("#nav-keys")).to_be_hidden()
+        for hidden in ("#nav-settings", "#nav-admin", "#account"):
+            expect(page.locator(hidden)).to_be_hidden()
         track_keys_listeners(page)
-        page.goto(f"{server.url}/#/keys")
-        expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
-        expect(page.locator("#nav-keys")).to_be_hidden()
-        assert page.evaluate("window.keysListenerAdds") == 2
-        assert page.evaluate("Object.values(window.keysListeners).every(listeners => listeners.size === 0)")
+        for legacy in ("keys", "team", "settings/members"):
+            page.goto(f"{server.url}/#/{legacy}")
+            expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+            expect(page).to_have_url(f"{server.url}/#/")
+            expect(page.locator("#nav-settings")).to_be_hidden()
+            assert page.evaluate("window.keysListenerAdds") == 0
         page.goto(f"{server.url}/#/")
         expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
         assert page.evaluate("Object.values(window.keysListeners).every(listeners => listeners.size === 0)")

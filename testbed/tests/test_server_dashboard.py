@@ -106,6 +106,32 @@ def sign_in_password(page, server, user, password):
     page.locator("#password-login").get_by_role("button", name="Sign in", exact=True).click()
 
 
+SETTINGS_LABELS = {
+    "account": "Account", "workspace": "Workspace", "members": "Members",
+    "keys": "API keys", "activity": "Activity",
+}
+
+
+def settings_card(page, section):
+    return page.locator(f"#settings-{section}")
+
+
+def open_settings(page, section="account"):
+    """Open Settings from the top bar, then the section from its nav; return the card."""
+    if "#/settings" not in page.url:
+        page.get_by_role("link", name="Settings", exact=True).click()
+    expect(page.get_by_role("heading", name="Settings", exact=True)).to_be_visible()
+    if section != "account":
+        link = page.get_by_role("navigation", name="Settings", exact=True).get_by_role(
+            "link", name=SETTINGS_LABELS[section], exact=True)
+        link.click()
+        # The hashchange that selects the section arrives after the click returns.
+        expect(link).to_have_attribute("aria-current", "true")
+    card = settings_card(page, section)
+    expect(card).to_be_visible()
+    return card
+
+
 def test_login_sync_key_refused_admin_shows_run(page, server_ui):
     page.allow_http_errors = True
     sign_in(page, server_ui, server_ui["sync"])
@@ -328,16 +354,24 @@ def test_workspace_switcher_changes_runs_and_sets_cookie(page, context, tmp_path
         expect(page.get_by_text("Signed in as admin · owner")).to_be_visible()
         expect(page.get_by_role("link", name="default-only", exact=True)).to_be_visible()
         expect(page.get_by_role("link", name="alpha-only", exact=True)).to_have_count(0)
-        page.get_by_role("button", name="Account", exact=True).click()
-        dialog = page.get_by_role("dialog", name="Account", exact=True)
-        expect(dialog.get_by_role("button", name="Current workspace: Default")).to_be_visible()
-        expect(dialog.get_by_role("button", name="Current workspace: Default")).to_contain_text("owner")
-        expect(dialog.get_by_role("button", name="Switch to Team A")).to_be_visible()
-        expect(dialog.get_by_role("button", name="Switch to Team A")).to_contain_text("owner")
-        expect(dialog.get_by_role("link", name="Admin", exact=True)).to_be_visible()
+        expect(page.get_by_role("button", name="Account", exact=True)).to_be_hidden()
+        card = open_settings(page)
+        workspaces = card.get_by_role("list", name="Workspaces", exact=True)
+        current = workspaces.get_by_role("listitem").filter(has_text="Default")
+        expect(current.get_by_text("current", exact=True)).to_be_visible()
+        expect(current).to_contain_text("owner")
+        expect(current.get_by_role("button")).to_have_count(0)
+        other = workspaces.get_by_role("listitem").filter(has_text="Team A")
+        expect(other.get_by_role("button", name="Switch to Team A")).to_be_visible()
+        expect(other).to_contain_text("owner")
+        # The Admin link is in the top bar and the Settings nav, not in the card.
+        expect(page.get_by_role("link", name="Admin", exact=True)).to_be_visible()
+        expect(page.get_by_role("navigation", name="Settings", exact=True).get_by_role(
+            "link", name="Server admin ↗")).to_be_visible()
+        expect(card.get_by_role("link", name="Admin", exact=True)).to_have_count(0)
         page.set_viewport_size({"width": 375, "height": 812})
         assert_no_overflow(page)
-        dialog.get_by_role("button", name="Switch to Team A").click()
+        other.get_by_role("button", name="Switch to Team A").click()
         expect(page).to_have_url(re.compile(r"/w/team-a/"))
         expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
         expect(page.get_by_role("link", name="alpha-only", exact=True)).to_be_visible()
@@ -348,9 +382,9 @@ def test_workspace_switcher_changes_runs_and_sets_cookie(page, context, tmp_path
         assert cookies["aml_ws"]["sameSite"] == "Lax"
         assert cookies["aml_ws"].get("secure") in (False, None)
         assert_no_overflow(page)
-        page.get_by_role("button", name="Account", exact=True).click()
-        switched = page.get_by_role("dialog", name="Account", exact=True)
-        expect(switched.get_by_role("button", name="Current workspace: Team A")).to_be_visible()
+        switched = open_settings(page).get_by_role("list", name="Workspaces", exact=True)
+        expect(switched.get_by_role("listitem").filter(has_text="Team A").get_by_text(
+            "current", exact=True)).to_be_visible()
         expect(switched.get_by_role("button", name="Switch to Default")).to_be_visible()
         assert_no_overflow(page)
     finally:
