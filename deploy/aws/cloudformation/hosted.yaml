@@ -44,6 +44,12 @@ Parameters:
     MaxLength: 2048
     AllowedPattern: ^\S*$
     Description: Comma-separated sign-in emails of server administrators, without spaces; empty means none. Needs Firebase sign-in.
+  LegalBaseUrl:
+    Type: String
+    Default: ""
+    MaxLength: 512
+    AllowedPattern: ^(https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[^\s?#]*)?)?$
+    Description: https:// base URL of the Terms, Acceptable use and Privacy pages linked from the sign-in page; empty shows no links. Needs Firebase sign-in.
   VpcCidr:
     Type: String
     Default: 10.42.0.0/16
@@ -727,6 +733,8 @@ Resources:
               Value: !Ref OpenSignup
             - Name: AGENTICML_SERVER_ADMIN_EMAILS
               Value: !Ref AdminEmails
+            - Name: AGENTICML_SERVER_LEGAL_BASE_URL
+              Value: !Ref LegalBaseUrl
             - Name: AGENTICML_SERVER_LIMITS
               Value: /etc/agenticml/limits.json
             - Name: AGENTICML_SERVER_TRUSTED_PROXY

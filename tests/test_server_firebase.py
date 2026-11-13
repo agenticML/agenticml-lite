@@ -859,6 +859,68 @@ def test_firebase_config_route(tmp_path, monkeypatch):
         assert json.loads(got_post[2]) == json.loads(unknown_post[2])
 
 
+LEGAL_URLS = {
+    'terms': 'https://docs.example.org/legal/terms/',
+    'acceptable_use': 'https://docs.example.org/legal/acceptable-use/',
+    'privacy': 'https://docs.example.org/legal/privacy/',
+}
+
+
+@pytest.mark.parametrize('base', ['https://docs.example.org/legal', 'https://docs.example.org/legal/'])
+def test_firebase_config_has_legal_urls_only_when_set(tmp_path, monkeypatch, base):
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    with firebase_running(tmp_path / 'on', legal_base_url=base) as httpd:
+        status, _, body = call(httpd, '/auth/firebase/config')
+        assert status == 200
+        assert json.loads(body) == {
+            'projectId': PROJECT, 'apiKey': 'test-api-key-1',
+            'authDomain': f'{PROJECT}.firebaseapp.com', 'legal': LEGAL_URLS}
+    for unset in (None, ''):
+        with firebase_running(tmp_path / f'off-{unset!r}', legal_base_url=unset) as httpd:
+            assert 'legal' not in json.loads(call(httpd, '/auth/firebase/config')[2])
+
+
+@pytest.mark.parametrize('base', [
+    'http://docs.example.org/legal/', 'ftp://docs.example.org/', 'docs.example.org/legal/',
+    'javascript:alert(1)', '//docs.example.org/legal/', 'https://', 'https:///legal/',
+    'https://docs.example.org/legal/?x=1', 'https://docs.example.org/legal/#a',
+    'https://user:pw@docs.example.org/legal/', 'https://docs.example.org/le gal/',
+    'https://:443/', 'https://docs.example.org:abc/legal/'])
+def test_legal_base_url_must_be_https(tmp_path, monkeypatch, capsys, base):
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    with pytest.raises(ValueError, match='--legal-base-url'):
+        make_server(tmp_path / 'data', port=0, firebase=FIREBASE_CFG, cert_source=_source(),
+                    legal_base_url=base)
+    assert cli.main(['server', 'serve', '--data', str(tmp_path / 'cli'), '--port', '0',
+                     '--firebase-project', PROJECT, '--firebase-api-key', 'k',
+                     '--legal-base-url', base]) == 1
+    assert '--legal-base-url' in capsys.readouterr().err
+
+
+def test_cli_legal_base_url_flag_env_and_default(tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr('agenticml.server.serve', lambda *a, **kw: seen.update(kw))
+    monkeypatch.delenv('AGENTICML_SERVER_LEGAL_BASE_URL', raising=False)
+    argv = ['server', 'serve', '--data', str(tmp_path), '--port', '0']
+    assert cli.main(argv) == 0
+    assert 'legal_base_url' not in seen
+    monkeypatch.setenv('AGENTICML_SERVER_LEGAL_BASE_URL', '')
+    assert cli.main(argv) == 0
+    assert 'legal_base_url' not in seen
+    monkeypatch.setenv('AGENTICML_SERVER_LEGAL_BASE_URL', 'https://env.example.org/legal')
+    assert cli.main(argv) == 0
+    assert seen['legal_base_url'] == 'https://env.example.org/legal/'
+    assert cli.main(argv + ['--legal-base-url', 'https://flag.example.org/p/']) == 0
+    assert seen['legal_base_url'] == 'https://flag.example.org/p/'
+
+
+def test_legal_base_url_is_ignored_without_firebase(tmp_path, monkeypatch, caplog):
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    with running(tmp_path / 'nofb', legal_base_url='https://docs.example.org/legal/') as httpd:
+        assert httpd.web.legal_base_url is None
+    assert '--legal-base-url is ignored without --firebase-project' in caplog.text
+
+
 _FIREBASE_JS = (
     '/static/firebase-login.js',
     '/static/vendor/firebase/firebase-app-compat.js',

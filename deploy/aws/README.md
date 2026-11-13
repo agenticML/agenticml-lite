@@ -168,6 +168,7 @@ ready; the workflow passes unset variables to the template as empty strings.
 | `HOSTED_FIREBASE_API_KEY` | Public Firebase web API key | (empty) |
 | `HOSTED_OPEN_SIGNUP` | `true` or `false` | `false` |
 | `HOSTED_ADMIN_EMAILS` | Comma-separated admin emails (no spaces; empty = none) | (empty) |
+| `HOSTED_LEGAL_BASE_URL` | `https://` base URL of the policy pages (`terms/`, `acceptable-use/`, `privacy/` under it); the sign-in page links to them. Set it only after the policies are published; empty = no links. A value with a query, fragment or credentials is rejected at deploy; the server also refuses to start on a bad value | (empty) |
 
 `HOSTED_OPEN_SIGNUP=true` requires a non-empty `HOSTED_FIREBASE_PROJECT`;
 otherwise CloudFormation template assertions fail before any resource changes.
@@ -650,7 +651,7 @@ database schema and on-disk format. Otherwise roll forward, or restore a
 matched database, files, and object recovery point into an isolated stack before
 moving traffic. Never guess at downgrade compatibility.
 
-To make configuration changes (Multi-AZ, Firebase settings, open sign-up, or admin emails):
+To make configuration changes (Multi-AZ, Firebase settings, open sign-up, admin emails, or the policy base URL):
 1. Update the corresponding variable in the GitHub `hosted` environment.
 2. Re-run the deploy workflow with the currently deployed commit ref or SHA
    (this needs dispatch; until then, use "Re-run all jobs" on the last

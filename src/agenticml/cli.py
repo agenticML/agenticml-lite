@@ -546,6 +546,19 @@ def _admin_emails_from_args(args):
     return frozenset(emails)
 
 
+def _legal_base_url_from_args(args):
+    """Policy base URL from ``--legal-base-url`` or the environment (flag wins).
+
+    Empty means unset. Anything but an https:// URL raises ValueError.
+    """
+    from .server.webauth import normalize_legal_base_url
+
+    raw = getattr(args, "legal_base_url", None)
+    if raw is None:
+        raw = os.environ.get("AGENTICML_SERVER_LEGAL_BASE_URL", "")
+    return normalize_legal_base_url(raw)
+
+
 def cmd_server_serve(args):
     from .server import serve
     from .server.db.errors import DatabaseError
@@ -579,6 +592,9 @@ def cmd_server_serve(args):
         admin_emails = _admin_emails_from_args(args)
         if admin_emails:
             extra["admin_emails"] = admin_emails
+        legal_base_url = _legal_base_url_from_args(args)
+        if legal_base_url:
+            extra["legal_base_url"] = legal_base_url
         min_client = args.min_client_version
         if min_client is None:
             min_client = os.environ.get("AGENTICML_SERVER_MIN_CLIENT_VERSION") or None
@@ -1762,6 +1778,10 @@ def main(argv=None):
     p_serve.add_argument("--admin-emails", default=None, metavar="LIST",
                         help="Comma-separated emails that become server admins at their next verified "
                              "Firebase sign-in (default: AGENTICML_SERVER_ADMIN_EMAILS)")
+    p_serve.add_argument("--legal-base-url", default=None, metavar="URL",
+                         help="https:// base URL of the Terms, Acceptable use and Privacy pages "
+                              "linked from the Firebase sign-in page; unset shows no links "
+                              "(default: AGENTICML_SERVER_LEGAL_BASE_URL)")
     p_serve.add_argument("--min-client-version", default=None, metavar="X.Y",
                          help="Reject agenticml-lite clients older than this on /v2 "
                               "(default: AGENTICML_SERVER_MIN_CLIENT_VERSION or 2.2)")
