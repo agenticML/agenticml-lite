@@ -450,7 +450,7 @@ def test_email_admin_creates_key_and_changes_role(page, firebase_ui):
         "name": httpd.web._cookie_name(), "value": token, "url": firebase_ui["url"]}])
     page.goto(firebase_ui["url"])
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
-    page.get_by_role("link", name="Keys", exact=True).click()
+    open_settings(page, "keys")
     expect(page.get_by_role("table", name="Keys", exact=True)).to_be_visible()
     page.get_by_role("button", name="New key", exact=True).click()
     dialog = page.get_by_role("dialog", name="New key", exact=True)
@@ -461,8 +461,7 @@ def test_email_admin_creates_key_and_changes_role(page, firebase_ui):
     dialog.get_by_role("button", name="Close", exact=True).click()
     assert [(key.name, key.user) for key in httpd.keys.list() if key.name == "laptop"] == [
         ("laptop", "boss@example.com")]
-    page.get_by_role("link", name="Team", exact=True).click()
-    expect(page.get_by_role("heading", name="Team", exact=True)).to_be_visible()
+    open_settings(page, "members")
     row = page.get_by_role("row").filter(has_text="bob@example.com")
     with page.expect_response(lambda r: r.request.method == "PATCH") as patched:
         row.get_by_label("Role for bob@example.com", exact=True).select_option("viewer")
