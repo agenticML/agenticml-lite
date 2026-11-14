@@ -77,8 +77,8 @@ Header (like agenticml-server): eyebrow `Workspace · <workspace name>`,
 `<h1>Settings</h1>`, subtitle "Your account, this workspace's people and
 its API keys." Then a two-column layout: a section nav
 (`<nav aria-label="Settings">`, links to `#/settings/<section>`, only the
-sections the role can open, plus for server admins a separated
-"Server admin" link to `/admin/`) and a column of cards
+sections the role can open; server admins reach `/admin/` from the
+top-bar Admin link only, see package 28.1) and a column of cards
 (`<section class="settings-card" aria-labelledby=…>` each with an `h2`).
 
 Sections and who sees them (from `workspaceCan`, unchanged):
