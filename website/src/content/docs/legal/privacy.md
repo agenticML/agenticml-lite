@@ -69,7 +69,7 @@ We host and operate the service using the following third-party service provider
 ## 6. Data Retention and Backups
 
 - **Active data:** Your experiment data is retained for as long as your workspace remains active.
-- **Deletion:** When a workspace is deleted, its database records, EFS run files, and S3 objects are deleted. If removing S3 objects fails, the failure is logged and the operator retries the cleanup. Copies in backups and old S3 versions age out within 35 days. A record of the deletion is written to the server audit log.
+- **Deletion:** When a workspace is deleted, its database records, EFS run files, and S3 objects are deleted. If removing S3 objects fails, the failure is logged. [[OWNER: confirm how failed storage cleanup is handled]] Copies in backups and old S3 versions age out within 35 days. A record of the deletion is written to the server audit log.
 - **Backups:**
   - Automated RDS PostgreSQL snapshots with 7-day Point-in-Time Recovery (PITR) and daily AWS Backup retained for up to 35 days.
   - Amazon EFS daily AWS Backup retained for up to 35 days.
@@ -94,4 +94,4 @@ We may update this Privacy Policy from time to time. When changes are made, we w
 ## 10. Contact Us
 
 - **Privacy inquiries and deletion requests:** Email [[OWNER: contact address]].
-- **General technical support:** Submit an issue on GitHub Issues at [agenticML/agenticml-lite/issues](https://github.com/agenticML/agenticml-lite/issues).
+- **General technical support:** Submit an issue on GitHub Issues at [agenticML/agenticml-lite/issues](https://github.com/agenticML/agenticml-lite/issues). For the hosted service, put "hosted" in the title.

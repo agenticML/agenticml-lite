@@ -15,7 +15,7 @@ Within each workspace, members hold one of four roles:
 
 | Role | Permissions |
 | --- | --- |
-| `owner` | Workspace creator. Full admin permissions. Cannot be removed or demoted. Can delete workspace or transfer ownership. |
+| `owner` | Workspace creator. Full admin permissions. Cannot be removed or demoted. The server operator can transfer ownership with `agenticml server workspaces set-owner`. |
 | `admin` | Full workspace administration: manage members, invite users, issue/revoke any member's keys, edit notes, sync runs. |
 | `member` | Sync runs (`/v2`), edit run notes, and create/revoke own sync keys. |
 | `viewer` | Read-only dashboard access. Cannot sync (sync keys can only call `GET /v2/whoami`). |
@@ -69,7 +69,7 @@ The environment key is named `env`, held in memory only, and bound to the `defau
 
 ### In the dashboard
 
-1. In the sidebar, select **Keys**.
+1. In the top bar, open **Settings**, then **API keys**.
 2. Click **New key**, enter a name (e.g. `gpu-worker-1`), and select the scope (`sync` is default).
 3. Copy the key value immediately; keys are hashed with SHA-256 and cannot be displayed again.
 4. To revoke a key, click **Revoke**. Revocation takes effect immediately across all server processes.

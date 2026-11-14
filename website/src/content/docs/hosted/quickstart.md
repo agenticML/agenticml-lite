@@ -27,13 +27,13 @@ Your first verified sign-in creates a free personal workspace and makes you its 
 
 A training machine uploads with a sync key.
 
-1. In the dashboard, open **Keys**.
+1. Open **Settings** in the top bar, then **API keys**. A member, admin or owner sees this section. A viewer does not.
 2. Click **New key**.
 3. Enter a name for the machine, such as `gpu-box-1`. Use letters, digits, `.`, `_` and `-`, up to 64 characters.
 4. Leave **Scope** as `sync`.
 5. Click **Create**.
 
-The key is shown once and cannot be recovered. Copy it now. The dialog also shows a ready-made login command that has the key in it. Do not use that command: it puts the key in your shell history and in the process list. Use the next steps instead.
+The key is shown once and cannot be recovered. Copy it now. The dialog also shows a login command with the key in it. Do not use that command: it puts the key in your shell history and in the process list. Use the next steps instead.
 
 ## 4. Install the client
 
@@ -103,9 +103,9 @@ Open `https://app.agenticml.xyz/w/<slug>/` with your slug. Your runs are listed 
 
 **HTTP 426, "this server needs agenticml-lite >= 2.2".** The client is too old. The message suggests `pip install -U agenticml-lite`, but that installs 1.0.0 today. Install 3.0 from GitHub as in step 4.
 
-**"invalid API key" on login.** The key was copied wrongly, was revoked, or belongs to another server. Make a new key on the **Keys** page.
+**"invalid API key" on login.** The key was copied wrongly, was revoked, or belongs to another server. Make a new key under **Settings > API keys**.
 
-**"API key rejected — run agenticml login" during sync.** The key was revoked or removed. A one-shot `agenticml sync` exits with status 1. `agenticml sync --follow` exits with status 3. Make a new key and run `agenticml login --host https://app.agenticml.xyz` again.
+**"API key rejected — run `agenticml login`" during sync.** The key was revoked or removed. A one-shot `agenticml sync` exits with status 1. `agenticml sync --follow` exits with status 3. Make a new key and run `agenticml login --host https://app.agenticml.xyz` again.
 
 **HTTP 403.** Read the message after the status code:
 

@@ -60,7 +60,7 @@ You agree to comply with our [Acceptable Use Policy](/agenticml-lite/legal/accep
 ## 7. Account and Workspace Deletion
 
 - **Deletion upon request:** You may request complete deletion of your account and workspaces at any time by sending a request to [[OWNER: contact address]].
-- **Data removal:** Deleting a workspace deletes its database records, experiment run files on Amazon EFS, and objects in Amazon S3. If removing S3 objects fails, the failure is logged and the operator retries the cleanup. Copies in backups and in old S3 versions age out within 35 days. A record of the deletion is written to the server audit log.
+- **Data removal:** Deleting a workspace deletes its database records, experiment run files on Amazon EFS, and objects in Amazon S3. If removing S3 objects fails, the failure is logged. [[OWNER: confirm how failed storage cleanup is handled]] Copies in backups and in old S3 versions age out within 35 days. A record of the deletion is written to the server audit log.
 - **Backups:** Copies residing in automated backup archives age out according to our retention schedule (up to 35 days).
 
 ## 8. Suspension and Termination
@@ -83,5 +83,5 @@ We may update these Terms from time to time. When we do, we will update the "Las
 
 ## 12. Support and Contact
 
-- **Support:** Technical support during the public preview is provided on a best-effort basis via GitHub Issues at [agenticML/agenticml-lite/issues](https://github.com/agenticML/agenticml-lite/issues).
+- **Support:** Technical support during the public preview is provided on a best-effort basis via GitHub Issues at [agenticML/agenticml-lite/issues](https://github.com/agenticML/agenticml-lite/issues). For the hosted service, put "hosted" in the title.
 - **Legal and deletion requests:** Contact [[OWNER: contact address]].

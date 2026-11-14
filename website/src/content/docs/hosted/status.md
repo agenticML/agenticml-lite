@@ -23,7 +23,7 @@ The service runs one server task and one database in a single availability zone.
 ## What is live
 
 - **Nov 12, 2026:** first deploy. The service answers at `https://app.agenticml.xyz` with a valid certificate, and the health check above works.
-- **Nov 13, 2026:** sign-in with Google, or email and password, is on. Open sign-up is on: a verified sign-in with no account gets one free personal workspace. See [Sign-up](/agenticml-lite/hosted/#sign-up) for the current state.
+- **Nov 13, 2026:** sign-in with Google, or email and password, is on. See [Sign-up](/agenticml-lite/hosted/#sign-up) for the current sign-up state.
 
 ## In progress
 

@@ -243,9 +243,9 @@ Run directly:
 Or run as a systemd service: see [deploy/systemd/README.md](deploy/systemd/README.md) and [deploy/systemd/agenticml-server.service](deploy/systemd/agenticml-server.service).
 ```bash
 sudo useradd --system --home /var/lib/agenticml-server --shell /usr/sbin/nologin agenticml
-sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v3.0.0/deploy/systemd/agenticml-server.service
+sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/main/deploy/systemd/agenticml-server.service
 ```
-Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`). Edit `AGENTICML_SERVER_PUBLIC_URL` in the unit (or `sudo systemctl edit agenticml-server`), then `daemon-reload` and `enable --now`:
+The unit is fetched from `main` because there is no 3.0 tag yet. Once 3.0.0 is released, use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`). Edit `AGENTICML_SERVER_PUBLIC_URL` in the unit (or `sudo systemctl edit agenticml-server`), then `daemon-reload` and `enable --now`:
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now agenticml-server
@@ -283,7 +283,7 @@ agenticml server users add admin --role admin --data /var/lib/agenticml-server
 
 Every API key is bound to a specific workspace and owning account. On sync (`/v2`), the server identifies the workspace directly from the key.
 
-In the dashboard, open **Keys** → **New key**, name it (e.g. `gpu-box-1`), and copy the shown command.
+In the dashboard, open **Settings** > **API keys** > **New key**, name it (e.g. `gpu-box-1`), and copy the key (not the command).
 
 CLI alternative:
 ```bash

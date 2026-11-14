@@ -70,7 +70,7 @@ We reserve the right to investigate potential violations of this policy. If we i
 If you discover a security vulnerability, evidence of abuse, or a violation of this policy, please report it immediately:
 
 - **Abuse and security reports:** Email [[OWNER: contact address]].
-- **General technical issues:** File an issue on GitHub Issues at [agenticML/agenticml-lite/issues](https://github.com/agenticML/agenticml-lite/issues).
+- **General technical issues:** File an issue on GitHub Issues at [agenticML/agenticml-lite/issues](https://github.com/agenticML/agenticml-lite/issues). For the hosted service, put "hosted" in the title.
 
 ## 7. Changes to This Policy
 

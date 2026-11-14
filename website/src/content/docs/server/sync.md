@@ -93,7 +93,7 @@ mkdir -p ~/.config/systemd/user
 curl -fsSL -o ~/.config/systemd/user/agenticml-sync.service https://raw.githubusercontent.com/agenticML/agenticml-lite/main/deploy/systemd/agenticml-sync.service
 ```
 
-Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`).
+The unit file is the same for 2.2 and 3.0, so `main` works for either version.
 
 ```bash
 systemctl --user daemon-reload

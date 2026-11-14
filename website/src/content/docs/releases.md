@@ -53,7 +53,7 @@ pip install 'agenticml-lite[system] @ git+https://github.com/agenticML/agenticml
 - **Workspace switcher:** Switch between workspaces from the dashboard.
 - **Hosted service:** A service on AWS at `https://app.agenticml.xyz`. It is a public preview, run on a best-effort basis with no SLA. See the [hosted quickstart](/agenticml-lite/hosted/quickstart/).
 - **Firebase sign-in:** Sign in to the hosted service with Google or email and password.
-- **Self-serve sign-up:** Open sign-up is on as of Nov 13, 2026. A verified sign-in with no account gets one free personal workspace.
+- **Self-serve sign-up:** See [Sign-up](/agenticml-lite/hosted/#sign-up) for whether open sign-up is on.
 - **Free plan limits (as of Nov 13, 2026):** 5 GB storage, 2 GB uploads per UTC day, 600 requests per minute per workspace, 5 people (members plus pending invites), and 1 free workspace per account. Over the storage, daily upload or people limit the server answers 403. Over the request rate it answers 429 with `Retry-After`.
 - **Several server processes and S3 objects:** PostgreSQL deployments can run more than one server process. Content-addressed objects (code snapshots, media, copied artifacts) can be stored in Amazon S3. The hosted service uses both.
 - **Metric summaries:** The server keeps a summary of each metric series in the database, so the runs list can sort and filter by metric.
