@@ -59,26 +59,23 @@ Only the operator can delete a workspace. Once the Privacy policy is published, 
 
 ## Several workspaces from one machine
 
-All hosted workspaces share one address, `https://app.agenticml.xyz`. The client keeps one saved key per server address, and it keeps its sync progress per server address too. So two things go wrong if you use two workspaces from one machine with a plain `agenticml login`: the second login replaces the first key, and a run that was synced to one workspace counts as "up to date" for the other.
+All hosted workspaces share one address, `https://app.agenticml.xyz`. The client saves only one key per server address, so logging in for a second workspace replaces the first saved key. Provide the key using `AGENTICML_API_KEY` per shell or per command from your secret store.
 
-Until this is fixed in the client, use one data directory and one key per workspace. Set `AGENTICML_DIR` to a different folder for each workspace, and pass that workspace's key in `AGENTICML_API_KEY` from your secret store:
+Sync progress is tracked per server and workspace (`<host>/w/<slug>`). A single local store can sync the same run to multiple workspaces on the host without conflict. Sync each workspace with its own key:
 
 ```bash
 export AGENTICML_HOST=https://app.agenticml.xyz
 
-# workspace A
-AGENTICML_DIR=$HOME/agenticml-team-a AGENTICML_API_KEY="$TEAM_A_KEY" agenticml run train.py
-AGENTICML_DIR=$HOME/agenticml-team-a AGENTICML_API_KEY="$TEAM_A_KEY" agenticml sync --all
+# Train once in the local store
+agenticml run train.py
 
-# workspace B
-AGENTICML_DIR=$HOME/agenticml-team-b AGENTICML_API_KEY="$TEAM_B_KEY" agenticml run train.py
-AGENTICML_DIR=$HOME/agenticml-team-b AGENTICML_API_KEY="$TEAM_B_KEY" agenticml sync --all
+# Sync to workspace A
+AGENTICML_API_KEY="$TEAM_A_KEY" agenticml sync --all
+
+# Sync to workspace B
+AGENTICML_API_KEY="$TEAM_B_KEY" agenticml sync --all
 ```
 
-To send a run you already synced to one workspace to another, forget its saved progress first, then sync with the other workspace's key:
+To clear saved progress for a run, `agenticml sync RUN_ID --reset` forgets every cursor for this host across all workspaces. The next sync asks the server what it already has and uploads the rest.
 
-```bash
-agenticml sync RUN_ID --reset
-```
-
-`--reset` needs explicit run ids. The next sync asks the server what it already has and uploads the rest.
+Older clients (installed from `dev` before this change, or 2.x clients) keep only one cursor per server host. For older clients, use a separate `AGENTICML_DIR` per workspace, or run `agenticml sync RUN_ID --reset` before syncing with the second key.

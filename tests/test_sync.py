@@ -86,8 +86,16 @@ def command(remote, writer, *args, key=None):
                      "--dir", str(writer.root)])
 
 
+def state_key(url, workspace="default"):
+    """The sync.json key a 3.0 server's workspace gets (package 24.11)."""
+    return sync._state_key(url, workspace)
+
+
 def state(remote, writer):
-    return json.loads((writer.run_dir / "sync.json").read_bytes())["hosts"][remote[1].base_url]
+    hosts = json.loads((writer.run_dir / "sync.json").read_bytes())["hosts"]
+    names = sync._host_keys(hosts, remote[1].base_url)
+    assert len(names) == 1, names
+    return hosts[names[0]]
 
 
 def allowed(directory):
@@ -183,7 +191,7 @@ def test_finished_idle_makes_no_requests(remote, tmp_path, monkeypatch, capsys):
         pytest.fail("idle run made a request")
     monkeypatch.setattr(remote[1].session, "request", forbidden)
     assert push(remote, writer).status == "up to date"
-    assert sync._selected_ids(writer.root, remote[1].base_url, [], True) == []
+    assert sync._selected_ids(writer.root, remote[1].base_url, [], True, workspace="default") == []
     # cmd_sync still performs its one preflight request, before run selection.
 
 
@@ -330,7 +338,9 @@ def test_v1_entry_replaced_and_other_host_preserved(remote, tmp_path):
     path.write_text(json.dumps({"version": 1, "hosts": {remote[1].base_url: old, other: old}}))
     assert push(remote, writer).complete
     saved = json.loads(path.read_bytes())["hosts"]
-    assert saved[remote[1].base_url]["protocol"] == 2
+    assert saved[state_key(remote[1].base_url)]["protocol"] == 2
+    # A v1 entry is never adopted: it holds no protocol 2 cursor.
+    assert saved[remote[1].base_url] == old
     assert saved[other] == old
 
 
@@ -723,7 +733,7 @@ def test_append_mismatch_rewrites_once(remote, tmp_path):
         data = path.read_bytes()
         path.write_bytes(b"\x00" * 8 + data[8:])
         saved = json.loads((writer.run_dir / "sync.json").read_text())
-        host = remote[1].base_url
+        host = state_key(remote[1].base_url)
         saved["hosts"][host]["files"]["scalars/0.bin"]["size"] = 0
         saved["hosts"][host]["files"]["scalars/0.bin"]["tail"] = hashlib.sha256().hexdigest()
         (writer.run_dir / "sync.json").write_text(json.dumps(saved))
@@ -940,3 +950,180 @@ def test_permanent_failures_use_types_not_message_text():
     assert sync._permanent_failure(sync.OwnershipError(message))
     assert sync._permanent_failure(sync.PermanentSyncError("deterministic failure"))
     assert not sync._permanent_failure(ValueError(message))
+
+
+# Package 24.11: one sync cursor per host and workspace.
+
+def second_workspace(server, slug="beta", owner="beta-owner"):
+    """A second workspace on ``server`` and a sync key bound to it."""
+    from agenticml.server.db.workspaces import WorkspaceRepo
+    from agenticml.server.workspaces import prepare_store, store_root
+    server.users.add(owner, "admin")
+    workspace = WorkspaceRepo(server.db).create(slug, owner=owner)
+    prepare_store(server.data_dir, workspace["id"])
+    keys = KeyStore(server.data_dir / "server", db=server.db, workspace_id=workspace["id"])
+    _, key = keys.create("beta-box", "sync", user=owner)
+    return key, store_root(server.data_dir, workspace["id"])
+
+
+def hosts_of(writer):
+    return json.loads((writer.run_dir / "sync.json").read_bytes())["hosts"]
+
+
+def test_one_store_syncs_one_run_to_two_workspaces(remote, tmp_path):
+    server, client = remote
+    beta_key, beta_root = second_workspace(server)
+    writer = writer_at(tmp_path, rich=True)
+    assert command(remote, writer, writer.run_id) == 0
+    assert command(remote, writer, writer.run_id, key=beta_key) == 0
+    identical(remote, writer)
+    assert allowed(beta_root / "runs" / writer.run_id) == allowed(writer.run_dir)
+    hosts = hosts_of(writer)
+    assert set(hosts) == {state_key(client.base_url), state_key(client.base_url, "beta")}
+    assert all(entry["complete"] for entry in hosts.values())
+    # --all with either key finds nothing left to send.
+    for key in (client.api_key, beta_key):
+        with Client(client.base_url, key) as other:
+            identity = sync._identity(other)
+            assert sync._selected_ids(writer.root, client.base_url, [], True, key=identity["key"],
+                                      features=identity["features"], user=identity.get("user"),
+                                      workspace=identity["workspace"]) == []
+
+
+def legacy_entry(remote, writer):
+    """Rewrite sync.json as a pre-24.11 client left it: keyed by host only."""
+    path = writer.run_dir / "sync.json"
+    data = json.loads(path.read_bytes())
+    host = remote[1].base_url
+    data["hosts"] = {host: data["hosts"].pop(state_key(host))}
+    path.write_text(json.dumps(data))
+    return data["hosts"][host]
+
+
+def test_host_only_cursor_is_adopted_without_resending(remote, tmp_path, monkeypatch):
+    writer = writer_at(tmp_path)
+    assert push(remote, writer).complete
+    old = legacy_entry(remote, writer)
+    sent = []
+    original = Client.append
+    monkeypatch.setattr(Client, "append", lambda self, *args, **kwargs: (
+        sent.append(args), original(self, *args, **kwargs))[1])
+    result = push(remote, writer)
+    assert result.complete and sent == [] and result.bytes == 0
+    hosts = hosts_of(writer)
+    assert set(hosts) == {state_key(remote[1].base_url)}
+    assert hosts[state_key(remote[1].base_url)]["files"] == old["files"]
+    assert push(remote, writer).status == "up to date"
+
+
+def test_host_only_cursor_stays_when_run_is_not_in_workspace(remote, tmp_path):
+    server, client = remote
+    beta_key, beta_root = second_workspace(server)
+    writer = writer_at(tmp_path)
+    assert push(remote, writer).complete
+    old = legacy_entry(remote, writer)
+    assert command(remote, writer, writer.run_id, key=beta_key) == 0
+    assert allowed(beta_root / "runs" / writer.run_id) == allowed(writer.run_dir)
+    hosts = hosts_of(writer)
+    assert hosts[client.base_url] == old
+    assert hosts[state_key(client.base_url, "beta")]["complete"]
+    # The default workspace still adopts its own cursor later.
+    assert push(remote, writer).complete
+    assert set(hosts_of(writer)) == {state_key(client.base_url), state_key(client.base_url, "beta")}
+
+
+def test_host_only_cursor_of_another_user_is_not_adopted(remote, tmp_path):
+    server, client = remote
+    writer = writer_at(tmp_path)
+    server.users.add("mallory", "member")
+    _, other = server.keys.create("mallory-box", "sync", user="mallory")
+    with Client(client.base_url, other) as mallory:
+        assert push((server, mallory), writer).complete
+    legacy_entry(remote, writer)
+    before = (writer.run_dir / "sync.json").read_bytes()
+    server.users.add("alice", "member")
+    _, alice_key = server.keys.create("alice-box", "sync", user="alice")
+    with Client(client.base_url, alice_key) as alice:
+        result = sync.SyncResult(writer.run_id)
+        with pytest.raises(sync.OwnershipError):
+            sync.sync_run(RunReader(writer.root, writer.run_id), alice.base_url, alice, result)
+    assert (writer.run_dir / "sync.json").read_bytes() == before
+
+
+def test_reset_forgets_every_workspace_of_the_host(remote, tmp_path):
+    server, client = remote
+    beta_key, _ = second_workspace(server)
+    writer = writer_at(tmp_path)
+    other = "https://elsewhere.example.com"
+    assert command(remote, writer, writer.run_id) == 0
+    assert command(remote, writer, writer.run_id, key=beta_key) == 0
+    path = writer.run_dir / "sync.json"
+    data = json.loads(path.read_bytes())
+    data["hosts"][client.base_url] = dict(data["hosts"][state_key(client.base_url)])
+    data["hosts"][other] = {"protocol": 2, "files": {}}
+    path.write_text(json.dumps(data))
+    assert command(remote, writer, "--reset", writer.run_id) == 0
+    assert set(hosts_of(writer)) == {other}
+
+
+def test_server_without_workspaces_keeps_the_host_key(remote, tmp_path, monkeypatch):
+    original = Client.whoami
+
+    def old_server(self):
+        identity = dict(original(self))
+        identity.pop("workspace")
+        return identity
+
+    monkeypatch.setattr(Client, "whoami", old_server)
+    writer = writer_at(tmp_path)
+    assert push(remote, writer).complete
+    assert set(hosts_of(writer)) == {remote[1].base_url}
+    assert push(remote, writer).status == "up to date"
+
+
+def test_pruned_run_is_refused_for_another_workspace(remote, tmp_path):
+    server, client = remote
+    beta_key, beta_root = second_workspace(server)
+    writer = writer_at(tmp_path, count=OVERVIEW_MIN_POINTS + 1)
+    assert command(remote, writer, writer.run_id, "--prune") == 0
+    with Client(client.base_url, beta_key) as beta:
+        result = push((server, beta), writer)
+    assert result.failed and result.permanent
+    assert "full scalar history is no longer local" in result.status
+    assert state_key(client.base_url) in result.status
+    assert not (beta_root / "runs" / writer.run_id).exists()
+
+
+def test_dry_run_uses_the_only_cursor_of_the_host(remote, tmp_path, capsys):
+    writer = writer_at(tmp_path)
+    assert command(remote, writer, writer.run_id) == 0
+    capsys.readouterr()
+    assert command(remote, writer, writer.run_id, "--dry-run") == 0
+    assert "up to date" in capsys.readouterr().out
+
+
+def test_pruned_host_only_cursor_is_adopted_and_stays_up_to_date(remote, tmp_path):
+    writer = writer_at(tmp_path, count=OVERVIEW_MIN_POINTS + 1)
+    assert command(remote, writer, writer.run_id, "--prune") == 0
+    legacy_entry(remote, writer)
+    result = push(remote, writer)
+    assert result.complete and not result.failed
+    key = state_key(remote[1].base_url)
+    data = json.loads((writer.run_dir / "sync.json").read_bytes())
+    assert set(data["hosts"]) == {key} and data["hosts"][key]["pruned"]
+    assert key in data["pruned_hosts"]
+    assert push(remote, writer).status == "up to date"
+
+
+def test_all_selects_a_host_only_run_once_and_migrates_it(remote, tmp_path):
+    writer = writer_at(tmp_path)
+    assert push(remote, writer).complete
+    legacy_entry(remote, writer)
+    identity = sync._identity(remote[1])
+    selected = lambda: sync._selected_ids(  # noqa: E731
+        writer.root, remote[1].base_url, [], True, key=identity["key"],
+        features=identity["features"], user=identity.get("user"), workspace=identity["workspace"])
+    assert selected() == [writer.run_id]
+    assert command(remote, writer, "--all") == 0
+    assert set(hosts_of(writer)) == {state_key(remote[1].base_url)}
+    assert selected() == []

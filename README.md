@@ -176,7 +176,7 @@ The store root is `init(dir=...)`, else `AGENTICML_DIR`, else `~/.agenticml`. La
     meta.json                    project, config, status, summary, env, git
     events.jsonl                 config updates, code, artifacts, finish
     notes.md                     run note (Markdown, up to 256 KiB)
-    sync.json                    per-host upload cursor, after a sync
+    sync.json                    upload cursor per server and workspace, after a sync
     scalars/<id>.bin             8 bytes per point: uint32 step, float32 value
     scalars/<id>.ovw             overview, at finish, if the series has > 65536 points
     scalars/_time.bin            one record per scalar flush
@@ -214,7 +214,7 @@ agenticml sync RUN_ID --reset
 
 `login` checks the key (skip with `--no-verify`) and writes `~/.config/agenticml/credentials.json` at mode `0600`. The directory is `AGENTICML_CONFIG_DIR`, else `$XDG_CONFIG_HOME/agenticml`, else `~/.config/agenticml`. `AGENTICML_HOST` has no default; `login` requires `--host` unless a default host is already saved. Use the `agenticml login` prompt to enter the key, or `AGENTICML_API_KEY` for sync. Avoid command-line `--key` / `--api-key`: their values are visible in `ps`. `login` also accepts stdin. `sync` sends runs to an `agenticml server` over [protocol v2](docs/PROTOCOL.md). `sync` takes the key from `--api-key`, then `AGENTICML_API_KEY`, then the file. `whoami` uses `AGENTICML_API_KEY`, then the file. `whoami --offline` skips the server check. `logout` removes the saved key for one host. On `login`, `whoami`, and `sync`, `--insecure` allows `http://` to a non-local host; localhost does not need it.
 
-Sync copies each run's store files byte for byte (`meta.json`, `events.jsonl`, scalars, overviews, indexes) plus the objects they reference (code, media, copied artifacts) to an `agenticml server` over [protocol v2](docs/PROTOCOL.md). A per-file cursor in `runs/<id>/sync.json` tracks accepted bytes, so an interrupted sync resumes from the last accepted request. `--all` selects runs that are incomplete or changed. `--watch N` repeats every N seconds until every selected run has synced, failed permanently, or gone stale. `--dry-run` prints counts without sending or saving state. `--reset` forgets this host's cursor for explicit run ids and the next sync resumes from the server's copy (rejects `--all`).
+Sync copies each run's store files byte for byte (`meta.json`, `events.jsonl`, scalars, overviews, indexes) plus the objects they reference (code, media, copied artifacts) to an `agenticml server` over [protocol v2](docs/PROTOCOL.md). A per-file cursor in `runs/<id>/sync.json` tracks accepted bytes, so an interrupted sync resumes from the last accepted request. `--all` selects runs that are incomplete or changed. `--watch N` repeats every N seconds until every selected run has synced, failed permanently, or gone stale. `--dry-run` prints counts without sending or saving state. `--reset` forgets every cursor for this host, all workspaces, for explicit run ids and the next sync resumes from the server's copy (rejects `--all`).
 
 Not uploaded: notes (`notes.md`). Lineage code is uploaded to servers that support it, and by-reference (`copy=False`) artifacts are uploaded only with `sync --artifacts`. A run id already owned by another key on the server fails with an error naming that key. See [docs/PROTOCOL.md](docs/PROTOCOL.md) for protocol details.
 

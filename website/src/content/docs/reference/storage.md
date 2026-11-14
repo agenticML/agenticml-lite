@@ -14,7 +14,7 @@ The store root is `init(dir=...)`, else `AGENTICML_DIR`, else `~/.agenticml`.
     meta.json               project, config, status, summary, env, git
     events.jsonl            config updates, code, artifacts, finish
     notes.md                run note (Markdown, up to 256 KiB)
-    sync.json               per-host upload cursor, after a sync
+    sync.json               upload cursor per server and workspace, after a sync
     scalars/<id>.bin        8 bytes per point: uint32 step, float32 value
     scalars/index.json
     media/index.json

@@ -684,13 +684,13 @@ the local files:
 
 ### 3. Cursor state in `sync.json`
 
-The client maintains host-scoped sync state in `<root>/runs/<id>/sync.json`:
+The client maintains host- and workspace-scoped sync state in `<root>/runs/<id>/sync.json`:
 
 ```json
 {
   "version": 1,
   "hosts": {
-    "https://aml.example.com": {
+    "https://aml.example.com/w/default": {
       "protocol": 2,
       "owner": "gpu-box-1",
       "owner_user": "alice",
@@ -721,17 +721,33 @@ The client maintains host-scoped sync state in `<root>/runs/<id>/sync.json`:
   `{"kind": "byref", "id": "<name>:v<version>", "reason": "..."}` in
   `skipped`. The `artifacts.json` cursor lives under `files` like other
   atomic files.
+- **Workspaces**: On a 3.0 server (its `/v2/whoami` names the key's workspace),
+  the cursor key is `<host>/w/<workspace-slug>`, e.g.
+  `https://aml.example.com/w/default` (the same path as that workspace's dashboard).
+  Each workspace maintains its own cursor, so one local store (`AGENTICML_DIR`)
+  can sync the same run to several workspaces on one host, just by syncing with
+  each workspace's key. 2.x servers (no workspace in `whoami`) keep the bare
+  host key, unchanged. On the first sync with a 3.0 server, if a run has an old
+  host-only entry, the client checks remote run state via `GET /v2/runs/{id}/state`.
+  If the run exists in the key's workspace and belongs to the key's user, the
+  old entry is moved to the new `<host>/w/<slug>` key and the run is committed
+  once more (the server checks sizes; no accepted bytes are resent). Otherwise
+  the workspace starts with an empty cursor (rebuilt from `/state`) and the old
+  host-only entry is kept for the workspace that has the run. v1 entries (no
+  `"protocol": 2`) are never moved.
 - **Owner and user**: On servers that return `user` in `whoami`, the client
   compares ownership by user (`owner_user`), allowing a machine to switch to
-  another key of the same user. It caches `owner_user` per host in `sync.json`.
-  When syncing against a server that omits `user` (version 2.0 or 2.1), the
-  client falls back to checking `owner` against its key name.
+  another key of the same user. It caches `owner_user` per host and workspace in
+  `sync.json`. When syncing against a server that omits `user` (version 2.0 or 2.1),
+  the client falls back to checking `owner` against its key name.
 - **Update timing**: `sync.json` is atomically replaced and directory-fsynced
   after every accepted HTTP write request, ensuring interrupted syncs resume
   where they left off.
 - **Compatibility**: Host entries without `"protocol": 2` (v1 entries) are
-  treated as empty and replaced on first save. Entries for other hosts are
-  retained untouched. `store.gc` reads `complete: true` and `source_hash == run_fingerprint()`.
+  treated as empty and replaced on first save. Host-only protocol 2 entries are
+  migrated to per-workspace entries as described above. Entries for other hosts
+  are retained untouched. `store.gc` reads `complete: true` and
+  `source_hash == run_fingerprint()`.
 
 ### 4. Rollback detection and rewrite
 
@@ -753,8 +769,9 @@ Before appending, the client checks for local rollbacks:
 
 ### 5. Cursor recovery via `GET /state`
 
-When a host entry has no `files` map (new run, lost `sync.json`, after
-`sync --reset RUN_ID`, or upgrading an older v1 host entry):
+When a host or workspace entry has no `files` map (new run, a workspace with no
+cursor yet, lost `sync.json`, after `sync --reset RUN_ID`, or upgrading an older
+v1 host entry):
 
 1. The client calls `GET /v2/runs/{id}/state`.
 2. If the run is unknown on the server (`404 Not Found`), the client starts with

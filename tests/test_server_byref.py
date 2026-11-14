@@ -94,17 +94,17 @@ def test_backfill_after_complete_without_flag(remote, tmp_path):
     assert push(remote, writer).complete
     identity = sync._identity(remote[1])
     assert writer.run_id not in sync._selected_ids(
-        writer.root, remote[1].base_url, [], True, key=identity["key"], features=identity["features"])
+        writer.root, remote[1].base_url, [], True, key=identity["key"], features=identity["features"], workspace=identity["workspace"])
     assert writer.run_id in sync._selected_ids(
         writer.root, remote[1].base_url, [], True, key=identity["key"],
-        features=identity["features"], artifacts=True)
+        features=identity["features"], workspace=identity["workspace"], artifacts=True)
     assert push(remote, writer, artifacts=True).complete
     mapping = json.loads((remote[0].root / "runs" / writer.run_id / "artifacts.json").read_text())
     assert mapping["artifacts"][0]["sha256"] == sha
     assert push(remote, writer, artifacts=True).status == "up to date"
     assert writer.run_id not in sync._selected_ids(
         writer.root, remote[1].base_url, [], True, key=identity["key"],
-        features=identity["features"], artifacts=True)
+        features=identity["features"], workspace=identity["workspace"], artifacts=True)
 
 
 def test_cached_hash_not_recomputed(remote, tmp_path, monkeypatch):
