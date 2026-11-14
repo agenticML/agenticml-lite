@@ -1,9 +1,9 @@
 ---
-title: agenticml-lite
-description: Local-first experiment tracking for machine learning. Files on disk, a dashboard on localhost, optional sync.
+title: Experiment tracking for machine learning
+description: Track ML runs as files on disk with a local dashboard. Sync to a self-hosted server or the hosted service preview when you want to share.
 template: splash
 hero:
-  tagline: Track every training run as files on disk. Browse them in a local dashboard. No server, database, or Docker required.
+  tagline: Track every training run as files on disk and browse them in a local dashboard. Local tracking needs no server, database, or Docker. Sync to your own server or the hosted service preview to share runs with a team.
   actions:
     - text: Get started
       link: /agenticml-lite/getting-started/quickstart/
@@ -19,6 +19,26 @@ import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 ```bash
 pip install agenticml-lite
 ```
+
+This installs 1.0.0, which tracks locally only and cannot sync to the self-hosted server or the hosted service. Version 3.0 adds workspaces and the hosted service to the self-hosted server. It is a pre-release, so install it from GitHub (the command follows the `dev` branch and changes as development continues):
+
+```bash
+pip install 'agenticml-lite[system] @ git+https://github.com/agenticML/agenticml-lite@dev'
+```
+
+## Three ways to use it
+
+<CardGrid>
+	<Card title="Local" icon="laptop">
+		Runs are plain files on your machine. Nothing is sent anywhere. Start with the [quickstart](/agenticml-lite/getting-started/quickstart/).
+	</Card>
+	<Card title="Self-hosted" icon="server">
+		Run the 3.0 server on your own hardware for a shared dashboard and sync. Read the [Server](/agenticml-lite/server/) section.
+	</Card>
+	<Card title="Hosted (public preview)" icon="external">
+		Sign in at `app.agenticml.xyz` and sync without running a server. Best effort, no SLA. See the [Hosted service](/agenticml-lite/hosted/) section.
+	</Card>
+</CardGrid>
 
 ## Why agenticml-lite
 
@@ -46,4 +66,11 @@ pip install agenticml-lite
 	<LinkCard title="Python SDK" description="Log metrics, config, media, and artifacts from Python." href="/agenticml-lite/guides/python-sdk/" />
 	<LinkCard title="Dashboard" description="View runs, charts, and notes locally." href="/agenticml-lite/guides/dashboard/" />
 	<LinkCard title="Distributed, resume, disabled" description="Multi-GPU training, resuming runs, and turning tracking off." href="/agenticml-lite/guides/distributed/" />
+</CardGrid>
+
+## Releases and status
+
+<CardGrid>
+	<LinkCard title="Releases" description="What each version (1.0, 2.0, 2.1, 2.2, 3.0) includes and how to install it." href="/agenticml-lite/releases/" />
+	<LinkCard title="Service status" description="What is live on the hosted service and what is still open." href="/agenticml-lite/hosted/status/" />
 </CardGrid>

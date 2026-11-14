@@ -12,7 +12,7 @@ export default defineConfig({
 		starlight({
 			plugins: [starlightLinksValidator({ errorOnLocalLinks: false })],
 			title: 'agenticml-lite',
-			description: 'Local-first experiment tracking for machine learning.',
+			description: 'Experiment tracking for machine learning: local files, a self-hosted server and a hosted service preview.',
 			logo: { light: './src/assets/logo-light.svg', dark: './src/assets/logo-dark.svg', alt: 'agenticML', replacesTitle: true },
 			favicon: '/favicon.svg',
 			social: [
@@ -26,10 +26,10 @@ export default defineConfig({
 			sidebar: [
 				{ label: 'Getting started', items: [{ autogenerate: { directory: 'getting-started' } }] },
 				{ label: 'Hosted service', items: [{ autogenerate: { directory: 'hosted' } }] },
-				{ label: 'Releases', slug: 'releases' },
 				{ label: 'Guides', items: [{ autogenerate: { directory: 'guides' } }] },
 				{ label: 'Server', items: [{ autogenerate: { directory: 'server' } }] },
 				{ label: 'Reference', items: [{ autogenerate: { directory: 'reference' } }] },
+				{ label: 'Releases', slug: 'releases' },
 			],
 		}),
 	],
