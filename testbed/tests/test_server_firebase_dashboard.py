@@ -110,15 +110,14 @@ class _NoCerts:
         return {}
 
 
-@pytest.fixture
-def firebase_ui(tmp_path, monkeypatch):
-    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+def _serve_firebase(tmp_path, **extra):
     httpd = make_server(
         tmp_path / "data", port=0,
         firebase=FirebaseConfig(
             project="demo-project", api_key="test-api-key-1",
             auth_domain="demo-project.firebaseapp.com"),
         cert_source=CertificateSource(fetch=lambda: _NoCerts()),
+        **extra,
     )
     thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
     thread.start()
@@ -129,6 +128,29 @@ def firebase_ui(tmp_path, monkeypatch):
         httpd.shutdown()
         thread.join(timeout=5)
         httpd.server_close()
+
+
+@pytest.fixture
+def firebase_ui(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    yield from _serve_firebase(tmp_path)
+
+
+LEGAL_BASE = "https://docs.example.org/legal"
+LEGAL_LINKS = {
+    "Terms": f"{LEGAL_BASE}/terms/",
+    "Acceptable use policy": f"{LEGAL_BASE}/acceptable-use/",
+    "Privacy policy": f"{LEGAL_BASE}/privacy/",
+}
+LEGAL_TEXT = (
+    "By continuing you agree to the Terms and the Acceptable use policy. "
+    "See the Privacy policy.")
+
+
+@pytest.fixture
+def firebase_ui_legal(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    yield from _serve_firebase(tmp_path, legal_base_url=LEGAL_BASE)
 
 
 def stub_vendor(page):
@@ -568,4 +590,55 @@ def test_firebase_sign_in_layout_wide_and_narrow(page, firebase_ui):
     page.set_viewport_size({"width": 375, "height": 812})
     expect(page.locator(".auth-brand")).to_be_hidden()
     expect(page.locator(".auth-compact-logo .auth-logo")).to_be_visible()
+    assert_no_overflow(page)
+
+
+@pytest.mark.parametrize("path", ["/login", "/invite?token=x"])
+def test_firebase_sign_in_shows_policy_links_when_configured(page, firebase_ui_legal, path):
+    stub_vendor(page)
+    page.goto(f"{firebase_ui_legal['url']}{path}")
+    legal = page.locator("#legal")
+    expect(legal).to_be_visible()
+    expect(legal).to_have_text(LEGAL_TEXT)
+    links = legal.locator("a")
+    expect(links).to_have_count(3)
+    for index, (text, href) in enumerate(LEGAL_LINKS.items()):
+        link = links.nth(index)
+        expect(link).to_have_text(text)
+        expect(link).to_have_attribute("href", href)
+        expect(link).to_have_attribute("target", "_blank")
+        expect(link).to_have_attribute("rel", "noopener noreferrer")
+
+
+@pytest.mark.parametrize("path", ["/login", "/invite?token=x"])
+def test_firebase_sign_in_has_no_policy_links_by_default(page, firebase_ui, path):
+    stub_vendor(page)
+    page.goto(f"{firebase_ui['url']}{path}")
+    expect(page.get_by_role("button", name="Continue with Google", exact=True)).to_be_visible()
+    expect(page.locator("#legal")).to_be_hidden()
+    expect(page.locator("#legal a")).to_have_count(0)
+
+
+def test_firebase_policy_links_ignore_non_https_urls(page, firebase_ui_legal):
+    stub_vendor(page)
+    page.route(
+        re.compile(r"/auth/firebase/config$"),
+        json_auth(200, {
+            "projectId": "demo-project", "apiKey": "k", "authDomain": "demo-project.firebaseapp.com",
+            "legal": {"terms": "javascript:alert(1)", "acceptable_use": "https://x.example/a/",
+                      "privacy": "https://x.example/p/"}}))
+    page.goto(f"{firebase_ui_legal['url']}/login")
+    expect(page.get_by_role("button", name="Continue with Google", exact=True)).to_be_visible()
+    expect(page.locator("#legal")).to_be_hidden()
+    expect(page.locator("#legal a")).to_have_count(0)
+
+
+def test_firebase_policy_links_no_overflow_at_375(page, firebase_ui_legal):
+    stub_vendor(page)
+    page.set_viewport_size({"width": 375, "height": 812})
+    page.goto(f"{firebase_ui_legal['url']}/login")
+    expect(page.locator("#legal")).to_be_visible()
+    assert_no_overflow(page)
+    page.goto(f"{firebase_ui_legal['url']}/invite?token=x")
+    expect(page.locator("#legal")).to_be_visible()
     assert_no_overflow(page)

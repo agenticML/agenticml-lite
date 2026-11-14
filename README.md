@@ -1,6 +1,6 @@
 # agenticml-lite
 
-agenticml-lite is a local-first experiment tracker. Training writes metrics, config, code, and media to files on disk, and `agenticml ui` serves a TensorBoard-style dashboard from those files. There is no server, database, or Docker image to run. Upload to [AgenticML](https://agenticml.xyz) is optional, with `agenticml login` and `agenticml sync`. Install the package as `agenticml-lite` and import it as `agenticml`. The API is pre-alpha (`0.1.0.dev0`).
+agenticml-lite is a local-first experiment tracker. Training writes metrics, config, code, and media to files on disk, and `agenticml ui` serves a TensorBoard-style dashboard from those files. There is no server, database, or Docker image to run. Upload to an `agenticml server` (self-hosted, or the hosted service in public preview) is optional, with `agenticml login` and `agenticml sync`. Install the package as `agenticml-lite` and import it as `agenticml`. PyPI has 1.0.0, the local tracker. 3.0, with the server and the hosted service, is a pre-release you install from GitHub (see Install).
 
 Documentation: <https://agenticml.github.io/agenticml-lite/>
 
@@ -19,6 +19,12 @@ pip install "agenticml-lite[postgres]" # PostgreSQL database backend (psycopg)
 pip install "agenticml-lite[s3]"       # Amazon S3 object storage (boto3)
 pip install "agenticml-lite[firebase]" # Firebase Auth token verification (PyJWT)
 pip install "agenticml-lite[hosted]"   # Full hosted bundle (postgres, s3, firebase)
+```
+
+PyPI has only 1.0.0 (local tracking, no sync). The server extras and syncing to a server need 3.0, which is not on PyPI yet. Until it is, install it from GitHub. This follows the `dev` branch, so it changes as development continues:
+
+```bash
+pip install 'agenticml-lite[system] @ git+https://github.com/agenticML/agenticml-lite@dev'
 ```
 
 ## Quickstart
@@ -210,7 +216,7 @@ agenticml sync RUN_ID --reset
 
 Sync copies each run's store files byte for byte (`meta.json`, `events.jsonl`, scalars, overviews, indexes) plus the objects they reference (code, media, copied artifacts) to an `agenticml server` over [protocol v2](docs/PROTOCOL.md). A per-file cursor in `runs/<id>/sync.json` tracks accepted bytes, so an interrupted sync resumes from the last accepted request. `--all` selects runs that are incomplete or changed. `--watch N` repeats every N seconds until every selected run has synced, failed permanently, or gone stale. `--dry-run` prints counts without sending or saving state. `--reset` forgets this host's cursor for explicit run ids and the next sync resumes from the server's copy (rejects `--all`).
 
-Not uploaded in 2.0: notes (`notes.md`), by-reference (`copy=False`) artifacts, and lineage code diffs. A run id already owned by another key on the server fails with an error naming that key. See [docs/PROTOCOL.md](docs/PROTOCOL.md) for protocol details.
+Not uploaded: notes (`notes.md`). Lineage code is uploaded to servers that support it, and by-reference (`copy=False`) artifacts are uploaded only with `sync --artifacts`. A run id already owned by another key on the server fails with an error naming that key. See [docs/PROTOCOL.md](docs/PROTOCOL.md) for protocol details.
 
 ## On-prem server
 
@@ -237,9 +243,9 @@ Run directly:
 Or run as a systemd service: see [deploy/systemd/README.md](deploy/systemd/README.md) and [deploy/systemd/agenticml-server.service](deploy/systemd/agenticml-server.service).
 ```bash
 sudo useradd --system --home /var/lib/agenticml-server --shell /usr/sbin/nologin agenticml
-sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v3.0.0/deploy/systemd/agenticml-server.service
+sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/main/deploy/systemd/agenticml-server.service
 ```
-Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`). Edit `AGENTICML_SERVER_PUBLIC_URL` in the unit (or `sudo systemctl edit agenticml-server`), then `daemon-reload` and `enable --now`:
+The unit is fetched from `main` because there is no 3.0 tag yet. Once 3.0.0 is released, use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`). Edit `AGENTICML_SERVER_PUBLIC_URL` in the unit (or `sudo systemctl edit agenticml-server`), then `daemon-reload` and `enable --now`:
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now agenticml-server
@@ -277,7 +283,7 @@ agenticml server users add admin --role admin --data /var/lib/agenticml-server
 
 Every API key is bound to a specific workspace and owning account. On sync (`/v2`), the server identifies the workspace directly from the key.
 
-In the dashboard, open **Keys** → **New key**, name it (e.g. `gpu-box-1`), and copy the shown command.
+In the dashboard, open **Settings** > **API keys** > **New key**, name it (e.g. `gpu-box-1`), and copy the key (not the command).
 
 CLI alternative:
 ```bash

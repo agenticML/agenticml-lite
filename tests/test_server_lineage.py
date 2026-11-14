@@ -906,8 +906,9 @@ def test_receive_concurrency_limit_after_body(remote, snapshots, tmp_path, monke
         finally:
             release.set()
         assert [future.result().status_code for future in pending] == [201, 201]
-    assert server.lineage_receives.acquire(blocking=False)
-    assert server.lineage_receives.acquire(blocking=False)
+    # The handler frees its slot after sending the response, so wait for it.
+    assert server.lineage_receives.acquire(timeout=2)
+    assert server.lineage_receives.acquire(timeout=2)
     server.lineage_receives.release()
     server.lineage_receives.release()
     assert_tmp_clean(server)

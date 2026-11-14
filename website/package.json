@@ -6,11 +6,19 @@
   "scripts": {
     "dev": "astro dev",
     "build": "astro build",
-    "preview": "astro preview"
+    "preview": "astro preview",
+    "check:overflow": "node scripts/overflow-check.mjs"
+  },
+  "engines": {
+    "node": ">=22"
   },
   "dependencies": {
     "@astrojs/starlight": "0.42.6",
     "astro": "7.4.0",
-    "sharp": "0.35.5"
+    "sharp": "0.35.5",
+    "starlight-links-validator": "0.27.0"
+  },
+  "devDependencies": {
+    "playwright": "1.62.0"
   }
 }

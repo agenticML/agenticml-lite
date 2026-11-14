@@ -923,6 +923,19 @@ kbd {
   max-width: 100%;
   white-space: normal;
 }
+.auth-legal {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+.auth-legal a {
+  color: var(--accent);
+}
+.auth-legal a:hover {
+  color: var(--accent-hover);
+}
 
 @media (max-width: 960px) {
   .auth-shell {

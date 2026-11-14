@@ -11,8 +11,16 @@ Install the package as `agenticml-lite` and import it as `agenticml`. It needs P
 pip install agenticml-lite
 ```
 
-:::caution[Pre-alpha]
-The API is pre-alpha (`0.1.0.dev0`) and may change between releases.
+:::note[Which version you get]
+`pip install agenticml-lite` installs 1.0.0, the local tracker. It cannot sync to a server.
+
+Version 3.0 adds the self-hosted server and the hosted service. It is a pre-release and is not on PyPI yet. Install it from GitHub:
+
+```bash
+pip install 'agenticml-lite[system] @ git+https://github.com/agenticML/agenticml-lite@dev'
+```
+
+This command follows the `dev` branch, so what you get changes as development continues. See [Releases](/agenticml-lite/releases/) for what each version includes.
 :::
 
 ## Optional extras
@@ -24,6 +32,17 @@ The API is pre-alpha (`0.1.0.dev0`) and may change between releases.
 | `media` | Pillow, for logging numpy arrays and PIL images | `pip install "agenticml-lite[media]"` |
 
 System metrics are sampled every 10 seconds when `psutil` is installed.
+
+### Server extras
+
+These extras are for the server. They need version 3.0 (see above).
+
+| Extra | Adds |
+| --- | --- |
+| `postgres` | PostgreSQL database backend |
+| `s3` | Amazon S3 object storage |
+| `firebase` | Firebase sign-in |
+| `hosted` | `postgres`, `s3` and `firebase` together |
 
 ## Next
 

@@ -170,7 +170,7 @@ off; the server CLI over ECS Exec still works.
 | 4.2 | Create the first admin through the `/setup` link logged at startup (newest "No admin user yet" line in `/ecs/agenticml-hosted`), on `https://app.agenticml.xyz` only; login without `@`, password of 12+ characters. This makes the account owner of `default` and server admin and closes `/setup`. **Done** Nov 13, 2026: `server users list` shows the account as `owner`, created by `setup` | You can sign in at `/login`; `/setup` returns 404 |
 | 4.2a | Turn on Firebase sign-in. Firebase console: create a project the owner administers, enable Email/Password (not email link) and Google, add `app.agenticml.xyz` to the authorized domains, register a web app (no Hosting). GitHub `hosted` environment: set `HOSTED_FIREBASE_PROJECT` and `HOSTED_FIREBASE_API_KEY`, keep `HOSTED_OPEN_SIGNUP=false`. Re-run the deploy and approve it. **Done** Nov 13, 2026: project `agenticml-hosted`, deploy run 43269670813 attempt 2, task definition `agenticml-hosted:3` | The task has `AGENTICML_SERVER_FIREBASE_PROJECT`; `/login` shows "Continue with Google" with no console errors; `POST /login` with a password and `/setup` return 404 |
 | 4.2b | Create the owner's web admin account, named after the exact email of the Google account they sign in with. With package 24.7: set `HOSTED_ADMIN_EMAILS` to that email in the GitHub `hosted` environment, approve the deploy, and sign in at `/login` with "Continue with Google"; no ECS Exec. Without 24.7 (fallback): in ECS Exec, `agenticml server accounts add <email> --server-admin --data /data`, then `agenticml server users add <email> --role admin --workspace default --public-url https://app.agenticml.xyz --data /data`. The account has no password, so the first verified Google sign-in with that email links to it. Then sign in at `/login` with "Continue with Google" | The owner lands in `default` as server admin; `server users list` shows the email account |
-| 4.3 | Create two customer workspaces, each with an admin, a member and a sync key, using email logins: with package 24.7, on `/admin` (workspace and owner email) and each workspace's Team and Keys pages; without it, through ECS Exec (`users add <email>`). People accept their invite or sign in with "Continue with Google" or Firebase email/password; the email must be verified and match the login. Then add one account to the other workspace with a different role (`users add`, no invite). Before running, re-check these commands against the code's Firebase path: package 24.6 checked the password path only | Each person sees only their own workspaces, with the right roles |
+| 4.3 | Create two customer workspaces, each with an admin, a member and a sync key, using email logins: with package 24.7, on `/admin` (workspace and owner email) and each workspace's Settings > Members and API keys sections; without it, through ECS Exec (`users add <email>`). People accept their invite or sign in with "Continue with Google" or Firebase email/password; the email must be verified and match the login. Then add one account to the other workspace with a different role (`users add`, no invite). Before running, re-check these commands against the code's Firebase path: package 24.6 checked the password path only | Each person sees only their own workspaces, with the right roles |
 | 4.4 | On a training machine with 3.0.0 installed from `dev`, sync one smoke run per workspace, each from its own `AGENTICML_DIR` with that workspace's key (sync state is kept per host, not per workspace) | Runs, metrics and artifacts show in the right dashboard and nowhere else |
 
 ## Phase 5: Launch checks (owner, exit criterion 6)
@@ -192,12 +192,29 @@ off; the server CLI over ECS Exec still works.
 
 At this point the AWS deployment is live and package 24.3 is done.
 
+## Phase 7: Public launch (owner and agents)
+
+**Status: planned** (Nov 13, 2026) in package
+[29](packages/29-docs-site.md). The service has taken sign-ups since
+Nov 13, but nothing public points to it, and there are no policies yet.
+This phase makes the docs site the way people find and use it. 7.1 and 7.2
+can start now, beside Phases 4–6.
+
+| # | Step | Who | Done when |
+| --- | --- | --- | --- |
+| 7.1 | Docs site: Releases page, hosted section (overview, quickstart, workspaces) and a public "Service status and roadmap" page that mirrors this roadmap without AWS identifiers (packages 29.1–29.5 and 29.2a–c) | Sonnet, Antigravity | Merged to `dev` with the build, link and 375px checks green |
+| 7.2 | Publish the site through a docs-only PR to `main`; enforce HTTPS on Pages; set the repo description and homepage (29.6) | git agent; owner merges and sets them | The live site shows the hosted pages and status page |
+| 7.3 | Owner decides open sign-up until the policies exist (package 29, D1), and supplies the policy facts (D4) | Owner | Decisions recorded in the 29 plan |
+| 7.4 | Terms, acceptable use and privacy policy on the docs site, linked from `/login` and the invite page (29.7); email existing sign-ups (D6) | Antigravity drafts; owner and lawyer approve; Sonnet links; owner approves the deploy | `/login` and `/invite` show the three links in a browser, and they return 200 |
+| 7.5 | Promote: Sign in action, banner and header link on the docs site (29.8) | Sonnet | Live, with no overflow at 375px |
+| 7.6 | Keep the status page current: the PR that records a result in Phases 4–6 also updates the docs status page, then the git agent opens the docs-only PR to `main` | Supervisor; owner merges | The live status page shows the result and a new "last updated" date |
+
 ## After AWS is live (separate work, not in this roadmap)
 
 - Firebase sign-in moved into Phase 4 (steps 4.2a and 4.2b) on Nov 13,
   2026.
 - Terms of service, acceptable use and privacy policies, linked from the
-  sign-in page (needs a small code change).
+  sign-in page: moved into Phase 7 (step 7.4) on Nov 13, 2026.
 - Open sign-up (exit criterion 7): turned on Nov 13, 2026 (owner's choice) by
   setting `HOSTED_OPEN_SIGNUP=true` and re-running deploy run 43417765936.
   Exit criterion 7's storage-limit walk-through is still to do.

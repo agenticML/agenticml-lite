@@ -381,13 +381,41 @@ def firebase_login_csp(auth_domain):
     )
 
 
+def normalize_legal_base_url(value):
+    """Return an ``https://`` policy base URL ending in ``/``, or None when unset.
+
+    Raises ValueError for anything else: the sign-in page links to this URL.
+    """
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        raise ValueError("--legal-base-url must not contain spaces or control characters")
+    try:
+        parts = urlsplit(value)
+        host = parts.hostname
+        parts.port  # raises ValueError for a non-numeric or out-of-range port
+    except ValueError:
+        raise ValueError("--legal-base-url is not a valid URL") from None
+    if parts.scheme != "https" or not host:
+        raise ValueError("--legal-base-url must be an https:// URL")
+    # An empty query or fragment ("...?" or "...#") parses as "", so check the
+    # characters too: the page names are appended to this string.
+    if (parts.username is not None or parts.password is not None
+            or "?" in value or "#" in value):
+        raise ValueError("--legal-base-url must not have credentials, a query, or a fragment")
+    return value if value.endswith("/") else value + "/"
+
+
 class WebAuth:
     """Owns /login, /logout, /invite, /setup, sessions, and the request gate."""
 
     def __init__(self, keys, public_url=None, clock=time.time, throttle_clock=time.time,
                  users=None, trusted_proxies=(), identity_header=None,
                  firebase=None, cert_source=None, plans=None, open_signup=False,
-                 admin_emails=frozenset()):
+                 admin_emails=frozenset(), legal_base_url=None):
         self.keys = keys
         self.users = users if users is not None else UserStore(keys.server_dir, db=keys.db, workspace_id=keys.workspace_id or '0' * 32)
         self.public_url = public_url
@@ -409,6 +437,10 @@ class WebAuth:
             self.admin_emails = frozenset()
         if self.admin_emails:
             logger.info("server admin emails configured: %d", len(self.admin_emails))
+        self.legal_base_url = normalize_legal_base_url(legal_base_url)
+        if self.legal_base_url and self.firebase is None:
+            logger.warning("--legal-base-url is ignored without --firebase-project")
+            self.legal_base_url = None
         if self.firebase is not None:
             from .firebase import FIREBASE_EXTRA, FIREBASE_IDENTITY, firebase_available
             if self.identity_header is not None:
@@ -1067,11 +1099,15 @@ class WebAuth:
         if self.firebase is None:
             handler._json({"error": "not found"}, 404)
             return
-        handler._json(
-            {"projectId": self.firebase.project, "apiKey": self.firebase.api_key,
-             "authDomain": self.firebase.auth_domain},
-            headers=self._headers(),
-        )
+        config = {"projectId": self.firebase.project, "apiKey": self.firebase.api_key,
+                  "authDomain": self.firebase.auth_domain}
+        if self.legal_base_url:
+            config["legal"] = {
+                "terms": self.legal_base_url + "terms/",
+                "acceptable_use": self.legal_base_url + "acceptable-use/",
+                "privacy": self.legal_base_url + "privacy/",
+            }
+        handler._json(config, headers=self._headers())
 
     def _firebase_auth(self, handler):
         from .db.workspaces import AccountRepo, InviteRepo

@@ -266,7 +266,7 @@ class IngestServer(DashboardServer):
     def __init__(self, data, host, port, public_url=None, env_key=None,
                  trusted_proxies=(), identity_header=None, db=None,
                  firebase=None, cert_source=None, plans=None, open_signup=False,
-                 min_client_version=None, admin_emails=frozenset()):
+                 min_client_version=None, admin_emails=frozenset(), legal_base_url=None):
         from .clientwindow import parse_min_client
         from .firebase import require_open_signup
         from .ingest import IngestHandler
@@ -294,7 +294,8 @@ class IngestServer(DashboardServer):
             self.keys, public_url, users=self.users,
             trusted_proxies=trusted_proxies, identity_header=identity_header,
             firebase=firebase, cert_source=cert_source, plans=plans,
-            open_signup=open_signup, admin_emails=admin_emails)
+            open_signup=open_signup, admin_emails=admin_emails,
+            legal_base_url=legal_base_url)
         self.store_file_mode = 0o666 & ~_read_umask()
         self.limits = Limits()
         self.lineage_enabled = shutil.which("git") is not None
@@ -499,7 +500,7 @@ class IPv6IngestServer(IngestServer):
 def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None,
                 trusted_proxies=(), identity_header=None, database=None,
                 firebase=None, cert_source=None, plans=None, open_signup=False, objects=None,
-                min_client_version=None, admin_emails=frozenset()):
+                min_client_version=None, admin_emails=frozenset(), legal_base_url=None):
     """Prepare and lock the data directory; port=0 chooses a free port."""
     from .firebase import require_open_signup
     from .limits import Plans
@@ -539,7 +540,7 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
         server = cls(data, host, port, public_url, env_key, trusted_proxies, identity_header, db=db,
                      firebase=firebase, cert_source=cert_source, plans=plans,
                      open_signup=open_signup, min_client_version=min_client_version,
-                     admin_emails=admin_emails)
+                     admin_emails=admin_emails, legal_base_url=legal_base_url)
         server.objects = backend
         server._server_lock = handle
         for workspace in server.workspaces.list():
@@ -559,7 +560,7 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
 def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None,
           trusted_proxies=(), identity_header=None, database=None,
           firebase=None, cert_source=None, plans=None, open_signup=False, objects=None,
-          min_client_version=None, admin_emails=frozenset()):
+          min_client_version=None, admin_emails=frozenset(), legal_base_url=None):
     """Run until interrupted, with an optional environment admin key."""
     extra = {}
     if objects is not None:
@@ -578,6 +579,8 @@ def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None
         extra["min_client_version"] = min_client_version
     if admin_emails:
         extra["admin_emails"] = frozenset(admin_emails)
+    if legal_base_url is not None:
+        extra["legal_base_url"] = legal_base_url
     server = make_server(
         data, host, port, public_url, os.environ.get("AGENTICML_SERVER_KEY"),
         trusted_proxies, identity_header, **extra)

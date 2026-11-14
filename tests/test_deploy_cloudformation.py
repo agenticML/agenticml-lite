@@ -405,7 +405,7 @@ def test_hosted_template_fits_the_deploy_upload_limit():
 def test_hosted_parameters(hosted):
     params = hosted['Parameters']
     assert set(params) == {'ImageTag', 'Hostname', 'DesiredCount', 'MultiAZ', 'FirebaseProject',
-                           'FirebaseApiKey', 'OpenSignup', 'AdminEmails', 'VpcCidr'}
+                           'FirebaseApiKey', 'OpenSignup', 'AdminEmails', 'LegalBaseUrl', 'VpcCidr'}
     assert 'Default' not in params['ImageTag']
     assert params['Hostname']['Default'] == 'app.agenticml.xyz'
     # Lean default (package 24.5): one task; rolling deploys still start the new one first.
@@ -418,6 +418,15 @@ def test_hosted_parameters(hosted):
     assert params['AdminEmails']['Default'] == ''
     assert params['AdminEmails']['MaxLength'] == 2048
     assert params['AdminEmails']['AllowedPattern'] == r'^\S*$'
+    # Empty by default: nothing is linked from the sign-in page until the owner sets it.
+    assert params['LegalBaseUrl']['Default'] == ''
+    assert params['LegalBaseUrl']['AllowedPattern'] == r'^(https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[^\s?#]*)?)?$'
+    legal = re.compile(params['LegalBaseUrl']['AllowedPattern'])
+    for ok in ('', 'https://docs.example.org/', 'https://docs.example.org:8443/legal/', 'https://a.io'):
+        assert legal.match(ok), ok
+    for bad in ('http://a.io/', 'https://:443/', 'https://a.io:abc/', 'https://u@a.io/',
+                'https://a.io/?x=1', 'https://a.io/#f', 'https://a.io/a b'):
+        assert not legal.match(bad), bad
     assert params['VpcCidr']['Default'] == '10.42.0.0/16'
     # No hosted zone, e-mail address or bucket name is a parameter.
     assert not {'HostedZoneId', 'AlarmEmail', 'ObjectsBucketName', 'LogsBucketName'} & set(params)
@@ -633,6 +642,7 @@ def test_hosted_trusted_proxy_is_the_alb_subnets_only(hosted):
     assert env['AGENTICML_SERVER_LIMITS'] == '/etc/agenticml/limits.json'
     assert env['AGENTICML_SERVER_OPEN_SIGNUP'] == {'Ref': 'OpenSignup'}
     assert env['AGENTICML_SERVER_ADMIN_EMAILS'] == {'Ref': 'AdminEmails'}
+    assert env['AGENTICML_SERVER_LEGAL_BASE_URL'] == {'Ref': 'LegalBaseUrl'}
     assert env['AGENTICML_SERVER_PUBLIC_URL'] == {'Fn::Sub': 'https://${Hostname}'}
     assert env['AGENTICML_SERVER_OBJECTS'] == {'Fn::Sub': 's3://${ObjectsBucket}/hosted'}
     assert env['AWS_REGION'] == {'Ref': 'AWS::Region'}
@@ -863,6 +873,14 @@ def test_deploy_workflow_passes_the_admin_emails_variable_as_a_parameter_overrid
     (deploy,) = [s for s in steps if 'ADMIN_EMAILS' in s.get('env', {})]
     assert deploy['env']['ADMIN_EMAILS'] == '${{ vars.HOSTED_ADMIN_EMAILS }}'
     assert 'AdminEmails="$ADMIN_EMAILS"' in deploy['run']
+    assert '${{' not in deploy['run']
+
+
+def test_deploy_workflow_passes_the_legal_base_url_variable_as_a_parameter_override():
+    steps = load_workflow('deploy.yml')['jobs']['deploy']['steps']
+    (deploy,) = [s for s in steps if 'LEGAL_BASE_URL' in s.get('env', {})]
+    assert deploy['env']['LEGAL_BASE_URL'] == '${{ vars.HOSTED_LEGAL_BASE_URL }}'
+    assert 'LegalBaseUrl="$LEGAL_BASE_URL"' in deploy['run']
     assert '${{' not in deploy['run']
 
 

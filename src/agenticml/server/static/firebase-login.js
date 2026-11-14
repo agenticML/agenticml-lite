@@ -13,6 +13,7 @@
   const title = document.querySelector("#auth-title");
   const sub = document.querySelector("#auth-sub");
   const showPassword = document.querySelector("#show-password");
+  const legal = document.querySelector("#legal");
 
   const NO_ACCOUNT =
     "Your account has no access to this server. Ask a workspace admin for an invite.";
@@ -330,6 +331,43 @@
     });
   }
 
+  function legalLink(href, text) {
+    const link = document.createElement("a");
+    link.href = href;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = text;
+    return link;
+  }
+
+  function httpsUrl(value) {
+    if (typeof value !== "string") return null;
+    try {
+      return new URL(value).protocol === "https:" ? value : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // The server sends these only when it is configured with a policy base URL.
+  function showLegal(urls) {
+    if (!legal || !urls || typeof urls !== "object") return;
+    const terms = httpsUrl(urls.terms);
+    const aup = httpsUrl(urls.acceptable_use);
+    const privacy = httpsUrl(urls.privacy);
+    if (!terms || !aup || !privacy) return;
+    legal.replaceChildren(
+      "By continuing you agree to the ",
+      legalLink(terms, "Terms"),
+      " and the ",
+      legalLink(aup, "Acceptable use policy"),
+      ". See the ",
+      legalLink(privacy, "Privacy policy"),
+      ".",
+    );
+    legal.hidden = false;
+  }
+
   async function start() {
     let response;
     try {
@@ -349,6 +387,7 @@
       showError(GENERIC);
       return;
     }
+    showLegal(config.legal);
     try {
       firebase.initializeApp({
         apiKey: config.apiKey,

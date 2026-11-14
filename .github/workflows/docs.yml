@@ -6,22 +6,24 @@ on:
     paths:
       - "website/**"
       - ".github/workflows/docs.yml"
+  pull_request:
+    paths:
+      - "website/**"
+      - ".github/workflows/docs.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
-
-# One deploy at a time; a newer push replaces a queued one.
-concurrency:
-  group: pages
-  cancel-in-progress: false
 
 jobs:
   build:
     name: Build site
     runs-on: ubuntu-latest
+    # A newer run of the same ref replaces this build. Deploys use their own
+    # group below, so a build can never cancel a queued deploy.
+    concurrency:
+      group: docs-${{ github.ref }}
+      cancel-in-progress: true
     defaults:
       run:
         working-directory: website
@@ -39,14 +41,34 @@ jobs:
           npm ci
           npm run build
 
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-1.62.0-${{ runner.os }}
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Check overflow at 375px
+        run: npm run check:overflow
+
       - uses: actions/upload-pages-artifact@v5
+        if: github.event_name != 'pull_request'
         with:
           path: website/dist/
 
   deploy:
     name: Deploy to GitHub Pages
     needs: build
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    # One deploy at a time; a newer push replaces a queued one.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
