@@ -1394,9 +1394,10 @@ def test_email_admin_invite_link_and_self_checks(tmp_path, monkeypatch):
     with firebase_running(tmp_path / 'data') as httpd:
         cookie = _email_admin(httpd)
         _member_account(httpd, 'bob@example.com')
+        # Package 24.11c: no member re-invite with Firebase on; members sign in at /login.
         status, data = _api(httpd, cookie, '/api/w/default/members/Bob%40Example.com/invite',
                             'POST', {})
-        assert status == 200 and '/invite?token=' in data['invite_url']
+        assert status == 409 and 'no invite link is needed' in data['error']
         status, data = _api(httpd, cookie, '/api/w/default/members/Boss%40Example.com/invite',
                             'POST', {})
         assert status == 409 and 'yourself' in data['error']
@@ -1417,3 +1418,28 @@ def test_email_admin_member_path_validation(tmp_path, monkeypatch):
                                     method, payload)
                 assert status == 400, (login, method)
                 assert data == {'error': 'invalid or reserved user name'}, (login, method)
+
+
+def test_member_reinvite_refused_on_firebase(tmp_path, monkeypatch):
+    # Package 24.11c: a re-invite is a password-reset token that the Firebase
+    # invite page never accepts, so the API refuses it without touching the
+    # member (no sign-out, no audit entry).
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    with firebase_running(tmp_path / 'data') as httpd:
+        repo = AccountRepo(httpd.db)
+        admin = repo.create('boss@example.com')
+        MembershipRepo(httpd.db, httpd.default_workspace_id).add(admin['id'], 'admin')
+        with httpd.db.transaction(write=True) as tx:
+            repo.link_firebase(admin['id'], 'uid-boss', 'boss@example.com', True, tx)
+        member = _member_account(httpd, 'ada@example.com', uid='uid-ada')
+        status, hdrs, _ = _post_firebase(httpd, _live_token(sub='uid-boss', email='boss@example.com'))
+        assert status == 200
+        cookie = hdrs['Set-Cookie']
+        before = AuditRepo(httpd.db, None).tail(50)
+        status, _, body, _ = authed(
+            httpd, '/api/w/default/members/ada@example.com/invite', 'POST', b'{}', cookie=cookie)
+        assert status == 409
+        assert 'no invite link is needed' in json.loads(body)['error']
+        after = repo.get('ada@example.com')
+        assert after['generation'] == member['generation']
+        assert AuditRepo(httpd.db, None).tail(50) == before

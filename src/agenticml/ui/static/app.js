@@ -5109,7 +5109,8 @@ async function mountTeam(cards, version, disposers = []) {
         user.keys == null ? "–" : String(user.keys),
         user.runs == null ? "–" : String(user.runs),
         el("div", { class: "team-actions" },
-          owner || user.name === data.me
+          // Firebase members sign in at /login; the server refuses a re-invite there.
+          owner || user.name === data.me || serverSession?.auth === "firebase"
             ? null
             : button("Invite link", () => inviteUser(user), "secondary"),
           owner ? null : button("Remove", () => removeUser(user), "secondary")),
@@ -5246,11 +5247,8 @@ async function mountTeam(cards, version, disposers = []) {
       }
     }, "primary");
     body.append(
-      el("p", {
-        text: serverSession?.auth === "firebase"
-          ? "This signs them out and gives them a new sign-in link."
-          : "This signs them out and clears their password.",
-      }),
+      // Never shown with Firebase: the row has no "Invite link" there.
+      el("p", { text: "This signs them out and clears their password." }),
       el("div", { class: "inline" }, button("Cancel", () => host.close(), "secondary"), confirm));
     host.showModal();
     body.querySelector("button").focus();
