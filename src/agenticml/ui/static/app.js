@@ -5892,11 +5892,6 @@ async function settingsPage(version, requested) {
       }
     },
   }));
-  const navItems = [...links];
-  if (session.server_admin)
-    navItems.push(el("a", {
-      class: "settings-nav-admin", href: "/admin/", text: "Server admin ↗",
-    }));
   const workspaceRow = sessionWorkspaces(session).find((row) => row.slug === currentWorkspaceSlug());
   const workspaceName = typeof workspaceRow?.name === "string" && workspaceRow.name
     ? workspaceRow.name : currentWorkspaceSlug();
@@ -5920,7 +5915,7 @@ async function settingsPage(version, requested) {
       el("p", { text: "Your account, this workspace's people and its API keys." })),
     el("div", { class: "settings-layout" },
       el("nav", { class: "settings-nav", "aria-label": "Settings" },
-        el("div", {}, ...navItems)),
+        el("div", {}, ...links)),
       el("div", { class: "settings-col" }, ...sections.map((section) => cards[section.id].section))));
 
   let active = "account";

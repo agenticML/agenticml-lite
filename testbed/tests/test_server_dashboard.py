@@ -364,10 +364,10 @@ def test_workspace_switcher_changes_runs_and_sets_cookie(page, context, tmp_path
         other = workspaces.get_by_role("listitem").filter(has_text="Team A")
         expect(other.get_by_role("button", name="Switch to Team A")).to_be_visible()
         expect(other).to_contain_text("owner")
-        # The Admin link is in the top bar and the Settings nav, not in the card.
+        # The Admin link is in the top bar only: not in the Settings nav or the card.
         expect(page.get_by_role("link", name="Admin", exact=True)).to_be_visible()
-        expect(page.get_by_role("navigation", name="Settings", exact=True).get_by_role(
-            "link", name="Server admin ↗")).to_be_visible()
+        expect(page.get_by_role("navigation", name="Settings", exact=True).locator(
+            'a[href="/admin/"]')).to_have_count(0)
         expect(card.get_by_role("link", name="Admin", exact=True)).to_have_count(0)
         page.set_viewport_size({"width": 375, "height": 812})
         assert_no_overflow(page)
