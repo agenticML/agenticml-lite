@@ -17,12 +17,12 @@ export default defineConfig({
 			favicon: '/favicon.svg',
 			social: [
 				{ icon: 'github', label: 'GitHub', href: 'https://github.com/agenticML/agenticml-lite' },
-				{ icon: 'external', label: 'Sign in', href: 'https://app.agenticml.xyz' },
 			],
 			editLink: {
 				baseUrl: 'https://github.com/agenticML/agenticml-lite/edit/dev/website/',
 			},
 			routeMiddleware: './src/routeData.ts',
+			components: { SocialIcons: './src/components/SocialIcons.astro' },
 			lastUpdated: true,
 			customCss: ['./src/styles/custom.css'],
 			sidebar: [

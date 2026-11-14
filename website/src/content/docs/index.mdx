@@ -11,6 +11,7 @@ hero:
     - text: Sign in to the hosted service
       link: https://app.agenticml.xyz
       icon: external
+      variant: secondary
     - text: View on GitHub
       link: https://github.com/agenticML/agenticml-lite
       icon: github
@@ -19,11 +20,13 @@ hero:
 
 import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
+The PyPI package is 1.0.0, which tracks locally only and cannot sync to the self-hosted server or the hosted service:
+
 ```bash
 pip install agenticml-lite
 ```
 
-This installs 1.0.0, which tracks locally only and cannot sync to the self-hosted server or the hosted service. Version 3.0 adds workspaces and the hosted service to the self-hosted server. It is a pre-release, so install it from GitHub (the command follows the `dev` branch and changes as development continues):
+Version 3.0 adds workspaces and the hosted service to the self-hosted server. It is a pre-release, so install it from GitHub (the command follows the `dev` branch and changes as development continues):
 
 ```bash
 pip install 'agenticml-lite[system] @ git+https://github.com/agenticML/agenticml-lite@dev'

@@ -66,6 +66,19 @@ def test_free_plan_numbers_match_limits_json():
             rf'\(members plus pending invites\), and {workspaces} free '
             r'workspace per account',
         ],
+        # Policy drafts (draft: true until the owner approves them); checked
+        # now so they are right when they are published.
+        'legal/terms.md': [
+            rf'\*\*Workspaces:\*\* {workspaces} free personal workspace',
+            rf'\*\*Storage:\*\* {storage} GB total storage',
+            rf'\*\*Daily uploads:\*\* {upload} GB of uploaded data',
+            rf'\*\*Request rate:\*\* {rpm} requests per minute',
+            rf'\*\*People:\*\* Up to {people} people',
+        ],
+        'legal/privacy.md': [
+            rf'\({storage} GB storage, {upload} GB daily uploads, {rpm} requests per '
+            rf'minute, {people} people\)',
+        ],
     }
     for page, patterns in expected.items():
         text = _text(page)
@@ -84,6 +97,8 @@ def test_minimum_client_matches_default_min_client():
             rf'needs agenticml-lite >= {version}',
         ],
         'releases.md': [rf'requires client version {version} or newer'],
+        'server/install.md': [rf'`AGENTICML_SERVER_MIN_CLIENT_VERSION` \| `{version}` \|'],
+        'server/upgrade.md': [rf'`--min-client-version` \(default {version}\)'],
     }
     for page, patterns in expected.items():
         text = _text(page)
@@ -103,10 +118,12 @@ def test_no_v3_0_0_raw_url_until_published():
     return 404 until the v3.0.0 tag exists (PUBLISHED_3_0 is flipped in 29.9)."""
     if PUBLISHED_3_0:
         return
+    paths = [p for p in sorted(DOCS.rglob('*')) if p.suffix in ('.md', '.mdx')]
+    paths += [ROOT / 'README.md', ROOT / 'docs/SERVER.md', ROOT / 'docs/HOSTED.md',
+              ROOT / 'deploy/systemd/README.md']
     bad = [
         f'{path.relative_to(ROOT)}: {match}'
-        for path in sorted(DOCS.rglob('*'))
-        if path.suffix in ('.md', '.mdx')
+        for path in paths
         for match in re.findall(
             r'raw\.githubusercontent\.com/\S*?/v3\.0\.0/\S*', path.read_text(encoding='utf-8')
         )
@@ -128,7 +145,7 @@ def _login_key_examples(text):
             continue
         if in_fence:
             fence_lines.append(line)
-    fenced = re.sub(r'\\\n', ' ', '\n'.join(fence_lines))
+    fenced = re.sub(r'\\[ \t]*\n', ' ', '\n'.join(fence_lines))
     found += re.findall(r'login[^\n]*--key[^\n]*', fenced)
     outside = '\n'.join(
         line for line in text.split('\n') if not line.lstrip().startswith('```')
@@ -157,6 +174,7 @@ def test_login_key_detector_catches_examples():
     ignore the export filter and prose that only warns about --key."""
     assert _login_key_examples('```bash\nagenticml login --host h --key abc\n```')
     assert _login_key_examples('```bash\nagenticml login --host h \\\n  --key abc\n```')
+    assert _login_key_examples('```bash\nagenticml login --host h \\  \n  --key abc\n```')
     assert _login_key_examples('Run `agenticml login --key abc` now.')
     assert not _login_key_examples('```bash\nagenticml export --key loss\n```')
     assert not _login_key_examples('Use the `agenticml login` prompt. Avoid `--key`.')

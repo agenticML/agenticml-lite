@@ -401,7 +401,10 @@ def normalize_legal_base_url(value):
         raise ValueError("--legal-base-url is not a valid URL") from None
     if parts.scheme != "https" or not host:
         raise ValueError("--legal-base-url must be an https:// URL")
-    if parts.username is not None or parts.password is not None or parts.query or parts.fragment:
+    # An empty query or fragment ("...?" or "...#") parses as "", so check the
+    # characters too: the page names are appended to this string.
+    if (parts.username is not None or parts.password is not None
+            or "?" in value or "#" in value):
         raise ValueError("--legal-base-url must not have credentials, a query, or a fragment")
     return value if value.endswith("/") else value + "/"
 

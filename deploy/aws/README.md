@@ -331,14 +331,14 @@ web and `/setup` return 404.
    account yet, a credential-less account is created. At their first verified
    Firebase sign-in (Google or email/password), the account is linked and they
    land in the workspace as owner.
-4. **Invite team members**: The workspace owner invites team members from the
-   workspace **Team** page. An invite produces a one-time link (72 hours). The
-   person opens it and signs in with Google or email/password using that same
-   email, which must be verified. Inviting someone who already has an account
-   adds the membership directly (no link).
-5. **Issue sync keys**: A workspace admin creates sync keys on the workspace
-   **Keys** page for any member (the person must be a member, i.e. has redeemed
-   their invite or been added directly).
+4. **Invite team members**: The workspace owner invites team members from
+   **Settings > Members** in the workspace. An invite produces a one-time link
+   (72 hours). The person opens it and signs in with Google or email/password
+   using that same email, which must be verified. Inviting someone who already
+   has an account adds the membership directly (no link).
+5. **Issue sync keys**: A workspace admin creates sync keys for any member in
+   **Settings > API keys** in the workspace (the person must be a member, i.e.
+   has redeemed their invite or been added directly).
 6. **Multi-workspace accounts**: With Firebase on, there are no passwords to set;
    adding an existing account to another workspace adds the membership
    directly. (The order rule requiring a user to set their password before being
@@ -458,8 +458,8 @@ never pass passwords with `--stdin` there.
 
 ### Customer workspaces and users (break-glass CLI)
 
-Creating customer workspaces on `/admin`, inviting members from the Team page,
-and issuing sync keys from the Keys page is the standard path. The CLI commands
+Creating customer workspaces on `/admin`, inviting members from **Settings > Members**,
+and issuing sync keys from **Settings > API keys** is the standard path. The CLI commands
 below remain available over ECS Exec as the break-glass path.
 
 All `users` and `keys` commands default to `--workspace default`, so always pass

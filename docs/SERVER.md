@@ -105,7 +105,7 @@ All data on the server is scoped to a workspace.
 - Dashboard APIs: `/api/w/<slug>/...`.
 - Global routes (no workspace prefix): `/account`, `/login`, `/invite`, `/healthz`, and `/admin/workspaces`.
 
-When an account belongs to multiple workspaces, the dashboard provides a workspace switcher in the navigation menu. Navigating to `/` redirects to the last-used workspace or the workspace selection page.
+The workspace switcher is in the **Account** section of the dashboard's **Settings** page. It appears when an account belongs to more than one workspace, when open sign-up is on, or for a server administrator. Navigating to `/` redirects to the last-used workspace or the workspace selection page.
 
 ### Roles and permissions
 
@@ -119,10 +119,10 @@ Every member of a workspace holds one of four roles within that workspace:
 | Issue / revoke own sync keys | – | yes | yes | yes |
 | Manage workspace members and invites | – | – | yes | yes |
 | Issue / revoke keys for any member | – | – | yes | yes |
-| Change workspace settings and rename | – | – | yes | yes |
+| View workspace name, plan and usage (Settings > Workspace) | – | – | yes | yes |
 
-- **`owner`**: The creator of the workspace. A workspace has exactly one owner. The owner cannot be removed or demoted. Only the server operator can transfer ownership (`server workspaces set-owner`) or delete a workspace (`server workspaces delete`).
-- **`admin`**: Full administrative rights within the workspace (members, invites, keys, notes, settings).
+- **`owner`**: The creator of the workspace. A workspace has exactly one owner. The owner cannot be removed or demoted. Only the server operator can rename a workspace (on `/admin` or `PATCH /api/admin/workspaces/<slug>`), transfer ownership (`server workspaces set-owner`) or delete a workspace (`server workspaces delete`).
+- **`admin`**: Full administrative rights within the workspace (members, invites, keys, notes); can view the workspace's plan and usage.
 - **`member`**: Can sync runs, edit notes, and manage their own sync keys.
 - **`viewer`**: Read-only dashboard access. Viewer sync keys can only call `GET /v2/whoami`; all other `/v2` endpoints return `403 Forbidden`.
 

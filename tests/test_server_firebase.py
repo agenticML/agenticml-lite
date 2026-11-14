@@ -884,6 +884,8 @@ def test_firebase_config_has_legal_urls_only_when_set(tmp_path, monkeypatch, bas
     'http://docs.example.org/legal/', 'ftp://docs.example.org/', 'docs.example.org/legal/',
     'javascript:alert(1)', '//docs.example.org/legal/', 'https://', 'https:///legal/',
     'https://docs.example.org/legal/?x=1', 'https://docs.example.org/legal/#a',
+    'https://docs.example.org/legal?', 'https://docs.example.org/legal#',
+    'data:text/html,hi',
     'https://user:pw@docs.example.org/legal/', 'https://docs.example.org/le gal/',
     'https://:443/', 'https://docs.example.org:abc/legal/'])
 def test_legal_base_url_must_be_https(tmp_path, monkeypatch, capsys, base):
