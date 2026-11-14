@@ -413,25 +413,33 @@ the index page) so D1 flips it once.
 - 29.8: home page Sign in action and banner live, still 0 overflow at 375px.
 - 29.9: `pip install agenticml-lite==3.0.0` works and no git install remains.
 
-## Resume notes (Nov 13, 2026)
+## Resume notes (Nov 14, 2026)
 
-Work stopped here at the owner's request; the branch and a draft PR to `dev` hold the state.
+Work paused again at the owner's request. Draft PR [#64](https://github.com/agenticML/agenticml-lite/pull/64) to `dev` holds everything below.
 
-- **Built:** 29.0 (plan), 29.1, 29.2a, 29.3, 29.4 and 29.7. 29.1, 29.2a and 29.3 passed their verifier. 29.4's verifier was stopped before it finished, so run it again. 29.7 passed its verifier after two fix rounds.
-- **Not started:** 29.5 (home page and navigation), 29.2b (375px check over every page in `docs.yml`), 29.2c (`tests/test_website_facts.py`) and 29.8 (promotion). 29.6 and 29.9 stay owner-gated.
-- **Open findings:**
-  - `website/src/content/docs/server/sync.md` ~line 94: the curl URL now points at `main`, but the next line still says to use the tag that matches the installed version. Make the two agree.
-  - 29.4: D5 names a `hosted` label for GitHub Issues, but the repository has none. The pages say "put 'hosted' in the title". Create the label, or keep that wording.
-  - For D1, the open-sign-up sentence also appears in the dated Nov 13 entry on the status page and in `releases.md` (~line 55).
-  - 29.7 (low): the terms and privacy drafts promise that a failed S3 cleanup "is retried by the operator". No runbook step does that yet.
-- **Settings page (merged from `dev`):** package 28 replaced the Keys, Team and Account entries with one Settings page (Account, Workspace, Members, API keys, Activity).
-  - These pages still say **Keys** or **Team**: `hosted/quickstart.md` (lines ~30 and ~106), `hosted/workspaces.md` (~28-30) and `server/keys.md` (~72).
-  - Rewrite them against the merged dashboard and check the button names in `src/agenticml/ui/static/app.js`.
-  - The "Keys page copies the key onto the command line" backlog entry still applies: `key-command` in `app.js`.
+- **Built and verified** (a fresh Sonnet reviewer, up to 2 fix rounds, then commit and push):
+  - 29.1, 29.2a, 29.3 (Nov 13)
+  - the review fixes (commit 602c4e7)
+  - 29.5 (279c884)
+  - 29.8 (1bdaf7f)
+  - 29.2b (2f44a55)
+- **29.4:** its review was re-run on Nov 14. The Settings page wording and the other findings were fixed in 602c4e7.
+- **29.7:** the supervisor's † second review of the server, deploy and sign-in page code found nothing (Nov 14).
+- **29.2c:** `tests/test_website_facts.py` is built and passes (5 tests). The coder showed each test can fail. It has not been reviewed yet.
+- **Settings page sync:** `docs/HOSTED.md`, `docs/SERVER.md` and AWS roadmap step 4.3 now use the Settings page names. `SERVER.md` also says only the operator can transfer or delete a workspace, which matches the code: there is no dashboard or API route for it.
+- **Open findings** (fix these first when resuming):
+  1. **Medium:** `website/src/content/docs/hosted/workspaces.md` ~58 tells users to request workspace deletion in a public GitHub issue with no slug or email, so the operator cannot tell which workspace is meant. The legal drafts say deletion goes to `[[OWNER: contact address]]`. Point to the Privacy policy's contact instead, and keep data out of public issues.
+  2. **Medium:** `docs/SERVER.md` ~108 says the dashboard has a workspace switcher in the navigation menu. It is now in Settings > Account (`workspaceSwitcher` in `app.js`), and it shows only for accounts with more than one workspace.
+  3. **Low:** `docs/SERVER.md` ~119: the roles table says admins and owners can rename a workspace. Only a server admin can (`PATCH /api/admin/workspaces/<slug>`).
+  4. **Low (29.8):** the header Sign in link is icon-only (the `external` glyph) and hidden at 375px. Consider visible text. The hero Sign in action has no `variant`, so it looks as primary as Get started. Use `variant: minimal` or `secondary`.
+  5. **Low (29.5):** on the home page, the bare `pip install agenticml-lite` block comes before the sentence saying it installs 1.0.0 (local only). Put the label first.
+  6. **Low:** `README.md` ~246-248 still uses the `v3.0.0` raw URL, which 404s until 29.9, and says "open Keys". `deploy/aws/README.md` has the stale Team/Keys wording (Backlog entry). Change it only with a `deploy/` change.
 - **Still to do before ready:**
-  - The supervisor reviews the whole diff (this is also the † second review for 29.7).
-  - Run `pytest -q tests`, then `-m ui` from `testbed/`, the Node 22 site build and the 375px check.
-  - Update these rows and mark the PR ready.
-- **Build note:** the site build needs Node 22 (`website/.nvmrc`); Node 20 fails.
+  - Review 29.2c.
+  - Run the full default suite. The run was stopped; the last full run was the 2994-pass baseline before these parts.
+  - Run `-m ui` from `testbed/` and the Node 22 build, and check that the 29.2b overflow step passes in CI on the PR.
+  - The supervisor reads the whole diff once more.
+  - Update the rows, then mark the PR ready.
+- **Build note:** the site build needs Node 22 (`website/.nvmrc`); Node 20 fails. Python venv: a python3.12 venv with `-e '.[dev]' playwright==1.62.0 -e './testbed[test]'`. The worktree's `testbed/.venv` lacks `jwt`.
 
 **Renumbered (Nov 13, 2026):** this package was planned as 28. `dev` merged its own package 28 (the Settings page, [#63](https://github.com/agenticML/agenticml-lite/pull/63)) first, so this one is now 29. Commit subjects on this branch from before the merge still say "28".

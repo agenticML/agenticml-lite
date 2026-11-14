@@ -239,18 +239,18 @@ after 27; 29 after 24.7 and 27, beside 24.3 (29.7 and 29.9 wait on the owner).
 | 26 | Retire agenticml-server | 24 live | Owner | S | – | not started |
 | 27 | Sign-in pages redesigned like agenticml-server (brand panel, logo, Sign in / Sign up tabs) | 18b | Sonnet | S | [plan](packages/27-sign-in-redesign.md) | done ([#57](https://github.com/agenticML/agenticml-lite/pull/57)) |
 | 28 | One Settings page: Account, Workspace, Members, API keys and Activity replace the Keys, Team and Account entries (like agenticml-server) | 27 | Sonnet | M | [plan](packages/28-settings-page.md) | in review ([#63](https://github.com/agenticML/agenticml-lite/pull/63)) |
-| 29 | Docs site: Releases page (1.0–3.0), hosted service section with status, home page, truth fixes, docs CI, policies and sign-in links | 24.7, 27 | Sonnet; prose Antigravity | M | [plan](packages/29-docs-site.md) | in progress: 29.0, 29.1, 29.2a, 29.3, 29.4, 29.7 built; 29.5, 29.2b, 29.2c, 29.8 next (see the plan's "Resume notes") |
-| 29.0 | Plan, roadmap rows, AWS roadmap Phase 7, Backlog entries | – | Supervisor | S | [plan](packages/29-docs-site.md) | done (this PR) |
-| 29.1 | Truth fixes in existing pages and README | 29.0 | Sonnet | S | [plan](packages/29-docs-site.md) | built, verifier passed; supervisor review pending |
-| 29.2a | Docs CI: PR builds, link validator, Node pin, job permissions and concurrency | 29.1 | Sonnet | S | [plan](packages/29-docs-site.md) | built, verifier passed; supervisor review pending |
-| 29.3 | Releases page (1.0, 2.0, 2.1, 2.2, 3.0) | 29.2a | Antigravity; Sonnet | S | [plan](packages/29-docs-site.md) | built, verifier passed after one fix round; supervisor review pending |
-| 29.4 | Hosted service section: overview and limits, quickstart, workspaces, service status | 29.3 | Antigravity; Sonnet | M | [plan](packages/29-docs-site.md) | built; verifier review stopped before it finished; review pending |
-| 29.5 | Home page and navigation | 29.4 | Sonnet | S | [plan](packages/29-docs-site.md) | plan ready |
-| 29.2b | 375px overflow check over every built page, in `docs.yml` | 29.5 | Sonnet | S | [plan](packages/29-docs-site.md) | plan ready |
-| 29.2c | Facts test: limits, minimum client, no unpublished tag URLs, no `login --key` | 29.4 | Sonnet | S | [plan](packages/29-docs-site.md) | plan ready |
+| 29 | Docs site: Releases page (1.0–3.0), hosted service section with status, home page, truth fixes, docs CI, policies and sign-in links | 24.7, 27 | Sonnet; prose Antigravity | M | [plan](packages/29-docs-site.md) | in progress ([#64](https://github.com/agenticML/agenticml-lite/pull/64), draft): every buildable part built; open findings, full-suite run and 29.2c review left (see the plan's "Resume notes") |
+| 29.0 | Plan, roadmap rows, AWS roadmap Phase 7, Backlog entries | – | Supervisor | S | [plan](packages/29-docs-site.md) | done ([#64](https://github.com/agenticML/agenticml-lite/pull/64)) |
+| 29.1 | Truth fixes in existing pages and README | 29.0 | Sonnet | S | [plan](packages/29-docs-site.md) | built, verifier passed ([#64](https://github.com/agenticML/agenticml-lite/pull/64)) |
+| 29.2a | Docs CI: PR builds, link validator, Node pin, job permissions and concurrency | 29.1 | Sonnet | S | [plan](packages/29-docs-site.md) | built, verifier passed ([#64](https://github.com/agenticML/agenticml-lite/pull/64)) |
+| 29.3 | Releases page (1.0, 2.0, 2.1, 2.2, 3.0) | 29.2a | Antigravity; Sonnet | S | [plan](packages/29-docs-site.md) | built, verifier passed ([#64](https://github.com/agenticML/agenticml-lite/pull/64)) |
+| 29.4 | Hosted service section: overview and limits, quickstart, workspaces, service status | 29.3 | Antigravity; Sonnet | M | [plan](packages/29-docs-site.md) | built; re-reviewed Nov 14 and fixed for the Settings page; two medium findings open ([#64](https://github.com/agenticML/agenticml-lite/pull/64)) |
+| 29.5 | Home page and navigation | 29.4 | Sonnet | S | [plan](packages/29-docs-site.md) | built, verifier passed ([#64](https://github.com/agenticML/agenticml-lite/pull/64)) |
+| 29.2b | 375px overflow check over every built page, in `docs.yml` | 29.5 | Sonnet | S | [plan](packages/29-docs-site.md) | built, verifier passed; first CI run on the PR pending ([#64](https://github.com/agenticML/agenticml-lite/pull/64)) |
+| 29.2c | Facts test: limits, minimum client, no unpublished tag URLs, no `login --key` | 29.4 | Sonnet | S | [plan](packages/29-docs-site.md) | built, passes; not yet reviewed ([#64](https://github.com/agenticML/agenticml-lite/pull/64)) |
 | 29.6 | Publish: docs-only PR to `main`; Pages HTTPS, repo description and homepage | 29.1–29.5, 29.2a–c, D3 | git agent; owner | S | [plan](packages/29-docs-site.md) | not started |
-| 29.7 † | Terms, acceptable use and privacy policy on the site; links on the sign-in and invite pages | 29.6 | Antigravity; owner and lawyer approve; Sonnet | M | [plan](packages/29-docs-site.md) | built: draft policies on the site, opt-in links (`HOSTED_LEGAL_BASE_URL` unset); drafts await owner and lawyer; supervisor † review pending |
-| 29.8 | Promotion: Sign in action, banner, header link | 29.7 | Sonnet | S | [plan](packages/29-docs-site.md) | not started |
+| 29.7 † | Terms, acceptable use and privacy policy on the site; links on the sign-in and invite pages | 29.6 | Antigravity; owner and lawyer approve; Sonnet | M | [plan](packages/29-docs-site.md) | built: draft policies on the site, opt-in links (`HOSTED_LEGAL_BASE_URL` unset); † second review by the supervisor, no findings; drafts await owner and lawyer |
+| 29.8 | Promotion: Sign in action, banner, header link | 29.7 | Sonnet | S | [plan](packages/29-docs-site.md) | built, verifier passed; live only after 29.6 (publishing waits for the policies, D1) ([#64](https://github.com/agenticML/agenticml-lite/pull/64)) |
 | 29.9 | After PyPI 3.0.0: `pip install`, tag URLs, release dates, `pyproject.toml` URLs | owner release | Sonnet | S | [plan](packages/29-docs-site.md) | blocked: 3.0.0 not on PyPI |
 
 Getting the hosted service live on AWS, step by step: [AWS deployment roadmap](aws-deployment-roadmap.md).
@@ -329,6 +329,16 @@ Getting the hosted service live on AWS, step by step: [AWS deployment roadmap](a
 Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
+
+- **Stale dashboard wording in the AWS runbook** (package 29, found in review).
+  - Where: `deploy/aws/README.md` lines 335, 340, 461 and 462.
+  - Problem: it still refers to the Team page and the Keys page, which the
+    single Settings page replaced (package 28).
+  - Fix: say **Settings > Members** and **Settings > API keys**. Do it in the
+    next change that touches `deploy/` (29.7 or 29.9), because a `deploy/` edit
+    triggers a hosted deploy.
+  - Done when: `grep -nE "(Team|Keys)\*{0,2} page" deploy/aws/README.md` finds
+    nothing.
 
 - **Hosted launch and rolling-upload verification** (package 24.3, owner).
   - Where: `deploy/aws/README.md`, sections Prerequisites through Upgrades.

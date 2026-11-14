@@ -76,8 +76,10 @@ For Linux production systems, run the server as a systemd system service. See [d
 sudo python3 -m venv /opt/agenticml
 sudo /opt/agenticml/bin/python -m pip install agenticml-lite
 sudo useradd --system --home /var/lib/agenticml-server --shell /usr/sbin/nologin agenticml
-sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v3.0.0/deploy/systemd/agenticml-server.service
+sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/main/deploy/systemd/agenticml-server.service
 ```
+
+The unit is fetched from `main` because there is no 3.0 tag yet. Once 3.0.0 is released, use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`).
 
 Edit `/etc/systemd/system/agenticml-server.service` or use `sudo systemctl edit agenticml-server` to set `AGENTICML_SERVER_PUBLIC_URL`. Then enable and start the service:
 
@@ -118,9 +120,8 @@ Every member of a workspace holds one of four roles within that workspace:
 | Manage workspace members and invites | – | – | yes | yes |
 | Issue / revoke keys for any member | – | – | yes | yes |
 | Change workspace settings and rename | – | – | yes | yes |
-| Delete workspace | – | – | – | yes |
 
-- **`owner`**: The creator of the workspace. A workspace has exactly one owner. The owner cannot be removed or demoted. Ownership can be transferred with `server workspaces set-owner`.
+- **`owner`**: The creator of the workspace. A workspace has exactly one owner. The owner cannot be removed or demoted. Only the server operator can transfer ownership (`server workspaces set-owner`) or delete a workspace (`server workspaces delete`).
 - **`admin`**: Full administrative rights within the workspace (members, invites, keys, notes, settings).
 - **`member`**: Can sync runs, edit notes, and manage their own sync keys.
 - **`viewer`**: Read-only dashboard access. Viewer sync keys can only call `GET /v2/whoami`; all other `/v2` endpoints return `403 Forbidden`.

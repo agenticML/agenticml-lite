@@ -107,8 +107,8 @@ The standard path is self-serve administration from `/admin` and the workspace d
 
 1. **Create workspace**: On `/admin`, click **New workspace** and enter the slug, name, and owner email (e.g. `customer@example.com`). If no account exists for that email yet, a credential-less account is created.
 2. **Owner sign-in**: The owner signs in with a verified Firebase sign-in (Google or verified email/password using that email). The first verified sign-in links the account and places them in the workspace as owner.
-3. **Invite team members**: The workspace owner invites team members from the workspace **Team** page. An invite generates a one-time link (valid 72 hours). The invitee signs in with Google or email/password using that exact email, which must be verified. Inviting someone who already has an account adds the membership directly without generating an invite link.
-4. **Issue sync keys**: A workspace admin creates sync API keys on the workspace **Keys** page for any member (the person must already be a workspace member).
+3. **Invite team members**: The workspace owner invites team members from **Settings > Members**. An invite generates a one-time link (valid 72 hours). The invitee signs in with Google or email/password using that exact email, which must be verified. Inviting someone who already has an account adds the membership directly without generating an invite link.
+4. **Issue sync keys**: A workspace admin creates sync API keys under **Settings > API keys** for any member (the person must already be a workspace member).
 5. **Multi-workspace accounts**: With Firebase on, there are no passwords to set; adding an account to additional workspaces attaches the membership directly. (The order rule requiring a user to set their password before being added to a second workspace applies to password sign-in only.)
 
 ### Break-glass CLI workspace creation
@@ -203,8 +203,8 @@ All workspace deletions write a permanent entry to the server audit log.
 Server administrators do **not** have ambient access to customer data. A server administrator navigating to `/w/<customer-slug>/` receives HTTP `404 Not Found` unless they are a member of that workspace.
 
 To grant support access:
-1. The customer must explicitly invite the support account (e.g. `support@agenticml.xyz`) as a `member` or `admin` through the workspace Team settings page.
-2. The invitation acceptance and all subsequent actions performed by support personnel are recorded in the workspace audit log (`/w/<slug>/team` and `server audit`).
+1. The customer must explicitly invite the support account (e.g. `support@agenticml.xyz`) as a `member` or `admin` through **Settings > Members**.
+2. The invitation acceptance and all subsequent actions performed by support personnel are recorded in the workspace audit log (**Settings > Activity** and `server audit`).
 3. Once support is complete, the customer removes the support account from their workspace members list.
 
 ## Backup and disaster recovery
