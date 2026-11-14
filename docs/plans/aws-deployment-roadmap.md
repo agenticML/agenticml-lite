@@ -85,8 +85,8 @@ in the PR that records a result.
 Next: step 4.2b (the owner signs in with Google; package 24.7 is live), then
 4.3 on `/admin` and each workspace's Settings page, then 4.4. Package
 [24.11](packages/24.11-phase-4-wrap-up.md) lets 4.4 use one local store for
-both workspaces and removes the "Invite link" button that cannot work with
-Firebase. Open sign-up was turned on early (Nov 13, 2026); the terms,
+both workspaces and removes the member "Invite link" button, which fails
+with 403 for most members on Firebase. Open sign-up was turned on early (Nov 13, 2026); the terms,
 acceptable use and privacy policies and their sign-in page links are Phase 7
 work (7.3, 7.4).
 

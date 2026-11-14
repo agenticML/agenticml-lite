@@ -611,23 +611,28 @@ an HTTP 404 response when attempting to access its dashboard.
 
 ### Sync state isolation between workspaces
 
-Sync state (`runs/<id>/sync.json`) is keyed by server hostname, not by
-workspace. If a single local store (`AGENTICML_DIR`) attempts to sync the same
-run to two workspaces on the same host, the second sync reports "up to date" and
-uploads nothing.
+A single local store (`AGENTICML_DIR`) can sync the same run to multiple
+workspaces on the same host. On 3.0 servers, sync state in `runs/<id>/sync.json`
+is keyed by host and workspace (such as `https://app.agenticml.xyz/w/customer-one`).
+Because each workspace maintains its own cursor, syncing to a second workspace
+uploads the run instead of reporting "up to date".
 
-Always maintain one `AGENTICML_DIR` per workspace (e.g.
-`$HOME/.agenticml-customer-one` and `$HOME/.agenticml-customer-two`).
-
-If you need to push a single local run to a second workspace from the same store,
-switch the shell to the second workspace's key (read with `read -rsp` as above,
-so the key stays out of shell history), then reset the run's cursor for this
-host and sync it again:
+To push a run to a second workspace from the same store, switch the shell to the
+second workspace's key (read with `read -rsp` as above, so the key stays out of
+shell history) and sync:
 
 ```sh
-agenticml sync <RUN_ID> --reset
+read -rsp 'customer-two sync key: ' AGENTICML_API_KEY; export AGENTICML_API_KEY; echo
 agenticml sync <RUN_ID>
 ```
+
+Running `agenticml sync <RUN_ID> --reset` forgets every cursor for that host
+across all workspaces; the next sync recovers state from the server.
+
+Older clients (installed before package 24.11, or 2.x clients) keep only one
+cursor per server host. With older clients, maintain one `AGENTICML_DIR` per
+workspace (e.g. `$HOME/.agenticml-customer-one` and `$HOME/.agenticml-customer-two`),
+or run `agenticml sync <RUN_ID> --reset` before syncing with the second key.
 
 ## Upgrades, rollback and config
 
