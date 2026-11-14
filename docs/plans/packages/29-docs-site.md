@@ -348,6 +348,9 @@ the index page) so D1 flips it once.
   preview. 3.0 installs from GitHub until it is on PyPI."
 - A "Sign in" link in the header as a second `social` entry pointing at
   `https://app.agenticml.xyz`.
+  *Changed in review (Nov 14):* a `social` entry is icon-only, so the link
+  is a visible text link from a `SocialIcons` override
+  (`website/src/components/SocialIcons.astro`) instead.
 - Check: the built `/` and `/guides/python-sdk/` pages contain the banner
   text and the Sign in link (a step in the 29.2b script), and the overflow
   check passes.
@@ -413,33 +416,21 @@ the index page) so D1 flips it once.
 - 29.8: home page Sign in action and banner live, still 0 overflow at 375px.
 - 29.9: `pip install agenticml-lite==3.0.0` works and no git install remains.
 
-## Resume notes (Nov 14, 2026)
+## Status (Nov 14, 2026)
 
-Work paused again at the owner's request. Draft PR [#64](https://github.com/agenticML/agenticml-lite/pull/64) to `dev` holds everything below.
+Resumed and finished on draft PR [#64](https://github.com/agenticML/agenticml-lite/pull/64) to `dev`; ready for the owner to merge.
 
-- **Built and verified** (a fresh Sonnet reviewer, up to 2 fix rounds, then commit and push):
-  - 29.1, 29.2a, 29.3 (Nov 13)
-  - the review fixes (commit 602c4e7)
-  - 29.5 (279c884)
-  - 29.8 (1bdaf7f)
-  - 29.2b (2f44a55)
-- **29.4:** its review was re-run on Nov 14. The Settings page wording and the other findings were fixed in 602c4e7.
-- **29.7:** the supervisor's † second review of the server, deploy and sign-in page code found nothing (Nov 14).
-- **29.2c:** `tests/test_website_facts.py` is built and passes (5 tests). The coder showed each test can fail. It has not been reviewed yet.
-- **Settings page sync:** `docs/HOSTED.md`, `docs/SERVER.md` and AWS roadmap step 4.3 now use the Settings page names. `SERVER.md` also says only the operator can transfer or delete a workspace, which matches the code: there is no dashboard or API route for it.
-- **Open findings** (fix these first when resuming):
-  1. **Medium:** `website/src/content/docs/hosted/workspaces.md` ~58 tells users to request workspace deletion in a public GitHub issue with no slug or email, so the operator cannot tell which workspace is meant. The legal drafts say deletion goes to `[[OWNER: contact address]]`. Point to the Privacy policy's contact instead, and keep data out of public issues.
-  2. **Medium:** `docs/SERVER.md` ~108 says the dashboard has a workspace switcher in the navigation menu. It is now in Settings > Account (`workspaceSwitcher` in `app.js`), and it shows only for accounts with more than one workspace.
-  3. **Low:** `docs/SERVER.md` ~119: the roles table says admins and owners can rename a workspace. Only a server admin can (`PATCH /api/admin/workspaces/<slug>`).
-  4. **Low (29.8):** the header Sign in link is icon-only (the `external` glyph) and hidden at 375px. Consider visible text. The hero Sign in action has no `variant`, so it looks as primary as Get started. Use `variant: minimal` or `secondary`.
-  5. **Low (29.5):** on the home page, the bare `pip install agenticml-lite` block comes before the sentence saying it installs 1.0.0 (local only). Put the label first.
-  6. **Low:** `README.md` ~246-248 still uses the `v3.0.0` raw URL, which 404s until 29.9, and says "open Keys". `deploy/aws/README.md` has the stale Team/Keys wording (Backlog entry). Change it only with a `deploy/` change.
-- **Still to do before ready:**
-  - Review 29.2c.
-  - Run the full default suite. The run was stopped; the last full run was the 2994-pass baseline before these parts.
-  - Run `-m ui` from `testbed/` and the Node 22 build, and check that the 29.2b overflow step passes in CI on the PR.
-  - The supervisor reads the whole diff once more.
-  - Update the rows, then mark the PR ready.
-- **Build note:** the site build needs Node 22 (`website/.nvmrc`); Node 20 fails. Python venv: a python3.12 venv with `-e '.[dev]' playwright==1.62.0 -e './testbed[test]'`. The worktree's `testbed/.venv` lacks `jwt`.
+- **Merged `dev`** (24.10, archive and restore workspaces on `/admin`) with no conflicts.
+- **Open findings fixed** (Sonnet review clean):
+  1. `hosted/workspaces.md`: a deletion request is a public issue with no private data; the operator confirms the workspace privately. Once the Privacy policy is published, requests go to its contact.
+  2. `docs/SERVER.md`: the workspace switcher is in Settings > Account and shows for more than one workspace, open sign-up or a server admin (`workspaceSwitcher` in `app.js`).
+  3. `docs/SERVER.md`: the roles table no longer says admins and owners can rename; only a server admin can (on `/admin`).
+  4. 29.8: the header has a visible "Sign in" text link (a `SocialIcons` override, `website/src/components/SocialIcons.astro`; in the mobile menu footer at 375px). The hero Sign in action is `secondary`.
+  5. 29.5: the 1.0.0 label now comes before the bare `pip install`.
+  6. `deploy/aws/README.md` uses Settings > Members and Settings > API keys; that Backlog entry is closed. `README.md` already fetched the unit from `main`.
+- **29.2c reviewed** (Sonnet): the test now also checks the minimum client on `server/install.md` and `server/upgrade.md`, the free-plan numbers in the Terms and Privacy drafts, `v3.0.0` raw URLs in `README.md`, `docs/SERVER.md`, `docs/HOSTED.md` and `deploy/systemd/README.md`, and continuation lines with trailing spaces. Each new check was shown to fail on changed facts.
+- **29.7 † second review by Cursor** (the earlier supervisor review does not count as the second review): safe; one low finding fixed, since a trailing `?` or `#` passed the query/fragment check (`normalize_legal_base_url` now rejects both characters; tests added). Cursor's re-check: clean.
+- **Checks:** see the PR description for the test runs. The site build (Node 26 locally, `.nvmrc` 22 in CI) passes with 0 link errors; the overflow check passes on 21 pages × 2 themes.
+- **Left for the owner:** merge (it triggers a hosted deploy that needs approval), the policy drafts with a lawyer, `HOSTED_LEGAL_BASE_URL`, the `hosted` issue label (D5), 29.6 and 29.9.
 
 **Renumbered (Nov 13, 2026):** this package was planned as 28. `dev` merged its own package 28 (the Settings page, [#63](https://github.com/agenticML/agenticml-lite/pull/63)) first, so this one is now 29. Commit subjects on this branch from before the merge still say "28".
