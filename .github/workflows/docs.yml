@@ -41,6 +41,17 @@ jobs:
           npm ci
           npm run build
 
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-1.62.0-${{ runner.os }}
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Check overflow at 375px
+        run: npm run check:overflow
+
       - uses: actions/upload-pages-artifact@v5
         if: github.event_name != 'pull_request'
         with:
