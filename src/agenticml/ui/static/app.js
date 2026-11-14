@@ -5293,10 +5293,15 @@ async function adminPage(version) {
   crumb.setAttribute("href", "/admin/");
   crumb.textContent = "agenticml / admin";
   const content = el("div", { class: "table-scroll" });
+  const archivedTable = el("div", { class: "table-scroll" });
+  const archivedSection = el("div", { class: "stack", hidden: true },
+    el("div", { class: "heading" }, el("h2", { text: "Archived" })),
+    archivedTable);
   const admins = el("div", { class: "table-scroll" });
   const activity = el("div", { class: "table-scroll" });
   const notice = el("p", { class: "muted", role: "status", "aria-live": "polite", hidden: true });
   const columns = ["Slug", "Name", "Status", "Plan", "Storage", "Uploads today", "People", "Members", "Created", "Actions"];
+  const archivedColumns = ["Slug", "Name", "Plan", "Storage", "Archived", "Actions"];
   const adminColumns = ["Login", "Source", "Sign-in", "Actions"];
   const activityColumns = ["Time", "Actor", "Action", "Target", "Client"];
 
@@ -5568,6 +5573,42 @@ async function adminPage(version) {
     body.querySelector("button")?.focus();
   }
 
+  function archiveWorkspace(workspace) {
+    const { host, body, error } = dialog(`Archive ${workspace.slug}?`);
+    const confirm = button("Archive", async () => {
+      error.hidden = true;
+      confirm.disabled = true;
+      try {
+        await write(`${patchUrl(workspace.slug)}/archive`, "POST", {});
+      } catch (reason) {
+        failure(error, reason);
+        if (reason.name !== "AbortError") confirm.disabled = false;
+        return;
+      }
+      host.close();
+      say(`Archived ${workspace.slug}.`);
+      await refreshAfterAction();
+    }, "primary");
+    body.append(
+      el("p", {
+        text: "Nobody can open or sync to it until it is restored. Its data is kept.",
+      }),
+      el("div", { class: "inline" }, button("Cancel", () => host.close(), "secondary"), confirm));
+    host.showModal();
+    body.querySelector("button")?.focus();
+  }
+
+  async function restoreWorkspace(workspace) {
+    try {
+      await write(`${patchUrl(workspace.slug)}/restore`, "POST", {});
+    } catch (reason) {
+      if (epoch === version && !disposed) showError(archivedTable, reason);
+      return;
+    }
+    say(`Restored ${workspace.slug}; it is suspended until you resume it.`);
+    await refreshAfterAction();
+  }
+
   function signinCell(admin) {
     switch (admin.signin) {
       case "firebase": return "Firebase";
@@ -5690,7 +5731,7 @@ async function adminPage(version) {
       typeof row.slug !== "string" || typeof row.name !== "string" ||
       typeof row.status !== "string"))
       throw new Error(`Could not load workspaces (${listResponse.status})`);
-    const rows = data.workspaces.map((workspace) => {
+    const rows = data.workspaces.filter((workspace) => !workspace.archived_at).map((workspace) => {
       const isDefault = workspace.slug === "default";
       const values = [
         workspace.slug,
@@ -5711,7 +5752,8 @@ async function adminPage(version) {
               workspace, workspace.status === "suspended" ? "active" : "suspended"),
             "secondary",
             { disabled: isDefault },
-          )),
+          ),
+          ...(isDefault ? [] : [button("Archive", () => archiveWorkspace(workspace), "secondary")])),
       ];
       return el("tr", { role: "row" }, ...values.map((value, index) =>
         el("td", { role: "cell", "data-label": columns[index] }, value)));
@@ -5720,6 +5762,28 @@ async function adminPage(version) {
       el("thead", { role: "rowgroup" }, el("tr", { role: "row" },
         ...columns.map((text) => el("th", { role: "columnheader", scope: "col", text })))),
       el("tbody", { role: "rowgroup" }, ...rows)));
+    const archived = data.workspaces.filter((workspace) => workspace.archived_at);
+    archivedSection.hidden = archived.length === 0;
+    if (archived.length) {
+      const archivedRows = archived.map((workspace) => {
+        const values = [
+          workspace.slug,
+          workspace.name,
+          workspace.plan || "free",
+          formatGb(workspace.stored_bytes ?? 0),
+          date(workspace.archived_at),
+          el("div", { class: "team-actions" },
+            button("Restore", () => restoreWorkspace(workspace), "secondary")),
+        ];
+        return el("tr", { role: "row" }, ...values.map((value, index) =>
+          el("td", { role: "cell", "data-label": archivedColumns[index] }, value)));
+      });
+      archivedTable.replaceChildren(el("table", {
+        class: "keys-table", role: "table", "aria-label": "Archived workspaces" },
+      el("thead", { role: "rowgroup" }, el("tr", { role: "row" },
+        ...archivedColumns.map((text) => el("th", { role: "columnheader", scope: "col", text })))),
+      el("tbody", { role: "rowgroup" }, ...archivedRows)));
+    } else archivedTable.replaceChildren();
     const adminData = await adminsResponse.json().catch(() => null);
     if (epoch !== version || sequence !== refreshSequence || disposed) return;
     if (adminsResponse.ok && Array.isArray(adminData?.server_admins) &&
@@ -5751,6 +5815,7 @@ async function adminPage(version) {
         createButton)),
     notice,
     content,
+    archivedSection,
     el("div", { class: "stack" },
       el("div", { class: "heading" },
         el("h2", { text: "Server admins" }),
