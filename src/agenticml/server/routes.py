@@ -100,6 +100,10 @@ _ROUTES.extend([
     _r("GET", r"/api/admin/workspaces", "server_admin", None, "admin_workspaces", "admin_workspaces_list"),
     _r("POST", r"/api/admin/workspaces", "server_admin", None, "admin_workspaces", "admin_workspaces_create"),
     _r("PATCH", r"/api/admin/workspaces/" + _SLUG, "server_admin", None, "admin_workspaces", "admin_workspaces_patch"),
+    _r("POST", r"/api/admin/workspaces/" + _SLUG + r"/archive", "server_admin", None,
+       "admin_workspaces", "admin_workspaces_archive"),
+    _r("POST", r"/api/admin/workspaces/" + _SLUG + r"/restore", "server_admin", None,
+       "admin_workspaces", "admin_workspaces_restore"),
     _r("GET", r"/api/admin/server-admins", "server_admin", None,
        "admin_server_admins", "admin_server_admins_list"),
     _r("POST", r"/api/admin/server-admins", "server_admin", None,
@@ -456,6 +460,7 @@ def _admin_public(row, extra=None):
         "plan": row.get("plan") or "free",
         "stored_bytes": 0, "uploads_today": 0, "people": 0,
         "limits": _decoded_limits(row),
+        "archived_at": row.get("archived_at"),
     }
     if extra:
         payload.update(extra)
@@ -505,7 +510,7 @@ def _discard_pending_owner(handler, accounts, login):
 
 
 def _admin_workspaces(webauth, handler, route, match):
-    from .db.workspaces import AccountRepo, WorkspaceRepo, is_email_login
+    from .db.workspaces import AccountRepo, WorkspaceRepo, WorkspaceStateError, is_email_login
     from .keys import ClientError
     from .keyspage import read_json
     from .webauth import LOGIN_BODY_MAX
@@ -517,6 +522,10 @@ def _admin_workspaces(webauth, handler, route, match):
         handler._json({"workspaces": [
             _admin_public(row, _admin_usage_fields(handler, row)) for row in repo.list()]},
                       headers=webauth._headers())
+        return
+    if handler.command == "POST" and route.name in (
+            "admin_workspaces_archive", "admin_workspaces_restore"):
+        _admin_workspace_archive(webauth, handler, repo, route, match.groupdict()["slug"])
         return
     if handler.command == "POST":
         payload = read_json(handler, LOGIN_BODY_MAX)
@@ -622,6 +631,9 @@ def _admin_workspaces(webauth, handler, route, match):
             try:
                 before = repo.get(slug)
                 row = repo.update(slug, name=name, new_slug=new_slug, status=status)
+            except WorkspaceStateError as exc:
+                handler._json({"error": str(exc)}, 409, webauth._headers())
+                return
             except ClientError as exc:
                 message = str(exc)
                 handler._json({"error": message}, 404 if message == "unknown workspace" else 400,
@@ -648,6 +660,42 @@ def _admin_workspaces(webauth, handler, route, match):
         return
     handler.close_connection = True
     handler._json({"error": "method not allowed"}, 405, webauth._headers())
+
+
+def _admin_workspace_archive(webauth, handler, repo, route, slug):
+    """Archive or restore a workspace (server admins only)."""
+    from .db.workspaces import WorkspaceStateError
+    from .keys import ClientError
+    from .keyspage import read_json
+    from .webauth import LOGIN_BODY_MAX
+
+    headers = webauth._headers()
+    principal = handler.principal
+    payload = read_json(handler, LOGIN_BODY_MAX)
+    if payload is None:
+        return
+    archiving = route.name == "admin_workspaces_archive"
+    try:
+        if archiving:
+            row = repo.archive(slug)
+        else:
+            row = repo.restore(slug, getattr(handler.server, "plans", None))
+    except WorkspaceStateError as exc:
+        handler._json({"error": str(exc)}, 409, headers)
+        return
+    except ClientError as exc:
+        message = str(exc)
+        handler._json({"error": message}, 404 if message == "unknown workspace" else 400, headers)
+        return
+    try:
+        _server_audit(handler).record(
+            principal.user, principal.via, "workspace.archive" if archiving else "workspace.restore",
+            row["id"], webauth.client_address(handler), {"slug": row["slug"]})
+    except Exception:
+        pass
+    members = next((item.get("members", 0) for item in repo.list() if item["id"] == row["id"]), 0)
+    handler._json({"workspace": _admin_public(
+        {**row, "members": members}, _admin_usage_fields(handler, row))}, headers=headers)
 
 
 _LIST_RETURN_NOTE = (

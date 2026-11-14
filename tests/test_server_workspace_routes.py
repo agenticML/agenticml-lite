@@ -65,6 +65,13 @@ def test_route_table_lists_workspace_and_sync():
     assert any(route.name == "account_session" for route in table)
     assert any(route.name == "home" and route.pattern == r"/" for route in table)
     assert any(route.scope == "server_admin" and "/api/admin/workspaces" in route.pattern for route in table)
+    ws_routes = {route.name: route for route in table
+                 if route.scope == "server_admin" and "/api/admin/workspaces" in route.pattern}
+    assert {name: route.method for name, route in ws_routes.items()} == {
+        "admin_workspaces_list": "GET", "admin_workspaces_create": "POST",
+        "admin_workspaces_patch": "PATCH", "admin_workspaces_archive": "POST",
+        "admin_workspaces_restore": "POST"}
+    assert all(route.handler == "admin_workspaces" for route in ws_routes.values())
     admins = {route.name: route for route in table if "/api/admin/server-admins" in route.pattern}
     assert {name: route.method for name, route in admins.items()} == {
         "admin_server_admins_list": "GET", "admin_server_admins_add": "POST",
