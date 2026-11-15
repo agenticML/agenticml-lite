@@ -13,12 +13,12 @@ The hosted service is the agenticml server, run for you at `https://app.agenticm
 It runs the same open-source server code as the [self-hosted server](/agenticml-lite/server/).
 
 :::note[Public preview]
-The hosted service is a public preview. It runs on a best-effort basis, with no SLA. The terms of service, acceptable use policy and privacy policy are not published yet. It runs one server task and a database in one availability zone, so an outage is possible. See the [service status](/agenticml-lite/hosted/status/) page for what has been checked and what has not.
+The hosted service is a public preview. It runs on a best-effort basis, with no SLA. It runs one server task and a database in one availability zone, so an outage is possible. See the [service status](/agenticml-lite/hosted/status/) page for what has been checked and what has not.
 :::
 
 ## Sign-up
 
-Open sign-up is on as of Nov 13, 2026. Sign in with a verified Google or email account, and if you have no account yet you get one free personal workspace. If sign-up is turned off, you need an invite from a workspace admin.
+Open sign-up is on as of Nov 13, 2026. By signing up you agree to the [terms of service](/agenticml-lite/legal/terms/), [acceptable use policy](/agenticml-lite/legal/acceptable-use/) and [privacy policy](/agenticml-lite/legal/privacy/). Sign in with a verified Google or email account, and if you have no account yet you get one free personal workspace. If sign-up is turned off, you need an invite from a workspace admin.
 
 ## Local, self-hosted or hosted
 
@@ -60,7 +60,7 @@ The dashboard warns you when storage or daily uploads pass 80% of the limit. `ag
 
 ## Support
 
-Use [GitHub Issues](https://github.com/agenticML/agenticml-lite/issues) and put "hosted" in the title. Issues are public, so do not post sync keys, run data or other private details. A mailbox for support is not set up yet.
+Use [GitHub Issues](https://github.com/agenticML/agenticml-lite/issues) and put "hosted" in the title. Issues are public, so do not post sync keys, run data or other private details. For legal, privacy and deletion requests, email [support@agenticml.xyz](mailto:support@agenticml.xyz).
 
 ## Next steps
 

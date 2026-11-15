@@ -66,11 +66,10 @@ def test_free_plan_numbers_match_limits_json():
             rf'\(members plus pending invites\), and {workspaces} free '
             r'workspace per account',
         ],
-        # Policy drafts (draft: true until the owner approves them); checked
-        # now so they are right when they are published.
+        # Published policies: their limits must match deploy/aws/limits.json.
         'legal/terms.md': [
-            rf'\*\*Workspaces:\*\* {workspaces} free personal workspace',
-            rf'\*\*Storage:\*\* {storage} GB total storage',
+            rf'\*\*Workspaces:\*\* Each account can own {workspaces} free workspace',
+            rf'\*\*Storage:\*\* {storage} GB \(decimal, ',
             rf'\*\*Daily uploads:\*\* {upload} GB of uploaded data',
             rf'\*\*Request rate:\*\* {rpm} requests per minute',
             rf'\*\*People:\*\* Up to {people} people',

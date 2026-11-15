@@ -32,6 +32,7 @@ export default defineConfig({
 				{ label: 'Server', items: [{ autogenerate: { directory: 'server' } }] },
 				{ label: 'Reference', items: [{ autogenerate: { directory: 'reference' } }] },
 				{ label: 'Releases', slug: 'releases' },
+				{ label: 'Legal', items: [{ autogenerate: { directory: 'legal' } }] },
 			],
 		}),
 	],
