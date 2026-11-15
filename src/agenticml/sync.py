@@ -123,16 +123,95 @@ def _save_state(reader, host, state):
 
 
 def _clear_host_state(reader, host):
-    # ``pruned`` / ``pruned_hosts`` stay. Reset must not make a pruned run
-    # look like it still has its raw series.
+    # Forgets every workspace's cursor on this host; the next sync rebuilds
+    # each from the server's /state. ``pruned`` / ``pruned_hosts`` stay:
+    # reset must not make a pruned run look like it still has its raw series.
     path = reader.run_dir / "sync.json"
     if not path.exists():
         return
     data = _load_state(reader)
-    if host not in data.get("hosts", {}):
+    names = _host_keys(data["hosts"], host)
+    if not names:
         return
-    data["hosts"].pop(host, None)
+    for name in names:
+        data["hosts"].pop(name, None)
     _publish_sync_state(reader, data)
+
+
+def _state_key(host, workspace):
+    """The ``sync.json`` key for one server and workspace.
+
+    3.0 servers name the key's workspace in ``/v2/whoami``; every workspace on
+    a hosted server shares one host, so each keeps its own cursor under
+    ``<host>/w/<slug>`` (the workspace's dashboard path). 2.x servers have no
+    workspaces and keep the bare host.
+    """
+    if not isinstance(workspace, str) or not workspace:
+        return host
+    return f"{host.rstrip('/')}/w/{workspace}"
+
+
+def _host_keys(hosts, host):
+    """Every key in ``hosts`` that belongs to ``host``: bare, or per workspace.
+
+    A second server mounted under ``<host>/w/<name>`` would share these keys;
+    servers are served at the root of their address, so that is unsupported.
+    """
+    prefix = host.rstrip("/") + "/w/"
+    return [name for name in hosts if name == host or (isinstance(name, str) and name.startswith(prefix))]
+
+
+def _dry_run_key(reader, host):
+    """Best cursor for a dry run or a count, which has no key and so no workspace.
+
+    The only entry this host has, if there is exactly one; else one this host
+    pruned (so a pruned run is not reported as blocked); else the bare host.
+    """
+    data = _load_state(reader)
+    hosts = data["hosts"]
+    names = [name for name in _host_keys(hosts, host)
+             if isinstance(hosts[name], dict) and hosts[name].get("protocol") == 2]
+    if len(names) == 1:
+        return names[0]
+    pruned = [name for name in names if hosts[name].get("pruned")]
+    return pruned[0] if pruned else host
+
+
+def _workspace_state(reader, client, host, key):
+    """Load the cursor for ``key``, adopting a host-only entry from an older client.
+
+    Clients before package 24.11 kept one cursor per host. That entry moves to
+    this workspace only if the server has the run here and it belongs to this
+    key's user, and then with ``complete`` cleared so this pass commits again
+    and the server checks the sizes. Otherwise this workspace starts empty
+    (the first pass asks /state) and the host-only entry is left for the
+    workspace that has the run.
+    """
+    data = _load_state(reader)
+    hosts = data["hosts"]
+    legacy = hosts.get(host)
+    if (key == host or key in hosts or not isinstance(legacy, dict)
+            or legacy.get("protocol") != 2):
+        return _host_state(reader, key)
+    remote = client.run_state(reader.run_id)
+    if remote is None:
+        return _host_state(reader, key)
+    _check_owner(reader, client, remote)
+    # Re-read after the request: ``sync --reset`` takes no run lock.
+    data = _load_state(reader)
+    hosts = data["hosts"]
+    if key in hosts or hosts.get(host) != legacy:
+        return _host_state(reader, key)
+    hosts.pop(host)
+    hosts[key] = {**legacy, "complete": False}
+    if legacy.get("pruned"):
+        recorded = data.get("pruned_hosts")
+        recorded = recorded if isinstance(recorded, list) else []
+        if key not in recorded:
+            recorded.append(key)
+        data["pruned_hosts"] = recorded
+    _publish_sync_state(reader, data)
+    return _host_state(reader, key)
 
 
 def _acquire_lock(run_dir):
@@ -814,7 +893,12 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False, ar
         # advertise this incomplete snapshot as synced to gc or prune it.
         source_hash = hashlib.sha256(json.dumps({name: {k: v for k, v in item.items() if k != "data"}
                                                 for name, item in files.items()}, sort_keys=True).encode()).hexdigest()
-    state = _host_state(reader, host)
+    if dry_run:
+        key = _dry_run_key(reader, host)
+        state = _host_state(reader, key)
+    else:
+        key = _state_key(host, _identity(client).get("workspace"))
+        state = _workspace_state(reader, client, host, key)
     features = (["lineage"] + (["byref"] if artifacts else [])) if dry_run else list(
         _identity(client).get("features") or [])
     lineage_commit = _local_lineage(reader, features, state)
@@ -824,9 +908,9 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False, ar
 
     def save():
         if not dry_run:
-            _save_state(reader, host, state)
+            _save_state(reader, key, state)
 
-    block = _pruned_upload_block(reader, host, state)
+    block = _pruned_upload_block(reader, key, state)
     if block:
         result.failed = result.permanent = True
         result.status = f"failed: {block}"
@@ -1259,7 +1343,7 @@ def _order_runs_lineage(root, run_ids):
 
 
 def _selected_ids(root, host, explicit, include_all, prune=False, key=None, features=(), artifacts=False,
-                  user=None):
+                  user=None, workspace=None, dry_run=False):
     selected = list(dict.fromkeys(explicit))
     if include_all:
         for meta in list_runs(root):
@@ -1268,7 +1352,10 @@ def _selected_ids(root, host, explicit, include_all, prune=False, key=None, feat
                 continue
             try:
                 reader = RunReader(root, run_id)
-                state = _host_state(reader, host)
+                # A run with only a pre-24.11 host-only cursor is selected once;
+                # sync_run then adopts or replaces that cursor.
+                state = _host_state(reader, _dry_run_key(reader, host) if dry_run
+                                    else _state_key(host, workspace))
                 if _sync_idle(reader, state, _source_hash(reader), key=key, features=features,
                               artifacts=artifacts, user=user):
                     if not (prune and not state.get("pruned")) and (key is None or state.get("owner") == key):
@@ -1316,7 +1403,9 @@ def _follow(args, root, host, api_key):
                 previous[sig] = signal.getsignal(sig)
                 signal.signal(sig, handle)
         client = Client(base_url=host, api_key=api_key, insecure=args.insecure, stop=stop)
-        selected = _selected_ids(root, host, run_ids, include_all, prune=prune)
+        # Only for the count below; the identity (and so the workspace) is
+        # read in the loop, so use the dry-run cursor guess here.
+        selected = _selected_ids(root, host, run_ids, include_all, prune=prune, dry_run=True)
         print(f"following {host}: {len(selected)} runs, every {interval:g}s", flush=True)
         while True:
             if stop.is_set():
@@ -1348,6 +1437,7 @@ def _follow(args, root, host, api_key):
                 selected = [rid for rid in _selected_ids(
                     root, host, run_ids, include_all, prune=prune, key=identity["key"],
                     features=identity.get("features", []), artifacts=artifacts, user=identity.get("user"),
+                    workspace=identity.get("workspace"),
                 ) if rid not in permanent_ids]
                 failure_log.prune(selected)
                 keep = set(selected)
@@ -1524,7 +1614,9 @@ def cmd_sync(args):
                                      features=_identity(client).get("features", []) if client is not None else (
                                          ["lineage"] + (["byref"] if artifacts else [])),
                                      artifacts=artifacts,
-                                     user=_identity(client).get("user") if client is not None else None)
+                                     user=_identity(client).get("user") if client is not None else None,
+                                     workspace=_identity(client).get("workspace") if client is not None else None,
+                                     dry_run=client is None)
             failure_log.prune(selected)
             if not selected and args.all:
                 print("up to date", flush=True)

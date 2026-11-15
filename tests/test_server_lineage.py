@@ -336,11 +336,11 @@ def test_featureless_backfill_and_idle(remote, snapshots, monkeypatch):
     server.lineage_enabled = True
     del client._sync_identity
     identity = sync._identity(client)
-    assert sync._selected_ids(parent.root, client.base_url, [], True, key=identity["key"], features=identity["features"]) == ["parent", "child"]
+    assert sync._selected_ids(parent.root, client.base_url, [], True, key=identity["key"], features=identity["features"], workspace=identity["workspace"]) == ["parent", "child"]
     assert push(remote, parent).complete
     assert state(remote, parent)["lineage"] == info(parent)["commit"]
     assert push(remote, parent).status == "up to date"
-    assert "parent" not in sync._selected_ids(parent.root, client.base_url, [], True, key=identity["key"], features=identity["features"])
+    assert "parent" not in sync._selected_ids(parent.root, client.base_url, [], True, key=identity["key"], features=identity["features"], workspace=identity["workspace"])
 
 
 def test_conflict_skip_completes_and_is_not_retried(remote, snapshots, monkeypatch):
@@ -1035,4 +1035,4 @@ def test_idle_lineage_does_not_resolve_local_ref(remote, snapshots, monkeypatch)
     assert push(remote, parent).status == "up to date"
     identity = sync._identity(remote[1])
     assert "parent" not in sync._selected_ids(parent.root, remote[1].base_url, [], True,
-                                             key=identity["key"], features=identity["features"])
+                                             key=identity["key"], features=identity["features"], workspace=identity["workspace"])

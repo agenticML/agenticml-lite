@@ -16,7 +16,7 @@ from agenticml.store import reader
 from agenticml.store.reader import RunReader, read_remote
 from agenticml.ui import server as ui_server
 from test_server_keys_web import api, call, csrf, login, running, server  # noqa: F401 (fixture)
-from test_sync import command, push, state, writer_at
+from test_sync import command, push, state, state_key, writer_at
 
 
 @pytest.mark.parametrize("role", ["viewer", "member", "admin"])
@@ -398,7 +398,7 @@ def test_same_machine_key_rotation(server, tmp_path, cached_user, idle):
     if not cached_user:
         path = writer.run_dir / "sync.json"
         payload = json.loads(path.read_bytes())
-        payload["hosts"][url].pop("owner_user")
+        payload["hosts"][state_key(url)].pop("owner_user")
         path.write_text(json.dumps(payload))
     if not idle:
         meta_path = writer.run_dir / "meta.json"
@@ -407,14 +407,14 @@ def test_same_machine_key_rotation(server, tmp_path, cached_user, idle):
         meta_path.write_text(json.dumps(meta))
     with Client(url, second) as client:
         pair = (server, client)
-        selected = sync._selected_ids(writer.root, url, [], True, key="desktop", user="alice")
+        selected = sync._selected_ids(writer.root, url, [], True, key="desktop", user="alice", workspace="default")
         assert selected == [writer.run_id]  # Visit once to refresh the key cache.
         assert push(pair, writer).complete
         saved = state(pair, writer)
         assert saved["owner"] == "desktop" and saved["owner_user"] == "alice"
         assert sync._sync_idle(RunReader(writer.root, writer.run_id), saved, saved["source_hash"],
                                key="laptop", user="alice")
-        assert sync._selected_ids(writer.root, url, [], True, key="desktop", user="alice") == []
+        assert sync._selected_ids(writer.root, url, [], True, key="desktop", user="alice", workspace="default") == []
     _, other = server.keys.create("foreign", user="admin")
     before = (writer.run_dir / "sync.json").read_bytes()
     with Client(url, other) as client:
@@ -464,7 +464,7 @@ def test_legacy_cache_checks_reused_key_name_via_all(server, tmp_path, monkeypat
         assert push((server, client), writer).complete
     path = writer.run_dir / "sync.json"
     payload = json.loads(path.read_bytes())
-    payload["hosts"][url].pop("owner_user")
+    payload["hosts"][state_key(url)].pop("owner_user")
     path.write_text(json.dumps(payload))
     server.keys.revoke("laptop")
     _, replacement = server.keys.create("laptop", user=replacement_user)
@@ -499,7 +499,7 @@ def test_up_to_date_does_not_stamp_unchecked_identity(server, tmp_path, monkeypa
         assert push(pair, writer).complete
         path = writer.run_dir / "sync.json"
         payload = json.loads(path.read_bytes())
-        cached = payload["hosts"][url]
+        cached = payload["hosts"][state_key(url)]
         cached.pop("owner_user")
         if unchecked == "no_cached_owner":
             cached.pop("owner")

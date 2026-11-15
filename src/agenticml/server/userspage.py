@@ -14,6 +14,8 @@ from .users import (
 
 logger = logging.getLogger("agenticml.server.userspage")
 _SELF_INVITE = "you cannot re-invite yourself; change your password from the Account menu"
+_FIREBASE_REINVITE = ("members sign in with Google or email at /login; no invite link is needed "
+                      "(send a new invite to someone who has not joined yet)")
 
 
 def _user_name(name):
@@ -155,6 +157,11 @@ def handle(webauth, handler, path, *, show_owner=False):
                     return
                 if name == principal.user:
                     handler._json({"error": _SELF_INVITE}, 409)
+                    return
+                if webauth.firebase is not None:
+                    # A re-invite is a password-reset token, which the Firebase
+                    # invite page never accepts; Firebase members just sign in.
+                    handler._json({"error": _FIREBASE_REINVITE}, 409)
                     return
                 try:
                     token = users.create_invite(name)

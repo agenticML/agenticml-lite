@@ -406,11 +406,13 @@ def test_team_page_uses_firebase_copy(page, firebase_ui):
         "This invite link is shown once. They sign in with Google or email and password, "
         "using this email; the email must be verified.")).to_be_visible()
     expect(form).not_to_contain_text("choose their own password")
-    page.get_by_role("row").filter(has_text="alice").get_by_role(
-        "button", name="Invite link", exact=True).click()
-    relink = page.get_by_role("dialog", name="Invite alice?", exact=True)
-    expect(relink).to_contain_text("This signs them out and gives them a new sign-in link.")
-    expect(relink).not_to_contain_text("clears their password")
+    # Package 24.11c: Firebase members sign in at /login, so there is no
+    # per-member "Invite link" (the API answers 409); Remove stays.
+    alice = page.get_by_role("row").filter(has_text="alice")
+    expect(alice.get_by_role("button", name="Remove", exact=True)).to_be_visible()
+    expect(alice.get_by_role("button", name="Invite link", exact=True)).to_have_count(0)
+    page.set_viewport_size({"width": 375, "height": 800})
+    assert_no_overflow(page)
 
 
 def test_admin_adds_new_email_as_pending_server_admin(page, firebase_ui):
