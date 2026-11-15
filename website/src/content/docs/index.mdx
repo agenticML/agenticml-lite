@@ -18,7 +18,7 @@ hero:
       variant: minimal
 ---
 
-import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+import { CardGrid, LinkCard } from '@astrojs/starlight/components';
 
 The PyPI package is 1.0.0, which tracks locally only and cannot sync to the self-hosted server or the hosted service:
 
@@ -35,32 +35,18 @@ pip install 'agenticml-lite[system] @ git+https://github.com/agenticML/agenticml
 ## Three ways to use it
 
 <CardGrid>
-	<Card title="Local" icon="laptop">
-		Runs are plain files on your machine. Nothing is sent anywhere. Start with the [quickstart](/agenticml-lite/getting-started/quickstart/).
-	</Card>
-	<Card title="Self-hosted" icon="server">
-		Run the 3.0 server on your own hardware for a shared dashboard and sync. Read the [Server](/agenticml-lite/server/) section.
-	</Card>
-	<Card title="Hosted (public preview)" icon="external">
-		Sign in at `app.agenticml.xyz` and sync without running a server. Best effort, no SLA. See the [Hosted service](/agenticml-lite/hosted/) section.
-	</Card>
+	<LinkCard title="Local" description="Runs are plain files on your machine. Nothing is sent anywhere. Start with the quickstart." href="/agenticml-lite/getting-started/quickstart/" />
+	<LinkCard title="Self-hosted" description="Run the 3.0 server on your own hardware for a shared dashboard and sync." href="/agenticml-lite/server/" />
+	<LinkCard title="Hosted (public preview)" description="Sign in at app.agenticml.xyz and sync without running a server. Best effort, no SLA." href="/agenticml-lite/hosted/" />
 </CardGrid>
 
 ## Why agenticml-lite
 
 <CardGrid>
-	<Card title="Local-first" icon="laptop">
-		Metrics, config, code, and media are written to plain files under `~/.agenticml`. Nothing leaves your machine unless you sync.
-	</Card>
-	<Card title="Zero-code tracking" icon="rocket">
-		`agenticml run train.py` captures args, code, PyTorch components, and TensorBoard logs without editing your script.
-	</Card>
-	<Card title="Built-in dashboard" icon="seti:html">
-		`agenticml ui` serves charts, media, and per-run notes on localhost, straight from the files.
-	</Card>
-	<Card title="Fast and small" icon="random">
-		About 3 µs per `log()` call and about 8 bytes per scalar point on disk.
-	</Card>
+	<LinkCard title="Local-first" description="Metrics, config, code, and media are written to plain files under ~/.agenticml. Nothing leaves your machine unless you sync." href="/agenticml-lite/reference/storage/" />
+	<LinkCard title="Zero-code tracking" description="agenticml run train.py captures args, code, PyTorch components, and TensorBoard logs without editing your script." href="/agenticml-lite/guides/zero-code/" />
+	<LinkCard title="Built-in dashboard" description="agenticml ui serves charts, media, and per-run notes on localhost, straight from the files." href="/agenticml-lite/guides/dashboard/" />
+	<LinkCard title="Fast and small" description="About 3 µs per log() call and about 8 bytes per scalar point on disk." href="/agenticml-lite/reference/storage/" />
 </CardGrid>
 
 ## Start here
