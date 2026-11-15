@@ -78,4 +78,6 @@ AGENTICML_API_KEY="$TEAM_B_KEY" agenticml sync --all
 
 To clear saved progress for a run, `agenticml sync RUN_ID --reset` forgets every cursor for this host across all workspaces. The next sync asks the server what it already has and uploads the rest.
 
-Older clients (installed from `dev` before this change, or 2.x clients) keep only one cursor per server host. For older clients, use a separate `AGENTICML_DIR` per workspace, or run `agenticml sync RUN_ID --reset` before syncing with the second key.
+Older clients keep one cursor per server address. If a run you synced to one workspace reports "up to date" when you sync it with another workspace's key, install the client again from `dev`, or run `agenticml sync RUN_ID --reset` before syncing with the second key.
+
+The first sync after you upgrade checks each run you synced before, once: one short request per run, and nothing is uploaded twice.

@@ -735,6 +735,15 @@ The client maintains host- and workspace-scoped sync state in `<root>/runs/<id>/
   the workspace starts with an empty cursor (rebuilt from `/state`) and the old
   host-only entry is kept for the workspace that has the run. v1 entries (no
   `"protocol": 2`) are never moved.
+  After upgrading, `--all` and `--follow` select each run that has only a
+  host-only entry once: one `/state` request and one commit per run, then the
+  run is idle again. `sync --reset RUN_ID` drops the bare host entry and every
+  `<host>/w/<slug>` entry for that host. A run pruned after syncing to one
+  workspace is refused for any other key (`pruned_hosts` records the
+  per-workspace key, and `--reset` keeps it); this includes a pruned run whose
+  host-only entry belongs to a workspace other than the current key's.
+  `--dry-run` has no key, so it reads the host's only entry, else one that
+  pruned the run, else the bare host.
 - **Owner and user**: On servers that return `user` in `whoami`, the client
   compares ownership by user (`owner_user`), allowing a machine to switch to
   another key of the same user. It caches `owner_user` per host and workspace in
@@ -744,8 +753,10 @@ The client maintains host- and workspace-scoped sync state in `<root>/runs/<id>/
   after every accepted HTTP write request, ensuring interrupted syncs resume
   where they left off.
 - **Compatibility**: Host entries without `"protocol": 2` (v1 entries) are
-  treated as empty and replaced on first save. Host-only protocol 2 entries are
-  migrated to per-workspace entries as described above. Entries for other hosts
+  treated as empty. On a 2.x server the entry is replaced on first save; on a
+  3.0 server it is left as it is and the workspace entry starts empty.
+  Host-only protocol 2 entries are migrated to per-workspace entries as
+  described above. Entries for other hosts
   are retained untouched. `store.gc` reads `complete: true` and
   `source_hash == run_fingerprint()`.
 

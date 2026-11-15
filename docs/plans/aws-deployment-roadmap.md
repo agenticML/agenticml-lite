@@ -61,7 +61,7 @@ in the PR that records a result.
 | 1. CloudFormation code | **done** (Nov 11, [#49](https://github.com/agenticML/agenticml-lite/pull/49)) | 1.1–1.6 | – |
 | 2. Bootstrap | **done** (Nov 11) | 2.1, 2.2, 2.3 | 2.1b: the second alert address confirms its email (owner) |
 | 3. First deploy | **done** (Nov 12) | 3.0a–3.3 | – |
-| 4. First accounts and data | **in progress** | 4.1, 4.2, 4.2a (Nov 13) | 4.2b: first Google sign-in as server admin (owner); then 4.3 and 4.4. Package [24.11](packages/24.11-phase-4-wrap-up.md) removes the 4.3 and 4.4 workarounds |
+| 4. First accounts and data | **in progress** | 4.1, 4.2, 4.2a (Nov 13) | 4.2b: first Google sign-in as server admin (owner); then 4.3 and 4.4. Package [24.11](packages/24.11-phase-4-wrap-up.md) (done, [#65](https://github.com/agenticML/agenticml-lite/pull/65)) removed the 4.3 and 4.4 workarounds |
 | 5. Launch checks | not started | – | After Phase 4 |
 | 6. Recovery and performance | not started | – | After Phase 5 |
 | 7. Public launch | in progress | 7.1 (Nov 14, [#64](https://github.com/agenticML/agenticml-lite/pull/64)); 7.4 and 7.5 built | 7.2: docs-only PR to `main` (git agent; owner merges); 7.3 policy facts (owner) |
@@ -84,7 +84,7 @@ in the PR that records a result.
 
 Next: step 4.2b (the owner signs in with Google; package 24.7 is live), then
 4.3 on `/admin` and each workspace's Settings page, then 4.4. Package
-[24.11](packages/24.11-phase-4-wrap-up.md) lets 4.4 use one local store for
+[24.11](packages/24.11-phase-4-wrap-up.md) (done) lets 4.4 use one local store for
 both workspaces and removes the member "Invite link" button, which fails
 with 403 for most members on Firebase. Open sign-up was turned on early (Nov 13, 2026); the terms,
 acceptable use and privacy policies and their sign-in page links are Phase 7
@@ -170,8 +170,8 @@ needs (see the 24.5 plan).
 **Status: in progress** (Nov 14, 2026): 4.1, 4.2 and 4.2a done (Nov 13);
 package 24.7 (self-serve server admins) is deployed, so 4.2b and 4.3 run
 through the web; the ECS Exec commands below still work as a fallback.
-Package [24.11](packages/24.11-phase-4-wrap-up.md) closes the two code gaps
-found for 4.3 and 4.4. Next is 4.2b (owner). Commands are in `deploy/aws/README.md`, sections "Accounts, Firebase
+Package [24.11](packages/24.11-phase-4-wrap-up.md) closed the two code gaps
+found for 4.3 and 4.4 ([#65](https://github.com/agenticML/agenticml-lite/pull/65)). Next is 4.2b (owner). Commands are in `deploy/aws/README.md`, sections "Accounts, Firebase
 and customers" and "Sync from a training machine" (rewritten in package
 [24.6](packages/24.6-phase-4-runbook.md) after a check against the code).
 

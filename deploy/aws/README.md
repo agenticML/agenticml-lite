@@ -629,6 +629,12 @@ agenticml sync <RUN_ID>
 Running `agenticml sync <RUN_ID> --reset` forgets every cursor for that host
 across all workspaces; the next sync recovers state from the server.
 
+The first `sync --all` or `--follow` after upgrading the client checks each
+run synced before, once (one `/state` request and one commit per run; no
+accepted bytes are sent again). A run pruned with `sync --prune` after syncing
+to one workspace cannot be uploaded to another: its full scalar history is no
+longer local.
+
 Older clients (installed before package 24.11, or 2.x clients) keep only one
 cursor per server host. With older clients, maintain one `AGENTICML_DIR` per
 workspace (e.g. `$HOME/.agenticml-customer-one` and `$HOME/.agenticml-customer-two`),
