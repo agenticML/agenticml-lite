@@ -3860,18 +3860,6 @@ pre,
   color: var(--text);
   font-weight: 500;
 }
-.settings-nav .settings-nav-admin {
-  position: relative;
-  margin-top: 10px;
-}
-.settings-nav .settings-nav-admin::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: -6px;
-  border-top: 1px solid var(--border);
-}
 .settings-col {
   display: flex;
   flex-direction: column;
@@ -4196,14 +4184,6 @@ pre,
   }
   .settings-nav a[aria-current] {
     border-color: var(--border-strong);
-  }
-  .settings-nav .settings-nav-admin {
-    margin: 0 0 0 6px;
-    border-style: dashed;
-    border-color: var(--border-strong);
-  }
-  .settings-nav .settings-nav-admin::before {
-    display: none;
   }
   .settings-card {
     padding: var(--s-4);

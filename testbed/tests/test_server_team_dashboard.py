@@ -355,10 +355,10 @@ def test_settings_nav_cards_and_top_bar_by_role(page, team_server):
     expect(page.locator(".breadcrumb")).to_have_text("agenticml / settings")
     expect(page.get_by_text("Workspace · Default")).to_be_visible()
     nav = page.get_by_role("navigation", name="Settings", exact=True)
-    # The admin-key owner is a server admin: Admin in the bar, a separated link in the nav.
+    # The admin-key owner is a server admin: Admin is in the top bar only, not in the nav.
     expect(nav.get_by_role("link")).to_have_text(
-        ["Account", "Workspace", "Members", "API keys", "Activity", "Server admin ↗"])
-    expect(nav.get_by_role("link", name="Server admin ↗")).to_have_attribute("href", "/admin/")
+        ["Account", "Workspace", "Members", "API keys", "Activity"])
+    expect(nav.locator('a[href="/admin/"]')).to_have_count(0)
     expect(page.get_by_role("link", name="Admin", exact=True)).to_have_attribute("href", "/admin/")
     expect(page.locator(".settings-card h2")).to_have_text(
         ["Your account", "Workspace", "Members", "API keys", "Activity"])
