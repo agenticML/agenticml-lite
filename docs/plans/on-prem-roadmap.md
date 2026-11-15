@@ -218,7 +218,7 @@ after 27; 29 after 24.7 and 27, beside 24.3 (29.7 and 29.9 wait on the owner).
 | 24 | AWS hosted deployment (Dockerfile, Terraform, deploy workflow, runbook, real-EFS benchmark) | 18c, 19, 20, 21 | Codex, Sonnet; owner runs it | M | [plan](packages/24-aws-deployment.md) | done (code, 3.0 PR; owner checks in Backlog) |
 | 24.1 | Image: Dockerfile, entrypoint, limits file, local hosted smoke test | 21 | Codex, Sonnet | S | [plan](packages/24-aws-deployment.md) | done (3.0 PR) |
 | 24.2 | Terraform, deploy workflow, `deploy-check` CI job, runbook | 24.1 | Codex, Sonnet | M | [plan](packages/24-aws-deployment.md) | done (3.0 PR; `terraform validate` runs in CI) |
-| 24.3 | Apply, first deploy, restore drill, real-EFS benchmark, exit criterion 6 | 24.5 | Owner | S | [AWS roadmap](aws-deployment-roadmap.md) | in progress (AWS roadmap Phases 0–3 done Nov 12, 2026; Phase 4: 4.1, 4.2, 4.2a done Nov 13, package 24.7 deployed, open sign-up on; next 4.2b, the owner's first Google sign-in, then 4.3 and 4.4 (package 24.11, done, removed their workarounds); Phases 5 and 6 not started. Per-step status: [AWS roadmap](aws-deployment-roadmap.md)) |
+| 24.3 | Apply, first deploy, restore drill, real-EFS benchmark, exit criterion 6 | 24.5 | Owner | S | [AWS roadmap](aws-deployment-roadmap.md) | in progress (AWS roadmap Phases 0–3 done Nov 12, 2026; Phase 4: 4.1, 4.2, 4.2a done Nov 13, package 24.7 deployed, open sign-up on; 4.2b (the owner's first Google sign-in as server admin) done, confirmed Nov 15; next 4.3, then 4.4 (package 24.11, done, removed their workarounds); Phases 5 and 6 not started. Per-step status: [AWS roadmap](aws-deployment-roadmap.md)) |
 | 24.4 † | CloudFormation replaces Terraform; Namecheap DNS; cost alerts | 24.2 | Sonnet; prose Antigravity | M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49); second review by the supervisor) |
 | 24.4a | `bootstrap.yaml`: ECR, OIDC, roles, certificate, alerts topic, budget, cost-step function | – | Sonnet | S–M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
 | 24.4b | `hosted.yaml` and its tests | 24.4a | Sonnet | M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
@@ -485,8 +485,9 @@ priority.
     Phase 4, ECS Exec works (4.1), the first admin exists (4.2) and Firebase
     sign-in is on with project `agenticml-hosted` (4.2a). Package 24.7 is
     deployed (server admins and customer workspaces without ECS Exec), and
-    open sign-up is on. Next is 4.2b (the owner's first Google sign-in as
-    server admin), then two workspaces and a sync to each.
+    open sign-up is on. 4.2b is done (the owner signed in with Google as
+    server admin; confirmed Nov 15). Next: two workspaces (4.3) and a sync
+    to each (4.4).
   - Fix: follow `deploy/aws/README.md`: bootstrap stack (with the Namecheap
     validation record), GitHub environment `hosted` with the role
     variables, first deploy, the `app` CNAME,
@@ -563,8 +564,9 @@ priority.
     violations.
   - Progress (Nov 13, 2026): the hosted service now runs with Firebase
     project `agenticml-hosted` (not agenticml-server's). `/login` loads the
-    real SDK with no console or CSP errors. Real Google sign-in comes with
-    AWS roadmap step 4.2b, an invite with 4.3.
+    real SDK with no console or CSP errors. A real Google sign-in worked in
+    AWS roadmap step 4.2b (confirmed Nov 15); an invite comes with 4.3, and
+    a Firebase email/password sign-in is still to try.
   - Done when: those steps pass, or each mismatch is fixed with a test.
 - **Firebase sign-in page test gaps** (package 18b.2 second review, Nov 8,
   2026).
