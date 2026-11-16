@@ -29,7 +29,7 @@ export default defineConfig({
 				{ label: 'Getting started', items: [{ autogenerate: { directory: 'getting-started' } }] },
 				{ label: 'Hosted service', items: [{ autogenerate: { directory: 'hosted' } }] },
 				{ label: 'Guides', items: [{ autogenerate: { directory: 'guides' } }] },
-				{ label: 'Server', items: [{ autogenerate: { directory: 'server' } }] },
+				{ label: 'On-prem server', items: [{ autogenerate: { directory: 'server' } }] },
 				{ label: 'Reference', items: [{ autogenerate: { directory: 'reference' } }] },
 				{ label: 'Releases', slug: 'releases' },
 				{ label: 'Legal', items: [{ autogenerate: { directory: 'legal' } }] },
