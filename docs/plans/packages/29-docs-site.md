@@ -77,6 +77,41 @@ with the supervisor deciding. Taken:
 - **Prose:** Antigravity drafts the Releases, hosted and policy pages from
   fact sheets; Sonnet wires them, fixes facts and runs the checks.
 
+### Owner decisions (Nov 15, 2026)
+
+- **D1:** publish the docs site only once the policies are ready. The
+  policies and the site go live together in one docs-only PR to `main`.
+  Open sign-up stays on.
+- **D4:** delegated to the supervisor; the answers are in the fact sheet
+  below. The owner approves them by merging the PR to `main`.
+- **D5:** the `hosted` issue label is created.
+- **Support mailbox (owner step):** before the PR to `main` merges, make
+  support@agenticml.xyz receive mail (Namecheap email forwarding for
+  agenticml.xyz). Do not change the `app` CNAME or the ACM validation CNAME.
+
+## Owner fact sheet for the policies (D4)
+
+The drafts in `website/src/content/docs/legal/` held `[[OWNER: ...]]`
+placeholders. The owner delegated these answers to the supervisor on Nov 15,
+2026, and approves them by merging the PR to `main`. No lawyer reviewed them.
+
+| # | Fact or decision | Where it is used | Answer |
+| --- | --- | --- | --- |
+| 1 | Operator name or legal entity | Terms, Acceptable use, Privacy (4 places) | the agenticML project |
+| 2 | Contact address for policy and deletion requests | Terms, Acceptable use, Privacy (5 places) | support@agenticml.xyz |
+| 3 | Effective date | Terms, Acceptable use, Privacy (3 places) | Nov 15, 2026 |
+| 4 | Governing law jurisdiction | Terms (1 place) | The country in which the operator of the service resides, with consumer rights kept |
+| 5 | Minimum age | Terms, Privacy (2 places) | 16 |
+| 6 | Confirm the "no model training" commitment | Terms (line 49), Privacy (line 48) | Kept: the service does not use customer data to train models |
+| 7 | How failed S3 cleanup on workspace deletion is handled (for example, retried by an operator within N days, or logged and removed by hand) | Terms (line 63), Privacy (line 72) | Logged and removed by hand; not retried (see Backlog, workspace delete cleanup) |
+| 8 | Confirm the staff-access paragraph (for the lawyer) | Privacy (line 67) | Rewritten to what the code does: server admins cannot open workspace contents without membership; infrastructure operators can reach stored data, and this is not logged in Activity |
+| 9 | Who approves the final text: the owner alone, or the owner with a lawyer | All three policies | The owner alone approves, by merging the PR to `main`; no lawyer review was done |
+| 10 | D6: how existing sign-ups are told about the policies (recommended: email) | Launch step for 29.7 | Email existing sign-ups when the policies go live (owner) |
+
+- Done Nov 15: the placeholders are filled and `draft: false` is set.
+- The owner approves the final text by merging the PR to `main`.
+- Then publish through the docs-only PR to `main`, set `HOSTED_LEGAL_BASE_URL` to `https://agenticml.github.io/agenticml-lite/legal/`, approve the hosted deploy, and check that `/login` and `/invite?token=x` show the footer links.
+
 ## Publishing route (D3)
 
 1. Every site change lands on `dev` through a normal PR, like all other work.
@@ -435,3 +470,19 @@ Resumed and finished on draft PR [#64](https://github.com/agenticML/agenticml-li
 - **Left for the owner:** merge (it triggers a hosted deploy that needs approval), the policy drafts with a lawyer, `HOSTED_LEGAL_BASE_URL`, the `hosted` issue label (D5), 29.6 and 29.9.
 
 **Renumbered (Nov 13, 2026):** this package was planned as 28. `dev` merged its own package 28 (the Settings page, [#63](https://github.com/agenticML/agenticml-lite/pull/63)) first, so this one is now 29. Commit subjects on this branch from before the merge still say "28".
+
+## Status (Nov 15, 2026)
+
+- [#64](https://github.com/agenticML/agenticml-lite/pull/64) merged to `dev` on Nov 14.
+- **Policies filled and fact-checked.** The owner fact sheet is answered (D4, delegated to the supervisor). A three-lens check of the policies against the code and templates applied 28 corrections. The row-level security claim is dropped: the hosted task may connect with a role that bypasses it (Backlog entry). `draft: true` is removed. The Terms, Acceptable use and Privacy pages sit in a Legal sidebar group, and the hosted pages link to them.
+- **GitHub settings done (owner approved):** repo description "Local-first experiment tracking with a self-hosted server and a hosted service", homepage https://agenticml.github.io/agenticml-lite/, and the `hosted` issue label (D5). `HOSTED_DESIRED_COUNT` is deleted.
+- **Enforce HTTPS refused.** GitHub answered "The certificate does not exist yet". Retry after the site is published from `main`.
+- `HOSTED_LEGAL_BASE_URL` is not set in the `hosted` environment, so `/login` and `/invite` show no policy links yet.
+- **Next, in order:**
+  1. Merge the PR to `dev`.
+  2. The git agent opens the docs-only PR to `main`.
+  3. The owner sets up support@agenticml.xyz forwarding, then merges.
+  4. Set `HOSTED_LEGAL_BASE_URL=https://agenticml.github.io/agenticml-lite/legal/` and approve the hosted deploy.
+  5. Check that the `/login` and `/invite?token=x` footer links show and return 200.
+  6. The owner emails existing sign-ups (D6).
+  7. Retry Enforce HTTPS on Pages.

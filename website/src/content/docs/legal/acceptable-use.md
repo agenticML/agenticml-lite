@@ -1,12 +1,11 @@
 ---
 title: Acceptable Use Policy
 description: Rules and acceptable use guidelines for the agenticml-lite hosted preview service.
-draft: true
 ---
 
-Last updated: [[OWNER: date]]
+Last updated: Nov 15, 2026
 
-This Acceptable Use Policy ("AUP") defines acceptable and prohibited behavior on the agenticml-lite hosted service (`https://app.agenticml.xyz`), operated by [[OWNER: operator name or legal entity]] ("we", "us", or "our").
+This Acceptable Use Policy ("AUP") defines acceptable and prohibited behavior on the agenticml-lite hosted service (`https://app.agenticml.xyz`), operated by the agenticML project ("agenticML", "we", "us", or "our").
 
 This policy applies to all users, accounts, API keys, and machine sync traffic. By using the service, you agree to comply with this policy and our [Terms of Service](/agenticml-lite/legal/terms/).
 
@@ -48,8 +47,8 @@ The service is a public preview and has **no formal compliance certifications** 
 
 Users of the free preview plan must adhere to the configured service limits:
 
-- **Workspaces:** 1 free personal workspace per account.
-- **Storage:** 5 GB total storage (committed experiment run files and stored objects).
+- **Workspaces:** Each account can own 1 free workspace at a time.
+- **Storage:** 5 GB (decimal) of committed experiment run files and artifact objects per workspace.
 - **Daily uploads:** 2 GB of uploaded data per UTC calendar day.
 - **Request rate:** 600 requests per minute per workspace.
 - **People:** 5 members and pending invitations per workspace.
@@ -62,14 +61,14 @@ We reserve the right to investigate potential violations of this policy. If we i
 
 - **Suspending the workspace:** The workspace is immediately disabled and answers HTTP `404 Not Found` on the dashboard, and sync clients are refused (HTTP `403`).
 - **Revoking API keys and sessions:** Blocking immediate access from automated sync clients or compromised credentials.
-- **Deleting the workspace and account:** Permanently removing customer data and terminating access.
+- **Deleting the workspace:** Permanently removing its data, and disabling the account's access.
 - **Reporting to authorities:** Reporting unlawful behavior to law enforcement when appropriate.
 
 ## 6. Reporting Violations
 
 If you discover a security vulnerability, evidence of abuse, or a violation of this policy, please report it immediately:
 
-- **Abuse and security reports:** Email [[OWNER: contact address]].
+- **Abuse and security reports:** Email [support@agenticml.xyz](mailto:support@agenticml.xyz).
 - **General technical issues:** File an issue on GitHub Issues at [agenticML/agenticml-lite/issues](https://github.com/agenticML/agenticml-lite/issues). For the hosted service, put "hosted" in the title.
 
 ## 7. Changes to This Policy

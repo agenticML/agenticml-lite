@@ -58,7 +58,7 @@ For deployment commands and runbook procedures, see [deploy/aws/README.md](../de
 
 With Firebase on, `/setup` returns 404; the first server administrator is provisioned via the `HOSTED_ADMIN_EMAILS` GitHub environment variable (and `AGENTICML_SERVER_ADMIN_EMAILS` server setting). Set `HOSTED_ADMIN_EMAILS` to your Google email, deploy, sign in at `https://app.agenticml.xyz/login` with "Continue with Google", and open `/admin`. A server admin without workspace memberships lands on `/workspaces` with an **Admin** button and sees no customer workspace data.
 
-The sign-in page links to the Terms, Acceptable use and Privacy pages only when the `HOSTED_LEGAL_BASE_URL` GitHub environment variable (the stack parameter `LegalBaseUrl` and the server setting `AGENTICML_SERVER_LEGAL_BASE_URL`) is set to an `https://` base URL, for example the docs site's `/legal/` address. It is empty by default, so set it only after the policies are published. Changing it needs a deploy.
+The sign-in page links to the Terms, Acceptable use and Privacy pages only when the `HOSTED_LEGAL_BASE_URL` GitHub environment variable (the stack parameter `LegalBaseUrl` and the server setting `AGENTICML_SERVER_LEGAL_BASE_URL`) is set to an `https://` base URL, for example the docs site's `/legal/` address. It is empty by default. The policies are on the docs site under `/legal/` (`/agenticml-lite/legal/terms/`, `/acceptable-use/` and `/privacy/`) once the site is published from `main`; set the variable after that. Changing it needs a deploy.
 
 The `/setup` endpoint only exists with Firebase off. When the server starts without an administrator and Firebase is disabled, it logs a one-time `/setup` link. Find the newest setup link in CloudWatch:
 
@@ -208,7 +208,7 @@ Server administrators do **not** have ambient access to customer data. A server 
 
 To grant support access:
 1. The customer must explicitly invite the support account (e.g. `support@agenticml.xyz`) as a `member` or `admin` through **Settings > Members**.
-2. The invitation acceptance and all subsequent actions performed by support personnel are recorded in the workspace audit log (**Settings > Activity** and `server audit`).
+2. Adding the support account and any change to its role are recorded in the workspace audit log (**Settings > Activity** and `server audit`). What a member views (runs, code, artifacts) is not logged.
 3. Once support is complete, the customer removes the support account from their workspace members list.
 
 ## Backup and disaster recovery
