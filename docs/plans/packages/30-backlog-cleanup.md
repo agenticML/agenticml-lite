@@ -1,6 +1,6 @@
 # Package 30: Backlog cleanup before the 3.0 release to `main`
 
-Nov 17, 2026 · Supervisor plan · Release 3.0 · Status: plan ready
+Nov 17, 2026 · Supervisor plan · Release 3.0 · Status: in review ([#79](https://github.com/agenticML/agenticml-lite/pull/79))
 
 The AWS roadmap is done (PR #77). Before `dev` is merged into `main` and
 3.0.0 is tagged, every entry in the roadmap Backlog is either fixed,
@@ -503,3 +503,35 @@ the hosted deploy: check ECS Exec, PID 1 and a clean stop (exit 0).
   scoping is bypassable via tagging and needs an exact action list), lock
   connection pooling and benchmark, idle-page metric polling.
 - Fix the 29.5b row (done, #69) and anything else stale.
+
+## Build notes (Nov 17, 2026)
+
+Every part was coded by Sonnet in its own worktree, reviewed by the
+supervisor, and merged onto the package branch; the † parts also got an
+adversarial review pass (independent Sonnet reviewers, each finding
+checked by a skeptic) and the supervisor's second review. Decisions and
+deviations worth keeping:
+
+- 30.1: a plain sync of a running run does repair short or missing append
+  files (the commit is refused while a file is shorter than committed and
+  the client recovers from `/state`); only a changed atomic file needs
+  `--reset` or a `/state` call. The runbook says so and tests pin it.
+- 30.2: the review found three gaps, all fixed: a pending invite token
+  could re-attach a detached account (redemption now checks it; a verified
+  Firebase email still may); `workspaces orphans`/`cleanup` could run
+  against a fresh empty database after a mistyped `--data` (they now
+  refuse a missing or empty database); and the display name and personal
+  workspace name and slug survived redaction. Role names were dropped from
+  the reserved logins so the default `admin` account can be deleted;
+  throttle buckets naming the login are cleared. The Privacy policy now
+  says server-level entries are redacted (the owner delegated the wording).
+- 30.3: a sync-scope key's dashboard login answers 403 (not 401).
+- 30.4: if a mail client drops the fragment, a new invitee sees "no access"
+  and reopens the full link or asks for a new invite; during a rolling
+  deploy a fragment link opened on an old task loses its token, so create
+  invites after the deploy finishes.
+- 30.5: the bulk committed-size preload was left out (not needed for the
+  memo's guarantee).
+- CI: `test_keys_401_redirects_to_login` was flaky (a background poll
+  redirected first); it now drives the keys page by hash with the other
+  reads parked.
