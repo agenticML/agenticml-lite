@@ -710,6 +710,10 @@ Resources:
             - RepositoryUri: !ImportValue agenticml-hosted-bootstrap-EcrRepositoryUri
           Essential: true
           StopTimeout: 120
+          # An init process is PID 1 (reaps what ECS Exec sessions leave
+          # behind) and forwards SIGTERM to the server for its drain.
+          LinuxParameters:
+            InitProcessEnabled: true
           PortMappings:
             - {ContainerPort: 8080, Protocol: tcp}
           MountPoints:
@@ -899,10 +903,14 @@ Resources:
       AlarmActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
       OKActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
 
-  # No healthy target for 5 minutes means the service is down. Uses the free
-  # load balancer metric (Container Insights is off); no alarm while the
-  # service is scaled to zero. Created after the service is stable, so a
-  # first create or a scale-up from zero does not alarm while tasks start.
+  # Fewer healthy targets than DesiredCount for 5 minutes means the service is
+  # down or degraded (with two tasks, one missing task alarms too). Uses the
+  # free load balancer metric (Container Insights is off); no alarm while the
+  # service is scaled to zero. Created or updated after the service is stable
+  # (DependsOn Service), so a first create or a scale-up does not alarm while
+  # tasks start. Scaling 2 -> 1 updates the service first, so the threshold
+  # still reads 2 for a short time after the second task stops; the alarm
+  # needs 5 consecutive minutes, so it normally never fires.
   HealthyHostsAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: HasTasks
@@ -916,7 +924,7 @@ Resources:
         - {Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName}
         - {Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName}
       ComparisonOperator: LessThanThreshold
-      Threshold: 1
+      Threshold: !Ref DesiredCount
       Period: 60
       EvaluationPeriods: 5
       TreatMissingData: breaching

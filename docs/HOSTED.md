@@ -226,11 +226,11 @@ Periodic restore drills must be performed in an isolated test environment as des
 
 CloudWatch alarms monitor core service health and deliver notifications to the `agenticml-alerts` SNS topic:
 - **ALB 5xx error rate**: Alerts when 5xx response count exceeds 5 within a 5-minute window (`agenticml-hosted-alb_5xx`).
-- **Unhealthy target host**: Alerts if any target host remains unhealthy for 5 consecutive minutes based on ALB health checks on `/healthz` (`agenticml-hosted-unhealthy`). There is no synthetic monitor.
+- **Unhealthy target host**: Alerts if any target host remains unhealthy for 5 consecutive minutes based on ALB health checks on `/healthz` (`agenticml-hosted-unhealthy`). A weekly GitHub Actions check (`monitor.yml`) requests `/healthz` and the docs site's external links and opens an issue labelled `hosted` when one fails; it is not an uptime guarantee, and the alarms here remain the alerting path.
 - **p95 target latency**: Alerts when target response time p95 exceeds 5 seconds over 5 minutes (`agenticml-hosted-latency-p95`).
 - **RDS free storage space**: Alerts when free storage falls below 2 GB (`agenticml-hosted-rds_storage`).
 - **RDS CPU utilization**: Alerts when database CPU utilization exceeds 80% over 5 minutes (`agenticml-hosted-rds_cpu`).
-- **Healthy target count**: Alerts when the ALB `HealthyHostCount` minimum is below 1 for 5 consecutive 60-second periods, treating missing data as breaching (`agenticml-hosted-healthy_hosts`; active only when desired task count is greater than zero).
+- **Healthy target count**: Alerts when the ALB `HealthyHostCount` minimum is below the desired task count (1 or 2) for 5 consecutive 60-second periods, treating missing data as breaching (`agenticml-hosted-healthy_hosts`; active only when desired task count is greater than zero; with two tasks, one missing target alarms too).
 - **Cost and budget alerts**: The daily cost-step function (`agenticml-cost-steps`) emails spend summaries each time month-to-date spend passes another $10 milestone against a $100 monthly budget (with an error alarm on function execution failures), while an AWS Budget alert monitors actual and forecasted monthly spend exceeding 100%.
 
 ### Emergency procedures

@@ -116,7 +116,7 @@ def test_no_email_address_in_template(name):
 def test_no_email_address_in_deploy_workflow():
     workflow = ROOT / '.github/workflows/deploy.yml'
     if workflow.exists():
-        assert '@' not in re.sub(r'(?:aws-actions|actions|docker)/[\w-]+@v\d+|\[@\]', '', workflow.read_text())
+        assert '@' not in re.sub(r'[\w./-]+@[0-9a-f]{40}|\[@\]', '', workflow.read_text())
 
 
 # -------------------------------------------------------------------- bootstrap
@@ -619,6 +619,9 @@ def test_hosted_service_runs_in_task_subnets_with_public_ip(hosted):
     assert cluster['ClusterName'] == 'agenticml-hosted'
     # Container Insights costs extra; the alarms use free ALB and RDS metrics.
     assert cluster['ClusterSettings'] == [{'Name': 'containerInsights', 'Value': 'disabled'}]
+    # ECS Exec sessions are deliberately not logged: keys and invite links printed
+    # in a session would be copied into CloudWatch. CloudTrail records each call.
+    assert 'Configuration' not in cluster
     assert not [n for n in walk(hosted) if isinstance(n, dict) and n.get('Namespace') == 'ECS/ContainerInsights']
     assert hosted['Resources']['LogGroup']['Properties'] == {
         'LogGroupName': '/ecs/agenticml-hosted', 'RetentionInDays': 30}
@@ -686,6 +689,9 @@ def test_hosted_image_comes_from_the_imported_repository(hosted):
     assert (props['Cpu'], props['Memory'], props['NetworkMode']) == ('512', '1024', 'awsvpc')
     assert props['RuntimePlatform'] == {'CpuArchitecture': 'ARM64', 'OperatingSystemFamily': 'LINUX'}
     assert container['StopTimeout'] == 120
+    # An init process is PID 1: it reaps what ECS Exec sessions leave behind and
+    # forwards SIGTERM to the server, which drains within StopTimeout.
+    assert container['LinuxParameters'] == {'InitProcessEnabled': True}
     (volume,) = props['Volumes']
     assert volume['EFSVolumeConfiguration']['TransitEncryption'] == 'ENABLED'
     assert volume['EFSVolumeConfiguration']['AuthorizationConfig']['IAM'] == 'ENABLED'
@@ -800,11 +806,13 @@ def test_hosted_alarms_notify_the_imported_topic(hosted):
         'unhealthy': ('AWS/ApplicationELB', 'UnHealthyHostCount', 'Maximum', None, 'GreaterThanOrEqualToThreshold', 1, 60, 5, 'notBreaching'),
         'rds_storage': ('AWS/RDS', 'FreeStorageSpace', 'Minimum', None, 'LessThanThreshold', 2000000000, 300, 1, 'notBreaching'),
         'rds_cpu': ('AWS/RDS', 'CPUUtilization', 'Average', None, 'GreaterThanThreshold', 80, 300, 1, 'notBreaching'),
-        'healthy_hosts': ('AWS/ApplicationELB', 'HealthyHostCount', 'Minimum', None, 'LessThanThreshold', 1, 60, 5, 'breaching'),
+        'healthy_hosts': ('AWS/ApplicationELB', 'HealthyHostCount', 'Minimum', None, 'LessThanThreshold', {'Ref': 'DesiredCount'}, 60, 5, 'breaching'),
         'latency-p95': ('AWS/ApplicationELB', 'TargetResponseTime', None, 'p95', 'GreaterThanThreshold', 5, 300, 1, 'notBreaching'),
     }
-    # healthy_hosts (no healthy target for 5 minutes) only exists while
-    # DesiredCount is not 0, so scaling to 0 does not leave it in ALARM.
+    # healthy_hosts (fewer healthy targets than tasks wanted for 5 minutes) only
+    # exists while DesiredCount is not 0, so scaling to 0 does not leave it in
+    # ALARM. A new MaxValue needs a review of the threshold wording.
+    assert hosted['Parameters']['DesiredCount']['MaxValue'] == 2
     assert hosted['Conditions']['HasTasks'] == {'Fn::Not': [{'Fn::Equals': [{'Ref': 'DesiredCount'}, 0]}]}
     conditions = {r['Properties']['AlarmName']: r.get('Condition')
                   for r in resources_of(hosted, 'AWS::CloudWatch::Alarm').values()}
@@ -965,3 +973,28 @@ def test_nothing_under_deploy_aws_mentions_terraform():
     for path in (ROOT / 'deploy/aws').rglob('*'):
         if path.is_file():
             assert 'terraform' not in path.read_text(errors='ignore').lower(), path
+
+
+USES_RE = re.compile(r'^\s*-?\s*uses:\s*(\S+?)@(\S+)[ \t]*(#.*)?$', re.M)
+
+
+@pytest.mark.parametrize('path', sorted((ROOT / '.github/workflows').glob('*.yml')), ids=lambda p: p.name)
+def test_workflow_actions_are_pinned_to_commit_shas(path):
+    text = path.read_text()
+    uses = USES_RE.findall(text)
+    assert uses, path
+    # Every `uses:` line is one the pattern understood, so none slips past the check.
+    assert len(uses) == len(re.findall(r'^\s*-?\s*uses:', text, re.M))
+    for action, ref, comment in uses:
+        assert re.fullmatch(r'[0-9a-f]{40}', ref), f'{path.name}: {action}@{ref} is not a commit SHA'
+        assert re.fullmatch(r'#\s*v\d+(\.\d+){0,2}', comment.strip()), f'{path.name}: {action} has no tag comment'
+    assert 'pinned to full commit SHAs' in text
+
+
+def test_ecs_exec_policy_is_stated_in_the_runbook_and_threat_model():
+    readme = ' '.join((ROOT / 'deploy/aws/README.md').read_text().split())
+    threat = ' '.join((ROOT / 'docs/THREAT_MODEL.md').read_text().split())
+    assert 'deliberately not logged' in readme and 'CloudTrail records each `ExecuteCommand` call' in readme
+    assert 'InitProcessEnabled' in readme
+    assert 'deliberately not logged' in threat and 'CloudWatch' in threat
+    assert 'directly as PID 1' not in (ROOT / 'deploy/aws/entrypoint.sh').read_text()

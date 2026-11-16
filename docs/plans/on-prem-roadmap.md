@@ -269,7 +269,7 @@ after 27; 29 after 24.7 and 27, beside 24.3 (29.7 and 29.9 wait on the owner); 3
 | 30.3 † | Admin plan edits merge atomically and prefill free limits; Keys copy command without `--key`; metric picker refresh; workspace rename by its owner | 30.1, 30.2 | Sonnet | M | [plan](packages/30-backlog-cleanup.md) | plan ready |
 | 30.4 † | Sign-in pages: setup and invite in the new shell, theme toggle, Firebase page tests, invite token in the URL fragment on hosted | 30.1, 30.2 | Sonnet | M | [plan](packages/30-backlog-cleanup.md) | plan ready |
 | 30.5 | Database: transaction connection cap, committed sizes per reader call, usage views on the database clock, 19.1 notes | 30.1, 30.2 | Sonnet | S–M | [plan](packages/30-backlog-cleanup.md) | plan ready |
-| 30.6 | AWS template and CI: ECS init process, healthy-hosts alarm from DesiredCount, actions pinned to SHAs, weekly hosted monitor | – | Sonnet | S–M | [plan](packages/30-backlog-cleanup.md) | plan ready |
+| 30.6 | AWS template and CI: ECS init process, healthy-hosts alarm from DesiredCount, actions pinned to SHAs, weekly hosted monitor | – | Sonnet | S–M | [plan](packages/30-backlog-cleanup.md) | in review ([#79](https://github.com/agenticML/agenticml-lite/pull/79); Sonnet coded, supervisor reviewed) |
 | 30.7 | Roadmap and Backlog: owner checklists, deferred entries to Later, stale rows | 30.1–30.6 | Supervisor | S | [plan](packages/30-backlog-cleanup.md) | plan ready |
 
 Getting the hosted service live on AWS, step by step: [AWS deployment roadmap](aws-deployment-roadmap.md).

@@ -44,7 +44,7 @@ Trust boundaries define the isolation model across single-tenant and multi-tenan
   - **No ambient data access**: The `server_admin` flag grants authority over platform operations (workspace creation, quotas, account status), but grants no access to workspace runs, files, or metrics.
   - **Support access protocol**: If a customer requires support, a workspace administrator must explicitly invite the support user account as a `member` of their workspace.
   - **Audit logging**: Support invitations, member role assignments, and data access are permanently recorded in the workspace audit trail (`audit_events`).
-  - **Cloud infrastructure access**: AWS operators with ECS Exec have `ExecuteCommand` API calls recorded in AWS CloudTrail (including the `--command` string); interactive session contents are not logged (the cluster has no `ExecuteCommandConfiguration`).
+  - **Cloud infrastructure access**: AWS operators with ECS Exec have `ExecuteCommand` API calls recorded in AWS CloudTrail (including the `--command` string); interactive session contents are deliberately not logged (the cluster has no `ExecuteCommandConfiguration`), because keys and invite links printed in a session would be copied into CloudWatch; the task runs with an init process so session leftovers are reaped.
 
 ### 3. Shared Git processing of hostile bundles
 

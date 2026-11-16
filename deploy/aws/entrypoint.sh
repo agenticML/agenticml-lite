@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
-# Python validates the comma-separated CIDRs and execs the server directly as PID 1.
+# Python validates the comma-separated CIDRs and execs the server in its place
+# (no shell stays in between). On Fargate an init process is PID 1
+# (InitProcessEnabled in the task definition) and the server is its child.
 exec python - "$@" <<'PYTHON'
 import ipaddress
 import os

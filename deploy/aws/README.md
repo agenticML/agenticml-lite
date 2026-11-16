@@ -451,10 +451,34 @@ Check that `ls /data/server` shows no `agenticml.db`. If
 SQLite database on EFS at `/data/server/agenticml.db` instead of the hosted
 PostgreSQL instance.
 
-Keys and invite links print once. Exec sessions are not logged (the cluster has
-no `ExecuteCommandConfiguration`; only CloudTrail records the `ExecuteCommand`
-call and its `--command` string). Never put secrets on `--command` strings and
-never pass passwords with `--stdin` there.
+Keys and invite links print once. Exec session contents are deliberately not
+logged: the cluster has no `ExecuteCommandConfiguration`, because keys and invite
+links printed in a session would be copied into CloudWatch (30-day retention).
+CloudTrail records each `ExecuteCommand` call and its `--command` string. Never
+put secrets on `--command` strings and never pass passwords with `--stdin`
+there. ECS Exec needs no task-role change beyond the SSM messages permissions
+the task role already has.
+
+The task definition enables Fargate's init process (`InitProcessEnabled`), so
+PID 1 in the container is an init process and the `agenticml` server is its
+child. The init process reaps processes that exec sessions leave behind and
+forwards SIGTERM to the server, which drains for up to 120 s on a stop. The
+image has no init of its own and no `ps`. After a deploy, check from a session
+that PID 1 is an init process and that `agenticml` is its child:
+
+```sh
+cat /proc/1/comm
+for p in /proc/[0-9]*; do echo "${p#/proc/} ppid=$(awk '/^PPid/{print $2}' $p/status) $(cat $p/comm)"; done
+```
+
+and check a clean stop: after `aws ecs update-service --cluster
+agenticml-hosted --service agenticml-hosted --force-new-deployment`, the old
+task's exit code is 0 (not 137) and it stopped in well under 120 s:
+
+```sh
+aws ecs describe-tasks --cluster agenticml-hosted --tasks <old task arn> \
+  --query 'tasks[0].[stoppedReason,containers[0].exitCode,stoppingAt,stoppedAt]'
+```
 
 ### Customer workspaces and users (break-glass CLI)
 
@@ -1043,9 +1067,13 @@ Alarms publish to the `agenticml-alerts` SNS topic:
 5. `agenticml-hosted-rds_cpu`: RDS CPU utilization > 80% over 5 minutes (period
    300 s, statistic `Average`).
 6. `agenticml-hosted-healthy_hosts`: ALB `HealthyHostCount` for the target
-   group, statistic `Minimum`, below 1 for 5 periods of 60 s, missing data
-   treated as breaching. This alarm exists only while `DesiredCount` is
-   greater than 0. (It replaces `agenticml-hosted-running_tasks`, which needed
+   group, statistic `Minimum`, below `DesiredCount` (1 or 2) for 5 periods of
+   60 s, missing data treated as breaching. With two tasks, one missing
+   target alarms too. This alarm exists only while `DesiredCount` is
+   greater than 0. The threshold follows the stack's value after the service
+   is stable, so when you scale 2 to 1 it reads 2 for a short time after the
+   second task stops; five consecutive minutes are needed, so it normally does
+   not fire. (It replaces `agenticml-hosted-running_tasks`, which needed
    Container Insights; Container Insights is off.)
 
 Additional bootstrap alarms:
@@ -1055,6 +1083,21 @@ Additional bootstrap alarms:
   spend exceeds 100% of the monthly budget.
 
 Confirm the email subscriptions and exercise one alarm to verify alerting.
+
+A weekly GitHub Actions run (`.github/workflows/monitor.yml`, Mondays 06:17 UTC,
+also runnable with `gh workflow run monitor.yml`) requests
+`https://app.agenticml.xyz/healthz` and the docs site's external links. It is
+not an uptime guarantee and does not replace the alarms: on a failure it opens
+one issue titled "Hosted monitor failed" with the label `hosted`, comments on
+it while the failure lasts and closes it when the check passes again. Scheduled
+runs use the default branch (`dev`), so the schedule starts once the workflow
+is there.
+
+All workflow actions are pinned to full commit SHAs (tag in a comment). Update
+the SHA and the comment together; look up a tag's commit with
+`gh api repos/<owner>/<repo>/git/ref/tags/<tag>` and dereference annotated tags.
+After changing the pins, run `publish-testpypi.yml` once before tagging a
+release.
 
 ### Operations and scaling
 
@@ -1074,7 +1117,10 @@ aws ecs update-service --cluster agenticml-hosted --service agenticml-hosted --d
 ```
 
 The next deploy that updates the service sets the count back to the stack's
-value.
+value. `update-service` bypasses CloudFormation, so the `healthy_hosts` alarm
+keeps the threshold of the stack's `DesiredCount`: it stays at 1 with the
+service at 2, and with the stack at 2 and the service at 1 it will alarm. Prefer
+the workflow input.
 
 To suspend an abusive workspace, click **Suspend** on its row on `/admin`. **Archive**
 there suspends it and moves it to the Archived table (data kept; Restore brings it back).
