@@ -640,6 +640,172 @@ cursor per server host. With older clients, maintain one `AGENTICML_DIR` per
 workspace (e.g. `$HOME/.agenticml-customer-one` and `$HOME/.agenticml-customer-two`),
 or run `agenticml sync <RUN_ID> --reset` before syncing with the second key.
 
+## Launch checks (Phase 5)
+
+Six checks that close AWS roadmap Phase 5. The owner runs them; each has a pass
+line. Record the date, run id, result and any Backlog entry in the roadmap row.
+`scripts/hosted_check.py` has three subcommands: `make-run` creates a finished
+local run, `verify` compares local runs with the server (file sizes and
+sha256, referenced objects, status, fingerprint), and `isolation` probes
+another workspace with this workspace's key. It reads the key from
+`AGENTICML_API_KEY` (or asks for it) and never prints it. The script lives in
+the repository. On a training machine without a checkout, fetch it from `dev`:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/agenticML/agenticml-lite/dev/scripts/hosted_check.py
+```
+
+The commands below use the setup from "Environment configuration" above
+(`AGENTICML_HOST`, a per-workspace `AGENTICML_DIR`, and the key read with
+`read -rsp`). For the AWS commands, export the profile and region once, as in
+"Connecting via ECS Exec":
+
+```sh
+export AWS_PROFILE=agenticml-account AWS_REGION=us-east-2
+```
+
+### 5.1 Rolling deploy during an upload
+
+Re-running a deploy of the commit that is already live does not roll anything:
+the change set is empty and ECS starts no new task. Force a new deployment
+instead; it uses the same rolling settings.
+
+The upload must overlap the moment the old task drains. The new task needs a
+few minutes to start, so start the roll first and the upload when the new
+task is running.
+
+1. In terminal 1 (customer-one key), make the run but do not sync yet. Note
+   the run id and the `checkpoint sha256` line. Use `--mb 1000` on a fast
+   link, so the upload takes at least two minutes:
+
+   ```sh
+   python scripts/hosted_check.py make-run --mb 300
+   ```
+
+2. In terminal 2, start the roll and watch the deployments until the new one
+   (`PRIMARY`) shows `runningCount` 1 while the old one (`ACTIVE`) is still
+   listed:
+
+   ```sh
+   aws ecs update-service --cluster agenticml-hosted --service agenticml-hosted --force-new-deployment
+   watch -n 10 "aws ecs describe-services --cluster agenticml-hosted --services agenticml-hosted --query 'services[0].deployments[].[status,runningCount,rolloutState]' --output text"
+   ```
+
+3. As soon as the new task runs, start the upload in terminal 1. The old task
+   now drains (up to 120 seconds) while requests move to the new one:
+
+   ```sh
+   agenticml sync --all
+   ```
+
+4. In terminal 2, wait for the roll to finish:
+
+   ```sh
+   aws ecs wait services-stable --cluster agenticml-hosted --services agenticml-hosted
+   ```
+
+5. If the sync ends early with an error, run `agenticml sync --all` again. That
+   counts as a pass only if `verify` passes afterwards.
+6. Verify, then read the service events:
+
+   ```sh
+   python scripts/hosted_check.py verify <RUN_ID>
+   aws ecs describe-services --cluster agenticml-hosted --services agenticml-hosted \
+     --query 'services[0].events[:5]'
+   ```
+
+Pass: `verify` prints `RESULT: PASS`, no acknowledged upload was lost, and the
+client retried and finished on its own. Record that the old task stopped after
+the new one was healthy, and the time of each. A `verify` failure blocks the
+launch: record it and open a Backlog entry.
+
+### 5.2 Isolation
+
+With customer-one's key, probe a customer-two run. Point `AGENTICML_DIR` at
+customer-two's store so the script finds that run's object digests (or pass
+`--object <SHA>`):
+
+```sh
+AGENTICML_DIR=$HOME/.agenticml-customer-two \
+  python scripts/hosted_check.py isolation --run <customer-two RUN_ID>
+```
+
+Then do the browser step the script prints: signed in as customer-one's owner,
+open `https://app.agenticml.xyz/w/customer-two/` and a customer-two run URL.
+Both must show "not found".
+
+Pass: every probe gets 404, 401, 403, a redirect to `/login`, or lists the
+object as missing, and never data. The script only reads from customer-two.
+
+### 5.3 Older client
+
+Install the 2.2 client from commit `bd0d499` in a separate venv, use a
+separate `AGENTICML_DIR`, and run the smoke script from "Smoke test":
+
+```sh
+python -m venv ~/aml-old-venv && . ~/aml-old-venv/bin/activate
+pip install 'agenticml-lite @ git+https://github.com/agenticML/agenticml-lite@bd0d499'
+export AGENTICML_DIR=$HOME/.agenticml-old-client
+cd ~/aml-smoke && python smoke.py customer-one
+agenticml sync --all
+```
+
+Then switch back to the 3.0 environment (so `verify` uses the 3.0 tool, with
+the same `AGENTICML_DIR`) and run `python scripts/hosted_check.py verify <RUN_ID>`.
+
+Pass: the sync succeeds and `verify` passes. If the server answers 426 (the
+client is older than the minimum client version), record that this check fails
+and why. Do not change the minimum.
+
+### 5.4 Object encryption
+
+Stored objects use SSE-S3. Take the objects bucket name from the stack
+outputs (`ObjectsBucket`), list three keys, and read each one:
+
+```sh
+aws s3api list-objects-v2 --bucket <ObjectsBucket output> --prefix hosted/ --max-items 3
+aws s3api head-object --bucket <ObjectsBucket output> --key <KEY>
+```
+
+Then download the `checkpoint` artifact of the 5.1 run from the dashboard and
+compare:
+
+```sh
+sha256sum <downloaded file>
+```
+
+Pass: each `head-object` shows `"ServerSideEncryption": "AES256"`, and the
+`sha256sum` equals the `checkpoint sha256` line `make-run` printed.
+
+### 5.5 Alarm drill
+
+Set one alarm to `ALARM` by hand. This also confirms both SNS subscriptions
+(step 2.1b):
+
+```sh
+aws cloudwatch set-alarm-state --alarm-name agenticml-hosted-alb_5xx \
+  --state-value ALARM --state-reason "Phase 5 alarm drill"
+```
+
+Pass: both alert addresses receive the ALARM email. The alarm returns to OK at
+its next evaluation. If the second address gets nothing, re-subscribe it
+(step 2.1b).
+
+### 5.6 Row-level security role check
+
+The task connects to RDS as the master user. The server logs "row-level
+security is not enforced for database role" at startup if that role has
+SUPERUSER or BYPASSRLS:
+
+```sh
+aws logs filter-log-events --log-group-name /ecs/agenticml-hosted \
+  --filter-pattern '"row-level security is not enforced"' --max-items 5
+```
+
+Pass: the result is recorded (warning present or absent) and the Backlog entry
+is updated. Any event means row-level security is bypassed. CloudWatch keeps
+30 days, so a task started within that window has logged its startup line.
+
 ## Upgrades, rollback and config
 
 Every push to `dev` that changes the image or the stack queues a deploy of
@@ -652,6 +818,10 @@ deploys start the new task before stopping the old one
 deploys without downtime. The old task drains on SIGTERM; ALB deregistration
 delay and ECS stop timeout are both 120 seconds. Watch uploads and client
 retries during the rolling deployment.
+
+Re-running a deploy of the commit that is already live is an empty change set
+and does not restart the task. To roll the service without a new commit, use
+`aws ecs update-service --cluster agenticml-hosted --service agenticml-hosted --force-new-deployment`.
 
 Until dispatch is available, roll back by reverting on `dev`: the push of the
 revert triggers a deploy. With dispatch, run the workflow with
