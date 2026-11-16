@@ -60,7 +60,7 @@ The dashboard warns you when storage or daily uploads pass 80% of the limit. `ag
 
 ## Support
 
-Use [GitHub Issues](https://github.com/agenticML/agenticml-lite/issues) and put "hosted" in the title. Issues are public, so do not post sync keys, run data or other private details. For legal, privacy and deletion requests, email [support@agenticml.xyz](mailto:support@agenticml.xyz).
+Use [GitHub Issues](https://github.com/agenticML/agenticml-lite/issues) and put "hosted" in the title. Issues are public, so do not post sync keys, run data or other private details. For legal, privacy and deletion requests, email [contact@agenticml.xyz](mailto:contact@agenticml.xyz).
 
 ## Next steps
 

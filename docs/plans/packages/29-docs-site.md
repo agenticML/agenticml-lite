@@ -43,7 +43,7 @@ live.
 | D2 | Where the policies live | Docs site under `/legal/` (text edits need no hosted deploy; the sign-in page links out with plain `<a>` tags, no CSP change) | Served by the app at `/terms`, `/acceptable-use`, `/privacy` behind an opt-in `AGENTICML_SERVER_LEGAL_DIR` (needs server code, a hosted deploy per edit, and a † second review) |
 | D3 | Publishing route before `dev` → `main` | A docs-only PR to `main` that copies `website/` and `docs.yml` from `dev` | Allow `dev` on the `github-pages` environment (a later `main` push silently overwrites it); wait for the full 3.0 merge and PyPI release |
 | D4 | Policy facts | Owner supplies: operator name or entity, contact address, governing law, minimum age, deletion by email request, who approves (with a lawyer) | – |
-| D5 | Support channel | GitHub Issues with a `hosted` label until a mailbox exists; later `support@agenticml.xyz` (Namecheap forwarding, check it does not touch the `app` record) | A mailbox now |
+| D5 | Support channel | GitHub Issues with a `hosted` label; legal, privacy, deletion, abuse and security requests go to `contact@agenticml.xyz` (an existing Zoho Mail mailbox, decided Nov 16, 2026) | A mailbox now |
 | D6 | Users who signed up before the policies | Email them the policies when they go live; continued use means acceptance | Click-through on next sign-in (new code) |
 | D7 | Install command until PyPI 3.0.0 | Git install `@dev` with a "moves with development" warning, and the owner releases 3.0.0 soon | Owner cuts `v3.0.0rc1` and the docs pin to it |
 | D8 | Custom domain | Later (Backlog): `docs.agenticml.xyz` after PyPI 3.0.0 | Now; or the apex `agenticml.xyz` |
@@ -85,9 +85,10 @@ with the supervisor deciding. Taken:
 - **D4:** delegated to the supervisor; the answers are in the fact sheet
   below. The owner approves them by merging the PR to `main`.
 - **D5:** the `hosted` issue label is created.
-- **Support mailbox (owner step):** before the PR to `main` merges, make
-  support@agenticml.xyz receive mail (Namecheap email forwarding for
-  agenticml.xyz). Do not change the `app` CNAME or the ACM validation CNAME.
+- **Contact mailbox (done):** the contact address is `contact@agenticml.xyz`,
+  an existing mailbox on the domain's Zoho Mail (decided Nov 16, 2026), so
+  there is no mail setup left. Do not change the `app` CNAME or the ACM
+  validation CNAME.
 
 ## Owner fact sheet for the policies (D4)
 
@@ -98,7 +99,7 @@ placeholders. The owner delegated these answers to the supervisor on Nov 15,
 | # | Fact or decision | Where it is used | Answer |
 | --- | --- | --- | --- |
 | 1 | Operator name or legal entity | Terms, Acceptable use, Privacy (4 places) | the agenticML project |
-| 2 | Contact address for policy and deletion requests | Terms, Acceptable use, Privacy (5 places) | support@agenticml.xyz |
+| 2 | Contact address for policy and deletion requests | Terms, Acceptable use, Privacy (5 places) | contact@agenticml.xyz (existing Zoho Mail mailbox; owner decided Nov 16, 2026) |
 | 3 | Effective date | Terms, Acceptable use, Privacy (3 places) | Nov 15, 2026 |
 | 4 | Governing law jurisdiction | Terms (1 place) | The country in which the operator of the service resides, with consumer rights kept |
 | 5 | Minimum age | Terms, Privacy (2 places) | 16 |
@@ -477,12 +478,13 @@ Resumed and finished on draft PR [#64](https://github.com/agenticML/agenticml-li
 - **Policies filled and fact-checked.** The owner fact sheet is answered (D4, delegated to the supervisor). A three-lens check of the policies against the code and templates applied 28 corrections. The row-level security claim is dropped: the hosted task may connect with a role that bypasses it (Backlog entry). `draft: true` is removed. The Terms, Acceptable use and Privacy pages sit in a Legal sidebar group, and the hosted pages link to them.
 - **GitHub settings done (owner approved):** repo description "Local-first experiment tracking with a self-hosted server and a hosted service", homepage https://agenticml.github.io/agenticml-lite/, and the `hosted` issue label (D5). `HOSTED_DESIRED_COUNT` is deleted.
 - **Enforce HTTPS refused.** GitHub answered "The certificate does not exist yet". Retry after the site is published from `main`.
+- **Contact address decided (Nov 16, 2026).** The owner chose `contact@agenticml.xyz` (an existing Zoho Mail mailbox) for legal, privacy, deletion, abuse and security requests; the earlier support address did not exist. All pages and plans use the new address, and the mail prerequisite is done. The policies' "Last updated" dates are unchanged because they are not published yet. The HOSTED.md staff support account example is now `help@agenticml.xyz`.
 - **Row-level security sentence restored (Nov 16, 2026).** The Phase 5.6 check found no bypass warning and row-level security enforced, so the Privacy page's isolation bullet says again that database tables enforce it as a second check.
 - `HOSTED_LEGAL_BASE_URL` is not set in the `hosted` environment, so `/login` and `/invite` show no policy links yet.
 - **Next, in order:**
   1. Merge the PR to `dev`.
   2. The git agent opens the docs-only PR to `main`.
-  3. The owner sets up support@agenticml.xyz forwarding, then merges.
+  3. The owner merges (the contact mailbox `contact@agenticml.xyz` already exists).
   4. Set `HOSTED_LEGAL_BASE_URL=https://agenticml.github.io/agenticml-lite/legal/` and approve the hosted deploy.
   5. Check that the `/login` and `/invite?token=x` footer links show and return 200.
   6. The owner emails existing sign-ups (D6).

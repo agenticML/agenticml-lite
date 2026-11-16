@@ -207,7 +207,7 @@ All workspace deletions write a permanent entry to the server audit log.
 Server administrators do **not** have ambient access to customer data. A server administrator navigating to `/w/<customer-slug>/` receives HTTP `404 Not Found` unless they are a member of that workspace.
 
 To grant support access:
-1. The customer must explicitly invite the support account (e.g. `support@agenticml.xyz`) as a `member` or `admin` through **Settings > Members**.
+1. The customer must explicitly invite the support account (for example `help@agenticml.xyz`) as a `member` or `admin` through **Settings > Members**.
 2. Adding the support account and any change to its role are recorded in the workspace audit log (**Settings > Activity** and `server audit`). What a member views (runs, code, artifacts) is not logged.
 3. Once support is complete, the customer removes the support account from their workspace members list.
 

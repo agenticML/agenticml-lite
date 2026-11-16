@@ -55,7 +55,7 @@ Open **Settings** in the top bar. What you see depends on your role.
 
 Viewers see only Account. Members see Account and API keys. The switcher appears only if you belong to more than one workspace, open sign-up is on, or you are a server admin.
 
-Only the operator can delete a workspace. Send deletion requests to [support@agenticml.xyz](mailto:support@agenticml.xyz), as the [Privacy policy](/agenticml-lite/legal/privacy/) describes. The operator confirms privately which workspace is yours before deleting anything. Do not post your workspace slug, email or run data in a public GitHub issue.
+Only the operator can delete a workspace. Send deletion requests to [contact@agenticml.xyz](mailto:contact@agenticml.xyz), as the [Privacy policy](/agenticml-lite/legal/privacy/) describes. The operator confirms privately which workspace is yours before deleting anything. Do not post your workspace slug, email or run data in a public GitHub issue.
 
 ## Several workspaces from one machine
 

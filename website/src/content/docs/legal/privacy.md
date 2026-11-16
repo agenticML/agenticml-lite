@@ -81,7 +81,7 @@ We host and operate the service using the following third-party service provider
 ## 7. Your Rights and Deletion Requests
 
 - **Access and export:** You can view, inspect, and download your experiment metrics, run files, and artifacts at any time through the dashboard or by using the `agenticml` CLI and Python SDK.
-- **Account and data deletion:** You may ask us to delete your workspaces, and your account record (email, display name and sign-in identifier), by contacting [support@agenticml.xyz](mailto:support@agenticml.xyz). There is no self-serve deletion; we carry the request out by hand, including removing your user from Firebase Authentication and deleting server-level audit log entries that name you. Load balancer access logs (90 days) and server logs (30 days) are not deleted on request and expire on their own schedule.
+- **Account and data deletion:** You may ask us to delete your workspaces, and your account record (email, display name and sign-in identifier), by contacting [contact@agenticml.xyz](mailto:contact@agenticml.xyz). There is no self-serve deletion; we carry the request out by hand, including removing your user from Firebase Authentication and deleting server-level audit log entries that name you. Load balancer access logs (90 days) and server logs (30 days) are not deleted on request and expire on their own schedule.
 - **Team management:** Workspace administrators can manage team members, revoke keys, and remove user memberships directly in the workspace settings.
 
 ## 8. Children's Privacy
@@ -94,5 +94,5 @@ We may update this Privacy Policy from time to time. When changes are made, we w
 
 ## 10. Contact Us
 
-- **Privacy inquiries and deletion requests:** Email [support@agenticml.xyz](mailto:support@agenticml.xyz).
+- **Privacy inquiries and deletion requests:** Email [contact@agenticml.xyz](mailto:contact@agenticml.xyz).
 - **General technical support:** Submit an issue on GitHub Issues at [agenticML/agenticml-lite/issues](https://github.com/agenticML/agenticml-lite/issues). For the hosted service, put "hosted" in the title.
