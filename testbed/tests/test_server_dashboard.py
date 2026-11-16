@@ -8,7 +8,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from agenticml.server.app import make_server
 from agenticml.server.db.repos import RunRepo
-from agenticml.server.db.workspaces import WorkspaceRepo
+from agenticml.server.db.workspaces import InviteRepo, WorkspaceRepo
 from agenticml.server.runs import adopt_directory, reconcile
 from agenticml.server.workspaces import prepare_store
 from agenticml.store import RunWriter, layout
@@ -408,12 +408,66 @@ def test_invite_page_sets_password_and_overflow(page, tmp_path, monkeypatch):
         expect(page.get_by_role("heading", name="Choose a password", exact=True)).to_be_visible()
         expect(page).to_have_url(f"{url}/invite")
         assert token not in page.url
+        expect(page.locator(".auth-shell")).to_be_visible()
+        expect(page.locator(".field-underline")).to_have_count(2)
+        expect(page.locator(".auth-brand")).to_be_hidden()
         assert_no_overflow(page)
         page.locator("#password").fill("password1234")
+        page.locator("#password2").fill("password1235")
+        page.get_by_role("button", name="Save password", exact=True).click()
+        expect(page.locator("#error")).to_have_text("Passwords do not match")
+        assert_no_overflow(page)
         page.locator("#password2").fill("password1234")
         page.get_by_role("button", name="Save password", exact=True).click()
         expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
         assert_no_overflow(page)
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()
+
+
+def test_invite_existing_account_page_joins_and_overflow(page, tmp_path, monkeypatch):
+    # The account lives in the default workspace; the invite is into a second
+    # one, so the page offers "Join workspace" and redeeming answers 409 (the
+    # account keeps its password and signs in at /login).
+    page.allow_http_errors = True
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    httpd = make_server(tmp_path / "data", port=0)
+    httpd.users.add("alice", role="admin")
+    beta = WorkspaceRepo(httpd.db).create("beta", owner="alice")
+    prepare_store(httpd.data_dir, beta["id"])
+    # The invite exists first; the account is then created in the default workspace.
+    token = InviteRepo(httpd.db, beta["id"]).create("carol", "member", "alice")
+    httpd.users.add("carol", role="member")
+    httpd.users.set_password("carol", "password1234")
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        page.set_viewport_size({"width": 375, "height": 812})
+        page.goto(f"{url}/invite?token={token}")
+        expect(page.get_by_role("heading", name="You already have an account", exact=True)).to_be_visible()
+        expect(page.get_by_role("button", name="Join workspace", exact=True)).to_be_visible()
+        expect(page.get_by_role("link", name="Sign in", exact=True)).to_have_attribute("href", "/login")
+        expect(page.locator("input[type=password]")).to_have_count(0)
+        expect(page.locator(".auth-shell")).to_be_visible()
+        expect(page).to_have_url(f"{url}/invite")
+        assert token not in page.url
+        assert "carol" not in page.content()
+        assert_no_overflow(page)
+        # A server error shows its message and re-enables the button.
+        page.route("**/invite", lambda route: route.fulfill(
+            status=503, content_type="application/json", body='{"error": "boom"}')
+            if route.request.method == "POST" else route.continue_())
+        page.get_by_role("button", name="Join workspace", exact=True).click()
+        expect(page.locator("#error")).to_have_text("boom")
+        expect(page.get_by_role("button", name="Join workspace", exact=True)).to_be_enabled()
+        assert_no_overflow(page)
+        page.unroute("**/invite")
+        # The real redeem answers 409 for an existing account and lands on /login.
+        page.get_by_role("button", name="Join workspace", exact=True).click()
+        expect(page).to_have_url(f"{url}/login")
     finally:
         httpd.shutdown()
         thread.join(timeout=5)

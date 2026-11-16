@@ -135,6 +135,7 @@ EXAMPLES = {
     "static_setup_js": {"method": "GET", "path": "/static/setup.js"},
     "static_invite_js": {"method": "GET", "path": "/static/invite.js"},
     "static_signout_js": {"method": "GET", "path": "/static/signout.js"},
+    "static_theme_js": {"method": "GET", "path": "/static/theme.js"},
     "static_firebase_login_js": {"method": "GET", "path": "/static/firebase-login.js"},
     "static_firebase_app": {"method": "GET", "path": "/static/vendor/firebase/firebase-app-compat.js"},
     "static_firebase_auth": {"method": "GET", "path": "/static/vendor/firebase/firebase-auth-compat.js"},

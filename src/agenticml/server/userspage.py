@@ -7,7 +7,7 @@ from .limits import LimitReached
 from .db import DatabaseError
 from .keys import ClientError, KeyStoreUnavailable, LastAdminError, validate_name
 from .db.workspaces import validate_login
-from .keyspage import command_host, read_json
+from .keyspage import command_host, invite_link, read_json
 from .users import (
     CROSS_WORKSPACE_CREDENTIALS, DETACHED_ACCOUNT, IdentityTaken, ROLES, UserNameTaken, UserNotFound, allowed,
 )
@@ -52,7 +52,7 @@ def _user_run_counts(handler):
 
 
 def _invite_url(webauth, handler, token):
-    return command_host(webauth, handler)["host"].rstrip("/") + "/invite?token=" + token
+    return invite_link(command_host(webauth, handler)["host"], token, webauth.firebase is not None)
 
 
 def _audit(handler, principal, action, target, detail=None):

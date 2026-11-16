@@ -1029,3 +1029,65 @@ def test_expired_invite_post_counts_against_address_throttle(tmp_path, monkeypat
             status, _, payload = call(httpd, "/invite", "POST", body, csrf(httpd))
             assert status == 404
         assert call(httpd, "/invite", "POST", body, csrf(httpd))[0] == 429
+
+
+# --- 8. Sign-in page shell and theme (package 30.4) ---
+
+_SIGN_IN_FORM_PAGES = (
+    "login.html", "firebase-login.html", "setup.html", "invite.html", "invite-existing.html")
+_THEME_SCRIPT = '<script src="/static/theme.js"></script>'
+
+
+def _page_text(name):
+    from agenticml.server.webauth import _LOGIN_STATIC
+    return (_LOGIN_STATIC / name).read_text(encoding="utf-8")
+
+
+def test_sign_in_pages_share_the_auth_shell():
+    import re
+    brands, logos = [], []
+    for name in _SIGN_IN_FORM_PAGES:
+        text = _page_text(name)
+        brand = re.search(r'<aside class="auth-brand".*?</aside>', text, re.S)
+        logo = re.search(r'<div class="auth-compact-logo">.*?</div>', text, re.S)
+        assert brand and logo, name
+        brands.append(brand.group(0))
+        logos.append(logo.group(0))
+        assert 'class="auth-page"' in text and "auth-shell" in text, name
+        if name in ("setup.html", "invite.html", "invite-existing.html"):
+            assert "login-card" not in text and "login-page" not in text, name
+        # CSP: no inline script and no inline event handlers.
+        assert not re.search(r"<script(?![^>]*\bsrc=)", text), name
+        assert not re.search(r"\son[a-z]+=", text), name
+        # Theme: a blocking classic script in <head>, and the toggle after the form.
+        head = text.split("</head>")[0]
+        assert _THEME_SCRIPT in head, name
+        assert head.index(_THEME_SCRIPT) > head.index("app.css"), name
+        assert text.count('id="auth-theme"') == 1 and 'aria-label="Change' not in text, name
+        assert text.index('id="auth-theme"') > text.index("</main>"), name
+    assert len(set(brands)) == 1 and len(set(logos)) == 1
+
+
+def test_sign_in_pages_theme_script_is_served_and_inert(tmp_path):
+    with running(tmp_path / "data") as httpd:
+        status, hdrs, body = call(httpd, "/static/theme.js")
+        assert status == 200 and body
+        assert hdrs["Content-Type"].startswith("text/javascript")
+        assert hdrs["Cache-Control"] == "no-store"
+        for forbidden in (b"fetch(", b"XMLHttpRequest", b"sendBeacon"):
+            assert forbidden not in body
+        assert b"agenticml-theme" in body
+        status, _, page = call(httpd, "/login")
+        assert status == 200 and _THEME_SCRIPT.encode() in page and b'id="auth-theme"' in page
+
+
+def test_403_identity_page_keeps_old_card_and_theme_script(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    with running(tmp_path / "data", trusted_proxies=("127.0.0.1",),
+                 identity_header="tailscale") as httpd:
+        status, _, body = call(httpd, "/", headers={"Tailscale-User-Login": "stranger@example.com"})
+        assert status == 403
+        assert b"No user for this identity" in body and b"login-card" in body
+        assert _THEME_SCRIPT.encode() in body and b'id="auth-theme"' not in body
+        status, _, css = call(httpd, "/static/app.css")
+        assert status == 200 and b".login-card" in css

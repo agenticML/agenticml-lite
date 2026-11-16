@@ -79,14 +79,25 @@ def assert_dialog_fits(page, dialog):
 
 
 def test_setup_creates_admin_and_opens_dashboard(page, fresh_server):
-    page.set_viewport_size({"width": 375, "height": 812})
+    page.set_viewport_size({"width": 1280, "height": 800})
     token = fresh_server["httpd"].web.setup_token
     page.goto(f"{fresh_server['url']}/setup?token={token}")
     expect(page.get_by_role("heading", name="Create admin account", exact=True)).to_be_visible()
     expect(page).to_have_url(f"{fresh_server['url']}/setup")
     assert token not in page.url
+    expect(page.locator(".auth-shell")).to_be_visible()
+    expect(page.locator(".auth-brand")).to_be_visible()
+    expect(page.locator(".field-underline")).to_have_count(3)
+    page.set_viewport_size({"width": 375, "height": 812})
+    expect(page.locator(".auth-brand")).to_be_hidden()
+    expect(page.locator(".auth-compact-logo .auth-logo")).to_be_visible()
     assert_no_overflow(page)
     page.locator("#password").fill("password1234")
+    page.locator("#password2").fill("password1235")
+    page.get_by_role("button", name="Create admin account", exact=True).click()
+    expect(page.locator("#error")).to_have_text("Passwords do not match")
+    assert_no_overflow(page)
+    page.locator("#password2").fill("password1234")
     page.locator("#password2").fill("password1234")
     page.get_by_role("button", name="Create admin account", exact=True).click()
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()

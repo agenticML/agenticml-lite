@@ -740,11 +740,21 @@ def _invite_base(args):
     return None
 
 
-def _print_invite(token, base):
+def _hosted_invites(args):
+    """True when links should carry the token in the fragment (Firebase on).
+    A bad Firebase setting here must not break `users invite`."""
+    try:
+        return _firebase_from_args(args) is not None
+    except (ValueError, RuntimeError):
+        return False
+
+
+def _print_invite(token, base, hosted=False):
+    from .server.keyspage import invite_link
     if base:
-        print(f"{base}/invite?token={token}")
+        print(invite_link(base, token, hosted))
     else:
-        print(f"/invite?token={token}")
+        print(invite_link("", token, hosted))
         print("open it on your server's address")
 
 
@@ -797,12 +807,12 @@ def cmd_server_users(args):
                 token = users.create_invite(args.name, operator=True)
                 log.record(actor, "cli", "user.invite", args.name,
                            detail={"expires_at": users.get(args.name).invite["expires_at"]})
-                _print_invite(token, _invite_base(args))
+                _print_invite(token, _invite_base(args), _hosted_invites(args))
         elif args.users_action == "invite":
             token = users.create_invite(args.name, operator=True)
             log.record(actor, "cli", "user.invite", args.name,
                        detail={"expires_at": users.get(args.name).invite["expires_at"]})
-            _print_invite(token, _invite_base(args))
+            _print_invite(token, _invite_base(args), _hosted_invites(args))
             _print_account_workspaces(db, args.name)
         elif args.users_action == "set-password":
             users.set_password(args.name, _read_cli_password(args), operator=True)

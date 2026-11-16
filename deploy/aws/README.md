@@ -335,7 +335,12 @@ web and `/setup` return 404.
    **Settings > Members** in the workspace. An invite produces a one-time link
    (72 hours). The person opens it and signs in with Google or email/password
    using that same email, which must be verified. Inviting someone who already
-   has an account adds the membership directly (no link).
+   has an account adds the membership directly (no link). On this stack the link
+   looks like `https://app.agenticml.xyz/invite#token=...`: the token sits in the
+   URL fragment, which browsers never send, so it stays out of the load balancer
+   access logs. If a mail client drops the fragment, the person lands on the
+   plain sign-in page without the invite and is told they have no access; they
+   open the full link again in a browser, or the owner sends a new invite.
 5. **Issue sync keys**: A workspace admin creates sync keys for any member in
    **Settings > API keys** in the workspace (the person must be a member, i.e.
    has redeemed their invite or been added directly).
@@ -504,6 +509,11 @@ To provision the first customer workspace (`customer-one`):
    agenticml server users invite alice@example.com --workspace customer-one \
      --public-url https://app.agenticml.xyz --data /data
    ```
+   The task has the Firebase settings in its environment, so the link prints as
+   `https://app.agenticml.xyz/invite#token=...` (token in the URL fragment, never
+   sent to the load balancer). Run outside the task without those settings, the
+   command prints the self-hosted `?token=` form, which the hosted page also
+   accepts.
 4. Add team members:
    ```sh
    agenticml server users add bob@example.com --role member --workspace customer-one \
@@ -1119,7 +1129,11 @@ definition) afterwards.
 
 Monitor the service with `aws logs tail /ecs/agenticml-hosted --follow`, ECS
 service events, and CloudWatch alarms. ALB access logs expire in 90 days (stored
-in the logs bucket); application logs in CloudWatch expire in 30 days.
+in the logs bucket); application logs in CloudWatch expire in 30 days. Invite
+links on this stack carry the token in the URL fragment, which is never sent to
+the load balancer, so new access logs hold no invite tokens. Links created before
+that change used `?token=`; they are single use, expire in 72 hours and only work
+for the invited verified email, and their log lines age out with the rest.
 
 ### Alarms
 

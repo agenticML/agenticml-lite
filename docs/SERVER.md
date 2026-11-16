@@ -241,6 +241,8 @@ agenticml server users set-identity LOGIN [IDENTITY] --workspace SLUG
 
 `--workspace` defaults to `default`.
 
+Invite and setup links on a self-hosted server carry their token in the query string (`/invite?token=...`, `/setup?token=...`), because the server reads it to choose the page. If such a server sits behind a proxy or load balancer that logs request URLs, those tokens (single use, 72 hours for invites) appear in its logs; exclude query strings from that log. With Firebase sign-in on (the hosted service), `users invite` and the Members page print `/invite#token=...` instead: the fragment is never sent to the server or to any proxy in front of it.
+
 ## API keys and sync authentication
 
 All sync requests over [protocol v2](PROTOCOL.md) authenticate using HTTP bearer tokens:

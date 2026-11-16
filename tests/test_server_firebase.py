@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import base64
 import json
+import re
 import time
 
 import jwt
@@ -947,7 +948,7 @@ def test_firebase_login_csp_and_assets(tmp_path, monkeypatch):
             status, hdrs, _ = call(httpd, path)
             assert status == 200
             assert hdrs.get('Content-Security-Policy') == _FIREBASE_LOGIN_CSP
-        for path in _FIREBASE_JS:
+        for path in _FIREBASE_JS + ('/static/theme.js',):
             status, hdrs, body = call(httpd, path)
             assert status == 200
             assert hdrs.get('Content-Type', '').startswith('text/javascript')
@@ -971,6 +972,9 @@ def test_firebase_login_csp_and_assets(tmp_path, monkeypatch):
         status, hdrs, _ = call(httpd, '/login')
         assert status == 200
         assert hdrs.get('Content-Security-Policy') == _CSP
+        status, hdrs, body = call(httpd, '/static/theme.js')
+        assert status == 200 and body
+        assert hdrs.get('Content-Type', '').startswith('text/javascript')
         unknown = call(httpd, '/no-such-agenticml-route')
         for path in _FIREBASE_JS:
             got = call(httpd, path)
@@ -1404,6 +1408,54 @@ def test_email_admin_invite_link_and_self_checks(tmp_path, monkeypatch):
         status, data = _api(httpd, cookie, '/api/w/default/members/Boss%40Example.com',
                             'DELETE')
         assert status == 409 and data == {'error': 'you cannot remove yourself'}
+
+
+def test_firebase_invite_url_uses_fragment(tmp_path, monkeypatch):
+    # Package 30.4: with Firebase on the token goes in the URL fragment, which
+    # browsers never send, so ALB access logs do not record live invite tokens.
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    with firebase_running(tmp_path / 'data') as httpd:
+        cookie = _email_admin(httpd)
+        status, data = _api(httpd, cookie, '/api/w/default/invites', 'POST',
+                            {'login': 'new@example.com', 'role': 'member'})
+        assert status == 201 and data['added'] is False
+        url = data['invite_url']
+        assert re.fullmatch(r'https?://[^/?#]+/invite#token=[A-Za-z0-9_-]+', url), url
+        assert '?token=' not in url
+        # Old links keep working: the page is the same for any /invite request.
+        token = url.split('#token=', 1)[1]
+        status, _, page = call(httpd, '/invite?token=' + token)
+        assert status == 200 and b'/static/firebase-login.js' in page
+
+
+def test_invite_cli_link_format_follows_firebase(tmp_path, monkeypatch, capsys):
+    base = ['--public-url', 'https://app.example.org', '--data', str(tmp_path / 'data')]
+    monkeypatch.delenv('AGENTICML_SERVER_PUBLIC_URL', raising=False)
+    monkeypatch.delenv('AGENTICML_SERVER_FIREBASE_PROJECT', raising=False)
+    monkeypatch.delenv('AGENTICML_SERVER_FIREBASE_API_KEY', raising=False)
+    monkeypatch.delenv('AGENTICML_SERVER_FIREBASE_AUTH_DOMAIN', raising=False)
+    assert cli.main(['server', 'users', 'add', 'cara', '--no-invite', *base]) == 0
+    capsys.readouterr()
+    # Without Firebase: the query form, unchanged.
+    assert cli.main(['server', 'users', 'invite', 'cara', *base]) == 0
+    first = capsys.readouterr().out.splitlines()[0]
+    assert first.startswith('https://app.example.org/invite?token=') and '#' not in first
+    # With Firebase configured (as in the hosted task): the fragment form.
+    monkeypatch.setenv('AGENTICML_SERVER_FIREBASE_PROJECT', 'demo-project')
+    monkeypatch.setenv('AGENTICML_SERVER_FIREBASE_API_KEY', 'AIzaSyTestKey')
+    assert cli.main(['server', 'users', 'invite', 'cara', *base]) == 0
+    first = capsys.readouterr().out.splitlines()[0]
+    assert first.startswith('https://app.example.org/invite#token=') and '?' not in first
+    # No public URL: still the fragment form, plus the hint line.
+    assert cli.main(['server', 'users', 'invite', 'cara', '--data', str(tmp_path / 'data')]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].startswith('/invite#token=')
+    assert lines[1] == "open it on your server's address"
+    # A bad Firebase setting must not break `users invite`: it falls back to the query form.
+    monkeypatch.setenv('AGENTICML_SERVER_FIREBASE_PROJECT', 'X')
+    assert cli.main(['server', 'users', 'invite', 'cara', *base]) == 0
+    first = capsys.readouterr().out.splitlines()[0]
+    assert first.startswith('https://app.example.org/invite?token=')
 
 
 def test_email_admin_member_path_validation(tmp_path, monkeypatch):

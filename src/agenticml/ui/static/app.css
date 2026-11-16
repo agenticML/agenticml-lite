@@ -593,8 +593,9 @@ kbd {
 }
 
 /* Sign-in pages (package 27): two panels, brand left and form right,
-   after the agenticml-server sign-in screen. setup.html and invite.html
-   keep .login-page / .login-card above. */
+   after the agenticml-server sign-in screen. Every sign-in page uses this
+   shell; .login-page / .login-card above remain only for the 403 "no user
+   for this identity" page. */
 .auth-page {
   margin: 0;
 }
@@ -765,11 +766,26 @@ kbd {
 
 /* Form side */
 .auth-form-side {
+  position: relative;
   display: flex;
   flex-direction: column;
   min-width: 0;
   padding: 32px 40px 40px;
   background: var(--surface);
+}
+/* The theme toggle comes after the form in the DOM and sits top right. */
+.auth-theme {
+  position: absolute;
+  top: 28px;
+  right: 40px;
+  flex: none;
+  font-family: var(--font-mono-stack);
+  font-size: var(--fs-xs);
+}
+@media (min-width: 961px) {
+  :root[data-theme="dark"] .auth-form-side {
+    border-left: 1px solid var(--hairline);
+  }
 }
 .auth-compact-logo {
   display: none;
@@ -907,6 +923,13 @@ kbd {
 .link-button:hover {
   color: var(--accent-hover);
 }
+.auth-links a {
+  color: var(--accent);
+  text-decoration: none;
+}
+.auth-links a:hover {
+  color: var(--accent-hover);
+}
 .auth-error {
   margin: 0;
   font-size: 13.5px;
@@ -951,6 +974,10 @@ kbd {
 @media (max-width: 560px) {
   .auth-form-side {
     padding: 24px 20px 28px;
+  }
+  .auth-theme {
+    top: 20px;
+    right: 20px;
   }
 }
 #theme {

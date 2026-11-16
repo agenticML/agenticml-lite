@@ -140,6 +140,10 @@ def test_admin_page_keeps_account_dialog_and_workspace_pages_get_admin_link(page
     expect(dialog.get_by_role("heading", name="Workspaces", exact=True)).to_be_visible()
     expect(dialog.get_by_role("link", name="Admin", exact=True)).to_be_visible()
     expect(dialog.get_by_label("New password", exact=True)).to_be_visible()
+    # Password mode has the form the Firebase dialog omits (see test_server_firebase_dashboard.py).
+    expect(dialog.get_by_label("Confirm password", exact=True)).to_be_visible()
+    expect(dialog.get_by_role("button", name="Change password", exact=True)).to_be_visible()
+    expect(dialog.locator(".identity div").filter(has_text="Sign-in").locator("dd")).to_have_text("password")
     dialog.get_by_role("button", name="Close", exact=True).click()
     expect(dialog).to_have_count(0)
 

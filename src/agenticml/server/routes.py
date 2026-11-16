@@ -71,6 +71,7 @@ _ROUTES.extend([
     _r("GET", r"/static/setup.js", "public", None, "public_asset", "static_setup_js"),
     _r("GET", r"/static/invite.js", "public", None, "public_asset", "static_invite_js"),
     _r("GET", r"/static/signout.js", "public", None, "public_asset", "static_signout_js"),
+    _r("GET", r"/static/theme.js", "public", None, "public_asset", "static_theme_js"),
     _r("GET", r"/static/firebase-login.js", "public", None, "public_asset", "static_firebase_login_js"),
     _r("GET", r"/static/vendor/firebase/firebase-app-compat.js", "public", None, "public_asset", "static_firebase_app"),
     _r("GET", r"/static/vendor/firebase/firebase-auth-compat.js", "public", None, "public_asset", "static_firebase_auth"),
@@ -889,7 +890,7 @@ def _static_file(webauth, handler, route, match):
 
 
 def _invites(webauth, handler, route, match):
-    from .keyspage import command_host, read_json
+    from .keyspage import command_host, invite_link, read_json
     from .keys import ClientError
     from .webauth import LOGIN_BODY_MAX
 
@@ -923,7 +924,7 @@ def _invites(webauth, handler, route, match):
             handler._json({"added": True, "login": login, "role": role,
                            "invite_url": None, "expires_at": None}, 201)
             return
-        url = command_host(webauth, handler)["host"].rstrip("/") + "/invite?token=" + token
+        url = invite_link(command_host(webauth, handler)["host"], token, webauth.firebase is not None)
         handler._json({"added": False, "login": login, "role": role,
                        "invite_url": url, "expires_at": expires_at}, 201)
         return

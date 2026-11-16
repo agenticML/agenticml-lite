@@ -54,8 +54,13 @@
   let busy = false;
   let mode = "signin";
   if (location.pathname === "/invite") {
-    invite = new URLSearchParams(location.search).get("token") || null;
-    if (location.search) history.replaceState(null, "", "/invite");
+    // The token is in the fragment (never sent to the server or its load
+    // balancer); links made before that change carry it in the query.
+    invite =
+      new URLSearchParams(location.hash.slice(1)).get("token") ||
+      new URLSearchParams(location.search).get("token") ||
+      null;
+    if (location.search || location.hash) history.replaceState(null, "", "/invite");
   }
 
   function hideExtras() {

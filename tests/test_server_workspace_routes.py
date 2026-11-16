@@ -466,8 +466,10 @@ def test_invite_existing_account_and_workspace_token_flow(two):
     status, hdrs, page = call(server, "/invite?token=" + token)
     assert status == 200
     assert b"you already have an account" in page.lower()
+    assert b"auth-shell" in page and b'id="invite-existing"' in page
     assert b'type="password"' not in page.lower()
     assert b"<button" in page.lower()
+    assert hdrs["Referrer-Policy"] == "no-referrer"
     assert b"newbie" not in page
     after = AccountRepo(server.db).get("newbie")
     assert after["password"] == before["password"] and after["generation"] == before["generation"]
@@ -500,7 +502,7 @@ def test_invite_existing_account_and_workspace_token_flow(two):
 
     token = InviteRepo(server.db, a["id"]).create("fresh", "member", "alice")
     status, _, page = call(server, "/invite?token=" + token)
-    assert status == 200 and b"Choose a password" in page
+    assert status == 200 and b"Choose a password" in page and b"auth-shell" in page
     status, hdrs, body = call(
         server, "/invite", "POST",
         json.dumps({"token": token, "password": PASSWORD}).encode(), csrf(server))
