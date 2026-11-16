@@ -453,13 +453,30 @@ Additional environment variables:
 
 Every append, atomic write, and object put on the server does `os.fsync` plus a directory fsync. That is the main extra cost when `<data>` is on EFS or another network filesystem. `server/tmp` and `store` must already be on the same filesystem (the server refuses to start otherwise). Run a single server process per data directory when using SQLite. NFSv4 emulates `flock` on `server.lock`; AWS documents NFSv4.1 (`nfsvers=4.1`) for EFS, and that is the recommended mount.
 
-These numbers were measured on local NVMe, then again with a modelled fsync delay injected **only in the benchmark's server process**. They are modelled numbers, not measurements on real EFS (labelled as modelled until the owner's real-EFS benchmark run). 5 ms and 20 ms are assumptions for typical EFS commit latency on small writes. Recommendations below are from **1 and 8 clients only**; larger N is unmeasured.
+The first two tables below were measured on local NVMe, then again with a modelled fsync delay injected **only in the benchmark's server process**. They are modelled numbers, not measurements on real EFS. 5 ms and 20 ms are assumptions for typical EFS commit latency on small writes. The real-EFS table (measured on the hosted service's filesystem settings, Nov 16, 2026) comes after them. Recommendations below are from **1 and 8 clients only**; larger N is unmeasured.
 
 The first published tables held a process-wide `objects_lock` across each object PUT's temp-file `fsync`, rename, and directory fsync. After those runs, object writes fsync the private temp file with no lock held, then take one lock per `objects/<hh>` prefix only for the unsafe-destination check, the already-present check, `mkdir`, `os.replace`, and the directory fsync. The 20 ms 1-client and 8-client configs and the local 8-client config were re-run after that change. Before/after rows below use the numbers already published here as **before**. The local 1-client and both 5 ms rows were not re-run (labelled pre-change). Every before/after row is a single run with unquantified noise. The before and after runs were not on guaranteed identical machine state.
 
-**Machine:** Intel Core i7-14700K (28 threads), 32 GiB RAM, NVMe SSD `CT1000P3PSSD8` (931.5 G, ROTA=0), ext4 on `/dev/nvme0n1p3`, Python 3.10.12, git 2.34.1.
+**Machine (local and modelled tables):** Intel Core i7-14700K (28 threads), 32 GiB RAM, NVMe SSD `CT1000P3PSSD8` (931.5 G, ROTA=0), ext4 on `/dev/nvme0n1p3`, Python 3.10.12, git 2.34.1.
 
 **Workload** (`scripts/bench_server.py` defaults): each client writes 4 live runs × 4000 steps × 8 metrics and 50 distinct 65536-byte `copy=True` artifacts (split across that client's runs), then 3 passes of sync (one full sync, then two incremental append+sync passes, back to back). Clients start together. Uploaded payload on the first pass is about 4.32 MB per client (about 1.04 MB of scalars plus 3.28 MB of objects).
+
+### Real EFS (Fargate, us-east-2)
+
+Measured on Nov 16, 2026 on a restored copy of the hosted filesystem (see the restore drill in `deploy/aws/README.md`), with the same settings as production: General Purpose, Elastic throughput, encrypted, mounted over TLS through an access point.
+
+**Environment:** Fargate ARM64, 4 vCPU and 16 GB visible (task size 4096/8192), Python 3.12.12, us-east-2b. NFS 4.1 with `rsize`/`wsize` 1 MiB, `hard`, `noresvport`, `timeo=600`, `retrans=2`. `scripts/bench_server.py` from commit `0bd558d`, default workload above. The task ran for about 3 minutes. Each configuration was run 3 times. Cells show the median with the range of the 3 runs.
+
+**What this measures:** run files, appends, and object writes on real EFS, with the SQLite database on the task's local disk. It is not SQLite on EFS (3.0 refuses that) and it is not the hosted Postgres path: in hosted mode the database is Postgres, not on EFS. So the numbers cover the EFS file I/O part of the hosted server, not RDS or S3 latency.
+
+| Clients | Initial wall | Throughput | Incremental p50 / p95 | Commit p50 / p95 | Object PUT p50 / p95 | Objects/s | Server CPU |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 4.14 s (3.89-4.23) | 1.04 MB/s (1.02-1.11) | 1.51 s (1.33-1.57) / 1.77 s (1.59-1.80) | 11.3 ms (10.1-11.3) / 13.2 ms (11.7-13.3) | 35.0 ms (33.9-35.9) / 38.8 ms (37.3-39.9) | 12.1 (11.8-12.9) | 1.20 s (1.20-1.26) |
+| 8 | 10.07 s (9.87-10.19) | 3.43 MB/s (3.39-3.50) | 3.93 s (3.91-3.96) / 4.24 s (4.23-4.28) | 52.7 ms (50.8-53.6) / 86.8 ms (85.4-91.3) | 75.6 ms (74.5-75.7) / 97.2 ms (94.1-103.1) | 39.7 (39.3-40.5) | 17.5 s (17.4-17.7) |
+
+The runs agree closely, so the spread is small. Throughput is the aggregate over all clients; objects/s counts 50 objects per client.
+
+**Against the models:** the machines differ (Fargate ARM64 versus the local i7), so this is a rough comparison. Commit p50 on real EFS is about 10-11 ms at 1 client and about 51-54 ms at 8. At 1 client that is below both models (26 ms at 5 ms, 55 ms at 20 ms). At 8 clients it sits between them (37 ms and 64 ms). Object PUT p50 is about 34-36 ms at 1 client, between the 5 ms model (22 ms) and the 20 ms model (51 ms). At 8 clients the PUT p50 of about 75 ms is above the 20 ms model after the object-lock change (49 ms) and below the pre-change 5 ms row (124 ms). So the 20 ms assumption is a safe upper bound for commits, and object PUTs under 8 clients are somewhat slower than the model.
 
 ### Local disk
 
@@ -494,14 +511,14 @@ Three repeat runs of the local 8-client config on the final code (same workload)
 
 These are from 1 and 8 clients only. Larger N is unmeasured.
 
-- **`sync --follow --interval`:** keep the default 30 s. The slowest incremental pass here was 3.239 s (8 clients, 20 ms modelled delay, after the object-lock change; 3.398 s before) for 4 live runs. Passes ran back to back; this was not a 30 s follow loop.
-- **Heartbeat (60 s) vs stale (600 s):** the 60 s heartbeat was not exercised. Passes were back to back. The slowest commit was 125.78 ms (8-client, 20 ms modelled, commit p95 after the change; 92.52 ms before). At this N a 60 s heartbeat would stay well under the 600 s stale threshold; that is inferred from commit latency, not measured in a follow loop.
-- **`APPEND_CHUNK` (8 MiB):** leave it. Each series file in this workload is 32 kB per pass (`4000 × 8` bytes), far below 8 MiB. The cost is fsync round-trips per request, not chunk size. Shrinking the chunk would add requests and fsyncs.
-- **EFS mount options (not measured here):** `nfsvers=4.1`, `hard`, `noresvport`. NFSv4 emulates `flock`; 4.1 is the version to use. General Purpose vs Elastic throughput was not measured.
+- **`sync --follow --interval`:** keep the default 30 s (kept after the real-EFS run). The slowest incremental pass was 4.28 s on real EFS (8 clients, p95 of the worst repetition) and 3.239 s on the 20 ms model, for 4 live runs. Both are far below 30 s. Passes ran back to back; this was not a 30 s follow loop.
+- **Heartbeat (60 s) vs stale (600 s):** the 60 s heartbeat was not exercised. Passes were back to back. The slowest commit p95 was 125.78 ms (8-client, 20 ms modelled, after the change) and 91.3 ms on real EFS (8 clients). Kept: at this N a 60 s heartbeat would stay well under the 600 s stale threshold; that is inferred from commit latency, not measured in a follow loop.
+- **`APPEND_CHUNK` (8 MiB):** leave it (kept; the real-EFS numbers do not contradict this). Each series file in this workload is 32 kB per pass (`4000 × 8` bytes), far below 8 MiB. The cost is fsync round-trips per request, not chunk size. Shrinking the chunk would add requests and fsyncs.
+- **EFS mount options:** `nfsvers=4.1`, `hard`, `noresvport`. NFSv4 emulates `flock`; 4.1 is the version to use. The real-EFS run used these options with General Purpose and Elastic throughput. Other mount options and other throughput modes were not compared. A filesystem restored from a backup comes back in Bursting mode; switch it to Elastic if you want the same behaviour.
 
 ### Reproduce on real EFS
 
-Point `--data` at the EFS mount and omit `--fsync-delay-ms`:
+To repeat the real-EFS run, point `--data` at the EFS mount and omit `--fsync-delay-ms`:
 
 ```bash
 python scripts/bench_server.py --data /mnt/efs/agenticml --clients 1
@@ -512,7 +529,7 @@ The script starts a server on `127.0.0.1:0`, creates one sync key per client, an
 
 Machines behind the same NAT or HTTP proxy share one throttle bucket, even if they are distinct hosts. A burst of simultaneous starts can see a brief 429; the client retries 429 up to `max_retries`, sleeping `Retry-After` when present (capped at 60 s). With `--follow`, a single request can now wait up to about 3 × 60 s on repeated 429s before follow's own backoff starts. This benchmark uses `max_retries=0` when it has distinct `127.0.0.x` addresses.
 
-`--quick` is a smoke size (under a minute). Replace the modelled tables above with real-EFS numbers when that run is done.
+`--quick` is a smoke size (under a minute). The local and modelled tables stay as published; they are labelled as modelled.
 
 ## Troubleshooting
 

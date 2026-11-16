@@ -59,11 +59,11 @@ in the PR that records a result.
 | --- | --- | --- | --- |
 | 0. Account checks | **done** (Nov 11) | 0.1–0.4 | – |
 | 1. CloudFormation code | **done** (Nov 11, [#49](https://github.com/agenticML/agenticml-lite/pull/49)) | 1.1–1.6 | – |
-| 2. Bootstrap | **done** (Nov 11) | 2.1, 2.2, 2.3 | 2.1b: the second alert address re-subscribes (its pending subscription expired; owner) |
+| 2. Bootstrap | **done** (Nov 11) | 2.1, 2.2, 2.3 | 2.1b closed: one alert address (owner's choice, Nov 16) |
 | 3. First deploy | **done** (Nov 12) | 3.0a–3.3 | – |
 | 4. First accounts and data | **done** (Nov 16) | 4.1, 4.2, 4.2a (Nov 13); 4.2b (Nov 15); 4.3 and 4.4 (owner confirmed Nov 16) | – |
-| 5. Launch checks | **in progress** | 5.1 and 5.6 (Nov 16); 5.4 (encryption) and 5.5 (drill fired) partly | 5.2 isolation and 5.3 2.2 client (owner); the 5.4 download check; the 5.5 email confirmation and the second alert address (2.1b); package [24.12](packages/24.12-phase-5-launch-checks.md) |
-| 6. Recovery and performance | not started | – | After Phase 5 |
+| 5. Launch checks | **done** (Nov 16; the 5.5 email confirmation is pending the owner) | 5.1 to 5.6 (Nov 16); package [24.12](packages/24.12-phase-5-launch-checks.md) | The owner confirms the 5.5 alarm email arrived |
+| 6. Recovery and performance | **done** (Nov 16, package [24.13](packages/24.13-phase-6-restore-drill.md)) | 6.1 restore drill, 6.2 real-EFS benchmark | – |
 | 7. Public launch | in progress | 7.1 (Nov 14, [#64](https://github.com/agenticML/agenticml-lite/pull/64)); 7.3 (Nov 15); 7.4 policies filled and fact-checked on `dev`; 7.5 built | 7.2 docs-only PR to `main` after the dev PR merges; the owner sets up support@agenticml.xyz mail first; then `HOSTED_LEGAL_BASE_URL` and the deploy (7.4) |
 
 ### Live service
@@ -135,16 +135,14 @@ account, used by other roles: always pass its ARN to the bootstrap stack.
   match the stack outputs.
 - A hand-made $10 console budget was deleted, so `agenticml-monthly` is the
   only budget.
-- Open: on Nov 12 the second alert address had not yet confirmed its SNS
-  subscription. It must click the AWS confirmation email; the link expires
-  three days after the stack was created (about Nov 14). If it has expired,
-  re-subscribe the address to the `AlertsTopicArn` output with
-  `aws sns subscribe --protocol email`. This does not block Phase 3.
+- Closed Nov 16 (owner's choice): the second alert address never confirmed
+  its SNS subscription and the pending subscription expired, so the alerts
+  topic has one email address and the second is dropped.
 
 | # | Step | Done when | Status |
 | --- | --- | --- | --- |
 | 2.1 | Deploy the bootstrap stack from a laptop with admin credentials, passing the two alert emails and the OIDC ARN from 0.3 if one exists. While it waits, copy the certificate validation CNAME into Namecheap | Stack `CREATE_COMPLETE`; outputs show the roles, ECR URI, certificate and alerts topic | done (Nov 11) |
-| 2.1b | Each alert address clicks the AWS confirmation email | Both subscriptions confirmed | open (owner): the second address had not confirmed on Nov 12. Found Nov 16: its pending subscription expired and AWS removed it, so the topic has one email subscription. Re-subscribe the second address and confirm it |
+| 2.1b | Each alert address clicks the AWS confirmation email | Each alert address has a confirmed subscription | closed (Nov 16): one alert address, by the owner's choice. The second address had not confirmed on Nov 12; its pending subscription expired and AWS removed it, and the owner decided not to re-subscribe it |
 | 2.2 | In GitHub, create the `hosted` environment with required reviewers, limited to trusted branches/tags | Environment exists | done (Nov 11) |
 | 2.3 | Set the `hosted` variables: role ARNs from 2.1, `AWS_REGION=us-east-2`, desired count 2 (`HOSTED_DESIRED_COUNT`, deleted Nov 15, 2026); leave the Firebase variables empty and sign-up `false` | Variables set | done (Nov 11) |
 
@@ -194,32 +192,37 @@ off; the server CLI over ECS Exec still works.
 
 ## Phase 5: Launch checks (owner, exit criterion 6)
 
-**Status: in progress** (Nov 16, 2026). Phase 4 is done. Package
+**Status: done** (Nov 16, 2026; the 5.5 email confirmation is pending the owner). Phase 4 is done. Package
 [24.12](packages/24.12-phase-5-launch-checks.md) built `scripts/hosted_check.py`
 (`make-run`, `verify`, `isolation`) and the runbook section "Launch checks
 (Phase 5)" in `deploy/aws/README.md`, which has the commands and pass lines for
 each step. The owner runs 5.1 to 5.6 and records date, run id, result and any
 Backlog entry in the row. On Nov 16 the supervisor ran the AWS steps (5.1 deploy,
 5.4 and 5.5 checks, 5.6 log search) with the owner's profile at the owner's
-request, and the owner ran the client side.
+request, and the owner ran the client side. Results: 5.1, 5.2, 5.3, 5.4 and 5.6
+passed; 5.5 fired and is done except the owner's confirmation of the email.
 
 | # | Step | Done when | Status |
 | --- | --- | --- | --- |
-| 5.1 | Rolling deploy during an upload: start a large upload (`make-run --mb 300`, then `agenticml sync --all`), then force a new deployment (`aws ecs update-service ... --force-new-deployment`) while it uploads. A re-run of the workflow does not roll anything: the commit is already live, so the change set is empty and ECS starts no new task | No acknowledged upload lost; the client retried and finished on its own; `hosted_check.py verify` passes for the run | done (Nov 16): forced deployment 05:34:23 UTC during a `make-run --mb 1500 --files 60` upload to customer-one; new task healthy 05:35:08; old task draining 05:36:09, stopped with exit 0 at 05:39:18; the 60 object uploads split 30/30 across the two tasks, one finishing during draining; no failed request (one expected 404); sync finished without a re-run; `verify` PASS |
-| 5.2 | Isolation: `hosted_check.py isolation` with customer-one's key against a customer-two run, its objects and URLs, plus one browser session check (customer-one's owner opens customer-two's dashboard and a run URL) | Every probe gets 404, 401 or 403 (or "missing"), never data | ready (owner) |
-| 5.3 | A 2.2 client (commit `bd0d499`) syncs a run to the hosted service | Sync succeeds; `verify` passes with the 3.0 tool | ready (owner) |
-| 5.4 | S3 check: `aws s3api head-object` on sampled objects shows `AES256`; a dashboard download matches the source bytes (`sha256sum`) | `ServerSideEncryption: AES256` on sampled objects; the download's sha256 equals the local artifact's | partly: SSE AES256 on all objects (Nov 16); download check pending (owner) |
-| 5.5 | Alarm drill: `aws cloudwatch set-alarm-state` puts one alarm in `ALARM`; this also covers the second subscription (2.1b) | Both alert addresses receive the ALARM email | partly: drill fired Nov 16, delivered to the one subscribed address; second address must re-subscribe (2.1b) |
+| 5.1 | Rolling deploy during an upload: start a large upload (`make-run --mb 300`, then `agenticml sync --all`), then force a new deployment (`aws ecs update-service ... --force-new-deployment`) while it uploads. A re-run of the workflow does not roll anything: the commit is already live, so the change set is empty and ECS starts no new task | No acknowledged upload lost; the client retried and finished on its own; `hosted_check.py verify` passes for the run | done (Nov 16): forced deployment 05:34:23 UTC during a `make-run --mb 1500 --files 60` upload to customer-two (with customer-two's key; the first record said customer-one, corrected Nov 16 from the S3 prefix layout and the isolation probe); new task healthy 05:35:08; old task draining 05:36:09, stopped with exit 0 at 05:39:18; the 60 object uploads split 30/30 across the two tasks, one finishing during draining; no failed request (one expected 404); sync finished without a re-run; `verify` PASS |
+| 5.2 | Isolation: `hosted_check.py isolation` with customer-one's key against a customer-two run, its objects and URLs, plus one browser session check (customer-one's owner opens customer-two's dashboard and a run URL) | Every probe gets 404, 401 or 403 (or "missing"), never data | done (Nov 16): `isolation` with customer-one's key against customer-two's run: state, lineage and commit 404; dashboard page 303 to `/login`; dashboard API 401 (with the key and without credentials); RESULT PASS. The objects probe was skipped (no local copy of the run in that store); S3 keeps objects under per-workspace prefixes, so the same file uploaded to both workspaces is stored twice. Browser step (owner): customer-one's owner sees "not found" for customer-two's dashboard and run URL |
+| 5.3 | A 2.2 client (commit `bd0d499`) syncs a run to the hosted service | Sync succeeds; `verify` passes with the 3.0 tool | done (Nov 16): the 2.2 client (`bd0d499`, installed with `uv pip`) synced a smoke run to customer-one (files=8, objects=0 because the identical artifact already existed in that workspace); `verify` with the 3.0 tool PASS (owner). Gotchas are in the runbook, 5.3: `uv venv` makes a venv without `pip`, and a stale `agenticml` on `PATH` (shell command hash) can shadow the venv's |
+| 5.4 | S3 check: `aws s3api head-object` on sampled objects shows `AES256`; a dashboard download matches the source bytes (`sha256sum`) | `ServerSideEncryption: AES256` on sampled objects; the download's sha256 equals the local artifact's | done (Nov 16): all 64 stored objects use SSE-S3 `AES256`, and all 64 hash exactly to their content address (server-side check by the supervisor, 0 mismatches); with `verify` PASS this shows the stored bytes equal the uploaded bytes. The owner's dashboard download was not separately confirmed |
+| 5.5 | Alarm drill: `aws cloudwatch set-alarm-state` puts one alarm in `ALARM` | The alert address receives the ALARM email (one address, 2.1b closed) | done except the owner's confirmation of the email: the drill fired on Nov 16 (`ALARM` at 05:11 UTC, action published to the alerts topic); the owner has not yet confirmed the email arrived |
 | 5.6 | Row-level security role check: search `/ecs/agenticml-hosted` for "row-level security is not enforced" (the task connects as the RDS master user) | Result recorded (warning present or absent) and the Backlog entry updated | done (Nov 16): no warning; RLS enforced |
 
 ## Phase 6: Recovery and performance (owner)
 
-**Status: not started.** Starts when Phase 5 is done.
+**Status: done** (Nov 16, 2026, package
+[24.13](packages/24.13-phase-6-restore-drill.md)). The supervisor ran the AWS
+steps with the owner's profile; the owner approved the drill resources (cost
+under $1). Every drill resource was deleted afterwards; the scheduled recovery
+point was kept. Runbook: `scripts/restore_drill/README.md`.
 
 | # | Step | Done when | Status |
 | --- | --- | --- | --- |
-| 6.1 | Restore drill: RDS point-in-time restore, EFS restore from AWS Backup and S3 object versions, all into a separate test service | Recovery age, duration and integrity recorded; drill resources removed | not started |
-| 6.2 | Real-EFS benchmark with 1 and 8 clients | Numbers recorded in `docs/SERVER.md` | not started |
+| 6.1 | Restore drill: RDS point-in-time restore, EFS restore from AWS Backup and S3 object versions, all into a separate test service | Recovery age, duration and integrity recorded; drill resources removed | done (Nov 16): from the scheduled daily EFS point (backup 05:00 to 08:03). **Rule found:** restore the database to the recovery point's completion time (T_DB = T_S3 = `CompletionDate`). Attempt 1 at the backup start (05:00) had 60 `object_missing` problems and 60 `object_orphan` warnings for the run synced at 05:33; attempt 2 at 08:03:34 had 0 and 0. Timings (attempt 2): RDS 12 min 36 s; EFS restore job 1 min 32 s, mount target and access points ready after about 17 min; S3 copy of 64 versions (1.57 GB) with SHA-256 check 3 min 11 s; app healthy 22 s after the task was created. The restores ran in parallel, so a verified service took the RDS restore plus about 1 minute. Recovery point age: EFS daily point (up to 24 h plus the 3 h backup run); RDS about 5 min; S3 continuous. Gates: read-only SQL (migrations 9, counts equal to production except one later run); server status lists all 11 workspaces; `verify --deep` 0 problems, 0 warnings; a new sync verified, admin-key logins list their runs, `verify --deep` 0 and 0 afterwards. Firebase sign-in was not testable (no public DNS). An on-demand EFS backup was refused with AccessDenied (Backlog, low). Production unchanged; every drill resource deleted. Final listing 16:03 UTC: nothing remains; production unchanged |
+| 6.2 | Real-EFS benchmark with 1 and 8 clients | Numbers recorded in `docs/SERVER.md` | done (Nov 16): on the restored drill filesystem with production's settings (General Purpose, Elastic, encrypted, TLS access point), Fargate ARM64 4 vCPU, `bench_server.py` at `0bd558d`, SQLite on local disk, 3 repetitions each. 1 client: commit p50 about 11 ms, object PUT p50 about 35 ms, 1.04 MB/s initial sync. 8 clients: commit p50 about 53 ms, object PUT p50 about 76 ms, 3.43 MB/s. The 30 s `--follow --interval`, the 60 s heartbeat and `APPEND_CHUNK` recommendations were kept (numbers in `docs/SERVER.md`) |
 
 At this point the AWS deployment is live and package 24.3 is done.
 
