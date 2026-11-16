@@ -70,6 +70,7 @@ _ROUTES.extend([
     _r("GET", r"/static/login.js", "public", None, "public_asset", "static_login_js"),
     _r("GET", r"/static/setup.js", "public", None, "public_asset", "static_setup_js"),
     _r("GET", r"/static/invite.js", "public", None, "public_asset", "static_invite_js"),
+    _r("GET", r"/static/signout.js", "public", None, "public_asset", "static_signout_js"),
     _r("GET", r"/static/firebase-login.js", "public", None, "public_asset", "static_firebase_login_js"),
     _r("GET", r"/static/vendor/firebase/firebase-app-compat.js", "public", None, "public_asset", "static_firebase_app"),
     _r("GET", r"/static/vendor/firebase/firebase-auth-compat.js", "public", None, "public_asset", "static_firebase_auth"),
@@ -409,16 +410,29 @@ def _workspaces_page(webauth, handler, route, match):
     admin_link = (
         '<a class="btn btn-ghost btn-sm" href="/admin/">Admin</a>'
         if getattr(handler.principal, "server_admin", False) else "")
+    # An identity proxy owns the sign-in, so its sessions get the label only.
+    can_sign_out = handler.principal.via != "proxy"
+    session_box = (
+        '<span id="session" class="topbar-session"><span class="topbar-session-label">'
+        "Signed in as {user}</span>{button}</span>".format(
+            user=html_escape(handler.principal.user, quote=True),
+            button=(
+                '<button id="sign-out" class="btn btn-ghost btn-sm" type="button">Sign out</button>'
+                if can_sign_out else "")))
+    signout_script = (
+        '<script type="module" src="/static/signout.js"></script>' if can_sign_out else "")
     body = (
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"/>"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>"
         "<meta name=\"color-scheme\" content=\"light dark\"/>"
         "<title>agenticml · Workspaces</title>"
-        "<link rel=\"stylesheet\" href=\"/static/app.css\"/></head>"
+        "<link rel=\"stylesheet\" href=\"/static/app.css\"/>"
+        + signout_script +
+        "</head>"
         "<body class=\"picker-page\">"
         "<header class=\"topbar\">"
         "<a href=\"/workspaces\" class=\"breadcrumb\">agenticml / workspaces</a>"
-        + admin_link +
+        + admin_link + session_box +
         "</header>"
         "<main id=\"app\"><div class=\"workspace stack\">"
         "<div class=\"heading\"><h1>Workspaces</h1></div>"

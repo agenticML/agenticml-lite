@@ -132,6 +132,9 @@ def test_admin_page_keeps_account_dialog_and_workspace_pages_get_admin_link(page
     expect(page.get_by_role("heading", name="Admin", exact=True)).to_be_visible()
     expect(page.locator("#nav-settings")).to_be_hidden()
     expect(page.locator("#nav-admin")).to_be_hidden()
+    # The top bar holds the only Workspaces link (the heading no longer repeats it).
+    expect(page.get_by_role("link", name="Workspaces", exact=True)).to_have_count(1)
+    expect(page.locator("#nav-workspaces")).to_be_visible()
     page.get_by_role("button", name="Account", exact=True).click()
     dialog = page.get_by_role("dialog", name="Account", exact=True)
     expect(dialog.get_by_role("heading", name="Workspaces", exact=True)).to_be_visible()
@@ -162,9 +165,33 @@ def test_no_overflow_admin_and_picker(page, admin_server):
     assert_no_overflow(page)
     assert_dialog_fits(page, account)
     account.get_by_role("button", name="Close", exact=True).click()
-    page.get_by_role("link", name="Workspaces", exact=True).click()
+    page.locator("#nav-workspaces").click()
     expect(page.get_by_role("heading", name="Workspaces", exact=True)).to_be_visible()
     assert_no_overflow(page)
+
+
+def test_top_bar_workspaces_link_and_sign_out_everywhere(page, admin_server):
+    page.set_viewport_size({"width": 375, "height": 812})
+    sign_in_password(page, admin_server, "admin", PASSWORD)
+    expect(page.get_by_role("heading", name="Workspaces", exact=True)).to_be_visible()
+    # The picker has Sign out but no Workspaces link of its own.
+    expect(page.locator("#nav-workspaces")).to_have_count(0)
+    expect(page.locator("#sign-out")).to_be_visible()
+    assert_no_overflow(page)
+    page.locator('a[href="/w/default/"]').click()
+    expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+    link = page.locator("#nav-workspaces")
+    expect(link).to_be_visible()
+    expect(link).to_have_attribute("href", "/workspaces")
+    expect(page.locator("#sign-out")).to_be_visible()
+    assert_no_overflow(page)
+    link.click()
+    expect(page).to_have_url(re.compile(r"/workspaces$"))
+    expect(page.get_by_role("heading", name="Workspaces", exact=True)).to_be_visible()
+    page.locator("#sign-out").click()
+    expect(page.get_by_role("heading", name="Sign in", exact=True)).to_be_visible()
+    page.goto(admin_server["url"] + "/workspaces")
+    expect(page.get_by_role("heading", name="Sign in", exact=True)).to_be_visible()
 
 
 def admin_row(page, login):

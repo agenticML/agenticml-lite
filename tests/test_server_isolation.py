@@ -130,6 +130,7 @@ EXAMPLES = {
     "static_login_js": {"method": "GET", "path": "/static/login.js"},
     "static_setup_js": {"method": "GET", "path": "/static/setup.js"},
     "static_invite_js": {"method": "GET", "path": "/static/invite.js"},
+    "static_signout_js": {"method": "GET", "path": "/static/signout.js"},
     "static_firebase_login_js": {"method": "GET", "path": "/static/firebase-login.js"},
     "static_firebase_app": {"method": "GET", "path": "/static/vendor/firebase/firebase-app-compat.js"},
     "static_firebase_auth": {"method": "GET", "path": "/static/vendor/firebase/firebase-auth-compat.js"},
@@ -847,6 +848,17 @@ def test_beta_only_account_signs_in_by_proxy_and_password(iso):
     denied = _snapshot(*_ask(iso["server"], "GET", "/w/default/", cookie=cookie))
     missing = _snapshot(*_ask(iso["server"], "GET", "/w/%s/" % MISSING_SLUG, cookie=cookie))
     assert denied == missing and denied[0] == 404
+
+
+def test_proxy_picker_has_no_sign_out(iso):
+    extra = {"Tailscale-User-Login": "member-a@example.com"}
+    status, _, body = _ask(iso["server"], "GET", "/workspaces", extra=extra)
+    assert status == 200
+    assert b"Signed in as" in body
+    assert b'id="sign-out"' not in body and b"signout.js" not in body
+    cookie = iso["cookies"]["password:member-a"]
+    status, _, body = _ask(iso["server"], "GET", "/workspaces", cookie=cookie)
+    assert status == 200 and b'id="sign-out"' in body
 
 
 def test_proxy_server_admin_reaches_admin_api(iso):

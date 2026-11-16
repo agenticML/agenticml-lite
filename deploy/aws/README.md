@@ -310,7 +310,7 @@ web and `/setup` return 404.
    server admin privileges (`source` is `list`). With open sign-up on, the
    account also gets the free personal workspace (once); with it off, a server
    admin with no workspace membership lands on `/workspaces` with an Admin
-   button. Server admins see no customer workspace data without membership.
+   button and Sign out. Server admins see no customer workspace data without membership.
 2. **Open `/admin`**: Click Admin or open `https://app.agenticml.xyz/admin/`.
    The "Server admins" section lists all server administrators (login, grant
    source, and sign-in state).

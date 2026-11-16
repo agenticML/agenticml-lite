@@ -115,7 +115,7 @@ Trust boundaries define the isolation model across single-tenant and multi-tenan
   - **No account takeover**: The list never takes over an account that has a password or another identity. Accounts created by the list get a personal workspace only when open sign-up is on, at most once, within the free limits.
   - **Scoped revocation**: List removal revokes only list-granted rights, at the next sign-in (use `/admin` Remove to revoke at once). Rights granted on `/admin` or via the CLI are kept.
   - **Last server admin guard**: The last server admin who can sign in (password, identity proxy or Firebase) is never removed by the list, web, or CLI; a pending admin that has never signed in does not count.
-  - **No ambient workspace access**: Server administrators see no workspace data without membership. An admin without workspace membership lands on `/workspaces` with an Admin button and cannot access customer runs, files, or objects.
+  - **No ambient workspace access**: Server administrators see no workspace data without membership. An admin without workspace membership lands on `/workspaces` with an Admin button and Sign out and cannot access customer runs, files, or objects.
 
 ## Out of scope
 
