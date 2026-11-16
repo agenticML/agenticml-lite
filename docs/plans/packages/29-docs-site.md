@@ -448,7 +448,7 @@ the index page) so D1 flips it once.
 - 29.7: the three policies are live and `/login` and `/invite?token=x` on
   `app.agenticml.xyz` show the footer links (checked in a browser, since
   the footer is rendered by script); the Backlog entry
-  "Release 3.0.0: tag, publish, legal pages" is updated.
+  "Release 3.0.0: tag and publish" is updated.
 - 29.8: home page Sign in action and banner live, still 0 overflow at 375px.
 - 29.9: `pip install agenticml-lite==3.0.0` works and no git install remains.
 
@@ -489,3 +489,13 @@ Resumed and finished on draft PR [#64](https://github.com/agenticML/agenticml-li
   5. Check that the `/login` and `/invite?token=x` footer links show and return 200.
   6. The owner emails existing sign-ups (D6).
   7. Retry Enforce HTTPS on Pages.
+
+## Status (Nov 16, 2026)
+
+- **29.6 done.** The docs-only PR [#75](https://github.com/agenticML/agenticml-lite/pull/75) merged to `main` at 17:53 UTC (`website/` and `docs.yml` copied from `dev`; PRs #74 and #76 had merged to `dev` first and #75 was refreshed from `dev`, so `main` and `dev` have identical `website/`). Pages deploy run 43923087030 succeeded. The live pages `/`, `/releases/`, `/hosted/`, `/hosted/quickstart/`, `/hosted/status/`, `/legal/terms/`, `/legal/acceptable-use/` and `/legal/privacy/` return 200. The repo description and homepage were set Nov 15.
+- **Policy facts and text approved (D4).** The owner delegated the facts to the supervisor, chose `contact@agenticml.xyz`, and approved the text by merging #75. No lawyer review.
+- **29.7 done.** `HOSTED_LEGAL_BASE_URL=https://agenticml.github.io/agenticml-lite/legal/` is set. Deploy run 43811140859 (the waiting #71 merge, package 28.2, head `10fd4ba`) was approved by the owner and succeeded, so 28.2 and the policy links shipped in one roll. The live `/auth/firebase/config` returns the three policy URLs (all 200). In a browser, `/login` and `/invite?token=x` show the footer "By continuing you agree to the Terms and the Acceptable use policy. See the Privacy policy." with the three links, no console errors, no horizontal overflow at desktop width or 375px.
+- **29.8 done.** The Sign in link and banner are live with #75.
+- **Enforce HTTPS moved.** GitHub still answers "The certificate does not exist yet" after publishing; the default `github.io` project URL has no certificate of its own for this setting. It is now part of the "Docs custom domain" Backlog entry (enforce HTTPS once `docs.agenticml.xyz` is set up). The 29.6 "Enforce HTTPS" check in "Done when" is deferred to that entry.
+- **Keeping the status page current (7.6)** is an ongoing practice: each result that changes the public status page goes to `dev`, then a docs-only PR to `main`.
+- **Left for the owner:** D6, email existing sign-ups about the policies. 29.9 stays blocked on PyPI 3.0.0.
