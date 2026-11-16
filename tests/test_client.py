@@ -164,7 +164,7 @@ def test_round_trip_missing_object_file_append_state_commit(server):
         assert client.put_file("run-1", "meta.json", meta) == {"size": len(meta)}
         assert client.append("run-1", "events.jsonl", 0, events) == len(events)
         state = client.run_state("run-1")
-        assert state["owner"] == "one"
+        assert state["owner"] == "admin"
         assert state["owner_user"] == "admin"
         assert "meta.json" in state["files"]
         assert "events.jsonl" in state["files"]

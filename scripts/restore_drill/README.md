@@ -115,9 +115,28 @@ files: attempt 1 (T_DB at 05:00) found 60 `object_missing` problems and 60
 `object_orphan` warnings for a run synced at 05:33, and attempt 2 (T_DB at
 08:03) found 0 and 0.
 
-Limit: a sync made during the backup window can still leave the database ahead
-of the files for that run. Look at the sync times and, when you need a clean
-result, pick a point whose window had no syncs (or quiesce writers).
+Backup window: record how long the daily point ran for every drill (Nov 16:
+05:00 to 08:03; the first AWS Backup copy of an EFS is a full copy and later ones
+are incremental, so the next drill should be shorter).
+
+A sync made inside the window can still leave the database ahead of the files for
+that run. After gate 2, `server verify` (plain `verify` already checks run file
+sizes and hashes; `--deep` only adds the S3 object re-hash) then reports
+`size_mismatch` or `file_hash` problems for such runs. These are expected, not
+failures of the restore. Repair them from the client that holds the run, for
+running and finished runs alike (the run id is the `runs/<id>/` part of the
+problem path in `server verify --json`):
+
+```bash
+agenticml sync <run> --reset     # forgets this host's saved cursor, for every workspace
+agenticml sync <run>             # once per workspace key; a finished run is otherwise "up to date"
+```
+
+Runs that were pruned locally (`sync --prune`) or that no client has any more
+cannot be repaired: record them in the drill record and either leave the warning
+or delete the run. A running run also repairs its append files on its next plain
+sync; a changed atomic file (`file_hash`) is healed by any client call that reads
+`/state`; `--reset` covers every case.
 
 ### Option A: an on-demand EFS point now (reads production EFS, writes nothing to it)
 
@@ -495,9 +514,11 @@ listings are the real proof.
 ## Record
 
 Write the drill record (no AWS identifiers; the one below is the Nov 16 record) into the roadmap and the status
-page: recovery point age and recovery duration per store, total time (first
-restore call to the gate-3 `## done`), integrity results, any cross-store
-orphans, the cost, and the benchmark tables in `docs/SERVER.md`. Timings come
+page: recovery point age and recovery duration per store, the EFS backup window
+(start to completion), total time (first restore call to the gate-3 `## done`),
+integrity results, any cross-store orphans, the runs repaired or unrepairable
+after the step 1 repair, the cost, and the benchmark tables in `docs/SERVER.md`.
+Expected result after the repair: `server verify` with 0 problems. Timings come
 from `state.env`, the `*.task.json` files, the restore job and the RDS events.
 
 | Store | Recovery point age | Recovery duration |

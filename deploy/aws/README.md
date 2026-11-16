@@ -924,7 +924,13 @@ in its own ECS cluster `agenticml-restore-drill`, and is removed afterwards.
    `object_missing` problems and 60 `object_orphan` warnings in `verify
    --deep`), and a database restored to the completion time does (attempt 2: 0
    and 0). A sync made during the backup window can still leave the database
-   ahead of the files for that run; record any warnings. The EFS recovery point
+   ahead of the files for that run (`size_mismatch` or `file_hash` problems in
+   `verify`, expected after restoring). Repair it from the client that holds the
+   run: `agenticml sync <run> --reset`, then `agenticml sync <run>` (once per
+   workspace key; see step 1 of the restore-drill runbook in
+   `scripts/restore_drill/README.md`). Runs that were pruned locally or that no
+   client has cannot be repaired: record them and leave the warning or delete
+   the run. After the repair `verify` reports 0 problems. The EFS recovery point
    can be an on-demand AWS Backup job (tagged, and deleted afterwards) or the
    latest scheduled point. On Nov 16 an on-demand `start-backup-job` was
    refused with AccessDenied for the operator's `aws login` session: use the

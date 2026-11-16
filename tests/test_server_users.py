@@ -435,7 +435,7 @@ def test_viewer_whoami_and_write_routes_403(tmp_path, monkeypatch):
         assert not list(httpd.tmp_dir.iterdir())
 
 
-def test_member_ownership_and_compat_state(tmp_path, monkeypatch):
+def test_member_ownership_and_state(tmp_path, monkeypatch):
     monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
     with running(tmp_path / "data") as httpd:
         httpd.users.add("alice", role="member")
@@ -454,8 +454,9 @@ def test_member_ownership_and_compat_state(tmp_path, monkeypatch):
         }).encode(), key=second)[0] == 200
         status, state, _ = request(httpd, "/v2/runs/run-1/state", key=second)
         assert status == 200
-        assert state["owner"] == "two" and state["owner_user"] == "alice"
-        assert state["remote"]["owner"] == "two" and state["remote"]["owner_user"] == "alice"
+        assert state["owner"] == "alice" and state["owner_user"] == "alice"
+        assert state["remote"]["owner"] == "alice" and state["remote"]["owner_user"] == "alice"
+        assert state["remote"]["owner_key"] == "one"
         other = foreign_key(httpd, "other", user="bob")
         status, payload, _ = request(httpd, "/v2/runs/run-1/files/meta.json", "PUT", b"{}", other)
         assert status == 409

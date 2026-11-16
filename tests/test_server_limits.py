@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 
@@ -1342,3 +1343,27 @@ def test_admin_patch_plan_limits_audit_and_non_admin_404(server):
     missing = authed(server, '/api/no-such', 'PATCH', b'{}', extra=csrf(server), cookie=outsider)
     assert denied[0] == 404 and json.loads(denied[2]) == {'error': 'not found'}
     assert denied[0] == missing[0]
+
+
+def test_server_doc_limits_example_loads(tmp_path):
+    from agenticml.server.limits import Plans
+    text = Path('docs/SERVER.md').read_text()
+    match = re.search(r'## Usage limits and quotas.*?```json\n(.*?)```', text, re.S)
+    assert match is not None, 'docs/SERVER.md: no json block under "Usage limits and quotas"'
+    path = tmp_path / 'limits.json'
+    path.write_text(match.group(1))
+    example = Path('docs/examples/limits.json')
+    assert json.loads(match.group(1)) == json.loads(example.read_text())
+    loaded, expected = Plans.load(path), Plans.load(example)
+    assert loaded.free == expected.free
+    assert loaded.free_workspaces_per_account == expected.free_workspaces_per_account
+    assert 'free_workspaces_per_account' in text.split('### Limit enforcement', 1)[1].split('\n## ', 1)[0]
+
+
+def test_hosted_doc_describes_suspended_workspace_statuses():
+    text = Path('docs/HOSTED.md').read_text()
+    match = re.search(r'^### Suspending a workspace\n(.*?)(?=^#{1,3} )', text, re.S | re.M)
+    assert match is not None, 'docs/HOSTED.md: no "Suspending a workspace" section'
+    section = match.group(1)
+    assert '404' in section and '403' in section and 'workspace suspended' in section
+    assert 'for all workspace endpoints' not in section

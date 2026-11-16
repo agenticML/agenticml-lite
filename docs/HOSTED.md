@@ -180,7 +180,7 @@ If an account violates terms of service or payment lapses, suspend the workspace
 agenticml server workspaces suspend acme-corp --data /data
 ```
 
-Suspended workspaces immediately block all API requests, dashboard access, and sync uploads. The server returns HTTP `404 Not Found` for all workspace endpoints, preventing disclosure of the workspace's existence.
+A suspended workspace is closed at once. The dashboard and its `/api/w/<slug>/...` endpoints answer `404 Not Found`, exactly as for a workspace that does not exist, so the slug is not disclosed. Sync clients that present one of its keys are refused with `403 Forbidden` (`{"error": "workspace suspended"}`) on every `/v2` request, including `whoami`; `sync --follow` does not retry this error. Data, keys and memberships are kept.
 
 To resume service:
 
@@ -217,6 +217,8 @@ The hosted service relies on managed AWS backup mechanisms:
 - **RDS PostgreSQL**: Automated snapshots with 7-day Point-in-Time Recovery (PITR) and daily AWS Backup copies retained for 35 days.
 - **EFS filesystem**: Daily AWS Backup copies retained for 35 days.
 - **S3 objects**: Protected by S3 bucket versioning (noncurrent versions kept 30 days). AWS Backup covers EFS and RDS only.
+
+After a restore from backup, the database is restored to the completion time of the EFS recovery point (the daily backup runs from 05:00 UTC and can take hours; the first Nov 16 drill copy took about 3 hours). A run synced inside that window can have files behind the database: `agenticml server verify` lists them as `size_mismatch` or `file_hash` problems. Each affected user repairs a run with `agenticml sync <run> --reset`, then `agenticml sync <run>` (once per workspace key; a finished run is otherwise "up to date" and never asks the server). Runs that were pruned locally, or that no client has any more, cannot be repaired; they keep the warning or are deleted.
 
 Periodic restore drills must be performed in an isolated test environment as described in [deploy/aws/README.md](../deploy/aws/README.md#restore-drill-and-real-efs-benchmark).
 

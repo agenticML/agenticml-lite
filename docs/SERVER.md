@@ -159,7 +159,7 @@ agenticml server workspaces create SLUG [--name NAME] [--owner LOGIN] [--databas
 # Rename a workspace or change its slug
 agenticml server workspaces rename SLUG --name NEW_NAME [--slug NEW_SLUG] [--database URL] [--data DIR]
 
-# Suspend or resume a workspace (suspended workspaces reject all access with 404)
+# Suspend or resume a workspace (suspended workspaces answer 404 on the dashboard and 403 to sync clients)
 agenticml server workspaces suspend SLUG [--database URL] [--data DIR]
 agenticml server workspaces resume SLUG [--database URL] [--data DIR]
 
@@ -329,19 +329,24 @@ Enforce storage and traffic limits per workspace using `--limits`:
 agenticml server serve --limits /etc/agenticml-limits.json
 ```
 
-Example limits configuration file:
+Example limits configuration file (also shipped as `docs/examples/limits.json`; `deploy/aws/limits.json` is the hosted one):
 
 ```json
 {
-  "free": {
-    "storage_bytes": 5000000000,
-    "upload_bytes_per_day": 2000000000,
-    "requests_per_minute": 600,
-    "people": 5,
-    "workspaces_per_account": 1
+  "default_plan": "free",
+  "free_workspaces_per_account": 1,
+  "plans": {
+    "free": {
+      "storage_bytes": 5000000000,
+      "upload_bytes_per_day": 2000000000,
+      "requests_per_minute": 600,
+      "people": 5
+    }
   }
 }
 ```
+
+The file must have exactly these keys: anything else makes the server refuse to start with `invalid limits file`. `free_workspaces_per_account` is how many free workspaces one account may own (`0` disables free workspaces).
 
 ### Limit enforcement
 
@@ -349,7 +354,7 @@ Example limits configuration file:
 - **Daily upload quota**: Bytes uploaded within the current UTC day. Exceeding the quota returns HTTP 403 with the reset time.
 - **Request rate limit**: Requests per minute per workspace across all server processes. Exceeding the rate returns HTTP `429 Too Many Requests` with a `Retry-After` header.
 - **People quota**: Maximum members plus pending invites. Inviting additional members is blocked once the quota is reached.
-- **Free workspaces**: Maximum free-plan workspaces an individual account can own.
+- **Free workspaces per account** (`free_workspaces_per_account`): Maximum free-plan workspaces an individual account can own.
 
 ## Backups and restore
 
@@ -388,6 +393,8 @@ To restore a PostgreSQL server:
    agenticml server serve --data /backups/20261109-0000 --database "$DATABASE_URL"
    ```
 
+After a restore, `agenticml server verify` can list runs whose files are behind the database (`size_mismatch`, `file_hash`) when they were synced while the backup ran. The client that holds such a run repairs it with `agenticml sync RUN --reset`, then `agenticml sync RUN`.
+
 ## Operator diagnostics: `status` and `verify`
 
 Inspect server health and data integrity on the host:
@@ -418,7 +425,7 @@ When starting a 3.0 server against an existing 2.x data directory, the server au
    found 2.x <path> after this server was converted on <date>; move it away (the converted copy is <path>.2x)
    ```
 
-Sync clients on version 2.2 continue to sync to a 3.0 server without modification.
+Sync clients on version 2.2 continue to sync to a 3.0 server without modification. Clients must be 2.2 or newer: older ones are refused with HTTP 426, and 2.0 and 2.1 clients misreport their own runs as foreign if you lower `--min-client-version`.
 
 ## Configuration reference
 
@@ -441,7 +448,7 @@ Sync clients on version 2.2 continue to sync to a 3.0 server without modificatio
 | `--admin-emails LIST` | `AGENTICML_SERVER_ADMIN_EMAILS` | unset | Comma-separated emails granted server admin on verified Firebase sign-in. Ignored without Firebase. |
 | `--legal-base-url URL` | `AGENTICML_SERVER_LEGAL_BASE_URL` | unset | `https://` base URL of your Terms, Acceptable use and Privacy pages (`terms/`, `acceptable-use/`, `privacy/` under it). With Firebase on, the sign-in page (`/login` and `/invite`) then shows "By continuing you agree to the Terms and the Acceptable use policy. See the Privacy policy." with those links. A non-`https://` value stops the server at startup. Ignored without Firebase. Not set means no links. |
 | `--open-signup` | `AGENTICML_SERVER_OPEN_SIGNUP` | off | Allow verified Firebase sign-in to create an account and personal workspace. A verified account with no workspace gets one at sign-in (once; an admin-deleted sign-up workspace is not recreated). |
-| `--min-client-version X.Y` | `AGENTICML_SERVER_MIN_CLIENT_VERSION` | `2.2` | Reject `agenticml-lite` clients older than `X.Y` on `/v2` requests with HTTP 426. |
+| `--min-client-version X.Y` | `AGENTICML_SERVER_MIN_CLIENT_VERSION` | `2.2` | Reject `agenticml-lite` clients older than `X.Y` on `/v2` requests with HTTP 426. Values below `2.2` are unsupported: 2.0 and 2.1 clients misreport their own runs as foreign. |
 
 Additional environment variables:
 - `AGENTICML_SERVER_KEY`: Static admin API key named `env` kept in memory. Bound to the `default` workspace.

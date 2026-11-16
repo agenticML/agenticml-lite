@@ -57,7 +57,7 @@ Authorization: Bearer <key>
 
 Sync clients declare their package version in the `User-Agent` header (e.g. `User-Agent: agenticml-lite/3.0.0`).
 
-The server enforces a minimum client support window via `--min-client-version X.Y` (environment variable `AGENTICML_SERVER_MIN_CLIENT_VERSION`, default `2.2`).
+The server enforces a minimum client support window via `--min-client-version X.Y` (environment variable `AGENTICML_SERVER_MIN_CLIENT_VERSION`, default `2.2`). Values below `2.2` are not supported: 2.0 and 2.1 clients compare `owner` with their key name and misreport their own runs as foreign.
 
 On `/v2/*` requests (except `GET /v2/whoami`), any client with a User-Agent identifying an `agenticml-lite` version older than the minimum is rejected with HTTP `426 Upgrade Required`:
 
@@ -155,7 +155,7 @@ client recovery.
 | `GET /v2/whoami` | None | `200 {"key": name, "scope": scope, "user": user, "role": role, "protocol": 2, "workspace": slug, "features": ["lineage", "byref"]}` | 401 |
 | `POST /v2/objects/missing` | `{"objects": [sha256, ...]}` | `200 {"missing": [sha256, ...]}` | 401, 403, 411, 413, 422, 503 |
 | `PUT /v2/objects/{sha256}` | Raw bytes (`application/octet-stream`) | `201 {"sha256": sha256, "created": true}` or `200 {"sha256": sha256, "created": false}` | 401, 403, 411, 413, 422, 503 |
-| `GET /v2/runs/{id}/state` | None | `200 {"owner": name, "owner_user": user, "files": {path: {"size": n, "sha256": h}}, "remote": {...}}` | 401, 403, 404 |
+| `GET /v2/runs/{id}/state` | None | `200 {"owner": user, "owner_user": user, "files": {path: {"size": n, "sha256": h}}, "remote": {...}}` | 401, 403, 404 |
 | `PUT /v2/runs/{id}/files/{path}` | Raw bytes | `200 {"size": n}` | 401, 403, 404, 409, 411, 413, 422, 503 |
 | `POST /v2/runs/{id}/append/{path}?offset=N[&truncate=1]` | Raw bytes | `200 {"size": n}` | 401, 403, 404, 409, 411, 413, 422, 503 |
 | `GET /v2/runs/{id}/lineage` | None | `200 {"commit": sha_or_null, "tips": [sha, ...]}` | 401, 403, 404, 409, 422, 503 |
@@ -326,7 +326,7 @@ any valid sync or admin key.
 - **Response**: `200 OK`
   ```json
   {
-    "owner": "gpu-box-1",
+    "owner": "alice",
     "owner_user": "alice",
     "files": {
       "meta.json": {"size": 812, "sha256": "a1b2..."},
@@ -335,7 +335,7 @@ any valid sync or admin key.
       "scalars/0.bin": {"size": 8000, "sha256": "0718..."}
     },
     "remote": {
-      "owner": "gpu-box-1",
+      "owner": "alice",
       "owner_user": "alice",
       "owner_key": "gpu-box-1",
       "last_sync_key": "gpu-box-1",
@@ -350,12 +350,11 @@ any valid sync or admin key.
     sizes, hashes, owner information, and commit metadata directly from the
     database (`runs` and `run_files` tables). The server no longer creates or
     updates `remote.json` files on disk. The response schema remains identical.
-  - **Compatibility rule**: To preserve compatibility with 2.0 and 2.1 clients,
-    the `owner` field in `state`, `state.remote`, and 409 conflict payloads
-    returns the **calling key's name** if the caller's user owns the run. If
-    the run is owned by another user, `owner` returns the owning user's name.
-  - `owner_user` always carries the real user name of the owner, both at the
-    top level and inside `remote`.
+  - `owner` and `owner_user` both carry the real user name of the owner, at
+    the top level, inside `remote` and in 409 conflict payloads. The key that
+    created the run is `owner_key`. Before 3.0, `owner` carried the calling
+    key's name for the caller's own runs; clients older than 2.2 relied on that
+    and are unsupported (the default `--min-client-version 2.2` refuses them).
   - `owner_key` (the key that created the run) and `last_sync_key` (the key of
     the last commit) in `remote` are visible only to keys belonging to the
     owning user; they are omitted for callers of other users.
@@ -392,7 +391,7 @@ Atomically write or replace an allow-listed atomic file.
   - `403 Forbidden`: `{"error": "role viewer cannot sync"}`
   - `404 Not Found`: disallowed path, or unknown run for non-meta files
     (`{"error": "unknown run"}`).
-  - `409 Conflict`: `{"error": "run owned by another user", "owner": "<name>", "owner_user": "<user>"}`
+  - `409 Conflict`: `{"error": "run owned by another user", "owner": "<user>", "owner_user": "<user>"}`
   - `411 Length Required`: `{"error": "length required"}`
   - `413 Payload Too Large`: `{"error": "payload too large"}`
   - `422 Unprocessable Entity`: `{"error": "invalid meta.json"}`,
@@ -428,7 +427,7 @@ Append records to an allow-listed append file, or atomically replace it when
   - `403 Forbidden`: `{"error": "role viewer cannot sync"}`
   - `404 Not Found`: disallowed path or unknown run.
   - `409 Conflict`:
-    - `{"error": "run owned by another user", "owner": "<name>", "owner_user": "<user>"}`
+    - `{"error": "run owned by another user", "owner": "<user>", "owner_user": "<user>"}`
     - `{"size": S}` (gap: `offset > S`)
     - `{"size": S, "mismatch": true}` (overlapping bytes disagree)
     - `{"error": "run is not running", "status": "<status>"}` (`truncate=1` attempted
@@ -482,7 +481,7 @@ sizes before updating `remote.json`.
   - `403 Forbidden`: `{"error": "role viewer cannot sync"}`
   - `404 Not Found`: unknown run (`{"error": "unknown run"}`).
   - `409 Conflict`:
-    - `{"error": "run owned by another user", "owner": "<name>", "owner_user": "<user>"}`
+    - `{"error": "run owned by another user", "owner": "<user>", "owner_user": "<user>"}`
     - `{"error": "status does not match meta.json", "status": "<server_status>"}`
     - `{"error": "size mismatch", "sizes": {path: server_size_or_null, ...}}`
   - `411 Length Required`: `{"error": "length required"}`
@@ -514,8 +513,8 @@ A run does not exist on the server until `meta.json` is created:
    ```json
    {"error": "run owned by another user", "owner": "alice", "owner_user": "alice"}
    ```
-   with HTTP status `409 Conflict`. (Under the compatibility rule, `owner` is
-   the owning user's name because the caller belongs to a different user).
+   with HTTP status `409 Conflict`. `owner` and `owner_user` both carry the
+   owning user's name (never a key name).
 3. **Commit attribution**: When committing (`POST /v2/runs/{id}/commit`), the
    server records `last_sync_key` (the key that performed the commit) alongside
    `last_sync_at` in `remote.json`.
@@ -748,7 +747,10 @@ The client maintains host- and workspace-scoped sync state in `<root>/runs/<id>/
   compares ownership by user (`owner_user`), allowing a machine to switch to
   another key of the same user. It caches `owner_user` per host and workspace in
   `sync.json`. When syncing against a server that omits `user` (version 2.0 or 2.1),
-  the client falls back to checking `owner` against its key name.
+  the client falls back to checking `owner` against its key name. Since 3.0
+  servers send the user name in `owner`, this fallback is only meaningful for
+  those old servers; clients older than 2.2 are refused by 3.0 servers by default
+  and misreport their own runs as foreign if an operator lets them in.
 - **Update timing**: `sync.json` is atomically replaced and directory-fsynced
   after every accepted HTTP write request, ensuring interrupted syncs resume
   where they left off.
