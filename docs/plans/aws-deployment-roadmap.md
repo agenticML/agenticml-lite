@@ -50,6 +50,9 @@ Nov 12, 2026 the owner had the supervisor run Phase 3 with the owner's
 
 ## Current state (Nov 16, 2026)
 
+All seven phases are done as of Nov 16, 2026. Two owner confirmations remain:
+the 5.5 alarm email and the D6 email to existing sign-ups.
+
 Where things stand; update this section, and the Status column of the step,
 in the PR that records a result.
 
@@ -64,23 +67,23 @@ in the PR that records a result.
 | 4. First accounts and data | **done** (Nov 16) | 4.1, 4.2, 4.2a (Nov 13); 4.2b (Nov 15); 4.3 and 4.4 (owner confirmed Nov 16) | – |
 | 5. Launch checks | **done** (Nov 16; the 5.5 email confirmation is pending the owner) | 5.1 to 5.6 (Nov 16); package [24.12](packages/24.12-phase-5-launch-checks.md) | The owner confirms the 5.5 alarm email arrived |
 | 6. Recovery and performance | **done** (Nov 16, package [24.13](packages/24.13-phase-6-restore-drill.md)) | 6.1 restore drill, 6.2 real-EFS benchmark | – |
-| 7. Public launch | in progress | 7.1 (Nov 14, [#64](https://github.com/agenticML/agenticml-lite/pull/64)); 7.3 (Nov 15); 7.4 policies filled and fact-checked on `dev`; 7.5 built | 7.2 docs-only PR to `main` after the dev PR merges; then `HOSTED_LEGAL_BASE_URL` and the deploy (7.4) |
+| 7. Public launch | **done** (Nov 16; the D6 email and the 5.5 email confirmation are pending the owner) | 7.1 (Nov 14, [#64](https://github.com/agenticML/agenticml-lite/pull/64)); 7.2 to 7.6 (Nov 16, [#75](https://github.com/agenticML/agenticml-lite/pull/75) and deploy run 43811140859) | The owner emails existing sign-ups about the policies (D6) and confirms the 5.5 alarm email |
 
 ### Live service
 
 | What | State |
 | --- | --- |
 | Bootstrap stack `agenticml-hosted-bootstrap` | `UPDATE_COMPLETE`; redeployed twice on Nov 12 with the [24.5](packages/24.5-lean-hosted.md) fixes (immutable OIDC subject, `ecr:BatchGetImage`, EFS service-linked role) |
-| Hosted stack `agenticml-hosted` | `UPDATE_COMPLETE` from deploy run 43722433179 (Nov 15; `dev` at `0bd558d`, the [#65](https://github.com/agenticML/agenticml-lite/pull/65) merge, which includes [#66](https://github.com/agenticML/agenticml-lite/pull/66)), image `0bd558d5b1bb7e0b48b2c39d9b69a9df3e6aa65d-arm64`. It carries package 24.11 (sync state per workspace in the client; no member "Invite link" button on Firebase) and package 28.1 (Settings nav without the Server admin link). The older waiting run 43705268601 (the #66 merge) was rejected as superseded. Earlier: run 43269670813 (Nov 12 and 13) shipped the 24.6 `whoami` change and the Firebase variables |
-| Service | 1 of 1 ARM64 task (0.5 vCPU / 1 GB) running, task definition `agenticml-hosted:9` (run 43722433179); a forced deployment on Nov 16 for step 5.1 replaced the task with the same image |
+| Hosted stack `agenticml-hosted` | `UPDATE_COMPLETE` from deploy run 43811140859 (Nov 16; `dev` at `10fd4ba`, the [#71](https://github.com/agenticML/agenticml-lite/pull/71) merge, package 28.2), image `10fd4ba…-arm64`, with `AGENTICML_SERVER_LEGAL_BASE_URL` set so the policy links show on the sign-in pages. The owner approved the run, which shipped 28.2 and the policy links in one roll. Run 43722433179 (Nov 15, `dev` at `0bd558d`, the [#65](https://github.com/agenticML/agenticml-lite/pull/65) merge, which includes [#66](https://github.com/agenticML/agenticml-lite/pull/66)) carried package 24.11 (sync state per workspace in the client; no member "Invite link" button on Firebase) and package 28.1 (Settings nav without the Server admin link). The older waiting run 43705268601 (the #66 merge) was rejected as superseded. Earlier: run 43269670813 (Nov 12 and 13) shipped the 24.6 `whoami` change and the Firebase variables |
+| Service | 1 of 1 ARM64 task (0.5 vCPU / 1 GB) running, a new task definition from run 43811140859 (Nov 16; the number was not checked); before it, `agenticml-hosted:9` (run 43722433179) and a forced deployment on Nov 16 for step 5.1 |
 | Database | `agenticml-hosted`, `db.t4g.micro`, single-AZ, 20 GB, available |
 | Alarms | all six OK; Container Insights off. The 5.5 drill put `agenticml-hosted-alb_5xx` in `ALARM` on Nov 16 (05:11 UTC); it returns to OK by itself |
 | Load balancer | `agenticml-hosted-1705349735.us-east-2.elb.amazonaws.com`; `/healthz` 200 with the `app.agenticml.xyz` host |
 | DNS | `app` CNAME at Namecheap → the load balancer (step 3.2, Nov 12); `https://app.agenticml.xyz/healthz` returns 200 with a valid certificate |
 | Admin account | The first admin, created through `/setup` on Nov 13 (step 4.2): owner of `default`, server admin, password login. With Firebase on, it can no longer sign in on the web; it stays as the break-glass account for the server CLI over ECS Exec |
-| Sign-in | **Firebase**, project `agenticml-hosted` (Google and email/password; `app.agenticml.xyz` is an authorized domain). `/login` serves the Firebase page with no console or CSP errors; password `POST /login` and `/setup` return 404. **Open sign-up is on** since Nov 13, 2026 (owner's choice, before the policies are published; see the roadmap Backlog): a verified sign-in with no account gets a free personal workspace |
+| Sign-in | **Firebase**, project `agenticml-hosted` (Google and email/password; `app.agenticml.xyz` is an authorized domain). `/login` serves the Firebase page with no console or CSP errors; password `POST /login` and `/setup` return 404. **Open sign-up is on** since Nov 13, 2026 (owner's choice): a verified sign-in with no account gets a free personal workspace. Since Nov 16 `/login` and `/invite` show the policy links ("By continuing you agree to the Terms and the Acceptable use policy. See the Privacy policy."), with no console errors and no horizontal overflow at desktop width or 375px |
 | Email admin account | Through `HOSTED_ADMIN_EMAILS` (package [24.7](packages/24.7-self-serve-admins.md), [#58](https://github.com/agenticML/agenticml-lite/pull/58), task definition `agenticml-hosted:4`; the server logs one admin email configured). The owner's first Google sign-in created the account as server admin (step 4.2b, done; confirmed by the owner Nov 15) |
-| GitHub `hosted` environment | `HOSTED_FIREBASE_PROJECT=agenticml-hosted` and `HOSTED_FIREBASE_API_KEY` set Nov 13; `HOSTED_ADMIN_EMAILS` (the owner's Google email) and `HOSTED_OPEN_SIGNUP=true` set Nov 13. `HOSTED_DESIRED_COUNT` was unused since 24.5 and was deleted Nov 15, 2026. `HOSTED_LEGAL_BASE_URL` is unset until the policies are published |
+| GitHub `hosted` environment | `HOSTED_FIREBASE_PROJECT=agenticml-hosted` and `HOSTED_FIREBASE_API_KEY` set Nov 13; `HOSTED_ADMIN_EMAILS` (the owner's Google email) and `HOSTED_OPEN_SIGNUP=true` set Nov 13. `HOSTED_DESIRED_COUNT` was unused since 24.5 and was deleted Nov 15, 2026. `HOSTED_LEGAL_BASE_URL=https://agenticml.github.io/agenticml-lite/legal/` set Nov 16 (the live `/auth/firebase/config` returns the three policy URLs, all 200) |
 
 Next: step 4.3 on `/admin` and each workspace's Settings page (4.2b, the
 owner's Google sign-in as server admin, is done), then 4.4. Package
@@ -88,8 +91,8 @@ owner's Google sign-in as server admin, is done), then 4.4. Package
 both workspaces and removes the member "Invite link" button, which fails
 with 403 for most members on Firebase. Both 24.11 and 28.1 are deployed
 (run 43722433179, Nov 15, 2026), so the button is gone on the live service. Open sign-up was turned on early (Nov 13, 2026); the terms,
-acceptable use and privacy policies and their sign-in page links are Phase 7
-work (7.3, 7.4).
+acceptable use and privacy policies and their sign-in page links were Phase 7
+work (7.3, 7.4, done Nov 16, 2026).
 
 ## Phase 0: Account checks (owner, ~30 min)
 
@@ -228,25 +231,25 @@ At this point the AWS deployment is live and package 24.3 is done.
 
 ## Phase 7: Public launch (owner and agents)
 
-**Status: in progress** (Nov 15, 2026): 7.1 merged to `dev` in
-[#64](https://github.com/agenticML/agenticml-lite/pull/64); 7.5 is built there.
-The policy facts are decided (7.3) and the policies are filled and
-fact-checked on `dev` (7.4). Next: merge the PR to `dev`, then publish the
-site and the policies together in one docs-only PR to `main` (7.2). The contact address is
-`contact@agenticml.xyz`, an existing mailbox on the domain's Zoho Mail (decided
-Nov 16, 2026); that prerequisite is done.
+**Status: done** (Nov 16, 2026): 7.1 merged to `dev` in
+[#64](https://github.com/agenticML/agenticml-lite/pull/64). The docs site and
+the policies were published together in the docs-only PR
+[#75](https://github.com/agenticML/agenticml-lite/pull/75) to `main` (7.2), and
+`/login` and `/invite` link to the policies since deploy run 43811140859
+(7.4). The contact address is `contact@agenticml.xyz`, an existing mailbox on
+the domain's Zoho Mail (decided Nov 16, 2026). One owner step is left: the D6
+email to existing sign-ups.
 Plan: package [29](packages/29-docs-site.md). The service has taken sign-ups since
-Nov 13, but nothing public points to it, and the policies are not live yet.
-This phase makes the docs site the way people find and use it.
+Nov 13. This phase made the docs site the way people find and use it.
 
 | # | Step | Who | Done when | Status |
 | --- | --- | --- | --- | --- |
 | 7.1 | Docs site: Releases page, hosted section (overview, quickstart, workspaces) and a public "Service status and roadmap" page that mirrors this roadmap without AWS identifiers (packages 29.1–29.5 and 29.2a–c) | Sonnet, Antigravity | Merged to `dev` with the build, link and 375px checks green | done ([#64](https://github.com/agenticML/agenticml-lite/pull/64), Nov 14) |
-| 7.2 | Publish the site through a docs-only PR to `main`; enforce HTTPS on Pages; set the repo description and homepage (29.6) | git agent; owner merges and sets them | The live site shows the hosted pages and status page | next, after the dev PR merges: the owner decided on Nov 15 (D1) to publish the site and the policies together, so this is one docs-only PR to `main`; the contact address `contact@agenticml.xyz` is an existing Zoho Mail mailbox (decided Nov 16, 2026), so no mail setup is left. After the owner merges: set `HOSTED_LEGAL_BASE_URL` and deploy (7.4), check the `/login` footer links, retry Enforce HTTPS, and email existing sign-ups (D6). Pages refused Enforce HTTPS on Nov 15 ("The certificate does not exist yet"): retry after publishing. The repo description and homepage are set (Nov 15). The site is not on `main` yet, so the hosted pages are not live |
-| 7.3 | Owner decides open sign-up until the policies exist (package 29, D1), and supplies the policy facts (D4) | Owner | Decisions recorded in the 29 plan | done (Nov 15): open sign-up stays on; D1 (publish together with the policies) and D4 (delegated to the supervisor; the owner approves by merging the PR to `main`) are recorded in the [29 plan](packages/29-docs-site.md) |
-| 7.4 | Terms, acceptable use and privacy policy on the docs site, linked from `/login` and the invite page (29.7); email existing sign-ups (D6) | Antigravity drafts; owner and lawyer approve; Sonnet links; owner approves the deploy | `/login` and `/invite` show the three links in a browser, and they return 200 | policies filled and fact-checked on `dev` (Nov 15; 28 corrections, no row-level security claim); no lawyer review. Waiting for the support mailbox, the PR to `main`, `HOSTED_LEGAL_BASE_URL=https://agenticml.github.io/agenticml-lite/legal/`, the deploy, and the owner's email to existing sign-ups (D6) |
-| 7.5 | Promote: Sign in action, banner and header link on the docs site (29.8) | Sonnet | Live, with no overflow at 375px | built in [#64](https://github.com/agenticML/agenticml-lite/pull/64); live with 7.2 |
-| 7.6 | Keep the status page current: the PR that records a result in Phases 4–6 also updates the docs status page, then the git agent opens the docs-only PR to `main` | Supervisor; owner merges | The live status page shows the result and a new "last updated" date | after 7.2 |
+| 7.2 | Publish the site through a docs-only PR to `main`; enforce HTTPS on Pages; set the repo description and homepage (29.6) | git agent; owner merges and sets them | The live site shows the hosted pages and status page | done (Nov 16): docs-only PR [#75](https://github.com/agenticML/agenticml-lite/pull/75) merged to `main` at 17:53 UTC (`website/` and `docs.yml` copied from `dev`); Pages deploy run 43923087030 succeeded; `/`, `/releases/`, `/hosted/`, `/hosted/quickstart/`, `/hosted/status/`, `/legal/terms/`, `/legal/acceptable-use/` and `/legal/privacy/` return 200. The repo description and homepage were set Nov 15. Enforce HTTPS: GitHub still answers "The certificate does not exist yet" (Nov 16, after publishing); the default `github.io` project URL has no certificate of its own for this setting, so it moved to the "Docs custom domain" Backlog entry in the on-prem roadmap |
+| 7.3 | Owner decides open sign-up until the policies exist (package 29, D1), and supplies the policy facts (D4) | Owner | Decisions recorded in the 29 plan | done (Nov 15): open sign-up stays on; D1 (publish together with the policies) and D4 (delegated to the supervisor; the owner approves by merging the PR to `main`) are recorded in the [29 plan](packages/29-docs-site.md); the owner approved the policy text by merging #75 (Nov 16, no lawyer review); the contact address `contact@agenticml.xyz` was chosen by the owner |
+| 7.4 | Terms, acceptable use and privacy policy on the docs site, linked from `/login` and the invite page (29.7); email existing sign-ups (D6) | Antigravity drafts; owner and lawyer approve; Sonnet links; owner approves the deploy | `/login` and `/invite` show the three links in a browser, and they return 200 | done (Nov 16): policies filled and fact-checked on `dev` (Nov 15; 28 corrections, no row-level security claim); no lawyer review. `HOSTED_LEGAL_BASE_URL=https://agenticml.github.io/agenticml-lite/legal/` set; deploy run 43811140859 (the waiting #71 merge, package 28.2, head `10fd4ba`) approved by the owner and succeeded. The live `/auth/firebase/config` returns the three policy URLs (all 200); in a browser `/login` and `/invite?token=x` show the footer with the three links, no console errors, no horizontal overflow at desktop width or 375px. Left for the owner: D6, email existing sign-ups about the policies |
+| 7.5 | Promote: Sign in action, banner and header link on the docs site (29.8) | Sonnet | Live, with no overflow at 375px | done (Nov 16): built in [#64](https://github.com/agenticML/agenticml-lite/pull/64); live with #75 |
+| 7.6 | Keep the status page current: the PR that records a result in Phases 4–6 also updates the docs status page, then the git agent opens the docs-only PR to `main` | Supervisor; owner merges | The live status page shows the result and a new "last updated" date | done as a practice (Nov 16): PR #74 (contact address) and PR #76 (status page date) went to `dev` and were published through #75; from now on, each result that changes the public status page goes to `dev`, then a docs-only PR to `main`. Ongoing |
 
 ## After AWS is live (separate work, not in this roadmap)
 

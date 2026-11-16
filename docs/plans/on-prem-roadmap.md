@@ -218,7 +218,7 @@ after 27; 29 after 24.7 and 27, beside 24.3 (29.7 and 29.9 wait on the owner).
 | 24 | AWS hosted deployment (Dockerfile, Terraform, deploy workflow, runbook, real-EFS benchmark) | 18c, 19, 20, 21 | Codex, Sonnet; owner runs it | M | [plan](packages/24-aws-deployment.md) | done (code, 3.0 PR; owner checks in Backlog) |
 | 24.1 | Image: Dockerfile, entrypoint, limits file, local hosted smoke test | 21 | Codex, Sonnet | S | [plan](packages/24-aws-deployment.md) | done (3.0 PR) |
 | 24.2 | Terraform, deploy workflow, `deploy-check` CI job, runbook | 24.1 | Codex, Sonnet | M | [plan](packages/24-aws-deployment.md) | done (3.0 PR; `terraform validate` runs in CI) |
-| 24.3 | Apply, first deploy, restore drill, real-EFS benchmark, exit criterion 6 | 24.5 | Owner | S | [AWS roadmap](aws-deployment-roadmap.md) | done (Nov 16, 2026; AWS roadmap Phases 0–6 done; the 5.5 alarm email confirmation is pending the owner; Phase 7 publishing is open. Per-step status: [AWS roadmap](aws-deployment-roadmap.md)) |
+| 24.3 | Apply, first deploy, restore drill, real-EFS benchmark, exit criterion 6 | 24.5 | Owner | S | [AWS roadmap](aws-deployment-roadmap.md) | done (Nov 16, 2026; AWS roadmap Phases 0–7 done; the owner still confirms the 5.5 alarm email and sends the D6 email to existing sign-ups. Per-step status: [AWS roadmap](aws-deployment-roadmap.md)) |
 | 24.4 † | CloudFormation replaces Terraform; Namecheap DNS; cost alerts | 24.2 | Sonnet; prose Antigravity | M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49); second review by the supervisor) |
 | 24.4a | `bootstrap.yaml`: ECR, OIDC, roles, certificate, alerts topic, budget, cost-step function | – | Sonnet | S–M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
 | 24.4b | `hosted.yaml` and its tests | 24.4a | Sonnet | M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
@@ -249,7 +249,7 @@ after 27; 29 after 24.7 and 27, beside 24.3 (29.7 and 29.9 wait on the owner).
 | 28 | One Settings page: Account, Workspace, Members, API keys and Activity replace the Keys, Team and Account entries (like agenticml-server) | 27 | Sonnet | M | [plan](packages/28-settings-page.md) | done ([#63](https://github.com/agenticML/agenticml-lite/pull/63), Nov 13, 2026) |
 | 28.1 | One Admin entry: drop the "Server admin ↗" link from the Settings nav; the top-bar Admin link stays (owner's request on the design board, Nov 14, 2026) | 28 | Supervisor | S | [plan](packages/28.1-settings-nav-admin-link.md) | done ([#66](https://github.com/agenticML/agenticml-lite/pull/66), Nov 15, 2026) |
 | 28.2 | Top bar on every signed-in page: a Workspaces link back to `/workspaces` on workspace pages and `/admin`; Sign out and "Signed in as" on the `/workspaces` picker (owner's request, Nov 16, 2026) | 28.1 | Sonnet | S | [plan](packages/28.2-topbar-workspaces-signout.md) | done ([#71](https://github.com/agenticML/agenticml-lite/pull/71); Sonnet coded, supervisor reviewed, Nov 16, 2026) |
-| 29 | Docs site: Releases page (1.0–3.0), hosted service section with status, home page, truth fixes, docs CI, policies and sign-in links | 24.7, 27 | Sonnet; prose Antigravity | M | [plan](packages/29-docs-site.md) | merged ([#64](https://github.com/agenticML/agenticml-lite/pull/64), Nov 14, 2026): every buildable part done. Nov 15: policies filled and fact-checked on `dev`; publishing (29.6, 29.7) goes in one docs-only PR to `main` (the contact address `contact@agenticml.xyz` is an existing Zoho Mail mailbox, decided Nov 16, 2026); 29.9 is blocked on PyPI |
+| 29 | Docs site: Releases page (1.0–3.0), hosted service section with status, home page, truth fixes, docs CI, policies and sign-in links | 24.7, 27 | Sonnet; prose Antigravity | M | [plan](packages/29-docs-site.md) | done (Nov 16, 2026): merged ([#64](https://github.com/agenticML/agenticml-lite/pull/64), Nov 14) and published to `main` in the docs-only PR [#75](https://github.com/agenticML/agenticml-lite/pull/75) (Nov 16; Pages deploy run 43923087030). Policies filled and fact-checked Nov 15; policy links live on the sign-in pages since deploy run 43811140859 (Nov 16). Left for the owner: D6, email existing sign-ups; Enforce HTTPS moved to the "Docs custom domain" Backlog entry. 29.9 is blocked on PyPI |
 | 29.0 | Plan, roadmap rows, AWS roadmap Phase 7, Backlog entries | – | Supervisor | S | [plan](packages/29-docs-site.md) | done ([#64](https://github.com/agenticML/agenticml-lite/pull/64)) |
 | 29.1 | Truth fixes in existing pages and README | 29.0 | Sonnet | S | [plan](packages/29-docs-site.md) | done ([#64](https://github.com/agenticML/agenticml-lite/pull/64)) |
 | 29.2a | Docs CI: PR builds, link validator, Node pin, job permissions and concurrency | 29.1 | Sonnet | S | [plan](packages/29-docs-site.md) | done ([#64](https://github.com/agenticML/agenticml-lite/pull/64)) |
@@ -259,9 +259,9 @@ after 27; 29 after 24.7 and 27, beside 24.3 (29.7 and 29.9 wait on the owner).
 | 29.5b | Docs site names: "Self-hosted" becomes "On-prem server" and "Hosted" becomes "Hosted service" on the Home tiles; the sidebar's "Server" section becomes "On-prem server" (owner's request, Nov 15, 2026; the tile links landed in [#67](https://github.com/agenticML/agenticml-lite/pull/67)) | 29.5 | Sonnet | S | [plan](packages/29.5b-home-link-cards.md) | in review ([#69](https://github.com/agenticML/agenticml-lite/pull/69)) |
 | 29.2b | 375px overflow check over every built page, in `docs.yml` | 29.5 | Sonnet | S | [plan](packages/29-docs-site.md) | done ([#64](https://github.com/agenticML/agenticml-lite/pull/64)) |
 | 29.2c | Facts test: limits, minimum client, no unpublished tag URLs, no `login --key` | 29.4 | Sonnet | S | [plan](packages/29-docs-site.md) | done; covers the server pages and policy drafts too ([#64](https://github.com/agenticML/agenticml-lite/pull/64)) |
-| 29.6 | Publish: docs-only PR to `main`; Pages HTTPS, repo description and homepage | 29.1–29.5, 29.2a–c, D3 | git agent; owner | S | [plan](packages/29-docs-site.md) | next: docs-only PR to `main` after the dev PR merges (owner decided Nov 15 to publish with the policies, D1); the contact address is `contact@agenticml.xyz`, an existing mailbox on the domain's Zoho Mail (decided Nov 16, 2026), so that prerequisite is done; then Pages Enforce HTTPS (refused Nov 15: certificate not ready); repo description and homepage set Nov 15 |
-| 29.7 † | Terms, acceptable use and privacy policy on the site; links on the sign-in and invite pages | 29.6 | Antigravity; owner and lawyer approve; Sonnet | M | [plan](packages/29-docs-site.md) | policies filled and fact-checked on `dev` (Nov 15; D4 delegated to the supervisor, 28 corrections, no row-level security claim, no lawyer review); opt-in links built (`HOSTED_LEGAL_BASE_URL` unset); † second review by Cursor of the links ([#64](https://github.com/agenticML/agenticml-lite/pull/64)). Live when the PR to `main` merges, then set `HOSTED_LEGAL_BASE_URL=https://agenticml.github.io/agenticml-lite/legal/` and approve the deploy; the owner emails existing sign-ups (D6) |
-| 29.8 | Promotion: Sign in action, banner, header link | 29.7 | Sonnet | S | [plan](packages/29-docs-site.md) | built ([#64](https://github.com/agenticML/agenticml-lite/pull/64)); header Sign in is a visible text link; live with 29.6, which now waits only for the dev PR and the support mailbox (D1, Nov 15) |
+| 29.6 | Publish: docs-only PR to `main`; Pages HTTPS, repo description and homepage | 29.1–29.5, 29.2a–c, D3 | git agent; owner | S | [plan](packages/29-docs-site.md) | done (Nov 16, 2026): docs-only PR [#75](https://github.com/agenticML/agenticml-lite/pull/75) merged to `main` at 17:53 UTC; Pages deploy run 43923087030 succeeded; `/`, `/releases/`, `/hosted/`, `/hosted/quickstart/`, `/hosted/status/` and the three `/legal/` pages return 200; repo description and homepage set Nov 15. Enforce HTTPS is still refused ("The certificate does not exist yet"), so it moved to the "Docs custom domain" Backlog entry |
+| 29.7 † | Terms, acceptable use and privacy policy on the site; links on the sign-in and invite pages | 29.6 | Antigravity; owner and lawyer approve; Sonnet | M | [plan](packages/29-docs-site.md) | done (Nov 16, 2026): policies filled and fact-checked on `dev` (Nov 15; D4 delegated to the supervisor, 28 corrections, no row-level security claim, no lawyer review); the owner approved the text by merging [#75](https://github.com/agenticML/agenticml-lite/pull/75); † second review by Cursor of the links ([#64](https://github.com/agenticML/agenticml-lite/pull/64)). `HOSTED_LEGAL_BASE_URL=https://agenticml.github.io/agenticml-lite/legal/` set; deploy run 43811140859 (the #71 merge, package 28.2, head `10fd4ba`) approved by the owner and succeeded; `/login` and `/invite?token=x` show the three links in a browser, no console errors, no overflow at desktop width or 375px. Left for the owner: D6, email existing sign-ups |
+| 29.8 | Promotion: Sign in action, banner, header link | 29.7 | Sonnet | S | [plan](packages/29-docs-site.md) | done (Nov 16, 2026): built in [#64](https://github.com/agenticML/agenticml-lite/pull/64); header Sign in is a visible text link; live with [#75](https://github.com/agenticML/agenticml-lite/pull/75) |
 | 29.9 | After PyPI 3.0.0: `pip install`, tag URLs, release dates, `pyproject.toml` URLs | owner release | Sonnet | S | [plan](packages/29-docs-site.md) | blocked: 3.0.0 not on PyPI |
 
 Getting the hosted service live on AWS, step by step: [AWS deployment roadmap](aws-deployment-roadmap.md).
@@ -341,29 +341,19 @@ Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
-- **Release 3.0.0: tag, publish, legal pages (owner)** (Nov 9, 2026).
-  - Where: GitHub releases, PyPI, agenticml.xyz.
+- **Release 3.0.0: tag and publish (owner)** (Nov 9, 2026).
+  - Where: GitHub releases, PyPI.
   - Problem: the 3.0 PR sets version 3.0.0 but nothing is tagged or
-    published, and open sign-up needs terms of service, an acceptable use
-    policy and a privacy policy first (3.0 plan release checklist). The
-    `v2.2.0` tag was never created either; the 2.2 client compatibility
-    test falls back to commit `bd0d499` until it exists.
-  - Fix: after merging, tag `v2.2.0` at `bd0d499` and `v3.0.0` at the
-    merge, publish 3.0.0 to PyPI (`publish.yml`), and publish the three
-    policies before setting `HOSTED_OPEN_SIGNUP=true` in the `hosted`
-    environment.
-  - Done when: `pip install agenticml-lite==3.0.0` works and the policies
-    are linked from the sign-in page.
-  - Progress (Nov 13, 2026): the owner turned open sign-up on before the
-    policies were published (`HOSTED_OPEN_SIGNUP=true`, deploy run
-    43417765936). The policies and the sign-in page links are now the most
-    urgent part of this entry. Planned as package 29.7 (AWS roadmap step
-    7.4); PyPI has only 1.0.0, so package 29 documents the git install
-    until this entry is done.
-  - Progress (Nov 15, 2026): the policies are filled and fact-checked on
-    `dev` (operator "the agenticML project", contact@agenticml.xyz, no
-    lawyer review). They go live with the docs-only PR to `main`; then set
-    `HOSTED_LEGAL_BASE_URL` and deploy. The owner approves by merging.
+    published. The `v2.2.0` tag was never created either; the 2.2 client
+    compatibility test falls back to commit `bd0d499` until it exists. PyPI
+    has only 1.0.0, so package 29 documents the git install until this entry
+    is done.
+  - Fix: tag `v2.2.0` at `bd0d499` and `v3.0.0` at the merge of `dev` into
+    `main`, and publish 3.0.0 to PyPI (`publish.yml`).
+  - Done when: `pip install agenticml-lite==3.0.0` works.
+  - Progress (Nov 16, 2026): the legal pages part is done. The three policies
+    are live on the docs site and linked from `/login` and `/invite` (package
+    29.7, AWS roadmap step 7.4, deploy run 43811140859).
 - **Restore drill: a sync during the EFS backup window** (package 24.13,
   Nov 16, 2026). Medium priority.
   - Where: AWS Backup plan in `deploy/aws/cloudformation/hosted.yaml` (daily
@@ -417,13 +407,6 @@ priority.
     suspended workspace returns 404 for all API requests, but sync gets 403.
   - Fix: check the code, then fix both texts.
   - Done when: the examples load with `limits.py` and the wording matches.
-- **Retry Pages "Enforce HTTPS"** (package 29.6, owner, Nov 15, 2026). Low
-  priority.
-  - Where: GitHub repo settings, Pages.
-  - Problem: GitHub answered "The certificate does not exist yet" when the
-    supervisor (git agent) tried to turn on Enforce HTTPS on Nov 15.
-  - Fix: retry after the site is published from `main`.
-  - Done when: `https_enforced` is true for the Pages site.
 - **Two-task rolling deploy check** (package 24.3, owner). Low priority.
   - Where: `deploy/aws/README.md`, Launch checks 5.1.
   - Problem: the rolling deploy during an upload passed on Nov 16, 2026 (5.1;
@@ -459,6 +442,10 @@ priority.
     `Documentation`. Never touch the `app` record.
   - Done when: `https://docs.agenticml.xyz` serves the site with HTTPS
     enforced, old github.io URLs redirect, and the link check passes.
+  - Enforce HTTPS (moved here Nov 16, 2026): GitHub still answers "The
+    certificate does not exist yet" for the default `github.io` project URL
+    after publishing, so Enforce HTTPS cannot be turned on until the custom
+    domain is set up; then turn it on (`https_enforced` true).
 - **Hosted service monitoring for the public** (package 29, Nov 13, 2026).
   Low priority.
   - Where: `.github/workflows/`, the docs status page.
