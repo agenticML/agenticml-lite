@@ -189,7 +189,7 @@ starts. Order:
 16 → 17 → 18, then 18b and 21 in parallel, then 18c → 19 → 20 (19.1,
 the Postgres backend, runs beside 18b; 19.2 needs 18c's tables); 22 and 23
 after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live; 28
-after 27; 29 after 24.7 and 27, beside 24.3 (29.7 and 29.9 wait on the owner).
+after 27; 29 after 24.7 and 27, beside 24.3 (29.7 and 29.9 wait on the owner); 30 (Backlog cleanup) last, before the merge to `main`.
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -263,6 +263,14 @@ after 27; 29 after 24.7 and 27, beside 24.3 (29.7 and 29.9 wait on the owner).
 | 29.7 † | Terms, acceptable use and privacy policy on the site; links on the sign-in and invite pages | 29.6 | Antigravity; owner and lawyer approve; Sonnet | M | [plan](packages/29-docs-site.md) | done (Nov 16, 2026): policies filled and fact-checked on `dev` (Nov 15; D4 delegated to the supervisor, 28 corrections, no row-level security claim, no lawyer review); the owner approved the text by merging [#75](https://github.com/agenticML/agenticml-lite/pull/75); † second review by Cursor of the links ([#64](https://github.com/agenticML/agenticml-lite/pull/64)). `HOSTED_LEGAL_BASE_URL=https://agenticml.github.io/agenticml-lite/legal/` set; deploy run 43811140859 (the #71 merge, package 28.2, head `10fd4ba`) approved by the owner and succeeded; `/login` and `/invite?token=x` show the three links in a browser, no console errors, no overflow at desktop width or 375px. Left for the owner: D6, email existing sign-ups |
 | 29.8 | Promotion: Sign in action, banner, header link | 29.7 | Sonnet | S | [plan](packages/29-docs-site.md) | done (Nov 16, 2026): built in [#64](https://github.com/agenticML/agenticml-lite/pull/64); header Sign in is a visible text link; live with [#75](https://github.com/agenticML/agenticml-lite/pull/75) |
 | 29.9 | After PyPI 3.0.0: `pip install`, tag URLs, release dates, `pyproject.toml` URLs | owner release | Sonnet | S | [plan](packages/29-docs-site.md) | blocked: 3.0.0 not on PyPI |
+| 30 † | Backlog cleanup before the 3.0 release to `main`: every Backlog entry fixed, given an owner checklist, or moved to Later | 25, 29 | Sonnet; supervisor reviews (second review for † parts) | L | [plan](packages/30-backlog-cleanup.md) | in progress |
+| 30.1 † | Sync integrity and doc truth: failed atomic upload drops the cursor, restore-window repair tests and runbook, `compat_owner` removed, limits and suspended-workspace texts | – | Sonnet | S–M | [plan](packages/30-backlog-cleanup.md) | plan ready |
+| 30.2 † | Account and workspace lifecycle: `server accounts delete`, workspace delete never skips a step, `workspaces orphans`/`cleanup`, detached accounts | – | Sonnet | M | [plan](packages/30-backlog-cleanup.md) | plan ready |
+| 30.3 † | Admin plan edits merge atomically and prefill free limits; Keys copy command without `--key`; metric picker refresh; workspace rename by its owner | 30.1, 30.2 | Sonnet | M | [plan](packages/30-backlog-cleanup.md) | plan ready |
+| 30.4 † | Sign-in pages: setup and invite in the new shell, theme toggle, Firebase page tests, invite token in the URL fragment on hosted | 30.1, 30.2 | Sonnet | M | [plan](packages/30-backlog-cleanup.md) | plan ready |
+| 30.5 | Database: transaction connection cap, committed sizes per reader call, usage views on the database clock, 19.1 notes | 30.1, 30.2 | Sonnet | S–M | [plan](packages/30-backlog-cleanup.md) | plan ready |
+| 30.6 | AWS template and CI: ECS init process, healthy-hosts alarm from DesiredCount, actions pinned to SHAs, weekly hosted monitor | – | Sonnet | S–M | [plan](packages/30-backlog-cleanup.md) | plan ready |
+| 30.7 | Roadmap and Backlog: owner checklists, deferred entries to Later, stale rows | 30.1–30.6 | Supervisor | S | [plan](packages/30-backlog-cleanup.md) | plan ready |
 
 Getting the hosted service live on AWS, step by step: [AWS deployment roadmap](aws-deployment-roadmap.md).
 
