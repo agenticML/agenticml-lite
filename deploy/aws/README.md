@@ -757,6 +757,18 @@ Pass: the sync succeeds and `verify` passes. If the server answers 426 (the
 client is older than the minimum client version), record that this check fails
 and why. Do not change the minimum.
 
+Two things went wrong on the first run (Nov 16, 2026):
+
+- `uv venv` makes a venv without `pip`. Install with `uv pip install ...`
+  (with the venv active), not `pip install`.
+- A stale `agenticml` on `PATH` (the shell's command hash, for example in zsh)
+  can shadow the venv's. Run `rehash` (zsh) or `hash -r` (bash) after
+  activating, and check `which agenticml` points into the venv before
+  syncing.
+
+If the identical artifact already exists in that workspace, the 2.2 client
+uploads no object (`objects=0`); that is expected, and `verify` still decides.
+
 ### 5.4 Object encryption
 
 Stored objects use SSE-S3. Take the objects bucket name from the stack
@@ -867,84 +879,148 @@ the ALB security group on port 8080.
 
 ## Restore drill and Real EFS benchmark
 
+The step-by-step runbook is [`scripts/restore_drill/README.md`](../../scripts/restore_drill/README.md),
+with scripts that discover every ID at run time (stack outputs, the live task
+definition, describe calls) and keep the drill's own IDs in a git-ignored state
+directory (`DRILL_STATE_DIR`, default `./restore-drill-state`). This section
+states the policy and the decisions behind it. Everything is named
+`agenticml-restore-drill*` and tagged `Project=agenticml-restore-drill`, runs
+in its own ECS cluster `agenticml-restore-drill`, and is removed afterwards.
+
 ### Restore drill (owner, isolated test service only)
 
 1. Record a database recovery timestamp, EFS recovery point, and S3 versions
    before a fixture sync and after it. Quiesce writers for a coordinated
-   recovery point when exact cross-store consistency is required. Daily AWS
-   Backup retention is 35 days for EFS and RDS; native RDS PITR is 7 days.
-2. Restore RDS to a **new** instance:
+   recovery point when exact cross-store consistency is required. **Restore the
+   database to the EFS recovery point's completion time** (`CompletionDate`),
+   and cut the S3 versions at the same time, not at the point's start. An EFS
+   backup copies files while it runs (the Nov 16 daily point ran about 3
+   hours), so files synced in that window exist in the restored files and in S3;
+   a database restored to the start does not know them (attempt 1: 60
+   `object_missing` problems and 60 `object_orphan` warnings in `verify
+   --deep`), and a database restored to the completion time does (attempt 2: 0
+   and 0). A sync made during the backup window can still leave the database
+   ahead of the files for that run; record any warnings. The EFS recovery point
+   can be an on-demand AWS Backup job (tagged, and deleted afterwards) or the
+   latest scheduled point. On Nov 16 an on-demand `start-backup-job` was
+   refused with AccessDenied for the operator's `aws login` session: use the
+   latest scheduled point if it is refused. Daily AWS Backup retention is 35 days for EFS and
+   RDS; native RDS PITR is 7 days.
+2. Restore RDS to a **new** instance with a point-in-time restore. Reuse the
+   production network and parameter group and add the drill flags:
    ```sh
-   rds_sg=$(aws ec2 describe-security-groups --filters Name=group-name,Values=agenticml-hosted-rds --query 'SecurityGroups[0].GroupId' --output text)
    aws rds restore-db-instance-to-point-in-time \
      --source-db-instance-identifier agenticml-hosted \
      --target-db-instance-identifier agenticml-restore-drill \
-     --restore-time YOUR-UTC-TIMESTAMP \
-     --db-subnet-group-name agenticml-hosted \
-     --vpc-security-group-ids "$rds_sg" \
-     --no-publicly-accessible
+     --restore-time EFS-RECOVERY-POINT-COMPLETION-UTC --db-instance-class db.t4g.micro \
+     --db-subnet-group-name agenticml-hosted --vpc-security-group-ids "$RDS_SG" \
+     --db-parameter-group-name "$DB_PARAM_GROUP" --option-group-name "$DB_OPTION_GROUP" \
+     --ca-certificate-identifier "$DB_CA" --no-publicly-accessible --no-multi-az \
+     --no-deletion-protection --no-auto-minor-version-upgrade \
+     --backup-retention-period 0 \
+     --tags Key=Project,Value=agenticml-restore-drill
    ```
-   Wait with `aws rds wait db-instance-available --db-instance-identifier agenticml-restore-drill`.
-   Check encryption, TLS parameter group, and managed master secret before use.
+   `--db-parameter-group-name` keeps `rds.force_ssl` in force (without it the
+   restore uses the default group). `--no-deletion-protection` lets the drill
+   instance be deleted; `--backup-retention-period 0` skips automated backups,
+   so none are left behind. Wait with
+   `aws rds wait db-instance-available --db-instance-identifier agenticml-restore-drill`.
+   Check encryption, the TLS parameter group, and that `MasterUserSecret` is
+   null: a point-in-time restore keeps the master password as of the restore
+   time (which must be after the last rotation) and creates no managed secret.
+   Drill tasks therefore read the production secret at task start through the
+   existing execution role, exactly as the live service does. No person reads
+   it, and no IAM change is needed.
 3. In AWS Backup, restore the chosen EFS recovery point to a new encrypted
-   filesystem. Inspect recovery metadata with
-   `aws backup get-recovery-point-restore-metadata` using the vault
-   `agenticml-hosted` and recovery-point ARN; pass the reviewed metadata and a
-   restore-capable operator role to `aws backup start-restore-job`. Create
-   mount targets in the data subnets and an access point with uid/gid 10001.
-   AWS Backup may restore into a recovery subfolder: verify its contents and
-   place the restored store at the test access point root before starting the
-   server.
+   filesystem with **explicit metadata**: `file-system-id`, `Encrypted`,
+   `KmsKeyId` (the production key), `PerformanceMode` (`generalPurpose`),
+   `CreationToken` and `newFileSystem` (`true`), passed with
+   `aws backup start-restore-job --metadata file://... --resource-type EFS
+   --no-copy-source-tags-to-restored-resource --iam-role-arn <the stack's backup
+   role>` (compare with `aws backup get-recovery-point-restore-metadata`).
+   Make the restored filesystem match production (`ThroughputMode` elastic),
+   create a mount target in a data subnet with the production EFS security
+   group, and delete any filesystem policy it carries (**drill filesystem only**;
+   IAM mount authorization stays off, access is limited by the mount-target
+   security group, which admits only the task security group). Inspect the
+   restored tree with a one-off read-only task through a root access point:
+   AWS Backup may restore into an `aws-backup-restore_<timestamp>/` subfolder.
+   Then create the data access point (uid/gid 10001) with the `agenticml`
+   directory as its root path.
 4. Restore S3 object versions (including objects hidden by delete markers) into
-   a **separate test bucket**, selecting versions matching the recovery point.
-   Never remove production delete markers for a drill. Noncurrent versions
-   expire after 30 days; versioning is not an indefinite backup.
-5. Copy the current task definition into a separate test service, replacing
-   EFS IDs, database host/managed-secret ARN, S3 URL, public URL, and disabling
-   signup. Networking: tasks run in the public task subnets with a public IPv4
-   address for outbound traffic only (no NAT). Use the hosted stack outputs
-   `TaskSubnets` and `TaskSecurityGroup` with `assignPublicIp=ENABLED`. Give it
-   a separate least-privilege task/execution role for the restored resources.
-   Keep it off production DNS and the production target group. Verify login,
-   both workspaces, metrics, artifacts/code diffs, usage, and a new sync.
+   a **separate test bucket** (`agenticml-restore-drill-*`: all public access
+   blocked, default encryption, a policy that names the task role and denies
+   insecure transport), selecting the versions current at the recovery time
+   (`scripts/restore_drill/copy_versions_at.py`, which only reads the
+   production bucket and checks each copy against its SHA-256). Never remove
+   production delete markers for a drill. Noncurrent versions expire after 30
+   days; versioning is not an indefinite backup.
+5. Generate the drill task definitions with `scripts/restore_drill/mk_td.py`
+   from the live task definition, replacing EFS IDs, database host, S3 URL and
+   public URL (loopback), and disabling signup and Firebase. The script
+   refuses any definition that names a production identifier, ECS Exec or a
+   port mapping. Networking: tasks run in the public task subnets with a public
+   IPv4 address for outbound traffic only (no NAT), using the stack outputs
+   `TaskSubnets` and `TaskSecurityGroup` with `assignPublicIp=ENABLED`, in the
+   drill cluster (never the production service or target group, never
+   production DNS). **Roles:** the drill reuses the existing execution role and,
+   for the server task only, the existing task role through the drill bucket's
+   policy (inspect, SQL and benchmark tasks have no task role). That role can
+   also write the production `hosted/*` prefix, so the guards matter: the drill
+   entrypoint (`drill-run.sh`) refuses to start unless the database host is the
+   drill instance, the bucket is a drill bucket and the public URL is
+   loopback. A dedicated least-privilege role is the alternative; it is an IAM
+   create and needs the owner's approval. Verify, as one-off tasks (the image
+   has no `psql`, and ECS Exec is not used): a read-only SQL check, the server
+   `status`, `workspaces usage` and `verify --deep`, then a new sync and a
+   dashboard login per workspace with a temporary key in the restored database.
 6. Record recovery point age, recovery duration, commands, and integrity
-   results. Remove only drill resources after review. Do not overwrite live
-   database or files to test recovery. Record any cross-store inconsistency.
+   results. Remove only drill resources after review, in dependency order
+   (RDS, task definitions, cluster, EFS access points, mount target and
+   filesystem, the drill bucket, the on-demand recovery point, drill log
+   streams) and finish with a listing that proves nothing remains and
+   production is unchanged. Do not overwrite live database or files to test
+   recovery. Record any cross-store inconsistency.
 
 ### Real EFS benchmark (owner)
 
-Run the repository's `scripts/bench_server.py` on a one-off Fargate task with
-the same EFS access point, network/roles, and image. The production image
-intentionally contains only the installed wheel: create a temporary private
-benchmark image `FROM <deployed-image>` and `COPY scripts/bench_server.py /opt/bench_server.py`,
-then push it to a separate operator-owned private ECR repo (not a public image).
-Register a copy of the current task definition, substitute that image, and set
-entryPoint to `["python"]`, command to
-`["/opt/bench_server.py", "--data", "/data/benchmark-1", "--clients", "1"]`.
-Remove production database, S3, public-URL, Firebase, and limits variables and
-secrets from this benchmark definition: the script runs its own local server
-and measures EFS file operations, not the live customer database. Give it a
-separate EFS directory, never `/data` itself.
+Run the repository's `scripts/bench_server.py` on a one-off Fargate task in the
+drill cluster, on the **restored drill filesystem**, never on production EFS
+(the benchmark writes files). The drill filesystem has production's settings:
+the same KMS key, `generalPurpose`, elastic throughput, a TLS mount through an
+access point, a mount target in the same availability zone as the task, and the
+same image. Only IAM mount authorization is off, which affects authorization,
+not I/O. Use its own access point with root path `/bench` (uid/gid 10001), so the
+benchmark never touches restored application data.
 
-Fetch the network settings from stack outputs:
+No benchmark image and no ECR repository are needed. The production image
+intentionally contains only the installed wheel, so
+`scripts/restore_drill/mk_td.py bench` embeds `scripts/bench_server.py` as
+committed at the deployed commit (`git show <commit>:scripts/bench_server.py`,
+gzipped and base64-encoded when the task definition is generated) together with
+its sha256, and the container verifies the checksum before running it. The
+definition is a copy of the production one with a 4 vCPU / 8 GB size, no task
+role, and no database, S3, public-URL, Firebase, limits or secret variables: the
+script runs its own local server and measures EFS file operations, not the live
+customer database. SQLite refuses network filesystems and the hosted database
+is not on EFS either, so the benchmark keeps the server's SQLite database on the
+container's local disk (`/tmp`, one file per run, set per command through
+`AGENTICML_SERVER_DATABASE_URL`) while run files, appends and objects go to EFS. It runs 1 and 8 clients, 3 repetitions each, without
+`--fsync-delay-ms`, in a throw-away `/data/benchmark-<epoch>` directory that is
+removed when it ends.
 
-```sh
-subnets=$(aws cloudformation describe-stacks --stack-name agenticml-hosted --query "Stacks[0].Outputs[?OutputKey=='TaskSubnets'].OutputValue" --output text)
-task_sg=$(aws cloudformation describe-stacks --stack-name agenticml-hosted --query "Stacks[0].Outputs[?OutputKey=='TaskSecurityGroup'].OutputValue" --output text)
-aws ecs run-task --launch-type FARGATE \
-  --cluster agenticml-hosted \
-  --task-definition YOUR-BENCH-REVISION \
-  --network-configuration "awsvpcConfiguration={subnets=[$subnets],securityGroups=[$task_sg],assignPublicIp=ENABLED}"
-```
-
-Repeat with `/data/benchmark-8` and `--clients 8`, without `--fsync-delay-ms`.
-Inspect task exit codes and collect awslogs output. The local embedded benchmark
-is distinct from a production ALB/Postgres throughput test.
+Run it with `scripts/restore_drill/run_task.sh`, which reads the network from
+the stack outputs (`TaskSubnets`, `TaskSecurityGroup`, `assignPublicIp=ENABLED`),
+runs only in the drill cluster, prints `createdAt`, `startedAt`, `stoppedAt` and
+the exit code, and saves the CloudWatch log. The embedded benchmark is distinct
+from a production ALB/Postgres throughput test: it measures EFS file I/O
+plus a local-disk SQLite, not the hosted Postgres path.
 
 Record real EFS throughput/latency for 1 and 8 clients, region/AZ, task size,
 EFS elastic/generalPurpose settings, and NFS mount details in `docs/SERVER.md`.
 Confirm or revise `--follow --interval` and `APPEND_CHUNK` recommendations;
-remove only the isolated benchmark directories, images, and tasks afterwards.
+remove the drill resources (including the benchmark access point and task
+definition) afterwards.
 
 ## Incidents, launch evidence and cost
 

@@ -29,22 +29,21 @@ The service runs one server task and one database in a single availability zone.
 - **Nov 15, 2026:** the terms of service, acceptable use policy and privacy policy are published.
 - **Nov 16, 2026:** two customer workspaces, each with an admin, a member and a sync key, checked end to end: each person sees only their own workspaces, and a test run synced into each shows only in its own dashboard.
 - **Nov 16, 2026:** a new server version rolled out while a 1.5 GB upload was running; every upload finished, and the server's copy matched the local run byte for byte.
+- **Nov 16, 2026:** isolation between workspaces was checked from outside. With one workspace's key, another workspace's runs, URLs and sign-in all answered "not found" or asked for sign-in, and showed no data.
+- **Nov 16, 2026:** a 2.2 client synced to the service, and the server's copy matched.
+- **Nov 16, 2026:** stored objects are encrypted, and every stored object matches the bytes that were uploaded.
+- **Nov 16, 2026:** a restore from backup was tried. The database, the files and the objects were restored into a separate test service, which passed a full check and accepted a new sync. The database restore, the slowest part, took about 13 minutes. The live service was not touched, and the test service was removed afterwards.
+- **Nov 16, 2026:** storage speed was measured with 1 and 8 clients syncing at once. The results are in the project's server documentation and did not change any recommendation.
 
 ## In progress
 
-The launch checks are being run on the hosted service:
+One launch check is waiting on a person:
 
-- **Isolation:** try a key, a session and an address from one workspace against another, and confirm each gets "not found".
-- **Older client:** confirm a 2.2 client can sync to the hosted service.
-- **Object encryption:** confirm stored objects use the configured encryption, and that downloads match the source bytes.
-- **Alarms:** trigger one alarm and confirm the notification arrives.
+- **Alarms:** an alarm was triggered on Nov 16 and the notification was sent. We are waiting for the recipient to confirm the email arrived.
 
 ## Not done yet
 
-These checks are planned and have not been run on the hosted service:
-
-- **Restore drill:** restore the database, the file storage and old object versions into a separate test service, and record how long it takes and how much is recovered. Backups exist, but no restore has been tested.
-- **Storage speed:** measure the file storage with 1 and 8 clients syncing at once.
+- **Two tasks at once:** the service has only run one task at a time (apart from the short overlap during a version roll-out). Running two steady tasks has not been tried.
 
 ## Problems
 

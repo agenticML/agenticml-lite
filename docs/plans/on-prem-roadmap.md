@@ -218,7 +218,7 @@ after 27; 29 after 24.7 and 27, beside 24.3 (29.7 and 29.9 wait on the owner).
 | 24 | AWS hosted deployment (Dockerfile, Terraform, deploy workflow, runbook, real-EFS benchmark) | 18c, 19, 20, 21 | Codex, Sonnet; owner runs it | M | [plan](packages/24-aws-deployment.md) | done (code, 3.0 PR; owner checks in Backlog) |
 | 24.1 | Image: Dockerfile, entrypoint, limits file, local hosted smoke test | 21 | Codex, Sonnet | S | [plan](packages/24-aws-deployment.md) | done (3.0 PR) |
 | 24.2 | Terraform, deploy workflow, `deploy-check` CI job, runbook | 24.1 | Codex, Sonnet | M | [plan](packages/24-aws-deployment.md) | done (3.0 PR; `terraform validate` runs in CI) |
-| 24.3 | Apply, first deploy, restore drill, real-EFS benchmark, exit criterion 6 | 24.5 | Owner | S | [AWS roadmap](aws-deployment-roadmap.md) | in progress (AWS roadmap Phases 0–3 done Nov 12, 2026; Phase 4 done Nov 16, 2026 (4.3 and 4.4 confirmed by the owner; packages 24.11 and 28.1 deployed Nov 15, run 43722433179); Phase 5 in progress (5.1 and 5.6 done Nov 16), with package 24.12; Phase 6 not started. Per-step status: [AWS roadmap](aws-deployment-roadmap.md)) |
+| 24.3 | Apply, first deploy, restore drill, real-EFS benchmark, exit criterion 6 | 24.5 | Owner | S | [AWS roadmap](aws-deployment-roadmap.md) | done (Nov 16, 2026; AWS roadmap Phases 0–6 done; the 5.5 alarm email confirmation is pending the owner; Phase 7 publishing is open. Per-step status: [AWS roadmap](aws-deployment-roadmap.md)) |
 | 24.4 † | CloudFormation replaces Terraform; Namecheap DNS; cost alerts | 24.2 | Sonnet; prose Antigravity | M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49); second review by the supervisor) |
 | 24.4a | `bootstrap.yaml`: ECR, OIDC, roles, certificate, alerts topic, budget, cost-step function | – | Sonnet | S–M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
 | 24.4b | `hosted.yaml` and its tests | 24.4a | Sonnet | M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
@@ -239,7 +239,8 @@ after 27; 29 after 24.7 and 27, beside 24.3 (29.7 and 29.9 wait on the owner).
 | 24.11b | Sync cursor per host and workspace (`host/w/<slug>`), migrating host-only entries after a `/state` check; `--reset` clears every workspace of the host | 24.11a | Supervisor | S–M | [plan](packages/24.11-phase-4-wrap-up.md) | done ([#65](https://github.com/agenticML/agenticml-lite/pull/65)) |
 | 24.11c † | Firebase servers: no member "Invite link" (API answers 409, Members hides it) | 24.11a | Supervisor | S | [plan](packages/24.11-phase-4-wrap-up.md) | done ([#65](https://github.com/agenticML/agenticml-lite/pull/65); † second review by Cursor: no findings) |
 | 24.11d | Docs: runbook sync section, SERVER.md, PROTOCOL.md, README, website hosted workspaces and storage pages | 24.11b, 24.11c | Antigravity | S | [plan](packages/24.11-phase-4-wrap-up.md) | done ([#65](https://github.com/agenticML/agenticml-lite/pull/65); Antigravity drafted, supervisor checked against the code) |
-| 24.12 | Phase 5 launch checks: `scripts/hosted_check.py` (make-run, verify, isolation), runbook section, roadmap rows | 24.11 | Sonnet; supervisor reviews | S | [plan](packages/24.12-phase-5-launch-checks.md) | in progress (tool built; the owner and the supervisor ran 5.1, 5.4 (encryption), 5.5 (drill) and 5.6 on Nov 16, 2026; 5.2, 5.3 and the rest pending) |
+| 24.12 | Phase 5 launch checks: `scripts/hosted_check.py` (make-run, verify, isolation), runbook section, roadmap rows | 24.11 | Sonnet; supervisor reviews | S | [plan](packages/24.12-phase-5-launch-checks.md) | done (Nov 16, 2026; 5.1 to 5.6 run and recorded; the 5.5 email confirmation is pending the owner) |
+| 24.13 | Phase 6 restore drill and real-EFS benchmark: `scripts/restore_drill/`, tests, runbook, results | 24.12 | Sonnet; supervisor reviews and runs | M | [plan](packages/24.13-phase-6-restore-drill.md) | done (Nov 16, 2026; drill and benchmark run; resources removed) |
 | 25 | Docs, threat model, version 3.0.0 | 16–24 | Sonnet (Codex at limit); prose Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR; tag and PyPI release by the owner) |
 | 25.1 | Client support window (426), version 3.0.0, base-install smoke, 2.2 client check | 16–24 | Sonnet (Codex at limit) | S | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
 | 25.2 | SERVER.md, HOSTED.md, threat model, PROTOCOL.md, README, website, SECURITY.md | 25.1 | Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
@@ -340,35 +341,6 @@ Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
-- **Hosted launch and rolling-upload verification** (package 24.3, owner).
-  - Where: `deploy/aws/README.md`, sections Prerequisites through Upgrades.
-  - Problem: the infrastructure and deployment code have not run in our AWS
-    account; exit criterion 6 needs a real deployment.
-  - Fix: owner follows the AWS deployment roadmap Phases 2–5 and the
-    CloudFormation runbook: bootstrap stack, GitHub `hosted` environment,
-    first workflow deploy (one task by default since 24.5; for the two-task
-    checks, dispatch with `desired_count=2` once `deploy.yml` is on `main`, or
-    run `aws ecs update-service --desired-count 2` until the next deploy),
-    the Namecheap `app` CNAME, then
-    Firebase (later) and two customer
-    workspaces with admin/member accounts and workspace-bound sync keys.
-    Sync through both tasks and roll while uploading; verify acknowledged
-    sizes/hashes and dashboard parity, membership isolation, and client retry.
-  - Done when: `app.agenticml.xyz` serves both workspaces and evidence shows
-    a rolling deployment loses no uploads; record apply/deploy revisions and
-    sign-in, isolation and upload results. Owner only; no agent AWS calls.
-  - Progress (Nov 16, 2026): 5.1 rolling deploy during an upload passed
-    (`hosted_check.py verify` PASS, no lost uploads). The two-task checks are still open.
-- **Hosted backup restore drill** (package 24.3, owner).
-  - Where: `deploy/aws/README.md`, Restore drill.
-  - Problem: configured backups have not been restored; exit criterion 6
-    requires one real restore.
-  - Fix: restore RDS PITR to a new private instance, EFS from AWS Backup to
-    a new filesystem/access point, and matching S3 versions to a test bucket;
-    point an isolated test service and scoped roles at them with signup off.
-    Verify both workspaces, login, run files/metrics, objects, and a new sync.
-  - Done when: recovery age/duration and integrity results are recorded and
-    drill resources removed without changing live resources.
 - **Release 3.0.0: tag, publish, legal pages (owner)** (Nov 9, 2026).
   - Where: GitHub releases, PyPI, agenticml.xyz.
   - Problem: the 3.0 PR sets version 3.0.0 but nothing is tagged or
@@ -392,6 +364,23 @@ priority.
     `dev` (operator "the agenticML project", support@agenticml.xyz, no
     lawyer review). They go live with the docs-only PR to `main`; then set
     `HOSTED_LEGAL_BASE_URL` and deploy. The owner approves by merging.
+- **Restore drill: a sync during the EFS backup window** (package 24.13,
+  Nov 16, 2026). Medium priority.
+  - Where: AWS Backup plan in `deploy/aws/cloudformation/hosted.yaml` (daily
+    EFS backup at 05:00 UTC, which ran about 3 hours); `scripts/restore_drill/README.md`
+    step 1.
+  - Problem: the EFS backup is not a point in time. The drill restores the
+    database to the recovery point's completion time, so the database is at
+    least as new as the files, and the Nov 16 drill passed that way. A run
+    synced during the backup window can still be in the database while its
+    newest files or objects are missing from the restored filesystem, and
+    `verify --deep` then reports problems for that run.
+  - Fix: decide one: move the backup to the quietest hour and record its
+    duration; or document a repair step (re-sync the affected runs from the
+    clients, which keep the source data); or add a `server verify --repair`
+    that marks such runs incomplete so clients re-upload them.
+  - Done when: the runbook names the chosen approach and a drill (or a test
+    with a simulated mid-backup sync) shows a clean `verify --deep` after it.
 - **Account deletion tooling** (package 29 policy fact-check, Nov 15, 2026).
   - Where: `src/agenticml/server/` `server accounts` command (list and add
     only); Privacy policy; `deploy/aws/README.md`.
@@ -435,6 +424,18 @@ priority.
     supervisor (git agent) tried to turn on Enforce HTTPS on Nov 15.
   - Fix: retry after the site is published from `main`.
   - Done when: `https_enforced` is true for the Pages site.
+- **Two-task rolling deploy check** (package 24.3, owner). Low priority.
+  - Where: `deploy/aws/README.md`, Launch checks 5.1.
+  - Problem: the rolling deploy during an upload passed on Nov 16, 2026 (5.1;
+    the old and new task overlapped and shared the uploads), but the service
+    has only ever run one steady-state task. A steady two-task service has not
+    been exercised.
+  - Fix: set the desired count to 2 (`aws ecs update-service --desired-count
+    2` until the next deploy, or dispatch the workflow with
+    `desired_count=2`), sync several runs through both tasks, check
+    `verify --deep` and the dashboard, then set the count back to 1.
+  - Done when: a sync through two steady tasks verifies with 0 problems and
+    the result is recorded. Not needed for the launch.
 - **Keys page copies the key onto the command line** (package 29 plan, Nov
   13, 2026).
   - Where: `src/agenticml/ui/static/app.js`, new-key dialog (the
@@ -523,32 +524,6 @@ priority.
     the first `/runs`; add the two UI tests.
   - Done when: a metric logged after page load appears in the picker
     without a reload, with a test.
-- **Stand up the hosted service on AWS (package 24.3, owner)** (Nov 9,
-  2026).
-  - Where: `deploy/aws/cloudformation/` (bootstrap and hosted stacks),
-    `deploy/aws/README.md` runbook, `.github/workflows/deploy.yml`,
-    [AWS deployment roadmap](aws-deployment-roadmap.md) Phases 2–6.
-  - Problem: agents wrote and statically checked the stack (image build,
-    `scripts/hosted_smoke.sh` against local Postgres and moto, `cfn-lint`
-    and template tests in CI) but never ran it in AWS: creating billed
-    resources and a public endpoint is the owner's call.
-  - Progress (Nov 13, 2026): AWS roadmap Phases 0–3 are done: bootstrap
-    stack, `hosted` environment, first deploy from `dev`, the Namecheap
-    `app` CNAME, and `https://app.agenticml.xyz/healthz` returns 200. In
-    Phase 4, ECS Exec works (4.1), the first admin exists (4.2) and Firebase
-    sign-in is on with project `agenticml-hosted` (4.2a). Package 24.7 is
-    deployed (server admins and customer workspaces without ECS Exec), and
-    open sign-up is on. 4.2b is done (the owner signed in with Google as
-    server admin; confirmed Nov 15). Next: two workspaces (4.3) and a sync
-    to each (4.4).
-  - Fix: follow `deploy/aws/README.md`: bootstrap stack (with the Namecheap
-    validation record), GitHub environment `hosted` with the role
-    variables, first deploy, the `app` CNAME,
-    first server admin, two customer workspaces, a rolling deploy during a
-    sync, an RDS + EFS restore drill, and the real-EFS benchmark (replaces
-    the "Run the server benchmark on real EFS" entry below).
-  - Done when: exit criterion 6 of the 3.0 plan holds and `docs/SERVER.md`
-    shows real-EFS numbers.
 - **Many-process follow-ups for package 24** (package 20 reviews, Nov 9,
   2026).
   - Where: `src/agenticml/server/db/postgres.py` (session locks),
@@ -585,14 +560,6 @@ priority.
   - Fix: open outside the registry lock; consider salting keys per schema
     and a connection cap. Revisit in package 20.
   - Done when: each has a test or a recorded decision.
-- **Check S3 objects against a real bucket** (package 21, Nov 9, 2026).
-  - Where: `src/agenticml/server/objectstore.py`, hosted server configuration.
-  - Problem: moto covers the backend; real AWS checksums, conditional writes,
-    IAM and server-side encryption still need an owner check.
-  - Fix: sync a run and download its objects through the dashboard against
-    a real S3 bucket; confirm SSE and workspace-scoped keys.
-  - Done when: one sync and dashboard download match the source bytes and
-    the stored objects have the configured SSE.
 - **Retry object cleanup after a workspace deletion fails** (package 21,
   Nov 9, 2026).
   - Where: `server/workspaces.py` `delete_workspace`, S3 workspace prefix.
@@ -603,24 +570,18 @@ priority.
   - Done when: a failed cleanup can be retried and removes only that
     workspace's prefix.
 - **Check Firebase sign-in against the real Firebase project** (package 18b
-  caveat, Nov 8, 2026).
+  caveat, Nov 8, 2026). Reduced Nov 16, 2026.
   - Where: `src/agenticml/server/firebase.py`, `static/firebase-login.js`,
     the vendored SDK in `static/vendor/firebase/`.
-  - Problem: tests sign tokens locally and replace the Firebase SDK with a
-    fake in the browser, so Google's real certificates, the real SDK
-    (popup, redirect through `apis.google.com`, email verification) and the
-    sign-in page's CSP were never exercised end to end.
-  - Fix: on a test server with `--firebase-project` (agenticml-server's
-    project), the web API key and the server's host added to the project's
-    authorized domains, sign in once with Google and once with email and
-    password, accept one invite, and watch the browser console for CSP
-    violations.
-  - Progress (Nov 13, 2026): the hosted service now runs with Firebase
-    project `agenticml-hosted` (not agenticml-server's). `/login` loads the
-    real SDK with no console or CSP errors. A real Google sign-in worked in
-    AWS roadmap step 4.2b (confirmed Nov 15); an invite comes with 4.3, and
-    a Firebase email/password sign-in is still to try.
-  - Done when: those steps pass, or each mismatch is fixed with a test.
+  - Problem: the hosted service runs with Firebase project `agenticml-hosted`.
+    `/login` loads the real SDK with no console or CSP errors, a real Google
+    sign-in worked (AWS roadmap 4.2b, confirmed Nov 15) and people signed in
+    and accepted invites in 4.3 (confirmed Nov 16). Not yet recorded: a
+    Firebase email and password sign-in (with a verified email), and the
+    restore drill's server could not test sign-in at all (no public DNS).
+  - Fix: sign in once with email and password on `app.agenticml.xyz` (verified
+    email, matching an invite or account), and note the result.
+  - Done when: that sign-in works, or each mismatch is fixed with a test.
 - **Firebase sign-in page test gaps** (package 18b.2 second review, Nov 8,
   2026).
   - Where: `testbed/tests/test_server_firebase_dashboard.py`.
@@ -688,22 +649,22 @@ priority.
     prerequisite once.
   - Done when: those steps pass, or any mismatch with the real CLI is fixed
     with a test that reproduces it.
-- **Run the server benchmark on real EFS** (package 9 caveat, Nov 6, 2026).
-  - Where: `scripts/bench_server.py`; `docs/SERVER.md`, section "Network
-    filesystems (EFS)".
-  - Problem: the published numbers are local NVMe plus an fsync delay
-    injected only into the benchmark's server process. No EFS or NFS mount
-    was available, so real EFS commit latency, metadata operations and flock
-    behaviour are unmeasured.
-  - Fix: mount EFS (`nfsvers=4.1,hard,noresvport`) as the server data
-    directory, run `python scripts/bench_server.py --data /mnt/efs/agenticml
-    --clients 1` and `--clients 8` without `--fsync-delay-ms`, and replace
-    the modelled tables; revisit `--follow --interval` and `APPEND_CHUNK` if
-    the numbers disagree.
-  - Done when: `docs/SERVER.md` shows real-EFS numbers for 1 and 8 clients,
-    labelled as such with mount details, and the recommendations are
-    confirmed or updated.
-  - Scheduled: done as part of 3.0 package 24, on the hosted stack's EFS.
+- **On-demand EFS backup refused for the operator session** (package 24.13,
+  Nov 16, 2026). Low priority.
+  - Where: AWS Backup vault `agenticml-hosted`; `scripts/restore_drill/README.md`,
+    step 1, option A.
+  - Problem: during the restore drill `aws backup start-backup-job` for the
+    hosted EFS was refused with AccessDenied ("Insufficient privileges") for
+    the operator's `aws login` session, an admin with no service control
+    policy and no vault access policy in the way. Restore jobs worked. The
+    drill used the latest scheduled recovery point instead, so on-demand EFS
+    backups (for example before a risky change) are unavailable from that
+    session.
+  - Fix: find the cause. Try the same call with access-key credentials or from
+    the console, compare the backup role's `iam:PassRole` and the session's
+    permissions, and check the CloudTrail event for the denial reason.
+  - Done when: an on-demand backup of the hosted EFS can be started, or the
+    runbook says which credentials to use.
 - **ECS Exec hardening** (package 24.6 check, Nov 12, 2026). Low priority.
   - Where: `deploy/aws/cloudformation/hosted.yaml` (container `server`,
     `Cluster`).
