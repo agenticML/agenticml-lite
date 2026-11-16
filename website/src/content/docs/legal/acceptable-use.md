@@ -68,7 +68,7 @@ We reserve the right to investigate potential violations of this policy. If we i
 
 If you discover a security vulnerability, evidence of abuse, or a violation of this policy, please report it immediately:
 
-- **Abuse and security reports:** Email [support@agenticml.xyz](mailto:support@agenticml.xyz).
+- **Abuse and security reports:** Email [contact@agenticml.xyz](mailto:contact@agenticml.xyz).
 - **General technical issues:** File an issue on GitHub Issues at [agenticML/agenticml-lite/issues](https://github.com/agenticML/agenticml-lite/issues). For the hosted service, put "hosted" in the title.
 
 ## 7. Changes to This Policy

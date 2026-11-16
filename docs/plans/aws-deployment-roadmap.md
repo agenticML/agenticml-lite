@@ -64,7 +64,7 @@ in the PR that records a result.
 | 4. First accounts and data | **done** (Nov 16) | 4.1, 4.2, 4.2a (Nov 13); 4.2b (Nov 15); 4.3 and 4.4 (owner confirmed Nov 16) | – |
 | 5. Launch checks | **done** (Nov 16; the 5.5 email confirmation is pending the owner) | 5.1 to 5.6 (Nov 16); package [24.12](packages/24.12-phase-5-launch-checks.md) | The owner confirms the 5.5 alarm email arrived |
 | 6. Recovery and performance | **done** (Nov 16, package [24.13](packages/24.13-phase-6-restore-drill.md)) | 6.1 restore drill, 6.2 real-EFS benchmark | – |
-| 7. Public launch | in progress | 7.1 (Nov 14, [#64](https://github.com/agenticML/agenticml-lite/pull/64)); 7.3 (Nov 15); 7.4 policies filled and fact-checked on `dev`; 7.5 built | 7.2 docs-only PR to `main` after the dev PR merges; the owner sets up support@agenticml.xyz mail first; then `HOSTED_LEGAL_BASE_URL` and the deploy (7.4) |
+| 7. Public launch | in progress | 7.1 (Nov 14, [#64](https://github.com/agenticML/agenticml-lite/pull/64)); 7.3 (Nov 15); 7.4 policies filled and fact-checked on `dev`; 7.5 built | 7.2 docs-only PR to `main` after the dev PR merges; then `HOSTED_LEGAL_BASE_URL` and the deploy (7.4) |
 
 ### Live service
 
@@ -232,8 +232,9 @@ At this point the AWS deployment is live and package 24.3 is done.
 [#64](https://github.com/agenticML/agenticml-lite/pull/64); 7.5 is built there.
 The policy facts are decided (7.3) and the policies are filled and
 fact-checked on `dev` (7.4). Next: merge the PR to `dev`, then publish the
-site and the policies together in one docs-only PR to `main` (7.2). Before
-it merges, the owner must make support@agenticml.xyz receive mail.
+site and the policies together in one docs-only PR to `main` (7.2). The contact address is
+`contact@agenticml.xyz`, an existing mailbox on the domain's Zoho Mail (decided
+Nov 16, 2026); that prerequisite is done.
 Plan: package [29](packages/29-docs-site.md). The service has taken sign-ups since
 Nov 13, but nothing public points to it, and the policies are not live yet.
 This phase makes the docs site the way people find and use it.
@@ -241,7 +242,7 @@ This phase makes the docs site the way people find and use it.
 | # | Step | Who | Done when | Status |
 | --- | --- | --- | --- | --- |
 | 7.1 | Docs site: Releases page, hosted section (overview, quickstart, workspaces) and a public "Service status and roadmap" page that mirrors this roadmap without AWS identifiers (packages 29.1–29.5 and 29.2a–c) | Sonnet, Antigravity | Merged to `dev` with the build, link and 375px checks green | done ([#64](https://github.com/agenticML/agenticml-lite/pull/64), Nov 14) |
-| 7.2 | Publish the site through a docs-only PR to `main`; enforce HTTPS on Pages; set the repo description and homepage (29.6) | git agent; owner merges and sets them | The live site shows the hosted pages and status page | next, after the dev PR merges: the owner decided on Nov 15 (D1) to publish the site and the policies together, so this is one docs-only PR to `main`; the owner sets up support@agenticml.xyz forwarding first. Pages refused Enforce HTTPS on Nov 15 ("The certificate does not exist yet"): retry after publishing. The repo description and homepage are set (Nov 15). The site is not on `main` yet, so the hosted pages are not live |
+| 7.2 | Publish the site through a docs-only PR to `main`; enforce HTTPS on Pages; set the repo description and homepage (29.6) | git agent; owner merges and sets them | The live site shows the hosted pages and status page | next, after the dev PR merges: the owner decided on Nov 15 (D1) to publish the site and the policies together, so this is one docs-only PR to `main`; the contact address `contact@agenticml.xyz` is an existing Zoho Mail mailbox (decided Nov 16, 2026), so no mail setup is left. After the owner merges: set `HOSTED_LEGAL_BASE_URL` and deploy (7.4), check the `/login` footer links, retry Enforce HTTPS, and email existing sign-ups (D6). Pages refused Enforce HTTPS on Nov 15 ("The certificate does not exist yet"): retry after publishing. The repo description and homepage are set (Nov 15). The site is not on `main` yet, so the hosted pages are not live |
 | 7.3 | Owner decides open sign-up until the policies exist (package 29, D1), and supplies the policy facts (D4) | Owner | Decisions recorded in the 29 plan | done (Nov 15): open sign-up stays on; D1 (publish together with the policies) and D4 (delegated to the supervisor; the owner approves by merging the PR to `main`) are recorded in the [29 plan](packages/29-docs-site.md) |
 | 7.4 | Terms, acceptable use and privacy policy on the docs site, linked from `/login` and the invite page (29.7); email existing sign-ups (D6) | Antigravity drafts; owner and lawyer approve; Sonnet links; owner approves the deploy | `/login` and `/invite` show the three links in a browser, and they return 200 | policies filled and fact-checked on `dev` (Nov 15; 28 corrections, no row-level security claim); no lawyer review. Waiting for the support mailbox, the PR to `main`, `HOSTED_LEGAL_BASE_URL=https://agenticml.github.io/agenticml-lite/legal/`, the deploy, and the owner's email to existing sign-ups (D6) |
 | 7.5 | Promote: Sign in action, banner and header link on the docs site (29.8) | Sonnet | Live, with no overflow at 375px | built in [#64](https://github.com/agenticML/agenticml-lite/pull/64); live with 7.2 |

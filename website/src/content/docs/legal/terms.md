@@ -58,7 +58,7 @@ You agree to comply with our [Acceptable Use Policy](/agenticml-lite/legal/accep
 
 ## 7. Account and Workspace Deletion
 
-- **Deletion upon request:** You can ask us to delete a workspace at any time by contacting [support@agenticml.xyz](mailto:support@agenticml.xyz). There is no self-serve delete button; an operator carries it out. To have your account record (email, name and sign-in identifier) removed as well, include that in your request. We remove it by hand, and we also remove it from Firebase Authentication.
+- **Deletion upon request:** You can ask us to delete a workspace at any time by contacting [contact@agenticml.xyz](mailto:contact@agenticml.xyz). There is no self-serve delete button; an operator carries it out. To have your account record (email, name and sign-in identifier) removed as well, include that in your request. We remove it by hand, and we also remove it from Firebase Authentication.
 - **Data removal:** Deleting a workspace deletes its database records, its run files on Amazon EFS, and its objects in Amazon S3. If removing the S3 objects fails, the server logs a warning that names the workspace, and we remove the leftover objects by hand after checking the log; this is a manual step and is not retried automatically. Copies in backups and in older S3 versions are removed by their retention schedules, about 35 days at most, once the workspace's S3 objects have been deleted. Load balancer access logs (90 days) and server logs (30 days) are not deleted on request and expire on their own schedule. A record of the deletion is written to the server audit log.
 - **Backups:** Copies residing in automated backup archives age out according to our retention schedule (up to 35 days).
 
@@ -83,4 +83,4 @@ We may update these Terms from time to time. When we do, we will update the "Las
 ## 12. Support and Contact
 
 - **Support:** Technical support during the public preview is provided on a best-effort basis via GitHub Issues at [agenticML/agenticml-lite/issues](https://github.com/agenticML/agenticml-lite/issues). For the hosted service, put "hosted" in the title.
-- **Legal and deletion requests:** Contact [support@agenticml.xyz](mailto:support@agenticml.xyz).
+- **Legal and deletion requests:** Contact [contact@agenticml.xyz](mailto:contact@agenticml.xyz).
