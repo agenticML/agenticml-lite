@@ -8,7 +8,7 @@ sidebar:
     variant: tip
 ---
 
-Every run, sync key and membership on `https://app.agenticml.xyz` belongs to one workspace. A workspace has its own address, `https://app.agenticml.xyz/w/<slug>/`. If you belong to more than one, the workspace switcher is under **Settings > Account**.
+Every run, sync key and membership on `https://app.agenticml.xyz` belongs to one workspace. A workspace has its own address, `https://app.agenticml.xyz/w/<slug>/`. If you belong to more than one, the workspace switcher is under **Settings > Account**. Every page's top bar has a **Workspaces** link back to your workspace list and **Sign out**.
 
 The server treats a workspace you do not belong to as if it did not exist: it answers "not found" to a key, a session or an address from another workspace. A live check of this on the hosted service is still on the [open list](/agenticml-lite/hosted/status/).
 

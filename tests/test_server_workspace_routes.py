@@ -344,7 +344,9 @@ def test_home_redirect_and_workspaces_picker(two):
     assert status == 200
     assert b'href="/w/default/"' in body and b'href="/w/alpha/"' in body
     assert b'href="/admin/"' in body
-    assert b"<script" not in body
+    assert b'src="/static/signout.js"' in body
+    assert b'id="sign-out"' in body and b"Signed in as alice" in body
+    assert b'href="/workspaces"' in body
     assert b"app.css" in body
 
     users_a = UserStore(server.data_dir / "server", db=server.db, workspace_id=a["id"])
@@ -361,12 +363,21 @@ def test_home_redirect_and_workspaces_picker(two):
     assert b"You are not a member of any workspace; ask an admin to invite you." in body
     assert b'href="/w/' not in body
     assert b'href="/admin/"' not in body
+    assert b'id="sign-out"' in body and b"Signed in as cara" in body
 
     _, admin_key = server.keys.create("alice-one", "admin", user="alice")
     _, _, hdrs = login(server, admin_key)
     key_cookie = hdrs["Set-Cookie"]
     status, hdrs, _, _ = _authed(server, "/", cookie=key_cookie)
     assert status == 303 and hdrs["Location"] == "/w/default/"
+
+
+def test_signout_asset_is_public(two):
+    server = two[0]
+    status, hdrs, body = call(server, "/static/signout.js")
+    assert status == 200
+    assert hdrs["Content-Type"].startswith("text/javascript")
+    assert b"/logout" in body and b"X-AgenticML-Request" in body
 
 
 def test_one_workspace_redirects_home(tmp_path, monkeypatch):

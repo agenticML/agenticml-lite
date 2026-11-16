@@ -133,7 +133,7 @@ A global account can have the `server_admin` flag set. Server administrators:
 - Manage accounts: list accounts, create accounts, and grant or revoke server administrator privileges.
 - View global storage and usage across all workspaces.
 - Configure workspace plans and limits.
-- **Isolation boundary**: Server administrators cannot view, list, or download runs or files within a workspace unless they are explicitly added as a member of that workspace. An admin without workspace membership lands on `/workspaces` with an Admin button and sees no customer workspace data.
+- **Isolation boundary**: Server administrators cannot view, list, or download runs or files within a workspace unless they are explicitly added as a member of that workspace. An admin without workspace membership lands on `/workspaces` with an Admin button and Sign out and sees no customer workspace data.
 
 Server administrator privileges can be granted through three paths:
 

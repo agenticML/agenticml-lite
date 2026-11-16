@@ -574,6 +574,8 @@ function viaLabel(via) {
       ? "admin key"
       : via || "—";
 }
+// Same few lines as server/static/signout.js (the picker page): that file is not
+// served by local `agenticml ui`, and this module is account-scoped on the server.
 async function signOut() {
   await fetch("/logout", {
     method: "POST",
@@ -600,6 +602,7 @@ const sessionReady = fetch(api("/account/session"), { credentials: "same-origin"
     // Workspace pages get one Settings entry (Keys, Team and Account live there);
     // the Account dialog stays only on /admin, which has no Settings page.
     const onWorkspace = !adminPath && currentWorkspaceSlug() !== null;
+    document.querySelector("#nav-workspaces").hidden = !onWorkspace && !adminPath;
     document.querySelector("#nav-settings").hidden = !onWorkspace;
     document.querySelector("#nav-admin").hidden = !onWorkspace || !data.server_admin;
     // The empty label keeps its auto margin, which right-aligns the bar's buttons.
@@ -5809,7 +5812,6 @@ async function adminPage(version) {
     el("div", { class: "heading" },
       el("h1", { text: "Admin" }),
       el("div", { class: "inline" },
-        el("a", { class: "btn btn-ghost btn-sm", href: "/workspaces", text: "Workspaces" }),
         createButton)),
     notice,
     content,

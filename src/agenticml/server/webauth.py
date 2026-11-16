@@ -364,6 +364,7 @@ _ASSETS = {
     "/static/login.js": (_LOGIN_STATIC / "login.js", _JS),
     "/static/setup.js": (_LOGIN_STATIC / "setup.js", _JS),
     "/static/invite.js": (_LOGIN_STATIC / "invite.js", _JS),
+    "/static/signout.js": (_LOGIN_STATIC / "signout.js", _JS),
     "/static/app.css": (_STATIC / "app.css", _FILES["app.css"]),
     "/static/InstrumentSans.woff2": (_STATIC / "InstrumentSans.woff2", _FILES["InstrumentSans.woff2"]),
     "/static/JetBrainsMono.woff2": (_STATIC / "JetBrainsMono.woff2", _FILES["JetBrainsMono.woff2"]),

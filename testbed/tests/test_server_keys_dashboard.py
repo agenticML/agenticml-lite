@@ -736,7 +736,7 @@ def test_local_ui_hides_settings_and_falls_back_to_runs(page, tmp_path, ui_serve
     with ui_server_factory(tmp_path / "local") as server:
         page.goto(server.url)
         expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
-        for hidden in ("#nav-settings", "#nav-admin", "#account"):
+        for hidden in ("#nav-workspaces", "#nav-settings", "#nav-admin", "#account"):
             expect(page.locator(hidden)).to_be_hidden()
         track_keys_listeners(page)
         for legacy in ("keys", "team", "settings/members"):
