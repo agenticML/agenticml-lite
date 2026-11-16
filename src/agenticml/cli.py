@@ -910,27 +910,27 @@ def cmd_server_workspaces(args):
                     str(row['stored_bytes']) + '/' + (maximum(row['limits']['storage_bytes']) if row['limits'] is not None else 'no limits file'),
                     str(row['upload_bytes']), str(row['people'])] for row in rows])
         elif action == 'set-plan':
-            from .server.limits import Plans, UNLIMITED, parse_size, parse_count
+            from .server.limits import Plans, parse_size, parse_count
             raw = (args.storage, args.uploads_per_day, args.requests_per_minute, args.people)
             if args.plan == 'free' and any(value is not None for value in raw):
                 raise ValueError('free plan cannot have custom limits')
+            # The one read only picks the "needs a limit flag" message; the merge
+            # itself happens inside set_plan's write transaction.
             current = repo.require(args.slug)
-            custom = None
+            patch = None
+            free_limits = None
             if args.plan == 'custom':
                 limits_file = args.limits or os.environ.get('AGENTICML_SERVER_LIMITS')
-                if current['plan'] == 'custom':
-                    custom = json.loads(current['custom_limits'])
-                elif limits_file:
-                    custom = dict(Plans.load(limits_file).free)
-                else:
-                    if all(value is None for value in raw):
+                if current['plan'] != 'custom':
+                    if limits_file:
+                        free_limits = dict(Plans.load(limits_file).free)
+                    elif all(value is None for value in raw):
                         raise ValueError('custom plan requires at least one limit flag without a limits file')
-                    custom = dict(UNLIMITED)
                 keys = ('storage_bytes', 'upload_bytes_per_day', 'requests_per_minute', 'people')
-                for key, value, parse in zip(keys, raw, (parse_size, parse_size, parse_count, parse_count)):
-                    if value is not None:
-                        custom[key] = parse(value)
-            old, new = repo.set_plan(args.slug, args.plan, custom if args.plan == 'custom' else None)
+                patch = {key: parse(value)
+                         for key, value, parse in zip(keys, raw, (parse_size, parse_size, parse_count, parse_count))
+                         if value is not None}
+            old, new = repo.set_plan(args.slug, args.plan, patch, merge=True, free_limits=free_limits)
             def plan_values(row):
                 return {'plan': row['plan'], 'limits': json.loads(row['custom_limits']) if row['custom_limits'] else None}
             log.record(actor, 'cli', 'workspace.plan', new['id'],

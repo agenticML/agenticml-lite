@@ -61,6 +61,7 @@ const ACTION_ROLE = {
   read: "viewer", password: "viewer",
   notes: "member", sync: "member", own_keys: "member",
   admin_keys: "admin", all_keys: "admin", users: "admin", audit: "admin",
+  rename: "admin",
 };
 function roleAllows(role, action) {
   const have = ROLE_RANK[role];
@@ -68,7 +69,7 @@ function roleAllows(role, action) {
   return Number.isInteger(have) && Number.isInteger(need) && have >= need;
 }
 function workspaceCan(session) {
-  const none = { notes: false, own_keys: false, all_keys: false, users: false, audit: false };
+  const none = { notes: false, own_keys: false, all_keys: false, users: false, audit: false, rename: false };
   const slug = currentWorkspaceSlug();
   if (!slug) return none;
   const row = sessionWorkspaces(session).find((item) => item.slug === slug);
@@ -79,6 +80,7 @@ function workspaceCan(session) {
     all_keys: roleAllows(role, "all_keys"),
     users: roleAllows(role, "users"),
     audit: roleAllows(role, "audit"),
+    rename: roleAllows(role, "rename"),
   };
 }
 function switchWorkspace(slug) {
@@ -206,7 +208,7 @@ function workspaceSwitcher(session, { card = false } = {}) {
     const isCurrent = row.slug === current;
     if (card) {
       return el("li", {},
-        el("span", { class: "settings-row-name", text: name }),
+        el("span", { class: "settings-row-name", "data-slug": row.slug, text: name }),
         role ? el("span", { class: "settings-row-role", text: role }) : null,
         el("span", { class: "settings-row-slot" },
           isCurrent
@@ -1130,7 +1132,16 @@ async function home(version) {
     seq = 0,
     metricNames = [],
     pickedMetric = "",
-    pickedStat = "last";
+    pickedStat = "last",
+    // The saved choice; kept when the metric is not in the list yet so it
+    // returns once the metric is first logged.
+    preferredMetric = "",
+    metricsLoaded = false,
+    runsLoaded = false,
+    recheckMetrics = false,
+    metricsSeq = 0,
+    polls = 0;
+  const metricsSignal = controller?.signal;
   const requestedMetrics = new Set();
   const rejectedMetrics = new Set();
   const metricPrefKey = () =>
@@ -1140,11 +1151,12 @@ async function home(version) {
     if (stored && typeof stored.name === "string") pickedMetric = stored.name;
     if (stored && ["last", "min", "max"].includes(stored.stat)) pickedStat = stored.stat;
   } catch {}
+  preferredMetric = pickedMetric;
   function saveMetricPref() {
     try {
       localStorage.setItem(
         metricPrefKey(),
-        JSON.stringify({ name: pickedMetric, stat: pickedStat }),
+        JSON.stringify({ name: preferredMetric, stat: pickedStat }),
       );
     } catch {}
   }
@@ -1153,13 +1165,50 @@ async function home(version) {
       el("option", { value: "", text: "None" }),
       ...metricNames.map((name) => el("option", { value: name, text: name })),
     );
-    if (!metricNames.includes(pickedMetric)) pickedMetric = "";
-    metricSelect.value = pickedMetric;
+    // Keep the saved choice until the first list arrives, so the first /runs
+    // already carries it.
+    if (metricsLoaded)
+      pickedMetric = metricNames.includes(preferredMetric) ? preferredMetric : "";
+    metricSelect.value = metricNames.includes(pickedMetric) ? pickedMetric : "";
     statSelect.value = pickedStat;
     metricControl.hidden = metricNames.length === 0;
   }
+  // Fetches the metric names without blocking /runs. A failure keeps the old
+  // list, and the select is rebuilt only when the list really changed.
+  async function loadMetricNames() {
+    if (!serverMode) return;
+    const mine = ++metricsSeq;
+    const mountEpoch = epoch;
+    try {
+      const response = await fetch(api("/metrics"), {
+        credentials: "same-origin",
+        signal: metricsSignal,
+      });
+      if (!response.ok) return;
+      const data = await response.json();
+      if (epoch !== mountEpoch || mine !== metricsSeq || !Array.isArray(data.metrics)) return;
+      const next = data.metrics.filter((name) => typeof name === "string" && name);
+      const first = !metricsLoaded;
+      metricsLoaded = true;
+      if (
+        !first &&
+        next.length === metricNames.length &&
+        next.every((name, index) => name === metricNames[index])
+      )
+        return;
+      metricNames = next;
+      const before = pickedMetric;
+      fillMetricSelect();
+      if (pickedMetric !== before) draw();
+      // A filter token may now resolve to a differently cased metric name.
+      if (metricQueryNames().some((name) => !requestedMetrics.has(name))) {
+        if (runsLoaded) refresh();
+        else recheckMetrics = true;
+      }
+    } catch {}
+  }
   metricSelect.onchange = () => {
-    pickedMetric = metricSelect.value;
+    preferredMetric = pickedMetric = metricSelect.value;
     saveMetricPref();
     refresh();
   };
@@ -2275,6 +2324,7 @@ async function home(version) {
   };
   async function refresh() {
     const mine = ++seq;
+    if (++polls % 3 === 0) loadMetricNames();
     clearTimeout(timer);
     clearTimeout(searchTimer);
     try {
@@ -2300,6 +2350,7 @@ async function home(version) {
       requestedMetrics.clear();
       for (const name of names) requestedMetrics.add(name);
       runs = result;
+      runsLoaded = true;
       for (const id of selected)
         if (!runs.some((run) => run.run_id === id)) selected.delete(id);
       draw();
@@ -2309,6 +2360,10 @@ async function home(version) {
         live ? "Live · refreshes every 5 s" : `${runs.length} runs`,
       );
       if (live) timer = setTimeout(refresh, 5000);
+      if (recheckMetrics) {
+        recheckMetrics = false;
+        if (metricQueryNames().some((name) => !requestedMetrics.has(name))) refresh();
+      }
     } catch (error) {
       if (epoch !== version || mine !== seq) return;
       showError(content, error);
@@ -2323,19 +2378,8 @@ async function home(version) {
   };
   await sessionReady;
   if (epoch !== version) return;
-  if (serverMode) {
-    try {
-      const response = await fetch(api("/metrics"), { credentials: "same-origin" });
-      if (response.ok) {
-        const data = await response.json();
-        if (Array.isArray(data.metrics))
-          metricNames = data.metrics.filter((name) => typeof name === "string" && name);
-      }
-    } catch {}
-  }
-  if (epoch !== version) return;
   fillMetricSelect();
-  await refresh();
+  await Promise.all([loadMetricNames(), refresh()]);
 }
 
 async function loadMetrics(run, signal) {
@@ -4417,12 +4461,16 @@ async function mountKeys(card, version, disposers = []) {
         }
         const value = el("code", { class: "key-value", text: data.key });
         const command = el("code", {
-          class: "key-command", text: `agenticml login --host ${shellQuote(data.host)} --key ${shellQuote(data.key)}`,
+          class: "key-command", text: `agenticml login --host ${shellQuote(data.host)}`,
         });
         data.key = null;
         body.replaceChildren(
           el("p", { text: "This key is shown once and cannot be recovered." }),
           value, copyCode("Copy key", value), command, copyCode("Copy command", command),
+          el("p", {
+            class: "muted",
+            text: "Run this command, then paste the key when it asks for it.",
+          }),
           el("p", {
             class: "muted", hidden: data.host_source !== "request",
             text: "No --public-url is set, so this uses the address you opened the dashboard at.",
@@ -4561,7 +4609,8 @@ async function mountKeys(card, version, disposers = []) {
 
 // Workspace, Members and Activity cards (all need the admin role). `cards` holds
 // the {aside, body} parts of each card. Returns the section's dispose function.
-async function mountTeam(cards, version, disposers = []) {
+// `workspaceName` has get() (the shown name) and set(name) (apply a new one in place).
+async function mountTeam(cards, version, disposers = [], workspaceName = null) {
   const signal = controller.signal;
   let activeDialog;
   let refreshSequence = 0;
@@ -5257,8 +5306,39 @@ async function mountTeam(cards, version, disposers = []) {
     body.querySelector("button").focus();
   }
 
+  function renameCurrentWorkspace() {
+    const { host, body, error } = dialog("Rename workspace");
+    const name = el("input", {
+      id: "rename-ws-name", class: "field", required: true, maxLength: 256,
+      autocomplete: "off", value: (workspaceName?.get() || "").trim(),
+    });
+    const save = el("button", { type: "submit", class: "btn btn-primary", text: "Save" });
+    const form = el("form", { class: "stack" },
+      el("label", { class: "field-label", htmlFor: name.id, text: "Name" }), name,
+      el("div", { class: "inline" }, button("Cancel", () => host.close(), "secondary"), save));
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      error.hidden = true;
+      save.disabled = true;
+      try {
+        const data = await request(api(""), "PATCH", { name: name.value.trim() });
+        if (typeof data.name === "string" && data.name) workspaceName?.set(data.name);
+        host.close();
+      } catch (reason) {
+        if (epoch === version && host.open) failure(error, reason);
+        if (reason.name !== "AbortError") save.disabled = false;
+      }
+    });
+    body.append(form);
+    host.showModal();
+    name.focus();
+    name.select();
+  }
+
   const planNote = el("span", { class: "settings-meta", hidden: true });
   cards.workspace.aside.append(planNote);
+  if (workspaceName && workspaceCan(serverSession).rename)
+    cards.workspace.aside.prepend(button("Rename", renameCurrentWorkspace, "secondary"));
   cards.workspace.body.append(usageBox);
   cards.members.body.append(
     inviteForm,
@@ -5281,6 +5361,7 @@ async function adminPage(version) {
   const signal = controller.signal;
   let disposed = false;
   let refreshSequence = 0;
+  let freeLimits = null;
   let activeDialog;
   const closeDialog = () => {
     activeDialog?.close();
@@ -5388,8 +5469,11 @@ async function adminPage(version) {
       el("option", { value: "free", text: "free" }),
       el("option", { value: "custom", text: "custom" }));
     plan.value = workspace.plan === "custom" ? "custom" : "free";
-    const current = workspace.limits && typeof workspace.limits === "object" && !Array.isArray(workspace.limits)
-      ? workspace.limits : {};
+    const stored = workspace.limits && typeof workspace.limits === "object" && !Array.isArray(workspace.limits)
+      ? workspace.limits : null;
+    // A free workspace switched to custom starts from the free plan's numbers,
+    // not from unlimited (empty fields).
+    const current = stored ?? (workspace.plan !== "custom" ? freeLimits : null) ?? {};
     const storage = el("input", {
       id: "plan-ws-storage", class: "field", inputMode: "numeric", autocomplete: "off",
       placeholder: "unlimited",
@@ -5732,6 +5816,8 @@ async function adminPage(version) {
       typeof row.slug !== "string" || typeof row.name !== "string" ||
       typeof row.status !== "string"))
       throw new Error(`Could not load workspaces (${listResponse.status})`);
+    freeLimits = data.free_limits && typeof data.free_limits === "object" && !Array.isArray(data.free_limits)
+      ? data.free_limits : null;
     const rows = data.workspaces.filter((workspace) => !workspace.archived_at).map((workspace) => {
       const isDefault = workspace.slug === "default";
       const values = [
@@ -5902,6 +5988,14 @@ async function settingsPage(version, requested) {
     ...[account.identity, account.switcher, ...account.password].filter(Boolean));
   if (session.via !== "proxy")
     cards.account.aside.append(button("Sign out", signOut, "secondary"));
+  // A rename shows at once in every place that names this workspace.
+  function applyWorkspaceName(name) {
+    if (workspaceRow) workspaceRow.name = name;
+    page.querySelector(".settings-ws-name").textContent = name;
+    page.querySelector(".settings-header .eyebrow").textContent = `Workspace · ${name}`;
+    for (const node of page.querySelectorAll(".settings-row-name[data-slug]"))
+      if (node.dataset.slug === currentWorkspaceSlug()) node.textContent = name;
+  }
   // Workspace: name and slug here, the plan and usage tiles from the team mount.
   if (cards.workspace)
     cards.workspace.body.append(el("div", { class: "settings-row" },
@@ -5970,7 +6064,11 @@ async function settingsPage(version, requested) {
   if (cards.workspace)
     mounts.push(mountTeam(
       { workspace: cards.workspace, members: cards.members, activity: cards.activity },
-      version, disposers));
+      version, disposers,
+      {
+        get: () => workspaceRow?.name || currentWorkspaceSlug(),
+        set: applyWorkspaceName,
+      }));
   await Promise.all(mounts);
   if (epoch !== version) dispose();
   else if (settingsView?.page === page) {

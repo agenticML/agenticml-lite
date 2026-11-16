@@ -1370,3 +1370,175 @@ def test_hosted_doc_describes_suspended_workspace_statuses():
     section = match.group(1)
     assert '404' in section and '403' in section and 'workspace suspended' in section
     assert 'for all workspace endpoints' not in section
+
+
+def _patch_plan(server, cookie, body):
+    from test_server_web import authed, csrf
+    status, _, payload, _ = authed(
+        server, '/api/admin/workspaces/default', 'PATCH', json.dumps(body).encode(),
+        extra=csrf(server), cookie=cookie)
+    return status, json.loads(payload)
+
+
+def _stored_limits(server):
+    return json.loads(WorkspaceRepo(server.db).get('default')['custom_limits'])
+
+
+def test_set_plan_strict_contract_without_merge(server):
+    repo = WorkspaceRepo(server.db)
+    with pytest.raises(ValueError, match='missing keys'):
+        repo.set_plan('default', 'custom', {'people': 1})
+    with pytest.raises(ValueError, match='limits must be an object'):
+        repo.set_plan('default', 'custom', None)
+    assert repo.get('default')['plan'] == 'free'
+    with pytest.raises(ValueError, match='limits must be an object'):
+        repo.set_plan('default', 'custom', [], merge=True)
+    with pytest.raises(ValueError, match='unknown keys'):
+        repo.set_plan('default', 'custom', {'bogus': 1}, merge=True)
+    assert repo.get('default')['plan'] == 'free'
+
+
+def test_set_plan_merge_bases(server):
+    from agenticml.server.limits import UNLIMITED
+    repo = WorkspaceRepo(server.db)
+    free = {'storage_bytes': 10, 'upload_bytes_per_day': 20, 'requests_per_minute': 30, 'people': 4}
+    repo.set_plan('default', 'custom', {'people': 1}, merge=True, free_limits=free)
+    assert _stored_limits(server) == {**free, 'people': 1}
+    # An already-custom workspace ignores free_limits and keeps its own values.
+    repo.set_plan('default', 'custom', {'storage_bytes': None}, merge=True, free_limits=UNLIMITED)
+    assert _stored_limits(server) == {**free, 'people': 1, 'storage_bytes': None}
+    repo.set_plan('default', 'free')
+    repo.set_plan('default', 'custom', {'people': 2}, merge=True)
+    assert _stored_limits(server) == {**UNLIMITED, 'people': 2}
+    # No patch on a custom workspace rewrites the same limits.
+    repo.set_plan('default', 'custom', None, merge=True)
+    assert _stored_limits(server) == {**UNLIMITED, 'people': 2}
+    with pytest.raises(Exception, match='unknown workspace'):
+        repo.set_plan('nope', 'custom', {'people': 1}, merge=True)
+
+
+def test_set_plan_merge_waits_for_a_concurrent_write(server):
+    """The merge reads the row inside its own write transaction, so a write
+    that commits first is never overwritten by stale values."""
+    import threading
+    import time
+    from agenticml.server.limits import UNLIMITED
+    repo = WorkspaceRepo(server.db)
+    repo.set_plan('default', 'custom', {**UNLIMITED, 'storage_bytes': 1}, merge=False)
+    started = threading.Event()
+    errors = []
+
+    def patch_people():
+        started.set()
+        try:
+            WorkspaceRepo(server.db).set_plan('default', 'custom', {'people': 3}, merge=True)
+        except Exception as exc:  # pragma: no cover - reported below
+            errors.append(exc)
+
+    worker = threading.Thread(target=patch_people)
+    with server.db.transaction(write=True) as tx:
+        tx.advisory_lock('users')
+        row = tx.fetchone('SELECT id FROM workspaces WHERE slug=?', ('default',))
+        worker.start()
+        started.wait(5)
+        time.sleep(0.3)
+        # Raw SQL: set_plan would raise on a nested transaction.
+        tx.execute('UPDATE workspaces SET custom_limits=? WHERE id=?',
+                   (json.dumps({**UNLIMITED, 'storage_bytes': 99}), row['id']))
+    worker.join(10)
+    assert not worker.is_alive() and not errors
+    assert _stored_limits(server) == {**UNLIMITED, 'storage_bytes': 99, 'people': 3}
+
+
+def test_concurrent_admin_patches_do_not_lose_updates(server):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    from agenticml.server.limits import KEYS, UNLIMITED
+    cookie = _dash_cookie(server)
+    status, _ = _patch_plan(server, cookie, {'plan': 'custom', 'limits': dict(UNLIMITED)})
+    assert status == 200
+    keys = ('storage_bytes', 'people')
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for round_number in range(1, 13):
+            barrier = threading.Barrier(2)
+
+            def send(key):
+                barrier.wait(5)
+                return _patch_plan(server, cookie, {'plan': 'custom', 'limits': {key: round_number}})
+
+            results = list(pool.map(send, keys))
+            assert [status for status, _ in results] == [200, 200], results
+            stored = _stored_limits(server)
+            assert stored['storage_bytes'] == round_number and stored['people'] == round_number, (
+                round_number, stored)
+    assert set(stored) == set(KEYS)
+
+
+def test_admin_patch_partial_limits_merge_and_free_defaults(server):
+    from agenticml.server.limits import UNLIMITED
+    from test_server_web import authed, csrf
+    cookie = _dash_cookie(server)
+    # No plans configured: the merge starts from unlimited.
+    status, payload = _patch_plan(server, cookie, {'plan': 'custom', 'limits': {'people': 9}})
+    assert status == 200, payload
+    assert payload['workspace']['limits'] == {**UNLIMITED, 'people': 9}
+    assert _patch_plan(server, cookie, {'plan': 'free'})[0] == 200
+    configure(server, storage_bytes=5000, upload_bytes_per_day=6000, requests_per_minute=70, people=8)
+    free = dict(server.plans.free)
+    status, payload = _patch_plan(server, cookie, {'plan': 'custom', 'limits': {'storage_bytes': 1}})
+    assert status == 200, payload
+    assert payload['workspace']['limits'] == {**free, 'storage_bytes': 1}
+    status, payload = _patch_plan(server, cookie, {'plan': 'custom', 'limits': {'people': 2}})
+    assert status == 200 and payload['workspace']['limits'] == {**free, 'storage_bytes': 1, 'people': 2}
+    status, payload = _patch_plan(server, cookie, {'plan': 'custom', 'limits': {'people': None}})
+    assert status == 200 and payload['workspace']['limits']['people'] is None
+    status, payload = _patch_plan(server, cookie, {'plan': 'custom', 'limits': {'bogus': 1}})
+    assert status == 400 and 'unknown keys' in payload['error']
+    status, payload = _patch_plan(server, cookie, {'plan': 'custom', 'limits': []})
+    assert status == 400 and payload['error'] == 'limits must be an object'
+    status, payload = _patch_plan(server, cookie, {'plan': 'custom', 'limits': {'people': -1}})
+    assert status == 400
+    status, _, body, _ = authed(
+        server, '/api/admin/workspaces/nope', 'PATCH',
+        json.dumps({'plan': 'custom', 'limits': {'people': 1}}).encode(),
+        extra=csrf(server), cookie=cookie)
+    assert status == 404 and json.loads(body)['error'] == 'unknown workspace'
+
+
+def test_admin_list_exposes_free_limits(server):
+    from test_server_web import authed
+    cookie = _dash_cookie(server)
+    status, _, body, _ = authed(server, '/api/admin/workspaces', cookie=cookie)
+    payload = json.loads(body)
+    assert status == 200 and payload['free_limits'] is None
+    configure(server, storage_bytes=5000, people=3)
+    status, _, body, _ = authed(server, '/api/admin/workspaces', cookie=cookie)
+    payload = json.loads(body)
+    assert payload['free_limits'] == dict(server.plans.free)
+    default = next(row for row in payload['workspaces'] if row['slug'] == 'default')
+    assert default['plan'] == 'free' and default['limits'] is None
+
+
+def test_cli_set_plan_merges_in_the_repo_transaction(server, tmp_path, capsys):
+    data = str(server.data_dir)
+    path = tmp_path / 'limits.json'
+    path.write_text(Path('docs/examples/limits.json').read_text())
+    from agenticml.server.limits import Plans, UNLIMITED
+    free = dict(Plans.load(path).free)
+    # A free workspace with no flag and no limits file would silently become unlimited.
+    assert cli.main(['server', 'workspaces', 'set-plan', 'default', 'custom', '--data', data]) == 1
+    assert 'custom plan requires at least one limit flag' in capsys.readouterr().err
+    assert WorkspaceRepo(server.db).get('default')['plan'] == 'free'
+    # With a limits file the free numbers are the base.
+    assert cli.main(['server', 'workspaces', 'set-plan', 'default', 'custom', '--people', '2',
+                     '--limits', str(path), '--data', data]) == 0
+    assert _stored_limits(server) == {**free, 'people': 2}
+    # Custom to custom keeps earlier values.
+    assert cli.main(['server', 'workspaces', 'set-plan', 'default', 'custom', '--storage', '1GB',
+                     '--data', data]) == 0
+    assert _stored_limits(server) == {**free, 'people': 2, 'storage_bytes': 1000000000}
+    assert cli.main(['server', 'workspaces', 'set-plan', 'default', 'free', '--data', data]) == 0
+    assert cli.main(['server', 'workspaces', 'set-plan', 'default', 'custom', '--people', '1',
+                     '--data', data]) == 0
+    assert _stored_limits(server) == {**UNLIMITED, 'people': 1}
+    capsys.readouterr()

@@ -82,6 +82,10 @@ EXAMPLES = {
     },
     "invites_revoke": {"method": "DELETE", "path": "/api/w/{slug}/invites/{login}"},
     "audit": {"method": "GET", "path": "/api/w/{slug}/audit"},
+    "workspace_rename": {
+        "method": "PATCH", "path": "/api/w/{slug}",
+        "body": {"name": "Isolation workspace"},
+    },
     "admin_page": {"method": "GET", "path": "/admin/"},
     "admin_workspaces_list": {"method": "GET", "path": "/api/admin/workspaces"},
     "admin_workspaces_create": {

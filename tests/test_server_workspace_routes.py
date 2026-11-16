@@ -63,6 +63,9 @@ def test_route_table_lists_workspace_and_sync():
     assert any("/api/w/" in route.pattern and "members" in route.pattern for route in table)
     assert any("/api/w/" in route.pattern and "invites" in route.pattern for route in table)
     assert any(route.name == "account_session" for route in table)
+    rename = [route for route in table if route.name == "workspace_rename"]
+    assert len(rename) == 1 and rename[0].method == "PATCH" and rename[0].scope == "workspace"
+    assert rename[0].action == "rename" and not rename[0].pattern.endswith("/")
     assert any(route.name == "home" and route.pattern == r"/" for route in table)
     assert any(route.scope == "server_admin" and "/api/admin/workspaces" in route.pattern for route in table)
     ws_routes = {route.name: route for route in table
@@ -543,3 +546,137 @@ def test_create_workspace_store_oserror_does_not_leave_row(two, monkeypatch):
     assert status == 503
     assert json.loads(body) == {"error": "could not create workspace"}
     assert WorkspaceRepo(server.db).get("omega") is None
+
+
+def _rename(server, slug, body, cookie, **extra):
+    raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+    status, _, payload, _ = authed(
+        server, f"/api/w/{slug}", "PATCH", raw, extra=csrf(server, **extra), cookie=cookie)
+    return status, (json.loads(payload) if payload else None)
+
+
+def _member_cookie(server, workspace, login_name, role):
+    users = UserStore(server.data_dir / "server", db=server.db, workspace_id=workspace["id"])
+    users.add(login_name, role)
+    users.set_password(login_name, PASSWORD)
+    status, _, hdrs = password_login(server, login_name, PASSWORD)
+    assert status == 200
+    return hdrs["Set-Cookie"]
+
+
+def test_owner_renames_workspace(two):
+    server, a, b, _, _, _, _ = two
+    cookie = _password_cookie(server, "alice")
+    status, payload = _rename(server, "alpha", {"name": "  Alpha Labs  "}, cookie)
+    assert status == 200 and payload == {"slug": "alpha", "name": "Alpha Labs"}
+    row = WorkspaceRepo(server.db).get("alpha")
+    assert row["name"] == "Alpha Labs" and row["slug"] == "alpha" and row["status"] == "active"
+    assert WorkspaceRepo(server.db).get("beta")["name"] == b["name"]
+    status, _, body, _ = _authed(server, "/api/account/session", cookie=cookie)
+    by_slug = {item["slug"]: item for item in json.loads(body)["workspaces"]}
+    assert by_slug["alpha"]["name"] == "Alpha Labs"
+    # A name of exactly 256 characters is accepted.
+    assert _rename(server, "alpha", {"name": "x" * 256}, cookie)[0] == 200
+
+
+def test_rename_roles_and_workspace_scoping(two):
+    server, a, b, keys_a, _, ka, _ = two
+    owner = _password_cookie(server, "alice")
+    admin = _member_cookie(server, a, "carol", "admin")
+    member = _member_cookie(server, a, "dave", "member")
+    viewer = _member_cookie(server, a, "erin", "viewer")
+    assert _rename(server, "alpha", {"name": "By admin"}, admin) == (
+        200, {"slug": "alpha", "name": "By admin"})
+    for cookie in (member, viewer):
+        assert _rename(server, "alpha", {"name": "Nope"}, cookie) == (403, {"error": "forbidden"})
+    assert WorkspaceRepo(server.db).get("alpha")["name"] == "By admin"
+    # A member of alpha only is a stranger to beta: the same 404 as a missing workspace.
+    missing = _rename(server, "no-such", {"name": "Nope"}, owner)
+    assert missing[0] == 404
+    assert _rename(server, "beta", {"name": "Nope"}, owner) == missing
+    assert WorkspaceRepo(server.db).get("beta")["name"] == b["name"]
+    # Anonymous requests never reach the route.
+    status, _, _, _ = authed(
+        server, "/api/w/alpha", "PATCH", b'{"name": "Nope"}', extra=csrf(server), cookie="agenticml_session=bogus")
+    assert status in (401, 404)
+    assert WorkspaceRepo(server.db).get("alpha")["name"] == "By admin"
+    # Keys: an admin-scope key session may rename, a sync key cannot even sign in.
+    _, admin_key = keys_a.create("alice-ui", "admin", user="alice")
+    _, _, hdrs = login(server, admin_key)
+    assert _rename(server, "alpha", {"name": "By key"}, hdrs["Set-Cookie"]) == (
+        200, {"slug": "alpha", "name": "By key"})
+    assert login(server, ka)[0] == 403
+
+
+def test_rename_refused_for_suspended_and_archived_workspaces(two):
+    server, a, b, _, _, _, _ = two
+    cookie = _password_cookie(server, "alice")
+    WorkspaceRepo(server.db).update("alpha", status="suspended")
+    assert _rename(server, "alpha", {"name": "Nope"}, cookie)[0] == 404
+    WorkspaceRepo(server.db).update("alpha", status="active")
+    WorkspaceRepo(server.db).archive("alpha")
+    assert _rename(server, "alpha", {"name": "Nope"}, cookie)[0] == 404
+    assert WorkspaceRepo(server.db).get("alpha")["name"] == a["name"]
+
+
+def test_rename_audit_entries(two):
+    from agenticml.server.db.repos import AuditRepo
+    server, a, b, _, _, _, _ = two
+    cookie = _password_cookie(server, "alice")
+    member = _member_cookie(server, a, "dave", "member")
+
+    def renames(workspace_id):
+        return [event for event in AuditRepo(server.db, workspace_id).tail(50)
+                if event["action"] == "workspace.rename"]
+
+    assert _rename(server, "alpha", {"name": "Alpha Labs"}, cookie)[0] == 200
+    detail = {"slug": "alpha", "name": "Alpha Labs", "old_name": a["name"]}
+    for workspace_id in (a["id"], None):
+        events = renames(workspace_id)
+        assert len(events) == 1
+        assert events[0]["actor"] == "alice" and events[0]["target"] == a["id"]
+        assert events[0]["detail"] == detail
+    # A no-op rename and a refused one add nothing.
+    assert _rename(server, "alpha", {"name": "Alpha Labs"}, cookie)[0] == 200
+    assert _rename(server, "alpha", {"name": "Nope"}, member)[0] == 403
+    assert len(renames(a["id"])) == 1 and len(renames(None)) == 1
+    status, _, body, _ = _authed(server, "/api/w/alpha/audit", cookie=cookie)
+    assert status == 200
+    assert any(event["action"] == "workspace.rename" for event in json.loads(body)["events"])
+
+
+@pytest.mark.parametrize("body", [
+    {}, {"name": ""}, {"name": "   "}, {"name": 5}, {"name": None}, {"name": "x" * 257},
+    {"name": "a\nb"}, {"name": "a\tb"}, {"name": "a\x00b"},
+    {"name": "ok", "slug": "other"}, {"name": "ok", "status": "suspended"},
+    {"name": "ok", "plan": "custom"}, {"name": "ok", "limits": {}}, {"slug": "other"},
+])
+def test_rename_rejects_bad_bodies(two, body):
+    server, a, _, _, _, _, _ = two
+    cookie = _password_cookie(server, "alice")
+    status, payload = _rename(server, "alpha", body, cookie)
+    assert status == 400 and "error" in payload, payload
+    row = WorkspaceRepo(server.db).get("alpha")
+    assert row["name"] == a["name"] and row["slug"] == "alpha" and row["status"] == "active"
+    assert row["plan"] == a["plan"]
+
+
+def test_rename_request_hygiene(two):
+    server, a, _, _, _, _, _ = two
+    cookie = _password_cookie(server, "alice")
+    headers = csrf(server)
+    del headers["X-AgenticML-Request"]
+    status, _, body, _ = authed(
+        server, "/api/w/alpha", "PATCH", b'{"name": "Nope"}', extra=headers, cookie=cookie)
+    assert status == 403 and json.loads(body)["error"] == "cross-site request refused"
+    status, _, body, _ = authed(
+        server, "/api/w/alpha", "PATCH", b'{"name": "Nope"}',
+        extra=csrf(server, **{"Content-Type": "text/plain"}), cookie=cookie)
+    assert status == 415
+    status, _, _, _ = authed(
+        server, "/api/w/alpha", "PATCH", b'[1]', extra=csrf(server), cookie=cookie)
+    assert status == 400
+    assert WorkspaceRepo(server.db).get("alpha")["name"] == a["name"]
+    # No trailing-slash alias: it answers like any unknown path.
+    assert _rename(server, "alpha/", {"name": "Nope"}, cookie)[0] == 404
+    assert WorkspaceRepo(server.db).get("alpha")["name"] == a["name"]

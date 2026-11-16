@@ -34,6 +34,7 @@ ACTIONS = {
     "read": "viewer", "password": "viewer",
     "notes": "member", "sync": "member", "own_keys": "member",
     "admin_keys": "admin", "all_keys": "admin", "users": "admin", "audit": "admin",
+    "rename": "admin",
 }
 _USER_FIELDS = {
     "name", "id", "role", "identity", "password", "invite", "generation",

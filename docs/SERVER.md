@@ -120,8 +120,9 @@ Every member of a workspace holds one of four roles within that workspace:
 | Manage workspace members and invites | – | – | yes | yes |
 | Issue / revoke keys for any member | – | – | yes | yes |
 | View workspace name, plan and usage (Settings > Workspace) | – | – | yes | yes |
+| Rename the workspace (Settings > Workspace, `PATCH /api/w/<slug>`) | – | – | yes | yes |
 
-- **`owner`**: The creator of the workspace. A workspace has exactly one owner. The owner cannot be removed or demoted. Only the server operator can rename a workspace (on `/admin` or `PATCH /api/admin/workspaces/<slug>`), transfer ownership (`server workspaces set-owner`) or delete a workspace (`server workspaces delete`).
+- **`owner`**: The creator of the workspace. A workspace has exactly one owner. The owner cannot be removed or demoted. An owner or admin can rename the workspace in **Settings > Workspace** or with `PATCH /api/w/<slug>` and a body of exactly `{"name": "..."}`; the name is trimmed, must be 1 to 256 characters and may not contain control characters, and the slug is never changed. The rename is recorded as `workspace.rename` in the workspace's Activity and in the server log. Only the server operator can change the slug (on `/admin` or `PATCH /api/admin/workspaces/<slug>`), transfer ownership (`server workspaces set-owner`) or delete a workspace (`server workspaces delete`).
 - **`admin`**: Full administrative rights within the workspace (members, invites, keys, notes); can view the workspace's plan and usage.
 - **`member`**: Can sync runs, edit notes, and manage their own sync keys.
 - **`viewer`**: Read-only dashboard access. Viewer sync keys can only call `GET /v2/whoami`; all other `/v2` endpoints return `403 Forbidden`.
@@ -185,6 +186,8 @@ agenticml server workspaces set-plan SLUG free [--database URL] [--data DIR]
 agenticml server workspaces recount SLUG [--database URL] [--data DIR]
 agenticml server workspaces recount --all [--database URL] [--data DIR]
 ```
+
+`set-plan SLUG custom` merges the flags you pass onto the workspace's current limits inside one database transaction: a custom workspace keeps its other limits, and a free workspace starts from the free plan in `--limits FILE` (or `AGENTICML_SERVER_LIMITS`), or from unlimited when there is no limits file. `PATCH /api/admin/workspaces/<slug>` with a partial `limits` object merges the same way, so two administrators editing different limits at once do not lose each other's change. The dashboard's plan dialog always sends all four limits, so there the last save wins; switching a free workspace to custom in it starts from the free plan's numbers. `GET /api/admin/workspaces` returns the free plan's limits as `free_limits` (null without a limits file).
 
 ### Account management CLI
 
@@ -288,6 +291,16 @@ Benefits of PostgreSQL:
 - **Row-Level Security**: Defense-in-depth isolation ensures queries only access rows matching the session's active workspace.
 
 Run files and shadow Git repositories must reside on a shared POSIX network filesystem (such as Amazon EFS mounted with NFSv4.1).
+
+### Database connections per process
+
+Each server process opens a bounded number of connections:
+
+- **Transactions**: at most 24 at once (`TRANSACTION_CONNECTION_LIMIT`). A 25th request waits up to 10 seconds for a free slot, then gets `503` with `Retry-After`, the same answer as a database lock timeout. The pool keeps 16 of them idle. The `/healthz` check never opens a transaction, so it is not held up by this wait.
+- **Session locks**: at most 64 more, each on its own connection (48 for run and object locks, 16 for quota, lineage and import locks), plus one lifetime connection for the server lock.
+- **Hard ceiling** per process: about 90 connections. In practice far fewer are in use: at most 8 uploads receive a body at once, and each holds at most one run or object lock and one inner lock, so a busy process uses roughly 40.
+
+The hosted database (`db.t4g.micro`, about 112 connections by default) is sized for two tasks at that level, which is what a rolling deploy runs. Check `SHOW max_connections;` if you move to a smaller instance or run more than two tasks. A process paused while it holds a lock is a known residual risk, covered in section 8 of [THREAT_MODEL.md](THREAT_MODEL.md).
 
 ## Amazon S3 object storage
 

@@ -136,6 +136,7 @@ _ROUTES.extend([
     _ws("POST", r"invites", "users", "invites", "invites_create"),
     _ws("DELETE", r"invites/" + _LOGIN, "users", "invites", "invites_revoke"),
     _ws("GET", r"audit", "audit", "audit", "audit"),
+    _r("PATCH", r"/api/w/" + _SLUG, "workspace", "rename", "workspace_rename", "workspace_rename"),
 ])
 ROUTES = tuple(_ROUTES)
 
@@ -354,7 +355,10 @@ def _usage(webauth, handler, route, match):
     limits = plans.limits_for(row)
     usage_repo = UsageRepo(handler.server.db, workspace.id)
     counters = usage_repo.get()
-    now = plans.clock()
+    # The database clock decides the day on Postgres (as upload enforcement
+    # does), so the page cannot disagree with the limit across midnight UTC;
+    # a test clock override still wins. One reading feeds day and reset time.
+    now = plans.clock() if plans.has_clock_override else usage_repo.now()
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
     else:
@@ -448,15 +452,16 @@ def _uploads_today(usage, day):
     return 0
 
 
-def _admin_usage_fields(handler, row):
-    from .db.usage import UsageRepo, utc_day
+def _admin_usage_fields(handler, row, day=None):
+    """``day`` (the UTC day) is read once per list; None reads it here."""
+    from .db.usage import UsageRepo
 
     usage = UsageRepo(handler.server.db, row["id"])
     counters = usage.get()
     return {
         "plan": row.get("plan") or "free",
         "stored_bytes": int(counters.get("stored_bytes") or 0),
-        "uploads_today": _uploads_today(counters, utc_day()),
+        "uploads_today": _uploads_today(counters, day if day is not None else usage.day()),
         "people": usage.people(),
     }
 
@@ -488,22 +493,6 @@ def _plan_values(row):
     }
 
 
-def _merged_custom_limits(handler, current, limits):
-    from .limits import UNLIMITED
-    decoded = _decoded_limits(current)
-    if current is not None and current.get("plan") == "custom" and decoded is not None:
-        merged = dict(decoded)
-    else:
-        plans = getattr(handler.server, "plans", None)
-        merged = dict(plans.free) if plans is not None else dict(UNLIMITED)
-    if limits is None:
-        return merged
-    if not isinstance(limits, dict):
-        raise ValueError("limits must be an object")
-    merged.update(limits)
-    return merged
-
-
 def _server_audit(handler):
     from .audit import AuditLog
     return AuditLog(handler.server.data_dir / "server", db=handler.server.db, workspace_id=None)
@@ -533,8 +522,14 @@ def _admin_workspaces(webauth, handler, route, match):
     repo = WorkspaceRepo(handler.server.db)
     principal = handler.principal
     if handler.command == "GET":
+        from .db.usage import UsageRepo
+        plans = getattr(handler.server, "plans", None)
+        rows = repo.list()
+        # One database-clock reading for the whole list, not one per row.
+        day = UsageRepo(handler.server.db, rows[0]["id"]).day() if rows else None
         handler._json({"workspaces": [
-            _admin_public(row, _admin_usage_fields(handler, row)) for row in repo.list()]},
+            _admin_public(row, _admin_usage_fields(handler, row, day)) for row in rows],
+            "free_limits": dict(plans.free) if plans is not None else None},
                       headers=webauth._headers())
         return
     if handler.command == "POST" and route.name in (
@@ -619,12 +614,10 @@ def _admin_workspaces(webauth, handler, route, match):
                               webauth._headers())
                 return
             try:
-                if plan == "custom":
-                    current = repo.get(slug)
-                    if current is None:
-                        raise ClientError("unknown workspace")
-                    limits = _merged_custom_limits(handler, current, limits)
-                old, row = repo.set_plan(slug, plan, None if plan == "free" else limits)
+                plans = getattr(handler.server, "plans", None)
+                old, row = repo.set_plan(
+                    slug, plan, None if plan == "free" else limits, merge=True,
+                    free_limits=plans.free if plans is not None else None)
             except ClientError as exc:
                 message = str(exc)
                 handler._json({"error": message}, 404 if message == "unknown workspace" else 400,
@@ -656,7 +649,7 @@ def _admin_workspaces(webauth, handler, route, match):
             try:
                 log = _server_audit(handler)
                 client = webauth.client_address(handler)
-                if new_slug not in (None, slug) or name not in (None, before["name"] if before else name):
+                if new_slug not in (None, slug) or (before is not None and row["name"] != before["name"]):
                     log.record(principal.user, principal.via, "workspace.rename", row["id"], client,
                                {"slug": row["slug"], "name": row["name"]})
                 if status is not None and before is not None and status != before["status"]:
@@ -852,6 +845,44 @@ def _admin_audit(webauth, handler, route, match):
     handler._json({"events": events, "skipped": 0}, 200, headers)
 
 
+def _workspace_rename(webauth, handler, route, match):
+    """Rename the bound workspace. The body is exactly ``{"name": str}``."""
+    from .db.workspaces import WorkspaceRepo
+    from .keys import ClientError
+    from .keyspage import read_json
+    from .webauth import LOGIN_BODY_MAX
+
+    headers = webauth._headers()
+    payload = read_json(handler, LOGIN_BODY_MAX)
+    if payload is None:
+        return
+    name = payload.get("name")
+    if set(payload) != {"name"} or not isinstance(name, str):
+        handler._json({"error": "invalid request"}, 400, headers)
+        return
+    ctx = handler.workspace
+    try:
+        old, row = WorkspaceRepo(handler.server.db).rename(ctx.id, name)
+    except ClientError as exc:
+        message = str(exc)
+        handler._json({"error": message}, 404 if message == "unknown workspace" else 400, headers)
+        return
+    if old["name"] != row["name"]:
+        principal = handler.principal
+        client = webauth.client_address(handler)
+        detail = {"slug": row["slug"], "name": row["name"], "old_name": old["name"]}
+        try:
+            ctx.audit.record(principal.user, principal.via, "workspace.rename", row["id"], client, detail)
+        except Exception:
+            pass
+        try:
+            _server_audit(handler).record(
+                principal.user, principal.via, "workspace.rename", row["id"], client, detail)
+        except Exception:
+            pass
+    handler._json({"slug": row["slug"], "name": row["name"]}, headers=headers)
+
+
 def _static_file(webauth, handler, route, match):
     handler._effective_path = "/static/" + (route.target or match.groupdict().get("name", ""))
     handler._get()
@@ -925,6 +956,7 @@ HANDLERS = {
     "members": _members,
     "invites": _invites,
     "audit": _audit,
+    "workspace_rename": _workspace_rename,
     "session": _session,
     "account_password": _account_password,
     "account_workspaces": _account_workspaces,

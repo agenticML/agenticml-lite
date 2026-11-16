@@ -145,8 +145,9 @@ def test_login_command_quotes_shell_arguments(page, fresh_server):
     command = dialog.locator(".key-command").inner_text()
     host = httpd.public_url or fresh_server["url"]
     quoted_host = "'" + host.replace("'", "'\\''") + "'"
-    assert command == f"agenticml login --host {quoted_host} --key '{value}'"
-    assert shlex.split(command) == ["agenticml", "login", "--host", host, "--key", value]
+    assert command == f"agenticml login --host {quoted_host}"
+    assert shlex.split(command) == ["agenticml", "login", "--host", host]
+    assert "--key" not in command and value not in command
 
 
 @pytest.mark.parametrize("event,persisted", [("pagehide", False), ("pageshow", True)])
@@ -187,7 +188,10 @@ def test_create_copy_close_and_revoke_sync_key(page, context, server_ui):
     open_keys(page, server_ui)
     dialog, value = create_key(page, "worker")
     expect(dialog.locator(".key-command")).to_have_text(
-        f"agenticml login --host '{server_ui['url']}' --key '{value}'")
+        f"agenticml login --host '{server_ui['url']}'")
+    expect(dialog.get_by_text("Run this command, then paste the key when it asks for it.", exact=True)).to_be_visible()
+    # The hint mentions no key on the command line; only a <code> element could carry one.
+    expect(dialog.locator("code").filter(has_text="--key")).to_have_count(0)
     expect(dialog.get_by_text("This key is shown once and cannot be recovered.", exact=True)).to_be_visible()
     expect(dialog.get_by_text(
         "No --public-url is set, so this uses the address you opened the dashboard at.", exact=True,
@@ -202,7 +206,9 @@ def test_create_copy_close_and_revoke_sync_key(page, context, server_ui):
     expect(dialog.get_by_role("status")).to_have_text("")
     dialog.get_by_role("button", name="Copy command", exact=True).click()
     expect(dialog.get_by_role("status")).to_have_text("Copied")
-    assert page.evaluate("navigator.clipboard.readText()") == f"agenticml login --host '{server_ui['url']}' --key '{value}'"
+    copied = page.evaluate("navigator.clipboard.readText()")
+    assert copied == f"agenticml login --host '{server_ui['url']}'"
+    assert "--key" not in copied and value not in copied
     expect(copy_key).to_be_visible()
     dialog.get_by_role("button", name="Close", exact=True).click()
     row = key_row(page, "worker")
@@ -230,7 +236,7 @@ def test_copy_fallback_selects_text_and_announces_feedback(page, server_ui, clip
         page.evaluate("Object.defineProperty(navigator, 'clipboard', {value: undefined})")
     else:
         page.evaluate("() => { navigator.clipboard.writeText = () => Promise.reject(new Error('unavailable')); }")
-    for label, text in (("Copy key", value), ("Copy command", f"agenticml login --host '{server_ui['url']}' --key '{value}'")):
+    for label, text in (("Copy key", value), ("Copy command", f"agenticml login --host '{server_ui['url']}'")):
         dialog.get_by_role("button", name=label, exact=True).click()
         page.wait_for_function("text => window.getSelection().toString() === text", arg=text)
         feedback = dialog.get_by_role("button", name="Press Ctrl+C to copy", exact=True)
@@ -330,7 +336,8 @@ def test_keys_no_overflow_and_dialog_focus_on_narrow_screens(page, server_ui, wi
     expect(dialog.locator(".key-value")).to_be_visible()
     value = dialog.locator(".key-value").inner_text()
     expect(dialog.locator(".key-command")).to_have_text(
-        f"agenticml login --host '{server_ui['url']}' --key '{value}'")
+        f"agenticml login --host '{server_ui['url']}'")
+    expect(dialog.locator("code").filter(has_text="--key")).to_have_count(0)
     assert_no_overflow(page)
     assert_dialog_fits(page, dialog)
     expect(dialog.get_by_role("button", name="Copy key", exact=True)).to_be_focused()
@@ -668,9 +675,28 @@ def test_route_change_clears_secret_and_ignores_late_response(page, server_ui, s
 def test_keys_401_redirects_to_login(page, context, server_ui):
     page.allow_http_errors = True
     sign_in(page, server_ui, server_ui["admin"])
-    expect(page.get_by_role("link", name="Settings", exact=True)).to_be_visible()
+    expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+    # Only the keys 401 may send the browser to /login. The members read answers 200 (the
+    # keys card reads it before the keys, and the team card reads it too); every other
+    # workspace read (the runs poll, invites, usage) is parked, because its own 401 would
+    # redirect first.
+    parked = []
+
+    def answer(route):
+        url = route.request.url
+        if url.endswith("/api/w/default/keys"):
+            route.continue_()
+        elif url.endswith("/api/w/default/members"):
+            route.fulfill(status=200, json={"users": []})
+        else:
+            parked.append(route)
+
+    page.route("**/api/w/default/**", answer)
     context.clear_cookies()
-    page.get_by_role("link", name="Settings", exact=True).click()
+    # Navigate by hash: the Settings link can be re-rendered while the click retries.
+    with page.expect_response(f"{server_ui['url']}/api/w/default/keys") as keys:
+        page.evaluate("location.hash = '#/settings/keys'")
+    assert keys.value.status == 401
     expect(page).to_have_url(f"{server_ui['url']}/login")
 
 

@@ -18,6 +18,14 @@ def validate_slug(slug):
     return slug
 
 
+def validate_workspace_name(name):
+    """Return the trimmed display name, or raise ClientError."""
+    if (not isinstance(name, str) or not name.strip() or len(name.strip()) > 256
+            or any(ord(char) < 32 or ord(char) == 127 for char in name)):
+        raise ClientError('invalid workspace name')
+    return name.strip()
+
+
 def slug_from_email_local(email):
     """Turn an email's local part into a workspace slug: ``[a-z0-9-]``, max 32."""
     local = email.split('@', 1)[0].lower() if isinstance(email, str) and '@' in email else ''
@@ -485,8 +493,8 @@ class WorkspaceRepo:
     def update(self, slug, *, name=None, new_slug=None, status=None):
         if new_slug is not None:
             validate_slug(new_slug)
-        if name is not None and (not isinstance(name, str) or not name.strip() or len(name) > 256):
-            raise ClientError('invalid workspace name')
+        if name is not None:
+            name = validate_workspace_name(name)
         if status is not None and status not in ('active', 'suspended'):
             raise ClientError('invalid workspace status')
         with self.db.transaction(write=True) as tx:
@@ -507,19 +515,55 @@ class WorkspaceRepo:
                         status or row['status'], row['id']))
             return self.by_id(row['id'], tx)
 
-    def set_plan(self, slug, plan, custom_limits=None):
+    def rename(self, workspace_id, name):
+        """Change only the display name; returns ``(old_row, new_row)``.
+
+        Never touches slug, status, plan or archived_at (unlike ``update``).
+        The ``users`` lock serialises it with ``update``, which rewrites the
+        name column from its own read.
+        """
+        name = validate_workspace_name(name)
+        with self.db.transaction(write=True) as tx:
+            tx.advisory_lock('users')
+            old = self.by_id(workspace_id, tx)
+            if old is None:
+                raise ClientError('unknown workspace')
+            if old['name'] != name:
+                tx.execute('UPDATE workspaces SET name=? WHERE id=?', (name, workspace_id))
+            return old, self.by_id(workspace_id, tx)
+
+    def set_plan(self, slug, plan, custom_limits=None, *, merge=False, free_limits=None):
+        """Set a workspace plan.
+
+        Without ``merge`` a custom plan needs all four limits. With ``merge``
+        ``custom_limits`` may be partial (or None) and is merged inside the
+        write transaction onto the limits read there: the workspace's own when
+        it is already custom, otherwise ``free_limits`` (or unlimited).
+        """
         import json
-        from ..limits import validate_limits
+        from ..limits import UNLIMITED, validate_limits
         if plan not in ('free', 'custom'):
             raise ClientError('plan must be free or custom')
         if plan == 'free' and custom_limits is not None:
             raise ClientError('free plan cannot have custom limits')
-        encoded = json.dumps(validate_limits(custom_limits)) if plan == 'custom' else None
+        if plan == 'custom' and merge and custom_limits is not None and not isinstance(custom_limits, dict):
+            raise ValueError('limits must be an object')
+        if plan == 'custom' and not merge:
+            encoded = json.dumps(validate_limits(custom_limits))
+        else:
+            encoded = None
         with self.db.transaction(write=True) as tx:
             tx.advisory_lock('users')
             old = self.get(slug, tx)
             if old is None:
                 raise ClientError('unknown workspace')
+            if plan == 'custom' and merge:
+                if old['plan'] == 'custom' and old['custom_limits']:
+                    base = json.loads(old['custom_limits'])
+                else:
+                    base = dict(free_limits) if free_limits is not None else dict(UNLIMITED)
+                base.update(custom_limits or {})
+                encoded = json.dumps(validate_limits(base))
             tx.execute('UPDATE workspaces SET plan=?, custom_limits=? WHERE id=?',
                        (plan, encoded, old['id']))
             return old, self.by_id(old['id'], tx)

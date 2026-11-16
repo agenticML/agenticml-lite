@@ -875,3 +875,36 @@ def test_out_of_order_session_lock_release_keeps_stack(databases):
         if outer is not None:
             outer_cm.__exit__(None, None, None)
     assert postgres._held_lock_connections.stack == []
+
+
+def test_usage_views_use_database_clock(servers, monkeypatch):
+    """Postgres only: the process clock says 2001, the database clock says today."""
+    import json
+    from datetime import timedelta
+    from agenticml.server import limits
+    from agenticml.server.db import usage as usage_module
+    from test_server_limits import _dash_cookie
+    from test_server_web import authed
+    a, _ = servers
+    monkeypatch.setattr(limits, 'utc_now', lambda: datetime(2001, 1, 1, tzinfo=timezone.utc))
+    monkeypatch.setattr(usage_module, 'utc_day', lambda: '2001-01-01')
+    # No clock override, so the views must read the database clock.
+    a.plans = limits.Plans({'default_plan': 'free', 'free_workspaces_per_account': 1,
+                            'plans': {'free': limits.UNLIMITED}})
+    assert not a.plans.has_clock_override
+    usage = UsageRepo(a.db, a.default_workspace_id)
+    with a.db.transaction(write=True) as tx:
+        usage.add_upload(123, tx)
+    today = usage.get()['upload_day']
+    assert today != '2001-01-01'
+    cookie = _dash_cookie(a)
+    status, _, body, _ = authed(a, '/api/w/default/usage', cookie=cookie)
+    assert status == 200
+    uploads = json.loads(body)['uploads_today']
+    tomorrow = (datetime.fromisoformat(today) + timedelta(days=1)).date().isoformat()
+    assert uploads['used'] == 123
+    assert uploads['resets_at'] == tomorrow + 'T00:00:00Z'
+    status, _, body, _ = authed(a, '/api/admin/workspaces', cookie=cookie)
+    assert status == 200
+    default = next(row for row in json.loads(body)['workspaces'] if row['slug'] == 'default')
+    assert default['uploads_today'] == 123

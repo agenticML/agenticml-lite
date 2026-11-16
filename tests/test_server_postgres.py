@@ -591,3 +591,201 @@ def test_record_file_and_claim_meta_serialize_missing_run(open_db, monkeypatch, 
     assert repo.get('new-run')['owner_user'] == 'alice'
     assert repo.get('new-run')['last_step'] == 2**40
     assert repo.committed_size('new-run', 'scalars/_time.bin') == 7
+
+
+def test_set_plan_merge_serialises_on_the_users_lock(open_db):
+    from agenticml.server.db.workspaces import WorkspaceRepo
+    from agenticml.server.limits import KEYS, UNLIMITED
+    db = open_db()
+    repo = WorkspaceRepo(db)
+    repo.set_plan('default', 'custom', dict(UNLIMITED), merge=False)
+    started = threading.Event()
+    errors = []
+
+    def patch_people():
+        started.set()
+        try:
+            WorkspaceRepo(db).set_plan('default', 'custom', {'people': 3}, merge=True)
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=patch_people)
+    with db.transaction(write=True) as tx:
+        tx.advisory_lock('users')
+        wid = tx.fetchone('SELECT id FROM workspaces WHERE slug=?', ('default',))[0]
+        worker.start()
+        started.wait(5)
+        threading.Event().wait(0.3)
+        tx.execute('UPDATE workspaces SET custom_limits=? WHERE id=?',
+                   (json.dumps({**UNLIMITED, 'storage_bytes': 99}), wid))
+    worker.join(10)
+    assert not worker.is_alive() and not errors, errors
+    assert json.loads(repo.get('default')['custom_limits']) == {**UNLIMITED, 'storage_bytes': 99, 'people': 3}
+
+    barrier = threading.Barrier(len(KEYS))
+
+    def hammer(key):
+        barrier.wait(10)
+        for value in range(1, 16):
+            WorkspaceRepo(db).set_plan('default', 'custom', {key: value}, merge=True)
+
+    with ThreadPoolExecutor(len(KEYS)) as pool:
+        list(pool.map(hammer, KEYS))
+    assert json.loads(repo.get('default')['custom_limits']) == dict.fromkeys(KEYS, 15)
+
+
+def _small_cap(monkeypatch, limit=2, wait=.2):
+    from agenticml.server.db import postgres
+    monkeypatch.setattr(postgres, 'TRANSACTION_CONNECTION_LIMIT', limit)
+    monkeypatch.setattr(postgres, '_TRANSACTION_WAIT', wait)
+
+
+def _all_slots_free(db, limit):
+    taken = 0
+    while db._tx_slots.acquire(blocking=False):
+        taken += 1
+    for _ in range(taken):
+        db._tx_slots.release()
+    return taken == limit
+
+
+def test_twenty_concurrent_transactions_fit_under_the_cap(open_db):
+    from agenticml.server.db import postgres
+    assert postgres.TRANSACTION_CONNECTION_LIMIT == 24
+    db = open_db()
+    barrier = threading.Barrier(20)
+
+    def hold(_):
+        with db.transaction():
+            barrier.wait(timeout=15)
+
+    with ThreadPoolExecutor(20) as pool:
+        list(pool.map(hold, range(20)))
+    assert _all_slots_free(db, 24)
+
+
+def test_transaction_connection_cap_maps_to_busy(open_db, monkeypatch):
+    import time
+    _small_cap(monkeypatch)
+    db = open_db()
+    entered = threading.Barrier(3)
+    release = threading.Event()
+
+    def hold():
+        with db.transaction():
+            entered.wait(timeout=10)
+            release.wait(timeout=10)
+
+    threads = [threading.Thread(target=hold) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    try:
+        entered.wait(timeout=10)
+        assert len(db._connections) <= 2
+        started = time.monotonic()
+        with pytest.raises(DatabaseBusy, match='database is locked'):
+            with db.transaction():
+                pytest.fail('entered past the cap')
+        assert .1 <= time.monotonic() - started < 3
+        assert not getattr(db._local, 'active', False)
+        assert len(db._connections) <= 2
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(10)
+    with db.transaction() as tx:
+        assert tx.fetchone('SELECT 1')[0] == 1
+    assert _all_slots_free(db, 2)
+
+
+def test_transaction_cap_is_released_on_error_and_failed_begin(open_db, monkeypatch):
+    _small_cap(monkeypatch)
+    db = open_db()
+    with pytest.raises(ValueError):
+        with db.transaction():
+            raise ValueError('abort')
+    assert _all_slots_free(db, 2)
+
+    class Failing:
+        closed = True
+        broken = False
+
+        def execute(self, sql, *args):
+            raise db._psycopg.errors.QueryCanceled('begin failed')
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(db, '_new_connection', lambda **kwargs: Failing())
+    with db._lock:
+        idle, db._idle = db._idle, []
+    try:
+        with pytest.raises(DatabaseError):
+            with db.transaction():
+                pass
+    finally:
+        with db._lock:
+            db._idle = idle
+    assert _all_slots_free(db, 2)
+
+
+def test_lock_holder_gets_busy_not_a_hang_when_transaction_slots_are_taken(open_db, monkeypatch):
+    _small_cap(monkeypatch, limit=1, wait=.2)
+    db = open_db()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hold():
+        with db.transaction():
+            entered.set()
+            release.wait(timeout=10)
+
+    thread = threading.Thread(target=hold)
+    thread.start()
+    try:
+        assert entered.wait(10)
+        with db.session_lock('run:cap:one', timeout=1) as held:
+            with pytest.raises(DatabaseBusy, match='database is locked'):
+                with db.transaction():
+                    pass
+            # The confirm path runs on the lock connection and needs no slot.
+            db.confirm_session_locks()
+            assert held.execute('SELECT 1').fetchone()[0] == 1
+    finally:
+        release.set()
+        thread.join(10)
+    assert _all_slots_free(db, 1)
+
+
+def test_session_locks_do_not_collide_across_schemas(open_db, postgres_admin):
+    import secrets
+    from psycopg import sql
+    schema = 't_' + secrets.token_hex(8)
+    postgres_admin.execute(sql.SQL('CREATE SCHEMA {} AUTHORIZATION agenticml_test').format(
+        sql.Identifier(schema)))
+    first = other = same = None
+    try:
+        first = open_db()
+        other = open_db(postgres_url(os.environ['AGENTICML_TEST_DATABASE_URL'], schema))
+        same = open_db()
+        with first.session_lock('run:same:key', timeout=1):
+            with other.session_lock('run:same:key', timeout=.2):
+                pass
+            with pytest.raises(DatabaseBusy):
+                with same.session_lock('run:same:key', timeout=.05):
+                    pass
+    finally:
+        for db in (first, other, same):
+            if db is not None:
+                db.close()
+        postgres_admin.execute(sql.SQL('DROP SCHEMA {} CASCADE').format(sql.Identifier(schema)))
+
+
+def test_registry_probe_returns_none_for_a_missing_postgres_database(pg_url, tmp_path, monkeypatch):
+    from agenticml.server import db as db_package
+    monkeypatch.setattr(db_package, '_registry', {})
+    monkeypatch.setattr(PostgresDatabase, 'exists', staticmethod(lambda url: False))
+    assert for_server_dir(tmp_path / 'server', pg_url, create=False) is None
