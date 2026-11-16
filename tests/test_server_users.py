@@ -839,7 +839,7 @@ def test_add_refuses_when_run_scan_truncated(tmp_path, monkeypatch):
     assert users.get("alice") is not None
     with pytest.raises(ClientError, match="reclaim-runs"):
         users.add("zzz")
-    users.add("zzz", reclaim_runs=True)
+    users.add("zzz", reclaim_runs=True, operator=True)
     assert users.get("zzz") is not None
 
 

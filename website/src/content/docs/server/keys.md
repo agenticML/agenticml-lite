@@ -123,6 +123,9 @@ agenticml server accounts add user@example.com --display-name "User Name"
 
 # Grant server admin privileges
 agenticml server accounts set-server-admin user@example.com on
+
+# Erase an account on request (refused while it is a server admin or owns a workspace or runs)
+agenticml server accounts delete user@example.com
 ```
 
 ## Dashboard sign-in and sessions

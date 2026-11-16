@@ -546,6 +546,69 @@ A server admin account sees a customer workspace only if explicitly added as a
 workspace member. The `/admin/` portal lists and creates workspaces across the
 server. Keep public signup disabled until setup is complete.
 
+**Accounts with no workspace:** a person removed from their last workspace has an
+account but no membership (a "detached" account). A workspace admin can add such
+an account over HTTP (Settings > Members) only for the workspace it last left, and
+never when it is a server admin. For any other workspace, and for accounts that never
+had a membership, an operator adds it over ECS Exec:
+
+```sh
+agenticml server users add alice@example.com --role member --workspace customer-two --data /data
+```
+
+### Deleting a workspace and retrying cleanup
+
+```sh
+agenticml server workspaces delete customer-one --yes-delete customer-one --data /data
+```
+
+The order is: database row, audit entry (`workspace.delete`), files on EFS, then S3
+objects (`--objects` or `AGENTICML_SERVER_OBJECTS`); every step runs even if another
+fails. The command exits 0 once the row is gone, so **check stderr**: a line
+`Warning: file cleanup failed for workspace <id>; retry with: ...` or
+`Warning: object cleanup failed for workspace <id>; retry with: ...` means data is left
+and a `workspace.cleanup_failed` event was recorded. Retry (safe to repeat; only that
+id, only `workspaces/<id>` and the `<prefix>/<id>/` S3 prefix are touched):
+
+```sh
+agenticml server workspaces orphans --data /data       # lists ids with files or objects but no row
+agenticml server workspaces cleanup <id> --data /data  # refuses ids that are still in the database
+```
+
+`server verify` and `server status` list the same leftovers as
+`workspace_orphan_files` / `workspace_orphan_objects` warnings. `workspaces cleanup --all
+--yes-delete all` removes every listed id; never run it against a restored or drill
+database (see `scripts/restore_drill/README.md`).
+
+### Deleting an account (privacy request)
+
+Erases one person's account on request. Steps, in this order:
+
+1. Find the login and its Firebase uid: `agenticml server accounts list --json --data /data`.
+2. Delete or transfer the person's workspaces. The command refuses an account that owns a
+   workspace (`workspaces set-owner`, or `workspaces delete`) or owns runs (delete those
+   runs or their workspaces first). Personal workspace names derive from the email, so delete
+   the personal workspace rather than transferring it.
+3. If the account is a server admin, run `agenticml server accounts set-server-admin LOGIN off`
+   and remove the email from the admin emails list.
+4. Delete the Firebase user in the Firebase console (Authentication > Users) FIRST. With open
+   sign-up on, a person who can still sign in would otherwise get a fresh account and a new
+   personal workspace right after the deletion.
+5. Run the command over ECS Exec:
+   ```sh
+   agenticml server accounts delete LOGIN --yes-delete LOGIN --data /data
+   ```
+   It removes sessions, keys, pending invites, memberships and failed-login throttle
+   entries, replaces the login in
+   `created_by`/`invited_by` columns with `[deleted account]`, redacts the server-level audit
+   log (actor and target replaced, display name and the personal workspace's name and slug
+   replaced, client address cleared on rows the person acted in) and
+   records one `account.delete` event that names only the account id.
+
+Not touched: load-balancer access logs (kept 90 days), server logs (30 days), and the Activity
+logs of workspaces the person belonged to (they stay with their workspace until it is deleted;
+the command lists the workspaces).
+
 ## Sync from a training machine
 
 ### Installation

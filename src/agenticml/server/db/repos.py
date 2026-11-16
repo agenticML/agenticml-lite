@@ -143,18 +143,22 @@ class UserRepo(WorkspaceBound):
             row = tx.fetchone(self._select() + 'AND a.identity=?', (self.workspace_id, value))
             return self.decode(row) if row else None
 
-    def add(self, name, role='member', identity=None, created_by='cli', *, reclaim_runs=False, plans=None):
+    def add(self, name, role='member', identity=None, created_by='cli', *, reclaim_runs=False, plans=None,
+            operator=False):
         record = self._new(name, role, identity, created_by)
         with self._tx(write=True) as tx:
             tx.advisory_lock('users')
             if self.get(record.name, tx):
                 raise UserNameTaken('user name already exists')
-            if plans is not None:
-                plans.check_people(self.db, self.workspace_id, tx)
             existing = self.accounts.get(record.name, tx)
             if not reclaim_runs:
                 if existing is not None and existing['created_by'] == 'legacy run owner':
                     raise ClientError(f'runs are still owned by {record.name}; pass --reclaim-runs to give them to the new user')
+            if existing is not None:
+                self.accounts.require_attachable(existing, self.workspace_id, tx, operator=operator)
+            if plans is not None:
+                plans.check_people(self.db, self.workspace_id, tx)
+            if not reclaim_runs:
                 if existing is None and RunRepo(self.db, self.workspace_id).name_owns(record.name, tx):
                     raise ClientError(f'runs are still owned by {record.name}; pass --reclaim-runs to give them to the new user')
             if identity is not None:
@@ -170,7 +174,9 @@ class UserRepo(WorkspaceBound):
                                       generation=existing['generation']))
             else:
                 self.save(tx, record)
-            return self.get(record.name, tx)
+            added = self.get(record.name, tx)
+            self.accounts.clear_detached(added.id, tx)
+            return added
 
     def remove(self, name):
         with self._tx(write=True) as tx:
@@ -185,6 +191,9 @@ class UserRepo(WorkspaceBound):
                                   (self.workspace_id, found.id))[0]
             tx.execute('DELETE FROM invites WHERE workspace_id=? AND login=?', (self.workspace_id, name))
             tx.execute('DELETE FROM memberships WHERE workspace_id=? AND account_id=?', (self.workspace_id, found.id))
+            if self.accounts.is_detached(found.id, tx):
+                # The only workspace that may put this account back over HTTP.
+                self.accounts.note_detached(found.id, self.workspace_id, tx)
             return revoked
 
     def discard(self, name, user_id):
@@ -589,6 +598,109 @@ class AuditRepo(WorkspaceBound):
                                params + ((before, limit) if before is not None else (limit,)))
             return [{**dict(row), 'detail': json.loads(row['detail']) if row['detail'] is not None else None}
                     for row in rows]
+
+    # ``detail`` keys that hold a person (a login, email, identity or name). Only
+    # values under these keys are replaced whole; anything else (``role``,
+    # ``slug``, ``method`` ...) is left alone so a short login such as ``admin``
+    # cannot rewrite unrelated values.
+    PEOPLE_KEYS = frozenset({
+        'owner', 'login', 'user', 'email', 'invited_by', 'name', 'new_owner', 'old_owner',
+        'display_name', 'identity', 'created_by'})
+
+    def redact_account(self, needles, tx, display_name=None):
+        """Rewrite server-level rows that name a deleted account; returns rows changed.
+
+        ``needles`` are the account's login, email, identity and Firebase uid.
+        ``actor`` or ``target`` equal to one (case-insensitive) becomes the
+        placeholder, and ``client`` (the person's address) is cleared on rows the
+        person acted in. In ``detail`` a string under a key in ``PEOPLE_KEYS`` that
+        equals a needle is replaced whole; for needles containing ``@`` the
+        needle is also replaced inside longer strings. ``display_name`` is replaced
+        only under the ``display_name`` key, and under ``name`` when the value is
+        ``<display_name>'s workspace``, and only on rows whose actor or target is the
+        person (another person's row with the same display name is left alone). The ``slug`` and ``name`` of the workspace a
+        person created at sign-up (``workspace.create`` with via ``signup``, actor =
+        the person) are replaced in every server-level row about that workspace id.
+        Workspace-level rows are never touched.
+        """
+        import re
+        if self.workspace_id is not None:
+            raise ValueError('only the server-level audit log can be redacted')
+        placeholder = '[deleted account]'
+        lowered = {n.lower() for n in needles if isinstance(n, str) and n}
+        if not lowered:
+            return 0
+        shown = display_name.lower() if isinstance(display_name, str) and display_name.strip() else None
+        personal = shown + "'s workspace" if shown else None
+        emails = [n for n in lowered if '@' in n]
+        patterns = [re.compile('(?<![A-Za-z0-9._%+-])' + re.escape(n) + '(?![A-Za-z0-9._%+-])', re.I)
+                    for n in emails]
+
+        def scrub(value, key=None, own_workspace=False, named=False):
+            if isinstance(value, dict):
+                return {k: scrub(v, k, own_workspace, named) for k, v in value.items()}
+            if isinstance(value, list):
+                return [scrub(item, key, own_workspace, named) for item in value]
+            if not isinstance(value, str):
+                return value
+            low = value.lower()
+            if key in self.PEOPLE_KEYS and low in lowered:
+                return placeholder
+            if named and ((key == 'display_name' and low == shown) or (key == 'name' and low == personal)):
+                return placeholder
+            if own_workspace and key in ('slug', 'name'):
+                return placeholder
+            for pattern in patterns:
+                value = pattern.sub(placeholder, value)
+            return value
+
+        names = sorted(lowered)
+        marks = ','.join('?' * len(names))
+        changed = 0
+        with self._bind(tx):
+            # Workspaces this person created at sign-up (their personal workspace).
+            own = [r['target'] for r in tx.fetchall(
+                "SELECT target FROM audit_events WHERE workspace_id IS NULL AND action='workspace.create' "
+                f"AND via='signup' AND target IS NOT NULL AND LOWER(actor) IN ({marks})", tuple(names))]
+            own = sorted(set(own))
+            clauses = [f'LOWER(actor) IN ({marks})', f'LOWER(target) IN ({marks})']
+            params = list(names) + list(names)
+            if own:
+                clauses.append('target IN (' + ','.join('?' * len(own)) + ')')
+                params += own
+            likes = set(names) | ({shown} if shown else set())
+            for needle in sorted(likes):
+                # detail is stored as ASCII JSON, so non-ASCII text is \\uXXXX escaped.
+                for form in {needle, json.dumps(needle)[1:-1]}:
+                    clauses.append("LOWER(detail) LIKE ? ESCAPE '\\'")
+                    params.append('%' + form.lower().replace('\\', '\\\\').replace('%', '\\%')
+                                  .replace('_', '\\_') + '%')
+            rows = tx.fetchall(
+                'SELECT id, actor, target, client, detail FROM audit_events '
+                'WHERE workspace_id IS NULL AND (' + ' OR '.join(clauses) + ')', tuple(params))
+            for row in rows:
+                actor, target, client, detail = row['actor'], row['target'], row['client'], row['detail']
+                about_own_workspace = target in own
+                named = False
+                if isinstance(actor, str) and actor.lower() in lowered:
+                    actor, client, named = placeholder, None, True
+                if isinstance(target, str) and target.lower() in lowered:
+                    target, named = placeholder, True
+                if detail is not None:
+                    try:
+                        parsed = json.loads(detail)
+                    except ValueError:
+                        parsed = None
+                    else:
+                        scrubbed = scrub(parsed, None, about_own_workspace, named)
+                        if scrubbed != parsed:
+                            detail = json.dumps(scrubbed)
+                if (actor, target, client, detail) == (row['actor'], row['target'], row['client'], row['detail']):
+                    continue
+                tx.execute('UPDATE audit_events SET actor=?, target=?, client=?, detail=? '
+                           'WHERE id=? AND workspace_id IS NULL', (actor, target, client, detail, row['id']))
+                changed += 1
+        return changed
 
 
 _RUN_COLUMNS = ('run_id', 'project', 'created_at', 'owner_user', 'owner_key', 'status',

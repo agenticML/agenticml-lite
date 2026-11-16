@@ -602,6 +602,8 @@ def test_people_boundaries_pending_and_existing_accounts(server, used):
         with pytest.raises(LimitReached, match='people limit reached \\(3 of 3\\)'):
             invites.create('new-person', 'member', 'admin', plans=server.plans)
         AccountRepo(server.db).create('existing')
+        # A person with a workspace elsewhere (a detached account needs an operator).
+        WorkspaceRepo(server.db).create('elsewhere', owner='existing')
         with pytest.raises(LimitReached):
             invites.create('existing', 'member', 'admin', plans=server.plans)
         with pytest.raises(LimitReached):
@@ -1139,6 +1141,7 @@ def test_existing_account_pending_invite_checks_people(server):
     invites = InviteRepo(server.db, server.default_workspace_id)
     invites.create('pending-account', 'viewer', 'admin')
     account = AccountRepo(server.db).create('pending-account')
+    WorkspaceRepo(server.db).create('elsewhere', owner='pending-account')  # not detached
     usage = configure(server, people=2)
     assert usage.people() == 2
     with pytest.raises(LimitReached):

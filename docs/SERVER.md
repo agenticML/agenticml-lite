@@ -166,6 +166,11 @@ agenticml server workspaces resume SLUG [--database URL] [--data DIR]
 # Delete a workspace (requires typed confirmation of the slug; deletes files and objects)
 agenticml server workspaces delete SLUG [--yes-delete SLUG] [--objects URL] [--database URL] [--data DIR]
 
+# Find and retry leftovers of a deletion (workspace ids with files or S3 objects but no database row)
+agenticml server workspaces orphans [--objects URL] [--json] [--database URL] [--data DIR]
+agenticml server workspaces cleanup WORKSPACE_ID [--objects URL] [--database URL] [--data DIR]
+agenticml server workspaces cleanup --all --yes-delete all [--objects URL] [--database URL] [--data DIR]
+
 # Transfer workspace ownership
 agenticml server workspaces set-owner SLUG --owner LOGIN [--database URL] [--data DIR]
 
@@ -194,9 +199,17 @@ agenticml server accounts add LOGIN [--display-name NAME] [--server-admin] [--da
 
 # Grant or revoke server admin privileges
 agenticml server accounts set-server-admin LOGIN on|off [--database URL] [--data DIR]
+
+# Erase an account (privacy request): sessions, keys, memberships, pending invites; redacts the
+# server-level audit log. Refused while the account is a server admin or owns a workspace or runs.
+agenticml server accounts delete LOGIN [--yes-delete LOGIN] [--json] [--database URL] [--data DIR]
 ```
 
+`accounts delete` leaves workspace Activity logs alone (they stay with their workspace) and prints the Firebase uid to delete in the Firebase console. `workspaces cleanup --all` removes every id `orphans` lists, so never run it against a restored or drill database; `server verify` and `server status` list orphans as warnings.
+
 ### Workspace membership and user CLI
+
+An account that belongs to no workspace (removed from its last one) can be added again over HTTP (**Settings > Members**) only by an admin of the workspace it last left, and never when it is a server admin. For any other workspace, and for accounts that never had a membership, an operator must run `agenticml server users add LOGIN --workspace SLUG`.
 
 Manage memberships and users within a specific workspace using `agenticml server users`:
 

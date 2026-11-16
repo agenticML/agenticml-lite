@@ -1009,7 +1009,7 @@ class WebAuth:
                     return
                 created = None
                 try:
-                    created = self.users.add(name, role="admin", created_by="setup")
+                    created = self.users.add(name, role="admin", created_by="setup", operator=True)
                     user = self.users.set_password(name, password, operator=True)
                     self.keys._write_setup_closed()
                 except UserNameTaken:
@@ -1958,7 +1958,7 @@ class WebAuth:
         return True
 
     def _invite(self, handler):
-        from .users import InviteExistingAccount, InviteInvalid
+        from .users import DETACHED_ACCOUNT, InviteExistingAccount, InviteInvalid
 
         if not handler._csrf_ok():
             handler.close_connection = True
@@ -1980,6 +1980,12 @@ class WebAuth:
             if kind == "existing":
                 try:
                     self._redeem_workspace_invite(token)
+                except ClientError as exc:
+                    if str(exc) != DETACHED_ACCOUNT:
+                        raise
+                    outcome = "failed"
+                    handler._json({"error": DETACHED_ACCOUNT}, 403, self._headers())
+                    return
                 except InviteExistingAccount:
                     outcome = "success"
                     handler._json(

@@ -373,8 +373,15 @@ object bucket is unreachable" error; `## status` lists every workspace with its
 members, keys, runs and objects (the object total matches the S3 copy), and the
 users with roles; `## usage` is printed; `verify --deep` reports 0 problems
 (warnings such as orphans are recorded as cross-store inconsistency, not
-failures); `## done rc=0`. The time from the task's `createdAt` to `## healthy` is
+failures; after restoring an older database, `workspace_orphan_files` and
+`workspace_orphan_objects` warnings are expected for workspaces created after
+the restore point); `## done rc=0`. The time from the task's `createdAt` to `## healthy` is
 the app recovery step.
+
+**Never run `agenticml server workspaces cleanup --all` (or `cleanup <id>`) against
+a restored or drill database.** The restored database does not know workspaces created
+later, so their live files and S3 prefixes look like orphans and cleanup would delete
+real data.
 
 ## 8. Gate 3: a new sync and a login per workspace
 

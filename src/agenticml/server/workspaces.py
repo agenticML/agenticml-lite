@@ -89,38 +89,54 @@ def _rmtree_at(parent_fd, name):
 
 
 def discard_store(data, workspace_id):
-    """Remove workspaces/<id>/ without following symlinks. Missing is OK."""
+    """Remove workspaces/<id>/ without following symlinks.
+
+    Returns True when ``workspaces/<id>`` is gone afterwards (also when it was
+    already missing or was a symlink that got unlinked), False when anything is
+    left or the safe path was skipped.
+    """
     wid = require_workspace_id(workspace_id)
     parent = Path(data) / 'workspaces'
     if not hasattr(os, 'O_DIRECTORY') or not hasattr(os, 'O_NOFOLLOW'):
         logger.warning('discard_store skipped: descriptor-relative deletion is unavailable')
-        return
+        return False
     if not getattr(shutil.rmtree, 'avoids_symlink_attacks', False):
         logger.warning('discard_store skipped: shutil.rmtree cannot avoid symlink attacks')
-        return
+        return False
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     try:
         parent_fd = os.open(parent, flags)
+    except FileNotFoundError:
+        return True
     except OSError:
-        return
+        return False
     try:
         st = os.fstat(parent_fd)
         if not stat.S_ISDIR(st.st_mode):
-            return
+            return False
         if st.st_uid != os.geteuid():
             logger.warning('discard_store skipped: workspaces directory is not owned by this process')
-            return
+            return False
         try:
             child = os.lstat(wid, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return True
         except OSError:
-            return
+            return False
         if stat.S_ISLNK(child.st_mode) or not stat.S_ISDIR(child.st_mode):
             try:
                 os.unlink(wid, dir_fd=parent_fd)
             except OSError:
                 pass
-            return
-        _rmtree_at(parent_fd, wid)
+        else:
+            _rmtree_at(parent_fd, wid)
+        try:
+            os.lstat(wid, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        return False
     finally:
         os.close(parent_fd)
 
@@ -164,18 +180,43 @@ def convert_store(db, data):
         prepare_store(data, workspace['id'])
 
 
-def delete_workspace(db, data, slug, *, objects=None):
-    """Delete the workspace; mark the returned row if object cleanup failed."""
+def delete_workspace(db, data, slug, *, objects=None, on_deleted=None):
+    """Delete the workspace; every cleanup step runs even if another fails.
+
+    The database row goes first (the ``default`` refusal raises before anything
+    else), then ``on_deleted(row)`` is called (the CLI writes the audit event
+    there), then the files, then the objects. The returned row carries
+    ``files_cleanup_failed`` and, only when True, ``object_cleanup_failed``.
+    """
     row = WorkspaceRepo(db).require(slug)
-    root = prepare_store(data, row['id'])
     # No SQLite transaction is held across filesystem operations.
     WorkspaceRepo(db).delete(slug)
-    shutil.rmtree(root.parent)
-    layout.fsync_dir(root.parent.parent)
+    if on_deleted is not None:
+        try:
+            on_deleted(row)
+        except Exception:
+            logger.warning('on_deleted callback failed for workspace %s', row['id'], exc_info=True)
+    try:
+        files_ok = bool(discard_store(data, row['id']))
+    except Exception:
+        logger.warning('file cleanup failed for workspace %s; run: agenticml server workspaces cleanup %s',
+                       row['id'], row['id'], exc_info=True)
+        files_ok = False
+    else:
+        if files_ok:
+            try:
+                layout.fsync_dir(Path(data) / 'workspaces')
+            except OSError:
+                logger.warning('fsync of the workspaces directory failed', exc_info=True)
+        else:
+            logger.warning('file cleanup left data for workspace %s; run: agenticml server workspaces cleanup %s',
+                           row['id'], row['id'])
+    row = dict(row, files_cleanup_failed=not files_ok)
     if objects is not None:
         try:
             objects.delete_workspace(row['id'])
         except Exception:
-            row = dict(row, object_cleanup_failed=True)
-            logger.warning('object cleanup failed for workspace %s; bytes are orphaned', row['id'], exc_info=True)
+            row['object_cleanup_failed'] = True
+            logger.warning('object cleanup failed for workspace %s; run: agenticml server workspaces cleanup %s',
+                           row['id'], row['id'], exc_info=True)
     return row

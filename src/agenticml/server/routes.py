@@ -876,7 +876,9 @@ def _invites(webauth, handler, route, match):
             token = repo.create(login, role, principal.user, plans=getattr(handler.server, "plans", None))
         except ClientError as exc:
             from .limits import LimitReached
-            handler._json({"error": str(exc)}, 403 if isinstance(exc, LimitReached) else 400)
+            from .users import DETACHED_ACCOUNT
+            handler._json({"error": str(exc)},
+                          403 if isinstance(exc, LimitReached) or str(exc) == DETACHED_ACCOUNT else 400)
             return
         rows = [row for row in repo.list() if row["login"] == login]
         expires_at = rows[0]["expires_at"] if rows else None

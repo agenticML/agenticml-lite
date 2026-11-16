@@ -211,7 +211,7 @@ def bootstrap_admin(data, public_url, *, install=False, database=None, firebase=
     if not _stdout_is_tty():
         raise UpError(_NO_ADMIN_TTY)
     try:
-        users.add("admin", role="admin", created_by="server up")
+        users.add("admin", role="admin", created_by="server up", operator=True)
     except UserNameTaken:
         raise UpError(_ADMIN_NAME_NOT_ADMIN) from None
     log.record(actor, "cli", "user.add", "admin", detail={"role": users.get("admin").role, "identity": None})

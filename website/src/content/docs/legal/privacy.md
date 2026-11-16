@@ -3,7 +3,7 @@ title: Privacy Policy
 description: Privacy practices and data handling for the agenticml-lite hosted preview service.
 ---
 
-Last updated: Nov 15, 2026
+Last updated: Nov 17, 2026
 
 The agenticML project ("agenticML", "we", "us", or "our") respects your privacy. This Privacy Policy describes how we collect, store, use, and protect your information when you use the agenticml-lite hosted service at `https://app.agenticml.xyz` ("the Service").
 
@@ -28,7 +28,7 @@ When your training scripts sync with the service using `agenticml`, the followin
 - **Artifacts:** Content-addressed files, model weights, and media files (such as images or figures) logged during runs.
 
 ### Operational and security logs (Audit Trail)
-- **Audit records:** The service records security-relevant events: sign-ins and sign-in failures, sign-outs, account creation, API key creation and revocation, member invitations, additions, removals and role changes, workspace creation, rename, suspension, archiving, plan changes and deletion, and run creation and status changes. The application only adds entries to the log. Events about a workspace's people, keys and runs are kept with that workspace and are deleted with it. Sign-in events and server-wide administration events are kept in a server-level log that is not deleted when a workspace is deleted. That server-level log has no fixed retention period; we delete entries that name you when you ask us to delete your account (see section 7).
+- **Audit records:** The service records security-relevant events: sign-ins and sign-in failures, sign-outs, account creation, API key creation and revocation, member invitations, additions, removals and role changes, workspace creation, rename, suspension, archiving, plan changes and deletion, and run creation and status changes. The application only adds entries to the log. Events about a workspace's people, keys and runs are kept with that workspace and are deleted with it. Sign-in events and server-wide administration events are kept in a server-level log that is not deleted when a workspace is deleted. That server-level log has no fixed retention period; when you ask us to delete your account, we redact the entries that name you (your name, email address and IP address are replaced or cleared; the entry itself stays) (see section 7).
 - **Technical data:** Each audit entry includes the time, who acted (their sign-in name, normally their email address, or the name of the API key), how they acted, the action, the target (for example another person's email, a run, a key or a workspace), a small JSON detail (for example a role, a workspace name or slug, a project name) and the client IP address.
 
 ## 2. Cookies and Tracking
@@ -70,7 +70,7 @@ We host and operate the service using the following third-party service provider
 ## 6. Data Retention and Backups
 
 - **Active data:** Your experiment data is retained for as long as your workspace remains active.
-- **Deletion:** When a workspace is deleted, its database records (members, invitations, keys, runs, metric summaries and the workspace's Activity log), its run files on EFS and its objects in S3 are deleted. This does not by itself remove your sign-in account. If removing S3 objects fails, the server logs a warning naming the workspace, and we remove the leftover objects by hand after checking the log; this is not retried automatically. Copies in backups and in older S3 versions are removed by their retention schedules, about 35 days at most, once the workspace's S3 objects have been deleted. A record of the deletion (who ran it, when, and the workspace id and slug) is kept in the server audit log. Workspace deletion is carried out by an operator; there is no self-serve delete button.
+- **Deletion:** When a workspace is deleted, its database records (members, invitations, keys, runs, metric summaries and the workspace's Activity log), its run files on EFS and its objects in S3 are deleted. This does not by itself remove your sign-in account. If removing S3 objects fails, the server logs a warning naming the workspace, and the operator retries the removal with a cleanup command once the problem is fixed; the retry is not automatic. Copies in backups and in older S3 versions are removed by their retention schedules, about 35 days at most, once the workspace's S3 objects have been deleted. A record of the deletion (who ran it, when, and the workspace id and slug) is kept in the server audit log. Workspace deletion is carried out by an operator; there is no self-serve delete button.
 - **Backups:**
   - Automated RDS PostgreSQL snapshots with 7-day Point-in-Time Recovery (PITR) and daily AWS Backup retained for up to 35 days.
   - Amazon EFS daily AWS Backup retained for up to 35 days.
@@ -81,7 +81,7 @@ We host and operate the service using the following third-party service provider
 ## 7. Your Rights and Deletion Requests
 
 - **Access and export:** You can view, inspect, and download your experiment metrics, run files, and artifacts at any time through the dashboard or by using the `agenticml` CLI and Python SDK.
-- **Account and data deletion:** You may ask us to delete your workspaces, and your account record (email, display name and sign-in identifier), by contacting [contact@agenticml.xyz](mailto:contact@agenticml.xyz). There is no self-serve deletion; we carry the request out by hand, including removing your user from Firebase Authentication and deleting server-level audit log entries that name you. Load balancer access logs (90 days) and server logs (30 days) are not deleted on request and expire on their own schedule.
+- **Account and data deletion:** You may ask us to delete your workspaces, and your account record (email, display name and sign-in identifier), by contacting [contact@agenticml.xyz](mailto:contact@agenticml.xyz). There is no self-serve deletion; we carry the request out by hand, including removing your user from Firebase Authentication and redacting server-level audit log entries that name you (your name, email address and IP address are replaced or cleared, rather than the entries being deleted). Load balancer access logs (90 days) and server logs (30 days) are not deleted on request and expire on their own schedule.
 - **Team management:** Workspace administrators can manage team members, revoke keys, and remove user memberships directly in the workspace settings.
 
 ## 8. Children's Privacy

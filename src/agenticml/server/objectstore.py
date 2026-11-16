@@ -28,6 +28,14 @@ class ObjectBackend:
         require_workspace_id(workspace_id)
         return [sha for sha in dict.fromkeys(shas) if not self.exists(workspace_id, sha)]
 
+    def workspace_ids(self):
+        """Workspace ids that have objects outside the per-workspace store.
+
+        Backends whose bytes live under ``workspaces/<id>/store`` (files) have
+        none: the directory scan covers them.
+        """
+        return []
+
 
 class FileObjects(ObjectBackend):
     name = 'file'
@@ -203,6 +211,28 @@ class S3Objects(ObjectBackend):
             if not page.get('IsTruncated'):
                 break
             token = page['NextContinuationToken']
+
+    def workspace_ids(self):
+        """Return the 32-hex workspace ids that have a prefix in the bucket (sorted).
+
+        Only ``CommonPrefixes`` under the base prefix are listed, one request
+        per page of prefixes. Any other name is ignored.
+        """
+        base = f'{self.prefix}/' if self.prefix else ''
+        found = set()
+        token = None
+        while True:
+            args = {'ContinuationToken': token} if token else {}
+            page = self._call(self.client.list_objects_v2, Bucket=self.bucket, Prefix=base,
+                              Delimiter='/', **args)
+            for item in page.get('CommonPrefixes', []):
+                name = item['Prefix'][len(base):].rstrip('/')
+                if re.fullmatch('[0-9a-f]{32}', name):
+                    found.add(name)
+            if not page.get('IsTruncated'):
+                break
+            token = page['NextContinuationToken']
+        return sorted(found)
 
     def delete_workspace(self, workspace_id):
         require_workspace_id(workspace_id)

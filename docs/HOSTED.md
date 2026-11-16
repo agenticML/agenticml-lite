@@ -200,7 +200,14 @@ Deleting a workspace removes all database records, deletes on-disk files on EFS,
 agenticml server workspaces delete acme-corp --yes-delete acme-corp --data /data
 ```
 
-All workspace deletions write a permanent entry to the server audit log.
+All workspace deletions write a permanent entry to the server audit log. The order is: database row, audit entry, files on EFS, then S3 objects; every step runs even if an earlier one fails. If a step fails the command still exits 0 (the workspace is gone), prints `Warning: file cleanup failed ...` or `Warning: object cleanup failed ...` on stderr with the retry command, and records a `workspace.cleanup_failed` audit event. Retry with:
+
+```bash
+agenticml server workspaces orphans --data /data
+agenticml server workspaces cleanup WORKSPACE_ID --data /data
+```
+
+`server verify` and `server status` also report leftovers as `workspace_orphan_files` / `workspace_orphan_objects` warnings.
 
 ## Customer support access
 

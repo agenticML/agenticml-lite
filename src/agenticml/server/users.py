@@ -81,6 +81,8 @@ class InviteExistingAccount(Exception):
         self.account_id = account_id
 
 
+DETACHED_ACCOUNT = 'this account is not in any workspace; ask a server admin to add it'
+
 CROSS_WORKSPACE_CREDENTIALS = (
     'this account belongs to other workspaces; only the person or a server admin can change it')
 
@@ -312,8 +314,10 @@ class UserStore:
     def by_identity(self, value):
         return self._call('by_identity', value)
 
-    def add(self, name, role="member", identity=None, created_by="cli", *, reclaim_runs=False, plans=None):
-        return self._call('add', name, role, identity, created_by, reclaim_runs=reclaim_runs, plans=plans)
+    def add(self, name, role="member", identity=None, created_by="cli", *, reclaim_runs=False, plans=None,
+            operator=False):
+        return self._call('add', name, role, identity, created_by, reclaim_runs=reclaim_runs, plans=plans,
+                          operator=operator)
 
     def remove(self, name):
         return self._call('remove', name)

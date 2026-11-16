@@ -9,7 +9,7 @@ from .keys import ClientError, KeyStoreUnavailable, LastAdminError, validate_nam
 from .db.workspaces import validate_login
 from .keyspage import command_host, read_json
 from .users import (
-    CROSS_WORKSPACE_CREDENTIALS, IdentityTaken, ROLES, UserNameTaken, UserNotFound, allowed,
+    CROSS_WORKSPACE_CREDENTIALS, DETACHED_ACCOUNT, IdentityTaken, ROLES, UserNameTaken, UserNotFound, allowed,
 )
 
 logger = logging.getLogger("agenticml.server.userspage")
@@ -284,5 +284,5 @@ def handle(webauth, handler, path, *, show_owner=False):
             message = str(exc) if isinstance(exc, ClientError) else "invalid request"
             if message == "invalid or reserved key name":
                 message = "invalid or reserved user name"
-            status = 403 if message == CROSS_WORKSPACE_CREDENTIALS else 400
+            status = 403 if message in (CROSS_WORKSPACE_CREDENTIALS, DETACHED_ACCOUNT) else 400
             handler._error({"error": message}, status)

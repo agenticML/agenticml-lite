@@ -88,6 +88,24 @@ class LastServerAdminError(ClientError):
     """Refused: the change would leave the server without a server admin."""
 
 
+class AccountDeleteBlocked(ClientError):
+    """Refused: the account cannot be deleted yet; nothing was changed."""
+
+
+DELETED_ACCOUNT = '[deleted account]'
+# Words the audit log and the account tables use for actors that are not
+# people; a login equal to one of them could not be told apart from them.
+RESERVED_ACTORS = frozenset({
+    'cli', 'setup', 'server up', 'legacy run owner', 'anonymous', 'signup', 'admin-emails',
+    'dashboard'})
+DETACHED_PREFIX = 'detached-from:'
+
+
+def detached_key(account_id):
+    """``server_settings`` name holding the workspace id an account last left."""
+    return DETACHED_PREFIX + account_id
+
+
 class AccountRepo:
     def __init__(self, db):
         self.db = db
@@ -250,6 +268,113 @@ class AccountRepo:
                 tx.execute('DELETE FROM sessions WHERE account_id=?', (account_id,))
                 tx.execute('DELETE FROM accounts WHERE id=? AND login=?', (account_id, login))
 
+    def is_detached(self, account_id, tx):
+        """True when the account has no membership in any workspace."""
+        with tx.cross_scope('account detached check'):
+            return tx.fetchone('SELECT 1 FROM memberships WHERE account_id=?', (account_id,)) is None
+
+    def note_detached(self, account_id, workspace_id, tx):
+        """Remember the workspace an account last left (its only way back over HTTP)."""
+        tx.execute(self.db.dialect.upsert('server_settings', ('name', 'value'), ('name',), ('value',)),
+                   (detached_key(account_id), workspace_id))
+
+    def clear_detached(self, account_id, tx):
+        tx.execute('DELETE FROM server_settings WHERE name=?', (detached_key(account_id),))
+
+    def require_attachable(self, account, workspace_id, tx, *, operator=False):
+        """Refuse HTTP attachment of a detached account unless the caller may.
+
+        An account with no membership may be attached by an operator, or by an
+        admin of the workspace it last left (never a server admin account).
+        Accounts that have a membership somewhere are not affected.
+        """
+        if operator or not self.is_detached(account['id'], tx):
+            return
+        row = tx.fetchone('SELECT value FROM server_settings WHERE name=?', (detached_key(account['id']),))
+        if account['server_admin'] or row is None or row[0] != workspace_id:
+            from ..users import DETACHED_ACCOUNT
+            raise ClientError(DETACHED_ACCOUNT)
+
+    def delete(self, login, tx=None):
+        """Erase one account and the login strings that name it.
+
+        One write transaction. Refuses (nothing changed) while the account is a
+        server admin, owns a workspace or owns runs. Server-level audit rows that
+        name the person are redacted; workspace-level rows stay with their
+        workspace. Returns a summary that does not contain the login.
+        """
+        if tx is None:
+            with self.db.transaction(write=True) as tx:
+                return self.delete(login, tx)
+        tx.cross_workspace('account delete')
+        tx.advisory_lock('users')
+        if not isinstance(login, str) or not login:
+            raise ClientError('unknown account')
+        if login.lower() in RESERVED_ACTORS or login.lower() == DELETED_ACCOUNT:
+            raise AccountDeleteBlocked(
+                'login is reserved as an audit actor name; this command will not delete it')
+        account = self.get(login, tx)
+        if account is None:
+            raise ClientError('unknown account')
+        aid, stored = account['id'], account['login']
+        if account['server_admin']:
+            raise AccountDeleteBlocked(
+                'account is a server admin; run set-server-admin LOGIN off first '
+                'and remove it from the admin emails list')
+        owned = [r[0] for r in tx.fetchall(
+            "SELECT w.slug FROM memberships m JOIN workspaces w ON w.id=m.workspace_id "
+            "WHERE m.account_id=? AND m.role='owner' ORDER BY w.slug", (aid,))]
+        if owned:
+            raise AccountDeleteBlocked(
+                'account owns workspaces: ' + ', '.join(owned) +
+                '; transfer them with `workspaces set-owner` or delete them first')
+        with_runs = [(r[0], r[1]) for r in tx.fetchall(
+            'SELECT w.slug, COUNT(*) FROM runs r JOIN workspaces w ON w.id=r.workspace_id '
+            'WHERE r.owner_account_id=? GROUP BY w.slug ORDER BY w.slug', (aid,))]
+        if with_runs:
+            raise AccountDeleteBlocked(
+                'account owns runs: ' + ', '.join(f'{slug} ({count})' for slug, count in with_runs) +
+                '; delete those runs or their workspaces first')
+        slugs = [r[0] for r in tx.fetchall(
+            'SELECT w.slug FROM memberships m JOIN workspaces w ON w.id=m.workspace_id '
+            'WHERE m.account_id=? ORDER BY w.slug', (aid,))]
+        digests = [r[0] for r in tx.fetchall('SELECT sha256 FROM keys WHERE account_id=?', (aid,))]
+        sessions = tx.execute('DELETE FROM sessions WHERE account_id=?', (aid,)).rowcount
+        for start in range(0, len(digests), 400):
+            chunk = digests[start:start + 400]
+            sessions += tx.execute(
+                'DELETE FROM sessions WHERE key_sha256 IN (' + ','.join('?' * len(chunk)) + ')',
+                tuple(chunk)).rowcount
+        tx.execute('DELETE FROM keys WHERE account_id=?', (aid,))
+        invites = tx.execute('DELETE FROM invites WHERE login=?', (stored,)).rowcount
+        tx.execute('DELETE FROM memberships WHERE account_id=?', (aid,))
+        tx.execute('UPDATE workspaces SET created_by=NULL WHERE created_by=?', (aid,))
+        tx.execute('UPDATE accounts SET created_by=? WHERE created_by=?', (DELETED_ACCOUNT, stored))
+        tx.execute('UPDATE keys SET created_by=? WHERE created_by=?', (DELETED_ACCOUNT, stored))
+        tx.execute('UPDATE invites SET invited_by=? WHERE invited_by=?', (DELETED_ACCOUNT, stored))
+        self.clear_detached(aid, tx)
+        # Failed-login throttle buckets are keyed 'user:<login typed>' and 'uid:<firebase uid>'
+        # (everything else is a client address).
+        names = sorted({n.lower() for n in (account['login'], account['email'], account['identity'])
+                        if isinstance(n, str) and n})
+        buckets = ['user:' + n for n in names]
+        if account['firebase_uid']:
+            buckets.append('uid:' + account['firebase_uid'].lower())
+        throttle = 0
+        if buckets:
+            tx.advisory_lock('throttle')
+            throttle = tx.execute('DELETE FROM login_attempts WHERE LOWER(bucket) IN (' +
+                                  ','.join('?' * len(buckets)) + ')', tuple(buckets)).rowcount
+        if tx.execute('DELETE FROM accounts WHERE id=? AND login=?', (aid, stored)).rowcount != 1:
+            raise DatabaseError('could not delete the account')
+        from .repos import AuditRepo
+        needles = [account[key] for key in ('login', 'email', 'identity', 'firebase_uid')]
+        redacted = AuditRepo(self.db, None).redact_account(
+            needles, tx, display_name=account['display_name'])
+        return {'id': aid, 'memberships': slugs, 'keys': len(digests), 'sessions': sessions,
+                'invites': invites, 'throttle_buckets': throttle, 'audit_redacted': redacted,
+                'firebase_uid': account['firebase_uid'], 'email': account['email']}
+
     def ensure_attribution(self, login, tx):
         """Retain removed 2.x owners without giving them membership or credentials."""
         if login is None:
@@ -333,6 +458,7 @@ class WorkspaceRepo:
         tx.execute('INSERT INTO workspace_usage (workspace_id) VALUES (?)', (wid,))
         tx.execute('INSERT INTO memberships (workspace_id, account_id, role) VALUES (?, ?, ?)',
                    (wid, account['id'], 'owner'))
+        accounts.clear_detached(account['id'], tx)
         return self.by_id(wid, tx)
 
     def allocate_slug(self, base, tx):
@@ -463,6 +589,7 @@ class WorkspaceRepo:
             tx.execute(self.db.dialect.upsert('memberships', ('workspace_id', 'account_id', 'role'),
                                              ('workspace_id', 'account_id'), ('role',)),
                        (row['id'], account['id'], 'owner'))
+            AccountRepo(self.db).clear_detached(account['id'], tx)
 
 
 class MembershipRepo(WorkspaceBound):
@@ -499,6 +626,7 @@ class MembershipRepo(WorkspaceBound):
             if self.get(account_id, tx):
                 raise ClientError('membership already exists')
             tx.execute('INSERT INTO memberships (workspace_id, account_id, role) VALUES (?, ?, ?)', (self.workspace_id, account_id, role))
+            AccountRepo(self.db).clear_detached(account_id, tx)
 
     def remove(self, account_id):
         from .repos import UserRepo
@@ -527,7 +655,7 @@ class InviteRepo(WorkspaceBound):
                 'SELECT login, role, expires_at, invited_by FROM invites WHERE workspace_id=? ORDER BY login',
                 (self.workspace_id,))]
 
-    def create(self, login, role, invited_by, *, plans=None):
+    def create(self, login, role, invited_by, *, plans=None, operator=False):
         from datetime import datetime, timedelta, timezone
         import hashlib
         login = validate_login(login)
@@ -540,6 +668,8 @@ class InviteRepo(WorkspaceBound):
             account = AccountRepo(self.db).get(login, tx)
             if account and MembershipRepo(self.db, self.workspace_id).get(account['id'], tx):
                 raise ClientError('membership already exists')
+            if account:
+                AccountRepo(self.db).require_attachable(account, self.workspace_id, tx, operator=operator)
             if plans is not None:
                 pending = tx.fetchone(
                     'SELECT 1 FROM invites WHERE workspace_id=? AND login=? AND expires_at>?',
@@ -613,6 +743,9 @@ class InviteRepo(WorkspaceBound):
                            'VALUES (?, ?, ?, ?, ?, ?)', (aid, invite['login'], invite['login'], json.dumps(record),
                                                         layout.format_timestamp(), invite['invited_by']))
             else:
+                # A token made before the account was detached does not re-attach
+                # it; a verified Firebase email (redeem_firebase) still can.
+                AccountRepo(self.db).require_attachable(account, self.workspace_id, tx)
                 aid = account['id']
             MembershipRepo(self.db, self.workspace_id).add(aid, invite['role'], tx)
             tx.execute('DELETE FROM invites WHERE workspace_id=? AND login=?', (self.workspace_id, invite['login']))
