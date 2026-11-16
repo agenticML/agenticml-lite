@@ -477,6 +477,7 @@ Resumed and finished on draft PR [#64](https://github.com/agenticML/agenticml-li
 - **Policies filled and fact-checked.** The owner fact sheet is answered (D4, delegated to the supervisor). A three-lens check of the policies against the code and templates applied 28 corrections. The row-level security claim is dropped: the hosted task may connect with a role that bypasses it (Backlog entry). `draft: true` is removed. The Terms, Acceptable use and Privacy pages sit in a Legal sidebar group, and the hosted pages link to them.
 - **GitHub settings done (owner approved):** repo description "Local-first experiment tracking with a self-hosted server and a hosted service", homepage https://agenticml.github.io/agenticml-lite/, and the `hosted` issue label (D5). `HOSTED_DESIRED_COUNT` is deleted.
 - **Enforce HTTPS refused.** GitHub answered "The certificate does not exist yet". Retry after the site is published from `main`.
+- **Row-level security sentence restored (Nov 16, 2026).** The Phase 5.6 check found no bypass warning and row-level security enforced, so the Privacy page's isolation bullet says again that database tables enforce it as a second check.
 - `HOSTED_LEGAL_BASE_URL` is not set in the `hosted` environment, so `/login` and `/invite` show no policy links yet.
 - **Next, in order:**
   1. Merge the PR to `dev`.

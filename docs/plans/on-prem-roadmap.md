@@ -218,7 +218,7 @@ after 27; 29 after 24.7 and 27, beside 24.3 (29.7 and 29.9 wait on the owner).
 | 24 | AWS hosted deployment (Dockerfile, Terraform, deploy workflow, runbook, real-EFS benchmark) | 18c, 19, 20, 21 | Codex, Sonnet; owner runs it | M | [plan](packages/24-aws-deployment.md) | done (code, 3.0 PR; owner checks in Backlog) |
 | 24.1 | Image: Dockerfile, entrypoint, limits file, local hosted smoke test | 21 | Codex, Sonnet | S | [plan](packages/24-aws-deployment.md) | done (3.0 PR) |
 | 24.2 | Terraform, deploy workflow, `deploy-check` CI job, runbook | 24.1 | Codex, Sonnet | M | [plan](packages/24-aws-deployment.md) | done (3.0 PR; `terraform validate` runs in CI) |
-| 24.3 | Apply, first deploy, restore drill, real-EFS benchmark, exit criterion 6 | 24.5 | Owner | S | [AWS roadmap](aws-deployment-roadmap.md) | in progress (AWS roadmap Phases 0–3 done Nov 12, 2026; Phase 4 done Nov 16, 2026 (4.3 and 4.4 confirmed by the owner; packages 24.11 and 28.1 deployed Nov 15, run 43722433179); Phase 5 next, with package 24.12; Phase 6 not started. Per-step status: [AWS roadmap](aws-deployment-roadmap.md)) |
+| 24.3 | Apply, first deploy, restore drill, real-EFS benchmark, exit criterion 6 | 24.5 | Owner | S | [AWS roadmap](aws-deployment-roadmap.md) | in progress (AWS roadmap Phases 0–3 done Nov 12, 2026; Phase 4 done Nov 16, 2026 (4.3 and 4.4 confirmed by the owner; packages 24.11 and 28.1 deployed Nov 15, run 43722433179); Phase 5 in progress (5.1 and 5.6 done Nov 16), with package 24.12; Phase 6 not started. Per-step status: [AWS roadmap](aws-deployment-roadmap.md)) |
 | 24.4 † | CloudFormation replaces Terraform; Namecheap DNS; cost alerts | 24.2 | Sonnet; prose Antigravity | M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49); second review by the supervisor) |
 | 24.4a | `bootstrap.yaml`: ECR, OIDC, roles, certificate, alerts topic, budget, cost-step function | – | Sonnet | S–M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
 | 24.4b | `hosted.yaml` and its tests | 24.4a | Sonnet | M | [plan](packages/24.4-cloudformation.md) | done ([#49](https://github.com/agenticML/agenticml-lite/pull/49)) |
@@ -239,7 +239,7 @@ after 27; 29 after 24.7 and 27, beside 24.3 (29.7 and 29.9 wait on the owner).
 | 24.11b | Sync cursor per host and workspace (`host/w/<slug>`), migrating host-only entries after a `/state` check; `--reset` clears every workspace of the host | 24.11a | Supervisor | S–M | [plan](packages/24.11-phase-4-wrap-up.md) | done ([#65](https://github.com/agenticML/agenticml-lite/pull/65)) |
 | 24.11c † | Firebase servers: no member "Invite link" (API answers 409, Members hides it) | 24.11a | Supervisor | S | [plan](packages/24.11-phase-4-wrap-up.md) | done ([#65](https://github.com/agenticML/agenticml-lite/pull/65); † second review by Cursor: no findings) |
 | 24.11d | Docs: runbook sync section, SERVER.md, PROTOCOL.md, README, website hosted workspaces and storage pages | 24.11b, 24.11c | Antigravity | S | [plan](packages/24.11-phase-4-wrap-up.md) | done ([#65](https://github.com/agenticML/agenticml-lite/pull/65); Antigravity drafted, supervisor checked against the code) |
-| 24.12 | Phase 5 launch checks: `scripts/hosted_check.py` (make-run, verify, isolation), runbook section, roadmap rows | 24.11 | Sonnet; supervisor reviews | S | [plan](packages/24.12-phase-5-launch-checks.md) | in progress (tool built; owner runs 5.1–5.6) |
+| 24.12 | Phase 5 launch checks: `scripts/hosted_check.py` (make-run, verify, isolation), runbook section, roadmap rows | 24.11 | Sonnet; supervisor reviews | S | [plan](packages/24.12-phase-5-launch-checks.md) | in progress (tool built; the owner and the supervisor ran 5.1, 5.4 (encryption), 5.5 (drill) and 5.6 on Nov 16, 2026; 5.2, 5.3 and the rest pending) |
 | 25 | Docs, threat model, version 3.0.0 | 16–24 | Sonnet (Codex at limit); prose Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR; tag and PyPI release by the owner) |
 | 25.1 | Client support window (426), version 3.0.0, base-install smoke, 2.2 client check | 16–24 | Sonnet (Codex at limit) | S | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
 | 25.2 | SERVER.md, HOSTED.md, threat model, PROTOCOL.md, README, website, SECURITY.md | 25.1 | Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
@@ -338,23 +338,6 @@ Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
-- **Row-level security may be bypassed on the hosted database** (package 29
-  policy fact-check, Nov 15, 2026). Security; do before public promotion.
-  - Where: `deploy/aws/cloudformation/hosted.yaml` (the task connects as the RDS master
-    user `agenticml`, lines about 411 and 719); `src/agenticml/server/db/postgres.py`
-    lines 93-97.
-  - Problem: the master user on RDS likely has BYPASSRLS, and the server only
-    logs a warning ("row-level security is not enforced for database role").
-    Isolation still holds in the application through membership checks, but
-    row-level security is the defence in depth the 3.0 plan relies on. The
-    policies no longer claim it.
-  - Fix: check the startup log, or run
-    `SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user`.
-    If bypassed, create a restricted login role for the app (no BYPASSRLS; not
-    the table owner, or the tables keep FORCE RLS, which `dialect.py` already
-    sets) and keep the master user for migrations.
-  - Done when: the hosted log has no such warning, and a test or runbook
-    check shows the app role lacks BYPASSRLS.
 - **Hosted launch and rolling-upload verification** (package 24.3, owner).
   - Where: `deploy/aws/README.md`, sections Prerequisites through Upgrades.
   - Problem: the infrastructure and deployment code have not run in our AWS
@@ -372,6 +355,8 @@ priority.
   - Done when: `app.agenticml.xyz` serves both workspaces and evidence shows
     a rolling deployment loses no uploads; record apply/deploy revisions and
     sign-in, isolation and upload results. Owner only; no agent AWS calls.
+  - Progress (Nov 16, 2026): 5.1 rolling deploy during an upload passed
+    (`hosted_check.py verify` PASS, no lost uploads). The two-task checks are still open.
 - **Hosted backup restore drill** (package 24.3, owner).
   - Where: `deploy/aws/README.md`, Restore drill.
   - Problem: configured backups have not been restored; exit criterion 6
