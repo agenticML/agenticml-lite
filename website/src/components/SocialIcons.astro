@@ -1,0 +1,22 @@
+---
+// The default social icons (GitHub) plus a visible "Sign in" text link to the
+// hosted service. Starlight shows these in the header on wide screens and in
+// the mobile menu footer on narrow ones.
+import Default from '@astrojs/starlight/components/SocialIcons.astro';
+---
+
+<Default><slot /></Default>
+<a href="https://app.agenticml.xyz" class="sign-in">Sign in</a>
+
+<style>
+	.sign-in {
+		color: var(--sl-color-text-accent);
+		font-size: var(--sl-text-sm);
+		font-weight: 600;
+		text-decoration: none;
+		white-space: nowrap;
+	}
+	.sign-in:hover {
+		color: var(--sl-color-white);
+	}
+</style>
