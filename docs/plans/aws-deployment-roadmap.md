@@ -59,10 +59,10 @@ in the PR that records a result.
 | --- | --- | --- | --- |
 | 0. Account checks | **done** (Nov 11) | 0.1–0.4 | – |
 | 1. CloudFormation code | **done** (Nov 11, [#49](https://github.com/agenticML/agenticml-lite/pull/49)) | 1.1–1.6 | – |
-| 2. Bootstrap | **done** (Nov 11) | 2.1, 2.2, 2.3 | 2.1b: the second alert address confirms its email (owner) |
+| 2. Bootstrap | **done** (Nov 11) | 2.1, 2.2, 2.3 | 2.1b: the second alert address re-subscribes (its pending subscription expired; owner) |
 | 3. First deploy | **done** (Nov 12) | 3.0a–3.3 | – |
 | 4. First accounts and data | **done** (Nov 16) | 4.1, 4.2, 4.2a (Nov 13); 4.2b (Nov 15); 4.3 and 4.4 (owner confirmed Nov 16) | – |
-| 5. Launch checks | **in progress** | – | 5.1–5.6 with package [24.12](packages/24.12-phase-5-launch-checks.md) (owner) |
+| 5. Launch checks | **in progress** | 5.1 and 5.6 (Nov 16); 5.4 (encryption) and 5.5 (drill fired) partly | 5.2 isolation and 5.3 2.2 client (owner); the 5.4 download check; the 5.5 email confirmation and the second alert address (2.1b); package [24.12](packages/24.12-phase-5-launch-checks.md) |
 | 6. Recovery and performance | not started | – | After Phase 5 |
 | 7. Public launch | in progress | 7.1 (Nov 14, [#64](https://github.com/agenticML/agenticml-lite/pull/64)); 7.3 (Nov 15); 7.4 policies filled and fact-checked on `dev`; 7.5 built | 7.2 docs-only PR to `main` after the dev PR merges; the owner sets up support@agenticml.xyz mail first; then `HOSTED_LEGAL_BASE_URL` and the deploy (7.4) |
 
@@ -72,9 +72,9 @@ in the PR that records a result.
 | --- | --- |
 | Bootstrap stack `agenticml-hosted-bootstrap` | `UPDATE_COMPLETE`; redeployed twice on Nov 12 with the [24.5](packages/24.5-lean-hosted.md) fixes (immutable OIDC subject, `ecr:BatchGetImage`, EFS service-linked role) |
 | Hosted stack `agenticml-hosted` | `UPDATE_COMPLETE` from deploy run 43722433179 (Nov 15; `dev` at `0bd558d`, the [#65](https://github.com/agenticML/agenticml-lite/pull/65) merge, which includes [#66](https://github.com/agenticML/agenticml-lite/pull/66)), image `0bd558d5b1bb7e0b48b2c39d9b69a9df3e6aa65d-arm64`. It carries package 24.11 (sync state per workspace in the client; no member "Invite link" button on Firebase) and package 28.1 (Settings nav without the Server admin link). The older waiting run 43705268601 (the #66 merge) was rejected as superseded. Earlier: run 43269670813 (Nov 12 and 13) shipped the 24.6 `whoami` change and the Firebase variables |
-| Service | 1 of 1 ARM64 task (0.5 vCPU / 1 GB) running, a new task definition (run 43722433179) |
+| Service | 1 of 1 ARM64 task (0.5 vCPU / 1 GB) running, task definition `agenticml-hosted:9` (run 43722433179); a forced deployment on Nov 16 for step 5.1 replaced the task with the same image |
 | Database | `agenticml-hosted`, `db.t4g.micro`, single-AZ, 20 GB, available |
-| Alarms | all six OK; Container Insights off |
+| Alarms | all six OK; Container Insights off. The 5.5 drill put `agenticml-hosted-alb_5xx` in `ALARM` on Nov 16 (05:11 UTC); it returns to OK by itself |
 | Load balancer | `agenticml-hosted-1705349735.us-east-2.elb.amazonaws.com`; `/healthz` 200 with the `app.agenticml.xyz` host |
 | DNS | `app` CNAME at Namecheap → the load balancer (step 3.2, Nov 12); `https://app.agenticml.xyz/healthz` returns 200 with a valid certificate |
 | Admin account | The first admin, created through `/setup` on Nov 13 (step 4.2): owner of `default`, server admin, password login. With Firebase on, it can no longer sign in on the web; it stays as the break-glass account for the server CLI over ECS Exec |
@@ -144,7 +144,7 @@ account, used by other roles: always pass its ARN to the bootstrap stack.
 | # | Step | Done when | Status |
 | --- | --- | --- | --- |
 | 2.1 | Deploy the bootstrap stack from a laptop with admin credentials, passing the two alert emails and the OIDC ARN from 0.3 if one exists. While it waits, copy the certificate validation CNAME into Namecheap | Stack `CREATE_COMPLETE`; outputs show the roles, ECR URI, certificate and alerts topic | done (Nov 11) |
-| 2.1b | Each alert address clicks the AWS confirmation email | Both subscriptions confirmed | open (owner): the second address had not confirmed on Nov 12; re-subscribe it if the link expired |
+| 2.1b | Each alert address clicks the AWS confirmation email | Both subscriptions confirmed | open (owner): the second address had not confirmed on Nov 12. Found Nov 16: its pending subscription expired and AWS removed it, so the topic has one email subscription. Re-subscribe the second address and confirm it |
 | 2.2 | In GitHub, create the `hosted` environment with required reviewers, limited to trusted branches/tags | Environment exists | done (Nov 11) |
 | 2.3 | Set the `hosted` variables: role ARNs from 2.1, `AWS_REGION=us-east-2`, desired count 2 (`HOSTED_DESIRED_COUNT`, deleted Nov 15, 2026); leave the Firebase variables empty and sign-up `false` | Variables set | done (Nov 11) |
 
@@ -199,16 +199,18 @@ off; the server CLI over ECS Exec still works.
 (`make-run`, `verify`, `isolation`) and the runbook section "Launch checks
 (Phase 5)" in `deploy/aws/README.md`, which has the commands and pass lines for
 each step. The owner runs 5.1 to 5.6 and records date, run id, result and any
-Backlog entry in the row.
+Backlog entry in the row. On Nov 16 the supervisor ran the AWS steps (5.1 deploy,
+5.4 and 5.5 checks, 5.6 log search) with the owner's profile at the owner's
+request, and the owner ran the client side.
 
 | # | Step | Done when | Status |
 | --- | --- | --- | --- |
-| 5.1 | Rolling deploy during an upload: start a large upload (`make-run --mb 300`, then `agenticml sync --all`), then force a new deployment (`aws ecs update-service ... --force-new-deployment`) while it uploads. A re-run of the workflow does not roll anything: the commit is already live, so the change set is empty and ECS starts no new task | No acknowledged upload lost; the client retried and finished on its own; `hosted_check.py verify` passes for the run | ready (owner) |
+| 5.1 | Rolling deploy during an upload: start a large upload (`make-run --mb 300`, then `agenticml sync --all`), then force a new deployment (`aws ecs update-service ... --force-new-deployment`) while it uploads. A re-run of the workflow does not roll anything: the commit is already live, so the change set is empty and ECS starts no new task | No acknowledged upload lost; the client retried and finished on its own; `hosted_check.py verify` passes for the run | done (Nov 16): forced deployment 05:34:23 UTC during a `make-run --mb 1500 --files 60` upload to customer-one; new task healthy 05:35:08; old task draining 05:36:09, stopped with exit 0 at 05:39:18; the 60 object uploads split 30/30 across the two tasks, one finishing during draining; no failed request (one expected 404); sync finished without a re-run; `verify` PASS |
 | 5.2 | Isolation: `hosted_check.py isolation` with customer-one's key against a customer-two run, its objects and URLs, plus one browser session check (customer-one's owner opens customer-two's dashboard and a run URL) | Every probe gets 404, 401 or 403 (or "missing"), never data | ready (owner) |
 | 5.3 | A 2.2 client (commit `bd0d499`) syncs a run to the hosted service | Sync succeeds; `verify` passes with the 3.0 tool | ready (owner) |
-| 5.4 | S3 check: `aws s3api head-object` on sampled objects shows `AES256`; a dashboard download matches the source bytes (`sha256sum`) | `ServerSideEncryption: AES256` on sampled objects; the download's sha256 equals the local artifact's | ready (owner) |
-| 5.5 | Alarm drill: `aws cloudwatch set-alarm-state` puts one alarm in `ALARM`; this also covers the second subscription (2.1b) | Both alert addresses receive the ALARM email | ready (owner) |
-| 5.6 | Row-level security role check: search `/ecs/agenticml-hosted` for "row-level security is not enforced" (the task connects as the RDS master user) | Result recorded (warning present or absent) and the Backlog entry updated | ready (owner) |
+| 5.4 | S3 check: `aws s3api head-object` on sampled objects shows `AES256`; a dashboard download matches the source bytes (`sha256sum`) | `ServerSideEncryption: AES256` on sampled objects; the download's sha256 equals the local artifact's | partly: SSE AES256 on all objects (Nov 16); download check pending (owner) |
+| 5.5 | Alarm drill: `aws cloudwatch set-alarm-state` puts one alarm in `ALARM`; this also covers the second subscription (2.1b) | Both alert addresses receive the ALARM email | partly: drill fired Nov 16, delivered to the one subscribed address; second address must re-subscribe (2.1b) |
+| 5.6 | Row-level security role check: search `/ecs/agenticml-hosted` for "row-level security is not enforced" (the task connects as the RDS master user) | Result recorded (warning present or absent) and the Backlog entry updated | done (Nov 16): no warning; RLS enforced |
 
 ## Phase 6: Recovery and performance (owner)
 

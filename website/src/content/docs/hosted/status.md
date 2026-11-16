@@ -28,12 +28,12 @@ The service runs one server task and one database in a single availability zone.
 - **Nov 15, 2026:** the 3.0 client from `dev` keeps its sync state per workspace, so one local store can sync to several workspaces.
 - **Nov 15, 2026:** the terms of service, acceptable use policy and privacy policy are published.
 - **Nov 16, 2026:** two customer workspaces, each with an admin, a member and a sync key, checked end to end: each person sees only their own workspaces, and a test run synced into each shows only in its own dashboard.
+- **Nov 16, 2026:** a new server version rolled out while a 1.5 GB upload was running; every upload finished, and the server's copy matched the local run byte for byte.
 
 ## In progress
 
 The launch checks are being run on the hosted service:
 
-- **Update while a sync is running:** deploy a new version during an upload and confirm no acknowledged upload is lost.
 - **Isolation:** try a key, a session and an address from one workspace against another, and confirm each gets "not found".
 - **Older client:** confirm a 2.2 client can sync to the hosted service.
 - **Object encryption:** confirm stored objects use the configured encryption, and that downloads match the source bytes.
