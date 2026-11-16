@@ -48,7 +48,7 @@ anything against AWS (billed resources, public endpoint). Exception: on
 Nov 12, 2026 the owner had the supervisor run Phase 3 with the owner's
 `agenticml-account` profile (bootstrap redeploys, approving the deploy run).
 
-## Current state (Nov 15, 2026)
+## Current state (Nov 16, 2026)
 
 Where things stand; update this section, and the Status column of the step,
 in the PR that records a result.
@@ -61,8 +61,8 @@ in the PR that records a result.
 | 1. CloudFormation code | **done** (Nov 11, [#49](https://github.com/agenticML/agenticml-lite/pull/49)) | 1.1–1.6 | – |
 | 2. Bootstrap | **done** (Nov 11) | 2.1, 2.2, 2.3 | 2.1b: the second alert address confirms its email (owner) |
 | 3. First deploy | **done** (Nov 12) | 3.0a–3.3 | – |
-| 4. First accounts and data | **in progress** | 4.1, 4.2, 4.2a (Nov 13); 4.2b (confirmed Nov 15) | 4.3: two customer workspaces on `/admin` and Settings (owner); then 4.4. Package [24.11](packages/24.11-phase-4-wrap-up.md) (done, [#65](https://github.com/agenticML/agenticml-lite/pull/65)) removed the 4.3 and 4.4 workarounds |
-| 5. Launch checks | not started | – | After Phase 4 |
+| 4. First accounts and data | **done** (Nov 16) | 4.1, 4.2, 4.2a (Nov 13); 4.2b (Nov 15); 4.3 and 4.4 (owner confirmed Nov 16) | – |
+| 5. Launch checks | **in progress** | – | 5.1–5.6 with package [24.12](packages/24.12-phase-5-launch-checks.md) (owner) |
 | 6. Recovery and performance | not started | – | After Phase 5 |
 | 7. Public launch | in progress | 7.1 (Nov 14, [#64](https://github.com/agenticML/agenticml-lite/pull/64)); 7.3 (Nov 15); 7.4 policies filled and fact-checked on `dev`; 7.5 built | 7.2 docs-only PR to `main` after the dev PR merges; the owner sets up support@agenticml.xyz mail first; then `HOSTED_LEGAL_BASE_URL` and the deploy (7.4) |
 
@@ -168,12 +168,12 @@ needs (see the 24.5 plan).
 
 ## Phase 4: First accounts and data (owner)
 
-**Status: in progress** (Nov 15, 2026): 4.1, 4.2 and 4.2a done (Nov 13);
+**Status: done** (Nov 16, 2026; the owner confirmed 4.3 and 4.4). Earlier status (Nov 15, 2026): 4.1, 4.2 and 4.2a done (Nov 13);
 4.2b done (the owner signed in with Google as server admin; confirmed Nov
 15); package 24.7 (self-serve server admins) is deployed, so 4.3 runs
 through the web; the ECS Exec commands below still work as a fallback.
 Package [24.11](packages/24.11-phase-4-wrap-up.md) closed the two code gaps
-found for 4.3 and 4.4 ([#65](https://github.com/agenticML/agenticml-lite/pull/65)). Next is 4.3 (owner). Packages 24.11 and 28.1 were deployed on Nov 15, 2026 (run 43722433179), so the member "Invite link" button is already gone on the live service before 4.3. Commands are in `deploy/aws/README.md`, sections "Accounts, Firebase
+found for 4.3 and 4.4 ([#65](https://github.com/agenticML/agenticml-lite/pull/65)). Packages 24.11 and 28.1 were deployed on Nov 15, 2026 (run 43722433179), so the member "Invite link" button is already gone on the live service before 4.3. Commands are in `deploy/aws/README.md`, sections "Accounts, Firebase
 and customers" and "Sync from a training machine" (rewritten in package
 [24.6](packages/24.6-phase-4-runbook.md) after a check against the code).
 
@@ -189,20 +189,26 @@ off; the server CLI over ECS Exec still works.
 | 4.2 | Create the first admin through the `/setup` link logged at startup (newest "No admin user yet" line in `/ecs/agenticml-hosted`), on `https://app.agenticml.xyz` only; login without `@`, password of 12+ characters. This makes the account owner of `default` and server admin and closes `/setup`. **Done** Nov 13, 2026: `server users list` shows the account as `owner`, created by `setup` | You can sign in at `/login`; `/setup` returns 404 | done (Nov 13) |
 | 4.2a | Turn on Firebase sign-in. Firebase console: create a project the owner administers, enable Email/Password (not email link) and Google, add `app.agenticml.xyz` to the authorized domains, register a web app (no Hosting). GitHub `hosted` environment: set `HOSTED_FIREBASE_PROJECT` and `HOSTED_FIREBASE_API_KEY`, keep `HOSTED_OPEN_SIGNUP=false`. Re-run the deploy and approve it. **Done** Nov 13, 2026: project `agenticml-hosted`, deploy run 43269670813 attempt 2, task definition `agenticml-hosted:3` | The task has `AGENTICML_SERVER_FIREBASE_PROJECT`; `/login` shows "Continue with Google" with no console errors; `POST /login` with a password and `/setup` return 404 | done (Nov 13) |
 | 4.2b | Create the owner's web admin account, named after the exact email of the Google account they sign in with. With package 24.7: set `HOSTED_ADMIN_EMAILS` to that email in the GitHub `hosted` environment, approve the deploy, and sign in at `/login` with "Continue with Google"; no ECS Exec. Without 24.7 (fallback): in ECS Exec, `agenticml server accounts add <email> --server-admin --data /data`, then `agenticml server users add <email> --role admin --workspace default --public-url https://app.agenticml.xyz --data /data`. The account has no password, so the first verified Google sign-in with that email links to it. Then sign in at `/login` with "Continue with Google" | The owner lands in `default` as server admin; `server users list` shows the email account | done (owner confirmed Nov 15) |
-| 4.3 | Create two customer workspaces, each with an admin, a member and a sync key, using email logins: with package 24.7, on `/admin` (workspace and owner email) and each workspace's Settings > Members and API keys sections; without it, through ECS Exec (`users add <email>`). People accept their invite or sign in with "Continue with Google" or Firebase email/password; the email must be verified and match the login. Then add one account to the other workspace with a different role (Settings > Members > Send invite, or `users add` over ECS Exec). The Firebase path was re-checked in package 24.7d; with Firebase on, Members has no per-member "Invite link" (24.11): someone who lost their invite gets a new one from "Send invite", and an existing member just signs in at `/login` | Each person sees only their own workspaces, with the right roles | **next** (owner) |
-| 4.4 | On a training machine with 3.0.0 installed from `dev`, sync one smoke run per workspace with that workspace's key. With a client that has package 24.11, one `AGENTICML_DIR` is enough (sync state is kept per workspace); with an older client, use one `AGENTICML_DIR` per workspace | Runs, metrics and artifacts show in the right dashboard and nowhere else | not started (owner, after 4.3) |
+| 4.3 | Create two customer workspaces, each with an admin, a member and a sync key, using email logins: with package 24.7, on `/admin` (workspace and owner email) and each workspace's Settings > Members and API keys sections; without it, through ECS Exec (`users add <email>`). People accept their invite or sign in with "Continue with Google" or Firebase email/password; the email must be verified and match the login. Then add one account to the other workspace with a different role (Settings > Members > Send invite, or `users add` over ECS Exec). The Firebase path was re-checked in package 24.7d; with Firebase on, Members has no per-member "Invite link" (24.11): someone who lost their invite gets a new one from "Send invite", and an existing member just signs in at `/login` | Each person sees only their own workspaces, with the right roles | done (owner confirmed Nov 16) |
+| 4.4 | On a training machine with 3.0.0 installed from `dev`, sync one smoke run per workspace with that workspace's key. With a client that has package 24.11, one `AGENTICML_DIR` is enough (sync state is kept per workspace); with an older client, use one `AGENTICML_DIR` per workspace | Runs, metrics and artifacts show in the right dashboard and nowhere else | done (owner confirmed Nov 16) |
 
 ## Phase 5: Launch checks (owner, exit criterion 6)
 
-**Status: not started.** Starts when Phase 4 is done.
+**Status: in progress** (Nov 16, 2026). Phase 4 is done. Package
+[24.12](packages/24.12-phase-5-launch-checks.md) built `scripts/hosted_check.py`
+(`make-run`, `verify`, `isolation`) and the runbook section "Launch checks
+(Phase 5)" in `deploy/aws/README.md`, which has the commands and pass lines for
+each step. The owner runs 5.1 to 5.6 and records date, run id, result and any
+Backlog entry in the row.
 
 | # | Step | Done when | Status |
 | --- | --- | --- | --- |
-| 5.1 | Rolling deploy: re-run the workflow while a sync is uploading | No acknowledged upload lost; sizes and hashes match | not started |
-| 5.2 | Isolation: a key, session and URL from one workspace against the other | Every request gets the "not found" answer | not started |
-| 5.3 | A 2.2 client syncs to the hosted service | Sync succeeds | not started |
-| 5.4 | Real S3 check: stored objects use the configured encryption; dashboard downloads match the source bytes | Recorded | not started |
-| 5.5 | Exercise one alarm | Email received | not started |
+| 5.1 | Rolling deploy during an upload: start a large upload (`make-run --mb 300`, then `agenticml sync --all`), then force a new deployment (`aws ecs update-service ... --force-new-deployment`) while it uploads. A re-run of the workflow does not roll anything: the commit is already live, so the change set is empty and ECS starts no new task | No acknowledged upload lost; the client retried and finished on its own; `hosted_check.py verify` passes for the run | ready (owner) |
+| 5.2 | Isolation: `hosted_check.py isolation` with customer-one's key against a customer-two run, its objects and URLs, plus one browser session check (customer-one's owner opens customer-two's dashboard and a run URL) | Every probe gets 404, 401 or 403 (or "missing"), never data | ready (owner) |
+| 5.3 | A 2.2 client (commit `bd0d499`) syncs a run to the hosted service | Sync succeeds; `verify` passes with the 3.0 tool | ready (owner) |
+| 5.4 | S3 check: `aws s3api head-object` on sampled objects shows `AES256`; a dashboard download matches the source bytes (`sha256sum`) | `ServerSideEncryption: AES256` on sampled objects; the download's sha256 equals the local artifact's | ready (owner) |
+| 5.5 | Alarm drill: `aws cloudwatch set-alarm-state` puts one alarm in `ALARM`; this also covers the second subscription (2.1b) | Both alert addresses receive the ALARM email | ready (owner) |
+| 5.6 | Row-level security role check: search `/ecs/agenticml-hosted` for "row-level security is not enforced" (the task connects as the RDS master user) | Result recorded (warning present or absent) and the Backlog entry updated | ready (owner) |
 
 ## Phase 6: Recovery and performance (owner)
 

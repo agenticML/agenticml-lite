@@ -8,7 +8,7 @@ sidebar:
     variant: tip
 ---
 
-This page says where the hosted service at `https://app.agenticml.xyz` stands. Updated by hand; last updated Nov 15, 2026. It changes when a check finishes, so it can be behind.
+This page says where the hosted service at `https://app.agenticml.xyz` stands. Updated by hand; last updated Nov 16, 2026. It changes when a check finishes, so it can be behind.
 
 :::note[Public preview]
 The hosted service is a public preview. It runs on a best-effort basis, with no SLA. See the [terms of service](/agenticml-lite/legal/terms/), [acceptable use policy](/agenticml-lite/legal/acceptable-use/) and [privacy policy](/agenticml-lite/legal/privacy/).
@@ -27,24 +27,22 @@ The service runs one server task and one database in a single availability zone.
 - **Nov 14, 2026:** workspace admins manage members and API keys on a Settings page, and server admins can archive and restore workspaces.
 - **Nov 15, 2026:** the 3.0 client from `dev` keeps its sync state per workspace, so one local store can sync to several workspaces.
 - **Nov 15, 2026:** the terms of service, acceptable use policy and privacy policy are published.
+- **Nov 16, 2026:** two customer workspaces, each with an admin, a member and a sync key, checked end to end: each person sees only their own workspaces, and a test run synced into each shows only in its own dashboard.
 
 ## In progress
 
-First customer workspaces, checked end to end:
-
-- Create two workspaces, each with an admin, a member and a sync key.
-- Confirm each person sees only their own workspaces, with the right roles.
-- Sync one test run from a training machine into each workspace, and confirm it shows in the right dashboard and nowhere else.
-
-## Not done yet
-
-These checks are planned and have not been run on the hosted service:
+The launch checks are being run on the hosted service:
 
 - **Update while a sync is running:** deploy a new version during an upload and confirm no acknowledged upload is lost.
 - **Isolation:** try a key, a session and an address from one workspace against another, and confirm each gets "not found".
 - **Older client:** confirm a 2.2 client can sync to the hosted service.
 - **Object encryption:** confirm stored objects use the configured encryption, and that downloads match the source bytes.
 - **Alarms:** trigger one alarm and confirm the notification arrives.
+
+## Not done yet
+
+These checks are planned and have not been run on the hosted service:
+
 - **Restore drill:** restore the database, the file storage and old object versions into a separate test service, and record how long it takes and how much is recovered. Backups exist, but no restore has been tested.
 - **Storage speed:** measure the file storage with 1 and 8 clients syncing at once.
 
