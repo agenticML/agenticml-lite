@@ -202,9 +202,9 @@ holds the deploy slot, and later pushes queue behind it (only the newest one
 is kept). If a newer commit is waiting, reject the older run instead of
 approving it, then approve the newer one.
 
-You can also start a run by hand with GitHub CLI, but GitHub only allows
-`workflow_dispatch` for workflows on the default branch, so this works only
-once `deploy.yml` is also on `main`:
+You can also start a run by hand with GitHub CLI. GitHub only allows
+`workflow_dispatch` for workflows on the default branch. That is `dev`, and
+`deploy.yml` is on it, so this works now:
 
 ```sh
 gh workflow run deploy.yml --ref dev
@@ -335,7 +335,10 @@ web and `/setup` return 404.
    **Settings > Members** in the workspace. An invite produces a one-time link
    (72 hours). The person opens it and signs in with Google or email/password
    using that same email, which must be verified. Inviting someone who already
-   has an account adds the membership directly (no link). On this stack the link
+   has an account adds the membership directly (no link). An account that was
+   removed from its last workspace can only be added back by an admin of that
+   workspace or by an operator (`agenticml server users add LOGIN --workspace
+   SLUG`); otherwise the invite is refused (403). On this stack the link
    looks like `https://app.agenticml.xyz/invite#token=...`: the token sits in the
    URL fragment, which browsers never send, so it stays out of the load balancer
    access logs. If a mail client drops the fragment, the person lands on the
@@ -918,8 +921,8 @@ is updated. Any event means row-level security is bypassed. CloudWatch keeps
 ## Upgrades, rollback and config
 
 Every push to `dev` that changes the image or the stack queues a deploy of
-that commit; approve it in GitHub Actions. Once `deploy.yml` is on `main`, you
-can also dispatch a reviewed commit SHA by hand. Database
+that commit; approve it in GitHub Actions. You can also dispatch a reviewed
+commit SHA by hand. Database
 migrations and imports run at server startup under PostgreSQL advisory locks
 (`pg_advisory_xact_lock`), safely coordinating concurrent task starts. Rolling
 deploys start the new task before stopping the old one
@@ -932,9 +935,9 @@ Re-running a deploy of the commit that is already live is an empty change set
 and does not restart the task. To roll the service without a new commit, use
 `aws ecs update-service --cluster agenticml-hosted --service agenticml-hosted --force-new-deployment`.
 
-Until dispatch is available, roll back by reverting on `dev`: the push of the
-revert triggers a deploy. With dispatch, run the workflow with
-`-f ref=<previous sha>` (ensure its immutable ECR image tag still exists).
+To roll back, run the workflow with `-f ref=<previous sha>` (ensure its
+immutable ECR image tag still exists), or revert on `dev`: the push of the
+revert triggers a deploy.
 Rolling back does **not** undo database
 migrations. A rollback is safe only if that server version supports the current
 database schema and on-disk format. Otherwise roll forward, or restore a
@@ -944,8 +947,8 @@ moving traffic. Never guess at downgrade compatibility.
 To make configuration changes (Multi-AZ, Firebase settings, open sign-up, admin emails, or the policy base URL):
 1. Update the corresponding variable in the GitHub `hosted` environment.
 2. Re-run the deploy workflow with the currently deployed commit ref or SHA
-   (this needs dispatch; until then, use "Re-run all jobs" on the last
-   deploy run, which reads the variables again and needs approval again).
+   (or use "Re-run all jobs" on the last deploy run, which reads the
+   variables again and needs approval again).
 
 The task count is set per run with the `desired_count` input instead (see
 Operations and scaling).
@@ -1192,8 +1195,7 @@ deploy workflow with the `desired_count` input (choices `1`, `0`, `2`; default
 gh workflow run deploy.yml --ref dev -f ref=<deployed sha> -f desired_count=2
 ```
 
-This needs `deploy.yml` on `main` (see First deploy). Until then, to run two
-tasks temporarily:
+As a fallback, to run two tasks temporarily without the workflow:
 
 ```sh
 aws ecs update-service --cluster agenticml-hosted --service agenticml-hosted --desired-count 2

@@ -369,6 +369,10 @@ Getting the hosted service live on AWS, step by step: [AWS deployment roadmap](a
   needs a benchmark that does not run migrations against the hosted
   database; do it when the latency is measured as a problem. Package 30.5
   capped transaction connections and documented the per-process ceiling.
+- Self-serve account deletion from Settings (the tail of the former
+  "Hosted service monitoring" entry). Until then account deletion is an
+  operator step: `agenticml server accounts delete` (package 30.2) and the
+  runbook section "Deleting an account (privacy request)".
 - Metric picker refresh while no run is live (package 30.3 left it out):
   `/metrics` is refreshed only while the runs page polls, which stops when no
   run is `running`.
@@ -380,9 +384,10 @@ entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
 Package 30 (Nov 17, 2026) cleared the Backlog before the 3.0 release: 21
-entries were fixed in parts 30.1–30.6, three moved to "Later (unscheduled)"
-with their reason, and the entries below are the ones that need the owner's
-accounts or machines. None of them blocks merging `dev` into `main`; the
+entries were fixed in parts 30.1–30.6 (for two of them, the many-process
+follow-ups and the metric picker, a remainder moved to "Later
+(unscheduled)"), the permissions boundary moved to Later, and the entries
+below are the ones that need the owner's accounts or machines. None of them blocks merging `dev` into `main`; the
 first one is the release itself.
 
 ### Owner steps

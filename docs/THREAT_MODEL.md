@@ -12,7 +12,7 @@ The server protects seven primary assets:
 4. **API keys and machine credentials**: Stored in the server database (`keys` table) as SHA-256 digests. Plaintext keys are shown once upon creation and never stored or logged. Each key is bound to exactly one workspace.
 5. **User accounts and credentials**: Global accounts stored in the `accounts` table. Passwords are encrypted with computationally expensive `scrypt` hashes with unique random salts. Firebase accounts are bound to immutable Firebase user IDs (`firebase_uid`).
 6. **Workspace memberships and roles**: Stored in `memberships` table, defining whether an account can access a workspace and whether their role is `viewer`, `member`, `admin`, or `owner`.
-7. **Audit trail**: Append-only audit records stored in the `audit_events` table (or local `audit.jsonl`), tracking security-relevant actions, authentication, membership changes, plan updates, and deletions. No secrets are ever written to the audit log.
+7. **Audit trail**: Audit records, added but never edited (except that `server accounts delete` redacts the server-level entries that name the deleted account), stored in the `audit_events` table (or local `audit.jsonl`), tracking security-relevant actions, authentication, membership changes, plan updates, and deletions. No secrets are ever written to the audit log.
 
 ## Trust boundaries
 
@@ -71,7 +71,7 @@ Trust boundaries define the isolation model across single-tenant and multi-tenan
 - **Controls**:
   - **Verified email requirement**: First sign-in via Firebase requires a verified email address before an account or personal workspace is provisioned. Unverified accounts cannot create workspaces or accept invites.
   - **Free workspace quota**: Each user account is restricted to owning at most 1 workspace on the `free` plan.
-  - **Administrative suspension**: Server administrators can immediately suspend or delete abusive workspaces via the CLI or admin dashboard.
+  - **Administrative suspension**: Server administrators can immediately suspend or archive abusive workspaces on the admin dashboard or with the CLI. Permanent deletion is the CLI only (`server workspaces delete`).
 
 ### 6. Firebase authentication and token verification
 

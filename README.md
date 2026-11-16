@@ -216,7 +216,7 @@ agenticml sync RUN_ID --reset
 
 Sync copies each run's store files byte for byte (`meta.json`, `events.jsonl`, scalars, overviews, indexes) plus the objects they reference (code, media, copied artifacts) to an `agenticml server` over [protocol v2](docs/PROTOCOL.md). A per-file cursor in `runs/<id>/sync.json` tracks accepted bytes, so an interrupted sync resumes from the last accepted request. `--all` selects runs that are incomplete or changed. `--watch N` repeats every N seconds until every selected run has synced, failed permanently, or gone stale. `--dry-run` prints counts without sending or saving state. `--reset RUN_ID ...` forgets those runs' cursors for this host, in every workspace, and the next sync resumes from the server's copy (rejects `--all`). The cursor is kept per server and workspace, so one store can sync a run to several workspaces of one server, each with its own key.
 
-Not uploaded: notes (`notes.md`). Lineage code is uploaded to servers that support it, and by-reference (`copy=False`) artifacts are uploaded only with `sync --artifacts`. A run id already owned by another key on the server fails with an error naming that key. See [docs/PROTOCOL.md](docs/PROTOCOL.md) for protocol details.
+Not uploaded: notes (`notes.md`). Lineage code is uploaded to servers that support it, and by-reference (`copy=False`) artifacts are uploaded only with `sync --artifacts`. A run id already owned by another user on the server fails with an error naming that user (`run id <id> belongs to user <name> on this server`). Ownership is per user, so any key of the owning user may write to the run. See [docs/PROTOCOL.md](docs/PROTOCOL.md) for protocol details.
 
 ## On-prem server
 

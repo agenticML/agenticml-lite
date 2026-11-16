@@ -121,7 +121,7 @@ client recovery.
 | `200 OK` | Success | Request completed successfully. |
 | `201 Created` | Created | New content-addressed object stored (`PUT /v2/objects/{sha256}`). |
 | `401 Unauthorized` | Auth failed | Missing, invalid, or revoked bearer token (`WWW-Authenticate: Bearer`). |
-| `403 Forbidden` | Forbidden | Calling key belongs to a `viewer` user (`{"error": "role viewer cannot sync"}`), or workspace storage/upload quota reached. |
+| `403 Forbidden` | Forbidden | Calling key belongs to a `viewer` user (`{"error": "role viewer cannot sync"}`), the workspace is suspended, or workspace storage/upload quota reached. |
 | `404 Not Found` | Not found | Unknown route, invalid run ID, unallowed path, or unknown run on state/append/commit/non-meta PUT. |
 | `405 Method Not Allowed` | Method rejected | Method not allowed for endpoint (`Allow` header returned). |
 | `408 Request Timeout` | Timeout | Request body read exceeded deadline or client disconnected. |
@@ -149,10 +149,12 @@ client recovery.
 
 ## Endpoints
 
+A key of a suspended workspace gets `403 {"error": "workspace suspended"}` on every `/v2` request, including `GET /v2/whoami`.
+
 | Method and path | Request body | Success response | Error codes |
 | --- | --- | --- | --- |
 | `GET /healthz` | None | `200 {"ok": true}` | None |
-| `GET /v2/whoami` | None | `200 {"key": name, "scope": scope, "user": user, "role": role, "protocol": 2, "workspace": slug, "features": ["lineage", "byref"]}` | 401 |
+| `GET /v2/whoami` | None | `200 {"key": name, "scope": scope, "user": user, "role": role, "protocol": 2, "workspace": slug, "features": ["lineage", "byref"]}` | 401, 403, 429 |
 | `POST /v2/objects/missing` | `{"objects": [sha256, ...]}` | `200 {"missing": [sha256, ...]}` | 401, 403, 411, 413, 422, 503 |
 | `PUT /v2/objects/{sha256}` | Raw bytes (`application/octet-stream`) | `201 {"sha256": sha256, "created": true}` or `200 {"sha256": sha256, "created": false}` | 401, 403, 411, 413, 422, 503 |
 | `GET /v2/runs/{id}/state` | None | `200 {"owner": user, "owner_user": user, "files": {path: {"size": n, "sha256": h}}, "remote": {...}}` | 401, 403, 404 |

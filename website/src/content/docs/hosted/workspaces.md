@@ -34,7 +34,7 @@ Owners and admins use **Settings > Members**.
 
 The link works once and expires after 72 hours. The person opens it and signs in with Google, or with email and password, using the same email you invited. The email must be verified. Pending invites are listed under **Pending invites** in the same card, where you can revoke them.
 
-If the email already has an account on the hosted service, the person is added to the workspace straight away and no link is made.
+If the email already has an account on the hosted service, the person is added to the workspace straight away and no link is made. An account that was removed from its last workspace can only be added back by an admin of that workspace or by an operator (`agenticml server users add LOGIN --workspace SLUG`); otherwise the invite is refused (403).
 
 To remove someone or change their role, use **Remove** or the role menu in the Members list.
 

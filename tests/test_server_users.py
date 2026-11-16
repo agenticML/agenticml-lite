@@ -624,8 +624,21 @@ def test_actions_cover_role_table():
     assert ROLES == ("viewer", "member", "admin", "owner")
     assert set(ACTIONS) >= {
         "read", "password", "notes", "sync", "own_keys",
-        "admin_keys", "all_keys", "users", "audit",
+        "admin_keys", "all_keys", "users", "audit", "rename",
     }
+
+
+def test_client_role_mirror_matches_server_actions():
+    import re
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1]
+              / "src" / "agenticml" / "ui" / "static" / "app.js").read_text(encoding="utf-8")
+    block = re.search(r"const ACTION_ROLE = \{(.*?)\};", source, re.S)
+    assert block, "ACTION_ROLE not found in app.js"
+    mirror = dict(re.findall(r'([a-z_]+):\s*"([a-z]+)"', block.group(1)))
+    assert mirror == ACTIONS
+    assert set(mirror.values()) <= set(ROLES)
 
 
 def test_bootstrap_admin_non_admin_named_admin(tmp_path, monkeypatch):
