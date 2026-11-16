@@ -8,10 +8,10 @@ sidebar:
     variant: tip
 ---
 
-This page says where the hosted service at `https://app.agenticml.xyz` stands. Updated by hand; last updated Nov 13, 2026. It changes when a check finishes, so it can be behind.
+This page says where the hosted service at `https://app.agenticml.xyz` stands. Updated by hand; last updated Nov 15, 2026. It changes when a check finishes, so it can be behind.
 
 :::note[Public preview]
-The hosted service is a public preview. It runs on a best-effort basis, with no SLA. The terms of service, acceptable use policy and privacy policy are not published yet.
+The hosted service is a public preview. It runs on a best-effort basis, with no SLA. See the [terms of service](/agenticml-lite/legal/terms/), [acceptable use policy](/agenticml-lite/legal/acceptable-use/) and [privacy policy](/agenticml-lite/legal/privacy/).
 :::
 
 ## Right now
@@ -24,6 +24,9 @@ The service runs one server task and one database in a single availability zone.
 
 - **Nov 12, 2026:** first deploy. The service answers at `https://app.agenticml.xyz` with a valid certificate, and the health check above works.
 - **Nov 13, 2026:** sign-in with Google, or email and password, is on. See [Sign-up](/agenticml-lite/hosted/#sign-up) for the current sign-up state.
+- **Nov 14, 2026:** workspace admins manage members and API keys on a Settings page, and server admins can archive and restore workspaces.
+- **Nov 15, 2026:** the 3.0 client from `dev` keeps its sync state per workspace, so one local store can sync to several workspaces.
+- **Nov 15, 2026:** the terms of service, acceptable use policy and privacy policy are published.
 
 ## In progress
 
@@ -44,7 +47,6 @@ These checks are planned and have not been run on the hosted service:
 - **Alarms:** trigger one alarm and confirm the notification arrives.
 - **Restore drill:** restore the database, the file storage and old object versions into a separate test service, and record how long it takes and how much is recovered. Backups exist, but no restore has been tested.
 - **Storage speed:** measure the file storage with 1 and 8 clients syncing at once.
-- **Policies:** the terms of service, acceptable use policy and privacy policy are not published.
 
 ## Problems
 
