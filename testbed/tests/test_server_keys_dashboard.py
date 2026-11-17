@@ -7,13 +7,14 @@ import threading
 
 import pytest
 from agenticml.server.app import make_server
+from agenticml.server.runs import reconcile
 from agenticml.store import RunWriter
 
 pytest.importorskip("playwright.sync_api")
 from playwright.sync_api import expect
 
 from test_server_dashboard import (
-    assert_no_overflow, browser, context, page, server_ui, sign_in,
+    assert_no_overflow, browser, context, open_settings, page, server_ui, sign_in,
 )
 
 pytestmark = [pytest.mark.browser, pytest.mark.ui]
@@ -37,8 +38,8 @@ def fresh_server(tmp_path, monkeypatch, request):
 
 def open_keys(page, server):
     sign_in(page, server, server["admin"])
-    page.get_by_role("link", name="Keys", exact=True).click()
-    expect(page.get_by_role("heading", name="Keys", exact=True)).to_be_visible()
+    open_settings(page, "keys")
+    expect(page.get_by_role("heading", name="API keys", exact=True)).to_be_visible()
     expect(page.get_by_role("table", name="Keys", exact=True)).to_be_visible()
 
 
@@ -78,14 +79,25 @@ def assert_dialog_fits(page, dialog):
 
 
 def test_setup_creates_admin_and_opens_dashboard(page, fresh_server):
-    page.set_viewport_size({"width": 375, "height": 812})
+    page.set_viewport_size({"width": 1280, "height": 800})
     token = fresh_server["httpd"].web.setup_token
     page.goto(f"{fresh_server['url']}/setup?token={token}")
     expect(page.get_by_role("heading", name="Create admin account", exact=True)).to_be_visible()
     expect(page).to_have_url(f"{fresh_server['url']}/setup")
     assert token not in page.url
+    expect(page.locator(".auth-shell")).to_be_visible()
+    expect(page.locator(".auth-brand")).to_be_visible()
+    expect(page.locator(".field-underline")).to_have_count(3)
+    page.set_viewport_size({"width": 375, "height": 812})
+    expect(page.locator(".auth-brand")).to_be_hidden()
+    expect(page.locator(".auth-compact-logo .auth-logo")).to_be_visible()
     assert_no_overflow(page)
     page.locator("#password").fill("password1234")
+    page.locator("#password2").fill("password1235")
+    page.get_by_role("button", name="Create admin account", exact=True).click()
+    expect(page.locator("#error")).to_have_text("Passwords do not match")
+    assert_no_overflow(page)
+    page.locator("#password2").fill("password1234")
     page.locator("#password2").fill("password1234")
     page.get_by_role("button", name="Create admin account", exact=True).click()
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
@@ -144,8 +156,9 @@ def test_login_command_quotes_shell_arguments(page, fresh_server):
     command = dialog.locator(".key-command").inner_text()
     host = httpd.public_url or fresh_server["url"]
     quoted_host = "'" + host.replace("'", "'\\''") + "'"
-    assert command == f"agenticml login --host {quoted_host} --key '{value}'"
-    assert shlex.split(command) == ["agenticml", "login", "--host", host, "--key", value]
+    assert command == f"agenticml login --host {quoted_host}"
+    assert shlex.split(command) == ["agenticml", "login", "--host", host]
+    assert "--key" not in command and value not in command
 
 
 @pytest.mark.parametrize("event,persisted", [("pagehide", False), ("pageshow", True)])
@@ -186,7 +199,10 @@ def test_create_copy_close_and_revoke_sync_key(page, context, server_ui):
     open_keys(page, server_ui)
     dialog, value = create_key(page, "worker")
     expect(dialog.locator(".key-command")).to_have_text(
-        f"agenticml login --host '{server_ui['url']}' --key '{value}'")
+        f"agenticml login --host '{server_ui['url']}'")
+    expect(dialog.get_by_text("Run this command, then paste the key when it asks for it.", exact=True)).to_be_visible()
+    # The hint mentions no key on the command line; only a <code> element could carry one.
+    expect(dialog.locator("code").filter(has_text="--key")).to_have_count(0)
     expect(dialog.get_by_text("This key is shown once and cannot be recovered.", exact=True)).to_be_visible()
     expect(dialog.get_by_text(
         "No --public-url is set, so this uses the address you opened the dashboard at.", exact=True,
@@ -201,7 +217,9 @@ def test_create_copy_close_and_revoke_sync_key(page, context, server_ui):
     expect(dialog.get_by_role("status")).to_have_text("")
     dialog.get_by_role("button", name="Copy command", exact=True).click()
     expect(dialog.get_by_role("status")).to_have_text("Copied")
-    assert page.evaluate("navigator.clipboard.readText()") == f"agenticml login --host '{server_ui['url']}' --key '{value}'"
+    copied = page.evaluate("navigator.clipboard.readText()")
+    assert copied == f"agenticml login --host '{server_ui['url']}'"
+    assert "--key" not in copied and value not in copied
     expect(copy_key).to_be_visible()
     dialog.get_by_role("button", name="Close", exact=True).click()
     row = key_row(page, "worker")
@@ -229,7 +247,7 @@ def test_copy_fallback_selects_text_and_announces_feedback(page, server_ui, clip
         page.evaluate("Object.defineProperty(navigator, 'clipboard', {value: undefined})")
     else:
         page.evaluate("() => { navigator.clipboard.writeText = () => Promise.reject(new Error('unavailable')); }")
-    for label, text in (("Copy key", value), ("Copy command", f"agenticml login --host '{server_ui['url']}' --key '{value}'")):
+    for label, text in (("Copy key", value), ("Copy command", f"agenticml login --host '{server_ui['url']}'")):
         dialog.get_by_role("button", name=label, exact=True).click()
         page.wait_for_function("text => window.getSelection().toString() === text", arg=text)
         feedback = dialog.get_by_role("button", name="Press Ctrl+C to copy", exact=True)
@@ -246,7 +264,7 @@ def test_copy_fallback_selects_text_and_announces_feedback(page, server_ui, clip
 def test_closing_key_dialog_preserves_outside_selection(page, server_ui):
     open_keys(page, server_ui)
     dialog, value = create_key(page, "worker")
-    page.get_by_role("heading", name="Keys", exact=True).evaluate("""node => {
+    page.get_by_role("heading", name="API keys", exact=True).evaluate("""node => {
         const range = document.createRange();
         range.selectNodeContents(node);
         const selection = window.getSelection();
@@ -254,11 +272,11 @@ def test_closing_key_dialog_preserves_outside_selection(page, server_ui):
         selection.addRange(range);
     }""")
     assert page.evaluate("window.getSelection().rangeCount") == 1
-    assert page.evaluate("window.getSelection().getRangeAt(0).toString()") == "Keys"
+    assert page.evaluate("window.getSelection().getRangeAt(0).toString()") == "API keys"
     dialog.evaluate("node => node.close()")
     assert_key_cleared(page, value)
     assert page.evaluate("window.getSelection().rangeCount") == 1
-    assert page.evaluate("window.getSelection().toString()") == "Keys"
+    assert page.evaluate("window.getSelection().toString()") == "API keys"
 
 
 def test_revoke_own_admin_signs_out(page, server_ui):
@@ -283,14 +301,14 @@ def test_closing_during_create_refreshes_after_the_write(page, server_ui):
         else:
             route.continue_()
 
-    page.route("**/api/server/keys", hold_create)
+    page.route("**/api/w/default/keys", hold_create)
     page.get_by_role("button", name="New key", exact=True).click()
     dialog = page.get_by_role("dialog", name="New key", exact=True)
     dialog.get_by_label("Name", exact=True).fill("delayed-worker")
     with page.expect_request(lambda request: request.method == "POST"):
         dialog.get_by_role("button", name="Create", exact=True).click()
     expect(dialog.get_by_role("button", name="Create", exact=True)).to_be_disabled()
-    with page.expect_response(lambda response: response.url.endswith("/api/server/keys")) as listing:
+    with page.expect_response(lambda response: response.url.endswith("/api/w/default/keys")) as listing:
         dialog.get_by_role("button", name="Close", exact=True).click()
     listing.value.finished()
     expect(key_row(page, "delayed-worker")).to_have_count(0)
@@ -329,7 +347,8 @@ def test_keys_no_overflow_and_dialog_focus_on_narrow_screens(page, server_ui, wi
     expect(dialog.locator(".key-value")).to_be_visible()
     value = dialog.locator(".key-value").inner_text()
     expect(dialog.locator(".key-command")).to_have_text(
-        f"agenticml login --host '{server_ui['url']}' --key '{value}'")
+        f"agenticml login --host '{server_ui['url']}'")
+    expect(dialog.locator("code").filter(has_text="--key")).to_have_count(0)
     assert_no_overflow(page)
     assert_dialog_fits(page, dialog)
     expect(dialog.get_by_role("button", name="Copy key", exact=True)).to_be_focused()
@@ -355,7 +374,7 @@ def test_keys_no_overflow_and_dialog_focus_on_narrow_screens(page, server_ui, wi
         assert table.locator("thead").bounding_box()["width"] <= 1
         expect(table).to_have_css("display", "block")
         expect(table.locator("td").first).to_have_css("display", "grid")
-        assert page.locator(".table-scroll").evaluate("node => node.scrollWidth <= node.clientWidth")
+        assert page.locator("#settings-keys .table-scroll").evaluate("node => node.scrollWidth <= node.clientWidth")
     else:
         expect(table).to_have_css("display", "table")
         expect(table.locator("thead")).to_have_css("display", "table-header-group")
@@ -379,6 +398,7 @@ def metrics_server(fresh_server):
                           for step in range(3)])
     writer.finish("finished")
     writer.close()
+    reconcile(httpd.root, httpd.run_index)
     return {**fresh_server, "admin": admin, "run_id": writer.run_id}
 
 
@@ -459,12 +479,12 @@ def test_create_errors_and_name_validation(page, server_ui):
     name.fill("admin")
     dialog.get_by_role("button", name="Create", exact=True).click()
     expect(dialog.get_by_role("alert")).to_have_text("key name already exists")
-    page.route("**/api/server/keys", lambda route: route.fulfill(
+    page.route("**/api/w/default/keys", lambda route: route.fulfill(
         status=400, json={"error": "invalid key scope"}))
     name.fill("worker")
     dialog.get_by_role("button", name="Create", exact=True).click()
     expect(dialog.get_by_role("alert")).to_have_text("invalid key scope")
-    page.unroute("**/api/server/keys")
+    page.unroute("**/api/w/default/keys")
     dialog.get_by_role("button", name="Close", exact=True).click()
 
 
@@ -513,13 +533,13 @@ def test_create_errors_and_name_validation(page, server_ui):
 def test_unusable_key_responses_show_readable_status(page, server_ui, method, status, body):
     page.allow_http_errors = True
     open_keys(page, server_ui)
-    page.route("**/api/server/keys**", lambda route: route.fulfill(
+    page.route("**/api/w/default/keys**", lambda route: route.fulfill(
         status=status, content_type="text/html", body=body,
     ) if route.request.method == method else route.continue_())
     if method == "GET":
         page.locator(".breadcrumb").click()
         expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
-        page.get_by_role("link", name="Keys", exact=True).click()
+        open_settings(page, "keys")
         expect(page.get_by_role("alert")).to_have_text(f"Could not load keys ({status})")
         expect(page.locator(".key-value")).to_have_count(0)
         expect(page.locator(".key-command")).to_have_count(0)
@@ -544,7 +564,7 @@ def test_write_401_keeps_buttons_disabled_until_login(page, context, server_ui, 
     page.allow_http_errors = True
     open_keys(page, server_ui)
     context.clear_cookies()
-    page.route("**/api/server/keys**", lambda route: route.fulfill(
+    page.route("**/api/w/default/keys**", lambda route: route.fulfill(
         status=401, json={"error": "login required"},
     ) if route.request.method == method else route.continue_())
     if method == "POST":
@@ -577,14 +597,14 @@ def test_write_401_keeps_buttons_disabled_until_login(page, context, server_ui, 
 
 def test_older_refresh_does_not_replace_newer_keys(page, server_ui):
     open_keys(page, server_ui)
-    original = page.request.get(f"{server_ui['url']}/api/server/keys").json()
+    original = page.request.get(f"{server_ui['url']}/api/w/default/keys").json()
     pending_create = []
-    page.route("**/api/server/keys", lambda route: pending_create.append(route)
+    page.route("**/api/w/default/keys", lambda route: pending_create.append(route)
                if route.request.method == "POST" else route.continue_())
     page.evaluate("""() => {
         const original = window.fetch;
         window.keyReads = [];
-        window.fetch = (url, options) => url === '/api/server/keys' && !options.method
+        window.fetch = (url, options) => url === '/api/w/default/keys' && !options.method
             ? new Promise(resolve => window.keyReads.push(data => resolve(new Response(JSON.stringify(data)))))
             : original(url, options);
     }""")
@@ -598,7 +618,7 @@ def test_older_refresh_does_not_replace_newer_keys(page, server_ui):
     with page.expect_response(lambda response: response.request.method == "POST"):
         pending_create[0].continue_()
     page.wait_for_function("() => window.keyReads.length === 2")
-    latest = page.request.get(f"{server_ui['url']}/api/server/keys").json()
+    latest = page.request.get(f"{server_ui['url']}/api/w/default/keys").json()
     page.evaluate("data => window.keyReads[1](data)", latest)
     expect(key_row(page, "worker")).to_be_visible()
     page.evaluate("""async data => {
@@ -639,14 +659,16 @@ def test_route_change_clears_secret_and_ignores_late_response(page, server_ui, s
         const original = window.fetch;
         window.runReads = 0;
         window.fetch = (url, options) => {
-            if (url === '/api/runs') window.runReads++;
-            return url === '/api/server/keys' ? new Promise(resolve => {
+            if (url === '/api/w/default/runs') window.runReads++;
+            return url === '/api/w/default/keys' ? new Promise(resolve => {
                 window.resolveKeys = () => resolve(new Response(null, {status}));
             }) : original(url, options);
         };
     }""", status)
-    page.get_by_role("link", name="Keys", exact=True).click()
-    expect(page.get_by_role("heading", name="Keys", exact=True)).to_be_visible()
+    page.get_by_role("link", name="Settings", exact=True).click()
+    page.get_by_role("navigation", name="Settings", exact=True).get_by_role(
+        "link", name="API keys", exact=True).click()
+    expect(page.get_by_role("heading", name="API keys", exact=True)).to_be_visible()
     page.wait_for_function("() => typeof window.resolveKeys === 'function'")
     page.locator(".breadcrumb").click()
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
@@ -657,16 +679,35 @@ def test_route_change_clears_secret_and_ignores_late_response(page, server_ui, s
         await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     }""")
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
-    expect(page).to_have_url(f"{server_ui['url']}/#/")
+    expect(page).to_have_url(f"{server_ui['url']}/w/default/#/")
     assert page.evaluate("window.runReads") == reads
 
 
 def test_keys_401_redirects_to_login(page, context, server_ui):
     page.allow_http_errors = True
     sign_in(page, server_ui, server_ui["admin"])
-    expect(page.get_by_role("link", name="Keys", exact=True)).to_be_visible()
+    expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+    # Only the keys 401 may send the browser to /login. The members read answers 200 (the
+    # keys card reads it before the keys, and the team card reads it too); every other
+    # workspace read (the runs poll, invites, usage) is parked, because its own 401 would
+    # redirect first.
+    parked = []
+
+    def answer(route):
+        url = route.request.url
+        if url.endswith("/api/w/default/keys"):
+            route.continue_()
+        elif url.endswith("/api/w/default/members"):
+            route.fulfill(status=200, json={"users": []})
+        else:
+            parked.append(route)
+
+    page.route("**/api/w/default/**", answer)
     context.clear_cookies()
-    page.get_by_role("link", name="Keys", exact=True).click()
+    # Navigate by hash: the Settings link can be re-rendered while the click retries.
+    with page.expect_response(f"{server_ui['url']}/api/w/default/keys") as keys:
+        page.evaluate("location.hash = '#/settings/keys'")
+    assert keys.value.status == 401
     expect(page).to_have_url(f"{server_ui['url']}/login")
 
 
@@ -696,11 +737,12 @@ def test_keys_failure_removes_navigation_listeners(page, server_ui, failure):
     track_keys_listeners(page)
     # A 204 keeps the current document available for checking disposal before navigation.
     page.route("**/login", lambda route: route.fulfill(status=204))
+    # The owner's Settings page mounts the keys and the team sections: two listeners each.
     if failure == "request-401":
-        page.get_by_role("link", name="Keys", exact=True).click()
+        open_settings(page, "keys")
         expect(page.get_by_role("table", name="Keys", exact=True)).to_be_visible()
-        assert page.evaluate("Object.values(window.keysListeners).every(listeners => listeners.size === 1)")
-        page.route("**/api/server/keys", lambda route: route.fulfill(status=401, json={}))
+        assert page.evaluate("Object.values(window.keysListeners).every(listeners => listeners.size === 2)")
+        page.route("**/api/w/default/keys", lambda route: route.fulfill(status=401, json={}))
         page.get_by_role("button", name="New key", exact=True).click()
         dialog = page.get_by_role("dialog", name="New key", exact=True)
         dialog.get_by_label("Name", exact=True).fill("worker")
@@ -708,30 +750,38 @@ def test_keys_failure_removes_navigation_listeners(page, server_ui, failure):
             dialog.get_by_role("button", name="Create", exact=True).click()
         expect(page.get_by_role("dialog")).to_have_count(0)
     else:
-        page.route("**/api/server/keys", lambda route: route.fulfill(
+        page.route("**/api/w/default/keys", lambda route: route.fulfill(
             status=401 if failure == "refresh-401" else 200, json={}))
         if failure == "refresh-401":
             with page.expect_request(f"{server_ui['url']}/login"):
-                page.get_by_role("link", name="Keys", exact=True).click()
+                page.get_by_role("link", name="Settings", exact=True).click()
         else:
-            page.get_by_role("link", name="Keys", exact=True).click()
+            open_settings(page, "keys")
             expect(page.get_by_text("Could not load keys (200)", exact=True)).to_be_visible()
-    assert page.evaluate("window.keysListenerAdds") == 2
+    assert page.evaluate("window.keysListenerAdds") == 4
+    if failure != "bad-body":
+        # The keys section disposed itself; only the team section's listeners remain.
+        assert page.evaluate("Object.values(window.keysListeners).every(listeners => listeners.size === 1)")
+    # Leaving Settings removes every listener, however the keys section ended.
+    page.locator(".breadcrumb").click()
+    expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
     assert page.evaluate("Object.values(window.keysListeners).every(listeners => listeners.size === 0)")
 
 
-def test_local_ui_hides_keys_and_falls_back_to_runs(page, tmp_path, ui_server_factory):
+def test_local_ui_hides_settings_and_falls_back_to_runs(page, tmp_path, ui_server_factory):
     page.allow_http_errors = True
     with ui_server_factory(tmp_path / "local") as server:
         page.goto(server.url)
         expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
-        expect(page.locator("#nav-keys")).to_be_hidden()
+        for hidden in ("#nav-workspaces", "#nav-settings", "#nav-admin", "#account"):
+            expect(page.locator(hidden)).to_be_hidden()
         track_keys_listeners(page)
-        page.goto(f"{server.url}/#/keys")
-        expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
-        expect(page.locator("#nav-keys")).to_be_hidden()
-        assert page.evaluate("window.keysListenerAdds") == 2
-        assert page.evaluate("Object.values(window.keysListeners).every(listeners => listeners.size === 0)")
+        for legacy in ("keys", "team", "settings/members"):
+            page.goto(f"{server.url}/#/{legacy}")
+            expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+            expect(page).to_have_url(f"{server.url}/#/")
+            expect(page.locator("#nav-settings")).to_be_hidden()
+            assert page.evaluate("window.keysListenerAdds") == 0
         page.goto(f"{server.url}/#/")
         expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
         assert page.evaluate("Object.values(window.keysListeners).every(listeners => listeners.size === 0)")

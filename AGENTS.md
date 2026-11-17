@@ -23,6 +23,10 @@ plans sit next to it in `docs/plans/`.
   blocked; set its status to `blocked: <reason>`.
 - Update a package's status in the same PR that changes it, and make sure its
   "Done when" check is satisfied (tests added and passing).
+- Keep progress visible: give each part of a multi-part package its own
+  roadmap sub-row, and push the branch with a draft PR as soon as the first
+  package is committed, then push every later package or part as it is
+  committed (see the roadmap's "Status" section).
 - When you leave something unfinished (found in review, out of scope, a
   known bug or follow-up), add it to the roadmap's Backlog with: where,
   problem, fix, and "done when". Place it by priority, not at the end by

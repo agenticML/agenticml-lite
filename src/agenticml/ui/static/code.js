@@ -216,9 +216,9 @@ export async function createCodeViewer({
   objectURL,
   parentId,
   onBaseline,
+  codeURL = (id) => `/api/runs/${encodeURIComponent(id)}/code`,
 }) {
-  const api = (id) => `/api/runs/${encodeURIComponent(id)}/code`;
-  const allFiles = (await get(api(run.run_id), signal)).sort((a, b) =>
+  const allFiles = (await get(codeURL(run.run_id), signal)).sort((a, b) =>
     a.path.localeCompare(b.path),
   );
   // The snapshot records which file was launched; the name guess is a fallback
@@ -259,7 +259,7 @@ export async function createCodeViewer({
   for (let start = 0; start < candidates.length && !baseline; start += 4) {
     const batch = candidates.slice(start, start + 4);
     const manifests = await Promise.all(
-      batch.map((candidate) => get(api(candidate.run_id), signal)),
+      batch.map((candidate) => get(codeURL(candidate.run_id), signal)),
     );
     const index = manifests.findIndex((files) => files.length);
     if (index >= 0) {

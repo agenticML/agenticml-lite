@@ -14,10 +14,258 @@ const fmt = (value) =>
         : String(value);
 const date = (value) =>
   Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString() : "—";
-const apiRun = (id) => `/api/runs/${encodeURIComponent(id)}`;
+// Server dashboard pages live at /w/<slug>/ and prefix APIs with /api/w/<slug>.
+// The local `agenticml ui` (pathname `/`) keeps /api/... so it stays unchanged.
+const WORKSPACE_PAGE = /^\/w\/([^/]+)/;
+function api(path) {
+  const queryAt = path.indexOf("?");
+  const pathname = queryAt < 0 ? path : path.slice(0, queryAt);
+  const query = queryAt < 0 ? "" : path.slice(queryAt);
+  const rest = pathname.replace(/^\/+/, "");
+  if (rest === "account" || rest.startsWith("account/"))
+    return `/api/${rest}${query}`;
+  const match = WORKSPACE_PAGE.exec(location.pathname);
+  if (match)
+    return `/api/w/${encodeURIComponent(match[1])}${rest ? `/${rest}` : ""}${query}`;
+  return `/api${rest ? `/${rest}` : ""}${query}`;
+}
+function currentWorkspaceSlug() {
+  const match = WORKSPACE_PAGE.exec(location.pathname);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+function isAdminPath() {
+  return location.pathname.replace(/\/+$/, "") === "/admin";
+}
+function currentWorkspaceRole(session) {
+  const slug = currentWorkspaceSlug();
+  const role = typeof session?.role === "string" ? session.role : "";
+  if (!slug) return role;
+  const row = sessionWorkspaces(session).find((item) => item.slug === slug);
+  return row && typeof row.role === "string" && row.role ? row.role : role;
+}
+function setWorkspaceCookie(slug) {
+  const parts = [
+    `aml_ws=${encodeURIComponent(slug)}`, "Path=/", "SameSite=Lax", "Max-Age=31536000",
+  ];
+  if (location.protocol === "https:") parts.push("Secure");
+  document.cookie = parts.join("; ");
+}
+function sessionWorkspaces(session) {
+  if (!Array.isArray(session?.workspaces)) return [];
+  return session.workspaces.filter(
+    (row) => row && typeof row.slug === "string" && row.slug,
+  );
+}
+const ROLE_RANK = { viewer: 0, member: 1, admin: 2, owner: 3 };
+const ACTION_ROLE = {
+  read: "viewer", password: "viewer",
+  notes: "member", sync: "member", own_keys: "member",
+  admin_keys: "admin", all_keys: "admin", users: "admin", audit: "admin",
+  rename: "admin",
+};
+function roleAllows(role, action) {
+  const have = ROLE_RANK[role];
+  const need = ROLE_RANK[ACTION_ROLE[action]];
+  return Number.isInteger(have) && Number.isInteger(need) && have >= need;
+}
+function workspaceCan(session) {
+  const none = { notes: false, own_keys: false, all_keys: false, users: false, audit: false, rename: false };
+  const slug = currentWorkspaceSlug();
+  if (!slug) return none;
+  const row = sessionWorkspaces(session).find((item) => item.slug === slug);
+  const role = row && typeof row.role === "string" ? row.role : "";
+  return {
+    notes: roleAllows(role, "notes"),
+    own_keys: roleAllows(role, "own_keys"),
+    all_keys: roleAllows(role, "all_keys"),
+    users: roleAllows(role, "users"),
+    audit: roleAllows(role, "audit"),
+    rename: roleAllows(role, "rename"),
+  };
+}
+function switchWorkspace(slug) {
+  setWorkspaceCookie(slug);
+  location.assign(`/w/${encodeURIComponent(slug)}/`);
+}
+function formatGb(bytes) {
+  if (bytes == null) return "unlimited";
+  return `${(Number(bytes) / 1e9).toFixed(1)} GB`;
+}
+function formatLimitCount(value) {
+  return value == null ? "unlimited" : String(value);
+}
+function usageBannerMessages(data) {
+  const items = [];
+  const consider = (used, limit, warn, reached) => {
+    if (limit == null || !Number.isFinite(used)) return;
+    if (used >= limit)
+      items.push({ text: reached, tone: "danger" });
+    else if (used >= 0.8 * limit)
+      items.push({ text: warn(Math.floor((100 * used) / limit)), tone: "warn" });
+  };
+  consider(
+    data?.storage?.used, data?.storage?.limit,
+    (pct) => `Storage ${pct}% used`,
+    "Storage limit reached: syncing is paused",
+  );
+  consider(
+    data?.uploads_today?.used, data?.uploads_today?.limit,
+    (pct) => `Daily uploads ${pct}% used`,
+    "Daily upload limit reached: resets at 00:00 UTC",
+  );
+  return items;
+}
+function usageBannerHost() {
+  let node = document.querySelector("#usage-banner");
+  if (node) return node;
+  node = el("div", { id: "usage-banner", class: "usage-banners", hidden: true });
+  document.querySelector("header.topbar")?.after(node);
+  return node;
+}
+async function loadUsageBanner() {
+  const host = usageBannerHost();
+  if (!serverMode || isAdminPath() || !currentWorkspaceSlug()) {
+    host.replaceChildren();
+    host.hidden = true;
+    return;
+  }
+  try {
+    const response = await fetch(api("/usage"), { credentials: "same-origin" });
+    const data = await response.json().catch(() => null);
+    if (!response.ok || !data || data.limits === null) {
+      host.replaceChildren();
+      host.hidden = true;
+      return;
+    }
+    const items = usageBannerMessages(data);
+    if (!items.length) {
+      host.replaceChildren();
+      host.hidden = true;
+      return;
+    }
+    host.hidden = false;
+    host.replaceChildren(...items.map((item) => el("p", {
+      class: `callout callout-${item.tone} usage-banner`,
+      role: "status",
+      text: item.text,
+    })));
+  } catch {
+    host.replaceChildren();
+    host.hidden = true;
+  }
+}
+function newWorkspaceForm(session, { card = false } = {}) {
+  if (!session.open_signup) return null;
+  const error = el("p", { class: "error", role: "alert", hidden: true });
+  const slug = el("input", {
+    id: "switcher-new-slug", class: "field", required: true, maxLength: 40,
+    pattern: "[a-z0-9][a-z0-9\\-]{0,39}", autocomplete: "off",
+  });
+  const name = el("input", {
+    id: "switcher-new-name", class: "field", required: true, maxLength: 256,
+    autocomplete: "off",
+  });
+  const save = el("button", { type: "submit", class: "btn btn-primary btn-sm", text: "Create" });
+  const form = el("form", { class: "stack workspace-new" },
+    card ? null : el("h3", { class: "eyebrow", text: "New workspace" }),
+    el("label", { class: "field-label", htmlFor: slug.id, text: "Slug" }), slug,
+    el("label", { class: "field-label", htmlFor: name.id, text: "Name" }), name,
+    save, error);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    error.hidden = true;
+    save.disabled = true;
+    try {
+      const response = await fetch(api("/account/workspaces"), {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "X-AgenticML-Request": "1", "Content-Type": "application/json" },
+        body: JSON.stringify({ slug: slug.value.trim(), name: name.value.trim() }),
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(
+        (typeof data?.error === "string" && data.error) || `Request failed (${response.status})`);
+      if (typeof data?.slug !== "string" || !data.slug)
+        throw new Error("workspace was not created");
+      switchWorkspace(data.slug);
+    } catch (reason) {
+      error.textContent = reason.message;
+      error.hidden = false;
+      save.disabled = false;
+    }
+  });
+  if (!card) return form;
+  return el("details", { class: "settings-details" },
+    el("summary", { text: "New workspace" }), form);
+}
+function workspaceSwitcher(session, { card = false } = {}) {
+  const workspaces = sessionWorkspaces(session);
+  if (workspaces.length <= 1 && !session.server_admin && !session.open_signup) return null;
+  const current = currentWorkspaceSlug();
+  const items = workspaces.map((row) => {
+    const name = typeof row.name === "string" && row.name ? row.name : row.slug;
+    const role = typeof row.role === "string" ? row.role : "";
+    const isCurrent = row.slug === current;
+    if (card) {
+      return el("li", {},
+        el("span", { class: "settings-row-name", "data-slug": row.slug, text: name }),
+        role ? el("span", { class: "settings-row-role", text: role }) : null,
+        el("span", { class: "settings-row-slot" },
+          isCurrent
+            ? el("span", { class: "chip ok", "aria-current": "true", text: "current" })
+            : el("button", {
+                type: "button",
+                class: "btn btn-ghost btn-sm",
+                "aria-label": `Switch to ${name}`,
+                text: "Switch",
+                onclick: () => switchWorkspace(row.slug),
+              })));
+    }
+    return el(
+      "li",
+      {},
+      el(
+        "button",
+        {
+          type: "button",
+          class: "btn btn-ghost btn-sm workspace-switcher-item",
+          ...(isCurrent
+            ? {
+                "aria-current": "true",
+                disabled: true,
+                "aria-label": `Current workspace: ${name}`,
+              }
+            : {
+                "aria-label": `Switch to ${name}`,
+                onclick: () => switchWorkspace(row.slug),
+              }),
+        },
+        el("span", { class: "workspace-switcher-name", text: name }),
+        role
+          ? el("span", { class: "workspace-switcher-role", text: role })
+          : null,
+        isCurrent ? chip("current") : null,
+      ),
+    );
+  });
+  return el(
+    "div",
+    { class: `workspace-switcher stack${card ? " settings-section" : ""}` },
+    el("h3", { class: "eyebrow", text: "Workspaces" }),
+    el("ul", {
+      class: card ? "settings-rows" : "workspace-switcher-list", "aria-label": "Workspaces",
+    }, ...items),
+    newWorkspaceForm(session, { card }),
+    // On workspace pages the Admin link is in the top bar and the Settings nav.
+    !card && session.server_admin
+      ? el("a", { class: "btn btn-ghost btn-sm", href: "/admin/", text: "Admin" })
+      : null,
+  );
+}
+const apiRun = (id) => api(`/runs/${encodeURIComponent(id)}`);
 const routeRun = (id) => `#/run/${encodeURIComponent(id)}`;
 const objectURL = (sha, type) =>
-  `/api/objects/${encodeURIComponent(sha)}?${new URLSearchParams({ type })}`;
+  `${api(`/objects/${encodeURIComponent(sha)}`)}?${new URLSearchParams({ type })}`;
 function el(tag, attrs = {}, ...children) {
   const node = document.createElement(tag);
   for (const [key, value] of Object.entries(attrs)) {
@@ -119,8 +367,34 @@ function changedLine(run, parent, isRoot, siblingKeys = []) {
 }
 // Runs filter. Words match name, id and tags; "task:x", "tag:x" and
 // "status:x" (with "failed" for crashed) narrow by task, tag and status; "key>n", "key<n", "key>=n",
-// "key<=n" and "key=v" test config, then summary, values. Every token must hold.
+// "key<=n" and "key=v" test config, then summary, values. "name.last|min|max<op><n>"
+// (e.g. loss.min<0.5) tests run.metrics when present. Every token must hold.
 const FILTER_COMPARISON = /^([^<>=:]+)(>=|<=|>|<|=)(.+)$/;
+const METRIC_FILTER = /^(.+)\.(last|min|max)(>=|<=|>|<|=)(.+)$/;
+function metricCompare(value, op, raw) {
+  const number = Number(raw);
+  if (op === "=")
+    return String(fmt(value)).toLowerCase() === raw || value === number;
+  if (!isNumber(value) || !Number.isFinite(number)) return false;
+  return op === ">"
+    ? value > number
+    : op === "<"
+      ? value < number
+      : op === ">="
+        ? value >= number
+        : value <= number;
+}
+function metricKey(run, name) {
+  if (!name || !run?.metrics) return undefined;
+  if (Object.prototype.hasOwnProperty.call(run.metrics, name)) return name;
+  return Object.keys(run.metrics).find(
+    (item) => item.toLowerCase() === String(name).toLowerCase(),
+  );
+}
+function metricStat(run, name, stat) {
+  const key = metricKey(run, name);
+  return key == null ? undefined : run.metrics[key]?.[stat];
+}
 function runMatches(run, query) {
   const text = `${run.name} ${run.run_id} ${(run.tags || []).join(" ")}`.toLowerCase();
   return query
@@ -140,6 +414,15 @@ function runMatches(run, query) {
           statusText(run.status, run).startsWith(wanted)
         );
       }
+      const metricToken = METRIC_FILTER.exec(token);
+      if (metricToken) {
+        const [, name, stat, op, raw] = metricToken;
+        // Only treat name.stat as a metric when this run actually has that
+        // series; otherwise fall through so dotted config keys like lr.min
+        // still use the comparison grammar.
+        if (metricKey(run, name) != null)
+          return metricCompare(metricStat(run, name, stat), op, raw);
+      }
       const compared = FILTER_COMPARISON.exec(token);
       if (compared) {
         const [, name, op, raw] = compared;
@@ -150,17 +433,7 @@ function runMatches(run, query) {
         if (configKey == null && summaryKey == null) return false;
         const value =
           configKey != null ? run.config[configKey] : run.summary[summaryKey];
-        const number = Number(raw);
-        if (op === "=")
-          return String(fmt(value)).toLowerCase() === raw || value === number;
-        if (!isNumber(value) || !Number.isFinite(number)) return false;
-        return op === ">"
-          ? value > number
-          : op === "<"
-            ? value < number
-            : op === ">="
-              ? value >= number
-              : value <= number;
+        return metricCompare(value, op, raw);
       }
       return text.includes(token);
     });
@@ -240,7 +513,7 @@ async function get(url, signal = controller?.signal) {
   }
   if (!response.ok)
     throw new Error(
-      `${response.status}: ${url.startsWith("/api/objects/") ? "Object unavailable" : await response.text()}`,
+      `${response.status}: ${url.includes("/objects/") ? "Object unavailable" : await response.text()}`,
     );
   return response.json();
 }
@@ -303,7 +576,17 @@ function viaLabel(via) {
       ? "admin key"
       : via || "—";
 }
-fetch("/api/server/session", { credentials: "same-origin" })
+// Same few lines as server/static/signout.js (the picker page): that file is not
+// served by local `agenticml ui`, and this module is account-scoped on the server.
+async function signOut() {
+  await fetch("/logout", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "X-AgenticML-Request": "1" },
+  });
+  location.assign("/login");
+}
+const sessionReady = fetch(api("/account/session"), { credentials: "same-origin" })
   .then(async (response) => {
     let data = null;
     try {
@@ -317,25 +600,27 @@ fetch("/api/server/session", { credentials: "same-origin" })
     if (!response.ok || !data) return;
     serverMode = true;
     serverSession = data;
-    document.querySelector("#nav-keys").hidden = !data.can?.own_keys;
-    document.querySelector("#nav-team").hidden = !data.can?.users;
+    const adminPath = isAdminPath();
+    // Workspace pages get one Settings entry (Keys, Team and Account live there);
+    // the Account dialog stays only on /admin, which has no Settings page.
+    const onWorkspace = !adminPath && currentWorkspaceSlug() !== null;
+    document.querySelector("#nav-workspaces").hidden = !onWorkspace && !adminPath;
+    document.querySelector("#nav-settings").hidden = !onWorkspace;
+    document.querySelector("#nav-admin").hidden = !onWorkspace || !data.server_admin;
+    // The empty label keeps its auto margin, which right-aligns the bar's buttons.
+    document.querySelector("#host").textContent = "";
     const box = document.querySelector("#session");
     const label = document.querySelector("#session-label");
-    label.textContent = `Signed in as ${data.user} · ${data.role}`;
+    label.textContent = `Signed in as ${data.user} · ${currentWorkspaceRole(data)}`;
     box.title = label.textContent;
     box.hidden = false;
-    document.querySelector("#account").hidden = false;
-    const signOut = document.querySelector("#sign-out");
-    signOut.hidden = data.via === "proxy";
-    signOut.onclick = async () => {
-      await fetch("/logout", {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "X-AgenticML-Request": "1" },
-      });
-      location.assign("/login");
-    };
-    document.querySelector("#account").onclick = () => openAccountDialog();
+    const account = document.querySelector("#account");
+    account.hidden = !adminPath;
+    const signOutButton = document.querySelector("#sign-out");
+    signOutButton.hidden = data.via === "proxy";
+    signOutButton.onclick = signOut;
+    account.onclick = () => openAccountDialog();
+    loadUsageBanner();
   })
   .catch(() => {});
 document.querySelector("#close-lightbox").onclick = () =>
@@ -367,82 +652,111 @@ function trapTab(host, event) {
     (event.shiftKey ? targets.at(-1) : targets[0])?.focus();
   }
 }
+// The signed-in user's identity, workspaces and password form. The Account
+// dialog (admin path) and the Settings Account card share it.
+function accountDetails(session, { card = false } = {}) {
+  const error = el("p", { class: "error", role: "alert", hidden: true });
+  const status = el("p", { class: "muted", role: "status", hidden: true });
+  const firebaseAuth = session.auth === "firebase";
+  let current = null;
+  let next = null;
+  let form = null;
+  const currentInput = () => el("input", {
+    id: "account-current", class: "field", type: "password",
+    autocomplete: "current-password", required: true,
+  });
+  if (!firebaseAuth) {
+    current = session.password_set ? currentInput() : null;
+    next = el("input", {
+      id: "account-new", class: "field", type: "password",
+      minLength: 12, maxLength: 1024, autocomplete: "new-password", required: true,
+    });
+    const confirm = el("input", {
+      id: "account-confirm", class: "field", type: "password",
+      minLength: 12, maxLength: 1024, autocomplete: "new-password", required: true,
+    });
+    const save = el("button", { type: "submit", class: "btn btn-primary", text: "Change password" });
+    form = el("form", { class: "stack" },
+      current
+        ? el("label", { class: "field-label", htmlFor: current.id, text: "Current password" })
+        : null,
+      current,
+      el("label", { class: "field-label", htmlFor: next.id, text: "New password" }), next,
+      el("label", { class: "field-label", htmlFor: confirm.id, text: "Confirm password" }), confirm,
+      save);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      error.hidden = true;
+      status.hidden = true;
+      if (next.value !== confirm.value) {
+        error.textContent = "Passwords do not match";
+        error.hidden = false;
+        return;
+      }
+      save.disabled = true;
+      try {
+        const response = await fetch(api("/account/password"), {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "X-AgenticML-Request": "1", "Content-Type": "application/json" },
+          body: JSON.stringify(current
+            ? { current: current.value, new: next.value }
+            : { new: next.value }),
+        });
+        const data = await response.json().catch(() => null);
+        if (response.status === 401 && data?.error === "login required") {
+          location.assign("/login");
+          return;
+        }
+        if (!response.ok) throw new Error(
+          (typeof data?.error === "string" && data.error) || `Password change failed (${response.status})`);
+        if (serverSession) serverSession.password_set = true;
+        status.textContent = "Password updated";
+        status.hidden = false;
+        form.reset();
+        if (!current) {
+          // A password now exists, so the next change must give the current one.
+          current = currentInput();
+          form.prepend(
+            el("label", { class: "field-label", htmlFor: current.id, text: "Current password" }),
+            current);
+        }
+      } catch (reason) {
+        error.textContent = reason.message;
+        error.hidden = false;
+      } finally {
+        save.disabled = false;
+      }
+    });
+  }
+  const identity = el("dl", { class: "kv-list identity" },
+    el("div", {}, el("dt", { text: "User" }), el("dd", { text: session.user })),
+    el("div", {}, el("dt", { text: "Role" }), el("dd", { text: currentWorkspaceRole(session) })),
+    el("div", {}, el("dt", { text: "Sign-in" }), el("dd", { text: viaLabel(session.via) })));
+  const password = firebaseAuth ? [] : [form, error, status];
+  return {
+    identity,
+    switcher: workspaceSwitcher(session, { card }),
+    password: card && password.length
+      ? [el("details", { class: "settings-details" },
+          el("summary", { text: "Change password" }), ...password)]
+      : password,
+    focusTarget: firebaseAuth ? null : (current || next),
+  };
+}
 function openAccountDialog() {
   const session = serverSession;
   if (!session) return;
   const previous = document.activeElement;
   const host = el("dialog", { class: "key-dialog", "aria-label": "Account" });
-  const error = el("p", { class: "error", role: "alert", hidden: true });
-  const status = el("p", { class: "muted", role: "status", hidden: true });
-  const current = session.password_set
-    ? el("input", {
-        id: "account-current", class: "field", type: "password",
-        autocomplete: "current-password", required: true,
-      })
-    : null;
-  const next = el("input", {
-    id: "account-new", class: "field", type: "password",
-    minLength: 12, maxLength: 1024, autocomplete: "new-password", required: true,
-  });
-  const confirm = el("input", {
-    id: "account-confirm", class: "field", type: "password",
-    minLength: 12, maxLength: 1024, autocomplete: "new-password", required: true,
-  });
-  const save = el("button", { type: "submit", class: "btn btn-primary", text: "Change password" });
-  const form = el("form", { class: "stack" },
-    current
-      ? el("label", { class: "field-label", htmlFor: current.id, text: "Current password" })
-      : null,
-    current,
-    el("label", { class: "field-label", htmlFor: next.id, text: "New password" }), next,
-    el("label", { class: "field-label", htmlFor: confirm.id, text: "Confirm password" }), confirm,
-    save);
-  form.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    error.hidden = true;
-    status.hidden = true;
-    if (next.value !== confirm.value) {
-      error.textContent = "Passwords do not match";
-      error.hidden = false;
-      return;
-    }
-    save.disabled = true;
-    try {
-      const response = await fetch("/api/server/account/password", {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "X-AgenticML-Request": "1", "Content-Type": "application/json" },
-        body: JSON.stringify(current
-          ? { current: current.value, new: next.value }
-          : { new: next.value }),
-      });
-      const data = await response.json().catch(() => null);
-      if (response.status === 401 && data?.error === "login required") {
-        location.assign("/login");
-        return;
-      }
-      if (!response.ok) throw new Error(
-        (typeof data?.error === "string" && data.error) || `Password change failed (${response.status})`);
-      if (serverSession) serverSession.password_set = true;
-      status.textContent = "Password updated";
-      status.hidden = false;
-      form.reset();
-    } catch (reason) {
-      error.textContent = reason.message;
-      error.hidden = false;
-    } finally {
-      save.disabled = false;
-    }
-  });
+  const details = accountDetails(session);
   host.append(
     el("div", { class: "heading" },
       el("h2", { text: "Account" }),
       button("Close", () => host.close(), "secondary")),
-    el("dl", { class: "kv-list identity" },
-      el("div", {}, el("dt", { text: "User" }), el("dd", { text: session.user })),
-      el("div", {}, el("dt", { text: "Role" }), el("dd", { text: session.role })),
-      el("div", {}, el("dt", { text: "Sign-in" }), el("dd", { text: viaLabel(session.via) }))),
-    form, error, status,
+    details.identity,
+    details.switcher,
+    ...details.password,
   );
   host.addEventListener("keydown", (event) => {
     if (event.key === "Tab") trapTab(host, event);
@@ -453,7 +767,7 @@ function openAccountDialog() {
   }, { once: true });
   document.body.append(host);
   host.showModal();
-  (current || next).focus();
+  (details.focusTarget || host.querySelector("button"))?.focus();
 }
 // Focus hosts own their keyboard handler so nested focus views close independently.
 function focus(title, subtitle, className = "", onClose = () => {}) {
@@ -757,10 +1071,38 @@ async function home(version) {
           count,
         ),
         el(
-          "label",
-          { class: "runs-filter" },
-          el("span", { class: "field-label", text: "Filter runs" }),
-          search,
+          "div",
+          { class: "runs-controls" },
+          el(
+            "div",
+            { class: "runs-metric-picker", hidden: true },
+            el(
+              "label",
+              {},
+              el("span", { class: "field-label", text: "Metric" }),
+              el("select", {
+                class: "field",
+                "aria-label": "Metric",
+                "data-testid": "runs-metric",
+              }),
+            ),
+            el(
+              "label",
+              {},
+              el("span", { class: "field-label", text: "Stat" }),
+              el("select", {
+                class: "field",
+                "aria-label": "Metric statistic",
+                "data-testid": "runs-metric-stat",
+              }),
+            ),
+          ),
+          el(
+            "label",
+            { class: "runs-filter" },
+            el("span", { class: "field-label", text: "Filter runs" }),
+            search,
+          ),
         ),
       ),
       el(
@@ -777,9 +1119,148 @@ async function home(version) {
       status,
     ),
   );
+  const metricSelect = content.parentElement.querySelector("[data-testid=runs-metric]");
+  const statSelect = content.parentElement.querySelector("[data-testid=runs-metric-stat]");
+  const metricControl = metricSelect.closest(".runs-metric-picker");
+  statSelect.replaceChildren(
+    ...["last", "min", "max"].map((stat) => el("option", { value: stat, text: stat })),
+  );
   let runs = [],
     project = null,
-    timer;
+    timer,
+    searchTimer,
+    seq = 0,
+    metricNames = [],
+    pickedMetric = "",
+    pickedStat = "last",
+    // The saved choice; kept when the metric is not in the list yet so it
+    // returns once the metric is first logged.
+    preferredMetric = "",
+    metricsLoaded = false,
+    runsLoaded = false,
+    recheckMetrics = false,
+    metricsSeq = 0,
+    polls = 0;
+  const metricsSignal = controller?.signal;
+  const requestedMetrics = new Set();
+  const rejectedMetrics = new Set();
+  const metricPrefKey = () =>
+    `agenticml-runs-metric:${currentWorkspaceSlug() || ""}`;
+  try {
+    const stored = JSON.parse(localStorage.getItem(metricPrefKey()) || "null");
+    if (stored && typeof stored.name === "string") pickedMetric = stored.name;
+    if (stored && ["last", "min", "max"].includes(stored.stat)) pickedStat = stored.stat;
+  } catch {}
+  preferredMetric = pickedMetric;
+  function saveMetricPref() {
+    try {
+      localStorage.setItem(
+        metricPrefKey(),
+        JSON.stringify({ name: preferredMetric, stat: pickedStat }),
+      );
+    } catch {}
+  }
+  function fillMetricSelect() {
+    metricSelect.replaceChildren(
+      el("option", { value: "", text: "None" }),
+      ...metricNames.map((name) => el("option", { value: name, text: name })),
+    );
+    // Keep the saved choice until the first list arrives, so the first /runs
+    // already carries it.
+    if (metricsLoaded)
+      pickedMetric = metricNames.includes(preferredMetric) ? preferredMetric : "";
+    metricSelect.value = metricNames.includes(pickedMetric) ? pickedMetric : "";
+    statSelect.value = pickedStat;
+    metricControl.hidden = metricNames.length === 0;
+  }
+  // Fetches the metric names without blocking /runs. A failure keeps the old
+  // list, and the select is rebuilt only when the list really changed.
+  async function loadMetricNames() {
+    if (!serverMode) return;
+    const mine = ++metricsSeq;
+    const mountEpoch = epoch;
+    try {
+      const response = await fetch(api("/metrics"), {
+        credentials: "same-origin",
+        signal: metricsSignal,
+      });
+      if (!response.ok) return;
+      const data = await response.json();
+      if (epoch !== mountEpoch || mine !== metricsSeq || !Array.isArray(data.metrics)) return;
+      const next = data.metrics.filter((name) => typeof name === "string" && name);
+      const first = !metricsLoaded;
+      metricsLoaded = true;
+      if (
+        !first &&
+        next.length === metricNames.length &&
+        next.every((name, index) => name === metricNames[index])
+      )
+        return;
+      metricNames = next;
+      const before = pickedMetric;
+      fillMetricSelect();
+      if (pickedMetric !== before) draw();
+      // A filter token may now resolve to a differently cased metric name.
+      if (metricQueryNames().some((name) => !requestedMetrics.has(name))) {
+        if (runsLoaded) refresh();
+        else recheckMetrics = true;
+      }
+    } catch {}
+  }
+  metricSelect.onchange = () => {
+    preferredMetric = pickedMetric = metricSelect.value;
+    saveMetricPref();
+    refresh();
+  };
+  statSelect.onchange = () => {
+    pickedStat = statSelect.value;
+    saveMetricPref();
+    draw();
+  };
+  function usableMetricName(name) {
+    return Boolean(name) && name.length <= 200 && !name.includes(",");
+  }
+  function metricQueryNames() {
+    const names = [];
+    const seen = new Set();
+    const add = (name) => {
+      if (
+        !usableMetricName(name) ||
+        seen.has(name) ||
+        rejectedMetrics.has(name) ||
+        names.length >= 8
+      )
+        return;
+      seen.add(name);
+      names.push(name);
+    };
+    add(pickedMetric);
+    for (const token of search.value.trim().toLowerCase().split(/\s+/).filter(Boolean)) {
+      const match = METRIC_FILTER.exec(token);
+      if (!match) continue;
+      add(metricNames.find((name) => name.toLowerCase() === match[1]) || match[1]);
+    }
+    return names;
+  }
+  function runsMetricsQuery(names) {
+    return names.length
+      ? `?metrics=${names.map(encodeURIComponent).join(",")}`
+      : "";
+  }
+  function sortTaskRuns(taskRuns) {
+    if (!pickedMetric) return taskRuns.slice().sort(newestFirst);
+    const lower = lowerBetter(pickedMetric);
+    return taskRuns.slice().sort((a, b) => {
+      const av = metricStat(a, pickedMetric, pickedStat);
+      const bv = metricStat(b, pickedMetric, pickedStat);
+      const aMissing = !isNumber(av);
+      const bMissing = !isNumber(bv);
+      if (aMissing !== bMissing) return aMissing ? 1 : -1;
+      if (aMissing) return newestFirst(a, b);
+      const cmp = lower ? av - bv : bv - av;
+      return cmp || newestFirst(a, b);
+    });
+  }
   const groupKey = (run) => `${run.project || ""}\u0000${taskName(run)}`;
   const EMPTY_SELECTION =
     "Select two or more runs to overlay their curves and diff their configs.";
@@ -868,7 +1349,7 @@ async function home(version) {
     entry.fetchedAt = Date.now();
     const current = () =>
       epoch === version && entry.token === token && lineage.get(key) === entry;
-    get(`/api/lineage?${new URLSearchParams({ project: key })}`)
+    get(`${api("/lineage")}?${new URLSearchParams({ project: key })}`)
       .then((data) => {
         if (!current()) return;
         if (!Array.isArray(data?.nodes)) throw new Error("Invalid lineage response");
@@ -930,10 +1411,13 @@ async function home(version) {
       onkeydown: (event) => event.stopPropagation(),
     });
     const facts = parentFacts(run, metricKey, entry, keys);
+    const metricValue = pickedMetric
+      ? fmt(metricStat(run, pickedMetric, pickedStat))
+      : fmt(run.summary?.[metricKey]);
     return el(
       "div",
       {
-        class: "run-grid run-row",
+        class: `run-grid run-row${pickedMetric ? " has-picked-metric" : ""}`,
         "data-run-id": run.run_id,
         "data-picked": selected.has(run.run_id),
         "data-focus": `row:${run.run_id}`,
@@ -971,6 +1455,12 @@ async function home(version) {
           text: facts.changed,
           title: facts.changed,
         }),
+        pickedMetric
+          ? el("span", {
+              class: "run-picked-inline muted",
+              text: `${pickedMetric} ${metricValue}`,
+            })
+          : null,
       ),
       el(
         "div",
@@ -983,8 +1473,8 @@ async function home(version) {
       el("span", { class: "muted run-progress", text: stepText(run.last_step) }),
       el("span", {
         class: "run-number run-metric",
-        title: metricKey || "",
-        text: fmt(run.summary?.[metricKey]),
+        title: pickedMetric || metricKey || "",
+        text: metricValue,
       }),
       el("span", {
         class: `run-number run-delta ${facts.tone}`,
@@ -997,15 +1487,19 @@ async function home(version) {
   const columns = (metricKey) =>
     el(
       "div",
-      { class: "run-grid run-columns" },
+      { class: `run-grid run-columns${pickedMetric ? " has-picked-metric" : ""}` },
       el("span"),
       el("span", { text: "Run · changed vs parent" }),
       el("span", { class: "run-status", text: "Status" }),
       el("span", { class: "run-progress", text: "Last step" }),
       el("span", {
         class: "run-number run-metric",
-        text: metricKey ? metricLabel(metricKey) : "Metric",
-        title: metricKey || "",
+        text: pickedMetric
+          ? `${pickedMetric} ${pickedStat}`
+          : metricKey
+            ? metricLabel(metricKey)
+            : "Metric",
+        title: pickedMetric || metricKey || "",
       }),
       el("span", { class: "run-number run-delta", text: "Δ vs parent" }),
       el("span", { class: "run-number run-duration", text: "Wall time" }),
@@ -1688,7 +2182,7 @@ async function home(version) {
     );
     const groups = [];
     for (const [task, taskRuns] of ordered) {
-      const visible = taskRuns.filter((run) => runMatches(run, query));
+      const visible = sortTaskRuns(taskRuns.filter((run) => runMatches(run, query)));
       if (query && !visible.length) continue;
       groups.push(taskGroup(key, task, taskRuns, visible, entry, keys));
     }
@@ -1821,12 +2315,42 @@ async function home(version) {
     restoreFocus(focused);
     lineageView?.render();
   }
-  search.oninput = draw;
+  search.oninput = () => {
+    clearTimeout(searchTimer);
+    const needed = metricQueryNames();
+    if (needed.some((name) => !requestedMetrics.has(name)))
+      searchTimer = setTimeout(refresh, 250);
+    else draw();
+  };
   async function refresh() {
+    const mine = ++seq;
+    if (++polls % 3 === 0) loadMetricNames();
+    clearTimeout(timer);
+    clearTimeout(searchTimer);
     try {
-      const result = await get("/api/runs");
-      if (epoch !== version) return;
+      let names = metricQueryNames();
+      let result;
+      try {
+        result = await get(api(`/runs${runsMetricsQuery(names)}`));
+      } catch (error) {
+        if (epoch !== version || mine !== seq) return;
+        const fallback = names.filter((name) => name === pickedMetric);
+        if (
+          !String(error.message).startsWith("422:") ||
+          fallback.length === names.length
+        )
+          throw error;
+        for (const name of names) {
+          if (name !== pickedMetric) rejectedMetrics.add(name);
+        }
+        names = fallback;
+        result = await get(api(`/runs${runsMetricsQuery(names)}`));
+      }
+      if (epoch !== version || mine !== seq) return;
+      requestedMetrics.clear();
+      for (const name of names) requestedMetrics.add(name);
       runs = result;
+      runsLoaded = true;
       for (const id of selected)
         if (!runs.some((run) => run.run_id === id)) selected.delete(id);
       draw();
@@ -1836,19 +2360,26 @@ async function home(version) {
         live ? "Live · refreshes every 5 s" : `${runs.length} runs`,
       );
       if (live) timer = setTimeout(refresh, 5000);
-    } catch (error) {
-      if (epoch === version) {
-        showError(content, error);
-        timer = setTimeout(refresh, 5000);
+      if (recheckMetrics) {
+        recheckMetrics = false;
+        if (metricQueryNames().some((name) => !requestedMetrics.has(name))) refresh();
       }
+    } catch (error) {
+      if (epoch !== version || mine !== seq) return;
+      showError(content, error);
+      timer = setTimeout(refresh, 5000);
     }
   }
   cleanup = () => {
     clearTimeout(timer);
+    clearTimeout(searchTimer);
     lineageView?.close(false);
     for (const key of [...lineage.keys()]) dropLineage(key);
   };
-  await refresh();
+  await sessionReady;
+  if (epoch !== version) return;
+  fillMetricSelect();
+  await Promise.all([loadMetricNames(), refresh()]);
 }
 
 async function loadMetrics(run, signal) {
@@ -2956,7 +3487,7 @@ async function runPage(id, version) {
   const signal = controller.signal;
   let [detail, summaries, initialMedia] = await Promise.all([
     get(apiRun(id), signal),
-    get("/api/runs", signal),
+    get(api("/runs"), signal),
     get(`${apiRun(id)}/media`, signal),
   ]);
   if (epoch !== version) return;
@@ -3369,6 +3900,7 @@ async function runPage(id, version) {
     button,
     focus,
     objectURL,
+    codeURL: (runId) => api(`/runs/${encodeURIComponent(runId)}/code`),
     parentId: parentId(),
     onBaseline: (baseline, entry) => {
       if (epoch !== version) return;
@@ -3405,7 +3937,7 @@ async function runPage(id, version) {
     try {
       const [next, index, nextMedia] = await Promise.all([
         get(apiRun(id), signal),
-        get("/api/runs", signal),
+        get(api("/runs"), signal),
         get(`${apiRun(id)}/media`, signal),
       ]);
       if (epoch !== version) return;
@@ -3548,7 +4080,7 @@ async function comparePage(ids, version) {
   const signal = controller.signal;
   const loadRuns = async () => {
     const [index, details] = await Promise.all([
-      get("/api/runs", signal),
+      get(api("/runs"), signal),
       Promise.all(
         ids.map(async (id) => ({
           ...(await get(apiRun(id), signal)),
@@ -3601,7 +4133,7 @@ async function comparePage(ids, version) {
       index === 0 ? "var(--s5)" : `var(--s${((index - 1) % 4) + 1})`,
     ]),
   );
-  codeDiff = createCodeDiff({ runs, colors, signal, el, get, button });
+  codeDiff = createCodeDiff({ runs, colors, signal, el, get, button, apiBase: api("") });
   const parentOfRun = (run) => run.parent_run_id || run.lineage?.parent_run_id;
   const selected = el(
     "div",
@@ -3730,7 +4262,9 @@ function shellQuote(value) {
   return "'" + value.replaceAll("'", "'\\''") + "'";
 }
 
-async function keysPage(version) {
+// API keys card: "New key" and the user filter in its header, the keys table in
+// its body. Returns the section's dispose function.
+async function mountKeys(card, version, disposers = []) {
   const signal = controller.signal;
   let activeDialog;
   let refreshSequence = 0;
@@ -3738,6 +4272,7 @@ async function keysPage(version) {
   const closeDialog = () => {
     const current = activeDialog;
     if (!current) return;
+    current.leave();
     current.wipe();
     current.host.close();
   };
@@ -3752,9 +4287,10 @@ async function keysPage(version) {
     window.removeEventListener("pageshow", restorePage);
     closeDialog();
   };
-  cleanup = dispose;
+  dispose.closeDialog = closeDialog;
+  disposers.push(dispose);
   const content = el("div", { class: "table-scroll" });
-  const allKeys = Boolean(serverSession?.can?.all_keys);
+  const allKeys = Boolean(workspaceCan(serverSession).all_keys);
   const columns = [
     ...(allKeys ? ["User"] : []),
     "Name", "Scope", "Prefix", "Created", "Created by", "Last used", "Runs", "Revoke",
@@ -3793,6 +4329,7 @@ async function keysPage(version) {
 
   function dialog(title) {
     let copyTimer;
+    let leaving = false;
     const copies = [];
     const previous = document.activeElement;
     const host = el("dialog", { class: "key-dialog", "aria-label": title });
@@ -3857,11 +4394,12 @@ async function keysPage(version) {
         } catch (reason) {
           if (epoch === version) showError(content, reason);
         }
-        if (epoch === version && !activeDialog)
+        // Closed by navigation: the page already moved on, so keep focus and scroll there.
+        if (epoch === version && !activeDialog && !leaving)
           (previous?.isConnected ? previous : newKeyButton).focus();
       }
     }, { once: true });
-    activeDialog = { host, wipe };
+    activeDialog = { host, wipe, leave: () => { leaving = true; } };
     app.append(host);
     return { host, body, error, copyCode, wipe };
   }
@@ -3893,7 +4431,7 @@ async function keysPage(version) {
     const syncAdminOption = () => {
       if (!allKeys || !userSelect) return;
       const selected = usersByName.get(userSelect.value);
-      adminOption.disabled = !selected || selected.role !== "admin";
+      adminOption.disabled = !selected || (selected.role !== "admin" && selected.role !== "owner");
       if (adminOption.disabled && scope.value === "admin") scope.value = "sync";
     };
     if (userSelect) userSelect.addEventListener("change", syncAdminOption);
@@ -3915,7 +4453,7 @@ async function keysPage(version) {
       try {
         const payload = { name: name.value, scope: scope.value };
         if (userSelect) payload.user = userSelect.value;
-        const data = await request("/api/server/keys", "POST", payload);
+        const data = await request(api("/keys"), "POST", payload);
         if (epoch !== version || !host.open) {
           data.key = null;
           if (epoch === version) await refresh();
@@ -3923,12 +4461,16 @@ async function keysPage(version) {
         }
         const value = el("code", { class: "key-value", text: data.key });
         const command = el("code", {
-          class: "key-command", text: `agenticml login --host ${shellQuote(data.host)} --key ${shellQuote(data.key)}`,
+          class: "key-command", text: `agenticml login --host ${shellQuote(data.host)}`,
         });
         data.key = null;
         body.replaceChildren(
           el("p", { text: "This key is shown once and cannot be recovered." }),
           value, copyCode("Copy key", value), command, copyCode("Copy command", command),
+          el("p", {
+            class: "muted",
+            text: "Run this command, then paste the key when it asks for it.",
+          }),
           el("p", {
             class: "muted", hidden: data.host_source !== "request",
             text: "No --public-url is set, so this uses the address you opened the dashboard at.",
@@ -3952,7 +4494,7 @@ async function keysPage(version) {
       error.hidden = true;
       revoke.disabled = true;
       try {
-        const data = await request(`/api/server/keys/${encodeURIComponent(key.name)}`, "DELETE");
+        const data = await request(`${api("/keys")}/${encodeURIComponent(key.name)}`, "DELETE");
         if (epoch !== version) return;
         if (data.signed_out) location.assign("/login");
         else if (host.open) host.close();
@@ -3974,14 +4516,15 @@ async function keysPage(version) {
     const user = usersByName.get(key.user);
     if (!user) return "user is missing";
     if (user.role === "viewer") return "role viewer cannot sync";
-    if (key.scope === "admin" && user.role !== "admin") return "only admins can use admin keys";
+    if (key.scope === "admin" && user.role !== "admin" && user.role !== "owner")
+      return "only admins can use admin keys";
     return "cannot sync with this key";
   }
 
   async function refresh() {
     const sequence = ++refreshSequence;
     if (allKeys && usersByName.size === 0) {
-      const usersResponse = await fetch("/api/server/users", { signal, credentials: "same-origin" });
+      const usersResponse = await fetch(api("/members"), { signal, credentials: "same-origin" });
       if (epoch !== version || sequence !== refreshSequence || disposed) return;
       if (usersResponse.ok) {
         const usersData = await usersResponse.json().catch(() => null);
@@ -3994,13 +4537,10 @@ async function keysPage(version) {
       }
     }
     const query = userFilter?.value ? `?user=${encodeURIComponent(userFilter.value)}` : "";
-    const response = await fetch("/api/server/keys" + query, { signal, credentials: "same-origin" });
+    const response = await fetch(api("/keys") + query, { signal, credentials: "same-origin" });
     if (epoch !== version || sequence !== refreshSequence || disposed) return;
     if (response.status === 404) {
-      dispose();
-      cleanup = () => {};
-      await home(version);
-      return;
+      throw new Error("API keys are no longer available to you.");
     }
     if (response.status === 401) {
       dispose();
@@ -4052,33 +4592,40 @@ async function keysPage(version) {
   }
 
   const newKeyButton = button("New key", newKey, "primary");
-  app.replaceChildren(el("div", { class: "workspace stack" },
-    el("div", { class: "heading" },
-      el("h1", { text: "Keys" }),
-      userFilter
-        ? el("div", { class: "runs-filter" },
-            el("span", { class: "field-label", text: "User" }), userFilter)
-        : null,
-      newKeyButton),
-    content));
+  card.aside.append(
+    ...(userFilter
+      ? [el("div", { class: "runs-filter" },
+          el("span", { class: "field-label", text: "User" }), userFilter)]
+      : []),
+    newKeyButton);
+  card.body.append(content);
   try {
     await refresh();
   } catch (reason) {
-    dispose();
-    if (epoch === version) cleanup = () => {};
-    throw reason;
+    if (epoch === version) showError(content, reason);
   }
+  return dispose;
 }
 
-async function teamPage(version) {
+// Workspace, Members and Activity cards (all need the admin role). `cards` holds
+// the {aside, body} parts of each card. Returns the section's dispose function.
+// `workspaceName` has get() (the shown name) and set(name) (apply a new one in place).
+async function mountTeam(cards, version, disposers = [], workspaceName = null) {
   const signal = controller.signal;
   let activeDialog;
   let refreshSequence = 0;
   let activitySequence = 0;
   let disposed = false;
+  let wipeInvite = () => {};
+  // Counts navigations away from the section, so a response that arrives after one
+  // cannot show its one-time link, take focus or open a dialog.
+  let leftCount = 0;
   const closeDialog = () => {
+    leftCount += 1;
+    wipeInvite();
     const current = activeDialog;
     if (!current) return;
+    current.leave();
     current.wipe();
     current.host.close();
   };
@@ -4093,8 +4640,11 @@ async function teamPage(version) {
     window.removeEventListener("pageshow", restorePage);
     closeDialog();
   };
-  cleanup = dispose;
+  dispose.closeDialog = closeDialog;
+  disposers.push(dispose);
   const content = el("div", { class: "table-scroll" });
+  const usageBox = el("section", { class: "stack usage-section", hidden: true, "aria-label": "Usage" });
+  const invitesContent = el("div", { class: "table-scroll" });
   const activity = el("div", { class: "table-scroll" });
   const activityStatus = el("div");
   const columns = ["Name", "Role", "Identity", "Sign-in", "Keys", "Runs", "Actions"];
@@ -4126,6 +4676,7 @@ async function teamPage(version) {
 
   function dialog(title) {
     let copyTimer;
+    let leaving = false;
     const copies = [];
     const previous = document.activeElement;
     const host = el("dialog", { class: "key-dialog", "aria-label": title });
@@ -4190,11 +4741,12 @@ async function teamPage(version) {
         } catch (reason) {
           if (epoch === version) showError(content, reason);
         }
-        if (epoch === version && !activeDialog)
-          (previous?.isConnected ? previous : addUserButton).focus();
+        // Closed by navigation: the page already moved on, so keep focus and scroll there.
+        if (epoch === version && !activeDialog && !leaving)
+          (previous?.isConnected ? previous : inviteLogin).focus();
       }
     }, { once: true });
-    activeDialog = { host, wipe };
+    activeDialog = { host, wipe, leave: () => { leaving = true; } };
     app.append(host);
     return { host, body, error, copyCode, wipe };
   }
@@ -4208,7 +4760,11 @@ async function teamPage(version) {
   function showInvite(host, body, copyCode, data) {
     const value = el("code", { class: "key-value", text: data.invite_url });
     body.replaceChildren(
-      el("p", { text: "This invite link is shown once. They choose their own password." }),
+      el("p", {
+        text: serverSession?.auth === "firebase"
+          ? "This invite link is shown once. They sign in with Google or email and password, using this email; the email must be verified."
+          : "This invite link is shown once. They choose their own password.",
+      }),
       value, copyCode("Copy invite link", value),
       el("p", {
         class: "muted",
@@ -4218,8 +4774,28 @@ async function teamPage(version) {
     body.querySelector("button")?.focus();
   }
 
+  function showAdded(host, body) {
+    body.replaceChildren(
+      el("p", {
+        text: "This login already has an account and was added to the workspace.",
+      }),
+    );
+  }
+
   function presentInvite(data, host, body, copyCode) {
     if (epoch !== version) return;
+    if (data?.added) {
+      if (host && host.open && host.isConnected) {
+        showAdded(host, body);
+        return;
+      }
+      const shown = dialog("Invite");
+      showAdded(shown.host, shown.body);
+      shown.host.showModal();
+      return;
+    }
+    if (typeof data?.invite_url !== "string" || !data.invite_url)
+      throw new Error("Invite did not return a link");
     if (host && host.open && host.isConnected) {
       showInvite(host, body, copyCode, data);
       return;
@@ -4229,48 +4805,132 @@ async function teamPage(version) {
     shown.host.showModal();
   }
 
-  function addUser() {
-    const { host, body, error, copyCode } = dialog("Add user");
-    const name = el("input", {
-      id: "user-name", class: "field", required: true, maxLength: 64,
-      pattern: "[A-Za-z0-9._\\-]{1,64}", autocomplete: "off",
-    });
-    const role = el("select", { id: "user-role", class: "field" },
-      el("option", { value: "viewer", text: "viewer" }),
-      el("option", { value: "member", text: "member" }),
-      el("option", { value: "admin", text: "admin" }));
-    role.value = "member";
-    const identity = el("input", {
-      id: "user-identity", class: "field", maxLength: 256, autocomplete: "off",
-    });
-    const create = el("button", { type: "submit", class: "btn btn-primary", text: "Add user" });
-    const form = el("form", { class: "stack" },
-      el("label", { class: "field-label", htmlFor: name.id, text: "Name" }), name,
-      el("label", { class: "field-label", htmlFor: role.id, text: "Role" }), role,
-      el("label", { class: "field-label", htmlFor: identity.id, text: "Identity" }), identity,
-      create);
-    form.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      name.setCustomValidity(["env", ".", ".."].includes(name.value) ? "Invalid or reserved user name" : "");
-      if (!form.reportValidity()) return;
-      error.hidden = true;
-      create.disabled = true;
-      try {
-        const payload = { name: name.value, role: role.value };
-        if (identity.value) payload.identity = identity.value;
-        const data = await request("/api/server/users", "POST", payload);
-        if (epoch !== version) return;
-        presentInvite(data, host, body, copyCode);
-      } catch (reason) {
-        if (epoch === version && host.open) failure(error, reason);
-        if (reason.name !== "AbortError") create.disabled = false;
+  const ROLE_NOTES = {
+    viewer: "Viewers can read runs and notes. They cannot sync or hold keys.",
+    member: "Members can sync runs, add notes and manage their own keys.",
+    admin: "Admins also manage all keys, people and activity.",
+  };
+  const inviteLogin = el("input", {
+    id: "invite-login", class: "field settings-grow", required: true, maxLength: 254,
+    autocomplete: "off", placeholder: "Login or email", "aria-label": "Login or email",
+  });
+  const inviteRole = el("select", {
+    id: "invite-role", class: "field settings-select", "aria-label": "Role",
+  },
+    el("option", { value: "viewer", text: "viewer" }),
+    el("option", { value: "member", text: "member" }),
+    el("option", { value: "admin", text: "admin" }));
+  inviteRole.value = "member";
+  const roleNote = el("span", { class: "settings-note", text: ROLE_NOTES.member });
+  inviteRole.addEventListener("change", () => { roleNote.textContent = ROLE_NOTES[inviteRole.value]; });
+  const inviteSend = el("button", { type: "submit", class: "btn btn-primary", text: "Send invite" });
+  const inviteError = el("p", { class: "error", role: "alert", hidden: true });
+  const inviteResult = el("div", { class: "settings-result stack", hidden: true });
+  // A live region that stays in the page, so the result is announced when it appears.
+  const inviteLive = el("div", { role: "status", "aria-live": "polite" }, inviteResult);
+  const inviteStatus = el("span", { class: "key-copy-status", role: "status", "aria-live": "polite" });
+  let inviteCopyTimer;
+  const inviteCopies = [];
+  // The one-time invite link is wiped when another invite is sent or the section goes away.
+  wipeInvite = () => {
+    clearTimeout(inviteCopyTimer);
+    const selection = window.getSelection();
+    for (let index = 0; index < (selection?.rangeCount || 0); index++) {
+      if (selection.getRangeAt(index).intersectsNode(inviteResult)) {
+        selection.removeAllRanges();
+        break;
       }
-    });
-    name.addEventListener("input", () => name.setCustomValidity(""));
-    body.append(form);
-    host.showModal();
-    name.focus();
+    }
+    inviteResult.querySelectorAll("code").forEach((node) => { node.textContent = ""; });
+    inviteCopies.length = 0;
+    inviteStatus.textContent = "";
+    inviteResult.replaceChildren();
+    inviteResult.hidden = true;
+  };
+  function showInviteResult(data) {
+    wipeInvite();
+    if (data?.added) {
+      inviteResult.append(el("p", {
+        text: "This login already has an account and was added to the workspace.",
+      }));
+    } else {
+      if (typeof data?.invite_url !== "string" || !data.invite_url)
+        throw new Error("Invite did not return a link");
+      const value = el("code", { class: "key-value", text: data.invite_url });
+      const copy = button("Copy invite link", async () => {
+        try {
+          await navigator.clipboard.writeText(value.textContent);
+          if (!value.isConnected) return;
+          copy.textContent = "Copied";
+        } catch {
+          if (!value.isConnected) return;
+          const range = document.createRange();
+          range.selectNodeContents(value);
+          const selection = window.getSelection();
+          selection.removeAllRanges();
+          selection.addRange(range);
+          copy.textContent = /Mac|iPhone|iPad/.test(navigator.platform)
+            ? "Press ⌘C to copy" : "Press Ctrl+C to copy";
+        }
+        inviteStatus.textContent = copy.textContent;
+        clearTimeout(inviteCopyTimer);
+        inviteCopyTimer = setTimeout(() => {
+          inviteCopies.forEach(([node, text]) => { node.textContent = text; });
+          inviteStatus.textContent = "";
+        }, 2000);
+      }, "secondary");
+      inviteCopies.push([copy, "Copy invite link"]);
+      inviteResult.append(
+        el("p", {
+          text: serverSession?.auth === "firebase"
+            ? "This invite link is shown once. They sign in with Google or email and password, using this email; the email must be verified."
+            : "This invite link is shown once. They choose their own password.",
+        }),
+        value, copy,
+        el("p", {
+          class: "muted",
+          text: data.expires_at ? `Expires ${date(data.expires_at)}` : "",
+        }),
+      );
+    }
+    inviteResult.hidden = false;
+    (inviteResult.querySelector("button") || inviteLogin).focus();
   }
+  const inviteForm = el("form", { class: "settings-form", "aria-label": "Invite someone" },
+    el("span", { class: "settings-label", text: "Invite someone" }),
+    el("div", { class: "settings-row" }, inviteLogin, inviteRole, inviteSend),
+    roleNote, inviteError, inviteLive, inviteStatus);
+  inviteForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!inviteForm.reportValidity()) return;
+    inviteError.hidden = true;
+    wipeInvite();
+    inviteSend.disabled = true;
+    const left = leftCount;
+    try {
+      const data = await request(api("/invites"), "POST", {
+        login: inviteLogin.value, role: inviteRole.value,
+      });
+      if (epoch !== version) return;
+      if (left !== leftCount) {
+        // The user left the section while this was sending: drop the link, just refresh.
+        data.invite_url = null;
+        await refresh();
+        return;
+      }
+      showInviteResult(data);
+      inviteLogin.value = "";
+      try {
+        await refresh();
+      } catch (reason) {
+        if (epoch === version) showError(content, reason);
+      }
+    } catch (reason) {
+      if (epoch === version) failure(inviteError, reason);
+    } finally {
+      inviteSend.disabled = false;
+    }
+  });
 
   function confirmAction(title, text, actionLabel, onConfirm) {
     const { host, body, error } = dialog(title);
@@ -4301,13 +4961,13 @@ async function teamPage(version) {
       `Remove ${user.name}? ${keys} key${user.keys === 1 ? "" : "s"} will be revoked.`,
       "Remove",
       async () => {
-        await request(`/api/server/users/${encodeURIComponent(user.name)}`, "DELETE");
+        await request(`${api("/members")}/${encodeURIComponent(user.name)}`, "DELETE");
       });
   }
 
   async function patchUser(user, payload, { reload = true } = {}) {
     const data = await request(
-      `/api/server/users/${encodeURIComponent(user.name)}`, "PATCH", payload);
+      `${api("/members")}/${encodeURIComponent(user.name)}`, "PATCH", payload);
     if (data.signed_out) {
       location.assign("/login");
       return data;
@@ -4319,6 +4979,7 @@ async function teamPage(version) {
   }
 
   function roleSelect(user) {
+    if (user.role === "owner") return el("span", { text: "owner" });
     const select = el("select", {
       class: "field", "aria-label": `Role for ${user.name}`,
     },
@@ -4369,6 +5030,7 @@ async function teamPage(version) {
   }
 
   function identityField(user) {
+    if (user.role === "owner") return user.identity || "—";
     const input = el("input", {
       class: "field", value: user.identity || "", maxLength: 256, autocomplete: "off",
       "aria-label": `Identity for ${user.name}`,
@@ -4391,17 +5053,92 @@ async function teamPage(version) {
     return user.password_set ? "password" : user.invite_pending ? "invite pending" : "—";
   }
 
-  async function refresh() {
-    const sequence = ++refreshSequence;
-    const response = await fetch("/api/server/users", { signal, credentials: "same-origin" });
-    if (epoch !== version || sequence !== refreshSequence || disposed) return;
-    if (response.status === 404) {
-      dispose();
-      cleanup = () => {};
-      await home(version);
+  function renderInvites(invites) {
+    if (!invites.length) {
+      invitesContent.replaceChildren(
+        el("p", { class: "muted", text: "No pending invites." }));
       return;
     }
-    if (response.status === 401) {
+    const inviteColumns = ["Login", "Role", "Expires", "Invited by", "Actions"];
+    const rows = invites.map((invite) => {
+      const values = [
+        invite.login,
+        typeof invite.role === "string" ? invite.role : "—",
+        invite.expires_at ? date(invite.expires_at) : "—",
+        typeof invite.invited_by === "string" && invite.invited_by ? invite.invited_by : "—",
+        button("Revoke", () => revokeInvite(invite), "secondary"),
+      ];
+      return el("tr", { role: "row" }, ...values.map((value, index) =>
+        el("td", { role: "cell", "data-label": inviteColumns[index] },
+          value == null ? "—" : value)));
+    });
+    invitesContent.replaceChildren(
+      el("table", { class: "keys-table", role: "table", "aria-label": "Pending invites" },
+        el("thead", { role: "rowgroup" }, el("tr", { role: "row" },
+          ...inviteColumns.map((text) => el("th", { role: "columnheader", scope: "col", text })))),
+        el("tbody", { role: "rowgroup" }, ...rows)));
+  }
+
+  function revokeInvite(invite) {
+    confirmAction(
+      `Revoke invite for ${invite.login}?`,
+      `Revoke the pending invite for ${invite.login}?`,
+      "Revoke",
+      async () => {
+        await request(`${api("/invites")}/${encodeURIComponent(invite.login)}`, "DELETE");
+      });
+  }
+
+  function renderUsage(data) {
+    if (!data || data.limits === null) {
+      usageBox.hidden = true;
+      usageBox.replaceChildren();
+      planNote.hidden = true;
+      return;
+    }
+    planNote.hidden = typeof data.plan !== "string" || !data.plan;
+    planNote.textContent = planNote.hidden ? "" : `plan: ${data.plan}`;
+    // Meters are visual only; they warn at the same 80% and 100% as the usage banners.
+    const meter = (label, used, limit) => {
+      if (!isNumber(used) || !isNumber(limit) || limit <= 0) return null;
+      const share = Math.min(100, Math.max(0, Math.round((100 * used) / limit)));
+      const tone = used >= limit ? " danger" : used >= 0.8 * limit ? " warn" : "";
+      const fill = el("span");
+      fill.style.width = `${share}%`;
+      return el("div", {
+        class: `usage-meter${tone}`, role: "meter", "aria-label": `${label} used`,
+        "aria-valuemin": "0", "aria-valuemax": "100", "aria-valuenow": String(share),
+      }, fill);
+    };
+    const pair = (label, value, bar) =>
+      el("div", {}, el("dt", { text: label }), el("dd", {}, value, bar));
+    usageBox.hidden = false;
+    usageBox.replaceChildren(
+      el("h3", { class: "eyebrow", text: "Usage" }),
+      el("dl", { class: "usage-tiles" },
+        pair("Storage", `${formatGb(data.storage?.used)} of ${formatGb(data.storage?.limit)}`,
+          meter("Storage", data.storage?.used, data.storage?.limit)),
+        pair("Daily uploads", `${formatGb(data.uploads_today?.used)} of ${formatGb(data.uploads_today?.limit)}`,
+          meter("Daily uploads", data.uploads_today?.used, data.uploads_today?.limit)),
+        pair("Requests per minute", formatLimitCount(data.requests_per_minute?.limit)),
+        pair("People", `${data.people?.used ?? "—"} of ${formatLimitCount(data.people?.limit)}`,
+          meter("People", data.people?.used, data.people?.limit)),
+      ),
+    );
+  }
+
+  async function refresh() {
+    const sequence = ++refreshSequence;
+    const [response, invitesResponse, usageResponse] = await Promise.all([
+      fetch(api("/members"), { signal, credentials: "same-origin" }),
+      fetch(api("/invites"), { signal, credentials: "same-origin" }),
+      fetch(api("/usage"), { signal, credentials: "same-origin" }),
+    ]);
+    if (epoch !== version || sequence !== refreshSequence || disposed) return;
+    if (response.status === 404) {
+      throw new Error("This workspace's people are no longer available to you.");
+    }
+    if (response.status === 401 || invitesResponse.status === 401) {
       dispose();
       location.assign("/login");
       return;
@@ -4415,6 +5152,7 @@ async function teamPage(version) {
       typeof user.name !== "string" || typeof user.role !== "string"))
       throw new Error(`Could not load users (${response.status})`);
     const rows = data.users.map((user) => {
+      const owner = user.role === "owner";
       const values = [
         user.name,
         roleSelect(user),
@@ -4423,8 +5161,11 @@ async function teamPage(version) {
         user.keys == null ? "–" : String(user.keys),
         user.runs == null ? "–" : String(user.runs),
         el("div", { class: "team-actions" },
-          user.name === data.me ? null : button("Invite link", () => inviteUser(user), "secondary"),
-          button("Remove", () => removeUser(user), "secondary")),
+          // Firebase members sign in at /login; the server refuses a re-invite there.
+          owner || user.name === data.me || serverSession?.auth === "firebase"
+            ? null
+            : button("Invite link", () => inviteUser(user), "secondary"),
+          owner ? null : button("Remove", () => removeUser(user), "secondary")),
       ];
       return el("tr", { role: "row" }, ...values.map((value, index) =>
         el("td", { role: "cell", "data-label": columns[index] }, value == null ? "–" : value)));
@@ -4433,6 +5174,26 @@ async function teamPage(version) {
       el("thead", { role: "rowgroup" }, el("tr", { role: "row" },
         ...columns.map((text) => el("th", { role: "columnheader", scope: "col", text })))),
       el("tbody", { role: "rowgroup" }, ...rows)));
+    let invites = [];
+    if (invitesResponse.ok) {
+      const invitesData = await invitesResponse.json().catch(() => null);
+      if (Array.isArray(invitesData?.invites))
+        invites = invitesData.invites.filter(
+          (invite) => invite && typeof invite.login === "string" && invite.login);
+    }
+    if (epoch !== version || sequence !== refreshSequence || disposed) return;
+    renderInvites(invites);
+    cards.members.aside.replaceChildren(el("span", {
+      class: "settings-meta",
+      text: `${data.users.length} member${data.users.length === 1 ? "" : "s"} · ${invites.length} invited`,
+    }));
+    if (usageResponse.ok) {
+      const usage = await usageResponse.json().catch(() => null);
+      if (epoch !== version || sequence !== refreshSequence || disposed) return;
+      renderUsage(usage);
+    } else {
+      renderUsage(null);
+    }
     try {
       await refreshActivity(true);
     } catch (reason) {
@@ -4470,7 +5231,7 @@ async function teamPage(version) {
     const sequence = activitySequence;
     const query = new URLSearchParams({ limit: String(limit) });
     if (!reset && oldestTs) query.set("before", oldestTs);
-    const response = await fetch(`/api/server/audit?${query}`, { signal, credentials: "same-origin" });
+    const response = await fetch(`${api("/audit")}?${query}`, { signal, credentials: "same-origin" });
     if (epoch !== version || disposed || sequence !== activitySequence) return false;
     if (response.status === 401) {
       dispose();
@@ -4520,10 +5281,17 @@ async function teamPage(version) {
     const confirm = button("Create invite link", async () => {
       error.hidden = true;
       confirm.disabled = true;
+      const left = leftCount;
       try {
         const data = await request(
-          `/api/server/users/${encodeURIComponent(user.name)}/invite`, "POST", {});
+          `${api("/members")}/${encodeURIComponent(user.name)}/invite`, "POST", {});
         if (epoch !== version) return;
+        if (left !== leftCount) {
+          // The user left the section while this was sending: drop the link, just refresh.
+          data.invite_url = null;
+          await refresh();
+          return;
+        }
         presentInvite(data, host, body, copyCode);
       } catch (reason) {
         if (epoch === version && host.open) failure(error, reason);
@@ -4531,20 +5299,617 @@ async function teamPage(version) {
       }
     }, "primary");
     body.append(
+      // Never shown with Firebase: the row has no "Invite link" there.
       el("p", { text: "This signs them out and clears their password." }),
       el("div", { class: "inline" }, button("Cancel", () => host.close(), "secondary"), confirm));
     host.showModal();
     body.querySelector("button").focus();
   }
 
-  const addUserButton = button("Add user", addUser, "primary");
-  app.replaceChildren(el("div", { class: "workspace stack" },
-    el("div", { class: "heading" }, el("h1", { text: "Team" }), addUserButton),
+  function renameCurrentWorkspace() {
+    const { host, body, error } = dialog("Rename workspace");
+    const name = el("input", {
+      id: "rename-ws-name", class: "field", required: true, maxLength: 256,
+      autocomplete: "off", value: (workspaceName?.get() || "").trim(),
+    });
+    const save = el("button", { type: "submit", class: "btn btn-primary", text: "Save" });
+    const form = el("form", { class: "stack" },
+      el("label", { class: "field-label", htmlFor: name.id, text: "Name" }), name,
+      el("div", { class: "inline" }, button("Cancel", () => host.close(), "secondary"), save));
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      error.hidden = true;
+      save.disabled = true;
+      try {
+        const data = await request(api(""), "PATCH", { name: name.value.trim() });
+        if (typeof data.name === "string" && data.name) workspaceName?.set(data.name);
+        host.close();
+      } catch (reason) {
+        if (epoch === version && host.open) failure(error, reason);
+        if (reason.name !== "AbortError") save.disabled = false;
+      }
+    });
+    body.append(form);
+    host.showModal();
+    name.focus();
+    name.select();
+  }
+
+  const planNote = el("span", { class: "settings-meta", hidden: true });
+  cards.workspace.aside.append(planNote);
+  if (workspaceName && workspaceCan(serverSession).rename)
+    cards.workspace.aside.prepend(button("Rename", renameCurrentWorkspace, "secondary"));
+  cards.workspace.body.append(usageBox);
+  cards.members.body.append(
+    inviteForm,
     content,
+    el("div", { class: "settings-section" },
+      el("h3", { text: "Pending invites" }),
+      invitesContent));
+  cards.activity.body.append(
+    activity,
+    el("div", { class: "activity-toolbar" }, loadOlder, activityStatus));
+  try {
+    await refresh();
+  } catch (reason) {
+    if (epoch === version) showError(content, reason);
+  }
+  return dispose;
+}
+
+async function adminPage(version) {
+  const signal = controller.signal;
+  let disposed = false;
+  let refreshSequence = 0;
+  let freeLimits = null;
+  let activeDialog;
+  const closeDialog = () => {
+    activeDialog?.close();
+  };
+  const dispose = () => {
+    disposed = true;
+    closeDialog();
+  };
+  cleanup = dispose;
+  const crumb = document.querySelector(".breadcrumb");
+  crumb.setAttribute("href", "/admin/");
+  crumb.textContent = "agenticml / admin";
+  const content = el("div", { class: "table-scroll" });
+  const archivedTable = el("div", { class: "table-scroll" });
+  const archivedSection = el("div", { class: "stack", hidden: true },
+    el("div", { class: "heading" }, el("h2", { text: "Archived" })),
+    archivedTable);
+  const admins = el("div", { class: "table-scroll" });
+  const activity = el("div", { class: "table-scroll" });
+  const notice = el("p", { class: "muted", role: "status", "aria-live": "polite", hidden: true });
+  const columns = ["Slug", "Name", "Status", "Plan", "Storage", "Uploads today", "People", "Members", "Created", "Actions"];
+  const archivedColumns = ["Slug", "Name", "Plan", "Storage", "Archived", "Actions"];
+  const adminColumns = ["Login", "Source", "Sign-in", "Actions"];
+  const activityColumns = ["Time", "Actor", "Action", "Target", "Client"];
+
+  async function write(url, method, payload) {
+    const response = await fetch(url, {
+      method,
+      signal,
+      credentials: "same-origin",
+      headers: { "X-AgenticML-Request": "1", "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (epoch !== version) throw new DOMException("Route changed", "AbortError");
+    if (response.status === 401) {
+      dispose();
+      location.assign("/login");
+      throw new DOMException("Redirecting to login", "AbortError");
+    }
+    const data = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(
+      (typeof data?.error === "string" && data.error) || `Request failed (${response.status})`);
+    return data;
+  }
+
+  function dialog(title) {
+    const previous = document.activeElement;
+    const host = el("dialog", { class: "key-dialog", "aria-label": title });
+    const body = el("div", { class: "stack" });
+    const error = el("p", { class: "error", role: "alert", hidden: true });
+    host.append(
+      el("div", { class: "heading" },
+        el("h2", { text: title }),
+        button("Close", () => host.close(), "secondary")),
+      body, error);
+    host.addEventListener("keydown", (event) => {
+      if (event.key === "Tab") trapTab(host, event);
+    });
+    host.addEventListener("close", () => {
+      host.remove();
+      if (activeDialog === host) activeDialog = null;
+      if (epoch === version && !disposed)
+        (previous?.isConnected ? previous : createButton).focus();
+    }, { once: true });
+    activeDialog = host;
+    app.append(host);
+    return { host, body, error };
+  }
+
+  function failure(error, reason) {
+    if (reason.name === "AbortError") return;
+    error.textContent = reason.message;
+    error.hidden = false;
+  }
+
+  function patchUrl(slug) {
+    return `${api("/admin/workspaces")}/${encodeURIComponent(slug)}`;
+  }
+
+  async function setStatus(workspace, status) {
+    try {
+      await write(patchUrl(workspace.slug), "PATCH", { status });
+      await refresh();
+    } catch (reason) {
+      if (epoch === version) showError(content, reason);
+    }
+  }
+
+  function parseLimitField(value) {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    if (!/^[0-9]+$/.test(trimmed)) throw new Error("limits must be non-negative integers or empty for unlimited");
+    const parsed = Number(trimmed);
+    if (!Number.isSafeInteger(parsed)) throw new Error("limits must be non-negative integers or empty for unlimited");
+    return parsed;
+  }
+
+  function fillLimitField(input, value) {
+    input.value = value == null ? "" : String(value);
+  }
+
+  function editPlan(workspace) {
+    const { host, body, error } = dialog("Edit plan");
+    const plan = el("select", { id: "plan-ws-plan", class: "field" },
+      el("option", { value: "free", text: "free" }),
+      el("option", { value: "custom", text: "custom" }));
+    plan.value = workspace.plan === "custom" ? "custom" : "free";
+    const stored = workspace.limits && typeof workspace.limits === "object" && !Array.isArray(workspace.limits)
+      ? workspace.limits : null;
+    // A free workspace switched to custom starts from the free plan's numbers,
+    // not from unlimited (empty fields).
+    const current = stored ?? (workspace.plan !== "custom" ? freeLimits : null) ?? {};
+    const storage = el("input", {
+      id: "plan-ws-storage", class: "field", inputMode: "numeric", autocomplete: "off",
+      placeholder: "unlimited",
+    });
+    const uploads = el("input", {
+      id: "plan-ws-uploads", class: "field", inputMode: "numeric", autocomplete: "off",
+      placeholder: "unlimited",
+    });
+    const requests = el("input", {
+      id: "plan-ws-requests", class: "field", inputMode: "numeric", autocomplete: "off",
+      placeholder: "unlimited",
+    });
+    const people = el("input", {
+      id: "plan-ws-people", class: "field", inputMode: "numeric", autocomplete: "off",
+      placeholder: "unlimited",
+    });
+    fillLimitField(storage, current.storage_bytes);
+    fillLimitField(uploads, current.upload_bytes_per_day);
+    fillLimitField(requests, current.requests_per_minute);
+    fillLimitField(people, current.people);
+    const customFields = el("div", { class: "stack" },
+      el("label", { class: "field-label", htmlFor: storage.id, text: "Storage bytes" }), storage,
+      el("label", { class: "field-label", htmlFor: uploads.id, text: "Upload bytes per day" }), uploads,
+      el("label", { class: "field-label", htmlFor: requests.id, text: "Requests per minute" }), requests,
+      el("label", { class: "field-label", htmlFor: people.id, text: "People" }), people);
+    const syncCustom = () => {
+      customFields.hidden = plan.value !== "custom";
+    };
+    plan.addEventListener("change", syncCustom);
+    syncCustom();
+    const save = el("button", { type: "submit", class: "btn btn-primary", text: "Save" });
+    const form = el("form", { class: "stack" },
+      el("label", { class: "field-label", htmlFor: plan.id, text: "Plan" }), plan,
+      customFields, save);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      error.hidden = true;
+      save.disabled = true;
+      try {
+        const payload = { plan: plan.value };
+        if (plan.value === "custom") {
+          payload.limits = {
+            storage_bytes: parseLimitField(storage.value),
+            upload_bytes_per_day: parseLimitField(uploads.value),
+            requests_per_minute: parseLimitField(requests.value),
+            people: parseLimitField(people.value),
+          };
+        }
+        await write(patchUrl(workspace.slug), "PATCH", payload);
+        host.close();
+        await refresh();
+      } catch (reason) {
+        failure(error, reason);
+        if (reason.name !== "AbortError") save.disabled = false;
+      }
+    });
+    body.append(form);
+    host.showModal();
+    plan.focus();
+  }
+
+  function renameWorkspace(workspace) {
+    const isDefault = workspace.slug === "default";
+    const { host, body, error } = dialog("Rename workspace");
+    const name = el("input", {
+      id: "rename-ws-name", class: "field", required: true, maxLength: 256,
+      autocomplete: "off", value: workspace.name || workspace.slug,
+    });
+    const slug = el("input", {
+      id: "rename-ws-slug", class: "field", required: true, maxLength: 40,
+      pattern: "[a-z0-9][a-z0-9\\-]{0,39}", autocomplete: "off",
+      value: workspace.slug, disabled: isDefault,
+    });
+    const save = el("button", { type: "submit", class: "btn btn-primary", text: "Save" });
+    const form = el("form", { class: "stack" },
+      el("label", { class: "field-label", htmlFor: name.id, text: "Name" }), name,
+      el("label", { class: "field-label", htmlFor: slug.id, text: "Slug" }), slug,
+      save);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      error.hidden = true;
+      save.disabled = true;
+      const payload = { name: name.value.trim() };
+      if (!isDefault) payload.slug = slug.value.trim();
+      try {
+        await write(patchUrl(workspace.slug), "PATCH", payload);
+        host.close();
+        await refresh();
+      } catch (reason) {
+        failure(error, reason);
+        if (reason.name !== "AbortError") save.disabled = false;
+      }
+    });
+    body.append(form);
+    host.showModal();
+    name.focus();
+  }
+
+  function say(text) {
+    notice.textContent = text || "";
+    notice.hidden = !text;
+  }
+
+  // After an action succeeded its dialog is closed: report a failed reload on the page.
+  async function refreshAfterAction() {
+    try {
+      await refresh();
+    } catch (reason) {
+      if (epoch === version && !disposed) showError(content, reason);
+    }
+  }
+
+  function addServerAdmin() {
+    const { host, body, error } = dialog("Add server admin");
+    const login = el("input", {
+      id: "new-admin-login", class: "field", required: true, maxLength: 254,
+      autocomplete: "off",
+    });
+    const save = el("button", { type: "submit", class: "btn btn-primary", text: "Add" });
+    const form = el("form", { class: "stack" },
+      el("label", { class: "field-label", htmlFor: login.id, text: "Email or login" }), login,
+      el("p", {
+        class: "muted",
+        text: serverSession?.auth === "firebase"
+          ? "If no account exists for this email, one is created; it is linked when they first sign in."
+          : "The account must already exist.",
+      }),
+      save);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      error.hidden = true;
+      save.disabled = true;
+      let data;
+      try {
+        data = await write(api("/admin/server-admins"), "POST", { login: login.value.trim() });
+      } catch (reason) {
+        failure(error, reason);
+        if (reason.name !== "AbortError") save.disabled = false;
+        return;
+      }
+      host.close();
+      say(data?.account_created
+        ? `Created an account for ${data.server_admin?.login} and made it a server admin; it is linked when they first sign in.`
+        : `${data?.server_admin?.login} is now a server admin.`);
+      await refreshAfterAction();
+    });
+    body.append(form);
+    host.showModal();
+    login.focus();
+  }
+
+  function removeServerAdmin(admin) {
+    const { host, body, error } = dialog(`Remove ${admin.login}?`);
+    const confirm = button("Remove", async () => {
+      error.hidden = true;
+      confirm.disabled = true;
+      let data;
+      try {
+        data = await write(
+          `${api("/admin/server-admins")}/${encodeURIComponent(admin.login)}`, "DELETE");
+      } catch (reason) {
+        failure(error, reason);
+        if (reason.name !== "AbortError") confirm.disabled = false;
+        return;
+      }
+      host.close();
+      if (admin.login === serverSession?.user) {
+        // The page can no longer load: this account is not a server admin now.
+        dispose();
+        location.assign("/workspaces");
+        return;
+      }
+      say(`${data?.removed ?? admin.login} is no longer a server admin.`);
+      await refreshAfterAction();
+    }, "primary");
+    body.append(
+      el("p", {
+        text: "They lose server admin on their next request. An email still on the admin email list gets it back at its next sign-in.",
+      }),
+      el("div", { class: "inline" }, button("Cancel", () => host.close(), "secondary"), confirm));
+    host.showModal();
+    body.querySelector("button")?.focus();
+  }
+
+  function archiveWorkspace(workspace) {
+    const { host, body, error } = dialog(`Archive ${workspace.slug}?`);
+    const confirm = button("Archive", async () => {
+      error.hidden = true;
+      confirm.disabled = true;
+      try {
+        await write(`${patchUrl(workspace.slug)}/archive`, "POST", {});
+      } catch (reason) {
+        failure(error, reason);
+        if (reason.name !== "AbortError") confirm.disabled = false;
+        return;
+      }
+      host.close();
+      say(`Archived ${workspace.slug}.`);
+      await refreshAfterAction();
+    }, "primary");
+    body.append(
+      el("p", {
+        text: "Nobody can open or sync to it until it is restored. Its data is kept.",
+      }),
+      el("div", { class: "inline" }, button("Cancel", () => host.close(), "secondary"), confirm));
+    host.showModal();
+    body.querySelector("button")?.focus();
+  }
+
+  async function restoreWorkspace(workspace) {
+    try {
+      await write(`${patchUrl(workspace.slug)}/restore`, "POST", {});
+    } catch (reason) {
+      if (epoch === version && !disposed) showError(archivedTable, reason);
+      return;
+    }
+    say(`Restored ${workspace.slug}; it is suspended until you resume it.`);
+    await refreshAfterAction();
+  }
+
+  function signinCell(admin) {
+    switch (admin.signin) {
+      case "firebase": return "Firebase";
+      case "identity": return "Identity proxy";
+      case "password": return "Password";
+      default: return chip("pending", "warn");
+    }
+  }
+
+  function renderServerAdmins(rows) {
+    if (!rows.length) {
+      admins.replaceChildren(el("p", { class: "muted", text: "No server admins." }));
+      return;
+    }
+    const lines = rows.map((admin) => {
+      const values = [
+        admin.login,
+        chip(admin.source === "list" ? "list" : "manual", admin.source === "list" ? "ok" : ""),
+        signinCell(admin),
+        el("div", { class: "team-actions" },
+          button("Remove", () => removeServerAdmin(admin), "secondary")),
+      ];
+      return el("tr", { role: "row" }, ...values.map((value, index) =>
+        el("td", { role: "cell", "data-label": adminColumns[index] }, value)));
+    });
+    admins.replaceChildren(el("table", { class: "keys-table", role: "table", "aria-label": "Server admins" },
+      el("thead", { role: "rowgroup" }, el("tr", { role: "row" },
+        ...adminColumns.map((text) => el("th", { role: "columnheader", scope: "col", text })))),
+      el("tbody", { role: "rowgroup" }, ...lines)));
+  }
+
+  function createWorkspace() {
+    const { host, body, error } = dialog("New workspace");
+    const slug = el("input", {
+      id: "new-ws-slug", class: "field", required: true, maxLength: 40,
+      pattern: "[a-z0-9][a-z0-9\\-]{0,39}", autocomplete: "off",
+    });
+    const name = el("input", {
+      id: "new-ws-name", class: "field", required: true, maxLength: 256,
+      autocomplete: "off",
+    });
+    const owner = el("input", {
+      id: "new-ws-owner", class: "field", required: true, maxLength: 254,
+      autocomplete: "off",
+    });
+    const save = el("button", { type: "submit", class: "btn btn-primary", text: "Create" });
+    const form = el("form", { class: "stack" },
+      el("label", { class: "field-label", htmlFor: slug.id, text: "Slug" }), slug,
+      el("label", { class: "field-label", htmlFor: name.id, text: "Name" }), name,
+      el("label", { class: "field-label", htmlFor: owner.id, text: "Owner login" }), owner,
+      el("p", {
+        class: "muted",
+        text: "If no account exists for this email, one is created; it is linked when they first sign in.",
+      }),
+      save);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      error.hidden = true;
+      save.disabled = true;
+      try {
+        const data = await write(api("/admin/workspaces"), "POST", {
+          slug: slug.value.trim(), name: name.value.trim(), owner: owner.value.trim(),
+        });
+        host.close();
+        say(data?.owner_created
+          ? `Created an account for ${owner.value.trim().toLowerCase()}; it is linked when they first sign in.`
+          : "");
+        await refresh();
+      } catch (reason) {
+        failure(error, reason);
+        if (reason.name !== "AbortError") save.disabled = false;
+      }
+    });
+    body.append(form);
+    host.showModal();
+    slug.focus();
+  }
+
+  function renderActivity(events) {
+    if (!events.length) {
+      activity.replaceChildren(el("p", { class: "muted", text: "No activity yet." }));
+      return;
+    }
+    const rows = events.map((event) => {
+      const values = [
+        date(event.ts), event.actor || "—", event.action || "—",
+        event.target == null || event.target === "" ? "—" : String(event.target),
+        event.client == null || event.client === "" ? "—" : String(event.client),
+      ];
+      return el("tr", { role: "row" }, ...values.map((value, index) =>
+        el("td", { role: "cell", "data-label": activityColumns[index] }, value)));
+    });
+    activity.replaceChildren(el("table", { class: "keys-table", role: "table", "aria-label": "Activity" },
+      el("thead", { role: "rowgroup" }, el("tr", { role: "row" },
+        ...activityColumns.map((text) => el("th", { role: "columnheader", scope: "col", text })))),
+      el("tbody", { role: "rowgroup" }, ...rows)));
+  }
+
+  async function refresh() {
+    const sequence = ++refreshSequence;
+    const [listResponse, auditResponse, adminsResponse] = await Promise.all([
+      fetch(api("/admin/workspaces"), { signal, credentials: "same-origin" }),
+      fetch(`${api("/admin/audit")}?${new URLSearchParams({ limit: "200" })}`, {
+        signal, credentials: "same-origin",
+      }),
+      fetch(api("/admin/server-admins"), { signal, credentials: "same-origin" }),
+    ]);
+    if (epoch !== version || sequence !== refreshSequence || disposed) return;
+    if (listResponse.status === 401 || auditResponse.status === 401 || adminsResponse.status === 401) {
+      dispose();
+      location.assign("/login");
+      return;
+    }
+    const data = await listResponse.json().catch(() => null);
+    if (epoch !== version || sequence !== refreshSequence || disposed) return;
+    if (!listResponse.ok) throw new Error(
+      (typeof data?.error === "string" && data.error) || `Could not load workspaces (${listResponse.status})`);
+    if (!Array.isArray(data?.workspaces) || data.workspaces.some((row) =>
+      row === null || typeof row !== "object" || Array.isArray(row) ||
+      typeof row.slug !== "string" || typeof row.name !== "string" ||
+      typeof row.status !== "string"))
+      throw new Error(`Could not load workspaces (${listResponse.status})`);
+    freeLimits = data.free_limits && typeof data.free_limits === "object" && !Array.isArray(data.free_limits)
+      ? data.free_limits : null;
+    const rows = data.workspaces.filter((workspace) => !workspace.archived_at).map((workspace) => {
+      const isDefault = workspace.slug === "default";
+      const values = [
+        workspace.slug,
+        workspace.name,
+        chip(workspace.status, workspace.status === "active" ? "ok" : "warn"),
+        workspace.plan || "free",
+        formatGb(workspace.stored_bytes ?? 0),
+        formatGb(workspace.uploads_today ?? 0),
+        workspace.people == null ? "—" : String(workspace.people),
+        workspace.members == null ? "—" : String(workspace.members),
+        date(workspace.created_at),
+        el("div", { class: "team-actions" },
+          button("Rename", () => renameWorkspace(workspace), "secondary"),
+          button("Plan", () => editPlan(workspace), "secondary"),
+          button(
+            workspace.status === "suspended" ? "Resume" : "Suspend",
+            () => setStatus(
+              workspace, workspace.status === "suspended" ? "active" : "suspended"),
+            "secondary",
+            { disabled: isDefault },
+          ),
+          ...(isDefault ? [] : [button("Archive", () => archiveWorkspace(workspace), "secondary")])),
+      ];
+      return el("tr", { role: "row" }, ...values.map((value, index) =>
+        el("td", { role: "cell", "data-label": columns[index] }, value)));
+    });
+    content.replaceChildren(el("table", { class: "keys-table", role: "table", "aria-label": "Workspaces" },
+      el("thead", { role: "rowgroup" }, el("tr", { role: "row" },
+        ...columns.map((text) => el("th", { role: "columnheader", scope: "col", text })))),
+      el("tbody", { role: "rowgroup" }, ...rows)));
+    const archived = data.workspaces.filter((workspace) => workspace.archived_at);
+    archivedSection.hidden = archived.length === 0;
+    if (archived.length) {
+      const archivedRows = archived.map((workspace) => {
+        const values = [
+          workspace.slug,
+          workspace.name,
+          workspace.plan || "free",
+          formatGb(workspace.stored_bytes ?? 0),
+          date(workspace.archived_at),
+          el("div", { class: "team-actions" },
+            button("Restore", () => restoreWorkspace(workspace), "secondary")),
+        ];
+        return el("tr", { role: "row" }, ...values.map((value, index) =>
+          el("td", { role: "cell", "data-label": archivedColumns[index] }, value)));
+      });
+      archivedTable.replaceChildren(el("table", {
+        class: "keys-table", role: "table", "aria-label": "Archived workspaces" },
+      el("thead", { role: "rowgroup" }, el("tr", { role: "row" },
+        ...archivedColumns.map((text) => el("th", { role: "columnheader", scope: "col", text })))),
+      el("tbody", { role: "rowgroup" }, ...archivedRows)));
+    } else archivedTable.replaceChildren();
+    const adminData = await adminsResponse.json().catch(() => null);
+    if (epoch !== version || sequence !== refreshSequence || disposed) return;
+    if (adminsResponse.ok && Array.isArray(adminData?.server_admins) &&
+        adminData.server_admins.every((row) => row !== null && typeof row === "object" &&
+          typeof row.login === "string"))
+      renderServerAdmins(adminData.server_admins);
+    else showError(admins, new Error(
+      (typeof adminData?.error === "string" && adminData.error) ||
+      `Could not load server admins (${adminsResponse.status})`));
+    if (auditResponse.ok) {
+      const audit = await auditResponse.json().catch(() => null);
+      if (epoch !== version || sequence !== refreshSequence || disposed) return;
+      renderActivity(Array.isArray(audit?.events) ? audit.events : []);
+    } else {
+      const audit = await auditResponse.json().catch(() => null);
+      if (epoch !== version || sequence !== refreshSequence || disposed) return;
+      showError(activity, new Error(
+        (typeof audit?.error === "string" && audit.error) ||
+        `Could not load activity (${auditResponse.status})`));
+    }
+  }
+
+  const createButton = button("New workspace", createWorkspace, "primary");
+  app.replaceChildren(el("div", { class: "workspace stack" },
+    el("div", { class: "heading" },
+      el("h1", { text: "Admin" }),
+      el("div", { class: "inline" },
+        createButton)),
+    notice,
+    content,
+    archivedSection,
+    el("div", { class: "stack" },
+      el("div", { class: "heading" },
+        el("h2", { text: "Server admins" }),
+        button("Add server admin", addServerAdmin, "primary")),
+      admins),
     el("div", { class: "stack" },
       el("div", { class: "heading" }, el("h2", { text: "Activity" })),
-      activity,
-      el("div", { class: "activity-toolbar" }, loadOlder, activityStatus))));
+      activity)));
   try {
     await refresh();
   } catch (reason) {
@@ -4554,18 +5919,210 @@ async function teamPage(version) {
   }
 }
 
+const SETTINGS_PATH = /^\/settings(?:\/([^/?#]*))?\/?$/;
+// A malformed % sequence in the hash must not throw; it just names no section.
+function sectionName(raw) {
+  try {
+    return decodeURIComponent(raw || "");
+  } catch {
+    return "";
+  }
+}
+// Cards the signed-in role can open, in page order.
+function settingsSections(session) {
+  const can = workspaceCan(session);
+  return [
+    { id: "account", label: "Account", title: "Your account", allowed: true },
+    { id: "workspace", label: "Workspace", title: "Workspace", allowed: can.users },
+    { id: "members", label: "Members", title: "Members", allowed: can.users },
+    { id: "keys", label: "API keys", title: "API keys", allowed: can.own_keys },
+    { id: "activity", label: "Activity", title: "Activity", allowed: can.audit },
+  ].filter((section) => section.allowed);
+}
+function settingsCard(id, title) {
+  const heading = el("h2", { id: `settings-h-${id}`, tabindex: "-1", text: title });
+  const aside = el("div", { class: "settings-aside" });
+  const body = el("div", { class: "settings-body" });
+  const section = el("section", {
+    id: `settings-${id}`, class: "settings-card", "aria-labelledby": heading.id,
+  }, el("div", { class: "settings-head" }, heading, aside), body);
+  return { section, heading, aside, body };
+}
+// The mounted Settings page, so a section change only scrolls instead of refetching.
+let settingsView = null;
+async function settingsPage(version, requested) {
+  await sessionReady;
+  if (version !== epoch) return;
+  if (!serverMode || !currentWorkspaceSlug()) {
+    // Local `agenticml ui` has no accounts, so no Settings.
+    history.replaceState(null, "", "#/");
+    markRoute("/");
+    await home(version);
+    return;
+  }
+  const session = serverSession;
+  const sections = settingsSections(session);
+  const ids = sections.map((section) => section.id);
+  const cards = {};
+  for (const section of sections) cards[section.id] = settingsCard(section.id, section.title);
+  const links = sections.map((section) => el("a", {
+    href: `#/settings/${section.id}`, "data-section": section.id, text: section.label,
+    // The hash does not change on the current item, so scroll to its card here.
+    onclick: (event) => {
+      // Modified clicks (new tab, new window) keep their browser behaviour.
+      if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey)
+        return;
+      if (event.currentTarget.hasAttribute("aria-current")) {
+        event.preventDefault();
+        show(section.id);
+      }
+    },
+  }));
+  const workspaceRow = sessionWorkspaces(session).find((row) => row.slug === currentWorkspaceSlug());
+  const workspaceName = typeof workspaceRow?.name === "string" && workspaceRow.name
+    ? workspaceRow.name : currentWorkspaceSlug();
+
+  // Account: today's Account dialog body.
+  const account = accountDetails(session, { card: true });
+  cards.account.body.append(
+    ...[account.identity, account.switcher, ...account.password].filter(Boolean));
+  if (session.via !== "proxy")
+    cards.account.aside.append(button("Sign out", signOut, "secondary"));
+  // A rename shows at once in every place that names this workspace.
+  function applyWorkspaceName(name) {
+    if (workspaceRow) workspaceRow.name = name;
+    page.querySelector(".settings-ws-name").textContent = name;
+    page.querySelector(".settings-header .eyebrow").textContent = `Workspace · ${name}`;
+    for (const node of page.querySelectorAll(".settings-row-name[data-slug]"))
+      if (node.dataset.slug === currentWorkspaceSlug()) node.textContent = name;
+  }
+  // Workspace: name and slug here, the plan and usage tiles from the team mount.
+  if (cards.workspace)
+    cards.workspace.body.append(el("div", { class: "settings-row" },
+      el("span", { class: "settings-ws-name", text: workspaceName }),
+      el("span", { class: "settings-meta", text: `slug ${currentWorkspaceSlug()}` })));
+
+  const page = el("div", { class: "settings-page" },
+    el("div", { class: "settings-header" },
+      el("span", { class: "eyebrow", text: `Workspace · ${workspaceName}` }),
+      el("h1", { text: "Settings" }),
+      el("p", { text: "Your account, this workspace's people and its API keys." })),
+    el("div", { class: "settings-layout" },
+      el("nav", { class: "settings-nav", "aria-label": "Settings" },
+        el("div", {}, ...links)),
+      el("div", { class: "settings-col" }, ...sections.map((section) => cards[section.id].section))));
+
+  let active = "account";
+  // Set by any pointer, key, wheel or touch input; cleared when a section is chosen.
+  let moved = false;
+  const markMoved = () => { moved = true; };
+  const movedEvents = ["pointerdown", "keydown", "wheel", "touchmove"];
+  movedEvents.forEach((type) => window.addEventListener(type, markMoved, { capture: true, passive: true }));
+  // Marks the section in the nav at once; the scroll waits until the cards are loaded.
+  function select(id) {
+    moved = false;
+    active = ids.includes(id) ? id : "account";
+    if (id && active !== id) history.replaceState(null, "", `#/settings/${active}`);
+    for (const link of links) {
+      if (link.dataset.section === active) link.setAttribute("aria-current", "true");
+      else link.removeAttribute("aria-current");
+    }
+  }
+  function reveal() {
+    const card = cards[active];
+    card.heading.focus({ preventScroll: true });
+    if (active === "account") {
+      window.scrollTo(0, 0);
+      return;
+    }
+    // Clear the sticky top bar, which wraps to several rows on narrow screens.
+    const bar = document.querySelector(".topbar")?.offsetHeight || 0;
+    window.scrollTo(0, window.scrollY + card.section.getBoundingClientRect().top - bar - 16);
+  }
+  function show(id) {
+    select(id);
+    reveal();
+  }
+
+  const disposers = [];
+  const dispose = () => {
+    if (settingsView?.page === page) settingsView = null;
+    movedEvents.forEach((type) => window.removeEventListener(type, markMoved, { capture: true }));
+    disposers.splice(0).forEach((fn) => fn());
+  };
+  cleanup = dispose;
+  app.replaceChildren(page);
+  settingsView = {
+    page, show,
+    // A one-time key or invite link must not survive navigation inside Settings.
+    closeDialogs: () => disposers.forEach((fn) => fn.closeDialog?.()),
+  };
+  select(requested);
+  // A section whose request fails shows its error in place; the other cards keep working.
+  const mounts = [];
+  if (cards.keys) mounts.push(mountKeys(cards.keys, version, disposers));
+  if (cards.workspace)
+    mounts.push(mountTeam(
+      { workspace: cards.workspace, members: cards.members, activity: cards.activity },
+      version, disposers,
+      {
+        get: () => workspaceRow?.name || currentWorkspaceSlug(),
+        set: applyWorkspaceName,
+      }));
+  await Promise.all(mounts);
+  if (epoch !== version) dispose();
+  else if (settingsView?.page === page) {
+    if (active !== "account" && !moved && !document.querySelector("dialog[open]")) reveal();
+    // Every card has loaded and the deferred scroll is done.
+    page.dataset.loaded = "true";
+  }
+}
+
+// Top bar state: the breadcrumb and the Settings link follow the current page.
+function markRoute(hash) {
+  const settings = SETTINGS_PATH.test(hash);
+  const crumb = document.querySelector(".breadcrumb");
+  crumb.setAttribute("href", "#/");
+  crumb.textContent = settings ? "agenticml / settings" : "agenticml / runs";
+  const link = document.querySelector("#nav-settings");
+  if (settings) link.setAttribute("aria-current", "page");
+  else link.removeAttribute("aria-current");
+}
+const LEGACY_ROUTES = { "/keys": "/settings/keys", "/team": "/settings/members" };
 async function route() {
+  let hash = location.hash.slice(1) || "/";
+  if (LEGACY_ROUTES[hash] && !isAdminPath()) {
+    // Old Keys and Team links keep working.
+    hash = LEGACY_ROUTES[hash];
+    history.replaceState(null, "", `#${hash}`);
+  }
+  const settings = isAdminPath() ? null : SETTINGS_PATH.exec(hash);
+  if (settings && settingsView?.page.isConnected) {
+    // Only the section changed: scroll to its card, no re-render or refetch.
+    settingsView.closeDialogs();
+    settingsView.show(sectionName(settings[1]));
+    return;
+  }
   const version = ++epoch;
   controller?.abort();
   cleanup();
   cleanup = () => {};
+  settingsView = null;
   document.querySelector("#lightbox").close();
   controller = new AbortController();
-  app.replaceChildren(loading("Loading runs…"));
+  app.replaceChildren(loading(
+    isAdminPath() ? "Loading…" : settings ? "Loading settings…" : "Loading runs…"));
   try {
-    const hash = location.hash.slice(1) || "/";
-    if (hash === "/keys") await keysPage(version);
-    else if (hash === "/team") await teamPage(version);
+    if (isAdminPath()) {
+      await sessionReady;
+      if (version !== epoch) return;
+      if (serverMode) {
+        await adminPage(version);
+        return;
+      }
+    }
+    markRoute(hash);
+    if (settings) await settingsPage(version, sectionName(settings[1]));
     else if (hash.startsWith("/run/"))
       await runPage(decodeURIComponent(hash.slice(5)), version);
     else if (hash.startsWith("/compare")) {

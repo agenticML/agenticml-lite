@@ -31,6 +31,10 @@ Authorization: Bearer <key>
 
 - **Key format**: The prefix `aml_` followed by 43 URL-safe base64 characters
   (32 random bytes, e.g. `aml_abc123...`).
+- **Workspace binding**: Every API key belongs to a user account and is bound to
+  exactly one workspace. On `/v2/*` requests, the server identifies the workspace
+  directly from the bearer token. Sync clients do not need to specify a
+  workspace slug in the URL.
 - **Scopes and roles**: Keys belong to users and are issued with either
   `sync` or `admin` scope. A key whose user has role `viewer` can only call
   `GET /v2/whoami`; every other `/v2` endpoint returns `403 Forbidden`
@@ -48,6 +52,21 @@ Authorization: Bearer <key>
   or responses.
 
 ## General rules
+
+### Client support window
+
+Sync clients declare their package version in the `User-Agent` header (e.g. `User-Agent: agenticml-lite/3.0.0`).
+
+The server enforces a minimum client support window via `--min-client-version X.Y` (environment variable `AGENTICML_SERVER_MIN_CLIENT_VERSION`, default `2.2`). Values below `2.2` are not supported: 2.0 and 2.1 clients compare `owner` with their key name and misreport their own runs as foreign.
+
+On `/v2/*` requests (except `GET /v2/whoami`), any client with a User-Agent identifying an `agenticml-lite` version older than the minimum is rejected with HTTP `426 Upgrade Required`:
+
+```json
+{"error": "this server needs agenticml-lite >= 2.2; run: pip install -U agenticml-lite"}
+```
+
+- `GET /v2/whoami` is exempt from the 426 check so client capability checks succeed without failing during discovery.
+- Foreign or missing `User-Agent` headers (such as `curl` or third-party HTTP clients) are accepted, keeping the protocol open.
 
 ### Run ID validation
 
@@ -102,7 +121,7 @@ client recovery.
 | `200 OK` | Success | Request completed successfully. |
 | `201 Created` | Created | New content-addressed object stored (`PUT /v2/objects/{sha256}`). |
 | `401 Unauthorized` | Auth failed | Missing, invalid, or revoked bearer token (`WWW-Authenticate: Bearer`). |
-| `403 Forbidden` | Forbidden | Calling key belongs to a `viewer` user (`{"error": "role viewer cannot sync"}`). |
+| `403 Forbidden` | Forbidden | Calling key belongs to a `viewer` user (`{"error": "role viewer cannot sync"}`), the workspace is suspended, or workspace storage/upload quota reached. |
 | `404 Not Found` | Not found | Unknown route, invalid run ID, unallowed path, or unknown run on state/append/commit/non-meta PUT. |
 | `405 Method Not Allowed` | Method rejected | Method not allowed for endpoint (`Allow` header returned). |
 | `408 Request Timeout` | Timeout | Request body read exceeded deadline or client disconnected. |
@@ -110,6 +129,8 @@ client recovery.
 | `411 Length Required` | Missing length | `Content-Length` missing, non-digit, duplicated, or `Transfer-Encoding` present. |
 | `413 Payload Too Large` | Oversized body | Declared body length exceeds endpoint limit. |
 | `422 Unprocessable Entity` | Validation error | Malformed JSON, torn record, object hash mismatch, or invalid query parameters. |
+| `426 Upgrade Required` | Client outdated | User-Agent declares an `agenticml-lite` version below server `--min-client-version`. |
+| `429 Too Many Requests` | Rate limited | Workspace request-rate quota exceeded (`Retry-After` header returned). |
 | `503 Service Unavailable` | Server busy | Request body admission capacity reached (`Retry-After: 5` header returned). |
 | `500 Internal Error` | Internal error | Unexpected server failure (`{"error": "internal error"}`). |
 
@@ -128,13 +149,15 @@ client recovery.
 
 ## Endpoints
 
+A key of a suspended workspace gets `403 {"error": "workspace suspended"}` on every `/v2` request, including `GET /v2/whoami`.
+
 | Method and path | Request body | Success response | Error codes |
 | --- | --- | --- | --- |
 | `GET /healthz` | None | `200 {"ok": true}` | None |
-| `GET /v2/whoami` | None | `200 {"key": name, "scope": scope, "user": user, "role": role, "protocol": 2, "features": ["lineage", "byref"]}` | 401 |
+| `GET /v2/whoami` | None | `200 {"key": name, "scope": scope, "user": user, "role": role, "protocol": 2, "workspace": slug, "features": ["lineage", "byref"]}` | 401, 403, 429 |
 | `POST /v2/objects/missing` | `{"objects": [sha256, ...]}` | `200 {"missing": [sha256, ...]}` | 401, 403, 411, 413, 422, 503 |
 | `PUT /v2/objects/{sha256}` | Raw bytes (`application/octet-stream`) | `201 {"sha256": sha256, "created": true}` or `200 {"sha256": sha256, "created": false}` | 401, 403, 411, 413, 422, 503 |
-| `GET /v2/runs/{id}/state` | None | `200 {"owner": name, "owner_user": user, "files": {path: {"size": n, "sha256": h}}, "remote": {...}}` | 401, 403, 404 |
+| `GET /v2/runs/{id}/state` | None | `200 {"owner": user, "owner_user": user, "files": {path: {"size": n, "sha256": h}}, "remote": {...}}` | 401, 403, 404 |
 | `PUT /v2/runs/{id}/files/{path}` | Raw bytes | `200 {"size": n}` | 401, 403, 404, 409, 411, 413, 422, 503 |
 | `POST /v2/runs/{id}/append/{path}?offset=N[&truncate=1]` | Raw bytes | `200 {"size": n}` | 401, 403, 404, 409, 411, 413, 422, 503 |
 | `GET /v2/runs/{id}/lineage` | None | `200 {"commit": sha_or_null, "tips": [sha, ...]}` | 401, 403, 404, 409, 422, 503 |
@@ -153,7 +176,7 @@ Unauthenticated health check.
 
 ### `GET /v2/whoami`
 
-Identify the calling API key, owning user, role, and server capabilities.
+Identify the calling API key, owning user, role, workspace, and server capabilities.
 
 - **Request**: `GET /v2/whoami`
   - Header: `Authorization: Bearer <key>`
@@ -165,14 +188,16 @@ Identify the calling API key, owning user, role, and server capabilities.
     "user": "alice",
     "role": "member",
     "protocol": 2,
+    "workspace": "default",
     "features": ["lineage", "byref"]
   }
   ```
 - **Errors**:
   - `401 Unauthorized`: `{"error": "unauthorized"}` with `WWW-Authenticate: Bearer`.
 
-The `user` and `role` fields identify the key's owner and assigned role. A key
-belonging to a user with role `viewer` can call `whoami`, but every other `/v2`
+The `user` and `role` fields identify the key's owner and assigned role. The
+`workspace` field identifies the slug of the workspace to which the key is bound.
+A key belonging to a user with role `viewer` can call `whoami`, but every other `/v2`
 route returns `403 Forbidden` (`{"error": "role viewer cannot sync"}`).
 
 The `lineage` feature is present only when Git was found at server startup;
@@ -303,7 +328,7 @@ any valid sync or admin key.
 - **Response**: `200 OK`
   ```json
   {
-    "owner": "gpu-box-1",
+    "owner": "alice",
     "owner_user": "alice",
     "files": {
       "meta.json": {"size": 812, "sha256": "a1b2..."},
@@ -312,7 +337,7 @@ any valid sync or admin key.
       "scalars/0.bin": {"size": 8000, "sha256": "0718..."}
     },
     "remote": {
-      "owner": "gpu-box-1",
+      "owner": "alice",
       "owner_user": "alice",
       "owner_key": "gpu-box-1",
       "last_sync_key": "gpu-box-1",
@@ -323,12 +348,15 @@ any valid sync or admin key.
     }
   }
   ```
-  - **Compatibility rule**: To preserve compatibility with 2.0 and 2.1 clients,
-    the `owner` field in `state`, `state.remote`, and 409 conflict payloads
-    returns the **calling key's name** if the caller's user owns the run. If
-    the run is owned by another user, `owner` returns the owning user's name.
-  - `owner_user` always carries the real user name of the owner, both at the
-    top level and inside `remote`.
+  - **Database source of truth**: In version 3.0, the server retrieves file
+    sizes, hashes, owner information, and commit metadata directly from the
+    database (`runs` and `run_files` tables). The server no longer creates or
+    updates `remote.json` files on disk. The response schema remains identical.
+  - `owner` and `owner_user` both carry the real user name of the owner, at
+    the top level, inside `remote` and in 409 conflict payloads. The key that
+    created the run is `owner_key`. Before 3.0, `owner` carried the calling
+    key's name for the caller's own runs; clients older than 2.2 relied on that
+    and are unsupported (the default `--min-client-version 2.2` refuses them).
   - `owner_key` (the key that created the run) and `last_sync_key` (the key of
     the last commit) in `remote` are visible only to keys belonging to the
     owning user; they are omitted for callers of other users.
@@ -365,7 +393,7 @@ Atomically write or replace an allow-listed atomic file.
   - `403 Forbidden`: `{"error": "role viewer cannot sync"}`
   - `404 Not Found`: disallowed path, or unknown run for non-meta files
     (`{"error": "unknown run"}`).
-  - `409 Conflict`: `{"error": "run owned by another user", "owner": "<name>", "owner_user": "<user>"}`
+  - `409 Conflict`: `{"error": "run owned by another user", "owner": "<user>", "owner_user": "<user>"}`
   - `411 Length Required`: `{"error": "length required"}`
   - `413 Payload Too Large`: `{"error": "payload too large"}`
   - `422 Unprocessable Entity`: `{"error": "invalid meta.json"}`,
@@ -401,7 +429,7 @@ Append records to an allow-listed append file, or atomically replace it when
   - `403 Forbidden`: `{"error": "role viewer cannot sync"}`
   - `404 Not Found`: disallowed path or unknown run.
   - `409 Conflict`:
-    - `{"error": "run owned by another user", "owner": "<name>", "owner_user": "<user>"}`
+    - `{"error": "run owned by another user", "owner": "<user>", "owner_user": "<user>"}`
     - `{"size": S}` (gap: `offset > S`)
     - `{"size": S, "mismatch": true}` (overlapping bytes disagree)
     - `{"error": "run is not running", "status": "<status>"}` (`truncate=1` attempted
@@ -455,7 +483,7 @@ sizes before updating `remote.json`.
   - `403 Forbidden`: `{"error": "role viewer cannot sync"}`
   - `404 Not Found`: unknown run (`{"error": "unknown run"}`).
   - `409 Conflict`:
-    - `{"error": "run owned by another user", "owner": "<name>", "owner_user": "<user>"}`
+    - `{"error": "run owned by another user", "owner": "<user>", "owner_user": "<user>"}`
     - `{"error": "status does not match meta.json", "status": "<server_status>"}`
     - `{"error": "size mismatch", "sizes": {path: server_size_or_null, ...}}`
   - `411 Length Required`: `{"error": "length required"}`
@@ -487,8 +515,8 @@ A run does not exist on the server until `meta.json` is created:
    ```json
    {"error": "run owned by another user", "owner": "alice", "owner_user": "alice"}
    ```
-   with HTTP status `409 Conflict`. (Under the compatibility rule, `owner` is
-   the owning user's name because the caller belongs to a different user).
+   with HTTP status `409 Conflict`. `owner` and `owner_user` both carry the
+   owning user's name (never a key name).
 3. **Commit attribution**: When committing (`POST /v2/runs/{id}/commit`), the
    server records `last_sync_key` (the key that performed the commit) alongside
    `last_sync_at` in `remote.json`.
@@ -657,13 +685,13 @@ the local files:
 
 ### 3. Cursor state in `sync.json`
 
-The client maintains host-scoped sync state in `<root>/runs/<id>/sync.json`:
+The client maintains host- and workspace-scoped sync state in `<root>/runs/<id>/sync.json`:
 
 ```json
 {
   "version": 1,
   "hosts": {
-    "https://aml.example.com": {
+    "https://aml.example.com/w/default": {
       "protocol": 2,
       "owner": "gpu-box-1",
       "owner_user": "alice",
@@ -694,17 +722,47 @@ The client maintains host-scoped sync state in `<root>/runs/<id>/sync.json`:
   `{"kind": "byref", "id": "<name>:v<version>", "reason": "..."}` in
   `skipped`. The `artifacts.json` cursor lives under `files` like other
   atomic files.
+- **Workspaces**: On a 3.0 server (its `/v2/whoami` names the key's workspace),
+  the cursor key is `<host>/w/<workspace-slug>`, e.g.
+  `https://aml.example.com/w/default` (the same path as that workspace's dashboard).
+  Each workspace maintains its own cursor, so one local store (`AGENTICML_DIR`)
+  can sync the same run to several workspaces on one host, just by syncing with
+  each workspace's key. 2.x servers (no workspace in `whoami`) keep the bare
+  host key, unchanged. On the first sync with a 3.0 server, if a run has an old
+  host-only entry, the client checks remote run state via `GET /v2/runs/{id}/state`.
+  If the run exists in the key's workspace and belongs to the key's user, the
+  old entry is moved to the new `<host>/w/<slug>` key and the run is committed
+  once more (the server checks sizes; no accepted bytes are resent). Otherwise
+  the workspace starts with an empty cursor (rebuilt from `/state`) and the old
+  host-only entry is kept for the workspace that has the run. v1 entries (no
+  `"protocol": 2`) are never moved.
+  After upgrading, `--all` and `--follow` select each run that has only a
+  host-only entry once: one `/state` request and one commit per run, then the
+  run is idle again. `sync --reset RUN_ID` drops the bare host entry and every
+  `<host>/w/<slug>` entry for that host. A run pruned after syncing to one
+  workspace is refused for any other key (`pruned_hosts` records the
+  per-workspace key, and `--reset` keeps it); this includes a pruned run whose
+  host-only entry belongs to a workspace other than the current key's.
+  `--dry-run` has no key, so it reads the host's only entry, else one that
+  pruned the run, else the bare host.
 - **Owner and user**: On servers that return `user` in `whoami`, the client
   compares ownership by user (`owner_user`), allowing a machine to switch to
-  another key of the same user. It caches `owner_user` per host in `sync.json`.
-  When syncing against a server that omits `user` (version 2.0 or 2.1), the
-  client falls back to checking `owner` against its key name.
+  another key of the same user. It caches `owner_user` per host and workspace in
+  `sync.json`. When syncing against a server that omits `user` (version 2.0 or 2.1),
+  the client falls back to checking `owner` against its key name. Since 3.0
+  servers send the user name in `owner`, this fallback is only meaningful for
+  those old servers; clients older than 2.2 are refused by 3.0 servers by default
+  and misreport their own runs as foreign if an operator lets them in.
 - **Update timing**: `sync.json` is atomically replaced and directory-fsynced
   after every accepted HTTP write request, ensuring interrupted syncs resume
   where they left off.
 - **Compatibility**: Host entries without `"protocol": 2` (v1 entries) are
-  treated as empty and replaced on first save. Entries for other hosts are
-  retained untouched. `store.gc` reads `complete: true` and `source_hash == run_fingerprint()`.
+  treated as empty. On a 2.x server the entry is replaced on first save; on a
+  3.0 server it is left as it is and the workspace entry starts empty.
+  Host-only protocol 2 entries are migrated to per-workspace entries as
+  described above. Entries for other hosts
+  are retained untouched. `store.gc` reads `complete: true` and
+  `source_hash == run_fingerprint()`.
 
 ### 4. Rollback detection and rewrite
 
@@ -726,8 +784,9 @@ Before appending, the client checks for local rollbacks:
 
 ### 5. Cursor recovery via `GET /state`
 
-When a host entry has no `files` map (new run, lost `sync.json`, after
-`sync --reset RUN_ID`, or upgrading an older v1 host entry):
+When a host or workspace entry has no `files` map (new run, a workspace with no
+cursor yet, lost `sync.json`, after `sync --reset RUN_ID`, or upgrading an older
+v1 host entry):
 
 1. The client calls `GET /v2/runs/{id}/state`.
 2. If the run is unknown on the server (`404 Not Found`), the client starts with
@@ -827,6 +886,10 @@ is committed at least every 60 s.
   - **HTTP 4xx client errors**: Any 4xx HTTP response other than `408 Request
     Timeout` and `429 Too Many Requests` (and excluding a second 404
     `RunMissingError` during upload).
+    *Exception in version 3.0*: Under `sync --follow`, an HTTP 403 response with
+    `storage limit reached` is treated as a paused state and retried every 10
+    minutes rather than permanently dropped. Once a workspace administrator
+    increases the storage quota, syncing resumes automatically.
 - **Transient failures** (retried on the next `--watch` pass):
   - Network errors, timeouts, and chunked encoding errors.
   - HTTP `408 Request Timeout`, `429 Too Many Requests`, and 5xx server errors
@@ -834,7 +897,23 @@ is committed at least every 60 s.
   - A second 404 in the same sync pass (`RunMissingError`), allowing recovery on
     the subsequent pass.
 
-### 11. Out of scope in protocol 2.0
+### 11. Dashboard runs list metrics API
+
+In version 3.0, the server dashboard exposes metric summaries directly via `GET /api/w/{slug}/runs` for sorting and filtering runs without reading run files:
+
+- **Query parameters**:
+  - `metrics`: Comma-separated list of metric names to include in each run's `metrics` dictionary (e.g. `?metrics=loss,val_loss,accuracy`). At most 8 names allowed, each up to 200 characters.
+  - `sort`: Metric sorting specification in the format `metric:<name>:<stat>` where `<stat>` is one of `last`, `min`, or `max` (e.g. `?sort=metric:val_loss:min`).
+  - `order`: Sort order, either `asc` (default) or `desc`.
+  - `filter`: Repeatable filter parameter in the format `metric:<name>:<stat>:<op>:<value>` where:
+    - `<stat>`: `last`, `min`, or `max`.
+    - `<op>`: Comparison operator: `lt` (`<`), `le` (`<=`), `gt` (`>`), `ge` (`>=`), or `eq` (`=`).
+    - `<value>`: Finite numeric value.
+    - Up to 8 filters can be combined, e.g. `?filter=metric:accuracy:last:gt:0.95&filter=metric:val_loss:min:lt:0.2`.
+- **Errors**:
+  - `422 Unprocessable Entity`: Invalid metric query syntax, unsupported stat, invalid operator, non-finite number, or more than 8 metric names/filters (`RunsQueryError`).
+
+### 12. Out of scope in protocol 2.0
 
 - **Notes**: `notes.md` is never synced. Local notes remain local; notes
   edited in the server dashboard stay on the server.

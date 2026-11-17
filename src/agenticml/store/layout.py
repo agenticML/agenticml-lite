@@ -425,7 +425,7 @@ def open_object(root, sha: str):
         raise
 
 
-def load_events(path: Path) -> list[dict]:
+def load_events(path: Path, *, maximum=None) -> list[dict]:
     """Read ``events.jsonl``.
 
     A crash can tear the last line. If that line is not valid JSON it is
@@ -435,7 +435,8 @@ def load_events(path: Path) -> list[dict]:
     not torn. Symlinked files are refused with a warning.
     """
     try:
-        raw = read_file_nofollow(path)
+        with open_nofollow(path) as handle:
+            raw = handle.read() if maximum is None else handle.read(maximum)
     except FileNotFoundError:
         return []
     except OSError as exc:

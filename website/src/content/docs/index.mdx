@@ -20,16 +20,16 @@ hero:
 
 import { CardGrid, LinkCard } from '@astrojs/starlight/components';
 
-The PyPI package is 1.0.0, which tracks locally only and cannot sync to the self-hosted server or the hosted service:
+Install the package from PyPI:
 
 ```bash
 pip install agenticml-lite
 ```
 
-Version 3.0 adds workspaces and the hosted service to the self-hosted server. It is a pre-release, so install it from GitHub (the command follows the `dev` branch and changes as development continues):
+Version 3.0.0 adds workspaces and the hosted service to the self-hosted server. To also sample CPU, memory and disk metrics, install the `system` extra:
 
 ```bash
-pip install 'agenticml-lite[system] @ git+https://github.com/agenticML/agenticml-lite@dev'
+pip install 'agenticml-lite[system]'
 ```
 
 ## Three ways to use it

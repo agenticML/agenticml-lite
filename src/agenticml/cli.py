@@ -16,6 +16,7 @@ agenticml code in the script:
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import logging
 import math
@@ -485,8 +486,82 @@ def cmd_ui(args):
     return 0
 
 
+def _env_flag(name):
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes"}
+
+
+def _firebase_from_args(args):
+    from .server.firebase import parse_firebase_config
+
+    project = getattr(args, "firebase_project", None)
+    if project is None:
+        project = os.environ.get("AGENTICML_SERVER_FIREBASE_PROJECT") or None
+    api_key = getattr(args, "firebase_api_key", None)
+    if api_key is None:
+        api_key = os.environ.get("AGENTICML_SERVER_FIREBASE_API_KEY") or None
+    auth_domain = getattr(args, "firebase_auth_domain", None)
+    if auth_domain is None:
+        auth_domain = os.environ.get("AGENTICML_SERVER_FIREBASE_AUTH_DOMAIN") or None
+    return parse_firebase_config(project, api_key, auth_domain)
+
+
+def _limits_from_args(args):
+    from .server.limits import Plans
+
+    path = getattr(args, "limits", None) or os.environ.get("AGENTICML_SERVER_LIMITS")
+    if not path:
+        return None, None
+    path = str(Path(path).expanduser().resolve())
+    return path, Plans.load(path)
+
+
+def _open_signup_from_args(args, firebase, plans=None):
+    from .server.firebase import require_open_signup
+
+    open_signup = bool(getattr(args, "open_signup", False) or _env_flag("AGENTICML_SERVER_OPEN_SIGNUP"))
+    require_open_signup(open_signup, firebase, plans)
+    return open_signup
+
+
+def _admin_emails_from_args(args):
+    """Server-admin emails from ``--admin-emails`` or the environment (flag wins).
+
+    Invalid entries are dropped with a warning: a typo in a deploy variable
+    must not take the service down.
+    """
+    from .server.db.workspaces import is_email_login
+
+    raw = getattr(args, "admin_emails", None)
+    if raw is None:
+        raw = os.environ.get("AGENTICML_SERVER_ADMIN_EMAILS", "")
+    emails = set()
+    for part in raw.split(","):
+        entry = part.strip().lower()
+        if not entry:
+            continue
+        if not is_email_login(entry):
+            logger.warning("ignoring admin email entry %r: not an email address", entry)
+            continue
+        emails.add(entry)
+    return frozenset(emails)
+
+
+def _legal_base_url_from_args(args):
+    """Policy base URL from ``--legal-base-url`` or the environment (flag wins).
+
+    Empty means unset. Anything but an https:// URL raises ValueError.
+    """
+    from .server.webauth import normalize_legal_base_url
+
+    raw = getattr(args, "legal_base_url", None)
+    if raw is None:
+        raw = os.environ.get("AGENTICML_SERVER_LEGAL_BASE_URL", "")
+    return normalize_legal_base_url(raw)
+
+
 def cmd_server_serve(args):
     from .server import serve
+    from .server.db.errors import DatabaseError
     from .server.webauth import parse_identity_header, parse_trusted_proxies
 
     public_url = args.public_url
@@ -500,13 +575,38 @@ def cmd_server_serve(args):
     identity = args.identity_header
     if identity is None:
         identity = os.environ.get("AGENTICML_SERVER_IDENTITY_HEADER") or None
+    extra = {}
+    if args.objects is not None:
+        extra["objects"] = args.objects
+    if args.database is not None:
+        extra["database"] = args.database
     try:
+        _, plans = _limits_from_args(args)
+        if plans is not None:
+            extra["plans"] = plans
+        firebase = _firebase_from_args(args)
+        if firebase is not None:
+            extra["firebase"] = firebase
+        if _open_signup_from_args(args, firebase, plans):
+            extra["open_signup"] = True
+        admin_emails = _admin_emails_from_args(args)
+        if admin_emails:
+            extra["admin_emails"] = admin_emails
+        legal_base_url = _legal_base_url_from_args(args)
+        if legal_base_url:
+            extra["legal_base_url"] = legal_base_url
+        min_client = args.min_client_version
+        if min_client is None:
+            min_client = os.environ.get("AGENTICML_SERVER_MIN_CLIENT_VERSION") or None
+        if min_client is not None:
+            extra["min_client_version"] = min_client
         serve(args.data, args.host, args.port, public_url,
               trusted_proxies=parse_trusted_proxies(proxies),
-              identity_header=parse_identity_header(identity))
+              identity_header=parse_identity_header(identity),
+              **extra)
     except KeyboardInterrupt:
         pass
-    except (OSError, ValueError, OverflowError) as exc:
+    except (OSError, ValueError, OverflowError, DatabaseError) as exc:
         print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
         return 1
     print("stopped")
@@ -524,16 +624,33 @@ def _parse_up_port(value):
 
 
 def cmd_server_up(args):
+    from .server.db.errors import DatabaseError
     from .server.up import UpError, up
 
+    extra = {}
+    if args.database is not None:
+        extra["database"] = args.database
     try:
-        up(args.data, args.port, install=args.install, force=args.force)
+        limits_file, plans = _limits_from_args(args)
+        if plans is not None:
+            extra["plans"] = plans
+        if limits_file is not None:
+            extra["limits"] = limits_file
+        firebase = _firebase_from_args(args)
+        if firebase is not None:
+            extra["firebase"] = firebase
+        if _open_signup_from_args(args, firebase, plans):
+            extra["open_signup"] = True
+        admin_emails = _admin_emails_from_args(args)
+        if admin_emails:
+            extra["admin_emails"] = admin_emails
+        up(args.data, args.port, install=args.install, force=args.force, **extra)
     except KeyboardInterrupt:
         pass
     except UpError as exc:
         print((str(exc).splitlines() or [type(exc).__name__])[0], file=sys.stderr)
         return 1
-    except (OSError, ValueError, OverflowError) as exc:
+    except (OSError, ValueError, OverflowError, DatabaseError) as exc:
         print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
         return 1
     if not args.install:
@@ -559,19 +676,20 @@ _MIGRATE_FAILED = "could not migrate keys.json; fix the file and retry"
 def cmd_server_keys(args):
     from .server.audit import AuditLog, cli_actor
     from .server.keys import KeyStore, KeyStoreUnavailable
-    from .server.users import UserStore, migrate
+    from .server.users import UserStore
+    from .server.db import DatabaseError, for_server_dir
 
     try:
         data, directory = _server_data_dir(args)
         actor = cli_actor()
-        log = AuditLog(directory)
-        if not migrate(data, actor=actor):
-            print(f"agenticml server: {_MIGRATE_FAILED}", file=sys.stderr)
-            return 1
-        keys = KeyStore(directory, env_key=None)
+        db = for_server_dir(directory, args.database, actor=actor)
+        from .server.db.workspaces import WorkspaceRepo
+        wid = WorkspaceRepo(db).require(args.workspace)['id']
+        log = AuditLog(directory, db=db, workspace_id=wid)
+        keys = KeyStore(directory, env_key=None, db=db, workspace_id=wid)
         if args.keys_action == "list":
             try:
-                keys = KeyStore(directory, os.environ.get("AGENTICML_SERVER_KEY"))
+                keys = KeyStore(directory, os.environ.get("AGENTICML_SERVER_KEY"), db=db, workspace_id=wid)
             except ValueError as exc:
                 print(f"agenticml server: warning: {exc}; listing file keys only", file=sys.stderr)
         if args.keys_action == "create":
@@ -580,7 +698,7 @@ def cmd_server_keys(args):
                 args.name, args.scope, user=args.user, created_users=created_users)
             if created_users:
                 log.record(actor, "cli", "user.add", record.user,
-                           detail={"role": "admin", "identity": None})
+                           detail={"role": created_users[0].role, "identity": None})
             log.record(actor, "cli", "key.create", record.name,
                        detail={"user": record.user, "scope": record.scope})
             print(key)
@@ -594,9 +712,9 @@ def cmd_server_keys(args):
         else:
             user = args.user
             if user is not None:
-                from .server.keys import validate_name
-                validate_name(user)
-                if UserStore(directory).get(user) is None:
+                from .server.db.workspaces import validate_login
+                user = validate_login(user)
+                if UserStore(directory, db=db, workspace_id=wid).get(user) is None:
                     raise ValueError("unknown user")
             records = [record.to_public() for record in keys.list()
                        if user is None or record.user == user]
@@ -609,7 +727,7 @@ def cmd_server_keys(args):
     except KeyboardInterrupt:
         print("stopped")
         return 0
-    except (OSError, ValueError, OverflowError, KeyStoreUnavailable) as exc:
+    except (OSError, ValueError, OverflowError, KeyStoreUnavailable, DatabaseError) as exc:
         print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
         return 1
     return 0
@@ -622,11 +740,21 @@ def _invite_base(args):
     return None
 
 
-def _print_invite(token, base):
+def _hosted_invites(args):
+    """True when links should carry the token in the fragment (Firebase on).
+    A bad Firebase setting here must not break `users invite`."""
+    try:
+        return _firebase_from_args(args) is not None
+    except (ValueError, RuntimeError):
+        return False
+
+
+def _print_invite(token, base, hosted=False):
+    from .server.keyspage import invite_link
     if base:
-        print(f"{base}/invite?token={token}")
+        print(invite_link(base, token, hosted))
     else:
-        print(f"/invite?token={token}")
+        print(invite_link("", token, hosted))
         print("open it on your server's address")
 
 
@@ -646,38 +774,50 @@ def _read_cli_password(args):
     return first
 
 
+def _print_account_workspaces(db, login):
+    from .server.db.workspaces import AccountRepo
+    slugs = AccountRepo(db).workspace_slugs(login)
+    if len(slugs) > 1:
+        print(f"{login} belongs to workspaces: {', '.join(slugs)}")
+
+
 def cmd_server_users(args):
     from .server.audit import AuditLog, cli_actor
     from .server.keys import KeyStore, KeyStoreUnavailable
-    from .server.users import UserStore, migrate
+    from .server.users import UserStore
+    from .server.db import DatabaseError, for_server_dir
 
     try:
         data, directory = _server_data_dir(args)
         actor = cli_actor()
-        log = AuditLog(directory)
-        if not migrate(data, actor=actor):
-            print(f"agenticml server: {_MIGRATE_FAILED}", file=sys.stderr)
-            return 1
-        users = UserStore(directory)
-        keys = KeyStore(directory)
+        db = for_server_dir(directory, args.database, actor=actor)
+        from .server.db.workspaces import WorkspaceRepo
+        wid = WorkspaceRepo(db).require(args.workspace)['id']
+        log = AuditLog(directory, db=db, workspace_id=wid)
+        users = UserStore(directory, db=db, workspace_id=wid)
+        keys = KeyStore(directory, db=db, workspace_id=wid)
         if args.users_action == "add":
+            from .server.db.workspaces import AccountRepo
+            existing_account = AccountRepo(db).get(args.name)
             user = users.add(args.name, role=args.role, identity=args.identity,
-                             reclaim_runs=args.reclaim_runs)
+                             reclaim_runs=args.reclaim_runs, operator=True)
             log.record(actor, "cli", "user.add", user.name,
                        detail={"role": user.role, "identity": user.identity})
-            if not args.no_invite:
-                token = users.create_invite(args.name)
+            if not args.no_invite and existing_account is None:
+                token = users.create_invite(args.name, operator=True)
                 log.record(actor, "cli", "user.invite", args.name,
                            detail={"expires_at": users.get(args.name).invite["expires_at"]})
-                _print_invite(token, _invite_base(args))
+                _print_invite(token, _invite_base(args), _hosted_invites(args))
         elif args.users_action == "invite":
-            token = users.create_invite(args.name)
+            token = users.create_invite(args.name, operator=True)
             log.record(actor, "cli", "user.invite", args.name,
                        detail={"expires_at": users.get(args.name).invite["expires_at"]})
-            _print_invite(token, _invite_base(args))
+            _print_invite(token, _invite_base(args), _hosted_invites(args))
+            _print_account_workspaces(db, args.name)
         elif args.users_action == "set-password":
-            users.set_password(args.name, _read_cli_password(args))
+            users.set_password(args.name, _read_cli_password(args), operator=True)
             log.record(actor, "cli", "user.password", args.name, detail={"method": "cli"})
+            _print_account_workspaces(db, args.name)
         elif args.users_action == "remove":
             removed_keys = keys.for_user(args.name)
             revoked = users.remove(args.name)
@@ -692,9 +832,10 @@ def cmd_server_users(args):
             log.record(actor, "cli", "user.role", args.name,
                        detail={"from": previous.role, "to": args.role})
         elif args.users_action == "set-identity":
-            user = users.set_identity(args.name, args.identity)
+            user = users.set_identity(args.name, args.identity, operator=True)
             log.record(actor, "cli", "user.identity", args.name,
                        detail={"identity": user.identity})
+            _print_account_workspaces(db, args.name)
         else:
             rows = []
             for user in users.list():
@@ -712,23 +853,302 @@ def cmd_server_users(args):
     except KeyboardInterrupt:
         print("stopped")
         return 0
-    except (OSError, ValueError, OverflowError, KeyStoreUnavailable) as exc:
+    except (OSError, ValueError, OverflowError, KeyStoreUnavailable, DatabaseError) as exc:
         print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
         return 1
     return 0
 
 
+def cmd_server_workspaces(args):
+    from .server.audit import AuditLog, cli_actor
+    from .server.db import DatabaseError, for_server_dir
+    from .server.db.workspaces import WorkspaceRepo, AccountRepo
+    from .server.workspaces import prepare_store, delete_workspace
+    from .store.errors import ObjectStoreUnavailable
+
+    try:
+        action = args.workspaces_action
+        if action in ('orphans', 'cleanup'):
+            # These commands compare files and objects with the database, so a
+            # mistyped --data or a missing --database must never be turned into a
+            # new empty database (every live workspace would look orphaned).
+            from .server.app import resolve_data_dir
+            data = resolve_data_dir(args.data)
+            directory = data / 'server'
+            db = for_server_dir(directory, args.database, create=False)
+            if db is None:
+                raise ValueError(f'no server database found for {data}; check --data and --database')
+            if action == 'cleanup' and not WorkspaceRepo(db).list():
+                raise ValueError('the database has no workspaces; refusing to clean up '
+                                 '(wrong --data/--database, or a database that was not restored?)')
+        else:
+            data, directory = _server_data_dir(args)
+            db = for_server_dir(directory, args.database)
+        repo = WorkspaceRepo(db)
+        actor = cli_actor()
+        log = AuditLog(directory, db=db, workspace_id=None)
+        if action == 'list':
+            rows = repo.list()
+            if args.json:
+                print(json.dumps(rows))
+            else:
+                fields = ('slug', 'name', 'status', 'members', 'created_at')
+                _print_table([list(fields)] + [[str(r[k]) for k in fields] for r in rows])
+        elif action == 'usage':
+            from .server.limits import Plans
+            from .server.db.usage import UsageRepo, utc_day
+            limits_file = args.limits or os.environ.get('AGENTICML_SERVER_LIMITS')
+            plans = Plans.load(limits_file) if limits_file else None
+            rows = []
+            for workspace in repo.list():
+                usage = UsageRepo(db, workspace['id'])
+                counters = usage.get()
+                limits = (plans.limits_for(workspace) if plans else
+                          json.loads(workspace['custom_limits']) if workspace['plan'] == 'custom' else None)
+                rows.append({'slug': workspace['slug'], 'plan': workspace['plan'],
+                             'stored_bytes': counters['stored_bytes'], 'limits': limits,
+                             'upload_bytes': counters['upload_bytes'] if counters['upload_day'] and counters['upload_day'] >= utc_day() else 0,
+                             'people': usage.people()})
+            rows.sort(key=lambda row: (-row['stored_bytes'], row['slug']))
+            if args.json:
+                print(json.dumps(rows))
+            else:
+                def maximum(value):
+                    return 'unlimited' if value is None else str(value)
+                fields = ('slug', 'plan', 'storage used/limit (bytes)', 'uploads today (bytes)', 'people')
+                _print_table([list(fields)] + [[row['slug'], row['plan'],
+                    str(row['stored_bytes']) + '/' + (maximum(row['limits']['storage_bytes']) if row['limits'] is not None else 'no limits file'),
+                    str(row['upload_bytes']), str(row['people'])] for row in rows])
+        elif action == 'set-plan':
+            from .server.limits import Plans, parse_size, parse_count
+            raw = (args.storage, args.uploads_per_day, args.requests_per_minute, args.people)
+            if args.plan == 'free' and any(value is not None for value in raw):
+                raise ValueError('free plan cannot have custom limits')
+            # The one read only picks the "needs a limit flag" message; the merge
+            # itself happens inside set_plan's write transaction.
+            current = repo.require(args.slug)
+            patch = None
+            free_limits = None
+            if args.plan == 'custom':
+                limits_file = args.limits or os.environ.get('AGENTICML_SERVER_LIMITS')
+                if current['plan'] != 'custom':
+                    if limits_file:
+                        free_limits = dict(Plans.load(limits_file).free)
+                    elif all(value is None for value in raw):
+                        raise ValueError('custom plan requires at least one limit flag without a limits file')
+                keys = ('storage_bytes', 'upload_bytes_per_day', 'requests_per_minute', 'people')
+                patch = {key: parse(value)
+                         for key, value, parse in zip(keys, raw, (parse_size, parse_size, parse_count, parse_count))
+                         if value is not None}
+            old, new = repo.set_plan(args.slug, args.plan, patch, merge=True, free_limits=free_limits)
+            def plan_values(row):
+                return {'plan': row['plan'], 'limits': json.loads(row['custom_limits']) if row['custom_limits'] else None}
+            log.record(actor, 'cli', 'workspace.plan', new['id'],
+                       detail={'slug': new['slug'], 'old': plan_values(old), 'new': plan_values(new)})
+            print(json.dumps(plan_values(new)))
+        elif action == 'create':
+            owner = args.owner
+            if owner is None:
+                admins = [r for r in AccountRepo(db).list() if r['server_admin']]
+                if len(admins) != 1:
+                    raise ValueError('--owner is required when there is not exactly one server admin')
+                owner = admins[0]['login']
+            row = repo.create(args.slug, args.name, owner)
+            prepare_store(data, row['id'])
+            log.record(actor, 'cli', 'workspace.create', row['id'], detail={'slug': row['slug'], 'owner': owner})
+        elif action == 'delete':
+            repo.require(args.slug)
+            confirmation = args.yes_delete if args.yes_delete is not None else input('Type the workspace slug to delete it: ')
+            if confirmation != args.slug:
+                raise ValueError('workspace deletion not confirmed')
+            from .server.objectstore import open_backend
+            backend = open_backend(args.objects if args.objects is not None else os.environ.get('AGENTICML_SERVER_OBJECTS'), data)
+
+            def on_deleted(deleted):
+                log.record(actor, 'cli', 'workspace.delete', deleted['id'], detail={'slug': args.slug})
+
+            row = delete_workspace(db, data, args.slug, objects=backend, on_deleted=on_deleted)
+            retry = f"; retry with: agenticml server workspaces cleanup {row['id']}"
+            if row.get('files_cleanup_failed'):
+                print(f"Warning: file cleanup failed for workspace {row['id']}{retry}", file=sys.stderr)
+            if row.get('object_cleanup_failed'):
+                print(f"Warning: object cleanup failed for workspace {row['id']}{retry}", file=sys.stderr)
+            if row.get('files_cleanup_failed') or row.get('object_cleanup_failed'):
+                log.record(actor, 'cli', 'workspace.cleanup_failed', row['id'],
+                           detail={'files': bool(row.get('files_cleanup_failed')),
+                                   'objects': bool(row.get('object_cleanup_failed'))})
+        elif action == 'orphans':
+            from .server import admin
+            from .server.objectstore import open_backend
+            backend = open_backend(args.objects if args.objects is not None else os.environ.get('AGENTICML_SERVER_OBJECTS'), data)
+            found = admin.orphan_workspaces(data, db, backend)
+            if args.json:
+                print(json.dumps(found))
+            else:
+                rows = [[wid, 'files'] for wid in found['files']] + [[wid, 'objects'] for wid in found['objects']]
+                if rows:
+                    _print_table([['workspace id', 'where']] + rows)
+        elif action == 'cleanup':
+            from .server import admin
+            from .server.db.workspaces import require_workspace_id
+            from .server.objectstore import open_backend
+            from .server.workspaces import discard_store
+            if bool(args.workspace_id) == bool(args.all):
+                raise ValueError('specify a workspace id or --all')
+            if args.all and args.yes_delete != 'all':
+                raise ValueError('cleanup --all needs --yes-delete all; never run it against a restored or drill database')
+            backend = open_backend(args.objects if args.objects is not None else os.environ.get('AGENTICML_SERVER_OBJECTS'), data)
+            if args.all:
+                found = admin.orphan_workspaces(data, db, backend)
+                targets = sorted(set(found['files']) | set(found['objects']))
+            else:
+                targets = [require_workspace_id(args.workspace_id)]
+            failed = False
+            for wid in targets:
+                # Re-check right before deleting: only ids that are not in the database.
+                if repo.by_id(wid) is not None:
+                    if not args.all:
+                        raise ValueError('workspace still exists; use workspaces delete')
+                    print(f'skipped {wid}: workspace exists', file=sys.stderr)
+                    continue
+                try:
+                    files_ok = bool(discard_store(data, wid))
+                except Exception:
+                    files_ok = False
+                objects_ok = None
+                if backend.name == 's3':
+                    try:
+                        backend.delete_workspace(wid)
+                        objects_ok = True
+                    except Exception:
+                        objects_ok = False
+                if files_ok and objects_ok is not False:
+                    print(f'cleaned {wid} ({"files and objects" if objects_ok else "files"})')
+                else:
+                    failed = True
+                    print(f'Warning: cleanup failed for workspace {wid} ('
+                          f'files {"ok" if files_ok else "failed"}'
+                          + ('' if objects_ok is None else f', objects {"ok" if objects_ok else "failed"}')
+                          + '); retry with: agenticml server workspaces cleanup ' + wid, file=sys.stderr)
+                log.record(actor, 'cli', 'workspace.cleanup', wid,
+                           detail={'files': files_ok, 'objects': objects_ok})
+            if failed:
+                return 1
+        elif action == 'recount':
+            from .server.db.usage import UsageRepo
+            if bool(args.slug) == bool(args.all):
+                raise ValueError('specify a workspace slug or --all')
+            rows = repo.list() if args.all else [repo.require(args.slug)]
+            for row in rows:
+                usage = UsageRepo(db, row['id'])
+                with db.transaction(write=True) as tx:
+                    usage.lock(tx)
+                    old = usage.get(tx)['stored_bytes']
+                    new = usage.recount(tx)
+                log.record(actor, 'cli', 'workspace.recount', row['id'],
+                           detail={'slug': row['slug'], 'old_stored_bytes': old, 'new_stored_bytes': new})
+                print(f"{row['slug']}: {old} -> {new} stored bytes")
+        elif action == 'set-owner':
+            row = repo.require(args.slug)
+            repo.set_owner(args.slug, args.owner)
+            log.record(actor, 'cli', 'workspace.owner', row['id'], detail={'owner': args.owner})
+        else:
+            row = repo.update(args.slug, name=args.name, new_slug=args.new_slug) if action == 'rename' else repo.update(
+                args.slug, status='suspended' if action == 'suspend' else 'active')
+            log.record(actor, 'cli', 'workspace.' + action, row['id'], detail={'slug': row['slug']})
+        return 0
+    except (OSError, ValueError, EOFError, DatabaseError, ObjectStoreUnavailable) as exc:
+        print(f'agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}', file=sys.stderr)
+        return 1
+
+
+def cmd_server_accounts(args):
+    from .server.audit import AuditLog, cli_actor
+    from .server.db import DatabaseError, for_server_dir
+    from .server.db.workspaces import AccountRepo
+    try:
+        data, directory = _server_data_dir(args)
+        db = for_server_dir(directory, args.database)
+        repo = AccountRepo(db)
+        if args.accounts_action == 'list':
+            rows = repo.list()
+            if args.json:
+                print(json.dumps(rows))
+            else:
+                fields = ('login', 'display_name', 'server_admin', 'source', 'firebase', 'email_verified', 'created_at')
+                table = [list(fields)]
+                for row in rows:
+                    table.append([
+                        row['login'], row['display_name'] or '',
+                        str(row['server_admin']),
+                        (row.get('server_admin_source') or 'manual') if row['server_admin'] else '-',
+                        'yes' if row.get('firebase_uid') else 'no',
+                        str(row.get('email_verified') or 0),
+                        row['created_at'] or '',
+                    ])
+                _print_table(table)
+        elif args.accounts_action == 'add':
+            account = repo.create(args.login, display_name=args.display_name, created_by='cli')
+            if args.server_admin:
+                repo.set_server_admin(account['login'], True, source='manual')
+                account = repo.get(account['login'])
+            AuditLog(directory, db=db, workspace_id=None).record(
+                cli_actor(), 'cli', 'account.create', account['login'],
+                detail={'server_admin': bool(args.server_admin),
+                        'display_name': account['display_name']})
+        elif args.accounts_action == 'set-server-admin':
+            repo.set_server_admin(args.login, args.value == 'on', source='manual')
+            AuditLog(directory, db=db, workspace_id=None).record(
+                cli_actor(), 'cli', 'account.server_admin', args.login, detail={'enabled': args.value == 'on'})
+        elif args.accounts_action == 'delete':
+            def fold(value):
+                return value.lower() if '@' in value else value
+            confirmation = (args.yes_delete if args.yes_delete is not None
+                            else input('Type the account login to delete it: '))
+            if fold(confirmation) != fold(args.login):
+                raise ValueError('account deletion not confirmed')
+            login = fold(args.login)
+            summary = repo.delete(args.login)
+            AuditLog(directory, db=db, workspace_id=None).record(
+                cli_actor(), 'cli', 'account.delete', summary['id'],
+                detail={'memberships': len(summary['memberships']), 'keys': summary['keys'],
+                        'sessions': summary['sessions'], 'invites': summary['invites'],
+                        'audit_redacted': summary['audit_redacted']})
+            if args.json:
+                print(json.dumps(summary))
+            else:
+                print(f"deleted account {login} (id {summary['id']})")
+                print(f"removed {len(summary['memberships'])} memberships, {summary['keys']} keys, "
+                      f"{summary['sessions']} sessions, {summary['invites']} pending invites; "
+                      f"redacted {summary['audit_redacted']} server-level audit rows")
+                if summary['memberships']:
+                    print('former workspaces (their Activity logs still name this login until the '
+                          'workspaces are deleted): ' + ', '.join(summary['memberships']))
+                if summary['firebase_uid']:
+                    print(f"Firebase user still exists: uid {summary['firebase_uid']} ({summary['email']}); "
+                          'delete it in the Firebase console (Authentication > Users)')
+        return 0
+    except (OSError, ValueError, EOFError, DatabaseError) as exc:
+        print(f'agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}', file=sys.stderr)
+        return 1
+
+
 def cmd_server_audit(args):
     from .server.audit import cli_main
 
-    return cli_main(args.data, args.limit, args.json)
+    return cli_main(args.data, args.limit, args.json, database=args.database,
+                    workspace=args.workspace, server=args.server)
 
 
 def _cmd_server_report(args, verify=False):
     from .server import admin
+    from .server.db.errors import DatabaseError
 
     try:
-        report = admin.verify(args.data, progress=not args.json) if verify else admin.status(args.data)
+        report = (admin.verify(args.data, progress=not args.json, database=args.database, objects=args.objects,
+                               workspace=args.workspace, deep=args.deep) if verify
+                  else admin.status(args.data, database=args.database, objects=args.objects,
+                                    workspace=args.workspace))
         if args.json:
             print(json.dumps(report, indent=2, sort_keys=True))
         else:
@@ -736,6 +1156,9 @@ def _cmd_server_report(args, verify=False):
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return 130
+    except DatabaseError as exc:
+        print(f"agenticml server: {exc}", file=sys.stderr)
+        return 1
     except (OSError, ValueError, OverflowError) as exc:
         print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
         return 2
@@ -748,6 +1171,149 @@ def cmd_server_status(args):
 
 def cmd_server_verify(args):
     return _cmd_server_report(args, verify=True)
+
+
+def cmd_server_backup(args):
+    from .server import backup
+    from .server.db.errors import DatabaseError
+
+    try:
+        report = backup.backup(args.to, data=args.data, database=args.database, objects=args.objects,
+                               files_only=args.files_only)
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+    except backup.BackupError as exc:
+        print(f"agenticml server: {exc}", file=sys.stderr)
+        return 1
+    except DatabaseError as exc:
+        print(f"agenticml server: {exc}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, OverflowError) as exc:
+        print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(backup.format_report(report, args.to))
+    return 0
+
+
+def cmd_server_reindex(args):
+    from .server.admin import _data_root
+    from .server.app import acquire_server_lock
+    from .server.db import for_server_dir, resolve_url, _is_postgres
+    from .server.db.errors import DatabaseError, DatabaseUrlError, SchemaTooNew
+    from .server.db.repos import RunRepo
+    from .server.runs import reindex
+
+    handle = None
+    try:
+        data, directory = _server_data_dir(args)
+        try:
+            if not _is_postgres(resolve_url(data, args.database)):
+                handle = acquire_server_lock(data / "server")
+        except ValueError as exc:
+            cause = exc.__cause__
+            if isinstance(cause, OSError) and cause.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                raise ValueError("stop the server first") from exc
+            raise
+        db = for_server_dir(data / "server", args.database)
+        if db.dialect.name == "postgres":
+            from contextlib import ExitStack
+            handle = ExitStack()
+            handle.enter_context(db.server_lock())
+        from .server.db.workspaces import WorkspaceRepo
+        from .server.workspaces import prepare_store
+        workspaces = WorkspaceRepo(db)
+        selected = [workspaces.require(args.workspace)] if args.workspace else workspaces.list()
+        counts = dict(adopted=0, removed=0, rebuilt=0)
+        for workspace in selected:
+            result = reindex(prepare_store(data, workspace['id']), RunRepo(db, workspace['id']))
+            for key in counts:
+                counts[key] += result[key]
+        print(f"adopted {counts['adopted']}, removed {counts['removed']}, rebuilt {counts['rebuilt']}")
+        return 0
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+    except (DatabaseError, DatabaseUrlError, SchemaTooNew) as exc:
+        print(f"agenticml server: {exc}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, OverflowError) as exc:
+        print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
+        return 2
+    finally:
+        if handle is not None:
+            handle.close()
+
+
+def cmd_server_metrics_rebuild(args):
+    from .server.app import acquire_server_lock
+    from .server.db import for_server_dir, resolve_url, _is_postgres
+    from .server.db.backfill import lock_run
+    from .server.db.errors import DatabaseBusy, DatabaseError, DatabaseUrlError, SchemaTooNew
+    from .server.db.repos import RunRepo
+    from .server.db.workspaces import WorkspaceRepo
+    from .server.workspaces import prepare_store
+
+    handle = None
+    try:
+        data, directory = _server_data_dir(args)
+        try:
+            if not _is_postgres(resolve_url(data, args.database)):
+                handle = acquire_server_lock(data / "server")
+        except ValueError as exc:
+            cause = exc.__cause__
+            if isinstance(cause, OSError) and cause.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                raise ValueError("stop the server first") from exc
+            raise
+        db = for_server_dir(directory, args.database)
+        workspaces = WorkspaceRepo(db)
+        selected = [workspaces.require(args.workspace)] if args.workspace else workspaces.list()
+        run_id = args.run_id
+        if run_id is not None and not valid_run_id(run_id):
+            raise ValueError("invalid run id")
+        rebuilt = 0
+        skipped = 0
+        found = False
+        for workspace in selected:
+            wid = workspace['id']
+            root = prepare_store(data, wid)
+            repo = RunRepo(db, wid)
+            if run_id is not None:
+                if repo.get(run_id) is None:
+                    continue
+                ids = [run_id]
+                found = True
+            else:
+                ids = [row['run_id'] for row in repo.all_rows()]
+            for current in ids:
+                try:
+                    with lock_run(db, wid, current):
+                        repo.rebuild_metrics(current, root)
+                except DatabaseBusy:
+                    print(f"agenticml server: warning: skipped locked run {current}",
+                          file=sys.stderr)
+                    skipped += 1
+                    continue
+                rebuilt += 1
+        if run_id is not None and not found:
+            raise ValueError("unknown run")
+        print(f"rebuilt {rebuilt}")
+        return 1 if skipped else 0
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+    except (DatabaseError, DatabaseUrlError, SchemaTooNew) as exc:
+        print(f"agenticml server: {exc}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, OverflowError) as exc:
+        print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
+        return 2
+    finally:
+        if handle is not None:
+            handle.close()
 
 
 def cmd_du(args):
@@ -1230,6 +1796,8 @@ def main(argv=None):
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     parser = argparse.ArgumentParser(prog="agenticml")
+    from . import __version__
+    parser.add_argument("--version", action="version", version="%(prog)s " + __version__)
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("run", help="Run a Python script inside a tracked run")
 
@@ -1299,11 +1867,17 @@ def main(argv=None):
     server_sub = p_server.add_subparsers(dest="server_action", required=True)
     p_audit = server_sub.add_parser("audit", help="Show recent audit events")
     p_audit.add_argument("--data", default=None)
+    p_audit.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    scope = p_audit.add_mutually_exclusive_group()
+    scope.add_argument('--workspace', default='default')
+    scope.add_argument('--server', action='store_true')
     p_audit.add_argument("--limit", type=int, default=50)
     p_audit.add_argument("--json", action="store_true")
     p_audit.set_defaults(func=cmd_server_audit)
     p_serve = server_sub.add_parser("serve", help="Serve protocol v2 ingest")
     p_serve.add_argument("--data", default=None, help="Data directory (default: AGENTICML_SERVER_DATA or ~/.agenticml-server)")
+    p_serve.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_serve.add_argument("--objects", default=None, metavar="URL", help="Object backend (default: AGENTICML_SERVER_OBJECTS or file://)")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8080)
     p_serve.add_argument("--public-url", default=None, help="Public server URL (default: AGENTICML_SERVER_PUBLIC_URL)")
@@ -1311,25 +1885,170 @@ def main(argv=None):
                         help="Trust this proxy CIDR for X-Forwarded-For and identity headers (repeatable)")
     p_serve.add_argument("--identity-header", choices=("alb", "tailscale", "oauth2-proxy"),
                         default=None, help="Honour this proxy identity header (requires --trusted-proxy)")
+    p_serve.add_argument("--firebase-project", default=None, metavar="ID",
+                        help="Firebase project id (default: AGENTICML_SERVER_FIREBASE_PROJECT)")
+    p_serve.add_argument("--firebase-api-key", default=None, metavar="KEY",
+                        help="Firebase web API key (default: AGENTICML_SERVER_FIREBASE_API_KEY)")
+    p_serve.add_argument("--firebase-auth-domain", default=None, metavar="HOST",
+                        help="Firebase auth domain (default: AGENTICML_SERVER_FIREBASE_AUTH_DOMAIN or <project>.firebaseapp.com)")
+    p_serve.add_argument("--limits", default=None, metavar="FILE", help="Workspace limits JSON (default: AGENTICML_SERVER_LIMITS)")
+    p_serve.add_argument("--open-signup", action="store_true",
+                        help="Allow verified Firebase sign-in to create an account (default: AGENTICML_SERVER_OPEN_SIGNUP)")
+    p_serve.add_argument("--admin-emails", default=None, metavar="LIST",
+                        help="Comma-separated emails that become server admins at their next verified "
+                             "Firebase sign-in (default: AGENTICML_SERVER_ADMIN_EMAILS)")
+    p_serve.add_argument("--legal-base-url", default=None, metavar="URL",
+                         help="https:// base URL of the Terms, Acceptable use and Privacy pages "
+                              "linked from the Firebase sign-in page; unset shows no links "
+                              "(default: AGENTICML_SERVER_LEGAL_BASE_URL)")
+    p_serve.add_argument("--min-client-version", default=None, metavar="X.Y",
+                         help="Reject agenticml-lite clients older than this on /v2 "
+                              "(default: AGENTICML_SERVER_MIN_CLIENT_VERSION or 2.2)")
     p_serve.set_defaults(func=cmd_server_serve)
     p_up = server_sub.add_parser("up", help="Serve on loopback through Tailscale Funnel")
     p_up.add_argument("--data", default=None, help="Data directory (default: AGENTICML_SERVER_DATA or ~/.agenticml-server)")
+    p_up.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
     p_up.add_argument("--port", type=_parse_up_port, default=8080)
     p_up.add_argument("--install", action="store_true", help="Write a user service that runs server up, then exit")
     p_up.add_argument("--force", action="store_true", help="Overwrite an existing user service file")
+    p_up.add_argument("--firebase-project", default=None, metavar="ID",
+                     help="Firebase project id (default: AGENTICML_SERVER_FIREBASE_PROJECT)")
+    p_up.add_argument("--firebase-api-key", default=None, metavar="KEY",
+                     help="Firebase web API key (default: AGENTICML_SERVER_FIREBASE_API_KEY)")
+    p_up.add_argument("--firebase-auth-domain", default=None, metavar="HOST",
+                     help="Firebase auth domain (default: AGENTICML_SERVER_FIREBASE_AUTH_DOMAIN or <project>.firebaseapp.com)")
+    p_up.add_argument("--limits", default=None, metavar="FILE",
+                     help="Workspace limits JSON (default: AGENTICML_SERVER_LIMITS)")
+    p_up.add_argument("--open-signup", action="store_true",
+                     help="Allow verified Firebase sign-in to create an account (default: AGENTICML_SERVER_OPEN_SIGNUP)")
+    p_up.add_argument("--admin-emails", default=None, metavar="LIST",
+                     help="Comma-separated emails that become server admins at their next verified "
+                          "Firebase sign-in (default: AGENTICML_SERVER_ADMIN_EMAILS)")
     p_up.set_defaults(func=cmd_server_up)
     for action, func, help_text in (
-            ("status", cmd_server_status, "Show runs, sizes, and key activity"),
-            ("verify", cmd_server_verify, "Check objects, run sizes, and lineage")):
+            ("status", cmd_server_status, "Show runs, sizes, and key activity per workspace"),
+            ("verify", cmd_server_verify, "Check objects, run sizes, and lineage per workspace")):
         child = server_sub.add_parser(action, help=help_text)
         child.add_argument("--data", default=None)
+        child.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+        child.add_argument("--objects", default=None, metavar="URL",
+                           help="Object backend (default: AGENTICML_SERVER_OBJECTS or file://)")
+        child.add_argument("--workspace", default=None, metavar="SLUG",
+                           help="Workspace slug (default: every workspace)")
+        if action == "verify":
+            child.add_argument("--deep", action="store_true",
+                               help="Re-hash every S3 object (file objects are always hashed)")
         child.add_argument("--json", action="store_true")
         child.set_defaults(func=func)
+    p_backup = server_sub.add_parser(
+        "backup", help="Copy the database and files of a running server to a directory",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="The server may keep running. The database is copied first, then each run file up to its\n"
+               "committed size, so the copy is consistent.\n\n"
+               "Restore (SQLite): agenticml server serve --data DIR\n"
+               "Restore (Postgres): restore the pg_dump into an empty database, then run\n"
+               "  agenticml server serve --data DIR --database URL\n"
+               "Postgres needs a dump first: pg_dump --format=custom \"$DATABASE_URL\" > DIR/server.dump,\n"
+               "then --files-only here. S3 objects are not copied (use bucket versioning or AWS Backup).")
+    p_backup.add_argument("--to", required=True, metavar="DIR",
+                          help="Backup directory (must not exist or be empty; not inside the data directory)")
+    p_backup.add_argument("--data", default=None)
+    p_backup.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_backup.add_argument("--objects", default=None, metavar="URL",
+                          help="Object backend (default: AGENTICML_SERVER_OBJECTS or file://)")
+    p_backup.add_argument("--files-only", action="store_true",
+                          help="Postgres: copy files only, after taking a pg_dump")
+    p_backup.add_argument("--json", action="store_true")
+    p_backup.set_defaults(func=cmd_server_backup)
+    p_reindex = server_sub.add_parser("reindex", help="Rebuild the run index from on-disk files")
+    p_reindex.add_argument("--data", default=None)
+    p_reindex.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_reindex.add_argument("--workspace", default=None, help="Workspace slug (default: every workspace)")
+    p_reindex.set_defaults(func=cmd_server_reindex)
+    p_metrics = server_sub.add_parser("metrics", help="Rebuild metric summaries")
+    metrics_sub = p_metrics.add_subparsers(dest="metrics_action", required=True)
+    p_rebuild = metrics_sub.add_parser("rebuild", help="Recompute metric summaries from committed files")
+    p_rebuild.add_argument("--data", default=None)
+    p_rebuild.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_rebuild.add_argument("--workspace", default=None, help="Workspace slug (default: every workspace)")
+    p_rebuild.add_argument("--run", default=None, dest="run_id", help="Run id (default: every run)")
+    p_rebuild.set_defaults(func=cmd_server_metrics_rebuild)
+    p_workspaces = server_sub.add_parser('workspaces', help='Manage server workspaces')
+    ws_sub = p_workspaces.add_subparsers(dest='workspaces_action', required=True)
+    for action in ('list', 'create', 'rename', 'suspend', 'resume', 'delete', 'set-owner', 'recount', 'usage', 'set-plan',
+                   'orphans', 'cleanup'):
+        child = ws_sub.add_parser(action)
+        child.add_argument('--data', default=None)
+        child.add_argument('--database', default=None, metavar='URL')
+        child.set_defaults(func=cmd_server_workspaces)
+        if action in ('list', 'usage'):
+            if action == 'usage':
+                child.add_argument('--limits', default=None, metavar='FILE',
+                                   help='Workspace limits JSON (default: AGENTICML_SERVER_LIMITS)')
+            child.add_argument('--json', action='store_true')
+            continue
+        if action == 'recount':
+            child.add_argument('slug', nargs='?')
+            child.add_argument('--all', action='store_true')
+            continue
+        if action == 'orphans':
+            child.add_argument('--objects', default=None, metavar='URL')
+            child.add_argument('--json', action='store_true')
+            continue
+        if action == 'cleanup':
+            child.add_argument('workspace_id', nargs='?')
+            child.add_argument('--all', action='store_true')
+            child.add_argument('--yes-delete', default=None, metavar='all',
+                               help='Required with --all: type "all"')
+            child.add_argument('--objects', default=None, metavar='URL')
+            continue
+        child.add_argument('slug')
+        if action == 'set-plan':
+            child.add_argument('--limits', default=None, metavar='FILE',
+                               help='Base free plan limits JSON (default: AGENTICML_SERVER_LIMITS)')
+            child.add_argument('plan', choices=('free', 'custom'))
+            child.add_argument('--storage', default=None)
+            child.add_argument('--uploads-per-day', default=None)
+            child.add_argument('--requests-per-minute', default=None)
+            child.add_argument('--people', default=None)
+        elif action == 'create':
+            child.add_argument('--name', default=None)
+            child.add_argument('--owner', default=None)
+        elif action == 'rename':
+            child.add_argument('--name', required=True)
+            child.add_argument('--slug', dest='new_slug', default=None)
+        elif action == 'delete':
+            child.add_argument('--objects', default=None, metavar='URL')
+            child.add_argument('--yes-delete', default=None, metavar='SLUG')
+        elif action == 'set-owner':
+            child.add_argument('--owner', required=True)
+    p_accounts = server_sub.add_parser('accounts', help='Manage global accounts')
+    acc_sub = p_accounts.add_subparsers(dest='accounts_action', required=True)
+    for action in ('list', 'add', 'set-server-admin', 'delete'):
+        child = acc_sub.add_parser(action)
+        child.add_argument('--data', default=None)
+        child.add_argument('--database', default=None, metavar='URL')
+        child.set_defaults(func=cmd_server_accounts)
+        if action == 'list':
+            child.add_argument('--json', action='store_true')
+        elif action == 'add':
+            child.add_argument('login')
+            child.add_argument('--display-name', default=None)
+            child.add_argument('--server-admin', action='store_true')
+        elif action == 'delete':
+            child.add_argument('login')
+            child.add_argument('--yes-delete', default=None, metavar='LOGIN')
+            child.add_argument('--json', action='store_true')
+        else:
+            child.add_argument('login')
+            child.add_argument('value', choices=('on', 'off'))
     p_keys = server_sub.add_parser("keys", help="Create, list, or revoke API keys")
     keys_sub = p_keys.add_subparsers(dest="keys_action", required=True)
     for action in ("create", "list", "revoke"):
         child = keys_sub.add_parser(action)
         child.add_argument("--data", default=None)
+        child.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+        child.add_argument("--workspace", default="default")
         child.set_defaults(func=cmd_server_keys)
         if action == "create":
             child.add_argument("--name", required=True)
@@ -1350,34 +2069,48 @@ def main(argv=None):
     p_users_add.add_argument("--no-invite", action="store_true")
     p_users_add.add_argument("--public-url", default=None)
     p_users_add.add_argument("--data", default=None)
+    p_users_add.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_users_add.add_argument("--workspace", default="default")
     p_users_add.set_defaults(func=cmd_server_users)
     p_users_invite = users_sub.add_parser("invite")
     p_users_invite.add_argument("name")
     p_users_invite.add_argument("--public-url", default=None)
     p_users_invite.add_argument("--data", default=None)
+    p_users_invite.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_users_invite.add_argument("--workspace", default="default")
     p_users_invite.set_defaults(func=cmd_server_users)
     p_users_password = users_sub.add_parser("set-password")
     p_users_password.add_argument("name")
     p_users_password.add_argument("--stdin", action="store_true")
     p_users_password.add_argument("--data", default=None)
+    p_users_password.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_users_password.add_argument("--workspace", default="default")
     p_users_password.set_defaults(func=cmd_server_users)
     p_users_list = users_sub.add_parser("list")
     p_users_list.add_argument("--json", action="store_true")
     p_users_list.add_argument("--data", default=None)
+    p_users_list.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_users_list.add_argument("--workspace", default="default")
     p_users_list.set_defaults(func=cmd_server_users)
     p_users_remove = users_sub.add_parser("remove")
     p_users_remove.add_argument("name")
     p_users_remove.add_argument("--data", default=None)
+    p_users_remove.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_users_remove.add_argument("--workspace", default="default")
     p_users_remove.set_defaults(func=cmd_server_users)
     p_users_role = users_sub.add_parser("set-role")
     p_users_role.add_argument("name")
     p_users_role.add_argument("role", choices=("viewer", "member", "admin"))
     p_users_role.add_argument("--data", default=None)
+    p_users_role.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_users_role.add_argument("--workspace", default="default")
     p_users_role.set_defaults(func=cmd_server_users)
     p_users_identity = users_sub.add_parser("set-identity")
     p_users_identity.add_argument("name")
     p_users_identity.add_argument("identity", nargs="?", default=None)
     p_users_identity.add_argument("--data", default=None)
+    p_users_identity.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_users_identity.add_argument("--workspace", default="default")
     p_users_identity.set_defaults(func=cmd_server_users)
 
     p_sync = sub.add_parser("sync", help="Incrementally upload local runs to a server")

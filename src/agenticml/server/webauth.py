@@ -1,4 +1,4 @@
-"""Dashboard login, in-memory sessions, identity proxy, and the request gate."""
+"""Dashboard login, persistent sessions, identity proxy, and the request gate."""
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -19,16 +19,19 @@ import time
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from agenticml.ui.server import (
+    _CSP,
     _DISCONNECT,
     _FILES,
     _STATIC,
     _reject_nonfinite,
+    _reset_request_workspace,
 )
-from . import audit, keyspage, userspage
+from . import keyspage
+from .db import DatabaseError
 from .keys import ClientError, KeyStoreUnavailable, validate_name
 from .users import (
-    InviteInvalid, Principal, ScryptUnavailable, UserNameTaken, UserStore,
-    allowed, resolve, scrypt_available, validate_password,
+    InviteInvalid, Principal, ScryptUnavailable, UserNameTaken, UserRecord, UserStore,
+    _check_password, _dummy_verify, allowed, resolve, scrypt_available, validate_password,
 )
 
 logger = logging.getLogger("agenticml.server.webauth")
@@ -120,6 +123,111 @@ def _bucket(address):
     return str(addr)
 
 
+class MemoryBuckets:
+    def __init__(self):
+        self.entries = OrderedDict()
+
+    def transaction(self, expiry, now, released_ticket=None, outcome=None, bucket=None):
+        from contextlib import nullcontext
+        return nullcontext()
+
+
+class DbBuckets(MemoryBuckets):
+    def __init__(self, db):
+        super().__init__()
+        from .db.repos import ThrottleRepo
+        self.db = db
+        self.repo = ThrottleRepo(db)
+
+    def transaction(self, expiry, now, released_ticket=None, outcome=None, bucket=None):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def manage():
+            # Tickets (holds) stay process-local; durable counts are shared.
+            # Each begin/finish is one write transaction under
+            # advisory_lock('throttle') that writes the buckets it touches
+            # and deletes expired rows (skipping any bucket with a live hold
+            # in this process), so a success cannot erase another process's
+            # failures. Unsaved failure counts stay in memory and are merged
+            # (max) with the database until a save succeeds, so a persistence
+            # failure never lowers the effective delay.
+            original = OrderedDict((k, (v[0], v[1], dict(v[2])))
+                                   for k, v in self.entries.items())
+            applied = False
+            persisted = False
+            touched = set() if bucket is None else {bucket}
+            try:
+                with self.db.transaction(write=True) as tx:
+                    tx.advisory_lock('throttle')
+                    rows = self.repo.load(tx=tx)
+                    holds = {k: dict(v[2]) for k, v in original.items() if v[2]}
+                    unsaved = {k: (v[0], v[1]) for k, v in original.items() if v[0]}
+                    self.entries.clear()
+                    previous = {key: (failures, last) for key, failures, last in rows}
+                    merged = {}
+                    for key, failures, last in rows:
+                        mem = unsaved.pop(key, None)
+                        if mem is not None:
+                            failures, last = max(failures, mem[0]), max(last, mem[1])
+                        merged[key] = (failures, last)
+                    merged.update(unsaved)
+                    for key, (failures, last) in merged.items():
+                        if key in holds or now - last < expiry:
+                            self.entries[key] = (failures, last, holds.pop(key, {}))
+                    for key, pending in holds.items():
+                        self.entries[key] = (0, 0, pending)
+                    before_failures = {key: self.entries[key][0] for key in self.entries}
+                    before_keys = set(self.entries)
+                    yield
+                    applied = True
+                    touched.update(before_keys - set(self.entries))
+                    touched.update(key for key, value in self.entries.items()
+                                   if before_failures.get(key) != value[0])
+                    if bucket is not None:
+                        touched.add(bucket)
+                    held = tuple(key for key, value in self.entries.items() if value[2])
+                    self.repo.save(self.entries, previous, tx, touched=touched,
+                                   before_failures=before_failures,
+                                   expire_before=now - expiry, keep=held)
+                # COMMIT succeeded. A commit failure must keep unsaved counts
+                # in memory (merged by max on the next load).
+                persisted = True
+            except BaseException:
+                if not applied or released_ticket is None:
+                    # Load failed, or begin() could not persist: the caller
+                    # never received a ticket, so drop the unissued hold.
+                    self.entries.clear()
+                    self.entries.update(original)
+                    if (not applied and outcome == "failed"
+                            and isinstance(released_ticket, tuple) and released_ticket):
+                        # finish("failed") never ran; count it in memory so
+                        # the next begin still delays. Unsaved, merged by max.
+                        address = released_ticket[0]
+                        entry = self.entries.get(address)
+                        if entry is not None and released_ticket in entry[2]:
+                            failures, _, holds = entry
+                            self.entries[address] = (
+                                failures + 1, now, dict(holds))
+                        elif entry is None:
+                            self.entries[address] = (1, now, {})
+                raise
+            finally:
+                # A finishing attempt releases its ticket even if its failure
+                # count could not be committed. Never leave an orphaned hold.
+                if isinstance(released_ticket, tuple) and released_ticket:
+                    entry = self.entries.get(released_ticket[0])
+                    if entry is not None:
+                        entry[2].pop(released_ticket, None)
+                for key in list(self.entries):
+                    failures, _, holds = self.entries[key]
+                    if holds:
+                        continue
+                    if (not failures) or (persisted and key in touched):
+                        del self.entries[key]
+        return manage()
+
+
 class LoginThrottle:
     """Failed-login delays keyed by a caller-supplied bucket. Responses never sleep.
 
@@ -138,14 +246,15 @@ class LoginThrottle:
     EXPIRE_AFTER = 15 * 60
     MAX_ENTRIES = 1024
 
-    def __init__(self, clock=time.monotonic):
+    def __init__(self, clock=time.monotonic, store=None):
         self._clock = clock
         self._lock = threading.Lock()
         self._tickets = itertools.count()
         # address -> (failures, last_failure, holds). holds maps each pending
         # ticket to its own deadline. While every bucket holds a ticket, the
         # table can exceed MAX_ENTRIES, bounded by in-flight connections.
-        self._entries = OrderedDict()
+        self._store = store if store is not None else MemoryBuckets()
+        self._entries = self._store.entries
 
     def _delay(self, n):
         if n < self.FREE_FAILURES:
@@ -160,7 +269,7 @@ class LoginThrottle:
         """Reserve a slot. Returns (retry_after, ticket); ticket is None if refused."""
         address = _bucket(address)
         now = self._clock()
-        with self._lock:
+        with self._lock, self._store.transaction(self.EXPIRE_AFTER, now, bucket=address):
             entry = self._live(address, now)
             if entry is None:
                 failures, last_failure, holds = 0, 0, {}
@@ -184,10 +293,14 @@ class LoginThrottle:
         if ticket is None:
             return
         now = self._clock()
-        with self._lock:
-            try:
-                address = ticket[0]
-            except (TypeError, IndexError):
+        try:
+            address = ticket[0]
+        except (TypeError, IndexError):
+            address = None
+        with self._lock, self._store.transaction(
+                self.EXPIRE_AFTER, now, released_ticket=ticket, outcome=outcome,
+                bucket=address):
+            if address is None:
                 return
             entry = self._entries.get(address)
             if entry is None:
@@ -239,39 +352,120 @@ class LoginThrottle:
 
 
 _LOGIN_STATIC = Path(__file__).with_name("static")
+_JS = "text/javascript; charset=utf-8"
+_FIREBASE_ASSETS = {
+    "/static/firebase-login.js": (_LOGIN_STATIC / "firebase-login.js", _JS),
+    "/static/vendor/firebase/firebase-app-compat.js": (
+        _LOGIN_STATIC / "vendor/firebase/firebase-app-compat.js", _JS),
+    "/static/vendor/firebase/firebase-auth-compat.js": (
+        _LOGIN_STATIC / "vendor/firebase/firebase-auth-compat.js", _JS),
+}
 _ASSETS = {
-    "/static/login.js": (_LOGIN_STATIC / "login.js", "text/javascript; charset=utf-8"),
-    "/static/setup.js": (_LOGIN_STATIC / "setup.js", "text/javascript; charset=utf-8"),
-    "/static/invite.js": (_LOGIN_STATIC / "invite.js", "text/javascript; charset=utf-8"),
+    "/static/login.js": (_LOGIN_STATIC / "login.js", _JS),
+    "/static/setup.js": (_LOGIN_STATIC / "setup.js", _JS),
+    "/static/invite.js": (_LOGIN_STATIC / "invite.js", _JS),
+    "/static/signout.js": (_LOGIN_STATIC / "signout.js", _JS),
+    "/static/theme.js": (_LOGIN_STATIC / "theme.js", _JS),
     "/static/app.css": (_STATIC / "app.css", _FILES["app.css"]),
     "/static/InstrumentSans.woff2": (_STATIC / "InstrumentSans.woff2", _FILES["InstrumentSans.woff2"]),
     "/static/JetBrainsMono.woff2": (_STATIC / "JetBrainsMono.woff2", _FILES["JetBrainsMono.woff2"]),
+    **_FIREBASE_ASSETS,
 }
+
+
+def firebase_login_csp(auth_domain):
+    """Dashboard CSP plus the Google hosts the Firebase sign-in pages need."""
+    return (
+        _CSP.replace("script-src 'self'", "script-src 'self' https://apis.google.com")
+        + "; connect-src 'self' https://identitytoolkit.googleapis.com"
+        " https://securetoken.googleapis.com https://www.googleapis.com https://apis.google.com"
+        + f"; frame-src https://{auth_domain} https://apis.google.com"
+    )
+
+
+def normalize_legal_base_url(value):
+    """Return an ``https://`` policy base URL ending in ``/``, or None when unset.
+
+    Raises ValueError for anything else: the sign-in page links to this URL.
+    """
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        raise ValueError("--legal-base-url must not contain spaces or control characters")
+    try:
+        parts = urlsplit(value)
+        host = parts.hostname
+        parts.port  # raises ValueError for a non-numeric or out-of-range port
+    except ValueError:
+        raise ValueError("--legal-base-url is not a valid URL") from None
+    if parts.scheme != "https" or not host:
+        raise ValueError("--legal-base-url must be an https:// URL")
+    # An empty query or fragment ("...?" or "...#") parses as "", so check the
+    # characters too: the page names are appended to this string.
+    if (parts.username is not None or parts.password is not None
+            or "?" in value or "#" in value):
+        raise ValueError("--legal-base-url must not have credentials, a query, or a fragment")
+    return value if value.endswith("/") else value + "/"
 
 
 class WebAuth:
     """Owns /login, /logout, /invite, /setup, sessions, and the request gate."""
 
-    def __init__(self, keys, public_url=None, clock=time.time, throttle_clock=time.monotonic,
-                 users=None, trusted_proxies=(), identity_header=None):
+    def __init__(self, keys, public_url=None, clock=time.time, throttle_clock=time.time,
+                 users=None, trusted_proxies=(), identity_header=None,
+                 firebase=None, cert_source=None, plans=None, open_signup=False,
+                 admin_emails=frozenset(), legal_base_url=None):
         self.keys = keys
-        self.users = users if users is not None else UserStore(keys.server_dir)
+        self.users = users if users is not None else UserStore(keys.server_dir, db=keys.db, workspace_id=keys.workspace_id or '0' * 32)
         self.public_url = public_url
         self.clock = clock
-        self.throttle = LoginThrottle(clock=throttle_clock)
+        self.throttle = LoginThrottle(clock=throttle_clock, store=DbBuckets(keys.db))
         self.trusted_proxies = parse_trusted_proxies(trusted_proxies)
         self.identity_header = parse_identity_header(identity_header)
         if self.identity_header is not None and not self.trusted_proxies:
             raise ValueError("identity header requires a trusted proxy")
         self._identity_name, self._identity_match = (
             IDENTITY_PRESETS[self.identity_header] if self.identity_header else (None, None))
+        self.firebase = firebase
+        self.cert_source = cert_source
+        self.open_signup = bool(open_signup)
+        self.admin_emails = frozenset(
+            email.lower() for email in (admin_emails or ()) if isinstance(email, str) and email)
+        if self.admin_emails and self.firebase is None:
+            logger.warning("--admin-emails is ignored without --firebase-project")
+            self.admin_emails = frozenset()
+        if self.admin_emails:
+            logger.info("server admin emails configured: %d", len(self.admin_emails))
+        self.legal_base_url = normalize_legal_base_url(legal_base_url)
+        if self.legal_base_url and self.firebase is None:
+            logger.warning("--legal-base-url is ignored without --firebase-project")
+            self.legal_base_url = None
+        if self.firebase is not None:
+            from .firebase import FIREBASE_EXTRA, FIREBASE_IDENTITY, firebase_available
+            if self.identity_header is not None:
+                raise ValueError(FIREBASE_IDENTITY)
+            if not firebase_available():
+                raise ValueError(FIREBASE_EXTRA)
+            if self.cert_source is None:
+                from .firebase import CertificateSource
+                self.cert_source = CertificateSource()
+        from .firebase import require_open_signup
+        require_open_signup(self.open_signup, self.firebase, plans)
         self._lock = threading.Lock()
-        self._sessions = {}
+        from .db.repos import SessionRepo
+        self.sessions = SessionRepo(keys.db)
         self.setup_token = None
         self._setup_used = False
         self._setup_lock = threading.Lock()
 
     def arm_setup(self, base_url):
+        if self.firebase is not None:
+            return
+        if self.keys.workspace_id is None:
+            return
         if not self.keys.prepare_setup():
             return
         if self._has_admin_user():
@@ -285,7 +479,7 @@ class WebAuth:
         )
 
     def _has_admin_user(self):
-        return any(user.role == "admin" for user in self.users.list())
+        return any(user.role in ("owner", "admin") for user in self.users.list())
 
     def _setup_armed(self):
         """Caller holds _setup_lock; observing an admin permanently disarms setup."""
@@ -348,20 +542,14 @@ class WebAuth:
         return value
 
     def _user_for_identity(self, identity):
-        matches = []
-        folded = identity.casefold()
-        exact = self._identity_match == "exact"
-        for user in self.users.list():
-            if user.identity is None:
-                continue
-            if exact:
-                if user.identity == identity:
-                    matches.append(user)
-            elif user.identity.casefold() == folded:
-                matches.append(user)
-            if len(matches) > 1:
-                return None
-        return matches[0] if len(matches) == 1 else None
+        from .db.workspaces import AccountRepo
+        account = AccountRepo(self.keys.db).by_identity(
+            identity, exact=self._identity_match == "exact")
+        if account is None:
+            return None
+        return Principal(
+            account["login"], "viewer", "proxy", None, account["id"],
+            account["generation"], server_admin=bool(account["server_admin"]))
 
     def _setup_matches(self, token):
         try:
@@ -382,12 +570,31 @@ class WebAuth:
 
     def handle(self, handler) -> bool:
         """Answer login routes and rejected requests. False means continue."""
+        _reset_request_workspace(handler)
         if handler.command in ("GET", "HEAD", "DELETE") and (
                 handler.headers.get_all("Content-Length") or handler.headers.get_all("Transfer-Encoding")):
             handler.close_connection = True
         path = self._path(handler)
         try:
+            if self.firebase is not None and path == "/auth/firebase/config":
+                if handler.command == "GET":
+                    self._firebase_config(handler)
+                else:
+                    handler.close_connection = True
+                    handler._json({"error": "method not allowed"}, 405)
+                return True
+            if self.firebase is not None and path == "/auth/firebase":
+                if handler.command == "POST":
+                    self._firebase_auth(handler)
+                else:
+                    handler.close_connection = True
+                    handler._json({"error": "method not allowed"}, 405)
+                return True
             if path == "/setup":
+                if self.firebase is not None:
+                    handler.close_connection = True
+                    handler._json({"error": "not found"}, 404)
+                    return True
                 with self._setup_lock:
                     self._setup_armed()
                 if handler.command == "GET":
@@ -399,6 +606,16 @@ class WebAuth:
                     handler._json({"error": "method not allowed"}, 405)
                 return True
             if path == "/invite":
+                if self.firebase is not None:
+                    if handler.command == "GET":
+                        self._firebase_login_page(handler)
+                    elif handler.command == "POST":
+                        handler.close_connection = True
+                        handler._json({"error": "not found"}, 404)
+                    else:
+                        handler.close_connection = True
+                        handler._json({"error": "method not allowed"}, 405)
+                    return True
                 if handler.command == "GET":
                     self._invite_page(handler)
                 elif handler.command == "POST":
@@ -408,9 +625,14 @@ class WebAuth:
                     handler._json({"error": "method not allowed"}, 405)
                 return True
             if handler.command == "GET" and path in _ASSETS:
-                self._asset(handler, path)
-                return True
+                if path not in _FIREBASE_ASSETS or self.firebase is not None:
+                    self._asset(handler, path)
+                    return True
             if handler.command == "POST" and path == "/login":
+                if self.firebase is not None:
+                    handler.close_connection = True
+                    handler._json({"error": "not found"}, 404)
+                    return True
                 self._login(handler)
                 return True
             if handler.command == "POST" and path == "/logout":
@@ -433,26 +655,11 @@ class WebAuth:
                     self._refuse(handler, path)
                 return True
             self._bind(handler, principal)
-            if handler.command == "GET" and path == "/api/server/session":
-                self._session_info(handler)
+            from .routes import dispatch_dashboard
+            if dispatch_dashboard(self, handler, path):
                 return True
-            if handler.command == "POST" and path == "/api/server/account/password":
-                self._account_password(handler)
-                return True
-            if path == "/api/server/keys" or (path or "").startswith("/api/server/keys/"):
-                keyspage.handle(self, handler, path)
-                return True
-            if path == "/api/server/users" or (path or "").startswith("/api/server/users/"):
-                userspage.handle(self, handler, path)
-                return True
-            if path == "/api/server/audit":
-                audit.handle(self, handler)
-                return True
-            if (path or "").startswith("/api/server/") and path != "/api/server/session":
-                handler.close_connection = True
-                handler._json({"error": "not found"}, 404)
-                return True
-            return False
+            handler._error({"error": "not found"}, 404)
+            return True
         except _DISCONNECT:
             handler.close_connection = True
             return True
@@ -464,11 +671,14 @@ class WebAuth:
                 except OSError:
                     handler.close_connection = True
             return True
-        except KeyStoreUnavailable:
+        except (KeyStoreUnavailable, DatabaseError):
             if not getattr(handler, "_started", False):
                 handler._error({"error": "key store unavailable"}, 503)
             return True
-        except ValueError:
+        except ValueError as exc:
+            from agenticml.store.notes import NoteTooLarge
+            if isinstance(exc, NoteTooLarge):
+                raise
             if not getattr(handler, "_started", False):
                 handler._error({"error": "invalid request"}, 400)
             return True
@@ -480,19 +690,25 @@ class WebAuth:
     def _audit(self, handler, action, target, detail=None, *, actor=None, via=None):
         try:
             principal = getattr(handler, "principal", None)
-            handler.server.audit.record(
+            from .audit import AuditLog
+            AuditLog(
+                handler.server.data_dir / "server", db=handler.server.db, workspace_id=None
+            ).record(
                 actor if actor is not None else principal.user,
                 via if via is not None else principal.via,
                 action, target, self.client_address(handler), {} if detail is None else detail)
         except Exception:
             logger.error("could not record audit event")
 
-    def _audit_login_failed(self, handler, name=None, *, method):
+    def _audit_login_failed(self, handler, name=None, *, method, provider=None):
         try:
             validate_name(name)
         except ClientError:
             name = None
-        self._audit(handler, "login.failed", name, {"method": method},
+        detail = {"method": method}
+        if method == "firebase":
+            detail["provider"] = provider
+        self._audit(handler, "login.failed", name, detail,
                     actor="anonymous", via=method)
 
     def _path(self, handler):
@@ -537,9 +753,9 @@ class WebAuth:
         """
         identity = self.proxy_identity(handler)
         if identity is not None:
-            user = self._user_for_identity(identity)
-            if user is not None:
-                return Principal(user.name, user.role, "proxy"), None
+            principal = self._user_for_identity(identity)
+            if principal is not None:
+                return principal, None
         session = self._session(handler)
         if session is not None:
             principal = self._principal_from_session(session)
@@ -561,6 +777,15 @@ class WebAuth:
             "name": principal.key or "", "sha256": "", "user": principal.user,
         }
 
+    def _stores_for(self, workspace_id):
+        if workspace_id == self.keys.workspace_id:
+            return self.keys, self.users
+        from .keys import KeyStore
+        from .users import UserStore
+        users = UserStore(self.keys.server_dir, db=self.keys.db, workspace_id=workspace_id)
+        keys = KeyStore(self.keys.server_dir, db=self.keys.db, workspace_id=workspace_id)
+        return keys, users
+
     def _principal_from_session(self, session):
         user_name = session.get("user")
         via = session.get("via") or "key"
@@ -571,21 +796,39 @@ class WebAuth:
             principal = resolve(self.keys, self.users, record)
             if principal is None or principal.user != "env":
                 return None
-            return Principal("env", "admin", "key", "env")
-        user = self.users.get(user_name)
-        if (user is None or user.id != session.get("id")
-                or user.generation != session.get("generation")):
-            return None
+            return Principal("env", "admin", "key", "env", workspace_id=record.workspace_id if record else None)
         if via == "key":
             record = self.keys.current(
                 session.get("key") or session.get("name"),
                 session.get("key_sha256") or session.get("sha256"))
-            principal = resolve(self.keys, self.users, record)
-            if (record is None or record.scope != "admin"
-                    or principal is None or principal.role != "admin"):
+            if record is None:
                 return None
-            return Principal(user.name, user.role, "key", record.name)
-        return Principal(user.name, user.role, via, None)
+            keys, users = self._stores_for(record.workspace_id)
+            principal = resolve(keys, users, record)
+            if (record.scope != "admin"
+                    or principal is None or principal.role not in ("owner", "admin")):
+                return None
+            if (principal.id != session.get("id")
+                    or principal.generation != session.get("generation")):
+                return None
+            return principal
+        user = self.users.get(user_name)
+        if user is None:
+            from .db.workspaces import AccountRepo
+            account = AccountRepo(self.keys.db).get(user_name)
+            if (account is None or account["id"] != session.get("id")
+                    or account["generation"] != session.get("generation")):
+                return None
+            return Principal(account["login"], "viewer", via, None, account["id"],
+                             account["generation"], server_admin=bool(account["server_admin"]))
+        if (user.id != session.get("id")
+                or user.generation != session.get("generation")):
+            return None
+        from .db.workspaces import AccountRepo
+        account = AccountRepo(self.keys.db).get(user.name)
+        return Principal(
+            user.name, user.role, via, None, user.id, user.generation,
+            server_admin=bool(account["server_admin"]) if account else False)
 
     def _session(self, handler):
         token = self._read_cookie(handler)
@@ -596,24 +839,25 @@ class WebAuth:
         except UnicodeEncodeError:
             return None
         with self._lock:
-            entry = self._sessions.get(digest)
+            entry = self.sessions.get(digest)
             if entry is None:
                 return None
             now = self.clock()
             if now - entry["last_seen"] >= SESSION_IDLE or now - entry["created"] >= SESSION_MAX_AGE:
-                del self._sessions[digest]
+                self.sessions.delete(digest)
                 return None
             snapshot = dict(entry)
         if self._principal_from_session(snapshot) is None:
             with self._lock:
-                self._sessions.pop(digest, None)
+                self.sessions.delete(digest)
             return None
         with self._lock:
-            current = self._sessions.get(digest)
+            current = self.sessions.get(digest)
             if current is None:
                 return None
             if self.clock() - current["last_seen"] >= 60:
-                current["last_seen"] = self.clock()
+                self.sessions.touch(digest, self.clock())
+                current = self.sessions.get(digest)
             return current
 
     def _attach(self, handler, session, principal=None):
@@ -641,13 +885,22 @@ class WebAuth:
             key = record.name
             key_sha256 = record.sha256
             via = "key"
-            found = None if user == "env" else self.users.get(user)
+            if user == "env":
+                found = None
+            else:
+                _, users = self._stores_for(record.workspace_id)
+                found = users.get(user)
+                if expected is not None:
+                    exp_id, exp_gen = expected
+                    if (found is None or found.id != exp_id
+                            or found.generation != exp_gen):
+                        return None, None
             user_id = None if found is None else found.id
             generation = 0 if found is None else found.generation
         elif user == "env":
             generation = 0 if generation is None else generation
         else:
-            found = self.users.get(user)
+            _, found = self._users_for_login(user)
             if expected is not None:
                 exp_id, exp_gen = expected
                 if (found is None or found.id != exp_id
@@ -666,12 +919,11 @@ class WebAuth:
             "key": key, "key_sha256": key_sha256,
             "name": key or "", "sha256": key_sha256 or "",
             "created": now, "last_seen": now,
+            "workspace_id": (record.workspace_id if record is not None else self.keys.workspace_id) if via == "key" else None,
         }
         with self._lock:
-            while len(self._sessions) >= SESSION_CAP:
-                oldest = min(self._sessions, key=lambda item: self._sessions[item]["last_seen"])
-                del self._sessions[oldest]
-            self._sessions[digest] = entry
+            self.sessions.prune(now, SESSION_IDLE, SESSION_MAX_AGE)
+            self.sessions.create(digest, entry, SESSION_CAP)
         return token, entry
 
     def _session_cookie_for(self, user, via, key=None, key_sha256=None, expected=None):
@@ -694,15 +946,10 @@ class WebAuth:
         except UnicodeEncodeError:
             return
         with self._lock:
-            self._sessions.pop(digest, None)
+            self.sessions.delete(digest)
 
     def drop_sessions(self, name, sha256):
-        with self._lock:
-            for digest, entry in list(self._sessions.items()):
-                key_name = entry.get("key") or entry.get("name")
-                key_hash = entry.get("key_sha256") or entry.get("sha256")
-                if key_name == name and key_hash == sha256:
-                    del self._sessions[digest]
+        self.sessions.delete_for_key(name, sha256)
 
     def _setup_page(self, handler):
         tokens = parse_qs(urlsplit(handler.path).query, keep_blank_values=True).get("token", [])
@@ -763,8 +1010,8 @@ class WebAuth:
                     return
                 created = None
                 try:
-                    created = self.users.add(name, role="admin", created_by="setup")
-                    user = self.users.set_password(name, password)
+                    created = self.users.add(name, role="admin", created_by="setup", operator=True)
+                    user = self.users.set_password(name, password, operator=True)
                     self.keys._write_setup_closed()
                 except UserNameTaken:
                     handler._json({"error": "user name already exists"}, 409)
@@ -813,7 +1060,7 @@ class WebAuth:
             outcome = "success"
             self._attach(handler, entry, Principal(user.name, user.role, "setup"))
             handler._json(
-                {"ok": True, "user": user.name, "role": user.role},
+                {"ok": True, "user": user.name, "role": "admin" if user.role == "owner" else user.role},
                 201, self._headers({"Set-Cookie": self._cookie(cookie)}),
             )
         except ValueError as exc:
@@ -834,8 +1081,403 @@ class WebAuth:
         handler._send(file.read_bytes(), content_type, headers={"Cache-Control": "no-store"})
 
     def _login_page(self, handler):
+        if self.firebase is not None:
+            self._firebase_login_page(handler)
+            return
         body = (_LOGIN_STATIC / "login.html").read_bytes()
         handler._send(body, "text/html; charset=utf-8", headers=self._headers())
+
+    def _firebase_login_page(self, handler):
+        handler._send(
+            (_LOGIN_STATIC / "firebase-login.html").read_bytes(),
+            "text/html; charset=utf-8",
+            headers=self._headers({
+                "Referrer-Policy": "no-referrer",
+                "Content-Security-Policy": firebase_login_csp(self.firebase.auth_domain),
+            }),
+        )
+
+    def _firebase_config(self, handler):
+        if self.firebase is None:
+            handler._json({"error": "not found"}, 404)
+            return
+        config = {"projectId": self.firebase.project, "apiKey": self.firebase.api_key,
+                  "authDomain": self.firebase.auth_domain}
+        if self.legal_base_url:
+            config["legal"] = {
+                "terms": self.legal_base_url + "terms/",
+                "acceptable_use": self.legal_base_url + "acceptable-use/",
+                "privacy": self.legal_base_url + "privacy/",
+            }
+        handler._json(config, headers=self._headers())
+
+    def _firebase_auth(self, handler):
+        from .db.workspaces import AccountRepo, InviteRepo
+        from .firebase import (
+            FirebaseTokenInvalid, FirebaseUnavailable, email_verified_for_link, verify_id_token)
+        from .users import InviteAccountExists, InviteEmailMismatch, InviteInvalid
+
+        if self.firebase is None:
+            handler.close_connection = True
+            handler._json({"error": "not found"}, 404)
+            return
+        if not handler._csrf_ok():
+            handler.close_connection = True
+            logger.info("login refused: cross-site")
+            handler._error({"error": "cross-site request refused"}, 403)
+            return
+        address = self.client_address(handler)
+        ticket = self._throttle_or_refuse(handler, address)
+        if ticket is None:
+            return
+        uid_ticket = None
+        outcome = "ignored"
+        try:
+            payload = self._read_login_payload(handler)
+            if payload is None:
+                return
+            token, invite = payload.get("id_token"), payload.get("invite")
+            if not isinstance(token, str):
+                raise ValueError("invalid login body")
+            if invite is not None and not isinstance(invite, str):
+                raise ValueError("invalid login body")
+            if invite == "":
+                invite = None
+            try:
+                claims = verify_id_token(
+                    token, self.firebase.project, now=self.clock(), keys=self.cert_source)
+            except FirebaseTokenInvalid as exc:
+                logger.info("login failed")
+                logger.debug("firebase token invalid: %s", exc.reason)
+                outcome = "failed"
+                self._audit_login_failed(handler, method="firebase")
+                handler._json({"error": "sign-in failed"}, 401, self._headers())
+                return
+            except FirebaseUnavailable:
+                handler._json({"error": "sign-in unavailable"}, 503, self._headers())
+                return
+            retry_after, uid_ticket = self.throttle.begin("uid:" + claims.uid)
+            if uid_ticket is None:
+                self.throttle.finish(ticket, "ignored")
+                ticket = None
+                handler.close_connection = True
+                handler._json(
+                    {"error": "too many failed logins; try again later"},
+                    429, self._headers({"Retry-After": str(retry_after)}),
+                )
+                return
+            pending = InviteRepo.find_pending(self.keys.db, invite) if invite else None
+            if invite is not None and pending is None:
+                logger.info("login failed")
+                outcome = "failed"
+                self._audit_login_failed(handler, method="firebase", provider=claims.provider)
+                handler._json(
+                    {"error": "this invite is no longer valid", "reason": "invite_invalid"},
+                    403, self._headers())
+                return
+            if pending is not None:
+                from .db.workspaces import emails_equal, is_email_login
+                if (not email_verified_for_link(claims) or not is_email_login(pending["login"])
+                        or not emails_equal(claims.email, pending["login"])):
+                    logger.info("login failed")
+                    outcome = "failed"
+                    self._audit_login_failed(handler, method="firebase", provider=claims.provider)
+                    handler._json(
+                        {"error": "this invite is for a different or unverified email"},
+                        403, self._headers())
+                    return
+            accounts = AccountRepo(self.keys.db)
+            account = None
+            if pending is not None:
+                try:
+                    account = InviteRepo.redeem_firebase(
+                        self.keys.db, invite, claims.uid, claims.email,
+                        email_verified_for_link(claims), claims.name)
+                except InviteEmailMismatch:
+                    logger.info("login failed")
+                    outcome = "failed"
+                    self._audit_login_failed(handler, method="firebase", provider=claims.provider)
+                    handler._json(
+                        {"error": "this invite is for a different or unverified email"},
+                        403, self._headers())
+                    return
+                except InviteAccountExists:
+                    logger.info("login failed")
+                    outcome = "failed"
+                    self._audit_login_failed(handler, method="firebase", provider=claims.provider)
+                    handler._json(
+                        {"error": "an account with this email already exists; "
+                                 "sign in with it or ask a server admin",
+                         "reason": "account_exists"},
+                        403, self._headers())
+                    return
+                except InviteInvalid:
+                    logger.info("login failed")
+                    outcome = "failed"
+                    self._audit_login_failed(handler, method="firebase", provider=claims.provider)
+                    handler._json(
+                        {"error": "this invite is no longer valid", "reason": "invite_invalid"},
+                        403, self._headers())
+                    return
+            signed_up = False
+            created_workspace = None
+            unverified = False
+            listed = bool(
+                self.admin_emails and email_verified_for_link(claims) and claims.email
+                and claims.email.lower() in self.admin_emails)
+            admin_created = False
+            if account is None:
+                with self.keys.db.transaction(write=True) as tx:
+                    tx.cross_workspace("sign-up creation")
+                    tx.advisory_lock("users")
+                    account = self._firebase_find_or_claim(accounts, claims, tx)
+                    plans = getattr(handler.server, "plans", None)
+                    if account is None and listed:
+                        account = self._firebase_admin_create(accounts, claims, tx)
+                        admin_created = account is not None
+                        if admin_created and self.open_signup:
+                            created_workspace = self._create_signup_workspace(
+                                account, claims, tx, plans)
+                            self._mark_personal_workspace(account, created_workspace, tx)
+                    elif account is None and self.open_signup:
+                        if email_verified_for_link(claims) and claims.email:
+                            account, created_workspace = self._firebase_open_signup(
+                                accounts, claims, tx, plans)
+                            signed_up = account is not None
+                        else:
+                            unverified = True
+                    elif account is not None and self.open_signup:
+                        created_workspace = self._personal_workspace_if_none(
+                            account, claims, tx, plans)
+            if unverified:
+                logger.info("login failed")
+                outcome = "failed"
+                self._audit_login_failed(
+                    handler, method="firebase", provider=claims.provider)
+                handler._json(
+                    {"error": "verify your email", "reason": "email_unverified"},
+                    403, self._headers())
+                return
+            if account is None:
+                logger.info("login failed")
+                outcome = "failed"
+                self._audit_login_failed(handler, method="firebase", provider=claims.provider)
+                handler._json(
+                    {"error": "no access", "reason": "no_account"}, 403, self._headers())
+                return
+            created_workspace = self._prepare_created_workspace(
+                handler, created_workspace, account)
+            if signed_up:
+                self._audit(handler, "account.signup", account["login"],
+                            actor=account["login"], via="signup")
+            if created_workspace is not None:
+                self._audit(
+                    handler, "workspace.create", created_workspace["id"],
+                    {"slug": created_workspace["slug"], "name": created_workspace["name"]},
+                    actor=account["login"], via="signup")
+            if admin_created:
+                self._audit(handler, "account.create", account["login"],
+                            {"created_by": "admin-emails"},
+                            actor=account["login"], via="admin-emails")
+            admin_change = None
+            with self.keys.db.transaction(write=True) as tx:
+                tx.advisory_lock("users")
+                accounts.refresh_firebase_email(
+                    account["id"], claims.email, email_verified_for_link(claims), tx)
+                admin_change = self._apply_admin_list(accounts, account, listed, tx)
+                account = dict(tx.fetchone(
+                    "SELECT * FROM accounts WHERE id=?", (account["id"],)))
+            if admin_change is not None:
+                self._audit(handler, "account.server_admin", account["login"],
+                            {"enabled": admin_change, "source": "admin-emails"},
+                            actor=account["login"], via="admin-emails")
+            self._between_verify_and_session(account)
+            cookie, entry = self._session_cookie_for(
+                account["login"], "firebase",
+                expected=(account["id"], account["generation"]))
+            if entry is None:
+                outcome = "failed"
+                self._audit_login_failed(handler, method="firebase", provider=claims.provider)
+                self._refuse_stale_credentials(handler)
+                return
+            outcome = "success"
+            if not self._attach(handler, entry):
+                outcome = "failed"
+                self._audit_login_failed(handler, method="firebase", provider=claims.provider)
+                handler._json({"error": "sign-in failed"}, 401, self._headers())
+                return
+            self._audit(handler, "login.ok", account["login"],
+                        {"method": "firebase", "provider": claims.provider},
+                        actor=account["login"], via="firebase")
+            handler._json(
+                {"ok": True, "user": account["login"]},
+                headers=self._headers({"Set-Cookie": self._cookie(cookie)}),
+            )
+        finally:
+            if ticket is not None:
+                self.throttle.finish(ticket, outcome)
+            if uid_ticket is not None:
+                self.throttle.finish(uid_ticket, outcome)
+
+    def _firebase_find_or_claim(self, accounts, claims, tx):
+        from .db.workspaces import emails_equal
+        from .firebase import email_verified_for_link
+
+        found = accounts.by_firebase_uid(claims.uid, tx)
+        if found is not None:
+            return found
+        if not (email_verified_for_link(claims) and claims.email and accounts.claimable(claims.email, tx)):
+            return None
+        account = accounts.get(claims.email, tx)
+        if account is None or not emails_equal(account["login"], claims.email):
+            return None
+        try:
+            accounts.link_firebase(
+                account["id"], claims.uid, claims.email, email_verified_for_link(claims), tx)
+        except (ClientError, DatabaseError):
+            found = accounts.by_firebase_uid(claims.uid, tx)
+            if found is not None:
+                return found
+            raise
+        return accounts.by_firebase_uid(claims.uid, tx) or accounts.get(claims.email, tx)
+
+    def _firebase_open_signup(self, accounts, claims, tx, plans):
+        if accounts.get(claims.email, tx) is not None:
+            return None, None
+        display = claims.name if isinstance(claims.name, str) and claims.name.strip() else (
+            claims.email.split("@", 1)[0] or "workspace")
+        account = accounts.create(claims.email, display, "signup", tx)
+        accounts.link_firebase(account["id"], claims.uid, claims.email, True, tx)
+        account = accounts.by_firebase_uid(claims.uid, tx) or accounts.get(claims.email, tx)
+        return account, self._create_signup_workspace(account, claims, tx, plans)
+
+    def _firebase_admin_create(self, accounts, claims, tx):
+        """Create the account of a listed, verified email (the caller adds the workspace)."""
+        if accounts.get(claims.email, tx) is not None:
+            return None
+        display = claims.name if isinstance(claims.name, str) and claims.name.strip() else (
+            claims.email.split("@", 1)[0] or "workspace")
+        account = accounts.create(claims.email, display, "admin-emails", tx)
+        accounts.link_firebase(account["id"], claims.uid, claims.email, True, tx)
+        return accounts.by_firebase_uid(claims.uid, tx) or accounts.get(claims.email, tx)
+
+    def _apply_admin_list(self, accounts, account, listed, tx):
+        """Grant or revoke list-sourced server admin; return the new state or None."""
+        from .db.workspaces import LastServerAdminError
+
+        row = tx.fetchone(
+            "SELECT login, server_admin, server_admin_source FROM accounts WHERE id=?",
+            (account["id"],))
+        if row is None:
+            return None
+        if listed and not row["server_admin"]:
+            accounts.set_server_admin(row["login"], True, source="list", tx=tx)
+            return True
+        if not listed and row["server_admin"] and row["server_admin_source"] == "list":
+            try:
+                accounts.set_server_admin(row["login"], False, tx=tx)
+            except LastServerAdminError:
+                logger.warning(
+                    "kept server admin that left the admin email list: it is the last one")
+                return None
+            return False
+        return None
+
+    def _signup_pending_key(self, account_id):
+        return f"signup_pending:{account_id}"
+
+    def _personal_workspace_key(self, account_id):
+        return f"personal_workspace:{account_id}"
+
+    def _mark_personal_workspace(self, account, workspace, tx):
+        from .db.repos import SettingsRepo
+
+        if workspace is not None:
+            SettingsRepo(self.keys.db).set(
+                self._personal_workspace_key(account["id"]), "1", tx)
+
+    def _personal_workspace_if_none(self, account, claims, tx, plans):
+        """Open sign-up: a verified sign-in of an account without any membership
+        may get the free personal workspace (the limit still applies).
+
+        Sign-up accounts only recover after a failed store preparation (the
+        signup_pending marker), so a workspace an admin deleted stays deleted.
+        Other accounts (list admins, CLI or /admin created) get one at most once
+        (the personal_workspace marker).
+        """
+        from .db.repos import SettingsRepo
+        from .firebase import email_verified_for_link
+
+        if not email_verified_for_link(claims):
+            return None
+        # A membership in an archived workspace does not count: the workspace
+        # is out of the owner's way, so they may get the free personal one.
+        if tx.fetchone(
+                "SELECT 1 FROM memberships m JOIN workspaces w ON w.id=m.workspace_id "
+                "WHERE m.account_id=? AND w.archived_at IS NULL", (account["id"],)):
+            return None
+        settings = SettingsRepo(self.keys.db)
+        if account.get("created_by") == "signup":
+            if settings.get(self._signup_pending_key(account["id"]), tx) is None:
+                return None
+            return self._create_signup_workspace(account, claims, tx, plans)
+        if settings.get(self._personal_workspace_key(account["id"]), tx) is not None:
+            return None
+        workspace = self._create_signup_workspace(account, claims, tx, plans)
+        self._mark_personal_workspace(account, workspace, tx)
+        return workspace
+
+    def _create_signup_workspace(self, account, claims, tx, plans):
+        from .db.workspaces import WorkspaceRepo, slug_from_email_local
+
+        workspaces = WorkspaceRepo(self.keys.db)
+        # A limits file with free_workspaces_per_account=0 creates the account
+        # but no workspace; the dashboard shows the "no workspaces" state.
+        limit = None if plans is None else plans.free_workspaces_per_account
+        if limit is not None and workspaces.owned_free_count(account["id"], tx) >= limit:
+            return None
+        login = account["login"]
+        display = claims.name if isinstance(claims.name, str) and claims.name.strip() else (
+            login.split("@", 1)[0] or "workspace")
+        slug = workspaces.allocate_slug(slug_from_email_local(login), tx)
+        suffix = "'s workspace"
+        name = display + suffix
+        if len(name) > 256:
+            name = display[:256 - len(suffix)].rstrip() + suffix
+        return workspaces.create(
+            slug, name, login, tx, plan="free", personal=1)
+
+    def _prepare_created_workspace(self, handler, created_workspace, account):
+        from .db.repos import SettingsRepo
+        from .db.workspaces import WorkspaceRepo
+        from .workspaces import discard_store, prepare_store
+
+        if created_workspace is None:
+            return None
+        marker = self._signup_pending_key(account["id"])
+        try:
+            prepare_store(handler.server.data_dir, created_workspace["id"])
+        except (OSError, DatabaseError):
+            logger.exception("could not create workspace store")
+            dropped = False
+            try:
+                with self.keys.db.transaction(write=True) as tx:
+                    tx.cross_workspace("signup workspace rollback")
+                    tx.advisory_lock("users")
+                    row = WorkspaceRepo(self.keys.db).get(created_workspace["slug"], tx)
+                    if row is not None and row["slug"] != "default":
+                        tx.execute("DELETE FROM workspaces WHERE id=?", (row["id"],))
+                        dropped = True
+                    SettingsRepo(self.keys.db).set(marker, "1", tx)
+                    SettingsRepo(self.keys.db).delete(
+                        self._personal_workspace_key(account["id"]), tx)
+            except Exception:
+                logger.exception("could not delete workspace after store failure")
+            if dropped:
+                discard_store(handler.server.data_dir, created_workspace["id"])
+            return None
+        SettingsRepo(self.keys.db).delete(marker)
+        return created_workspace
 
     def _read_login_payload(self, handler):
         length = handler._put_length(LOGIN_BODY_MAX)
@@ -894,7 +1536,11 @@ class WebAuth:
             if not isinstance(payload.get("key"), str):
                 raise ValueError("invalid login body")
             record = self.keys.verify(payload["key"])
-            principal = resolve(self.keys, self.users, record)
+            if record is None:
+                principal = None
+            else:
+                keys, users = self._stores_for(record.workspace_id)
+                principal = resolve(keys, users, record)
             if record is None or principal is None:
                 logger.info("login failed")
                 outcome = "failed"
@@ -907,7 +1553,7 @@ class WebAuth:
                 handler._json(
                     {"error": "this is a sync key; sign in with an admin key"}, 403, self._headers())
                 return
-            if principal.role != "admin":
+            if principal.role not in ("owner", "admin"):
                 logger.info("login failed")
                 self._audit_login_failed(handler, method="key")
                 handler._json(
@@ -917,9 +1563,7 @@ class WebAuth:
             expected = (
                 None if principal.id is None
                 else (principal.id, principal.generation))
-            token, entry = self._session_cookie_for(
-                principal.user, "key", key=record.name, key_sha256=record.sha256,
-                expected=expected)
+            token, entry = self._create_session(record, expected=expected)
             if entry is None:
                 outcome = "failed"
                 self._audit_login_failed(handler, method="key")
@@ -930,7 +1574,7 @@ class WebAuth:
             self._attach(handler, entry, principal)
             self._audit(handler, "login.ok", principal.user, {"method": "key"})
             handler._json(
-                {"ok": True, "user": principal.user, "role": principal.role},
+                {"ok": True, "user": principal.user, "role": "admin" if principal.role == "owner" else principal.role},
                 headers=self._headers({"Set-Cookie": self._cookie(token)}),
             )
         finally:
@@ -956,7 +1600,7 @@ class WebAuth:
                 handler._json({"error": ScryptUnavailable().args[0]}, 503, self._headers())
                 return
             try:
-                user = self.users.verify_password(name, password)
+                user = self._verify_login_password(name, password)
             except ClientError:
                 logger.info("login failed")
                 outcome = "failed"
@@ -981,7 +1625,7 @@ class WebAuth:
             self._attach(handler, entry, Principal(user.name, user.role, "password"))
             self._audit(handler, "login.ok", user.name, {"method": "password"})
             handler._json(
-                {"ok": True, "user": user.name, "role": user.role},
+                {"ok": True, "user": user.name, "role": "admin" if user.role == "owner" else user.role},
                 headers=self._headers({"Set-Cookie": self._cookie(token)}),
             )
         finally:
@@ -1005,15 +1649,90 @@ class WebAuth:
             self._headers({"Set-Cookie": self._cookie("", max_age=0)}),
         )
 
+    def _workspace_cookie(self, handler):
+        raw = handler.headers.get("Cookie")
+        if not raw:
+            return None
+        try:
+            jar = SimpleCookie()
+            jar.load(raw)
+        except CookieError:
+            return None
+        morsel = jar.get("aml_ws")
+        if morsel is None or not morsel.value:
+            return None
+        from .db.workspaces import validate_slug
+        try:
+            return validate_slug(morsel.value)
+        except ClientError:
+            return None
+
+    def _account_workspaces(self, handler):
+        principal = handler.principal
+        from .db.workspaces import AccountRepo, WorkspaceRepo
+        if principal.user == "env":
+            workspace = WorkspaceRepo(self.keys.db).get("default")
+            if workspace is None or workspace["status"] != "active":
+                return []
+            return [{"slug": workspace["slug"], "name": workspace["name"], "role": "admin"}]
+        rows = AccountRepo(self.keys.db).workspaces(principal.user)
+        session = getattr(handler, "session", None) or {}
+        bound = session.get("workspace_id") if principal.via == "key" else None
+        if bound:
+            workspace = WorkspaceRepo(self.keys.db).by_id(bound)
+            slug = None if workspace is None else workspace["slug"]
+            return [row for row in rows if row["slug"] == slug]
+        return rows
+
+    def _user_from_account(self, account, role="viewer"):
+        raw = account.get("password")
+        try:
+            password = json.loads(raw) if raw else None
+        except (ValueError, TypeError, RecursionError):
+            password = None
+        return UserRecord(
+            account["login"], account["id"], role, account.get("identity"),
+            password, None, int(account.get("generation") or 0),
+            account.get("created_at") or "", account.get("created_by") or "")
+
+    def _users_for_login(self, login):
+        user = self.users.get(login)
+        if user is not None:
+            return self.users, user
+        from .db.workspaces import AccountRepo, WorkspaceRepo
+        slugs = AccountRepo(self.keys.db).workspace_slugs(login)
+        if slugs:
+            workspace = WorkspaceRepo(self.keys.db).get(slugs[0])
+            if workspace is not None:
+                from .users import UserStore
+                users = UserStore(self.keys.server_dir, db=self.keys.db, workspace_id=workspace["id"])
+                found = users.get(login)
+                if found is not None:
+                    return users, found
+        account = AccountRepo(self.keys.db).get(login)
+        if account is None:
+            return None, None
+        return None, self._user_from_account(account)
+
+    def _verify_login_password(self, name, password):
+        users, found = self._users_for_login(name)
+        if users is not None:
+            return users.verify_password(name, password)
+        if found is None or found.password is None or not isinstance(password, str):
+            _dummy_verify(password if isinstance(password, str) else "")
+            return None
+        return found if _check_password(password, found.password) else None
+
     def _session_payload(self, handler):
         principal = handler.principal
-        user = None if principal.user == "env" else self.users.get(principal.user)
+        user = None if principal.user == "env" else self._users_for_login(principal.user)[1]
         key = principal.key if principal.via == "key" else None
         return {
             "server": True,
             "user": principal.user,
-            "role": principal.role,
+            "role": "admin" if principal.role == "owner" else principal.role,
             "via": principal.via,
+            "auth": "firebase" if self.firebase is not None else "password",
             "key": key,
             "scope": "admin" if principal.via == "key" else None,
             "can": {
@@ -1025,13 +1744,17 @@ class WebAuth:
             },
             "password_set": bool(user is not None and user.password is not None),
             "identity_proxy": self.identity_header is not None,
+            "workspaces": self._account_workspaces(handler),
+            "server_admin": bool(principal.server_admin),
+            "open_signup": bool(self.open_signup),
         }
 
     def _session_info(self, handler):
         handler._json(self._session_payload(handler), headers=self._headers())
 
-    def _check_current_password(self, handler, user, current):
+    def _check_current_password(self, handler, user, current, users=None):
         """Throttle the current-password check. False means a response was sent."""
+        store = self.users if users is None else users
         address = self.client_address(handler)
         address_ticket = self._throttle_or_refuse(handler, address)
         if address_ticket is None:
@@ -1052,7 +1775,7 @@ class WebAuth:
                 handler._json({"error": "invalid current password"}, 401, self._headers())
                 return False
             try:
-                verified = self.users.verify_password(user.name, current)
+                verified = store.verify_password(user.name, current)
             except ClientError:
                 outcome = "failed"
                 handler._json({"error": "invalid password"}, 400, self._headers())
@@ -1069,9 +1792,11 @@ class WebAuth:
 
     def _account_password(self, handler):
         principal = handler.principal
-        if principal.user == "env":
+        # Key-login and env sessions are workspace-bound; setup/invite proved
+        # the account token and may change the password they just set.
+        if principal.via == "key" or principal.user == "env":
             handler.close_connection = True
-            handler._json({"error": "environment user cannot set a password"}, 403, self._headers())
+            handler._json({"error": "this session cannot set a password"}, 403, self._headers())
             return
         try:
             payload = keyspage.read_json(handler, LOGIN_BODY_MAX)
@@ -1081,7 +1806,7 @@ class WebAuth:
             current = payload.get("current")
             if not isinstance(new, str):
                 raise ClientError("invalid password")
-            user = self.users.get(principal.user)
+            users, user = self._users_for_login(principal.user)
             if user is None:
                 handler.close_connection = True
                 handler._json({"error": "login required"}, 401, self._headers())
@@ -1094,12 +1819,12 @@ class WebAuth:
                     handler._json({"error": "login required"}, 401, self._headers())
                     return
             if user.password is not None:
-                if not self._check_current_password(handler, user, current):
+                if not self._check_current_password(handler, user, current, users):
                     return
             if not scrypt_available():
                 handler._json({"error": ScryptUnavailable().args[0]}, 503, self._headers())
                 return
-            updated = self.users.set_password(user.name, new)
+            updated = users.set_password(user.name, new, acting_account_id=user.id)
             self._audit(handler, "user.password", updated.name, {"method": "account"})
             token, entry = self._create_session(
                 user=updated.name, via="password",
@@ -1109,7 +1834,7 @@ class WebAuth:
                 return
             self._attach(handler, entry, Principal(updated.name, updated.role, "password"))
             handler._json(
-                {"ok": True, "user": updated.name, "role": updated.role},
+                {"ok": True, "user": updated.name, "role": "admin" if updated.role == "owner" else updated.role},
                 headers=self._headers({"Set-Cookie": self._cookie(token)}),
             )
         except ScryptUnavailable as exc:
@@ -1124,7 +1849,10 @@ class WebAuth:
         from datetime import datetime, timezone
 
         from agenticml.store import layout as store_layout
+        from .db.workspaces import InviteRepo
 
+        if InviteRepo.find_pending(self.keys.db, token) is not None:
+            return True
         if not isinstance(token, str) or not token:
             return False
         try:
@@ -1148,10 +1876,49 @@ class WebAuth:
                 found = True
         return found
 
+    def _invite_existing_page(self, handler):
+        body = (_LOGIN_STATIC / "invite-existing.html").read_bytes()
+        handler._send(body, "text/html; charset=utf-8", headers=self._headers({"Referrer-Policy": "no-referrer"}))
+
+    def _invite_kind(self, token):
+        """Return (pending_row, kind) where kind is new, existing, or reset."""
+        from .db.workspaces import AccountRepo, InviteRepo, MembershipRepo
+
+        pending = InviteRepo.find_pending(self.keys.db, token)
+        if pending is None:
+            return None, None
+        account = AccountRepo(self.keys.db).get(pending["login"])
+        if account is None:
+            return pending, "new"
+        member = MembershipRepo(self.keys.db, pending["workspace_id"]).get(account["id"])
+        return pending, "reset" if member is not None else "existing"
+
+    def _redeem_workspace_invite(self, token, password=None):
+        from .db.workspaces import AccountRepo, InviteRepo
+        from .users import InviteExistingAccount, InviteInvalid, UserStore
+
+        pending = InviteRepo.find_pending(self.keys.db, token)
+        if pending is None:
+            raise InviteInvalid("invalid invite")
+        InviteRepo(self.keys.db, pending["workspace_id"]).redeem(token, password)
+        users = UserStore(
+            self.keys.server_dir, db=self.keys.db, workspace_id=pending["workspace_id"])
+        user = users.get(pending["login"])
+        if user is None:
+            account = AccountRepo(self.keys.db).get(pending["login"])
+            if account is None:
+                raise InviteInvalid("invalid invite")
+            raise InviteExistingAccount(account["id"])
+        return user
+
     def _invite_page(self, handler):
         tokens = parse_qs(urlsplit(handler.path).query, keep_blank_values=True).get("token", [])
         token = tokens[0] if len(tokens) == 1 else None
-        if not self._invite_pending(token):
+        _, kind = self._invite_kind(token)
+        if kind == "existing":
+            self._invite_existing_page(handler)
+            return
+        if kind not in ("new", "reset") and not self._invite_pending(token):
             handler._json({"error": "not found"}, 404)
             return
         handler._send(
@@ -1159,7 +1926,26 @@ class WebAuth:
             headers=self._headers({"Referrer-Policy": "no-referrer"}),
         )
 
+    def _finish_invite_login(self, handler, user):
+        self._audit(handler, "user.password", user.name, {"method": "invite"},
+                    actor=user.name, via="invite")
+        self._between_verify_and_session(user)
+        cookie, entry = self._session_cookie_for(
+            user.name, "invite", expected=(user.id, user.generation))
+        if entry is None:
+            self._refuse_stale_credentials(handler)
+            return False
+        self._attach(handler, entry, Principal(user.name, user.role, "invite"))
+        self._audit(handler, "login.ok", user.name, {"method": "invite"})
+        handler._json(
+            {"ok": True, "user": user.name, "role": "admin" if user.role == "owner" else user.role},
+            headers=self._headers({"Set-Cookie": self._cookie(cookie)}),
+        )
+        return True
+
     def _invite(self, handler):
+        from .users import DETACHED_ACCOUNT, InviteExistingAccount, InviteInvalid
+
         if not handler._csrf_ok():
             handler.close_connection = True
             handler._error({"error": "cross-site request refused"}, 403)
@@ -1174,13 +1960,65 @@ class WebAuth:
             if payload is None:
                 return
             token, password = payload.get("token"), payload.get("password")
-            if not isinstance(token, str) or not isinstance(password, str):
+            if not isinstance(token, str):
+                raise ClientError("invalid invite body")
+            pending, kind = self._invite_kind(token)
+            if kind == "existing":
+                try:
+                    self._redeem_workspace_invite(token)
+                except ClientError as exc:
+                    if str(exc) != DETACHED_ACCOUNT:
+                        raise
+                    outcome = "failed"
+                    handler._json({"error": DETACHED_ACCOUNT}, 403, self._headers())
+                    return
+                except InviteExistingAccount:
+                    outcome = "success"
+                    handler._json(
+                        {"error": "you already have an account; sign in with it"}, 409,
+                        self._headers())
+                    return
+                except InviteInvalid:
+                    outcome = "failed"
+                    handler._json({"error": "not found"}, 404)
+                    return
+                handler._json({"error": "not found"}, 404)
+                return
+            if not isinstance(password, str):
                 raise ClientError("invalid invite body")
             if not scrypt_available():
                 handler._json({"error": ScryptUnavailable().args[0]}, 503, self._headers())
                 return
+            if kind == "new":
+                try:
+                    user = self._redeem_workspace_invite(token, password)
+                except InviteExistingAccount:
+                    outcome = "success"
+                    handler._json(
+                        {"error": "you already have an account; sign in with it"}, 409,
+                        self._headers())
+                    return
+                except InviteInvalid:
+                    outcome = "failed"
+                    handler._json({"error": "not found"}, 404)
+                    return
+                except ScryptUnavailable as exc:
+                    handler._json({"error": str(exc)}, 503, self._headers())
+                    return
+                if not self._finish_invite_login(handler, user):
+                    outcome = "failed"
+                    return
+                outcome = "success"
+                return
             try:
-                user = self.users.redeem_invite(token, password)
+                if pending is not None:
+                    from .users import UserStore
+                    users = UserStore(
+                        self.keys.server_dir, db=self.keys.db,
+                        workspace_id=pending["workspace_id"])
+                    user = users.redeem_invite(token, password)
+                else:
+                    user = self.users.redeem_invite(token, password)
             except InviteInvalid:
                 outcome = "failed"
                 handler._json({"error": "not found"}, 404)
@@ -1188,22 +2026,10 @@ class WebAuth:
             except ScryptUnavailable as exc:
                 handler._json({"error": str(exc)}, 503, self._headers())
                 return
-            self._audit(handler, "user.password", user.name, {"method": "invite"},
-                        actor=user.name, via="invite")
-            self._between_verify_and_session(user)
-            cookie, entry = self._session_cookie_for(
-                user.name, "invite", expected=(user.id, user.generation))
-            if entry is None:
+            if not self._finish_invite_login(handler, user):
                 outcome = "failed"
-                self._refuse_stale_credentials(handler)
                 return
             outcome = "success"
-            self._attach(handler, entry, Principal(user.name, user.role, "invite"))
-            self._audit(handler, "login.ok", user.name, {"method": "invite"})
-            handler._json(
-                {"ok": True, "user": user.name, "role": user.role},
-                headers=self._headers({"Set-Cookie": self._cookie(cookie)}),
-            )
         except ValueError as exc:
             if not getattr(handler, "_started", False):
                 handler._error(
@@ -1225,7 +2051,8 @@ class WebAuth:
                 "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"/>"
                 "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>"
                 "<title>agenticml · No user for this identity</title>"
-                "<link rel=\"stylesheet\" href=\"/static/app.css\"/></head>"
+                "<link rel=\"stylesheet\" href=\"/static/app.css\"/>"
+                "<script src=\"/static/theme.js\"></script></head>"
                 "<body class=\"login-page\"><main class=\"login-card\">"
                 "<p class=\"eyebrow\">agenticml</p><h1>No user for this identity</h1>"
                 f"<p>{text}</p></main></body></html>"

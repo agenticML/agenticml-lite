@@ -16,6 +16,7 @@ import requests
 from agenticml.client import Client, Conflict, ProtocolError, SyncStopped
 from agenticml.server.app import make_server
 from agenticml.server.keys import KeyStore
+from server_db_helpers import default_workspace_id
 
 
 @contextmanager
@@ -101,7 +102,7 @@ def fake_http(handler):
 def test_whoami_sync_and_admin_and_revoked(server):
     with client_for(server) as client:
         assert client.whoami() == {
-            "key": "one", "scope": "sync", "user": "admin", "role": "admin", "protocol": 2,
+            "key": "one", "scope": "sync", "user": "admin", "role": "owner", "protocol": 2, "workspace": "default",
             "features": (["lineage"] if server.lineage_enabled else []) + ["byref"],
         }
     _, admin = server.keys.create("boss", "admin")
@@ -112,7 +113,7 @@ def test_whoami_sync_and_admin_and_revoked(server):
             client.whoami()
         assert caught.value.response.status_code == 401
         assert "wrong-key" not in str(caught.value)
-    KeyStore(server.data_dir / "server").revoke("one")
+    KeyStore(server.data_dir / "server", workspace_id=default_workspace_id(server.data_dir / "server")).revoke("one")
     with client_for(server) as client:
         with pytest.raises(requests.HTTPError) as caught:
             client.whoami()
@@ -163,7 +164,7 @@ def test_round_trip_missing_object_file_append_state_commit(server):
         assert client.put_file("run-1", "meta.json", meta) == {"size": len(meta)}
         assert client.append("run-1", "events.jsonl", 0, events) == len(events)
         state = client.run_state("run-1")
-        assert state["owner"] == "one"
+        assert state["owner"] == "admin"
         assert state["owner_user"] == "admin"
         assert "meta.json" in state["files"]
         assert "events.jsonl" in state["files"]

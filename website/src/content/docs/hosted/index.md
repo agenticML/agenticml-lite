@@ -52,9 +52,9 @@ The dashboard warns you when storage or daily uploads pass 80% of the limit. `ag
 
 **Workspace data.** Everything a sync uploads: run metadata and config, metric series and summaries, event logs, media, copied artifacts, and code snapshots with their lineage history. A run's local note (`notes.md`) is not uploaded. By-reference artifacts are uploaded only with `sync --artifacts`.
 
-**Where.** All of it runs in AWS region `us-east-2` (Ohio): run metadata in a PostgreSQL database, run files on network file storage, and objects (code, media, copied artifacts) in S3. All three are set up to encrypt data at rest. A check of the stored objects is on the [open list](/agenticml-lite/hosted/status/).
+**Where.** All of it runs in AWS region `us-east-2` (Ohio): run metadata in a PostgreSQL database, run files on network file storage, and objects (code, media, copied artifacts) in S3. All three are set up to encrypt data at rest. On Nov 16, 2026 the stored objects were checked: they are encrypted and match the bytes that were uploaded (see [service status](/agenticml-lite/hosted/status/)).
 
-**Backups.** The database and file storage have daily backups kept for up to 35 days, and the database also allows point-in-time recovery for 7 days. S3 keeps old object versions for 30 days. A restore has not been tested yet, so do not rely on a restore. Deleted data can stay in backups for up to 35 days.
+**Backups.** The database and file storage have daily backups kept for up to 35 days, and the database also allows point-in-time recovery for 7 days. S3 keeps old object versions for 30 days. On Nov 16, 2026 a restore of the database, files and objects into a separate test service passed (see [service status](/agenticml-lite/hosted/status/)). Deleted data can stay in backups for up to 35 days.
 
 **Staff access.** A server administrator gets "not found" for a workspace they are not a member of. Support staff see a workspace only if a workspace admin invites a support account, and that is recorded in the workspace audit log.
 

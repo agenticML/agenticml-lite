@@ -168,9 +168,12 @@ def _purge_bench(data: Path):
     server_dir = data / "server"
     if not (server_dir / "keys.json").is_file():
         return
+    from agenticml.server.db import for_server_dir
     from agenticml.server.keys import KeyStore
+    from agenticml.server.workspaces import default_workspace_id
 
-    store = KeyStore(server_dir)
+    db = for_server_dir(server_dir)
+    store = KeyStore(server_dir, db=db, workspace_id=default_workspace_id(db))
     for record in list(store.list()):
         if record.name.startswith("bench-"):
             store.revoke(record.name)
@@ -406,11 +409,15 @@ def main():
             _purge_bench(data)
         _install_fsync_delay(args.fsync_delay_ms)
         from agenticml.server.app import make_server, prepare_data_dir
+        from agenticml.server.db import for_server_dir
         from agenticml.server.keys import KeyStore
+        from agenticml.server.workspaces import default_workspace_id
 
         prepare_data_dir(data)
         # A durable admin key so make_server does not arm/log the one-time setup token.
-        KeyStore(data / "server").create("bench-admin", scope="admin")
+        db = for_server_dir(data / "server")
+        KeyStore(data / "server", db=db, workspace_id=default_workspace_id(db)).create(
+            "bench-admin", scope="admin")
         server = make_server(data, "127.0.0.1", 0)
         threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
         host = f"http://127.0.0.1:{server.server_address[1]}"

@@ -29,6 +29,7 @@ result built from it.
 from __future__ import annotations
 
 from collections import OrderedDict
+from contextlib import contextmanager
 import json
 import logging
 import math
@@ -289,7 +290,7 @@ def _remote_status(remote: dict, now: float) -> str:
     return "stale"
 
 
-def list_runs(root, *, include_owner=False) -> list[dict]:
+def list_runs(root, *, include_owner=False, remote_lookup=None) -> list[dict]:
     """One dict per run, newest ``created_at`` first.
 
     Only ``meta.json`` is parsed for identity. Directories whose names are
@@ -300,6 +301,8 @@ def list_runs(root, *, include_owner=False) -> list[dict]:
     lock and an old heartbeat to be crashed. An unknown lock with an old
     heartbeat indicates a stale run. ``include_owner`` carries the normalized
     remote owner in ``_remote_owner`` for server dashboard list responses.
+    When given, ``remote_lookup(run_id)`` returns the normalised remote dict
+    (same shape as ``read_remote``) instead of reading ``remote.json``.
     """
     root_path = Path(root).expanduser().resolve()
     runs_root = str(root_path / "runs")
@@ -340,7 +343,7 @@ def list_runs(root, *, include_owner=False) -> list[dict]:
                         meta_run_id,
                     )
                 meta["run_id"] = dir_run_id
-            remote = read_remote(entry_path)
+            remote = remote_lookup(dir_run_id) if remote_lookup is not None else read_remote(entry_path)
             if include_owner:
                 meta["_remote_owner"] = remote["owner"] if remote else None
             meta["effective_status"] = _status_from(meta, entry_path, now, remote)
@@ -551,6 +554,24 @@ def _ensure_contained(root, path: Path) -> None:
         contained(root, path)
 
 
+def last_step_from_size(path: Path, size: int) -> int | None:
+    """Last complete record's step within the first ``size`` bytes, or None.
+
+    A torn tail inside that prefix is left unread. Missing files are None.
+    Symlinks raise from ``open_nofollow``.
+    """
+    complete = size - size % RECORD_SIZE
+    if complete < RECORD_SIZE:
+        return None
+    try:
+        with open_nofollow(path) as handle:
+            handle.seek(complete - RECORD_SIZE)
+            data = handle.read(RECORD_SIZE)
+            return RECORD_STRUCT.unpack(data)[0] if len(data) == RECORD_SIZE else None
+    except FileNotFoundError:
+        return None
+
+
 def _last_complete_step(path: Path) -> int | None:
     """Step in the last complete record of a scalar file, or None.
 
@@ -560,14 +581,9 @@ def _last_complete_step(path: Path) -> int | None:
     try:
         with open_nofollow(path) as handle:
             size = os.fstat(handle.fileno()).st_size
-            complete = size - size % RECORD_SIZE
-            if complete < RECORD_SIZE:
-                return None
-            handle.seek(complete - RECORD_SIZE)
-            data = handle.read(RECORD_SIZE)
-            return RECORD_STRUCT.unpack(data)[0] if len(data) == RECORD_SIZE else None
     except FileNotFoundError:
         return None
+    return last_step_from_size(path, size)
 
 
 def read_last_step(root, run_id: str) -> int | None:
@@ -590,13 +606,17 @@ class RunReader:
     ``remote()`` reads server-only ``remote.json`` when that file is present.
     """
 
-    def __init__(self, root, run_id: str) -> None:
+    def __init__(self, root, run_id: str, *, remote=None, committed_size=None) -> None:
         if not valid_run_id(run_id):
             raise ValueError(f"invalid run id: {run_id!r}")
         self.root = Path(root).expanduser().resolve()
         self.run_dir = run_dir(self.root, run_id)
         self.run_id = run_id
+        self._remote_provider = remote
+        self._committed_size = committed_size
         self._lock = threading.RLock()
+        # Per-thread, per public call memo of committed sizes (see _sizes_scope).
+        self._snap = threading.local()
         self._path_cache: dict[str, Path] = {}
         self._meta_path = self._c(self.run_dir / META_NAME)
         if self._meta_path.is_symlink():
@@ -617,6 +637,50 @@ class RunReader:
         self._status = ""
         self._index_cache: tuple[tuple[int, int, int], dict] | None = None
 
+    @contextmanager
+    def _sizes_scope(self):
+        """Memoise committed sizes for one public call on this thread.
+
+        Without it one ``series()`` asks the index twice for the same file,
+        and the two answers can differ. The memo is thread-local, entered
+        inside the reader lock, and dropped when the outermost call returns,
+        so the next call (and other processes' writes) are always seen.
+        """
+        if self._committed_size is None:
+            yield
+            return
+        snap = self._snap
+        depth = getattr(snap, "depth", 0)
+        if depth == 0:
+            snap.sizes = {}
+        snap.depth = depth + 1
+        try:
+            yield
+        finally:
+            snap.depth = depth
+            if depth == 0:
+                snap.sizes = None
+
+    def _file_size(self, path):
+        size = _file_size(path)
+        if self._committed_size is not None:
+            rel = path.relative_to(self.run_dir).as_posix()
+            sizes = getattr(self._snap, "sizes", None)
+            if sizes is None:
+                committed = self._committed_size(self.run_id, rel)
+            else:
+                if rel not in sizes:
+                    sizes[rel] = self._committed_size(self.run_id, rel)
+                committed = sizes[rel]
+            size = min(size, committed)
+        return size
+
+    def _read_append(self, path):
+        if self._committed_size is None:
+            return read_file_nofollow(path)
+        with open_nofollow(path) as handle:
+            return handle.read(self._file_size(path))
+
     def _c(self, path: Path) -> Path:
         """Resolved ``path`` inside the store root. Cached after the first check."""
         key = str(path)
@@ -629,7 +693,13 @@ class RunReader:
             return path
 
     def remote(self) -> dict | None:
-        """Normalised ``remote.json``, or None if missing or invalid. Re-read on each call."""
+        """Normalised ``remote.json``, or None if missing or invalid. Re-read on each call.
+
+        When constructed with a ``remote`` provider, that callable is used
+        instead of reading ``remote.json``.
+        """
+        if self._remote_provider is not None:
+            return self._remote_provider(self.run_id)
         self._c(self.run_dir / REMOTE_NAME)
         return read_remote(self.run_dir)
 
@@ -672,14 +742,18 @@ class RunReader:
     def record_sizes(self) -> dict:
         """Snapshot complete scalar byte lengths for one bounded sync pass."""
         sizes = {}
-        for key in self.keys():
-            size = _file_size(self._bin_path(_series_id(self._series_info(key))))
-            sizes[key] = size - size % RECORD_SIZE
+        with self._sizes_scope():
+            for key in self.keys():
+                size = self._file_size(self._bin_path(_series_id(self._series_info(key))))
+                sizes[key] = size - size % RECORD_SIZE
         return sizes
 
     def events(self) -> list:
         """Event objects. A torn last line is omitted; a bad earlier line is skipped."""
-        return load_events(self._c(self.run_dir / EVENTS_NAME))
+        path = self._c(self.run_dir / EVENTS_NAME)
+        with self._sizes_scope():
+            maximum = self._file_size(path) if self._committed_size is not None else None
+        return load_events(path, maximum=maximum)
 
     def code_manifest(self) -> list:
         """Code files merged by path. A later ``code`` event replaces an earlier one."""
@@ -758,7 +832,8 @@ class RunReader:
         """``(step, seconds_since_created_at)`` from ``_time.bin``, torn tail dropped."""
         path = self._c(self.run_dir / SCALARS_DIRNAME / TIME_BIN_NAME)
         try:
-            data = read_file_nofollow(path)
+            with self._sizes_scope():
+                data = self._read_append(path)
         except FileNotFoundError:
             return []
         except OSError as exc:
@@ -774,13 +849,26 @@ class RunReader:
     def last_step(self) -> int | None:
         """Last complete time record, without loading the time index."""
         path = self._c(self.run_dir / SCALARS_DIRNAME / TIME_BIN_NAME)
-        return _last_complete_step(path)
+        if self._committed_size is None:
+            return _last_complete_step(path)
+        with self._sizes_scope():
+            complete = self._file_size(path) // RECORD_SIZE * RECORD_SIZE
+        if complete < RECORD_SIZE:
+            return None
+        try:
+            with open_nofollow(path) as handle:
+                handle.seek(complete - RECORD_SIZE)
+                data = handle.read(RECORD_SIZE)
+            return RECORD_STRUCT.unpack(data)[0] if len(data) == RECORD_SIZE else None
+        except FileNotFoundError:
+            return None
 
     def tail(self, key: str) -> dict | None:
         """Last complete ``.bin`` record for ``key``, or None if missing or empty."""
         info = self._series_info(key)
         path = self._bin_path(_series_id(info))
-        size = _file_size(path)
+        with self._sizes_scope():
+            size = self._file_size(path)
         complete = size - (size % RECORD_SIZE)
         if complete < RECORD_SIZE:
             return None
@@ -818,7 +906,8 @@ class RunReader:
             return [], offset
         info = self._series_info(key)
         path = self._bin_path(_series_id(info))
-        size = _file_size(path)
+        with self._sizes_scope():
+            size = self._file_size(path)
         complete = size - (size % RECORD_SIZE)
         if offset >= complete:
             return [], offset
@@ -862,7 +951,7 @@ class RunReader:
             raise ValueError("max_points must be an integer >= 1")
         start = _bound(start)
         end = _bound(end)
-        with self._lock:
+        with self._lock, self._sizes_scope():
             return self._series_locked(key, max_points, start, end)
 
     def _series_locked(self, key: str, max_points: int, start, end) -> dict:
@@ -879,7 +968,7 @@ class RunReader:
         # Stat the prefix before reading monotonic. The writer clears the
         # flag before it appends an out-of-order record, so a flag that is
         # still true applies to this size.
-        size = _file_size(path)
+        size = self._file_size(path)
         if not path.is_file() or path.is_symlink():
             # sync --prune deletes the series file after finish. The overview
             # is then the whole answer, including queries that would have
@@ -1042,7 +1131,7 @@ class RunReader:
         return None
 
     def _incremental(self, key: str, path: Path) -> Overview:
-        size = _file_size(path)
+        size = self._file_size(path)
         complete = size - (size % RECORD_SIZE)
         cached = self._cache.get(key)
         if cached and cached[0] == "inc" and cached[2] <= complete:

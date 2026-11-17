@@ -80,13 +80,13 @@ def page(context):
     if tab.allow_http_errors:
         problems = [problem for problem in problems if not problem.startswith(("HTTP 4", "HTTP 503", "console: Failed to load resource:"))]
     session_404 = any(
-        problem.startswith("HTTP 404:") and "/api/server/session" in problem
+        problem.startswith("HTTP 404:") and "/api/account/session" in problem
         for problem in problems
     )
     problems = [
         problem for problem in problems
         if not (
-            (problem.startswith("HTTP 404:") and "/api/server/session" in problem)
+            (problem.startswith("HTTP 404:") and "/api/account/session" in problem)
             or (
                 session_404
                 and problem.startswith("console: Failed to load resource:")
@@ -102,6 +102,7 @@ def home(page, server):
     page.goto(server.url)
     expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
     expect(page.locator(".poll-status")).not_to_be_empty()
+    expect(page.get_by_test_id("runs-metric")).to_be_hidden()
 
 
 def row(page, name):
@@ -135,6 +136,13 @@ def painted(canvas):
 
 def test_home_lists_every_run(page, ui_server):
     home(page, ui_server)
+    expect(page.get_by_role("button", name="Account", exact=True)).to_have_count(0)
+    # The local dashboard has no accounts: no Settings or Admin entries, and the host label stays.
+    for name in ("Settings", "Admin", "Keys", "Team"):
+        expect(page.get_by_role("link", name=name, exact=True)).to_have_count(0)
+    expect(page.locator("#host")).to_contain_text("local · ")
+    expect(page.locator(".breadcrumb")).to_have_text("agenticml / runs")
+    expect(page.get_by_role("list", name="Workspaces", exact=True)).to_have_count(0)
     expect(page.locator(".run-row")).to_have_count(5)
     expect(page.locator(".poll-status")).to_have_text("5 runs")
     expect(page.locator(".runs-summary")).to_have_text("5 runs · 2 projects · 2 tasks")
@@ -213,6 +221,20 @@ def test_project_filter_and_search(page, ui_server):
     expect(page.locator(".run-row")).to_have_count(1)
     search.fill("")
     expect(page.locator(".run-row")).to_have_count(5)
+
+
+def test_dotted_config_filter_is_not_a_metric_token(page, tmp_path, ui_server_factory):
+    root = tmp_path / "dotted-config"
+    for name, lr_min in (("keep", 0.1), ("drop", 0.2)):
+        writer = RunWriter.create(
+            root, meta={"name": name, "project": "demo", "config": {"lr.min": lr_min}})
+        writer.finish("finished")
+        writer.close()
+    with ui_server_factory(root) as server:
+        home(page, server)
+        page.get_by_label("Filter runs").fill("lr.min=0.1")
+        expect(page.locator(".run-row")).to_have_count(1)
+        expect(page.get_by_role("link", name="keep", exact=True)).to_be_visible()
 
 
 @pytest.mark.parametrize("width", [375, 1400])
@@ -1267,7 +1289,7 @@ def mock_dashboard(page, runs):
 
     def respond(route):
         path = urlsplit(route.request.url).path
-        if path == "/api/server/session":
+        if path == "/api/account/session":
             route.fulfill(status=404, content_type="application/json",
                           body=json.dumps({"error": "not found"}))
             return

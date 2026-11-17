@@ -89,7 +89,7 @@ def test_round_trip_incremental_diff_and_replay(remote, snapshots, tmp_path):
     assert push(remote, child).complete
     assert lineage.diff(server.root, "child", "parent") == lineage.diff(child.root, "child", "parent")
     server.admin_key = server.keys.create("admin", "admin")[1]
-    status, _, body, _ = authed(server, "/api/runs/child/lineage")
+    status, _, body, _ = authed(server, "/api/w/default/runs/child/lineage")
     assert status == 200
     assert json.loads(body)["files"] == _lineage_changes(child.root, "child", RunReader(child.root, "child").meta())["files"]
     assert upload(client, child, incremental) == {"commit": info(child)["commit"], "created": False}
@@ -336,11 +336,11 @@ def test_featureless_backfill_and_idle(remote, snapshots, monkeypatch):
     server.lineage_enabled = True
     del client._sync_identity
     identity = sync._identity(client)
-    assert sync._selected_ids(parent.root, client.base_url, [], True, key=identity["key"], features=identity["features"]) == ["parent", "child"]
+    assert sync._selected_ids(parent.root, client.base_url, [], True, key=identity["key"], features=identity["features"], workspace=identity["workspace"]) == ["parent", "child"]
     assert push(remote, parent).complete
     assert state(remote, parent)["lineage"] == info(parent)["commit"]
     assert push(remote, parent).status == "up to date"
-    assert "parent" not in sync._selected_ids(parent.root, client.base_url, [], True, key=identity["key"], features=identity["features"])
+    assert "parent" not in sync._selected_ids(parent.root, client.base_url, [], True, key=identity["key"], features=identity["features"], workspace=identity["workspace"])
 
 
 def test_conflict_skip_completes_and_is_not_retried(remote, snapshots, monkeypatch):
@@ -876,7 +876,13 @@ def test_receive_concurrency_limit_after_body(remote, snapshots, tmp_path, monke
     server, client = remote
     parent, child = snapshots
     for writer in snapshots:
-        meta(client, writer)
+        # Same-project receives serialize on the lineage lock before receive().
+        # Exercise the global admission limit using two independent projects.
+        value = RunReader(writer.root, writer.run_id).meta()
+        value['project'] = writer.run_id
+        value['lineage'] = {**value['lineage'],
+                            'project_key': lineage.project_key(writer.run_id)}
+        client.put_file(writer.run_id, "meta.json", json.dumps(value).encode())
     data = [bundle(writer, tmp_path) for writer in snapshots]
     entered = [threading.Event(), threading.Event()]
     release = threading.Event()
@@ -900,8 +906,9 @@ def test_receive_concurrency_limit_after_body(remote, snapshots, tmp_path, monke
         finally:
             release.set()
         assert [future.result().status_code for future in pending] == [201, 201]
-    assert server.lineage_receives.acquire(blocking=False)
-    assert server.lineage_receives.acquire(blocking=False)
+    # The handler frees its slot after sending the response, so wait for it.
+    assert server.lineage_receives.acquire(timeout=2)
+    assert server.lineage_receives.acquire(timeout=2)
     server.lineage_receives.release()
     server.lineage_receives.release()
     assert_tmp_clean(server)
@@ -1028,4 +1035,4 @@ def test_idle_lineage_does_not_resolve_local_ref(remote, snapshots, monkeypatch)
     assert push(remote, parent).status == "up to date"
     identity = sync._identity(remote[1])
     assert "parent" not in sync._selected_ids(parent.root, remote[1].base_url, [], True,
-                                             key=identity["key"], features=identity["features"])
+                                             key=identity["key"], features=identity["features"], workspace=identity["workspace"])

@@ -16,9 +16,10 @@ import time
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
+from agenticml import sync as sync_mod
 from agenticml.server.app import make_server
 from agenticml.server.ingest import IngestHandler
-from agenticml.server.keys import KeyStore
+from agenticml.server.workspaces import default_workspace_id, store_root
 from agenticml.store import RunReader, RunWriter, list_runs
 from agenticml.store.layout import object_path
 from agenticml.store.reader import run_references
@@ -296,21 +297,30 @@ def sync_server(tmp_path):
 
         do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = _dispatch
 
-    def create_key(name):
-        return KeyStore(data / "server").create(name, scope="sync")[1]
-
     server = make_server(data, port=0)
     server.RequestHandlerClass = RecordingHandler
+
+    def create_key(name):
+        return server.keys.create(name, scope="sync")[1]
     thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
     thread.start()
     try:
         yield SimpleNamespace(host=f"http://127.0.0.1:{server.server_port}", key=create_key("testbed"),
-                              store=data / "store", create_key=create_key, calls=calls)
+                              store=store_root(data, default_workspace_id(server.db)),
+                              run_index=server.run_index, create_key=create_key, calls=calls)
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
         assert not thread.is_alive(), "ingest server did not stop"
+
+
+def host_state(path, host):
+    """The run's only sync cursor for ``host`` (per workspace since package 24.11)."""
+    hosts = json.loads(path.read_text())["hosts"]
+    names = sync_mod._host_keys(hosts, host)
+    assert len(names) == 1, names
+    return hosts[names[0]]
 
 
 def assert_synced_run(root, run_id, server, *, dead=False):
@@ -333,7 +343,7 @@ def assert_synced_run(root, run_id, server, *, dead=False):
     for hashes in run_references(root, run_id).values():
         for sha in hashes:
             assert object_path(server.store, sha).read_bytes() == object_path(root, sha).read_bytes()
-    return json.loads((server.store / "runs" / run_id / "remote.json").read_text())
+    return server.run_index.as_remote(run_id)
 
 
 def test_verified_login_and_online_whoami(cli, sync_server):
@@ -389,7 +399,7 @@ def test_full_incremental_sync_reset_and_all(cli, copied_store, sync_server):
     assert "failed" not in result.stdout
     assert assert_synced_run(copied_store, run_id, sync_server)["status"] == "finished"
     path = copied_store / "runs" / run_id / "sync.json"
-    state = json.loads(path.read_text())["hosts"][sync_server.host]
+    state = host_state(path, sync_server.host)
     assert state["protocol"] == 2 and state["complete"]
     remote_meta = RunReader(sync_server.store, run_id).meta()
     assert remote_meta["project"] == "testbed" and remote_meta["name"] == "explicit-baseline"
@@ -420,20 +430,19 @@ def test_full_incremental_sync_reset_and_all(cli, copied_store, sync_server):
     assert len(appends) == 1 and parse_qs(appends[0].query) == {"offset": [str(previous_size)]}
     cli("sync", "--all", *options, env=env)
     for run in list_runs(copied_store):
-        state = json.loads((copied_store / "runs" / run["run_id"] / "sync.json").read_text())[
-            "hosts"][sync_server.host]
+        state = host_state(copied_store / "runs" / run["run_id"] / "sync.json", sync_server.host)
         assert state["protocol"] == 2 and state["complete"]
         assert_synced_run(copied_store, run["run_id"], sync_server)
     before = len(sync_server.calls)
     cli("sync", run_id, "--reset", *options, env=env)
-    assert sync_server.host not in json.loads(path.read_text())["hosts"]
+    assert not sync_mod._host_keys(json.loads(path.read_text())["hosts"], sync_server.host)
     assert len(sync_server.calls) == before
     result = cli("sync", run_id, *options, env=env)
     assert "bytes=0" in result.stdout
     assert not any("truncate=1" in url or "/append/" in url
                    for _, url, _, _ in sync_server.calls[before:])
     assert assert_synced_run(copied_store, run_id, sync_server)["status"] == "finished"
-    state = json.loads(path.read_text())["hosts"][sync_server.host]
+    state = host_state(path, sync_server.host)
     assert state["protocol"] == 2 and state["complete"]
     assert cli("sync", "--all", "--reset", *options, env=env, check=False).returncode == 2
     assert cli("sync", "--reset", *options, env=env, check=False).returncode == 2
@@ -497,7 +506,7 @@ def test_dead_process_status_and_sync_finalization(cli, tmp_path, sync_server):
     assert list_runs(root)[0]["effective_status"] == "running"
     assert assert_synced_run(root, "abandoned", sync_server)["status"] == "running"
     state_path = root / "runs" / "abandoned" / "sync.json"
-    state = json.loads(state_path.read_text())["hosts"][sync_server.host]
+    state = host_state(state_path, sync_server.host)
     assert state["complete"] is False
     os.utime(lock_path, (0, 0))
     rows = json.loads(cli("ls", "--json", "--dir", root).stdout)
@@ -507,7 +516,7 @@ def test_dead_process_status_and_sync_finalization(cli, tmp_path, sync_server):
     assert assert_synced_run(root, "abandoned", sync_server, dead=True)["status"] == "crashed"
     assert RunReader(root, "abandoned").meta()["status"] == "running"
     assert list_runs(root)[0]["effective_status"] == "crashed"
-    assert json.loads(state_path.read_text())["hosts"][sync_server.host]["complete"] is True
+    assert host_state(state_path, sync_server.host)["complete"] is True
 
 
 @pytest.mark.parametrize("locked,expired_status", [(False, "crashed"), (None, "stale")])
@@ -553,13 +562,13 @@ def test_sync_watch_repeats_after_delay_and_completes(tmp_path, sync_server):
         assert first and "partial (running)" in first, first
         assert proc.poll() is None
         state_path = root / "runs" / writer.run_id / "sync.json"
-        state = json.loads(state_path.read_text())["hosts"][sync_server.host]
+        state = host_state(state_path, sync_server.host)
         assert state["complete"] is False
         writer.write_scalars([(1, {"loss": 1})])
         writer.finish("finished")
         assert proc.wait(timeout=10) == 0
         thread.join(timeout=2)
-        state = json.loads(state_path.read_text())["hosts"][sync_server.host]
+        state = host_state(state_path, sync_server.host)
         assert state["complete"] is True
         assert assert_synced_run(root, writer.run_id, sync_server)["status"] == "finished"
         assert RunReader(sync_server.store, writer.run_id).series("loss")["points"] == [[0, 2.0], [1, 1.0]]

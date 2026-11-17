@@ -1,6 +1,8 @@
 """Per-address login throttle and weak environment-key warning."""
+from concurrent.futures import ThreadPoolExecutor
 import http.client
 import json
+import os
 import secrets
 import socket
 import sys
@@ -71,9 +73,35 @@ def whoami(server, key=None, headers=None, source=None):
         conn.close()
 
 
-def test_throttle_free_failures_backoff_and_cap():
+@pytest.fixture(params=['memory', 'database'])
+def throttle_factory(request, tmp_path):
+    from agenticml.server.db import connect
+    from agenticml.server.webauth import DbBuckets
+    databases = []
+    def factory(**kwargs):
+        if request.param == 'database':
+            db = connect('sqlite:///' + str(tmp_path / f'throttle-{len(databases)}.db'))
+            databases.append(db)
+            kwargs['store'] = DbBuckets(db)
+        return LoginThrottle(**kwargs)
+    yield factory
+    for db in databases:
+        db.close()
+
+
+def bucket_entries(throttle):
+    from collections import OrderedDict
+    if not hasattr(throttle._store, 'repo'):
+        return throttle._entries
+    entries = OrderedDict((bucket, (failures,last,{}))
+                          for bucket, failures,last in throttle._store.repo.load())
+    entries.update(throttle._entries)
+    return entries
+
+
+def test_throttle_free_failures_backoff_and_cap(throttle_factory):
     now = [0.0]
-    throttle = LoginThrottle(clock=lambda: now[0])
+    throttle = throttle_factory(clock=lambda: now[0])
     for _ in range(LoginThrottle.FREE_FAILURES):
         retry, ticket = throttle.begin("a")
         assert retry == 0
@@ -92,9 +120,9 @@ def test_throttle_free_failures_backoff_and_cap():
     assert delays[6:] == [60, 60]
 
 
-def test_throttle_expires_success_clears_and_evicts_oldest():
+def test_throttle_expires_success_clears_and_evicts_oldest(throttle_factory):
     now = [0.0]
-    throttle = LoginThrottle(clock=lambda: now[0])
+    throttle = throttle_factory(clock=lambda: now[0])
     for _ in range(4):
         record_failed(throttle)
     retry, ticket = throttle.begin("a")
@@ -120,7 +148,7 @@ def test_throttle_expires_success_clears_and_evicts_oldest():
     assert retry == 1
 
     now[0] = 0.0
-    throttle = LoginThrottle(clock=lambda: now[0])
+    throttle = throttle_factory(clock=lambda: now[0])
     for index in range(LoginThrottle.MAX_ENTRIES):
         for _ in range(LoginThrottle.FREE_FAILURES):
             record_failed(throttle, f"addr-{index}")
@@ -147,9 +175,9 @@ def test_throttle_expires_success_clears_and_evicts_oldest():
     throttle.finish(ticket, "ignored")
 
 
-def test_throttle_buckets_mapped_ipv4_ipv6_slash64_and_scope():
+def test_throttle_buckets_mapped_ipv4_ipv6_slash64_and_scope(throttle_factory):
     now = [0.0]
-    throttle = LoginThrottle(clock=lambda: now[0])
+    throttle = throttle_factory(clock=lambda: now[0])
     for _ in range(LoginThrottle.FREE_FAILURES):
         record_failed(throttle, "::ffff:127.0.0.1")
     retry, ticket = throttle.begin("127.0.0.1")
@@ -159,7 +187,7 @@ def test_throttle_buckets_mapped_ipv4_ipv6_slash64_and_scope():
     assert ticket is None
     assert retry == 1
 
-    throttle = LoginThrottle(clock=lambda: now[0])
+    throttle = throttle_factory(clock=lambda: now[0])
     for _ in range(LoginThrottle.FREE_FAILURES):
         record_failed(throttle, "2001:db8:1:2::1")
     retry, ticket = throttle.begin("2001:db8:1:2::ffff")
@@ -170,7 +198,7 @@ def test_throttle_buckets_mapped_ipv4_ipv6_slash64_and_scope():
     assert ticket is not None
     throttle.finish(ticket, "ignored")
 
-    throttle = LoginThrottle(clock=lambda: now[0])
+    throttle = throttle_factory(clock=lambda: now[0])
     for _ in range(LoginThrottle.FREE_FAILURES):
         record_failed(throttle, "fe80::1%eth0")
     retry, ticket = throttle.begin("fe80::1")
@@ -181,9 +209,9 @@ def test_throttle_buckets_mapped_ipv4_ipv6_slash64_and_scope():
     assert retry == 1
 
 
-def test_ignored_with_other_attempt_pending():
+def test_ignored_with_other_attempt_pending(throttle_factory):
     now = [0.0]
-    throttle = LoginThrottle(clock=lambda: now[0])
+    throttle = throttle_factory(clock=lambda: now[0])
     for _ in range(4):
         record_failed(throttle)
     now[0] = 100.0
@@ -199,9 +227,9 @@ def test_ignored_with_other_attempt_pending():
     throttle.finish(guess, "failed")
 
 
-def test_success_with_other_attempt_pending():
+def test_success_with_other_attempt_pending(throttle_factory):
     now = [0.0]
-    throttle = LoginThrottle(clock=lambda: now[0])
+    throttle = throttle_factory(clock=lambda: now[0])
     for _ in range(4):
         record_failed(throttle)
     now[0] = 100.0
@@ -210,7 +238,7 @@ def test_success_with_other_attempt_pending():
     _, pending = throttle.begin("a")
     assert pending is not None
     throttle.finish(success, "success")
-    assert throttle._entries["a"][2]
+    assert bucket_entries(throttle)["a"][2]
     retry, extra = throttle.begin("a")
     assert extra is not None
     throttle.finish(extra, "ignored")
@@ -222,9 +250,9 @@ def test_success_with_other_attempt_pending():
     assert retry >= 1
 
 
-def test_holds_never_expire_or_evict():
+def test_holds_never_expire_or_evict(throttle_factory):
     now = [0.0]
-    throttle = LoginThrottle(clock=lambda: now[0])
+    throttle = throttle_factory(clock=lambda: now[0])
     for _ in range(4):
         record_failed(throttle, "held")
     _, held = throttle.begin("held")
@@ -238,7 +266,7 @@ def test_holds_never_expire_or_evict():
     assert ticket is None
 
     now[0] = 0.0
-    throttle = LoginThrottle(clock=lambda: now[0])
+    throttle = throttle_factory(clock=lambda: now[0])
     _, held = throttle.begin("held")
     for index in range(LoginThrottle.MAX_ENTRIES):
         for _ in range(LoginThrottle.FREE_FAILURES):
@@ -250,24 +278,127 @@ def test_holds_never_expire_or_evict():
     assert ticket is None
 
 
-def test_drop_at_zero_and_unknown_ticket():
-    throttle = LoginThrottle(clock=lambda: 0.0)
+@pytest.mark.skipif(not os.environ.get('AGENTICML_TEST_DATABASE_URL'),
+                    reason='AGENTICML_TEST_DATABASE_URL is not set')
+def test_throttle_two_dbbuckets_concurrent_failures_and_isolated_success(server_database):
+    from agenticml.server.db.postgres import PostgresDatabase
+    from agenticml.server.db.repos import ThrottleRepo
+    from agenticml.server.webauth import DbBuckets
+
+    db_a, db_b = PostgresDatabase(server_database), PostgresDatabase(server_database)
+    try:
+        a = LoginThrottle(clock=lambda: 0.0, store=DbBuckets(db_a))
+        b = LoginThrottle(clock=lambda: 0.0, store=DbBuckets(db_b))
+        shared = '198.51.100.10'
+        barrier = threading.Barrier(8)
+
+        def fail_together(throttle):
+            retry, ticket = throttle.begin(shared)
+            assert retry == 0 and ticket is not None
+            barrier.wait(timeout=10)
+            throttle.finish(ticket, 'failed')
+
+        with ThreadPoolExecutor(8) as pool:
+            futures = [pool.submit(fail_together, (a, b)[i % 2]) for i in range(8)]
+            for future in futures:
+                future.result(timeout=20)
+        rows = {bucket: failures for bucket, failures, _ in ThrottleRepo(db_a).load()}
+        assert rows[shared] == 8
+
+        kept, cleared = '198.51.100.11', '198.51.100.12'
+        for _ in range(3):
+            record_failed(a, cleared)
+            record_failed(b, kept)
+        retry, ticket = a.begin(cleared)
+        assert ticket is not None
+        a.finish(ticket, 'success')
+        rows = {bucket: failures for bucket, failures, _ in ThrottleRepo(db_a).load()}
+        assert rows[kept] == 3
+        assert cleared not in rows
+    finally:
+        db_a.close()
+        db_b.close()
+
+
+def test_throttle_commit_failure_keeps_unsaved_counts(throttle_factory, monkeypatch):
+    from contextlib import contextmanager
+
+    now = [0.0]
+    throttle = throttle_factory(clock=lambda: now[0])
+    if not hasattr(throttle._store, "repo"):
+        pytest.skip("database throttle store required")
+    for _ in range(LoginThrottle.FREE_FAILURES - 1):
+        record_failed(throttle, "a")
+    original = throttle._store.db.transaction
+    injected = []
+
+    @contextmanager
+    def wrapping(write=False):
+        with original(write=write) as tx:
+            yield tx
+            if write and not injected:
+                entry = throttle._store.entries.get("a")
+                if entry is not None and entry[0] >= LoginThrottle.FREE_FAILURES:
+                    injected.append(True)
+                    raise RuntimeError("injected commit failure")
+
+    monkeypatch.setattr(throttle._store.db, "transaction", wrapping)
+    retry, ticket = throttle.begin("a")
+    assert ticket is not None and retry == 0
+    with pytest.raises(RuntimeError, match="injected commit failure"):
+        throttle.finish(ticket, "failed")
+    assert injected
+    retry, ticket = throttle.begin("a")
+    assert ticket is None
+    assert retry >= 1
+
+
+def test_expired_throttle_rows_pruned_on_next_login(throttle_factory):
+    now = [0.0]
+    throttle = throttle_factory(clock=lambda: now[0])
+    repo = getattr(throttle._store, "repo", None)
+    if repo is None:
+        pytest.skip("database throttle store required")
+    for index in range(20):
+        record_failed(throttle, f"old-{index}")
+    assert len(repo.load()) == 20
+    now[0] = LoginThrottle.EXPIRE_AFTER + 1
+    record_failed(throttle, "new")
+    rows = {bucket: failures for bucket, failures, _ in repo.load()}
+    assert rows == {"new": 1}
+
+    now[0] = 0.0
+    throttle = throttle_factory(clock=lambda: now[0])
+    repo = throttle._store.repo
+    for index in range(20):
+        record_failed(throttle, f"old-{index}")
+    record_failed(throttle, "held")
+    _, held = throttle.begin("held")
+    assert held is not None
+    now[0] = LoginThrottle.EXPIRE_AFTER + 1
+    record_failed(throttle, "new")
+    rows = {bucket: failures for bucket, failures, _ in repo.load()}
+    assert rows == {"held": 1, "new": 1}
+
+
+def test_drop_at_zero_and_unknown_ticket(throttle_factory):
+    throttle = throttle_factory(clock=lambda: 0.0)
     throttle.finish(None, "failed")
     throttle.finish(("missing", 0), "failed")
-    assert throttle._entries == {}
+    assert bucket_entries(throttle) == {}
     _, ticket = throttle.begin("a")
     throttle.finish(("a", -1), "failed")
     throttle.finish(ticket, "ignored")
-    assert throttle._entries == {}
+    assert bucket_entries(throttle) == {}
     _, ticket = throttle.begin("a")
     throttle.finish(ticket, "success")
-    assert throttle._entries == {}
+    assert bucket_entries(throttle) == {}
     _, ticket = throttle.begin("a")
     throttle.finish(ticket, "failed")
-    assert list(throttle._entries) == ["a"]
+    assert list(bucket_entries(throttle)) == ["a"]
     _, ticket = throttle.begin("a")
     throttle.finish(ticket, "success")
-    assert throttle._entries == {}
+    assert bucket_entries(throttle) == {}
 
 
 def test_http_throttle_refuses_even_a_good_key_other_address_signs_in(server):

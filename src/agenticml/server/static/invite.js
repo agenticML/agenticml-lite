@@ -1,22 +1,22 @@
 let token = new URLSearchParams(location.search).get("token");
 history.replaceState(null, "", "/invite");
 
+const existing = document.querySelector("#invite-existing");
 const form = document.querySelector("#invite");
 const error = document.querySelector("#error");
-const passwordInput = document.querySelector("#password");
-const password2Input = document.querySelector("#password2");
-const submit = form.querySelector("button");
 
-form.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  error.hidden = true;
-  error.textContent = "";
-  if (passwordInput.value !== password2Input.value) {
-    error.textContent = "Passwords do not match";
-    error.hidden = false;
-    return;
+function showError(message) {
+  if (!error) return;
+  error.textContent = message;
+  error.hidden = false;
+}
+
+async function postInvite(body, submit) {
+  if (error) {
+    error.hidden = true;
+    error.textContent = "";
   }
-  submit.disabled = true;
+  if (submit) submit.disabled = true;
   try {
     const response = await fetch("/invite", {
       method: "POST",
@@ -25,9 +25,14 @@ form.addEventListener("submit", async (event) => {
         "Content-Type": "application/json",
         "X-AgenticML-Request": "1",
       },
-      body: JSON.stringify({ token, password: passwordInput.value }),
+      body: JSON.stringify(body),
     });
     const data = await response.json().catch(() => null);
+    if (existing && response.status === 409) {
+      token = null;
+      location.assign("/login");
+      return;
+    }
     if (!response.ok) throw new Error(
       (typeof data?.error === "string" && data.error) || `Invite failed (${response.status})`);
     if (data === null || typeof data !== "object" || Array.isArray(data) || data.ok !== true)
@@ -35,14 +40,32 @@ form.addEventListener("submit", async (event) => {
     token = null;
     location.assign("/");
   } catch (failure) {
-    error.textContent = failure.message || "Invite failed";
-    error.hidden = false;
-    submit.disabled = false;
+    showError(failure.message || "Invite failed");
+    if (submit) submit.disabled = false;
   }
-});
+}
 
-window.addEventListener("pagehide", () => {
-  token = null;
-  passwordInput.value = "";
-  password2Input.value = "";
-});
+if (existing) {
+  const submit = existing.querySelector("button");
+  existing.addEventListener("submit", (event) => {
+    event.preventDefault();
+    postInvite({ token }, submit);
+  });
+} else if (form) {
+  const passwordInput = document.querySelector("#password");
+  const password2Input = document.querySelector("#password2");
+  const submit = form.querySelector("button");
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (passwordInput.value !== password2Input.value) {
+      showError("Passwords do not match");
+      return;
+    }
+    postInvite({ token, password: passwordInput.value }, submit);
+  });
+  window.addEventListener("pagehide", () => {
+    token = null;
+    passwordInput.value = "";
+    password2Input.value = "";
+  });
+}

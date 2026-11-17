@@ -1,4 +1,4 @@
-"""Dashboard /api/server/users routes: authz, lifecycle, and audit lines."""
+"""Dashboard /api/w/default/members routes: authz, lifecycle, and audit lines."""
 import json
 
 import pytest
@@ -7,10 +7,11 @@ from agenticml.server import userspage
 from agenticml.server.keys import KeyStoreUnavailable
 from agenticml.store import RunWriter
 from test_server_keys_users import principal_session
+from server_db_helpers import transfer_default_owner
 from test_server_keys_web import call, csrf, login, running, server  # noqa: F401 (fixture)
 
 
-def api(server, path="/api/server/users", method="GET", payload=None, cookie=None, extra=None):
+def api(server, path="/api/w/default/members", method="GET", payload=None, cookie=None, extra=None):
     headers = csrf(server) if method in ("POST", "PATCH", "DELETE") else {}
     headers["Cookie"] = server.cookie if cookie is None else cookie
     headers.update(extra or {})
@@ -20,19 +21,17 @@ def api(server, path="/api/server/users", method="GET", payload=None, cookie=Non
 
 
 def audit_events(server):
-    path = server.data_dir / "server" / "audit.jsonl"
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in path.read_text().splitlines() if line]
+    from server_db_helpers import audit_rows
+    return audit_rows(server.data_dir / 'server')
 
 
 @pytest.mark.parametrize("role", ["member", "viewer"])
 @pytest.mark.parametrize("method,path,payload", [
-    ("GET", "/api/server/users", None),
-    ("POST", "/api/server/users", {"name": "x", "role": "member"}),
-    ("PATCH", "/api/server/users/admin", {"role": "member"}),
-    ("DELETE", "/api/server/users/admin", None),
-    ("POST", "/api/server/users/admin/invite", {}),
+    ("GET", "/api/w/default/members", None),
+    ("POST", "/api/w/default/members", {"name": "x", "role": "member"}),
+    ("PATCH", "/api/w/default/members/admin", {"role": "member"}),
+    ("DELETE", "/api/w/default/members/admin", None),
+    ("POST", "/api/w/default/members/admin/invite", {}),
 ])
 def test_member_and_viewer_forbidden(server, role, method, path, payload):
     cookie = principal_session(server, role + "-user", role)
@@ -46,12 +45,12 @@ def test_list_me_keys_and_runs(server):
     writer = RunWriter.create(server.root, run_id="bob-run", meta={"project": "p", "name": "n"})
     writer.finish("finished")
     writer.close()
-    (server.root / "runs" / "bob-run" / "remote.json").write_text(
-        json.dumps({"owner": "bob"}))
+    from server_db_helpers import adopt_run
+    adopt_run(server.root, server.root / "runs" / "bob-run", server.run_index, owner="bob")
     status, _, body = api(server)
     assert status == 200 and body["me"] == "admin"
     by_name = {row["name"]: row for row in body["users"]}
-    assert by_name["admin"]["role"] == "admin"
+    assert by_name["admin"]["role"] == "owner"
     assert by_name["admin"]["keys"] >= 1
     assert by_name["bob"]["role"] == "member" and by_name["bob"]["keys"] == 1
     assert by_name["bob"]["runs"] == 1
@@ -60,16 +59,10 @@ def test_list_me_keys_and_runs(server):
 
 
 def test_run_count_scan_cap(server, monkeypatch):
-    monkeypatch.setattr(userspage, "RUN_SCAN_MAX", 2)
-    runs = server.root / "runs"
-    runs.mkdir(exist_ok=True)
-    for name in ("a", "b"):
-        (runs / name).mkdir()
-        (runs / name / "remote.json").write_text(json.dumps({"owner": "admin"}))
-    assert api(server)[2]["users"][0]["runs"] == 2
-    (runs / "c").mkdir()
-    (runs / "c" / "remote.json").write_text(json.dumps({"owner": "admin"}))
-    assert api(server)[2]["users"][0]["runs"] is None
+    from server_db_helpers import insert_run
+    for name in ("a", "b", "c"):
+        insert_run(server.run_index, name, owner_user="admin")
+    assert api(server)[2]["users"][0]["runs"] == 3
 
 
 def test_add_user_invite_and_audit(server):
@@ -101,45 +94,50 @@ def test_add_with_identity_and_conflicts(server):
     assert status == 409 and body == {"error": "identity already in use"}
     status, _, body = api(server, method="POST", payload={"name": "env", "role": "member"})
     assert status == 400 and body == {"error": "invalid or reserved user name"}
-    status, _, body = api(server, "/api/server/users/..", "PATCH", {"role": "member"})
+    status, _, body = api(server, "/api/w/default/members/..", "PATCH", {"role": "member"})
     assert status == 400 and body == {"error": "invalid or reserved user name"}
     status, _, body = api(server, method="POST", payload={"name": "dave", "role": "owner"})
     assert status == 400 and body == {"error": "invalid role"}
 
 
-def test_add_refuses_name_that_owns_runs(server):
+def test_add_restores_membership_without_reclaiming_account(server):
     server.users.add("ghost", role="member")
     writer = RunWriter.create(server.root, run_id="old", meta={"project": "p", "name": "n"})
     writer.finish("finished")
     writer.close()
-    (server.root / "runs" / "old" / "remote.json").write_text(json.dumps({"owner": "ghost"}))
+    from server_db_helpers import adopt_run
+    adopt_run(server.root, server.root / "runs" / "old", server.run_index, owner="ghost")
+    account_id = server.users.get("ghost").id
     server.users.remove("ghost")
     status, _, body = api(server, method="POST", payload={"name": "ghost", "role": "member"})
-    assert status == 400 and "reclaim-runs" in body["error"]
+    assert status == 201 and body["invite_url"] is None
+    assert server.users.get("ghost").id == account_id
+    assert server.run_index.get("old")["owner_user"] == "ghost"
 
 
 def test_patch_role_identity_last_admin_and_unknown(server):
     api(server, method="POST", payload={"name": "bob", "role": "member"})
-    status, _, body = api(server, "/api/server/users/bob", "PATCH", {"role": "viewer"})
+    status, _, body = api(server, "/api/w/default/members/bob", "PATCH", {"role": "viewer"})
     assert status == 200 and body["user"]["role"] == "viewer" and body["signed_out"] is False
     assert audit_events(server)[-1]["action"] == "user.role"
     assert audit_events(server)[-1]["detail"] == {"from": "member", "to": "viewer"}
-    status, _, body = api(server, "/api/server/users/bob", "PATCH", {"identity": "bob@x.com"})
+    status, _, body = api(server, "/api/w/default/members/bob", "PATCH", {"identity": "bob@x.com"})
     assert status == 200 and body["user"]["identity"] == "bob@x.com"
     assert audit_events(server)[-1]["action"] == "user.identity"
-    status, _, body = api(server, "/api/server/users/bob", "PATCH", {"identity": None})
+    status, _, body = api(server, "/api/w/default/members/bob", "PATCH", {"identity": None})
     assert status == 200 and body["user"]["identity"] is None
-    status, _, body = api(server, "/api/server/users/admin", "PATCH", {"role": "member"})
+    status, _, body = api(server, "/api/w/default/members/admin", "PATCH", {"role": "member"})
     assert status == 409 and body == {"error": "last admin"}
-    status, _, body = api(server, "/api/server/users/missing", "PATCH", {"role": "member"})
+    status, _, body = api(server, "/api/w/default/members/missing", "PATCH", {"role": "member"})
     assert status == 404 and body == {"error": "not found"}
-    status, _, body = api(server, "/api/server/users/bob", "PATCH", {})
+    status, _, body = api(server, "/api/w/default/members/bob", "PATCH", {})
     assert status == 400 and body == {"error": "invalid request"}
 
 
 def test_patch_own_role_signs_out_when_another_admin_remains(server):
     api(server, method="POST", payload={"name": "bob", "role": "admin"})
-    status, headers, body = api(server, "/api/server/users/admin", "PATCH", {"role": "member"})
+    transfer_default_owner(server.users, "bob")
+    status, headers, body = api(server, "/api/w/default/members/admin", "PATCH", {"role": "member"})
     assert status == 200 and body["signed_out"] is True and body["user"]["role"] == "member"
     assert "Set-Cookie" in headers and "Max-Age=0" in headers["Set-Cookie"]
     assert api(server)[0] == 401
@@ -147,13 +145,13 @@ def test_patch_own_role_signs_out_when_another_admin_remains(server):
 
 def test_patch_role_errors_do_not_change_identity(server):
     api(server, method="POST", payload={"name": "bob", "role": "member"})
-    status, _, body = api(server, "/api/server/users/admin", "PATCH", {
+    status, _, body = api(server, "/api/w/default/members/admin", "PATCH", {
         "role": "member", "identity": "admin@x.com",
     })
     assert status == 409 and body == {"error": "last admin"}
     admin = server.users.get("admin")
-    assert admin.role == "admin" and admin.identity is None
-    status, _, body = api(server, "/api/server/users/bob", "PATCH", {
+    assert admin.role == "owner" and admin.identity is None
+    status, _, body = api(server, "/api/w/default/members/bob", "PATCH", {
         "role": "owner", "identity": "bob@x.com",
     })
     assert status == 400 and body == {"error": "invalid role"}
@@ -164,12 +162,12 @@ def test_patch_role_errors_do_not_change_identity(server):
 def test_patch_identity_error_does_not_change_role(server):
     api(server, method="POST", payload={"name": "bob", "role": "member"})
     api(server, method="POST", payload={"name": "cara", "role": "member", "identity": "taken@x.com"})
-    status, _, body = api(server, "/api/server/users/bob", "PATCH", {
+    status, _, body = api(server, "/api/w/default/members/bob", "PATCH", {
         "role": "admin", "identity": "taken@x.com",
     })
     assert status == 409 and body == {"error": "identity already in use"}
     assert server.users.get("bob").role == "member"
-    status, _, body = api(server, "/api/server/users/bob", "PATCH", {
+    status, _, body = api(server, "/api/w/default/members/bob", "PATCH", {
         "role": "admin", "identity": "x" * 300,
     })
     assert status == 400 and body == {"error": "invalid identity"}
@@ -178,7 +176,8 @@ def test_patch_identity_error_does_not_change_role(server):
 
 def test_patch_own_role_and_identity_signs_out(server):
     api(server, method="POST", payload={"name": "bob", "role": "admin"})
-    status, headers, body = api(server, "/api/server/users/admin", "PATCH", {
+    transfer_default_owner(server.users, "bob")
+    status, headers, body = api(server, "/api/w/default/members/admin", "PATCH", {
         "role": "member", "identity": "admin@x.com",
     })
     assert status == 200 and body["signed_out"] is True
@@ -190,11 +189,11 @@ def test_patch_own_role_and_identity_signs_out(server):
 def test_delete_self_last_admin_and_keys(server):
     api(server, method="POST", payload={"name": "bob", "role": "member"})
     server.keys.create("laptop", user="bob")
-    status, _, body = api(server, "/api/server/users/admin", "DELETE")
+    status, _, body = api(server, "/api/w/default/members/admin", "DELETE")
     assert status == 409 and body == {"error": "you cannot remove yourself"}
-    status, _, body = api(server, "/api/server/users/missing", "DELETE")
+    status, _, body = api(server, "/api/w/default/members/missing", "DELETE")
     assert status == 404 and body == {"error": "not found"}
-    status, _, body = api(server, "/api/server/users/bob", "DELETE")
+    status, _, body = api(server, "/api/w/default/members/bob", "DELETE")
     assert status == 200 and body == {"removed": "bob", "keys_revoked": 1}
     assert server.users.get("bob") is None
     assert server.keys.for_user("bob") == []
@@ -209,7 +208,7 @@ def test_delete_last_admin_as_env(tmp_path, monkeypatch):
     with running(tmp_path / "data", env_key="e" * 32) as httpd:
         httpd.cookie = login(httpd, "e" * 32)
         httpd.users.add("alice", role="admin")
-        status, _, body = api(httpd, "/api/server/users/alice", "DELETE")
+        status, _, body = api(httpd, "/api/w/default/members/alice", "DELETE")
         assert status == 409 and body == {"error": "last admin"}
 
 
@@ -217,17 +216,17 @@ def test_reinvite(server):
     api(server, method="POST", payload={"name": "bob", "role": "member"})
     server.users.set_password("bob", "password1234")
     assert server.users.get("bob").password is not None
-    status, _, body = api(server, "/api/server/users/bob/invite", "POST", {})
+    status, _, body = api(server, "/api/w/default/members/bob/invite", "POST", {})
     assert status == 200 and "/invite?token=" in body["invite_url"] and body["expires_at"]
     bob = server.users.get("bob")
     assert bob.password is None and bob.invite is not None
     assert audit_events(server)[-1]["action"] == "user.invite"
-    status, _, body = api(server, "/api/server/users/missing/invite", "POST", {})
+    status, _, body = api(server, "/api/w/default/members/missing/invite", "POST", {})
     assert status == 404 and body == {"error": "not found"}
 
 
 def test_reinvite_self_refused(server):
-    status, _, body = api(server, "/api/server/users/admin/invite", "POST", {})
+    status, _, body = api(server, "/api/w/default/members/admin/invite", "POST", {})
     assert status == 409 and body == {
         "error": "you cannot re-invite yourself; change your password from the Account menu"}
     admin = server.users.get("admin")
@@ -235,12 +234,12 @@ def test_reinvite_self_refused(server):
 
 
 def test_csrf_and_methods(server):
-    status, _, body = call(server, "/api/server/users", "POST", b"{}", {"Cookie": server.cookie})
+    status, _, body = call(server, "/api/w/default/members", "POST", b"{}", {"Cookie": server.cookie})
     assert status == 403 and json.loads(body)["error"] == "cross-site request refused"
     status, _, body = api(server, method="PUT", payload={"name": "x"})
     assert status == 405 and body == {"error": "method not allowed"}
-    assert api(server, "/api/server/users/admin")[0] == 405
-    assert api(server, "/api/server/users/admin/invite")[0] == 405
+    assert api(server, "/api/w/default/members/admin")[0] == 405
+    assert api(server, "/api/w/default/members/admin/invite")[0] == 405
 
 
 def test_add_rolls_back_if_invite_fails(server, monkeypatch):
@@ -283,7 +282,7 @@ def test_reinvite_get_failure_is_503_and_audited(server, monkeypatch, exc):
         return original(name)
 
     monkeypatch.setattr(server.users, "get", boom)
-    status, _, body = api(server, "/api/server/users/bob/invite", "POST", {})
+    status, _, body = api(server, "/api/w/default/members/bob/invite", "POST", {})
     assert status == 503 and body == {"error": "key store unavailable"}
     bob = original("bob")
     assert bob.invite is not None and bob.password is None
@@ -304,7 +303,7 @@ def test_reinvite_create_failure_is_503_without_audit(server, monkeypatch, exc):
         raise exc("private failure")
 
     monkeypatch.setattr(server.users, "create_invite", boom)
-    status, _, body = api(server, "/api/server/users/bob/invite", "POST", {})
+    status, _, body = api(server, "/api/w/default/members/bob/invite", "POST", {})
     assert status == 503 and body == {"error": "key store unavailable"}
     assert server.users.get("bob") == before
     assert audit_events(server) == events
@@ -323,7 +322,7 @@ def test_patch_get_failure_is_503_before_mutation(server, monkeypatch, exc):
         return original(name)
 
     monkeypatch.setattr(server.users, "get", boom)
-    status, _, body = api(server, "/api/server/users/bob", "PATCH", {
+    status, _, body = api(server, "/api/w/default/members/bob", "PATCH", {
         "role": "viewer", "identity": "bob@example.com",
     })
     assert status == 503 and body == {"error": "key store unavailable"}
@@ -332,16 +331,17 @@ def test_patch_get_failure_is_503_before_mutation(server, monkeypatch, exc):
 
 
 @pytest.mark.parametrize("store,attr,method,path,payload", [
-    ("users", "list", "GET", "/api/server/users", None),
-    ("keys", "list", "GET", "/api/server/users", None),
-    ("keys", "list", "DELETE", "/api/server/users/bob", None),
-    ("users", "get", "PATCH", "/api/server/users/bob", {"role": "viewer"}),
-    ("users", "get", "DELETE", "/api/server/users/bob", None),
-    ("users", "get", "POST", "/api/server/users/bob/invite", {}),
-    ("users", "list", "PATCH", "/api/server/users/admin", {"role": "member"}),
+    ("users", "list", "GET", "/api/w/default/members", None),
+    ("keys", "list", "GET", "/api/w/default/members", None),
+    ("keys", "list", "DELETE", "/api/w/default/members/bob", None),
+    ("users", "get", "PATCH", "/api/w/default/members/bob", {"role": "viewer"}),
+    ("users", "get", "DELETE", "/api/w/default/members/bob", None),
+    ("users", "get", "POST", "/api/w/default/members/bob/invite", {}),
+    ("users", "list", "PATCH", "/api/w/default/members/admin", {"role": "member"}),
 ])
 def test_list_get_unavailable_is_503(server, monkeypatch, store, attr, method, path, payload):
-    server.users.add("bob", role="member")
+    server.users.add("bob", role="admin")
+    transfer_default_owner(server.users, "bob")
 
     def boom(*args, **kwargs):
         raise KeyStoreUnavailable("private failure")
@@ -352,13 +352,14 @@ def test_list_get_unavailable_is_503(server, monkeypatch, store, attr, method, p
 
 
 @pytest.mark.parametrize("store,attr,method,path,payload", [
-    ("users", "list", "GET", "/api/server/users", None),
-    ("keys", "list", "GET", "/api/server/users", None),
-    ("keys", "list", "DELETE", "/api/server/users/bob", None),
-    ("users", "list", "PATCH", "/api/server/users/admin", {"role": "member"}),
+    ("users", "list", "GET", "/api/w/default/members", None),
+    ("keys", "list", "GET", "/api/w/default/members", None),
+    ("keys", "list", "DELETE", "/api/w/default/members/bob", None),
+    ("users", "list", "PATCH", "/api/w/default/members/admin", {"role": "member"}),
 ])
 def test_list_oserror_is_503(server, monkeypatch, store, attr, method, path, payload):
-    server.users.add("bob", role="member")
+    server.users.add("bob", role="admin")
+    transfer_default_owner(server.users, "bob")
     cookie = server.cookie
     if store == "keys":
         # Key sessions call keys.list() during auth; a password session does not.
@@ -380,13 +381,13 @@ def test_list_oserror_is_503(server, monkeypatch, store, attr, method, path, pay
 
 def test_audit_route_admin_and_forbidden(server):
     api(server, method="POST", payload={"name": "bob", "role": "member"})
-    status, headers, body = api(server, "/api/server/audit")
+    status, headers, body = api(server, "/api/w/default/audit")
     assert status == 200 and headers["Cache-Control"] == "no-store"
     assert isinstance(body["events"], list) and body["events"][0]["action"] in (
         "user.add", "user.invite")
     cookie = principal_session(server, "reader", "viewer")
-    status, _, body = api(server, "/api/server/audit", cookie=cookie)
+    status, _, body = api(server, "/api/w/default/audit", cookie=cookie)
     assert status == 403 and body == {"error": "forbidden"}
     cookie = principal_session(server, "mem", "member")
-    status, _, body = api(server, "/api/server/audit", cookie=cookie)
+    status, _, body = api(server, "/api/w/default/audit", cookie=cookie)
     assert status == 403 and body == {"error": "forbidden"}

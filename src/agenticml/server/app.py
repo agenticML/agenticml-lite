@@ -1,6 +1,7 @@
-"""Single-writer server lifecycle and data-directory safety."""
+"""Server lifecycle and data-directory safety."""
 from __future__ import annotations
 
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import errno
 import logging
@@ -17,9 +18,14 @@ import weakref
 
 from agenticml.store import layout
 from agenticml.ui.server import DashboardServer, _browser_host, _loopback_bind
-from .audit import AuditLog
+from .objectstore import open_backend, ObjectStoreUnavailable
 from .keys import KeyStore, env_key_looks_weak, validate_env_key
-from .users import UserStore, migrate
+from .users import UserStore
+from .db import DatabaseBusy, for_server_dir, resolve_url, _is_postgres
+from .db.repos import NoteRepo, RunRepo
+from .db.workspaces import WorkspaceRepo, require_workspace_id
+from .workspaces import default_workspace_id, prepare_store, store_root
+from .runs import reconcile, store_paths_safe
 from .audit import AuditLog
 from .webauth import IDENTITY_PRESETS, WebAuth
 
@@ -68,12 +74,12 @@ def prepare_data_dir(data):
     """Refuse redirected state directories and cross-device upload renames."""
     data = Path(data)
     data.mkdir(mode=0o700, parents=True, exist_ok=True)
-    for path in (data / "store", data / "server", data / "server" / "tmp"):
+    for path in (data / "server", data / "server" / "tmp", data / "workspaces"):
         _directory(path)
     if (data / "server").stat().st_mode & 0o077:
         logger.warning("server directory is group- or world-accessible: %s", data / "server")
-    if (data / "store").stat().st_dev != (data / "server" / "tmp").stat().st_dev:
-        raise ValueError("server/tmp and store must be on the same filesystem")
+    if (data / "workspaces").stat().st_dev != (data / "server" / "tmp").stat().st_dev:
+        raise ValueError("server/tmp and workspaces must be on the same filesystem")
 
 
 def acquire_server_lock(server_dir):
@@ -100,7 +106,7 @@ def acquire_server_lock(server_dir):
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as exc:
         handle.close()
-        if exc.errno in (errno.EAGAIN, errno.EACCES):
+        if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
             raise ValueError(f"another agenticml server is using {Path(server_dir).parent}") from exc
         if exc.errno in (errno.ENOLCK, errno.ENOSYS, errno.EOPNOTSUPP):
             raise ValueError("server filesystem does not support flock; refusing to run unlocked") from exc
@@ -108,15 +114,36 @@ def acquire_server_lock(server_dir):
     return handle
 
 
-def _clean_tmp(tmp_dir):
+def tmp_retention_seconds():
+    """Age after which Postgres mode may delete another process's tmp file.
+
+    A legal slow body can last BODY_DEADLINE + OBJECT_BODY_LIMIT /
+    BODY_BYTES_PER_SECOND (~2.3 h). Plus a 1 h margin. Host clocks and
+    filesystem mtime are assumed to agree within that margin; larger skew
+    can delete an in-flight upload or retain a dead file longer.
+    """
+    return BODY_DEADLINE + OBJECT_BODY_LIMIT / BODY_BYTES_PER_SECOND + 3600
+
+
+def _clean_tmp(tmp_dir, *, postgres=False):
+    cutoff = time.time() - tmp_retention_seconds()
     for entry in tmp_dir.iterdir():
-        if stat.S_ISDIR(entry.lstat().st_mode):
+        try:
+            info = entry.lstat()
+        except FileNotFoundError:
+            continue
+        if postgres and info.st_mtime >= cutoff:
+            continue
+        if stat.S_ISDIR(info.st_mode):
             if entry.name.startswith("lineage-"):
-                shutil.rmtree(entry)
+                try:
+                    shutil.rmtree(entry)
+                except FileNotFoundError:
+                    pass  # Another starting process already cleaned it.
             else:
                 logger.warning("ignoring subdirectory in server/tmp: %s", entry)
         else:
-            os.unlink(entry)
+            entry.unlink(missing_ok=True)
 
 
 def _validate_public_url(value):
@@ -155,23 +182,120 @@ def _read_umask():
     return mask
 
 
+class _ProcessLock:
+    """Thread lock followed by a database session lock, released in reverse."""
+
+    def __init__(self, lock, db, key):
+        self._lock, self._db, self._key = lock, db, key
+        self._session = None
+
+    def locked(self):
+        return self._lock.locked()
+
+    def acquire(self, blocking=True, timeout=-1):
+        if not blocking:
+            wait = 0
+        elif timeout is None or timeout < 0:
+            wait = None
+        else:
+            wait = timeout
+        deadline = None if wait is None else time.monotonic() + wait
+        if wait == 0:
+            got = self._lock.acquire(False)
+        elif wait is None:
+            got = self._lock.acquire()
+        else:
+            got = self._lock.acquire(True, wait)
+        if not got:
+            return False
+        try:
+            if not blocking:
+                session = self._db.session_lock(self._key, timeout=0, try_lock=True)
+            elif deadline is None:
+                session = self._db.session_lock(self._key, timeout=-1)
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise DatabaseBusy('database is locked')
+                session = self._db.session_lock(self._key, timeout=remaining)
+            session.__enter__()
+        except DatabaseBusy:
+            self._lock.release()
+            if blocking and wait is None:
+                raise
+            return False
+        except BaseException:
+            self._lock.release()
+            raise
+        self._session = session
+        return True
+
+    def release(self):
+        session = self._session
+        self._session = None
+        try:
+            if session is not None:
+                session.__exit__(None, None, None)
+        finally:
+            self._lock.release()
+
+    def __enter__(self):
+        self._lock.acquire()
+        try:
+            self._session = self._db.session_lock(self._key)
+            self._session.__enter__()
+        except BaseException:
+            self._lock.release()
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        session = self._session
+        self._session = None
+        try:
+            if session is not None:
+                return session.__exit__(*exc)
+        finally:
+            self._lock.release()
+
+
 class IngestServer(DashboardServer):
     # The writer lock must outlive every handler, including during shutdown.
     daemon_threads = False
 
     def __init__(self, data, host, port, public_url=None, env_key=None,
-                 trusted_proxies=(), identity_header=None):
+                 trusted_proxies=(), identity_header=None, db=None,
+                 firebase=None, cert_source=None, plans=None, open_signup=False,
+                 min_client_version=None, admin_emails=frozenset(), legal_base_url=None):
+        from .clientwindow import parse_min_client
+        from .firebase import require_open_signup
         from .ingest import IngestHandler
 
+        require_open_signup(open_signup, firebase, plans)
+        self.min_client = parse_min_client(min_client_version)
         self.data_dir = Path(data)
         self.tmp_dir = self.data_dir / "server" / "tmp"
-        self.keys = KeyStore(self.data_dir / "server", env_key)
-        self.users = UserStore(self.data_dir / "server")
-        self.audit = AuditLog(self.data_dir / "server")
+        db = db if db is not None else for_server_dir(self.data_dir / "server")
+        self.db = db
+        self.plans = plans
+        self.workspaces = WorkspaceRepo(db)
+        default = self.workspaces.get('default')
+        self.default_workspace_id = default_workspace_id(db) if default else None
+        self.run_index = RunRepo(db, self.default_workspace_id) if default else None
+        self.note_index = NoteRepo(db, self.default_workspace_id) if default else None
+        self.keys = KeyStore(self.data_dir / "server", env_key, db=db,
+                             workspace_id=self.default_workspace_id)
+        self.users = UserStore(self.data_dir / "server", db=db, workspace_id=self.default_workspace_id) if default else None
+        self.audit = AuditLog(self.data_dir / "server", db=db, workspace_id=self.default_workspace_id)
+        self._ws_stores = {}
+        self._ws_stores_lock = threading.Lock()
         self.public_url = public_url
         self.web = WebAuth(
             self.keys, public_url, users=self.users,
-            trusted_proxies=trusted_proxies, identity_header=identity_header)
+            trusted_proxies=trusted_proxies, identity_header=identity_header,
+            firebase=firebase, cert_source=cert_source, plans=plans,
+            open_signup=open_signup, admin_emails=admin_emails,
+            legal_base_url=legal_base_url)
         self.store_file_mode = 0o666 & ~_read_umask()
         self.limits = Limits()
         self.lineage_enabled = shutil.which("git") is not None
@@ -180,12 +304,16 @@ class IngestServer(DashboardServer):
             logger.warning("git is not installed; lineage code diffs are disabled")
         self.run_locks = weakref.WeakValueDictionary()
         self.run_locks_lock = threading.Lock()
+        self.quota_locks = weakref.WeakValueDictionary()
+        self.quota_locks_lock = threading.Lock()
         self.object_locks = weakref.WeakValueDictionary()
         self.object_locks_lock = threading.Lock()
+        self.lineage_locks = weakref.WeakValueDictionary()
+        self.lineage_locks_lock = threading.Lock()
         self._server_lock = None
         self._closing_workers = set()
         super().__init__(
-            self.data_dir / "store", host, port, read_only=False,
+            store_root(self.data_dir, default['id']) if default else self.data_dir / 'workspaces' / 'unavailable', host, port, read_only=False,
             handler_class=IngestHandler, auth=self.web, public_url=public_url,
         )
         base = public_url or f"http://{_browser_host(self.server_address[0])}:{self.server_address[1]}"
@@ -195,22 +323,126 @@ class IngestServer(DashboardServer):
             ranges = ", ".join(str(network) for network in self.web.trusted_proxies) or "none"
             logger.info("identity header %s; trusted proxies %s", header, ranges)
 
-    def run_lock(self, run_id):
+    def _after_append_write(self, run_id, path):
+        """Test hook: runs after an append is fsynced and before the size commit."""
+        if (os.environ.get("AGENTICML_TEST_HOOKS") == "1"
+                and os.environ.get("PYTEST_CURRENT_TEST")):
+            delay = int(os.environ.get("AGENTICML_TEST_APPEND_DELAY_MS", "0"))
+            if delay > 0:
+                print(f"AGENTICML_TEST_APPEND_WRITE {run_id} {path}\n", end="", flush=True)
+                time.sleep(delay / 1000)
+
+    def _after_atomic_write(self, run_id, path):
+        """Test hook: after rename+fsync, still inside the recording transaction."""
+
+    def _after_meta_claim(self, run_id):
+        """Test hook: runs after claiming ownership and before writing meta.json."""
+
+    def drop_workspace_stores(self, workspace_id):
+        """Drop cached stores after a workspace is deleted or by_id returns None."""
+        workspace_id = require_workspace_id(workspace_id)
+        with self._ws_stores_lock:
+            self._ws_stores.pop(workspace_id, None)
+
+    def workspace_stores(self, workspace_id, status):
+        """Cached UserStore/KeyStore/AuditLog for a workspace; rebuilt on status change."""
+        from .access import WorkspaceStores
+
+        workspace_id = require_workspace_id(workspace_id)
+        with self._ws_stores_lock:
+            cached = self._ws_stores.get(workspace_id)
+            if cached is None or cached[0] != status:
+                cached = (status, WorkspaceStores(self, workspace_id))
+                self._ws_stores[workspace_id] = cached
+            return cached[1]
+
+    @contextmanager
+    def run_reader(self, run_id, *, workspace_id):
+        from agenticml.store import reader as store_reader
+
+        wid = require_workspace_id(workspace_id)
+        key = (wid, run_id)
+        index = RunRepo(self.db, wid)
+        with self.reader_lock:
+            if key not in self.readers:
+                self.readers[key] = store_reader.RunReader(
+                    store_root(self.data_dir, wid), run_id, remote=index.normalized_remote,
+                    committed_size=index.committed_size if self.db.dialect.name == "postgres" else None)
+            self.readers.move_to_end(key)
+            while len(self.readers) > 64:
+                self.readers.popitem(last=False)
+            current = self.readers[key]
+        yield current
+
+    def cached_reader(self, run_id, *, workspace_id):
+        with self.reader_lock:
+            return self.readers.get((require_workspace_id(workspace_id), run_id))
+
+    def code_pair_diff(self, base_sha, target_sha, budget, *, workspace_id):
+        from agenticml.ui import server as ui
+
+        wid = require_workspace_id(workspace_id)
+        key = (wid, base_sha, target_sha, ui._CODE_DIFF_MAX_BYTES, ui._CODE_DIFF_FILE_LINES,
+               ui._CODE_DIFF_MAX_LINES, ui._CODE_DIFF_LINE_CHARS, ui._CODE_DIFF_AUTOJUNK_THRESHOLD)
+        with self.code_diff_lock:
+            if key in self.code_diffs:
+                self.code_diffs.move_to_end(key)
+                return self.code_diffs[key]
+        opener = lambda sha: self.objects.open(wid, sha)
+        result = ui._code_pair_diff(opener, base_sha, target_sha,
+                                    ui._CODE_DIFF_MAX_BYTES, ui._CODE_DIFF_FILE_LINES, budget)
+        if 'error' not in result and not budget.exhausted():
+            with self.code_diff_lock:
+                self.code_diffs[key] = result
+                self.code_diffs.move_to_end(key)
+                while len(self.code_diffs) > ui._CODE_DIFF_CACHE_SIZE:
+                    self.code_diffs.popitem(last=False)
+        return result
+
+    def run_lock(self, run_id, *, workspace_id):
+        run_id = (require_workspace_id(workspace_id), run_id)
         with self.run_locks_lock:
             lock = self.run_locks.get(run_id)
             if lock is None:
                 lock = threading.Lock()
                 self.run_locks[run_id] = lock
-            return lock
+            return self._combined_lock(lock, f"run:{run_id[0]}:{run_id[1]}")
 
-    def object_lock(self, sha):
-        prefix = sha[:2]
+    def quota_lock(self, workspace_id):
+        """Lock check, publish and accounting after the run/object lock.
+
+        Nothing may wait on a run/object lock while holding this lock.
+        """
+        workspace_id = require_workspace_id(workspace_id)
+        with self.quota_locks_lock:
+            lock = self.quota_locks.get(workspace_id)
+            if lock is None:
+                lock = threading.Lock()
+                self.quota_locks[workspace_id] = lock
+            return self._combined_lock(lock, f"quota:{workspace_id}")
+
+    def object_lock(self, sha, *, workspace_id):
+        prefix = (require_workspace_id(workspace_id), sha[:2])
         with self.object_locks_lock:
             lock = self.object_locks.get(prefix)
             if lock is None:
                 lock = threading.Lock()
                 self.object_locks[prefix] = lock
-            return lock
+            return self._combined_lock(lock, f"object:{prefix[0]}:{prefix[1]}")
+
+    def _combined_lock(self, lock, key):
+        # Order: thread → session → transaction; run/object → quota.
+        return _ProcessLock(lock, self.db, key) if self.db.dialect.name == "postgres" else lock
+
+    def lineage_lock(self, workspace_id, project_key):
+        workspace_id = require_workspace_id(workspace_id)
+        key = (workspace_id, project_key)
+        with self.lineage_locks_lock:
+            lock = self.lineage_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self.lineage_locks[key] = lock
+            return self._combined_lock(lock, f"lineage:{workspace_id}:{project_key}")
 
     def server_close(self, *, drain=0.0):
         if drain > 0:
@@ -254,6 +486,8 @@ class IngestServer(DashboardServer):
         self._closing_workers.clear()
         # If joining workers is interrupted, keep the lock: those workers can
         # still be applying writes while the caller handles the interruption.
+        if self.db is not None:
+            self.db.close()
         if self._server_lock is not None:
             self._server_lock.close()
             self._server_lock = None
@@ -264,8 +498,17 @@ class IPv6IngestServer(IngestServer):
 
 
 def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None,
-                trusted_proxies=(), identity_header=None):
+                trusted_proxies=(), identity_header=None, database=None,
+                firebase=None, cert_source=None, plans=None, open_signup=False, objects=None,
+                min_client_version=None, admin_emails=frozenset(), legal_base_url=None):
     """Prepare and lock the data directory; port=0 chooses a free port."""
+    from .firebase import require_open_signup
+    from .limits import Plans
+    if plans is not None and not isinstance(plans, Plans):
+        plans = Plans.load(plans)
+    require_open_signup(open_signup, firebase, plans)
+    from .clientwindow import parse_min_client
+    parse_min_client(min_client_version)
     validate_env_key(env_key)
     if env_key is not None and env_key_looks_weak(env_key):
         logger.warning(
@@ -273,26 +516,74 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
             "server keys create or secrets.token_urlsafe(32)")
     public_url = _validate_public_url(public_url)
     data = resolve_data_dir(data)
+    backend = open_backend(objects if objects is not None else os.environ.get("AGENTICML_SERVER_OBJECTS"), data)
+    if backend.name == 's3':
+        try:
+            backend._call(backend.client.head_bucket, Bucket=backend.bucket)
+        except (ObjectStoreUnavailable, FileNotFoundError) as exc:
+            raise ValueError('S3 object bucket is unreachable; check server logs and AWS configuration') from exc
+        if not _is_postgres(resolve_url(data, database)):
+            logger.warning('S3 objects are intended for the hosted Postgres setup')
     prepare_data_dir(data)
-    handle = acquire_server_lock(data / "server")
+    if not store_paths_safe(data / "store"):
+        raise ValueError("store or store/runs is a symlink or not a directory; fix or move it away")
+    handle = (None if _is_postgres(resolve_url(data, database))
+              else acquire_server_lock(data / "server"))
+    db = None
     try:
-        _clean_tmp(data / "server" / "tmp")
-        migrate(data, actor="server")
+        db = for_server_dir(data / "server", database)
+        if db.dialect.name == "postgres":
+            handle = ExitStack()
+            handle.enter_context(db.server_lock(shared=True))
+        _clean_tmp(data / "server" / "tmp", postgres=db.dialect.name == "postgres")
         cls = IPv6IngestServer if ":" in host else IngestServer
-        server = cls(data, host, port, public_url, env_key, trusted_proxies, identity_header)
+        server = cls(data, host, port, public_url, env_key, trusted_proxies, identity_header, db=db,
+                     firebase=firebase, cert_source=cert_source, plans=plans,
+                     open_signup=open_signup, min_client_version=min_client_version,
+                     admin_emails=admin_emails, legal_base_url=legal_base_url)
+        server.objects = backend
         server._server_lock = handle
+        for workspace in server.workspaces.list():
+            root = prepare_store(data, workspace['id'])
+            reconcile(root, RunRepo(db, workspace['id']))
+        from .db.backfill import backfill_metrics
+        backfill_metrics(server)
         return server
     except BaseException:
-        handle.close()
+        if db is not None:
+            db.close()
+        if handle is not None:
+            handle.close()
         raise
 
 
 def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None,
-          trusted_proxies=(), identity_header=None):
+          trusted_proxies=(), identity_header=None, database=None,
+          firebase=None, cert_source=None, plans=None, open_signup=False, objects=None,
+          min_client_version=None, admin_emails=frozenset(), legal_base_url=None):
     """Run until interrupted, with an optional environment admin key."""
+    extra = {}
+    if objects is not None:
+        extra["objects"] = objects
+    if plans is not None:
+        extra["plans"] = plans
+    if database is not None:
+        extra["database"] = database
+    if firebase is not None:
+        extra["firebase"] = firebase
+    if cert_source is not None:
+        extra["cert_source"] = cert_source
+    if open_signup:
+        extra["open_signup"] = True
+    if min_client_version is not None:
+        extra["min_client_version"] = min_client_version
+    if admin_emails:
+        extra["admin_emails"] = frozenset(admin_emails)
+    if legal_base_url is not None:
+        extra["legal_base_url"] = legal_base_url
     server = make_server(
         data, host, port, public_url, os.environ.get("AGENTICML_SERVER_KEY"),
-        trusted_proxies, identity_header)
+        trusted_proxies, identity_header, **extra)
     previous_handler = None
     stopping = False
 

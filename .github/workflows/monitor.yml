@@ -1,0 +1,82 @@
+# Actions are pinned to full commit SHAs, with the tag in a comment. To update
+# one, look up the tag's commit (dereference annotated tags) and change the SHA
+# and the comment together.
+name: Hosted service monitor
+
+# Weekly check of https://app.agenticml.xyz/healthz and of the docs site's
+# external links. It is not an uptime guarantee; the CloudWatch alarms are the
+# alerting path. A failure opens one issue labelled `hosted`, later failures
+# comment on it, and the next passing run closes it. Scheduled runs use the
+# default branch (dev), so the schedule starts once this file reaches it;
+# GitHub disables schedules after 60 days without repository activity.
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    if: github.repository == 'agenticML/agenticml-lite'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+
+      - id: check
+        name: Check the service and the docs links
+        continue-on-error: true
+        run: python scripts/monitor_hosted.py --report monitor-report.md
+
+      - name: Open or update the failure issue
+        if: steps.check.outcome == 'failure'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -s monitor-report.md ]; then
+            printf '# Hosted monitor report\n\nThe monitor did not produce a report.\n' > monitor-report.md
+          fi
+          printf '\nRun: %s\n' "$RUN_URL" >> monitor-report.md
+          number=$(gh issue list --label hosted --state open --search 'in:title "Hosted monitor failed"' \
+            --json number,title --jq '[.[] | select(.title == "Hosted monitor failed")][0].number // empty')
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body-file monitor-report.md
+          else
+            gh issue create --title 'Hosted monitor failed' --label hosted --body-file monitor-report.md
+          fi
+
+      - name: Close the failure issue after recovery
+        if: steps.check.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          number=$(gh issue list --label hosted --state open --search 'in:title "Hosted monitor failed"' \
+            --json number,title --jq '[.[] | select(.title == "Hosted monitor failed")][0].number // empty')
+          if [ -n "$number" ]; then
+            gh issue close "$number" --comment "Recovered: the monitor passed again. Run: $RUN_URL"
+          fi
+
+      - name: Fail the run when the check failed
+        if: steps.check.outcome == 'failure'
+        run: |
+          echo "::error::The hosted monitor failed; see the report above and the Hosted monitor failed issue."
+          exit 1

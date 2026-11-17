@@ -1,0 +1,7 @@
+firebase 13.1.0 (npm), Apache License 2.0, https://github.com/firebase/firebase-js-sdk
+Source: https://registry.npmjs.org/firebase/-/firebase-13.1.0.tgz
+npm integrity: sha512-II/6P63vYzWdS6gTM9+OaMZD6XaCHJdI/9OVa8Z+bEs18t3CR2JlSwCI12KYMramNqTkywJocjSpGePaVPng+A==
+Files copied unchanged from the package root: firebase-app-compat.js, firebase-auth-compat.js
+(the trailing sourceMappingURL comments point at maps that are not vendored).
+Vendored Nov 8, 2026 for package 18b. To update: download the new tarball, check its
+npm integrity hash, copy the same two files, and update this note.

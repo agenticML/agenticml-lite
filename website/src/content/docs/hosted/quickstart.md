@@ -33,17 +33,15 @@ A training machine uploads with a sync key.
 4. Leave **Scope** as `sync`.
 5. Click **Create**.
 
-The key is shown once and cannot be recovered. Copy it now. The dialog also shows a login command with the key in it. Do not use that command: it puts the key in your shell history and in the process list. Use the next steps instead.
+The key is shown once and cannot be recovered. Copy it now. The dialog also shows a login command without the key in it (`agenticml login --host <host>`). Run it, then paste the key when it asks for it. This keeps the key out of your shell history and the process list.
 
 ## 4. Install the client
 
-PyPI has only 1.0.0, which cannot sync to a server. Install 3.0 from GitHub (it needs `git`):
-
 ```bash
-pip install 'agenticml-lite[system] @ git+https://github.com/agenticML/agenticml-lite@dev'
+pip install 'agenticml-lite[system]'
 ```
 
-This follows the `dev` branch, so what you get moves as development continues. The hosted service needs client 2.2 or newer. A 2.2 client is expected to work but has not been checked against the hosted service yet, so use 3.0.
+The hosted service needs client 2.2 or newer. A 2.2 client is expected to work but has not been checked against the hosted service yet, so use 3.0.
 
 ## 5. Log in
 
@@ -101,7 +99,7 @@ Open `https://app.agenticml.xyz/w/<slug>/` with your slug. Your runs are listed 
 
 ## Troubleshooting
 
-**HTTP 426, "this server needs agenticml-lite >= 2.2".** The client is too old. The message suggests `pip install -U agenticml-lite`, but that installs 1.0.0 today. Install 3.0 from GitHub as in step 4.
+**HTTP 426, "this server needs agenticml-lite >= 2.2".** The client is too old. Run `pip install -U agenticml-lite` to install 3.0.0 (step 4).
 
 **"invalid API key" on login.** The key was copied wrongly, was revoked, or belongs to another server. Make a new key under **Settings > API keys**.
 

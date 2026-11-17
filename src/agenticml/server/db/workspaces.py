@@ -1,0 +1,888 @@
+"""Global accounts and workspace lifecycle; workspace data uses scoped repos."""
+from contextlib import contextmanager
+import re
+import secrets
+
+from agenticml.store import layout
+from ..keys import ClientError
+from .errors import DatabaseError
+
+_RESERVED = {'admin', 'api', 'static', 'w', 'account', 'login', 'logout', 'setup', 'invite', 'healthz', 'v2'}
+_EMAIL_LOGIN = re.compile(r'[^\s@]+@[^\s@]+\.[^\s@]+')
+_SLUG_OTHER = re.compile('[^a-z0-9]+')
+
+
+def validate_slug(slug):
+    if not isinstance(slug, str) or not re.fullmatch('[a-z0-9][a-z0-9-]{0,39}', slug) or slug in _RESERVED:
+        raise ClientError('invalid or reserved workspace slug')
+    return slug
+
+
+def validate_workspace_name(name):
+    """Return the trimmed display name, or raise ClientError."""
+    if (not isinstance(name, str) or not name.strip() or len(name.strip()) > 256
+            or any(ord(char) < 32 or ord(char) == 127 for char in name)):
+        raise ClientError('invalid workspace name')
+    return name.strip()
+
+
+def slug_from_email_local(email):
+    """Turn an email's local part into a workspace slug: ``[a-z0-9-]``, max 32."""
+    local = email.split('@', 1)[0].lower() if isinstance(email, str) and '@' in email else ''
+    cleaned = _SLUG_OTHER.sub('-', local).strip('-')[:32].rstrip('-')
+    return cleaned or 'workspace'
+
+
+def is_email_login(login):
+    return isinstance(login, str) and _EMAIL_LOGIN.fullmatch(login) is not None and len(login) <= 254
+
+
+def validate_login(login):
+    if is_email_login(login):
+        return login.lower()
+    from ..keys import validate_name
+    validate_name(login)
+    return login
+
+
+def emails_equal(left, right):
+    """True when both values are emails that match after ``validate_login`` lowercasing.
+
+    Uses ``str.lower``, not ``casefold``, so ``ß`` and ``ss`` stay distinct.
+    """
+    if not isinstance(left, str) or not isinstance(right, str) or not left or not right:
+        return False
+    return left.lower() == right.lower()
+
+
+def require_workspace_id(workspace_id):
+    if not isinstance(workspace_id, str) or not re.fullmatch('[0-9a-f]{32}', workspace_id):
+        raise ValueError('workspace id is required')
+    return workspace_id
+
+
+class WorkspaceBound:
+    """Bind ``app.workspace_id`` on every transaction this repo uses."""
+
+    @contextmanager
+    def _tx(self, write=False):
+        with self.db.transaction(write=write) as tx:
+            # Fresh transaction: GUC is transaction-local and this Tx is
+            # discarded on exit, so skip the restore round trip.
+            with self._bind(tx, restore=False):
+                yield tx
+
+    @contextmanager
+    def _bind(self, tx, restore=True):
+        previous = tx.bound
+        tx.bind_workspace(self.workspace_id)
+        try:
+            yield
+        except BaseException:
+            # An aborted Postgres transaction cannot run set_config; doing so
+            # would raise InFailedSqlTransaction and hide lock/deadlock errors.
+            tx.bound = previous
+            raise
+        else:
+            if restore:
+                tx._set_binding(previous)
+
+
+class WorkspaceStateError(ClientError):
+    """Refused: the workspace is not in a state that allows this change."""
+
+
+class LastServerAdminError(ClientError):
+    """Refused: the change would leave the server without a server admin."""
+
+
+class AccountDeleteBlocked(ClientError):
+    """Refused: the account cannot be deleted yet; nothing was changed."""
+
+
+DELETED_ACCOUNT = '[deleted account]'
+# Words the audit log and the account tables use for actors that are not
+# people; a login equal to one of them could not be told apart from them.
+RESERVED_ACTORS = frozenset({
+    'cli', 'setup', 'server up', 'legacy run owner', 'anonymous', 'signup', 'admin-emails',
+    'dashboard'})
+DETACHED_PREFIX = 'detached-from:'
+
+
+def detached_key(account_id):
+    """``server_settings`` name holding the workspace id an account last left."""
+    return DETACHED_PREFIX + account_id
+
+
+class AccountRepo:
+    def __init__(self, db):
+        self.db = db
+
+    def get(self, login, tx=None):
+        login = login.lower() if isinstance(login, str) and "@" in login else login
+        if tx is None:
+            with self.db.transaction() as tx:
+                return self.get(login, tx)
+        row = tx.fetchone('SELECT * FROM accounts WHERE login=?', (login,))
+        return dict(row) if row else None
+
+    def workspace_slugs(self, login, tx=None):
+        if tx is None:
+            with self.db.transaction() as tx:
+                return self.workspace_slugs(login, tx)
+        with tx.cross_scope('account workspace slugs'):
+            account = self.get(login, tx)
+            if account is None:
+                return []
+            return [r[0] for r in tx.fetchall(
+                'SELECT w.slug FROM memberships m JOIN workspaces w ON w.id=m.workspace_id '
+                'WHERE m.account_id=? ORDER BY w.slug', (account['id'],))]
+
+    def workspaces(self, login, tx=None):
+        """Active workspaces the account belongs to, with membership role."""
+        if tx is None:
+            with self.db.transaction() as tx:
+                return self.workspaces(login, tx)
+        with tx.cross_scope('account workspaces'):
+            account = self.get(login, tx)
+            if account is None:
+                return []
+            return [{'slug': row['slug'], 'name': row['name'], 'role': row['role']}
+                    for row in tx.fetchall(
+                        'SELECT w.slug, w.name, m.role FROM memberships m '
+                        'JOIN workspaces w ON w.id=m.workspace_id '
+                        'WHERE m.account_id=? AND w.status=? ORDER BY w.slug',
+                        (account['id'], 'active'))]
+
+    def by_identity(self, value, *, exact=False):
+        """Return the unique account for ``value``, or None.
+
+        ``exact`` compares ``identity`` as stored; otherwise ``identity_folded``.
+        More than one match is treated as no match, same as 2.2.
+        """
+        if not isinstance(value, str) or not value:
+            return None
+        with self.db.transaction() as tx:
+            if exact:
+                rows = tx.fetchall('SELECT * FROM accounts WHERE identity=?', (value,))
+            else:
+                rows = tx.fetchall(
+                    'SELECT * FROM accounts WHERE identity_folded=?', (value.casefold(),))
+            if len(rows) != 1:
+                return None
+            return dict(rows[0])
+
+    def by_firebase_uid(self, uid, tx=None):
+        if tx is None:
+            with self.db.transaction() as tx:
+                return self.by_firebase_uid(uid, tx)
+        row = tx.fetchone('SELECT * FROM accounts WHERE firebase_uid=?', (uid,))
+        return dict(row) if row else None
+
+    def list(self):
+        with self.db.transaction() as tx:
+            return [dict(r) for r in tx.fetchall(
+                'SELECT id, login, display_name, identity, server_admin, server_admin_source, generation, '
+                'created_at, created_by, firebase_uid, email, email_verified '
+                'FROM accounts ORDER BY created_at, login')]
+
+    def create(self, login, display_name=None, created_by='cli', tx=None):
+        login = validate_login(login)
+        if display_name is None:
+            display_name = login
+        if tx is None:
+            with self.db.transaction(write=True) as tx:
+                return self.create(login, display_name, created_by, tx)
+        tx.advisory_lock('users')
+        if self.get(login, tx):
+            raise ClientError('account already exists')
+        aid = secrets.token_hex(16)
+        tx.execute('INSERT INTO accounts (id, login, display_name, created_at, created_by) '
+                   'VALUES (?, ?, ?, ?, ?)', (aid, login, display_name, layout.format_timestamp(), created_by))
+        return dict(tx.fetchone('SELECT * FROM accounts WHERE id=?', (aid,)))
+
+    def claimable(self, login, tx):
+        account = self.get(login, tx)
+        return bool(account and account['password'] is None and account['identity'] is None
+                    and account['firebase_uid'] is None and account['created_by'] != 'legacy run owner')
+
+    def link_firebase(self, account_id, uid, email, verified, tx):
+        tx.advisory_lock('users')
+        row = tx.fetchone('SELECT * FROM accounts WHERE id=?', (account_id,))
+        if row is None:
+            raise ClientError('unknown account')
+        if row['firebase_uid'] is not None:
+            raise ClientError('account already linked')
+        if tx.fetchone('SELECT id FROM accounts WHERE firebase_uid=?', (uid,)):
+            raise ClientError('firebase uid already linked')
+        tx.execute('UPDATE accounts SET firebase_uid=?, email=?, email_verified=? WHERE id=?',
+                   (uid, email.lower() if isinstance(email, str) else email, 1 if verified else 0, account_id))
+
+    def refresh_firebase_email(self, account_id, email, verified, tx):
+        tx.advisory_lock('users')
+        if tx.fetchone('SELECT id FROM accounts WHERE id=?', (account_id,)) is None:
+            raise ClientError('unknown account')
+        tx.execute('UPDATE accounts SET email=?, email_verified=? WHERE id=?',
+                   (email.lower() if isinstance(email, str) else email, 1 if verified else 0, account_id))
+
+    def set_server_admin(self, login, enabled, *, source='manual', tx=None):
+        """Grant or revoke server admin; returns the updated account row.
+
+        ``source`` records who granted it: ``'manual'`` (CLI or web) overwrites
+        anything, ``'list'`` (deploy config) never downgrades a manual grant.
+        Revoking the only server admin raises ``LastServerAdminError``.
+        """
+        if source not in ('list', 'manual'):
+            raise ValueError('source must be list or manual')
+        if tx is None:
+            with self.db.transaction(write=True) as tx:
+                return self.set_server_admin(login, enabled, source=source, tx=tx)
+        tx.advisory_lock('users')
+        account = self.get(login, tx)
+        if account is None:
+            raise ClientError('unknown account')
+        if enabled:
+            if source == 'manual' or not account['server_admin']:
+                tx.execute('UPDATE accounts SET server_admin=1, server_admin_source=? WHERE id=?',
+                           (source, account['id']))
+        else:
+            # Only admins that can sign in count: a pending (credential-less)
+            # admin neither satisfies the guard nor is protected by it.
+            if (account['server_admin'] and self.can_sign_in(account) and not tx.fetchone(
+                    'SELECT 1 FROM accounts WHERE server_admin=1 AND id<>? AND '
+                    '(password IS NOT NULL OR identity IS NOT NULL OR firebase_uid IS NOT NULL)',
+                    (account['id'],))):
+                raise LastServerAdminError('cannot remove the last server admin')
+            tx.execute('UPDATE accounts SET server_admin=0, server_admin_source=NULL WHERE id=?',
+                       (account['id'],))
+        return dict(tx.fetchone('SELECT * FROM accounts WHERE id=?', (account['id'],)))
+
+    @staticmethod
+    def can_sign_in(account):
+        return any(account.get(key) is not None for key in ('password', 'identity', 'firebase_uid'))
+
+    def server_admins(self, tx=None):
+        if tx is None:
+            with self.db.transaction() as tx:
+                return self.server_admins(tx)
+        return [dict(r) for r in tx.fetchall(
+            'SELECT * FROM accounts WHERE server_admin=1 ORDER BY login')]
+
+    def discard_unreferenced(self, account_id, login, tx):
+        with tx.cross_scope('discard unreferenced account'):
+            if not tx.fetchone('SELECT 1 FROM memberships WHERE account_id=?', (account_id,)) and not tx.fetchone(
+                    'SELECT 1 FROM runs WHERE owner_account_id=?', (account_id,)):
+                tx.execute('UPDATE workspaces SET created_by=NULL WHERE created_by=?', (account_id,))
+                tx.execute('DELETE FROM sessions WHERE account_id=?', (account_id,))
+                tx.execute('DELETE FROM accounts WHERE id=? AND login=?', (account_id, login))
+
+    def is_detached(self, account_id, tx):
+        """True when the account has no membership in any workspace."""
+        with tx.cross_scope('account detached check'):
+            return tx.fetchone('SELECT 1 FROM memberships WHERE account_id=?', (account_id,)) is None
+
+    def note_detached(self, account_id, workspace_id, tx):
+        """Remember the workspace an account last left (its only way back over HTTP)."""
+        tx.execute(self.db.dialect.upsert('server_settings', ('name', 'value'), ('name',), ('value',)),
+                   (detached_key(account_id), workspace_id))
+
+    def clear_detached(self, account_id, tx):
+        tx.execute('DELETE FROM server_settings WHERE name=?', (detached_key(account_id),))
+
+    def require_attachable(self, account, workspace_id, tx, *, operator=False):
+        """Refuse HTTP attachment of a detached account unless the caller may.
+
+        An account with no membership may be attached by an operator, or by an
+        admin of the workspace it last left (never a server admin account).
+        Accounts that have a membership somewhere are not affected.
+        """
+        if operator or not self.is_detached(account['id'], tx):
+            return
+        row = tx.fetchone('SELECT value FROM server_settings WHERE name=?', (detached_key(account['id']),))
+        if account['server_admin'] or row is None or row[0] != workspace_id:
+            from ..users import DETACHED_ACCOUNT
+            raise ClientError(DETACHED_ACCOUNT)
+
+    def delete(self, login, tx=None):
+        """Erase one account and the login strings that name it.
+
+        One write transaction. Refuses (nothing changed) while the account is a
+        server admin, owns a workspace or owns runs. Server-level audit rows that
+        name the person are redacted; workspace-level rows stay with their
+        workspace. Returns a summary that does not contain the login.
+        """
+        if tx is None:
+            with self.db.transaction(write=True) as tx:
+                return self.delete(login, tx)
+        tx.cross_workspace('account delete')
+        tx.advisory_lock('users')
+        if not isinstance(login, str) or not login:
+            raise ClientError('unknown account')
+        if login.lower() in RESERVED_ACTORS or login.lower() == DELETED_ACCOUNT:
+            raise AccountDeleteBlocked(
+                'login is reserved as an audit actor name; this command will not delete it')
+        account = self.get(login, tx)
+        if account is None:
+            raise ClientError('unknown account')
+        aid, stored = account['id'], account['login']
+        if account['server_admin']:
+            raise AccountDeleteBlocked(
+                'account is a server admin; run set-server-admin LOGIN off first '
+                'and remove it from the admin emails list')
+        owned = [r[0] for r in tx.fetchall(
+            "SELECT w.slug FROM memberships m JOIN workspaces w ON w.id=m.workspace_id "
+            "WHERE m.account_id=? AND m.role='owner' ORDER BY w.slug", (aid,))]
+        if owned:
+            raise AccountDeleteBlocked(
+                'account owns workspaces: ' + ', '.join(owned) +
+                '; transfer them with `workspaces set-owner` or delete them first')
+        with_runs = [(r[0], r[1]) for r in tx.fetchall(
+            'SELECT w.slug, COUNT(*) FROM runs r JOIN workspaces w ON w.id=r.workspace_id '
+            'WHERE r.owner_account_id=? GROUP BY w.slug ORDER BY w.slug', (aid,))]
+        if with_runs:
+            raise AccountDeleteBlocked(
+                'account owns runs: ' + ', '.join(f'{slug} ({count})' for slug, count in with_runs) +
+                '; delete those runs or their workspaces first')
+        slugs = [r[0] for r in tx.fetchall(
+            'SELECT w.slug FROM memberships m JOIN workspaces w ON w.id=m.workspace_id '
+            'WHERE m.account_id=? ORDER BY w.slug', (aid,))]
+        digests = [r[0] for r in tx.fetchall('SELECT sha256 FROM keys WHERE account_id=?', (aid,))]
+        sessions = tx.execute('DELETE FROM sessions WHERE account_id=?', (aid,)).rowcount
+        for start in range(0, len(digests), 400):
+            chunk = digests[start:start + 400]
+            sessions += tx.execute(
+                'DELETE FROM sessions WHERE key_sha256 IN (' + ','.join('?' * len(chunk)) + ')',
+                tuple(chunk)).rowcount
+        tx.execute('DELETE FROM keys WHERE account_id=?', (aid,))
+        invites = tx.execute('DELETE FROM invites WHERE login=?', (stored,)).rowcount
+        tx.execute('DELETE FROM memberships WHERE account_id=?', (aid,))
+        tx.execute('UPDATE workspaces SET created_by=NULL WHERE created_by=?', (aid,))
+        tx.execute('UPDATE accounts SET created_by=? WHERE created_by=?', (DELETED_ACCOUNT, stored))
+        tx.execute('UPDATE keys SET created_by=? WHERE created_by=?', (DELETED_ACCOUNT, stored))
+        tx.execute('UPDATE invites SET invited_by=? WHERE invited_by=?', (DELETED_ACCOUNT, stored))
+        self.clear_detached(aid, tx)
+        # Failed-login throttle buckets are keyed 'user:<login typed>' and 'uid:<firebase uid>'
+        # (everything else is a client address).
+        names = sorted({n.lower() for n in (account['login'], account['email'], account['identity'])
+                        if isinstance(n, str) and n})
+        buckets = ['user:' + n for n in names]
+        if account['firebase_uid']:
+            buckets.append('uid:' + account['firebase_uid'].lower())
+        throttle = 0
+        if buckets:
+            tx.advisory_lock('throttle')
+            throttle = tx.execute('DELETE FROM login_attempts WHERE LOWER(bucket) IN (' +
+                                  ','.join('?' * len(buckets)) + ')', tuple(buckets)).rowcount
+        if tx.execute('DELETE FROM accounts WHERE id=? AND login=?', (aid, stored)).rowcount != 1:
+            raise DatabaseError('could not delete the account')
+        from .repos import AuditRepo
+        needles = [account[key] for key in ('login', 'email', 'identity', 'firebase_uid')]
+        redacted = AuditRepo(self.db, None).redact_account(
+            needles, tx, display_name=account['display_name'])
+        return {'id': aid, 'memberships': slugs, 'keys': len(digests), 'sessions': sessions,
+                'invites': invites, 'throttle_buckets': throttle, 'audit_redacted': redacted,
+                'firebase_uid': account['firebase_uid'], 'email': account['email']}
+
+    def ensure_attribution(self, login, tx):
+        """Retain removed 2.x owners without giving them membership or credentials."""
+        if login is None:
+            return None
+        tx.advisory_lock('users')
+        account = self.get(login, tx)
+        if account is None:
+            aid = secrets.token_hex(16)
+            tx.execute('INSERT INTO accounts (id, login, display_name, created_at, created_by) '
+                       'VALUES (?, ?, ?, ?, ?)', (aid, login, login, layout.format_timestamp(), 'legacy run owner'))
+            return aid
+        return account['id']
+
+
+class WorkspaceRepo:
+    def __init__(self, db):
+        self.db = db
+
+    def get(self, slug, tx=None):
+        if tx is None:
+            with self.db.transaction() as tx:
+                return self.get(slug, tx)
+        row = tx.fetchone('SELECT * FROM workspaces WHERE slug=?', (slug,))
+        return dict(row) if row else None
+
+    def by_id(self, wid, tx=None):
+        if tx is None:
+            with self.db.transaction() as tx:
+                return self.by_id(wid, tx)
+        row = tx.fetchone('SELECT * FROM workspaces WHERE id=?', (wid,))
+        return dict(row) if row else None
+
+    def require(self, slug):
+        row = self.get(slug)
+        if row is None:
+            raise ClientError('unknown workspace')
+        return row
+
+    def list(self):
+        with self.db.transaction() as tx:
+            tx.cross_workspace('workspace list')
+            return [dict(r) for r in tx.fetchall(
+                'SELECT w.*, (SELECT COUNT(*) FROM memberships m WHERE m.workspace_id=w.id) AS members '
+                'FROM workspaces w ORDER BY w.created_at, w.slug')]
+
+    def create(self, slug, name=None, owner=None, tx=None, *, plan='free', personal=0,
+               create_owner=None):
+        """Create a workspace owned by an existing account.
+
+        ``create_owner`` is the ``created_by`` value for a credential-less owner
+        account to create in the same transaction when ``owner`` is an email
+        with no account yet; the account is never left behind if the workspace
+        is refused. The created account is not returned; read it with
+        ``AccountRepo.get``.
+        """
+        validate_slug(slug)
+        if not isinstance(name or slug, str) or not (name or slug).strip() or len(name or slug) > 256:
+            raise ClientError('invalid workspace name')
+        if plan not in ('free', 'custom'):
+            raise ClientError('plan must be free or custom')
+        if tx is None:
+            with self.db.transaction(write=True) as tx:
+                return self.create(slug, name, owner, tx, plan=plan, personal=personal,
+                                   create_owner=create_owner)
+        tx.cross_workspace('workspace create')
+        tx.advisory_lock('users')
+        if self.get(slug, tx):
+            raise ClientError('workspace slug already exists')
+        accounts = AccountRepo(self.db)
+        account = accounts.get(validate_login(owner), tx) if owner else None
+        if account is None and create_owner and is_email_login(owner):
+            account = accounts.create(owner, None, create_owner, tx)
+        if account is None:
+            raise ClientError('workspace needs an existing owner account')
+        wid = secrets.token_hex(16)
+        tx.execute(
+            'INSERT INTO workspaces (id, slug, name, status, created_by, created_at, plan, personal) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            (wid, slug, name or slug, 'active', account['id'], layout.format_timestamp(),
+             plan, 1 if personal else 0))
+        tx.execute('INSERT INTO workspace_usage (workspace_id) VALUES (?)', (wid,))
+        tx.execute('INSERT INTO memberships (workspace_id, account_id, role) VALUES (?, ?, ?)',
+                   (wid, account['id'], 'owner'))
+        accounts.clear_detached(account['id'], tx)
+        return self.by_id(wid, tx)
+
+    def allocate_slug(self, base, tx):
+        candidate, n = base or 'workspace', 2
+        while True:
+            try:
+                validate_slug(candidate)
+            except ClientError:
+                candidate = f'{base}-{n}'
+                n += 1
+                continue
+            if self.get(candidate, tx) is None:
+                return candidate
+            candidate = f'{base}-{n}'
+            n += 1
+
+    def owned_free_count(self, account_id, tx):
+        with tx.cross_scope('owned free workspace count'):
+            return tx.fetchone(
+                "SELECT COUNT(*) FROM workspaces w JOIN memberships m ON m.workspace_id=w.id "
+                "WHERE m.account_id=? AND m.role='owner' AND w.plan='free' AND w.archived_at IS NULL",
+                (account_id,))[0]
+
+    def update(self, slug, *, name=None, new_slug=None, status=None):
+        if new_slug is not None:
+            validate_slug(new_slug)
+        if name is not None:
+            name = validate_workspace_name(name)
+        if status is not None and status not in ('active', 'suspended'):
+            raise ClientError('invalid workspace status')
+        with self.db.transaction(write=True) as tx:
+            tx.advisory_lock('users')
+            row = self.get(slug, tx)
+            if row is None:
+                raise ClientError('unknown workspace')
+            if row['slug'] == 'default' and new_slug not in (None, 'default'):
+                raise ClientError('cannot change the default workspace slug; the env key and the self-hosted default depend on it')
+            if row['slug'] == 'default' and status == 'suspended':
+                raise ClientError('cannot suspend the default workspace; the env key and the self-hosted default depend on it')
+            if status == 'active' and row.get('archived_at'):
+                raise WorkspaceStateError('restore the workspace first')
+            if new_slug != slug and new_slug is not None and self.get(new_slug, tx):
+                raise ClientError('workspace slug already exists')
+            tx.execute('UPDATE workspaces SET slug=?, name=?, status=? WHERE id=?',
+                       (new_slug or slug, name if name is not None else row['name'],
+                        status or row['status'], row['id']))
+            return self.by_id(row['id'], tx)
+
+    def rename(self, workspace_id, name):
+        """Change only the display name; returns ``(old_row, new_row)``.
+
+        Never touches slug, status, plan or archived_at (unlike ``update``).
+        The ``users`` lock serialises it with ``update``, which rewrites the
+        name column from its own read.
+        """
+        name = validate_workspace_name(name)
+        with self.db.transaction(write=True) as tx:
+            tx.advisory_lock('users')
+            old = self.by_id(workspace_id, tx)
+            if old is None:
+                raise ClientError('unknown workspace')
+            if old['name'] != name:
+                tx.execute('UPDATE workspaces SET name=? WHERE id=?', (name, workspace_id))
+            return old, self.by_id(workspace_id, tx)
+
+    def set_plan(self, slug, plan, custom_limits=None, *, merge=False, free_limits=None):
+        """Set a workspace plan.
+
+        Without ``merge`` a custom plan needs all four limits. With ``merge``
+        ``custom_limits`` may be partial (or None) and is merged inside the
+        write transaction onto the limits read there: the workspace's own when
+        it is already custom, otherwise ``free_limits`` (or unlimited).
+        """
+        import json
+        from ..limits import UNLIMITED, validate_limits
+        if plan not in ('free', 'custom'):
+            raise ClientError('plan must be free or custom')
+        if plan == 'free' and custom_limits is not None:
+            raise ClientError('free plan cannot have custom limits')
+        if plan == 'custom' and merge and custom_limits is not None and not isinstance(custom_limits, dict):
+            raise ValueError('limits must be an object')
+        if plan == 'custom' and not merge:
+            encoded = json.dumps(validate_limits(custom_limits))
+        else:
+            encoded = None
+        with self.db.transaction(write=True) as tx:
+            tx.advisory_lock('users')
+            old = self.get(slug, tx)
+            if old is None:
+                raise ClientError('unknown workspace')
+            if plan == 'custom' and merge:
+                if old['plan'] == 'custom' and old['custom_limits']:
+                    base = json.loads(old['custom_limits'])
+                else:
+                    base = dict(free_limits) if free_limits is not None else dict(UNLIMITED)
+                base.update(custom_limits or {})
+                encoded = json.dumps(validate_limits(base))
+            tx.execute('UPDATE workspaces SET plan=?, custom_limits=? WHERE id=?',
+                       (plan, encoded, old['id']))
+            return old, self.by_id(old['id'], tx)
+
+    def delete(self, slug):
+        with self.db.transaction(write=True) as tx:
+            tx.cross_workspace('workspace delete')
+            tx.advisory_lock('users')
+            row = self.get(slug, tx)
+            if row is None:
+                raise ClientError('unknown workspace')
+            if row['slug'] == 'default':
+                raise ClientError('cannot delete the default workspace; the env key and the self-hosted default depend on it')
+            tx.execute('DELETE FROM workspaces WHERE id=?', (row['id'],))
+            return row
+
+    def archive(self, slug):
+        """Suspend the workspace and mark it archived; its data is kept."""
+        with self.db.transaction(write=True) as tx:
+            tx.cross_workspace('workspace archive')
+            tx.advisory_lock('users')
+            row = self.get(slug, tx)
+            if row is None:
+                raise ClientError('unknown workspace')
+            if row['slug'] == 'default':
+                raise ClientError('cannot archive the default workspace; the env key and the self-hosted default depend on it')
+            if row.get('archived_at'):
+                raise WorkspaceStateError('workspace is already archived')
+            tx.execute('UPDATE workspaces SET status=?, archived_at=? WHERE id=?',
+                       ('suspended', layout.format_timestamp(), row['id']))
+            return self.by_id(row['id'], tx)
+
+    def restore(self, slug, plans=None):
+        """Clear the archived mark; the workspace stays suspended."""
+        with self.db.transaction(write=True) as tx:
+            tx.cross_workspace('workspace restore')
+            tx.advisory_lock('users')
+            row = self.get(slug, tx)
+            if row is None:
+                raise ClientError('unknown workspace')
+            if not row.get('archived_at'):
+                raise WorkspaceStateError('workspace is not archived')
+            limit = None if plans is None else plans.free_workspaces_per_account
+            if limit is not None and row['plan'] == 'free':
+                owners = tx.fetchall(
+                    "SELECT account_id FROM memberships WHERE workspace_id=? AND role='owner'",
+                    (row['id'],))
+                if any(self.owned_free_count(owner[0], tx) >= limit for owner in owners):
+                    raise WorkspaceStateError(
+                        'free workspaces are not available; change the plan to custom first'
+                        if limit == 0 else
+                        'the owner already has a free workspace; change the plan to custom '
+                        'or archive the other one first')
+            tx.execute('UPDATE workspaces SET archived_at=NULL WHERE id=?', (row['id'],))
+            return self.by_id(row['id'], tx)
+
+    def set_owner(self, slug, login):
+        with self.db.transaction(write=True) as tx:
+            tx.cross_workspace('workspace set owner')
+            tx.advisory_lock('users')
+            row = self.get(slug, tx)
+            account = AccountRepo(self.db).get(validate_login(login), tx)
+            if row is None or account is None:
+                raise ClientError('unknown workspace or account')
+            tx.bind_workspace(row['id'])
+            tx.execute("UPDATE memberships SET role='admin' WHERE workspace_id=? AND role='owner'", (row['id'],))
+            tx.execute(self.db.dialect.upsert('memberships', ('workspace_id', 'account_id', 'role'),
+                                             ('workspace_id', 'account_id'), ('role',)),
+                       (row['id'], account['id'], 'owner'))
+            AccountRepo(self.db).clear_detached(account['id'], tx)
+
+
+class MembershipRepo(WorkspaceBound):
+    def __init__(self, db, workspace_id):
+        self.db = db
+        self.workspace_id = require_workspace_id(workspace_id)
+
+    def get(self, account_id, tx=None):
+        if tx is None:
+            with self._tx() as tx:
+                return self.get(account_id, tx)
+        with self._bind(tx):
+            row = tx.fetchone('SELECT m.*, a.login FROM memberships m JOIN accounts a ON a.id=m.account_id '
+                              'WHERE m.workspace_id=? AND m.account_id=?', (self.workspace_id, account_id))
+            return dict(row) if row else None
+
+    def list(self, tx=None):
+        if tx is None:
+            with self._tx() as tx:
+                return self.list(tx)
+        with self._bind(tx):
+            return [dict(row) for row in tx.fetchall(
+                'SELECT m.*, a.login FROM memberships m JOIN accounts a ON a.id=m.account_id '
+                'WHERE m.workspace_id=? ORDER BY a.created_at, a.login', (self.workspace_id,))]
+
+    def add(self, account_id, role, tx=None):
+        if role not in ('admin', 'member', 'viewer'):
+            raise ClientError('invalid role')
+        if tx is None:
+            with self._tx(write=True) as tx:
+                return self.add(account_id, role, tx)
+        with self._bind(tx):
+            tx.advisory_lock('users')
+            if self.get(account_id, tx):
+                raise ClientError('membership already exists')
+            tx.execute('INSERT INTO memberships (workspace_id, account_id, role) VALUES (?, ?, ?)', (self.workspace_id, account_id, role))
+            AccountRepo(self.db).clear_detached(account_id, tx)
+
+    def remove(self, account_id):
+        from .repos import UserRepo
+        row = self.get(account_id)
+        if row is None:
+            raise ClientError('unknown member')
+        return UserRepo(self.db, self.workspace_id).remove(row['login'])
+
+    def set_role(self, account_id, role):
+        from .repos import UserRepo
+        row = self.get(account_id)
+        if row is None:
+            raise ClientError('unknown member')
+        return UserRepo(self.db, self.workspace_id).set_role(row['login'], role)
+
+
+class InviteRepo(WorkspaceBound):
+    """Workspace invites. Existing accounts receive membership without a token."""
+    def __init__(self, db, workspace_id):
+        self.db = db
+        self.workspace_id = require_workspace_id(workspace_id)
+
+    def list(self):
+        with self._tx() as tx:
+            return [dict(r) for r in tx.fetchall(
+                'SELECT login, role, expires_at, invited_by FROM invites WHERE workspace_id=? ORDER BY login',
+                (self.workspace_id,))]
+
+    def create(self, login, role, invited_by, *, plans=None, operator=False):
+        from datetime import datetime, timedelta, timezone
+        import hashlib
+        login = validate_login(login)
+        if role not in ('admin', 'member', 'viewer'):
+            raise ClientError('invalid role')
+        token = secrets.token_urlsafe(32)
+        digest = hashlib.sha256(token.encode('ascii')).hexdigest()
+        with self._tx(write=True) as tx:
+            tx.advisory_lock('users')
+            account = AccountRepo(self.db).get(login, tx)
+            if account and MembershipRepo(self.db, self.workspace_id).get(account['id'], tx):
+                raise ClientError('membership already exists')
+            if account:
+                AccountRepo(self.db).require_attachable(account, self.workspace_id, tx, operator=operator)
+            if plans is not None:
+                pending = tx.fetchone(
+                    'SELECT 1 FROM invites WHERE workspace_id=? AND login=? AND expires_at>?',
+                    (self.workspace_id, login, layout.format_timestamp(plans.clock())))
+                if not (account is None and pending is not None):
+                    plans.check_people(self.db, self.workspace_id, tx)
+            if account:
+                MembershipRepo(self.db, self.workspace_id).add(account['id'], role, tx)
+                return None
+            tx.execute(self.db.dialect.upsert('invites',
+                       ('workspace_id', 'login', 'role', 'sha256', 'expires_at', 'invited_by'),
+                       ('workspace_id', 'login'), ('role', 'sha256', 'expires_at', 'invited_by')),
+                       (self.workspace_id, login, role, digest,
+                        layout.format_timestamp(datetime.now(timezone.utc) + timedelta(hours=72)), invited_by))
+        return token
+
+    @staticmethod
+    def find_pending(db, token):
+        """Return a live workspace invite for ``token``, or None."""
+        from datetime import datetime, timezone
+        import hashlib
+        import hmac
+        if not isinstance(token, str) or not token:
+            return None
+        try:
+            digest = hashlib.sha256(token.encode('ascii')).hexdigest()
+        except UnicodeEncodeError:
+            return None
+        with db.transaction() as tx:
+            tx.cross_workspace('invite lookup by token')
+            row = tx.fetchone('SELECT * FROM invites WHERE sha256=?', (digest,))
+            if row is None or not hmac.compare_digest(row['sha256'], digest):
+                return None
+            try:
+                if layout.parse_timestamp(row['expires_at']) <= datetime.now(timezone.utc):
+                    return None
+            except (TypeError, ValueError):
+                return None
+            workspace = WorkspaceRepo(db).by_id(row['workspace_id'], tx)
+            if workspace is None or workspace['status'] != 'active':
+                return None
+            return dict(row)
+
+    def redeem(self, token, password=None):
+        from datetime import datetime, timezone
+        import hashlib
+        import hmac
+        import json
+        from ..users import _password_record, InviteInvalid
+        record = None if password is None else _password_record(password)
+        try:
+            digest = hashlib.sha256(token.encode('ascii')).hexdigest()
+        except (AttributeError, UnicodeEncodeError) as exc:
+            raise InviteInvalid('invalid invite') from exc
+        with self._tx(write=True) as tx:
+            tx.advisory_lock('users')
+            workspace = WorkspaceRepo(self.db).by_id(self.workspace_id, tx)
+            invite = tx.fetchone('SELECT * FROM invites WHERE workspace_id=? AND sha256=?',
+                                (self.workspace_id, digest))
+            if (not workspace or workspace['status'] != 'active' or not invite or
+                    not hmac.compare_digest(invite['sha256'], digest) or
+                    layout.parse_timestamp(invite['expires_at']) <= datetime.now(timezone.utc)):
+                raise InviteInvalid('invalid invite')
+            account = AccountRepo(self.db).get(invite['login'], tx)
+            existing = account is not None
+            if account is None:
+                if record is None:
+                    raise InviteInvalid('invalid invite')
+                aid = secrets.token_hex(16)
+                tx.execute('INSERT INTO accounts (id, login, display_name, password, created_at, created_by) '
+                           'VALUES (?, ?, ?, ?, ?, ?)', (aid, invite['login'], invite['login'], json.dumps(record),
+                                                        layout.format_timestamp(), invite['invited_by']))
+            else:
+                # A token made before the account was detached does not re-attach
+                # it; a verified Firebase email (redeem_firebase) still can.
+                AccountRepo(self.db).require_attachable(account, self.workspace_id, tx)
+                aid = account['id']
+            MembershipRepo(self.db, self.workspace_id).add(aid, invite['role'], tx)
+            tx.execute('DELETE FROM invites WHERE workspace_id=? AND login=?', (self.workspace_id, invite['login']))
+        if existing:
+            from ..users import InviteExistingAccount
+            raise InviteExistingAccount(aid)
+        return aid
+
+    def revoke(self, login):
+        login = validate_login(login)
+        with self._tx(write=True) as tx:
+            tx.advisory_lock('users')
+            row = tx.fetchone('SELECT * FROM invites WHERE workspace_id=? AND login=?',
+                              (self.workspace_id, login))
+            if row is None:
+                return None
+            tx.execute('DELETE FROM invites WHERE workspace_id=? AND login=?',
+                       (self.workspace_id, login))
+            return dict(row)
+
+    @staticmethod
+    def redeem_firebase(db, token, uid, email, verified, display_name=None):
+        """Accept a workspace invite for a Firebase identity in one transaction.
+
+        The uid's account (already linked, claimable by email, or newly created
+        credential-less with ``login = email``) receives the membership and the
+        invite is deleted. Email matching is re-checked under the lock so a
+        mismatch never redeems.
+        """
+        from datetime import datetime, timezone
+        import hashlib
+        import hmac
+
+        from ..users import InviteAccountExists, InviteEmailMismatch, InviteInvalid
+
+        if not isinstance(token, str) or not token:
+            raise InviteInvalid('invalid invite')
+        try:
+            digest = hashlib.sha256(token.encode('ascii')).hexdigest()
+        except UnicodeEncodeError as exc:
+            raise InviteInvalid('invalid invite') from exc
+        accounts = AccountRepo(db)
+        with db.transaction(write=True) as tx:
+            tx.cross_workspace('invite redeem by token')
+            tx.advisory_lock('users')
+            invite = tx.fetchone('SELECT * FROM invites WHERE sha256=?', (digest,))
+            if invite is None or not hmac.compare_digest(invite['sha256'], digest):
+                raise InviteInvalid('invalid invite')
+            try:
+                if layout.parse_timestamp(invite['expires_at']) <= datetime.now(timezone.utc):
+                    raise InviteInvalid('invalid invite')
+            except (TypeError, ValueError) as exc:
+                raise InviteInvalid('invalid invite') from exc
+            workspace = WorkspaceRepo(db).by_id(invite['workspace_id'], tx)
+            if workspace is None or workspace['status'] != 'active':
+                raise InviteInvalid('invalid invite')
+            login = invite['login']
+            if (not verified or not is_email_login(login)
+                    or not emails_equal(email, login)):
+                raise InviteEmailMismatch()
+            account = accounts.by_firebase_uid(uid, tx)
+            if account is None and accounts.claimable(email, tx):
+                account = accounts.get(email, tx)
+            if account is None:
+                existing = accounts.get(email, tx)
+                if existing is not None and (
+                        existing['password'] is not None or existing['identity'] is not None):
+                    raise InviteAccountExists()
+                try:
+                    account = accounts.create(
+                        email, display_name or email, invite['invited_by'], tx)
+                except ClientError:
+                    account = accounts.by_firebase_uid(uid, tx)
+                    if account is None and accounts.claimable(email, tx):
+                        account = accounts.get(email, tx)
+                    if account is None:
+                        existing = accounts.get(email, tx)
+                        if existing is not None and (
+                                existing['password'] is not None or existing['identity'] is not None):
+                            raise InviteAccountExists()
+                        raise InviteInvalid('invalid invite')
+            if account.get('firebase_uid') is None:
+                try:
+                    accounts.link_firebase(account['id'], uid, email, verified, tx)
+                except (ClientError, DatabaseError):
+                    linked = accounts.by_firebase_uid(uid, tx)
+                    if linked is None:
+                        raise
+                    account = linked
+            tx.bind_workspace(invite['workspace_id'])
+            members = MembershipRepo(db, invite['workspace_id'])
+            if members.get(account['id'], tx) is None:
+                members.add(account['id'], invite['role'], tx)
+            tx.execute('DELETE FROM invites WHERE workspace_id=? AND login=?',
+                       (invite['workspace_id'], invite['login']))
+            return dict(tx.fetchone('SELECT * FROM accounts WHERE id=?', (account['id'],)))

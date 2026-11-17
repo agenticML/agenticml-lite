@@ -41,7 +41,10 @@ FOLLOW_INTERVAL = 30.0
 HEARTBEAT = 60.0
 BACKOFF_MAX = 300.0
 FAILURE_REMINDER = 600.0
+LIMIT_RETRY = 600.0
+_QUOTA_PREFIXES = ("storage limit reached", "daily upload limit reached")
 _BACKOFF_EXP_CAP = 16
+_clock = time.monotonic
 _ATOMIC = re.compile(r"(?:meta\.json|artifacts\.json|scalars/index\.json|media/index\.json|scalars/(?:0|[1-9][0-9]{0,8})\.ovw)")
 _APPEND = re.compile(r"(?:events\.jsonl|scalars/_time\.bin|scalars/(?:0|[1-9][0-9]{0,8})\.bin)")
 _TRANSIENT_STATUS = frozenset({408, 429})
@@ -120,16 +123,95 @@ def _save_state(reader, host, state):
 
 
 def _clear_host_state(reader, host):
-    # ``pruned`` / ``pruned_hosts`` stay. Reset must not make a pruned run
-    # look like it still has its raw series.
+    # Forgets every workspace's cursor on this host; the next sync rebuilds
+    # each from the server's /state. ``pruned`` / ``pruned_hosts`` stay:
+    # reset must not make a pruned run look like it still has its raw series.
     path = reader.run_dir / "sync.json"
     if not path.exists():
         return
     data = _load_state(reader)
-    if host not in data.get("hosts", {}):
+    names = _host_keys(data["hosts"], host)
+    if not names:
         return
-    data["hosts"].pop(host, None)
+    for name in names:
+        data["hosts"].pop(name, None)
     _publish_sync_state(reader, data)
+
+
+def _state_key(host, workspace):
+    """The ``sync.json`` key for one server and workspace.
+
+    3.0 servers name the key's workspace in ``/v2/whoami``; every workspace on
+    a hosted server shares one host, so each keeps its own cursor under
+    ``<host>/w/<slug>`` (the workspace's dashboard path). 2.x servers have no
+    workspaces and keep the bare host.
+    """
+    if not isinstance(workspace, str) or not workspace:
+        return host
+    return f"{host.rstrip('/')}/w/{workspace}"
+
+
+def _host_keys(hosts, host):
+    """Every key in ``hosts`` that belongs to ``host``: bare, or per workspace.
+
+    A second server mounted under ``<host>/w/<name>`` would share these keys;
+    servers are served at the root of their address, so that is unsupported.
+    """
+    prefix = host.rstrip("/") + "/w/"
+    return [name for name in hosts if name == host or (isinstance(name, str) and name.startswith(prefix))]
+
+
+def _dry_run_key(reader, host):
+    """Best cursor for a dry run or a count, which has no key and so no workspace.
+
+    The only entry this host has, if there is exactly one; else one this host
+    pruned (so a pruned run is not reported as blocked); else the bare host.
+    """
+    data = _load_state(reader)
+    hosts = data["hosts"]
+    names = [name for name in _host_keys(hosts, host)
+             if isinstance(hosts[name], dict) and hosts[name].get("protocol") == 2]
+    if len(names) == 1:
+        return names[0]
+    pruned = [name for name in names if hosts[name].get("pruned")]
+    return pruned[0] if pruned else host
+
+
+def _workspace_state(reader, client, host, key):
+    """Load the cursor for ``key``, adopting a host-only entry from an older client.
+
+    Clients before package 24.11 kept one cursor per host. That entry moves to
+    this workspace only if the server has the run here and it belongs to this
+    key's user, and then with ``complete`` cleared so this pass commits again
+    and the server checks the sizes. Otherwise this workspace starts empty
+    (the first pass asks /state) and the host-only entry is left for the
+    workspace that has the run.
+    """
+    data = _load_state(reader)
+    hosts = data["hosts"]
+    legacy = hosts.get(host)
+    if (key == host or key in hosts or not isinstance(legacy, dict)
+            or legacy.get("protocol") != 2):
+        return _host_state(reader, key)
+    remote = client.run_state(reader.run_id)
+    if remote is None:
+        return _host_state(reader, key)
+    _check_owner(reader, client, remote)
+    # Re-read after the request: ``sync --reset`` takes no run lock.
+    data = _load_state(reader)
+    hosts = data["hosts"]
+    if key in hosts or hosts.get(host) != legacy:
+        return _host_state(reader, key)
+    hosts.pop(host)
+    hosts[key] = {**legacy, "complete": False}
+    if legacy.get("pruned"):
+        recorded = data.get("pruned_hosts")
+        recorded = recorded if isinstance(recorded, list) else []
+        if key not in recorded:
+            recorded.append(key)
+        data["pruned_hosts"] = recorded
+    _publish_sync_state(reader, data)
+    return _host_state(reader, key)
 
 
 def _acquire_lock(run_dir):
@@ -717,15 +799,35 @@ def _push_byref(reader, client, state, candidates, result, save, sizes, overflow
     sizes["artifacts.json"] = len(body)
     if state["files"].get("artifacts.json", {}).get("sha256") == digest:
         return
-    try:
-        client.put_file(reader.run_id, "artifacts.json", body)
-    except Conflict as exc:
-        _check_owner(reader, client, exc.payload)
-        raise
+    _put_atomic(reader, client, state, save, "artifacts.json", body)
     state["files"]["artifacts.json"] = {"size": len(body), "sha256": digest}
     result.files += 1
     result.bytes += len(body)
     save()
+
+
+def _put_atomic(reader, client, state, save, name, body):
+    """PUT an atomic file; on any failure forget its cursor entry.
+
+    The server renames the new bytes into place before it answers, so after a
+    lost response the old acknowledged sha no longer describes the server.
+    Dropping the entry makes the next pass send the local bytes again (the PUT
+    is idempotent) instead of skipping the file by hash. Residual: a kill
+    between the server's rename and the except block below never runs the
+    drop; any client that calls /state recovers the real hashes.
+    """
+    try:
+        return client.put_file(reader.run_id, name, body)
+    except BaseException as exc:
+        if state["files"].pop(name, None) is not None:
+            try:
+                save()
+            except Exception:  # Keep the original failure; the in-memory drop still holds for this pass.
+                logging.getLogger(__name__).warning(
+                    "could not save the sync state after a failed upload of %s", name, exc_info=True)
+        if isinstance(exc, Conflict):
+            _check_owner(reader, client, exc.payload)
+        raise
 
 
 def _check_owner(reader, client, payload):
@@ -736,6 +838,9 @@ def _check_owner(reader, client, payload):
             raise OwnershipError(
                 f"run id {reader.run_id} belongs to user {payload['owner_user']} on this server")
     elif owner and owner != identity["key"]:
+        # Only servers without `user` in whoami (2.0/2.1) get here. A 3.0
+        # server's `owner` is the user name, so this key-name comparison is
+        # meaningless against it (and always has `user`).
         raise OwnershipError(f"run id {reader.run_id} belongs to key {owner} on this server")
 
 
@@ -811,7 +916,12 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False, ar
         # advertise this incomplete snapshot as synced to gc or prune it.
         source_hash = hashlib.sha256(json.dumps({name: {k: v for k, v in item.items() if k != "data"}
                                                 for name, item in files.items()}, sort_keys=True).encode()).hexdigest()
-    state = _host_state(reader, host)
+    if dry_run:
+        key = _dry_run_key(reader, host)
+        state = _host_state(reader, key)
+    else:
+        key = _state_key(host, _identity(client).get("workspace"))
+        state = _workspace_state(reader, client, host, key)
     features = (["lineage"] + (["byref"] if artifacts else [])) if dry_run else list(
         _identity(client).get("features") or [])
     lineage_commit = _local_lineage(reader, features, state)
@@ -821,9 +931,9 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False, ar
 
     def save():
         if not dry_run:
-            _save_state(reader, host, state)
+            _save_state(reader, key, state)
 
-    block = _pruned_upload_block(reader, host, state)
+    block = _pruned_upload_block(reader, key, state)
     if block:
         result.failed = result.permanent = True
         result.status = f"failed: {block}"
@@ -922,11 +1032,7 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False, ar
         snapshot = files[name]
         if not force and state["files"].get(name, {}).get("sha256") == snapshot["sha256"]:
             return
-        try:
-            client.put_file(reader.run_id, name, snapshot["data"])
-        except Conflict as exc:
-            _check_owner(reader, client, exc.payload)
-            raise
+        _put_atomic(reader, client, state, save, name, snapshot["data"])
         state["files"][name] = {"size": snapshot["size"], "sha256": snapshot["sha256"]}
         sent_files.add(name)
         result.files = len(sent_files)
@@ -1105,6 +1211,18 @@ def _short_error(exc):
     return type(exc).__name__
 
 
+def _is_quota_limit(exc):
+    """True for 403s that `--follow` retries instead of dropping."""
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) != 403:
+        return False
+    return _error_detail(response).startswith(_QUOTA_PREFIXES)
+
+
+def _follow_attempt_done(run_id):
+    """Hook after a follow attempt has updated quota_until. Tests wait on this."""
+
+
 def _permanent_failure(exc):
     if isinstance(exc, RunMissingError):
         return False
@@ -1244,7 +1362,7 @@ def _order_runs_lineage(root, run_ids):
 
 
 def _selected_ids(root, host, explicit, include_all, prune=False, key=None, features=(), artifacts=False,
-                  user=None):
+                  user=None, workspace=None, dry_run=False):
     selected = list(dict.fromkeys(explicit))
     if include_all:
         for meta in list_runs(root):
@@ -1253,7 +1371,10 @@ def _selected_ids(root, host, explicit, include_all, prune=False, key=None, feat
                 continue
             try:
                 reader = RunReader(root, run_id)
-                state = _host_state(reader, host)
+                # A run with only a pre-24.11 host-only cursor is selected once;
+                # sync_run then adopts or replaces that cursor.
+                state = _host_state(reader, _dry_run_key(reader, host) if dry_run
+                                    else _state_key(host, workspace))
                 if _sync_idle(reader, state, _source_hash(reader), key=key, features=features,
                               artifacts=artifacts, user=user):
                     if not (prune and not state.get("pruned")) and (key is None or state.get("owner") == key):
@@ -1280,6 +1401,8 @@ def _follow(args, root, host, api_key):
     last_status = {}
     failure_log = _FailureLog()
     permanent_ids = set()
+    quota_until = {}
+    quota_announced = set()
     consecutive = 0
     active = None
     byref_warned = False
@@ -1299,7 +1422,9 @@ def _follow(args, root, host, api_key):
                 previous[sig] = signal.getsignal(sig)
                 signal.signal(sig, handle)
         client = Client(base_url=host, api_key=api_key, insecure=args.insecure, stop=stop)
-        selected = _selected_ids(root, host, run_ids, include_all, prune=prune)
+        # Only for the count below; the identity (and so the workspace) is
+        # read in the loop, so use the dry-run cursor guess here.
+        selected = _selected_ids(root, host, run_ids, include_all, prune=prune, dry_run=True)
         print(f"following {host}: {len(selected)} runs, every {interval:g}s", flush=True)
         while True:
             if stop.is_set():
@@ -1331,45 +1456,69 @@ def _follow(args, root, host, api_key):
                 selected = [rid for rid in _selected_ids(
                     root, host, run_ids, include_all, prune=prune, key=identity["key"],
                     features=identity.get("features", []), artifacts=artifacts, user=identity.get("user"),
+                    workspace=identity.get("workspace"),
                 ) if rid not in permanent_ids]
                 failure_log.prune(selected)
+                keep = set(selected)
+                quota_until = {rid: until for rid, until in quota_until.items() if rid in keep}
+                quota_announced.intersection_update(keep)
+                now = _clock()
                 for run_id in selected:
                     if stop.is_set():
                         raise SyncStopped()
+                    if quota_until.get(run_id, 0) > now:
+                        continue
                     active = SyncResult(run_id)
                     results[run_id] = active
+                    skip_emit = False
                     try:
-                        reader = RunReader(root, run_id)
                         try:
-                            if _effective(reader, reader.meta()) == "running":
-                                saw_running = True
-                        except Exception:
-                            pass
-                        sync_run(reader, host, client, active, prune=prune, artifacts=artifacts)
-                    except SyncStopped:
-                        raise
-                    except Exception as exc:
-                        if _is_unauthorized(exc):
-                            print(f"agenticml sync: {_short_error(exc)}", file=sys.stderr)
-                            return 3
-                        if _is_unreachable(exc):
-                            unreachable = exc
+                            reader = RunReader(root, run_id)
+                            try:
+                                if _effective(reader, reader.meta()) == "running":
+                                    saw_running = True
+                            except Exception:
+                                pass
+                            sync_run(reader, host, client, active, prune=prune, artifacts=artifacts)
+                        except SyncStopped:
+                            raise
+                        except Exception as exc:
+                            if _is_unauthorized(exc):
+                                print(f"agenticml sync: {_short_error(exc)}", file=sys.stderr)
+                                return 3
+                            if _is_unreachable(exc):
+                                unreachable = exc
+                                active.failed = True
+                                active.status = f"failed: {_short_error(exc)}"
+                                active = None
+                                break
                             active.failed = True
                             active.status = f"failed: {_short_error(exc)}"
-                            active = None
-                            break
-                        active.failed = True
-                        active.permanent = _permanent_failure(exc)
-                        active.status = f"failed: {_short_error(exc)}"
-                        if active.permanent:
-                            permanent_ids.add(run_id)
-                    else:
-                        if active.status == "partial (running)":
-                            saw_running = True
-                        if active.permanent:
-                            permanent_ids.add(run_id)
-                    _emit_follow(active, last_status, failure_log)
-                    active = None
+                            if _is_quota_limit(exc):
+                                quota_until[run_id] = _clock() + LIMIT_RETRY
+                                if run_id not in quota_announced:
+                                    print(active.line(), flush=True)
+                                    last_status[run_id] = active.status
+                                    quota_announced.add(run_id)
+                                skip_emit = True
+                            else:
+                                quota_until.pop(run_id, None)
+                                quota_announced.discard(run_id)
+                                active.permanent = _permanent_failure(exc)
+                                if active.permanent:
+                                    permanent_ids.add(run_id)
+                        else:
+                            quota_until.pop(run_id, None)
+                            quota_announced.discard(run_id)
+                            if active.status == "partial (running)":
+                                saw_running = True
+                            if active.permanent:
+                                permanent_ids.add(run_id)
+                        if not skip_emit:
+                            _emit_follow(active, last_status, failure_log)
+                        active = None
+                    finally:
+                        _follow_attempt_done(run_id)
             if unreachable is None and run_ids:
                 pending = False
                 failed = False
@@ -1484,7 +1633,9 @@ def cmd_sync(args):
                                      features=_identity(client).get("features", []) if client is not None else (
                                          ["lineage"] + (["byref"] if artifacts else [])),
                                      artifacts=artifacts,
-                                     user=_identity(client).get("user") if client is not None else None)
+                                     user=_identity(client).get("user") if client is not None else None,
+                                     workspace=_identity(client).get("workspace") if client is not None else None,
+                                     dry_run=client is None)
             failure_log.prune(selected)
             if not selected and args.all:
                 print("up to date", flush=True)
