@@ -5,7 +5,7 @@ sidebar:
   order: 2
 ---
 
-The server is part of the `agenticml-lite` package (Python 3.10+, POSIX only). It needs version 3.0, which is a pre-release installed from GitHub until it is on PyPI.
+The server is part of the `agenticml-lite` package (Python 3.10+, POSIX only). It needs version 3.0 or newer.
 
 ## Installation
 
@@ -14,12 +14,6 @@ Create a dedicated virtual environment and install `agenticml-lite`:
 ```bash
 sudo python3 -m venv /opt/agenticml
 sudo /opt/agenticml/bin/python -m pip install agenticml-lite
-```
-
-3.0 is not on PyPI yet, so this installs 1.0.0, which has no server. Until 3.0 is published, install it from GitHub instead (this follows the `dev` branch, so it moves as development continues):
-
-```bash
-sudo /opt/agenticml/bin/python -m pip install 'agenticml-lite @ git+https://github.com/agenticML/agenticml-lite@dev'
 ```
 
 ### Optional server extras
@@ -40,7 +34,7 @@ sudo /opt/agenticml/bin/pip install "agenticml-lite[firebase]"
 sudo /opt/agenticml/bin/pip install "agenticml-lite[hosted]"
 ```
 
-While 3.0 is only on GitHub, add the source to the extra, for example `'agenticml-lite[hosted] @ git+https://github.com/agenticML/agenticml-lite@dev'`.
+The hosted bundle is `'agenticml-lite[hosted]'`.
 
 ## Running the server
 
@@ -92,11 +86,10 @@ For production deployments on Linux, run the server as a systemd system service 
    ```bash
    sudo python3 -m venv /opt/agenticml
    sudo /opt/agenticml/bin/python -m pip install agenticml-lite
-   # 3.0 is not on PyPI yet; use the GitHub install shown under Installation instead
    sudo useradd --system --home /var/lib/agenticml-server --shell /usr/sbin/nologin agenticml
-   sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/main/deploy/systemd/agenticml-server.service
+   sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v3.0.0/deploy/systemd/agenticml-server.service
    ```
-   The unit is fetched from `main` because there is no 3.0 tag yet. Once 3.0.0 is released, use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`).
+   The unit is fetched from the `v3.0.0` tag. Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`).
 2. Edit `AGENTICML_SERVER_PUBLIC_URL` in the unit (or `sudo systemctl edit agenticml-server`), then reload systemd:
    ```bash
    sudo systemctl daemon-reload

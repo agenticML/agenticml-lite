@@ -11,14 +11,11 @@ Use this table to choose the version for your setup:
 
 | Path | Version | Install command |
 | --- | --- | --- |
-| Local tracking only | 1.0.0 from PyPI | `pip install agenticml-lite` |
-| Local tracking only | 3.0 from GitHub | `pip install 'agenticml-lite[system] @ git+https://github.com/agenticML/agenticml-lite@dev'` |
-| Self-hosted server | 3.0 from GitHub | `pip install 'agenticml-lite[system] @ git+https://github.com/agenticML/agenticml-lite@dev'` |
-| Hosted service | 3.0 client from GitHub | `pip install 'agenticml-lite[system] @ git+https://github.com/agenticML/agenticml-lite@dev'` |
+| Local tracking only | 3.0.0 from PyPI | `pip install agenticml-lite` |
+| Self-hosted server | 3.0.0 from PyPI | `pip install 'agenticml-lite[system]'` |
+| Hosted service | 3.0.0 from PyPI | `pip install 'agenticml-lite[system]'` |
 
-`pip install agenticml-lite` installs 1.0.0 from PyPI. It supports local tracking only. It cannot sync to a 2.x or 3.0 server.
-
-Version 3.0 includes the server and hosted service support. It is a pre-release and is not on PyPI yet. Install it from GitHub. This command follows the `dev` branch, so what you get moves with development.
+`pip install agenticml-lite` installs 3.0.0, which includes the server and hosted service support. To stay on 1.0.0, run `pip install agenticml-lite==1.0.0`. Version 1.0.0 supports local tracking only. It cannot sync to a 2.x or 3.0 server.
 
 A 2.2 client has not been checked against the hosted service. Use the 3.0 client.
 
@@ -34,16 +31,14 @@ This works on every version. The `agenticml --version` command works from 3.0. O
 
 ---
 
-## 3.0
+## 3.0.0
 
-**Status:** Pre-release. The hosted service is in public preview.
+**Status:** Released Nov 17, 2026 (tag `v3.0.0`). On PyPI. The hosted service is in public preview.
 
-Version 3.0 is on the `dev` branch. It is not tagged and is not on PyPI yet. The `pyproject.toml` version there is 3.0.0.
-
-Install from GitHub:
+Install from PyPI:
 
 ```bash
-pip install 'agenticml-lite[system] @ git+https://github.com/agenticML/agenticml-lite@dev'
+pip install 'agenticml-lite[system]'
 ```
 
 ### Features
@@ -136,7 +131,7 @@ Version 2.0 was merged to `dev` in pull requests from Nov 3 to Nov 5, 2026, and 
 
 **Status:** Released Nov 1, 2026 (tag `v1.0.0`). On PyPI.
 
-Version 1.0.0 is the only release published on PyPI.
+Version 1.0.0 was the first release on PyPI. Version 3.0.0 replaces it.
 
 ### Features
 

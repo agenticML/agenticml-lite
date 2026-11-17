@@ -12,15 +12,7 @@ pip install agenticml-lite
 ```
 
 :::note[Which version you get]
-`pip install agenticml-lite` installs 1.0.0, the local tracker. It cannot sync to a server.
-
-Version 3.0 adds the self-hosted server and the hosted service. It is a pre-release and is not on PyPI yet. Install it from GitHub:
-
-```bash
-pip install 'agenticml-lite[system] @ git+https://github.com/agenticML/agenticml-lite@dev'
-```
-
-This command follows the `dev` branch, so what you get changes as development continues. See [Releases](/agenticml-lite/releases/) for what each version includes.
+`pip install agenticml-lite` installs 3.0.0, which adds the self-hosted server and the hosted service. To stay on the 1.0.0 local tracker, which cannot sync to a server, run `pip install agenticml-lite==1.0.0`. See [Releases](/agenticml-lite/releases/) for what each version includes.
 :::
 
 ## Optional extras
