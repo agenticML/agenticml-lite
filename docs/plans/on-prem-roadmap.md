@@ -36,7 +36,7 @@ plans live next to it:
 | **2.0** | Self-hosted server, single user | Test CI, server ingest, protocol v2 sync, shared dashboard with key login and key issuing, `sync --follow`, systemd units and server guide (PyPI only; no container image) | Release checklist in the 2.0 plan, section 8 |
 | **2.1** | Full fidelity | Lineage code diffs on the server, by-reference artifacts, EFS performance check, operator tooling | A run synced to the server is indistinguishable from the local one in the dashboard, apart from notes |
 | **2.2** | Teams | Users and roles, per-user keys, dashboard sign-in through a trusted identity proxy, audit log | Two users with different roles share one server, each with the access their role allows, and every write is attributed |
-| **3.0** | Database storage, workspaces and hosted service | Server state in SQLite or Postgres, workspaces with accounts and memberships on one hostname, Firebase sign-in and self-serve sign-up with free limits, many server processes, S3 objects, metric summaries, AWS deployment, agenticml-server retired | Exit criteria 1–6 in the [3.0 plan](on-prem-3.0-plan.md) |
+| **3.0** | Database storage, workspaces and hosted service | Server state in SQLite or Postgres, workspaces with accounts and memberships on one hostname, Firebase sign-in and self-serve sign-up with free limits, many server processes, S3 objects, metric summaries, AWS deployment, agenticml-server retired | Exit criteria 1–6 in the [3.0 plan](on-prem-3.0-plan.md); released Nov 17, 2026 as 3.0.0 (tag `v3.0.0`, [PyPI](https://pypi.org/project/agenticml-lite/3.0.0/), [GitHub release](https://github.com/agenticML/agenticml-lite/releases/tag/v3.0.0)) |
 | Later | Scale and lifecycle | Unscheduled; see below | – |
 
 Decision (Nov 5, 2026): the server ships only as the `agenticml-lite`
@@ -191,6 +191,11 @@ the Postgres backend, runs beside 18b; 19.2 needs 18c's tables); 22 and 23
 after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live; 28
 after 27; 29 after 24.7 and 27, beside 24.3 (29.7 and 29.9 wait on the owner); 30 (Backlog cleanup) last, before the merge to `main`.
 
+Released Nov 17, 2026: `dev` merged into `main` in
+[#80](https://github.com/agenticML/agenticml-lite/pull/80) (`d1465a2`), TestPyPI
+dry run 44138465918, tag `v3.0.0`, Publish run 44139009661, 3.0.0 on PyPI
+(wheel and sdist) and the GitHub release.
+
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | 16 † | Database layer, SQLite backend, migrations; users, keys, sessions, throttle, audit in tables | 2.2 | Codex | L | [plan](packages/16-database-layer.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
@@ -241,7 +246,7 @@ after 27; 29 after 24.7 and 27, beside 24.3 (29.7 and 29.9 wait on the owner); 3
 | 24.11d | Docs: runbook sync section, SERVER.md, PROTOCOL.md, README, website hosted workspaces and storage pages | 24.11b, 24.11c | Antigravity | S | [plan](packages/24.11-phase-4-wrap-up.md) | done ([#65](https://github.com/agenticML/agenticml-lite/pull/65); Antigravity drafted, supervisor checked against the code) |
 | 24.12 | Phase 5 launch checks: `scripts/hosted_check.py` (make-run, verify, isolation), runbook section, roadmap rows | 24.11 | Sonnet; supervisor reviews | S | [plan](packages/24.12-phase-5-launch-checks.md) | done (Nov 16, 2026; 5.1 to 5.6 run and recorded; the 5.5 email confirmation is pending the owner) |
 | 24.13 | Phase 6 restore drill and real-EFS benchmark: `scripts/restore_drill/`, tests, runbook, results | 24.12 | Sonnet; supervisor reviews and runs | M | [plan](packages/24.13-phase-6-restore-drill.md) | done (Nov 16, 2026; drill and benchmark run; resources removed) |
-| 25 | Docs, threat model, version 3.0.0 | 16–24 | Sonnet (Codex at limit); prose Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR; tag and PyPI release by the owner) |
+| 25 | Docs, threat model, version 3.0.0 | 16–24 | Sonnet (Codex at limit); prose Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR; released Nov 17, 2026: tag `v3.0.0`, PyPI 3.0.0) |
 | 25.1 | Client support window (426), version 3.0.0, base-install smoke, 2.2 client check | 16–24 | Sonnet (Codex at limit) | S | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
 | 25.2 | SERVER.md, HOSTED.md, threat model, PROTOCOL.md, README, website, SECURITY.md | 25.1 | Antigravity | M | [plan](packages/25-docs-and-release.md) | done (3.0 PR) |
 | 26 | Retire agenticml-server | 24 live | Owner | S | – | not started |
@@ -249,7 +254,7 @@ after 27; 29 after 24.7 and 27, beside 24.3 (29.7 and 29.9 wait on the owner); 3
 | 28 | One Settings page: Account, Workspace, Members, API keys and Activity replace the Keys, Team and Account entries (like agenticml-server) | 27 | Sonnet | M | [plan](packages/28-settings-page.md) | done ([#63](https://github.com/agenticML/agenticml-lite/pull/63), Nov 13, 2026) |
 | 28.1 | One Admin entry: drop the "Server admin ↗" link from the Settings nav; the top-bar Admin link stays (owner's request on the design board, Nov 14, 2026) | 28 | Supervisor | S | [plan](packages/28.1-settings-nav-admin-link.md) | done ([#66](https://github.com/agenticML/agenticml-lite/pull/66), Nov 15, 2026) |
 | 28.2 | Top bar on every signed-in page: a Workspaces link back to `/workspaces` on workspace pages and `/admin`; Sign out and "Signed in as" on the `/workspaces` picker (owner's request, Nov 16, 2026) | 28.1 | Sonnet | S | [plan](packages/28.2-topbar-workspaces-signout.md) | done ([#71](https://github.com/agenticML/agenticml-lite/pull/71); Sonnet coded, supervisor reviewed, Nov 16, 2026) |
-| 29 | Docs site: Releases page (1.0–3.0), hosted service section with status, home page, truth fixes, docs CI, policies and sign-in links | 24.7, 27 | Sonnet; prose Antigravity | M | [plan](packages/29-docs-site.md) | done (Nov 16, 2026): merged ([#64](https://github.com/agenticML/agenticml-lite/pull/64), Nov 14) and published to `main` in the docs-only PR [#75](https://github.com/agenticML/agenticml-lite/pull/75) (Nov 16; Pages deploy run 43923087030). Policies filled and fact-checked Nov 15; policy links live on the sign-in pages since deploy run 43811140859 (Nov 16). Left for the owner: D6, email existing sign-ups; Enforce HTTPS moved to the "Docs custom domain" Backlog entry. 29.9 in review |
+| 29 | Docs site: Releases page (1.0–3.0), hosted service section with status, home page, truth fixes, docs CI, policies and sign-in links | 24.7, 27 | Sonnet; prose Antigravity | M | [plan](packages/29-docs-site.md) | done (Nov 16, 2026): merged ([#64](https://github.com/agenticML/agenticml-lite/pull/64), Nov 14) and published to `main` in the docs-only PR [#75](https://github.com/agenticML/agenticml-lite/pull/75) (Nov 16; Pages deploy run 43923087030). Policies filled and fact-checked Nov 15; policy links live on the sign-in pages since deploy run 43811140859 (Nov 16). Left for the owner: D6, email existing sign-ups; Enforce HTTPS moved to the "Docs custom domain" Backlog entry. 29.9 done ([#81](https://github.com/agenticML/agenticml-lite/pull/81)) |
 | 29.0 | Plan, roadmap rows, AWS roadmap Phase 7, Backlog entries | – | Supervisor | S | [plan](packages/29-docs-site.md) | done ([#64](https://github.com/agenticML/agenticml-lite/pull/64)) |
 | 29.1 | Truth fixes in existing pages and README | 29.0 | Sonnet | S | [plan](packages/29-docs-site.md) | done ([#64](https://github.com/agenticML/agenticml-lite/pull/64)) |
 | 29.2a | Docs CI: PR builds, link validator, Node pin, job permissions and concurrency | 29.1 | Sonnet | S | [plan](packages/29-docs-site.md) | done ([#64](https://github.com/agenticML/agenticml-lite/pull/64)) |
@@ -262,15 +267,15 @@ after 27; 29 after 24.7 and 27, beside 24.3 (29.7 and 29.9 wait on the owner); 3
 | 29.6 | Publish: docs-only PR to `main`; Pages HTTPS, repo description and homepage | 29.1–29.5, 29.2a–c, D3 | git agent; owner | S | [plan](packages/29-docs-site.md) | done (Nov 16, 2026): docs-only PR [#75](https://github.com/agenticML/agenticml-lite/pull/75) merged to `main` at 17:53 UTC; Pages deploy run 43923087030 succeeded; `/`, `/releases/`, `/hosted/`, `/hosted/quickstart/`, `/hosted/status/` and the three `/legal/` pages return 200; repo description and homepage set Nov 15. Enforce HTTPS is still refused ("The certificate does not exist yet"), so it moved to the "Docs custom domain" Backlog entry |
 | 29.7 † | Terms, acceptable use and privacy policy on the site; links on the sign-in and invite pages | 29.6 | Antigravity; owner and lawyer approve; Sonnet | M | [plan](packages/29-docs-site.md) | done (Nov 16, 2026): policies filled and fact-checked on `dev` (Nov 15; D4 delegated to the supervisor, 28 corrections, no row-level security claim, no lawyer review); the owner approved the text by merging [#75](https://github.com/agenticML/agenticml-lite/pull/75); † second review by Cursor of the links ([#64](https://github.com/agenticML/agenticml-lite/pull/64)). `HOSTED_LEGAL_BASE_URL=https://agenticml.github.io/agenticml-lite/legal/` set; deploy run 43811140859 (the #71 merge, package 28.2, head `10fd4ba`) approved by the owner and succeeded; `/login` and `/invite?token=x` show the three links in a browser, no console errors, no overflow at desktop width or 375px. Left for the owner: D6, email existing sign-ups |
 | 29.8 | Promotion: Sign in action, banner, header link | 29.7 | Sonnet | S | [plan](packages/29-docs-site.md) | done (Nov 16, 2026): built in [#64](https://github.com/agenticML/agenticml-lite/pull/64); header Sign in is a visible text link; live with [#75](https://github.com/agenticML/agenticml-lite/pull/75) |
-| 29.9 | After PyPI 3.0.0: `pip install`, tag URLs, release dates, `pyproject.toml` URLs | owner release | Sonnet | S | [plan](packages/29-docs-site.md) | in review (PR to dev, Nov 17, 2026; owner tags v3.0.0 after the main merge) |
-| 30 † | Backlog cleanup before the 3.0 release to `main`: every Backlog entry fixed, given an owner checklist, or moved to Later | 25, 29 | Sonnet; supervisor reviews (second review for † parts) | L | [plan](packages/30-backlog-cleanup.md) | in review ([#79](https://github.com/agenticML/agenticml-lite/pull/79); every part reviewed; † second reviews by the supervisor) |
-| 30.1 † | Sync integrity and doc truth: failed atomic upload drops the cursor, restore-window repair tests and runbook, `compat_owner` removed, limits and suspended-workspace texts | – | Sonnet | S–M | [plan](packages/30-backlog-cleanup.md) | in review ([#79](https://github.com/agenticML/agenticml-lite/pull/79); Sonnet coded, supervisor reviewed and did the † second review) |
-| 30.2 † | Account and workspace lifecycle: `server accounts delete`, workspace delete never skips a step, `workspaces orphans`/`cleanup`, detached accounts | – | Sonnet | M | [plan](packages/30-backlog-cleanup.md) | in review ([#79](https://github.com/agenticML/agenticml-lite/pull/79); Sonnet coded; supervisor reviewed with an adversarial review pass, three findings fixed; † second review by the supervisor) |
-| 30.3 † | Admin plan edits merge atomically and prefill free limits; Keys copy command without `--key`; metric picker refresh; workspace rename by its owner | 30.1, 30.2 | Sonnet | M | [plan](packages/30-backlog-cleanup.md) | in review ([#79](https://github.com/agenticML/agenticml-lite/pull/79); Sonnet coded; supervisor reviewed and did the † second review of the rename) |
-| 30.4 † | Sign-in pages: setup and invite in the new shell, theme toggle, Firebase page tests, invite token in the URL fragment on hosted | 30.1, 30.2 | Sonnet | M | [plan](packages/30-backlog-cleanup.md) | in review ([#79](https://github.com/agenticML/agenticml-lite/pull/79); Sonnet coded; supervisor reviewed with an adversarial review pass, no findings; † second review by the supervisor) |
-| 30.5 | Database: transaction connection cap, committed sizes per reader call, usage views on the database clock, 19.1 notes | 30.1, 30.2 | Sonnet | S–M | [plan](packages/30-backlog-cleanup.md) | in review ([#79](https://github.com/agenticML/agenticml-lite/pull/79); Sonnet coded, supervisor reviewed; session-lock pooling moved to Later) |
-| 30.6 | AWS template and CI: ECS init process, healthy-hosts alarm from DesiredCount, actions pinned to SHAs, weekly hosted monitor | – | Sonnet | S–M | [plan](packages/30-backlog-cleanup.md) | in review ([#79](https://github.com/agenticML/agenticml-lite/pull/79); Sonnet coded, supervisor reviewed) |
-| 30.7 | Roadmap and Backlog: owner checklists, deferred entries to Later, stale rows | 30.1–30.6 | Supervisor | S | [plan](packages/30-backlog-cleanup.md) | in review ([#79](https://github.com/agenticML/agenticml-lite/pull/79); Backlog rewritten: owner checklists, three entries moved to Later) |
+| 29.9 | After PyPI 3.0.0: `pip install`, tag URLs, release dates, `pyproject.toml` URLs | owner release | Sonnet | S | [plan](packages/29-docs-site.md) | done ([#81](https://github.com/agenticML/agenticml-lite/pull/81), Nov 17, 2026; released with 3.0.0: install lines, `v3.0.0` raw URLs and the Releases page checked live) |
+| 30 † | Backlog cleanup before the 3.0 release to `main`: every Backlog entry fixed, given an owner checklist, or moved to Later | 25, 29 | Sonnet; supervisor reviews (second review for † parts) | L | [plan](packages/30-backlog-cleanup.md) | done ([#79](https://github.com/agenticML/agenticml-lite/pull/79), merged Nov 17, 2026; every part reviewed; † second reviews by the supervisor) |
+| 30.1 † | Sync integrity and doc truth: failed atomic upload drops the cursor, restore-window repair tests and runbook, `compat_owner` removed, limits and suspended-workspace texts | – | Sonnet | S–M | [plan](packages/30-backlog-cleanup.md) | done ([#79](https://github.com/agenticML/agenticml-lite/pull/79), merged Nov 17, 2026; Sonnet coded, supervisor reviewed and did the † second review) |
+| 30.2 † | Account and workspace lifecycle: `server accounts delete`, workspace delete never skips a step, `workspaces orphans`/`cleanup`, detached accounts | – | Sonnet | M | [plan](packages/30-backlog-cleanup.md) | done ([#79](https://github.com/agenticML/agenticml-lite/pull/79), merged Nov 17, 2026; Sonnet coded; supervisor reviewed with an adversarial review pass, three findings fixed; † second review by the supervisor) |
+| 30.3 † | Admin plan edits merge atomically and prefill free limits; Keys copy command without `--key`; metric picker refresh; workspace rename by its owner | 30.1, 30.2 | Sonnet | M | [plan](packages/30-backlog-cleanup.md) | done ([#79](https://github.com/agenticML/agenticml-lite/pull/79), merged Nov 17, 2026; Sonnet coded; supervisor reviewed and did the † second review of the rename) |
+| 30.4 † | Sign-in pages: setup and invite in the new shell, theme toggle, Firebase page tests, invite token in the URL fragment on hosted | 30.1, 30.2 | Sonnet | M | [plan](packages/30-backlog-cleanup.md) | done ([#79](https://github.com/agenticML/agenticml-lite/pull/79), merged Nov 17, 2026; Sonnet coded; supervisor reviewed with an adversarial review pass, no findings; † second review by the supervisor) |
+| 30.5 | Database: transaction connection cap, committed sizes per reader call, usage views on the database clock, 19.1 notes | 30.1, 30.2 | Sonnet | S–M | [plan](packages/30-backlog-cleanup.md) | done ([#79](https://github.com/agenticML/agenticml-lite/pull/79), merged Nov 17, 2026; Sonnet coded, supervisor reviewed; session-lock pooling moved to Later) |
+| 30.6 | AWS template and CI: ECS init process, healthy-hosts alarm from DesiredCount, actions pinned to SHAs, weekly hosted monitor | – | Sonnet | S–M | [plan](packages/30-backlog-cleanup.md) | done ([#79](https://github.com/agenticML/agenticml-lite/pull/79), merged Nov 17, 2026; Sonnet coded, supervisor reviewed) |
+| 30.7 | Roadmap and Backlog: owner checklists, deferred entries to Later, stale rows | 30.1–30.6 | Supervisor | S | [plan](packages/30-backlog-cleanup.md) | done ([#79](https://github.com/agenticML/agenticml-lite/pull/79), merged Nov 17, 2026; Backlog rewritten: owner checklists, three entries moved to Later) |
 
 Getting the hosted service live on AWS, step by step: [AWS deployment roadmap](aws-deployment-roadmap.md).
 
@@ -387,39 +392,25 @@ Package 30 (Nov 17, 2026) cleared the Backlog before the 3.0 release: 21
 entries were fixed in parts 30.1–30.6 (for two of them, the many-process
 follow-ups and the metric picker, a remainder moved to "Later
 (unscheduled)"), the permissions boundary moved to Later, and the entries
-below are the ones that need the owner's accounts or machines. None of them blocks merging `dev` into `main`; the
-first one is the release itself.
+below are the ones that need the owner's accounts or machines. 3.0.0 was released
+on Nov 17, 2026; none of the entries below blocked it.
 
 ### Owner steps
 
-- **Release 3.0.0: tag and publish (owner)** (Nov 9, 2026; checklist Nov 17).
-  - Where: GitHub releases, PyPI, the `pypi` and `testpypi` environments.
-  - Problem: version 3.0.0 is set but nothing is tagged or published. The
-    `v2.2.0` tag was never created (the 2.2 client compatibility test falls
-    back to commit `bd0d499`). PyPI has only 1.0.0, so the docs show the git
-    install. The `pypi` environment has no required reviewer, so any pushed
-    `v*` tag publishes.
-  - Fix, in order:
-    1. Merge the 3.0 `dev` → `main` PR.
-    2. Add a required reviewer to the `pypi` environment (Settings →
-       Environments).
-    3. Dispatch `publish-testpypi.yml` on `main` once (it also proves the
-       actions newly pinned to commit SHAs in 30.6), then `pip install -i
-       https://test.pypi.org/simple/ agenticml-lite==3.0.0` in a clean venv.
-    4. `v2.2.0`: pushing it triggers `publish.yml` and would upload 2.2.0.
-       Recommended: `gh workflow disable publish.yml`, `git tag v2.2.0 bd0d499
-       && git push origin v2.2.0`, `gh workflow enable publish.yml` (or accept
-       2.2.0 on PyPI; harmless, 3.0.0 is newer).
-    5. `git tag -a v3.0.0 <merge commit> -m 'agenticml-lite 3.0.0' && git
-       push origin v3.0.0`; approve the `pypi` environment; watch Publish.
-    6. Check `pip install agenticml-lite==3.0.0` and `pip install
-       'agenticml-lite[hosted]'` in a clean venv; create the GitHub release
-       from `website/src/content/docs/releases.md`.
-    7. 29.9 was prepared before the release (owner's request, Nov 17); after
-       the tag, check the docs install lines and the `v3.0.0` raw URLs return
-       200.
-  - Done when: `pip install agenticml-lite==3.0.0` works and 29.9 is merged.
-  - Progress (Nov 16, 2026): the legal pages part is done.
+- **Release follow-ups (owner)** (3.0.0 released Nov 17, 2026). Low priority.
+  - Where: repository Settings → Environments → `pypi`; tags.
+  - Problem: the `pypi` environment has no required reviewer, so any pushed
+    `v*` tag publishes to PyPI at once (3.0.0 was published that way, with
+    the owner's go). The `v2.2.0` tag was never created (the 2.2 client
+    compatibility test falls back to commit `bd0d499`).
+  - Fix: (1) add a required reviewer to the `pypi` environment before the
+    next release; (2) optional: `gh workflow disable publish.yml`, `git tag
+    v2.2.0 bd0d499 && git push origin v2.2.0`, `gh workflow enable
+    publish.yml` (or skip it and remove the `v2.2.0` lookup from
+    `tests/test_server_client_window.py`).
+  - Done when: `gh api repos/agenticML/agenticml-lite/environments/pypi`
+    shows a `required_reviewers` rule, and `v2.2.0` exists or the decision to
+    skip it is recorded here.
 - **Two-task rolling deploy check** (package 24.3, owner). Low priority; not
   needed for the launch.
   - Where: `deploy/aws/README.md`, Launch checks 5.1.
