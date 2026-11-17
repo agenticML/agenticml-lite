@@ -68,11 +68,10 @@ def _fail(http_status, error, **extra):
     raise _RequestError(http_status, {"error": error, **extra})
 
 
-def compat_owner(principal, owner_user):
-    """Compatibility rule for /v2 owner fields (state, remote, and 409 payloads)."""
+def owner_fields(owner_user):
+    """The owner fields of /v2 state, remote and 409 payloads: both carry the real user."""
     real = owner_user if isinstance(owner_user, str) else None
-    shown = principal.key if real is not None and real == principal.user and principal.key else real
-    return {"owner": shown, "owner_user": real}
+    return {"owner": real, "owner_user": real}
 
 
 def _regular(path):
@@ -490,7 +489,7 @@ class IngestHandler(DashboardHandler):
         if not exists and not meta_write:
             _fail(404, "unknown run")
         if isinstance(owner, str) and owner != principal.user:
-            _fail(409, "run owned by another user", **compat_owner(principal, owner))
+            _fail(409, "run owned by another user", **owner_fields(owner))
         return self.workspace.run_index.as_remote(run_id) if row else {}
 
     def _atomic(self, run_id, name, body, record, principal, remote):
@@ -707,7 +706,7 @@ class IngestHandler(DashboardHandler):
                 files.update({name: {"size": size, "sha256": _hash_prefix(handle, size)}
                               for name, (handle, size) in snapshots.items()})
         owner = remote.get("owner")
-        fields = compat_owner(principal, owner)
+        fields = owner_fields(owner)
         shown_remote = {**remote, **fields}
         if owner != principal.user:
             shown_remote.pop("owner_key", None)

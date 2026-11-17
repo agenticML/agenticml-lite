@@ -12,7 +12,7 @@ The server protects seven primary assets:
 4. **API keys and machine credentials**: Stored in the server database (`keys` table) as SHA-256 digests. Plaintext keys are shown once upon creation and never stored or logged. Each key is bound to exactly one workspace.
 5. **User accounts and credentials**: Global accounts stored in the `accounts` table. Passwords are encrypted with computationally expensive `scrypt` hashes with unique random salts. Firebase accounts are bound to immutable Firebase user IDs (`firebase_uid`).
 6. **Workspace memberships and roles**: Stored in `memberships` table, defining whether an account can access a workspace and whether their role is `viewer`, `member`, `admin`, or `owner`.
-7. **Audit trail**: Append-only audit records stored in the `audit_events` table (or local `audit.jsonl`), tracking security-relevant actions, authentication, membership changes, plan updates, and deletions. No secrets are ever written to the audit log.
+7. **Audit trail**: Audit records, added but never edited (except that `server accounts delete` redacts the server-level entries that name the deleted account), stored in the `audit_events` table (or local `audit.jsonl`), tracking security-relevant actions, authentication, membership changes, plan updates, and deletions. No secrets are ever written to the audit log.
 
 ## Trust boundaries
 
@@ -32,7 +32,7 @@ Trust boundaries define the isolation model across single-tenant and multi-tenan
 - **Controls**:
   - **Explicit URL and key binding**: Dashboard and API routes require a workspace slug in the URL path (`/w/<slug>/...` and `/api/w/<slug>/...`). Sync API requests (`/v2/...`) derive the workspace directly from the bearer API key's cryptographic digest. A request can never default or fall back to an arbitrary workspace.
   - **Pre-handler authorization**: Before any route handler executes, the request is bound to a single workspace via `require_workspace_member` or `require_workspace_manager`. Data repositories cannot be instantiated without a verified `workspace_id`.
-  - **Uniform 404 responses**: Requests for non-existent workspaces, workspaces the caller does not belong to, and suspended workspaces all return identical HTTP `404 Not Found` responses. An attacker cannot enumerate valid workspace slugs.
+  - **Uniform 404 responses**: Requests on the dashboard and API for non-existent workspaces, workspaces the caller does not belong to, and suspended workspaces return identical HTTP `404 Not Found` responses. An attacker cannot enumerate valid workspace slugs. A sync client holding a valid key for a suspended workspace gets `403` `workspace suspended` (it already knows the workspace exists).
   - **PostgreSQL Row-Level Security (RLS)**: As defense-in-depth, PostgreSQL migrations define RLS policies on all workspace tables. The active workspace ID is set via `SET LOCAL app.workspace_id` within each transaction. Any query executing without the setting returns zero rows.
   - **Per-workspace object partitioning**: S3 objects are stored under `{prefix}/{workspace_id}/objects/{hh}/{sha256}`. Missing-object checks (`POST /v2/objects/missing`) inspect only the calling workspace's inventory. There is no cross-workspace object deduplication, preventing side-channel probing of whether another customer possesses a specific file.
   - **Isolation test suite**: CI runs a dedicated isolation suite that enumerates all server routes and asserts that cross-workspace access attempts return HTTP 404.
@@ -44,7 +44,7 @@ Trust boundaries define the isolation model across single-tenant and multi-tenan
   - **No ambient data access**: The `server_admin` flag grants authority over platform operations (workspace creation, quotas, account status), but grants no access to workspace runs, files, or metrics.
   - **Support access protocol**: If a customer requires support, a workspace administrator must explicitly invite the support user account as a `member` of their workspace.
   - **Audit logging**: Support invitations, member role assignments, and data access are permanently recorded in the workspace audit trail (`audit_events`).
-  - **Cloud infrastructure access**: AWS operators with ECS Exec have `ExecuteCommand` API calls recorded in AWS CloudTrail (including the `--command` string); interactive session contents are not logged (the cluster has no `ExecuteCommandConfiguration`).
+  - **Cloud infrastructure access**: AWS operators with ECS Exec have `ExecuteCommand` API calls recorded in AWS CloudTrail (including the `--command` string); interactive session contents are deliberately not logged (the cluster has no `ExecuteCommandConfiguration`), because keys and invite links printed in a session would be copied into CloudWatch; the task runs with an init process so session leftovers are reaped.
 
 ### 3. Shared Git processing of hostile bundles
 
@@ -71,7 +71,7 @@ Trust boundaries define the isolation model across single-tenant and multi-tenan
 - **Controls**:
   - **Verified email requirement**: First sign-in via Firebase requires a verified email address before an account or personal workspace is provisioned. Unverified accounts cannot create workspaces or accept invites.
   - **Free workspace quota**: Each user account is restricted to owning at most 1 workspace on the `free` plan.
-  - **Administrative suspension**: Server administrators can immediately suspend or delete abusive workspaces via the CLI or admin dashboard.
+  - **Administrative suspension**: Server administrators can immediately suspend or archive abusive workspaces on the admin dashboard or with the CLI. Permanent deletion is the CLI only (`server workspaces delete`).
 
 ### 6. Firebase authentication and token verification
 

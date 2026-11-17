@@ -33,7 +33,7 @@ A training machine uploads with a sync key.
 4. Leave **Scope** as `sync`.
 5. Click **Create**.
 
-The key is shown once and cannot be recovered. Copy it now. The dialog also shows a login command with the key in it. Do not use that command: it puts the key in your shell history and in the process list. Use the next steps instead.
+The key is shown once and cannot be recovered. Copy it now. The dialog also shows a login command without the key in it (`agenticml login --host <host>`). Run it, then paste the key when it asks for it. This keeps the key out of your shell history and the process list.
 
 ## 4. Install the client
 

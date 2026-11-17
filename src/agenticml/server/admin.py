@@ -102,6 +102,47 @@ def _selected_workspaces(db, workspace):
     return rows, chosen, not (len(rows) == 1 and rows[0]['slug'] == 'default')
 
 
+_WORKSPACE_ID = re.compile(r"[0-9a-f]{32}\Z")
+_ORPHAN_HINT = "workspace id is not in the database; run: agenticml server workspaces cleanup "
+_ORPHAN_LIST_FAILED = "could not list object store prefixes; workspace orphans were not checked"
+
+
+def orphan_workspaces(data, db, backend=None) -> dict:
+    """Workspace ids that have files or objects but no database row.
+
+    Order matters: the directory and the bucket prefixes are listed FIRST and
+    the database is read afterwards. A workspace row is committed before its
+    directory or objects exist, so a workspace created in between is in the
+    snapshot and is never reported.
+    """
+    files = []
+    try:
+        with os.scandir(Path(data) / "workspaces") as entries:
+            for entry in entries:
+                if _WORKSPACE_ID.match(entry.name) and (entry.is_symlink() or entry.is_dir(follow_symlinks=False)):
+                    files.append(entry.name)
+    except FileNotFoundError:
+        pass
+    listed = list(backend.workspace_ids()) if backend is not None else []
+    known = {row["id"] for row in WorkspaceRepo(db).list()}
+    return {"files": sorted({wid for wid in files if wid not in known}),
+            "objects": sorted({wid for wid in listed if wid not in known})}
+
+
+def _orphan_warnings(data, db, backend):
+    """(kind, workspace id) pairs, or a failure marker when listing the bucket failed."""
+    try:
+        found = orphan_workspaces(data, db, backend)
+    except DatabaseError:
+        raise
+    except Exception:
+        # Without the bucket listing the file orphans can still be reported.
+        found = orphan_workspaces(data, db, None)
+        return [("workspace_orphan_files", wid) for wid in found["files"]], True
+    return ([("workspace_orphan_files", wid) for wid in found["files"]] +
+            [("workspace_orphan_objects", wid) for wid in found["objects"]]), False
+
+
 def status(data, *, database=None, objects=None, workspace=None) -> dict:
     data, root = _data_root(data, database)
     url = _object_url(objects)
@@ -150,6 +191,20 @@ def status(data, *, database=None, objects=None, workspace=None) -> dict:
                     item = dict(item, workspace=part["slug"])
                 target.append(item)
     sizes["total"] = sum(sizes[name] for name in ("runs", "objects", "lineage"))
+    if db is not None and workspace is None:
+        try:
+            backend = None
+            if s3:
+                from .objectstore import open_backend
+                backend = open_backend(url, data)
+            found, failed = _orphan_warnings(data, db, backend)
+            warnings.extend(f"{kind}: workspaces/{wid}: {_ORPHAN_HINT}{wid}" for kind, wid in found)
+            if failed:
+                warnings.append(_ORPHAN_LIST_FAILED)
+        except DatabaseError:
+            warnings.append('could not load server database; workspace orphans were not checked')
+        except Exception:
+            warnings.append(_ORPHAN_LIST_FAILED)
     report = {"data": str(data), "runs": {"total": sum(p["runs"]["total"] for p in parts), "by_status": counts},
               "sizes": sizes, "keys": keys, "users": users, "warnings": warnings}
     if db is not None:
@@ -300,6 +355,18 @@ def verify(data, *, progress=False, database=None, objects=None, workspace=None,
         per_workspace[slug] = {name: report["checked"][name] - before[name] for name in before}
     if multi:
         report["workspaces"] = per_workspace
+    if db is not None and workspace is None:
+        try:
+            found, failed = _orphan_warnings(data, db, backend)
+        except DatabaseError:
+            found, failed = [], False
+            report["warnings"].append({"kind": "workspace_orphan_scan", "path": "workspaces",
+                                       "detail": "could not load server database; workspace orphans were not checked"})
+        for kind, wid in found:
+            report["warnings"].append({"kind": kind, "path": f"workspaces/{wid}", "detail": _ORPHAN_HINT + wid})
+        if failed:
+            report["warnings"].append({"kind": "workspace_orphan_scan", "path": "workspaces",
+                                       "detail": _ORPHAN_LIST_FAILED})
     report["ok"] = not report["problems"]
     return report
 

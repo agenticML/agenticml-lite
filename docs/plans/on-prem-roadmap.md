@@ -96,7 +96,7 @@ Progress is visible while work is under way (decided Nov 8, 2026):
 | --- | --- | --- | --- | --- | --- | --- |
 | 7 † | Lineage replication | 2.0 | Codex | M | [plan](packages/7-lineage-replication.md) | done (2.1 PR) |
 | 8 | By-reference artifacts | 2.0 | Cursor | S–M | [plan](packages/8-byref-artifacts.md) | done (2.1 PR) |
-| 9 | EFS benchmark and tuning | 2.0 | Cursor | S | [plan](packages/9-efs-benchmark.md) | done (2.1 PR; real-EFS run in Backlog) |
+| 9 | EFS benchmark and tuning | 2.0 | Cursor | S | [plan](packages/9-efs-benchmark.md) | done (2.1 PR; the real-EFS benchmark ran in package 24.13, Nov 16, 2026) |
 | 10 | Server operator commands | 2.0 | Codex | S | [plan](packages/10-server-operator-commands.md) | done (2.1 PR) |
 | 10b † | Server setup command (`server up`) | 2.0 | Cursor | M | [plan](packages/10b-server-up.md) | done (2.1 PR; real-tailnet check in Backlog) |
 
@@ -189,7 +189,7 @@ starts. Order:
 16 → 17 → 18, then 18b and 21 in parallel, then 18c → 19 → 20 (19.1,
 the Postgres backend, runs beside 18b; 19.2 needs 18c's tables); 22 and 23
 after 18; 24 after 18c–21; 25 after 16–24; 26 after 24 is live; 28
-after 27; 29 after 24.7 and 27, beside 24.3 (29.7 and 29.9 wait on the owner).
+after 27; 29 after 24.7 and 27, beside 24.3 (29.7 and 29.9 wait on the owner); 30 (Backlog cleanup) last, before the merge to `main`.
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -199,7 +199,7 @@ after 27; 29 after 24.7 and 27, beside 24.3 (29.7 and 29.9 wait on the owner).
 | 18.1a | Server core: accounts, workspaces, memberships, migration, `default` conversion, workspace-bound sync, CLI | 17 | Codex, Cursor | L | [plan](packages/18-workspaces.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
 | 18.1b | Route table, `/w/<slug>` and `/api/w/<slug>` routes, account and server-admin APIs, isolation suite | 18.1a | Cursor | L | [plan](packages/18-workspaces.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
 | 18.2 | Dashboard: workspace URLs, switcher, Team and Keys per workspace, admin page, picker | 18.1b | Cursor | M | [plan](packages/18-workspaces.md) | done ([#44](https://github.com/agenticML/agenticml-lite/pull/44)) |
-| 18b † | Firebase sign-in for the hosted service | 18 | Cursor | M | [plan](packages/18b-firebase-sign-in.md) | done (3.0 PR; real sign-in in Backlog) |
+| 18b † | Firebase sign-in for the hosted service | 18 | Cursor | M | [plan](packages/18b-firebase-sign-in.md) | done (3.0 PR; real Google sign-in confirmed Nov 15, 2026; the email and password check is an owner step in the Backlog) |
 | 18b.1 | Token verification, account linking, `/auth/firebase`, invites, CLI, extras | 18 | Cursor | M | [plan](packages/18b-firebase-sign-in.md) | done (3.0 PR) |
 | 18b.2 | Sign-in page with the vendored Firebase SDK, per-page CSP, UI tests | 18b.1 | Cursor | S | [plan](packages/18b-firebase-sign-in.md) | done (3.0 PR) |
 | 18c † | Self-serve sign-up and usage limits (free plan: storage, uploads, requests, people) | 18b | Codex, Cursor | M | [plan](packages/18c-signup-and-limits.md) | done (3.0 PR) |
@@ -212,7 +212,7 @@ after 27; 29 after 24.7 and 27, beside 24.3 (29.7 and 29.9 wait on the owner).
 | 20 † | Many server processes: database locks, shared throttle and sessions | 19 | Codex, Cursor | M | [plan](packages/20-many-processes.md) | done (3.0 PR) |
 | 20.1 | Cross-process session locks, process start, database clock, reader freshness, write fencing (compare-and-swap, lock checks) | 19 | Codex, Cursor | M | [plan](packages/20-many-processes.md) | done (3.0 PR) |
 | 20.2 | Two-process end-to-end test with a kill mid-upload | 20.1 | Codex, Cursor | S | [plan](packages/20-many-processes.md) | done (3.0 PR) |
-| 21 | S3 object backend | 18 | Codex, Sonnet | M | [plan](packages/21-s3-objects.md) | done (3.0 PR; real S3 in Backlog) |
+| 21 | S3 object backend | 18 | Codex, Sonnet | M | [plan](packages/21-s3-objects.md) | done (3.0 PR; real S3 checked in AWS roadmap Phase 5: objects AES256 and hashes verified, Nov 16, 2026) |
 | 22 | Metric summaries; sort and filter runs by metric | 17, 18 | Cursor | M | [plan](packages/22-metric-summaries.md) | done (3.0 PR) |
 | 23 | Operator commands: end-to-end 2.x conversion test (the import itself landed in 16–18), `server backup`, `status`/`verify` on the database | 18, 21, 22 | Sonnet (Codex at limit) | S–M | [plan](packages/23-operator-commands.md) | done (3.0 PR) |
 | 24 | AWS hosted deployment (Dockerfile, Terraform, deploy workflow, runbook, real-EFS benchmark) | 18c, 19, 20, 21 | Codex, Sonnet; owner runs it | M | [plan](packages/24-aws-deployment.md) | done (code, 3.0 PR; owner checks in Backlog) |
@@ -256,13 +256,21 @@ after 27; 29 after 24.7 and 27, beside 24.3 (29.7 and 29.9 wait on the owner).
 | 29.3 | Releases page (1.0, 2.0, 2.1, 2.2, 3.0) | 29.2a | Antigravity; Sonnet | S | [plan](packages/29-docs-site.md) | done ([#64](https://github.com/agenticML/agenticml-lite/pull/64)) |
 | 29.4 | Hosted service section: overview and limits, quickstart, workspaces, service status | 29.3 | Antigravity; Sonnet | M | [plan](packages/29-docs-site.md) | done; Settings page wording and the deletion-request finding fixed ([#64](https://github.com/agenticML/agenticml-lite/pull/64)) |
 | 29.5 | Home page and navigation | 29.4 | Sonnet | S | [plan](packages/29-docs-site.md) | done ([#64](https://github.com/agenticML/agenticml-lite/pull/64)) |
-| 29.5b | Docs site names: "Self-hosted" becomes "On-prem server" and "Hosted" becomes "Hosted service" on the Home tiles; the sidebar's "Server" section becomes "On-prem server" (owner's request, Nov 15, 2026; the tile links landed in [#67](https://github.com/agenticML/agenticml-lite/pull/67)) | 29.5 | Sonnet | S | [plan](packages/29.5b-home-link-cards.md) | in review ([#69](https://github.com/agenticML/agenticml-lite/pull/69)) |
+| 29.5b | Docs site names: "Self-hosted" becomes "On-prem server" and "Hosted" becomes "Hosted service" on the Home tiles; the sidebar's "Server" section becomes "On-prem server" (owner's request, Nov 15, 2026; the tile links landed in [#67](https://github.com/agenticML/agenticml-lite/pull/67)) | 29.5 | Sonnet | S | [plan](packages/29.5b-home-link-cards.md) | done ([#69](https://github.com/agenticML/agenticml-lite/pull/69), Nov 16, 2026) |
 | 29.2b | 375px overflow check over every built page, in `docs.yml` | 29.5 | Sonnet | S | [plan](packages/29-docs-site.md) | done ([#64](https://github.com/agenticML/agenticml-lite/pull/64)) |
 | 29.2c | Facts test: limits, minimum client, no unpublished tag URLs, no `login --key` | 29.4 | Sonnet | S | [plan](packages/29-docs-site.md) | done; covers the server pages and policy drafts too ([#64](https://github.com/agenticML/agenticml-lite/pull/64)) |
 | 29.6 | Publish: docs-only PR to `main`; Pages HTTPS, repo description and homepage | 29.1–29.5, 29.2a–c, D3 | git agent; owner | S | [plan](packages/29-docs-site.md) | done (Nov 16, 2026): docs-only PR [#75](https://github.com/agenticML/agenticml-lite/pull/75) merged to `main` at 17:53 UTC; Pages deploy run 43923087030 succeeded; `/`, `/releases/`, `/hosted/`, `/hosted/quickstart/`, `/hosted/status/` and the three `/legal/` pages return 200; repo description and homepage set Nov 15. Enforce HTTPS is still refused ("The certificate does not exist yet"), so it moved to the "Docs custom domain" Backlog entry |
 | 29.7 † | Terms, acceptable use and privacy policy on the site; links on the sign-in and invite pages | 29.6 | Antigravity; owner and lawyer approve; Sonnet | M | [plan](packages/29-docs-site.md) | done (Nov 16, 2026): policies filled and fact-checked on `dev` (Nov 15; D4 delegated to the supervisor, 28 corrections, no row-level security claim, no lawyer review); the owner approved the text by merging [#75](https://github.com/agenticML/agenticml-lite/pull/75); † second review by Cursor of the links ([#64](https://github.com/agenticML/agenticml-lite/pull/64)). `HOSTED_LEGAL_BASE_URL=https://agenticml.github.io/agenticml-lite/legal/` set; deploy run 43811140859 (the #71 merge, package 28.2, head `10fd4ba`) approved by the owner and succeeded; `/login` and `/invite?token=x` show the three links in a browser, no console errors, no overflow at desktop width or 375px. Left for the owner: D6, email existing sign-ups |
 | 29.8 | Promotion: Sign in action, banner, header link | 29.7 | Sonnet | S | [plan](packages/29-docs-site.md) | done (Nov 16, 2026): built in [#64](https://github.com/agenticML/agenticml-lite/pull/64); header Sign in is a visible text link; live with [#75](https://github.com/agenticML/agenticml-lite/pull/75) |
 | 29.9 | After PyPI 3.0.0: `pip install`, tag URLs, release dates, `pyproject.toml` URLs | owner release | Sonnet | S | [plan](packages/29-docs-site.md) | blocked: 3.0.0 not on PyPI |
+| 30 † | Backlog cleanup before the 3.0 release to `main`: every Backlog entry fixed, given an owner checklist, or moved to Later | 25, 29 | Sonnet; supervisor reviews (second review for † parts) | L | [plan](packages/30-backlog-cleanup.md) | in review ([#79](https://github.com/agenticML/agenticml-lite/pull/79); every part reviewed; † second reviews by the supervisor) |
+| 30.1 † | Sync integrity and doc truth: failed atomic upload drops the cursor, restore-window repair tests and runbook, `compat_owner` removed, limits and suspended-workspace texts | – | Sonnet | S–M | [plan](packages/30-backlog-cleanup.md) | in review ([#79](https://github.com/agenticML/agenticml-lite/pull/79); Sonnet coded, supervisor reviewed and did the † second review) |
+| 30.2 † | Account and workspace lifecycle: `server accounts delete`, workspace delete never skips a step, `workspaces orphans`/`cleanup`, detached accounts | – | Sonnet | M | [plan](packages/30-backlog-cleanup.md) | in review ([#79](https://github.com/agenticML/agenticml-lite/pull/79); Sonnet coded; supervisor reviewed with an adversarial review pass, three findings fixed; † second review by the supervisor) |
+| 30.3 † | Admin plan edits merge atomically and prefill free limits; Keys copy command without `--key`; metric picker refresh; workspace rename by its owner | 30.1, 30.2 | Sonnet | M | [plan](packages/30-backlog-cleanup.md) | in review ([#79](https://github.com/agenticML/agenticml-lite/pull/79); Sonnet coded; supervisor reviewed and did the † second review of the rename) |
+| 30.4 † | Sign-in pages: setup and invite in the new shell, theme toggle, Firebase page tests, invite token in the URL fragment on hosted | 30.1, 30.2 | Sonnet | M | [plan](packages/30-backlog-cleanup.md) | in review ([#79](https://github.com/agenticML/agenticml-lite/pull/79); Sonnet coded; supervisor reviewed with an adversarial review pass, no findings; † second review by the supervisor) |
+| 30.5 | Database: transaction connection cap, committed sizes per reader call, usage views on the database clock, 19.1 notes | 30.1, 30.2 | Sonnet | S–M | [plan](packages/30-backlog-cleanup.md) | in review ([#79](https://github.com/agenticML/agenticml-lite/pull/79); Sonnet coded, supervisor reviewed; session-lock pooling moved to Later) |
+| 30.6 | AWS template and CI: ECS init process, healthy-hosts alarm from DesiredCount, actions pinned to SHAs, weekly hosted monitor | – | Sonnet | S–M | [plan](packages/30-backlog-cleanup.md) | in review ([#79](https://github.com/agenticML/agenticml-lite/pull/79); Sonnet coded, supervisor reviewed) |
+| 30.7 | Roadmap and Backlog: owner checklists, deferred entries to Later, stale rows | 30.1–30.6 | Supervisor | S | [plan](packages/30-backlog-cleanup.md) | in review ([#79](https://github.com/agenticML/agenticml-lite/pull/79); Backlog rewritten: owner checklists, three entries moved to Later) |
 
 Getting the hosted service live on AWS, step by step: [AWS deployment roadmap](aws-deployment-roadmap.md).
 
@@ -334,6 +342,40 @@ Getting the hosted service live on AWS, step by step: [AWS deployment roadmap](a
 - Project-level access (viewers or members limited to some projects).
   Deferred from 2.2; 3.0 workspaces cover the common case (separate teams
   get separate workspaces).
+- Permissions boundary for the hosted stack's roles (moved from the Backlog
+  by package 30, Nov 17, 2026; own package after 3.0). A managed policy
+  `agenticml-hosted-boundary` in `bootstrap.yaml` (allow-list of what the
+  three hosted roles use, including everything the AWS Backup managed
+  policies need for EFS and RDS backups and restores, plus a deny of IAM,
+  Organizations and account actions), required by an
+  `iam:PermissionsBoundary` condition on the CloudFormation role's role
+  writes, and a deny of `cloudformation:CreateChangeSet` with
+  `cloudformation:ImportResourceTypes` in the deploy role. Why later: the
+  owner must apply the bootstrap stack before the next hosted deploy (that
+  deploy fails on the missing export otherwise); if the first boundary
+  deploy rolls back, removing the boundary is denied and the stack ends in
+  `UPDATE_ROLLBACK_FAILED` (ship it as the only change of its deploy); an
+  over-narrow boundary silently breaks scheduled backups (check a backup job
+  and a restore afterwards); and scoping writes by `Project` tag needs an
+  exact action list and is bypassable by tagging another resource (state it
+  in the threat model). Only a reviewed template run through the protected
+  `hosted` workflow can use the role today. Investigator spec with the
+  owner's `simulate-principal-policy` checks: package 30 plan notes.
+- Pool Postgres session-lock connections and measure lock latency on RDS
+  (moved from the Backlog by package 30). Every session lock opens a new
+  connection (about ten round trips on TLS). Pooling changes the
+  mutual-exclusion code (reset timeouts per checkout, `pg_advisory_unlock_all`
+  before reuse, never reuse a connection whose lock state is unknown) and
+  needs a benchmark that does not run migrations against the hosted
+  database; do it when the latency is measured as a problem. Package 30.5
+  capped transaction connections and documented the per-process ceiling.
+- Self-serve account deletion from Settings (the tail of the former
+  "Hosted service monitoring" entry). Until then account deletion is an
+  operator step: `agenticml server accounts delete` (package 30.2) and the
+  runbook section "Deleting an account (privacy request)".
+- Metric picker refresh while no run is live (package 30.3 left it out):
+  `/metrics` is refreshed only while the runs page polls, which stops when no
+  run is `running`.
 
 ## Backlog
 
@@ -341,351 +383,127 @@ Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority.
 
-- **Release 3.0.0: tag and publish (owner)** (Nov 9, 2026).
-  - Where: GitHub releases, PyPI.
-  - Problem: the 3.0 PR sets version 3.0.0 but nothing is tagged or
-    published. The `v2.2.0` tag was never created either; the 2.2 client
-    compatibility test falls back to commit `bd0d499` until it exists. PyPI
-    has only 1.0.0, so package 29 documents the git install until this entry
-    is done.
-  - Fix: tag `v2.2.0` at `bd0d499` and `v3.0.0` at the merge of `dev` into
-    `main`, and publish 3.0.0 to PyPI (`publish.yml`).
-  - Done when: `pip install agenticml-lite==3.0.0` works.
-  - Progress (Nov 16, 2026): the legal pages part is done. The three policies
-    are live on the docs site and linked from `/login` and `/invite` (package
-    29.7, AWS roadmap step 7.4, deploy run 43811140859).
-- **Restore drill: a sync during the EFS backup window** (package 24.13,
-  Nov 16, 2026). Medium priority.
-  - Where: AWS Backup plan in `deploy/aws/cloudformation/hosted.yaml` (daily
-    EFS backup at 05:00 UTC, which ran about 3 hours); `scripts/restore_drill/README.md`
-    step 1.
-  - Problem: the EFS backup is not a point in time. The drill restores the
-    database to the recovery point's completion time, so the database is at
-    least as new as the files, and the Nov 16 drill passed that way. A run
-    synced during the backup window can still be in the database while its
-    newest files or objects are missing from the restored filesystem, and
-    `verify --deep` then reports problems for that run.
-  - Fix: decide one: move the backup to the quietest hour and record its
-    duration; or document a repair step (re-sync the affected runs from the
-    clients, which keep the source data); or add a `server verify --repair`
-    that marks such runs incomplete so clients re-upload them.
-  - Done when: the runbook names the chosen approach and a drill (or a test
-    with a simulated mid-backup sync) shows a clean `verify --deep` after it.
-- **Account deletion tooling** (package 29 policy fact-check, Nov 15, 2026).
-  - Where: `src/agenticml/server/` `server accounts` command (list and add
-    only); Privacy policy; `deploy/aws/README.md`.
-  - Problem: account rows, Firebase users and server-level audit entries are
-    removed by hand, as the Privacy policy says.
-  - Fix: add `agenticml server accounts delete <login>` that removes
-    memberships, sessions, keys and the account, and redacts server-level
-    audit entries naming it; add a runbook step for the Firebase user.
-  - Done when: the command is tested and the runbook has the section.
-- **Workspace delete cleanup can skip steps** (package 29 policy fact-check,
-  Nov 15, 2026). Extends "Retry object cleanup after a workspace deletion
-  fails" below; fix them together.
-  - Where: `server/workspaces.py` `delete_workspace`.
-  - Problem: if S3 removal fails, only a warning is logged and the database
-    row is already gone, so `server verify` and `status` cannot find
-    leftovers. If the EFS `rmtree` raises, S3 cleanup and the audit entry are
-    skipped. The policies say failed S3 cleanup is logged and removed by hand.
-  - Fix: delete storage before or with a retryable record, or add a
-    `server objects orphans` command; write the audit entry first.
-  - Done when: tests cover both failures.
-- **ALB access logs keep invite tokens** (package 29 policy fact-check, Nov
-  15, 2026). Low priority.
-  - Where: `deploy/aws/` ALB access-log settings and retention (90 days).
-  - Problem: request URLs such as `/invite?token=...` are kept in the logs
-    for 90 days.
-  - Fix: shorter retention, or keep tokens out of URLs.
-  - Done when: the choice is made and documented.
-- **Fix two doc texts that do not match the code** (package 29 policy
-  fact-check, Nov 15, 2026). Low priority.
-  - Where: `docs/SERVER.md` limits JSON example (about lines 331-340);
-    `docs/HOSTED.md` suspended-workspace wording.
-  - Problem: the limits example does not match what
-    `src/agenticml/server/limits.py` accepts. `docs/HOSTED.md` says a
-    suspended workspace returns 404 for all API requests, but sync gets 403.
-  - Fix: check the code, then fix both texts.
-  - Done when: the examples load with `limits.py` and the wording matches.
-- **Two-task rolling deploy check** (package 24.3, owner). Low priority.
+Package 30 (Nov 17, 2026) cleared the Backlog before the 3.0 release: 21
+entries were fixed in parts 30.1–30.6 (for two of them, the many-process
+follow-ups and the metric picker, a remainder moved to "Later
+(unscheduled)"), the permissions boundary moved to Later, and the entries
+below are the ones that need the owner's accounts or machines. None of them blocks merging `dev` into `main`; the
+first one is the release itself.
+
+### Owner steps
+
+- **Release 3.0.0: tag and publish (owner)** (Nov 9, 2026; checklist Nov 17).
+  - Where: GitHub releases, PyPI, the `pypi` and `testpypi` environments.
+  - Problem: version 3.0.0 is set but nothing is tagged or published. The
+    `v2.2.0` tag was never created (the 2.2 client compatibility test falls
+    back to commit `bd0d499`). PyPI has only 1.0.0, so the docs show the git
+    install. The `pypi` environment has no required reviewer, so any pushed
+    `v*` tag publishes.
+  - Fix, in order:
+    1. Merge the 3.0 `dev` → `main` PR.
+    2. Add a required reviewer to the `pypi` environment (Settings →
+       Environments).
+    3. Dispatch `publish-testpypi.yml` on `main` once (it also proves the
+       actions newly pinned to commit SHAs in 30.6), then `pip install -i
+       https://test.pypi.org/simple/ agenticml-lite==3.0.0` in a clean venv.
+    4. `v2.2.0`: pushing it triggers `publish.yml` and would upload 2.2.0.
+       Recommended: `gh workflow disable publish.yml`, `git tag v2.2.0 bd0d499
+       && git push origin v2.2.0`, `gh workflow enable publish.yml` (or accept
+       2.2.0 on PyPI; harmless, 3.0.0 is newer).
+    5. `git tag -a v3.0.0 <merge commit> -m 'agenticml-lite 3.0.0' && git
+       push origin v3.0.0`; approve the `pypi` environment; watch Publish.
+    6. Check `pip install agenticml-lite==3.0.0` and `pip install
+       'agenticml-lite[hosted]'` in a clean venv; create the GitHub release
+       from `website/src/content/docs/releases.md`.
+    7. Then package 29.9 (install docs, tag URLs, `PUBLISHED_3_0 = True` in
+       `tests/test_website_facts.py`) and drop the raw-`main` skip in
+       `scripts/monitor_hosted.py`.
+  - Done when: `pip install agenticml-lite==3.0.0` works and 29.9 is merged.
+  - Progress (Nov 16, 2026): the legal pages part is done.
+- **Two-task rolling deploy check** (package 24.3, owner). Low priority; not
+  needed for the launch.
   - Where: `deploy/aws/README.md`, Launch checks 5.1.
-  - Problem: the rolling deploy during an upload passed on Nov 16, 2026 (5.1;
-    the old and new task overlapped and shared the uploads), but the service
-    has only ever run one steady-state task. A steady two-task service has not
-    been exercised.
-  - Fix: set the desired count to 2 (`aws ecs update-service --desired-count
-    2` until the next deploy, or dispatch the workflow with
-    `desired_count=2`), sync several runs through both tasks, check
-    `verify --deep` and the dashboard, then set the count back to 1.
+  - Problem: the service has only ever run one steady-state task.
+  - Fix: `gh workflow run deploy.yml --ref dev -f desired_count=2` (the
+    default branch is `dev`, so this works now; the `healthy_hosts` alarm then
+    uses threshold 2); `aws ecs wait services-stable`; both targets healthy
+    (`aws elbv2 describe-target-health`); sync several runs from two clients
+    or workspaces (mind the 2 GB daily upload limit per free workspace),
+    confirm both tasks served requests (log streams per task),
+    `scripts/hosted_check.py verify <run ids>` PASS, `server verify --deep`
+    over ECS Exec with 0 problems, reload the dashboard a few times (sessions
+    across tasks); then `-f desired_count=1`.
   - Done when: a sync through two steady tasks verifies with 0 problems and
-    the result is recorded. Not needed for the launch.
-- **Keys page copies the key onto the command line** (package 29 plan, Nov
-  13, 2026).
-  - Where: `src/agenticml/ui/static/app.js`, new-key dialog (the
-    `key-command` element).
-  - Problem: "Copy command" copies `agenticml login --host <host> --key
-    <key>`, which leaves the key in shell history; the docs (and the hosted
-    quickstart in package 29.4) say to paste the key at the prompt.
-  - Fix: copy `agenticml login --host <host>` only; keep the separate "Copy
-    key" button.
-  - Done when: a UI test asserts the copied command has no `--key`, and
-    there is no overflow at 375px.
-- **Docs custom domain** (package 29, decision D8, Nov 13, 2026).
-  - Where: `website/astro.config.mjs` (`site`, `base`), `website/public/CNAME`,
-    every `/agenticml-lite/` link in `website/src/content/docs`; Namecheap;
-    Pages settings.
-  - Problem: the docs live at `agenticml.github.io/agenticml-lite/`, and
-    `agenticml.xyz` has no DNS record.
-  - Fix: after PyPI 3.0.0, owner adds a Namecheap CNAME `docs` →
-    `agenticml.github.io.` and sets the Pages custom domain; Sonnet drops
-    `base`, rewrites the internal links and sets `pyproject.toml`
-    `Documentation`. Never touch the `app` record.
-  - Done when: `https://docs.agenticml.xyz` serves the site with HTTPS
-    enforced, old github.io URLs redirect, and the link check passes.
-  - Enforce HTTPS (moved here Nov 16, 2026): GitHub still answers "The
-    certificate does not exist yet" for the default `github.io` project URL
-    after publishing, so Enforce HTTPS cannot be turned on until the custom
-    domain is set up; then turn it on (`https_enforced` true).
-- **Hosted service monitoring for the public** (package 29, Nov 13, 2026).
-  Low priority.
-  - Where: `.github/workflows/`, the docs status page.
-  - Problem: the status page is updated by hand; nothing checks
-    `/healthz` or the site's external links on a schedule.
-  - Fix: a scheduled workflow that checks `https://app.agenticml.xyz/healthz`
-    and the site's external links weekly (opens an issue on failure);
-    self-serve account deletion later.
-  - Done when: the workflow runs on a schedule and a failing check opens an
-    issue.
-- **Setup and invite pages in the new sign-in style** (package 27, Nov 13,
-  2026).
-  - Where: `src/agenticml/server/static/setup.html`, `invite.html`.
-  - Problem: package 27 restyled `/login` (hosted and self-hosted) like
-    agenticml-server; `/setup` and the self-hosted invite page still use
-    the old centred card.
-  - Fix: move both pages onto the `.auth-*` shell (brand panel, logo,
-    underline fields), keeping their ids and behaviour.
-  - Done when: both pages use the shell, their UI tests pass, and there is
-    no overflow at 375px.
-- **Theme on the sign-in pages** (package 27, Nov 13, 2026).
-  - Where: `src/agenticml/server/static/*.html`, `app.css`.
-  - Problem: the sign-in pages are always light; agenticml-server has a
-    light/dark toggle and the dashboard follows the saved theme.
-  - Fix: apply the dashboard's saved theme (or the system preference) on
-    the sign-in pages with a same-origin script, and add the compact
-    toggle.
-  - Done when: a user with the dark theme sees a dark sign-in page, with a
-    UI test.
-- **Permissions boundary for the hosted stack's roles** (package 24.4a
-  review, Nov 11, 2026).
-  - Where: `deploy/aws/cloudformation/bootstrap.yaml` (`CloudFormationRole`,
-    Sid `HostedRoles`).
-  - Problem: the CloudFormation role can create `agenticml-hosted-*` roles
-    and give them any inline policy, then pass them to ECS tasks. Only a
-    reviewed template run through the protected `hosted` workflow can use
-    it, but nothing caps what those roles may do.
-  - Fix: a managed policy `agenticml-hosted-boundary` in the bootstrap stack
-    that denies IAM, Organizations and account actions and allows only the
-    services the hosted roles use; require it with an
-    `iam:PermissionsBoundary` condition on `CreateRole`/`PutRolePolicy`/
-    `AttachRolePolicy`, and deny removing it.
-  - Also (24.4 second review): the role's ec2, elasticloadbalancing, ecs,
-    rds, elasticfilesystem and backup write actions are scoped by region
-    only, and the account runs other services in us-east-2. A malicious
-    template could import their resources (an `IMPORT` change set) and
-    delete them. Limit those writes to resources tagged
-    `Project=agenticml-hosted` (`aws:ResourceTag` / `aws:RequestTag`), and
-    deny `cloudformation:CreateChangeSet` with
-    `cloudformation:ImportResourceTypes` in the deploy role.
-  - Done when: a template test asserts the boundary condition, the tag
-    conditions and the import deny, and a hosted role without the boundary
-    cannot be created (checked on the next real deploy).
-- **Metric picker polish** (package 22 review, Nov 9, 2026).
-  - Where: `src/agenticml/ui/static/app.js` runs page;
-    `testbed/tests/test_server_dashboard.py`.
-  - Problem: `/metrics` is loaded once per page load (a metric first
-    logged later, or a workspace that had none at load, needs a reload);
-    filter-token names are matched case-insensitively only against that
-    list; the first `/runs` waits for `/metrics`; the 422 fallback and the
-    250 ms debounce have no UI test.
-  - Fix: refresh `/metrics` every few polls and fetch it in parallel with
-    the first `/runs`; add the two UI tests.
-  - Done when: a metric logged after page load appears in the picker
-    without a reload, with a test.
-- **Many-process follow-ups for package 24** (package 20 reviews, Nov 9,
-  2026).
-  - Where: `src/agenticml/server/db/postgres.py` (session locks),
-    `store/reader.py`, `server/routes.py` usage views.
-  - Problem: every session lock opens a fresh Postgres connection (slow on
-    TLS/RDS; pins connections under RDS Proxy or pgbouncer); dashboard reads
-    query the committed size per file call; the usage page computes "today"
-    from the process clock while enforcement uses the database clock; a
-    process paused longer than the keepalive window while holding a lock
-    can still write after losing it (checks narrow this to the time
-    between two checks; see the package 20 plan).
-  - Fix: pool lock connections; cache committed sizes per read; use the
-    database clock in the usage views; record the paused-process residual
-    in the package 25 threat model and measure the rest in package 24.
-  - Done when: package 24's benchmark shows acceptable lock latency and the
-    threat model names the residual.
-- **Admin plan edits: concurrent merge and free→custom defaults** (package
-  18c.3 review, Nov 9, 2026).
-  - Where: `src/agenticml/server/routes.py` admin PATCH; `ui/static/app.js`
-    `editPlan`.
-  - Problem: the custom-limits merge reads outside the `set_plan`
-    transaction (two admins can overwrite each other's partial edits), and
-    switching free → custom opens empty fields (unlimited) instead of the
-    free limits.
-  - Fix: read and write in one transaction; prefill the free limits.
-  - Done when: both have tests.
-- **Remaining package 19.1 second-review notes** (Nov 9, 2026; the
-  password, test-isolation, connect-timeout and exception-chain items were
-  fixed in the 3.0 PR).
-  - Where: `src/agenticml/server/db/__init__.py`, `db/postgres.py`.
-  - Problem: the registry lock is held across Postgres network I/O; advisory
-    lock keys are database-wide (parallel test schemas share them); total
-    connections are not capped (only idle ones).
-  - Fix: open outside the registry lock; consider salting keys per schema
-    and a connection cap. Revisit in package 20.
-  - Done when: each has a test or a recorded decision.
-- **Retry object cleanup after a workspace deletion fails** (package 21,
-  Nov 9, 2026).
-  - Where: `server/workspaces.py` `delete_workspace`, S3 workspace prefix.
-  - Problem: an S3 outage after database deletion leaves unreachable bytes;
-    deletion logs a warning with the workspace id.
-  - Fix: retain the warned id and retry prefix deletion when S3 recovers;
-    add durable cleanup tracking if automatic retries are needed.
-  - Done when: a failed cleanup can be retried and removes only that
-    workspace's prefix.
-- **Check Firebase sign-in against the real Firebase project** (package 18b
-  caveat, Nov 8, 2026). Reduced Nov 16, 2026.
-  - Where: `src/agenticml/server/firebase.py`, `static/firebase-login.js`,
-    the vendored SDK in `static/vendor/firebase/`.
-  - Problem: the hosted service runs with Firebase project `agenticml-hosted`.
-    `/login` loads the real SDK with no console or CSP errors, a real Google
-    sign-in worked (AWS roadmap 4.2b, confirmed Nov 15) and people signed in
-    and accepted invites in 4.3 (confirmed Nov 16). Not yet recorded: a
-    Firebase email and password sign-in (with a verified email), and the
-    restore drill's server could not test sign-in at all (no public DNS).
-  - Fix: sign in once with email and password on `app.agenticml.xyz` (verified
-    email, matching an invite or account), and note the result.
-  - Done when: that sign-in works, or each mismatch is fixed with a test.
-- **Firebase sign-in page test gaps** (package 18b.2 second review, Nov 8,
-  2026).
-  - Where: `testbed/tests/test_server_firebase_dashboard.py`.
-  - Problem: the UI tests do not assert sign-out on terminal failures,
-    in-memory persistence, button disabling while a request is in flight,
-    the mapped Firebase error texts, that nothing is written to
-    `localStorage`/`sessionStorage`, or the account dialog with and without
-    Firebase.
-  - Fix: add those assertions with the fake `firebase` global (delayed
-    promises, injected failures, storage inspection).
-  - Done when: each behaviour has a failing-then-passing UI test.
-- **Sync client trusts its own cursor after a failed atomic upload** (package 17
-  second review, Nov 8, 2026).
-  - Where: `src/agenticml/sync.py` (atomic-file skip, around line 923).
-  - Problem: if a replacement of an atomic file (for example
-    `scalars/index.json`) reaches the server's disk but the request fails
-    before it is acknowledged, the client keeps its old cursor. If the
-    client's file later returns to the previously acknowledged bytes, the
-    client skips the upload without asking `/state`, so the server keeps
-    the unacknowledged bytes (for example a wrong metric label). Another
-    machine, or a client that asks `/state`, recovers, because `/state`
-    hashes atomic files from disk. 2.2 had the same gap.
-  - Fix: on any failed atomic upload, drop that file's cursor entry so the
-    next pass compares against `/state`.
-  - Done when: a test crashes the server after the rename of an atomic
-    replacement, restores the old bytes on the client, re-syncs with the
-    same `sync.json`, and the server ends with the old bytes.
-- **A removed member's login can be re-added by another workspace**
-  (package 18 review, Nov 8, 2026).
-  - Where: `src/agenticml/server/db/repos.py` `UserRepo.remove` and `add`.
-  - Problem: removing someone from their only workspace keeps their global
-    account (and password) with no memberships. An admin of another
-    workspace can then `add` that login; the account is single-workspace
-    again, so that admin may reset its credentials. Low risk (login-name
-    squatting on a self-hosted server), but surprising.
-  - Fix: when an account loses its last membership, either delete it (if it
-    owns no runs) or mark it so that only a server admin can attach it to a
-    workspace again.
-  - Done when: a test removes a member from their only workspace, another
-    workspace's admin tries to add and reset that login, and is refused.
-- **Compatibility owner rule can mislead a 2.0/2.1 client** (package 11
-  review, Nov 6, 2026). Blocked until no 2.0/2.1 sync clients remain.
-  - Where: `src/agenticml/server/ingest.py` `compat_owner`.
-  - Problem: old clients compare `owner` with their key name; another user
-    whose user name equals the client's key name looks like the client's own
-    run. The server's 409 stays authoritative, so there is no access, only a
-    confusing client message.
-  - Fix: the client half is done (package 12: 2.2 clients compare
-    `owner_user` with `whoami.user`). In a later release, once 2.0/2.1
-    clients are unsupported, return the real owner user in `owner` and drop
-    the rule.
-  - Done when: `compat_owner` is gone and a test covers the collision.
-- **Check `agenticml server up` on a real tailnet** (package 10b caveat,
-  Nov 6, 2026).
-  - Where: `src/agenticml/server/up.py`; `docs/SERVER.md` quick start.
-  - Problem: the tests use a fake `tailscale` executable. The real CLI's
-    `status --json` and `funnel status --json` shapes, and the full path from
-    a fresh machine to a working public HTTPS server, were not exercised on a
-    real tailnet (doing so exposes the machine to the internet, so it was
-    left to the owner).
-  - Fix: on a machine with Tailscale logged in, HTTPS enabled and the
-    `funnel` node attribute, run `agenticml server up`, sign in at the
-    printed URL, sync one run from another machine, stop with Ctrl+C and
-    confirm `tailscale funnel status` is empty; also try each missing
-    prerequisite once.
-  - Done when: those steps pass, or any mismatch with the real CLI is fixed
-    with a test that reproduces it.
+    the result is recorded here and on the status page.
 - **On-demand EFS backup refused for the operator session** (package 24.13,
   Nov 16, 2026). Low priority.
-  - Where: AWS Backup vault `agenticml-hosted`; `scripts/restore_drill/README.md`,
-    step 1, option A.
-  - Problem: during the restore drill `aws backup start-backup-job` for the
-    hosted EFS was refused with AccessDenied ("Insufficient privileges") for
-    the operator's `aws login` session, an admin with no service control
-    policy and no vault access policy in the way. Restore jobs worked. The
-    drill used the latest scheduled recovery point instead, so on-demand EFS
-    backups (for example before a risky change) are unavailable from that
-    session.
-  - Fix: find the cause. Try the same call with access-key credentials or from
-    the console, compare the backup role's `iam:PassRole` and the session's
-    permissions, and check the CloudTrail event for the denial reason.
+  - Where: AWS Backup vault `agenticml-hosted`; `scripts/restore_drill/README.md`
+    step 1 option A.
+  - Problem: `aws backup start-backup-job` for the hosted EFS answered
+    AccessDenied for the operator's `aws login` session; restores worked.
+  - Fix (diagnosis): (1) `aws cloudtrail lookup-events --lookup-attributes
+    AttributeKey=EventName,AttributeValue=StartBackupJob --max-results 5`
+    (us-east-2) and read `errorMessage` and `userIdentity`/session policy;
+    (2) retry from the console (AWS Backup → Protected resources → On-demand
+    backup) and with access-key credentials; (3) if both fail, check
+    `iam:PassRole` on `agenticml-hosted-backup` for the caller
+    (`aws iam simulate-principal-policy`), `aws backup describe-region-settings`
+    (EFS opted in), the vault access policy, and whether the same call works
+    for the RDS instance; the EFS file system policy denies only `Client*`
+    actions, so it is not the cause. Then the runbook names the credentials to
+    use, or says on-demand EFS backups are unavailable from an `aws login`
+    session (use the latest scheduled point).
   - Done when: an on-demand backup of the hosted EFS can be started, or the
     runbook says which credentials to use.
-- **ECS Exec hardening** (package 24.6 check, Nov 12, 2026). Low priority.
-  - Where: `deploy/aws/cloudformation/hosted.yaml` (container `server`,
-    `Cluster`).
-  - Problem: PID 1 is the Python server, which does not reap the processes
-    ECS Exec sessions leave behind (AWS recommends `InitProcessEnabled`), and
-    exec sessions are not logged anywhere; only CloudTrail records the
-    `ExecuteCommand` call.
-  - Fix: set `LinuxParameters: {InitProcessEnabled: true}` and check that
-    SIGTERM still reaches the server within `StopTimeout`. Decide whether to
-    log sessions (`ExecuteCommandConfiguration` to a CloudWatch group); if
-    yes, note that invite links and keys printed in a session then land in
-    that log.
-  - Done when: template tests check the init process (and the logging
-    choice), and cfn-lint is clean.
-- **Hosted alarm and action pinning follow-ups** (Cursor's review of 24.5,
-  Nov 12, 2026). Low priority.
-  - Where: `deploy/aws/cloudformation/hosted.yaml`, `HealthyHostsAlarm`;
-    `.github/workflows/deploy.yml`, `uses:` lines.
-  - Problem: the healthy-hosts alarm fires below one healthy target, so with
-    two tasks it does not fire when one task drops out of the target group
-    (the unhealthy-hosts and 5xx alarms still cover the usual cases). The
-    workflow's actions are pinned by tag (`@v4`, `@v3`), not by commit SHA.
-  - Fix: set the alarm threshold from `DesiredCount` (or document that
-    two-task mode relies on the other alarms); pin every `uses:` to a full
-    commit SHA with the tag in a comment, and update the workflow tests.
-  - Done when: the template and workflow tests check both, and cfn-lint is
-    clean.
-- **Workspace rename by its owner** (package 28, Nov 13, 2026). Low priority.
-  - Where: `src/agenticml/server/routes.py` (workspace routes),
-    `src/agenticml/ui/static/app.js` (Settings, Workspace card).
-  - Problem: only server admins can rename a workspace (on `/admin`);
-    agenticml-server lets a workspace owner or admin rename it from
-    Settings, and the design board's Settings proposal shows a Rename button.
-  - Fix: add `PATCH /api/w/<slug>` (name only, role `admin`, audited) and a
-    Rename action on the Workspace card.
-  - Done when: API and UI tests cover owner/admin allowed, member denied,
-    and the audit entry.
+- **Check Firebase email and password sign-in on the real project** (package
+  18b caveat, Nov 8, 2026; reduced Nov 16). Not release-blocking (Google
+  sign-in, which uses the same token check, works).
+  - Where: `app.agenticml.xyz/login`.
+  - Fix: in a private window, with a fresh mailbox that has no invite:
+    (1) create an account with email and password; expect "check your inbox"
+    and no dashboard; (2) sign in before verifying: refused; (3) click the
+    link, sign in again: dashboard with one personal workspace (sign-in
+    repeats `signInWithEmailAndPassword`, which refreshes the token);
+    (4) wrong password: "Wrong email or password."; (5) "Forgot password"
+    sends a working reset; (6) devtools: no CSP or console errors, nothing in
+    local or session storage. Delete the test Firebase user and workspace
+    afterwards (`server accounts delete`, package 30.2).
+  - Done when: every step passes, or each mismatch is fixed with a test in
+    `testbed/tests/test_server_firebase_dashboard.py`.
+- **Check `agenticml server up` on a real tailnet** (package 10b caveat, Nov
+  6, 2026). Not release-blocking.
+  - Where: `src/agenticml/server/up.py`; `docs/SERVER.md` quick start.
+  - Fix: on a machine with Tailscale logged in, MagicDNS and HTTPS certificates
+    on and the `funnel` node attribute: save redacted `tailscale status --json`
+    and `tailscale funnel status --json` (idle and while running); run
+    `agenticml server up`, open the URL from a phone off the network, sign in
+    with the printed invite link, sync one run from another machine; Ctrl+C
+    and confirm `tailscale funnel status` is empty; try each missing
+    prerequisite once (Tailscale down, MagicDNS off, HTTPS off, no funnel
+    attribute on a throwaway node, another service on 443); `server up
+    --install` once on Linux and remove it.
+  - Done when: those steps pass, or each mismatch is fixed with a test built
+    from the captured JSON in `tests/test_server_up.py`.
+- **Docs custom domain** (package 29, decision D8, Nov 13, 2026). Not needed
+  for 3.0.0: PyPI's Documentation URL may stay on github.io, which GitHub
+  redirects to the custom domain once it is set.
+  - Where: `website/astro.config.mjs` (`site`, `base`), `website/public/CNAME`,
+    internal `/agenticml-lite/` links in `website/src/content/docs` (also
+    `href="..."` and frontmatter `link:` forms), `website/scripts/overflow-check.mjs`,
+    `pyproject.toml` `Documentation`, `HOSTED_LEGAL_BASE_URL`; Namecheap; Pages
+    settings.
+  - Problem: the docs live at `agenticml.github.io/agenticml-lite/`, and
+    `agenticml.xyz` has no `docs` record. Enforce HTTPS cannot be turned on for
+    the github.io project URL ("The certificate does not exist yet").
+  - Fix, in this order (Astro's `base` changes asset URLs, so the domain and
+    the root-path build must go live together): (1) Sonnet prepares the
+    root-path build (drop `base`, rewrite internal links, redirects from
+    `/agenticml-lite/*`, CNAME file, overflow check, `pyproject.toml`) on a
+    branch; (2) owner adds the Namecheap CNAME `docs` → `agenticml.github.io.`
+    (never touch `app`); (3) owner sets the Pages custom domain and, at once,
+    the build is deployed (merge to `main` or dispatch `docs.yml`); (4) tick
+    Enforce HTTPS once the certificate exists; (5) set `HOSTED_LEGAL_BASE_URL`
+    to `https://docs.agenticml.xyz/legal/` and run the deploy.
+  - Done when: `https://docs.agenticml.xyz` serves the site with HTTPS
+    enforced, old github.io URLs redirect, and the link check passes.
+

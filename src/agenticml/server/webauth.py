@@ -365,6 +365,7 @@ _ASSETS = {
     "/static/setup.js": (_LOGIN_STATIC / "setup.js", _JS),
     "/static/invite.js": (_LOGIN_STATIC / "invite.js", _JS),
     "/static/signout.js": (_LOGIN_STATIC / "signout.js", _JS),
+    "/static/theme.js": (_LOGIN_STATIC / "theme.js", _JS),
     "/static/app.css": (_STATIC / "app.css", _FILES["app.css"]),
     "/static/InstrumentSans.woff2": (_STATIC / "InstrumentSans.woff2", _FILES["InstrumentSans.woff2"]),
     "/static/JetBrainsMono.woff2": (_STATIC / "JetBrainsMono.woff2", _FILES["JetBrainsMono.woff2"]),
@@ -1009,7 +1010,7 @@ class WebAuth:
                     return
                 created = None
                 try:
-                    created = self.users.add(name, role="admin", created_by="setup")
+                    created = self.users.add(name, role="admin", created_by="setup", operator=True)
                     user = self.users.set_password(name, password, operator=True)
                     self.keys._write_setup_closed()
                 except UserNameTaken:
@@ -1876,22 +1877,7 @@ class WebAuth:
         return found
 
     def _invite_existing_page(self, handler):
-        body = (
-            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"/>"
-            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>"
-            "<title>agenticml · Sign in</title>"
-            "<link rel=\"stylesheet\" href=\"/static/app.css\"/>"
-            "<script type=\"module\" src=\"/static/invite.js\"></script></head>"
-            "<body class=\"login-page\"><main class=\"login-card\">"
-            "<p class=\"eyebrow\">agenticml</p><h1>You already have an account</h1>"
-            "<p>You already have an account; join this workspace, then sign in with it.</p>"
-            "<form id=\"invite-existing\">"
-            "<button class=\"btn btn-primary\" type=\"submit\">Join workspace</button>"
-            "</form>"
-            "<p><a href=\"/login\">Sign in</a></p>"
-            "<p id=\"error\" class=\"error\" role=\"alert\" hidden></p>"
-            "</main></body></html>"
-        ).encode("utf-8")
+        body = (_LOGIN_STATIC / "invite-existing.html").read_bytes()
         handler._send(body, "text/html; charset=utf-8", headers=self._headers({"Referrer-Policy": "no-referrer"}))
 
     def _invite_kind(self, token):
@@ -1958,7 +1944,7 @@ class WebAuth:
         return True
 
     def _invite(self, handler):
-        from .users import InviteExistingAccount, InviteInvalid
+        from .users import DETACHED_ACCOUNT, InviteExistingAccount, InviteInvalid
 
         if not handler._csrf_ok():
             handler.close_connection = True
@@ -1980,6 +1966,12 @@ class WebAuth:
             if kind == "existing":
                 try:
                     self._redeem_workspace_invite(token)
+                except ClientError as exc:
+                    if str(exc) != DETACHED_ACCOUNT:
+                        raise
+                    outcome = "failed"
+                    handler._json({"error": DETACHED_ACCOUNT}, 403, self._headers())
+                    return
                 except InviteExistingAccount:
                     outcome = "success"
                     handler._json(
@@ -2059,7 +2051,8 @@ class WebAuth:
                 "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"/>"
                 "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>"
                 "<title>agenticml · No user for this identity</title>"
-                "<link rel=\"stylesheet\" href=\"/static/app.css\"/></head>"
+                "<link rel=\"stylesheet\" href=\"/static/app.css\"/>"
+                "<script src=\"/static/theme.js\"></script></head>"
                 "<body class=\"login-page\"><main class=\"login-card\">"
                 "<p class=\"eyebrow\">agenticml</p><h1>No user for this identity</h1>"
                 f"<p>{text}</p></main></body></html>"

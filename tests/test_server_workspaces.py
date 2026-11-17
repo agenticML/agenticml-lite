@@ -785,7 +785,7 @@ def test_legacy_run_owner_not_attached_without_reclaim_runs(two, tmp_path, capsy
     with pytest.raises(ClientError, match='reclaim-runs'):
         users_b.add('ghost')
     assert users_b.get('ghost') is None
-    users_b.add('ghost', reclaim_runs=True)
+    users_b.add('ghost', reclaim_runs=True, operator=True)
     ghost = users_b.get('ghost')
     assert ghost.id == aid
     assert ghost.created_by == 'cli'

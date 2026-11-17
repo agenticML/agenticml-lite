@@ -1,3 +1,6 @@
+# Actions are pinned to full commit SHAs, with the tag in a comment. To update
+# one, look up the tag's commit (dereference annotated tags) and change the SHA
+# and the comment together.
 name: Deploy hosted service
 # A push to dev that changes the image or the stack queues a deploy of that
 # commit; like every run it waits for the hosted environment's reviewer.
@@ -62,7 +65,7 @@ jobs:
             echo "::error::GitHub environment variable AWS_CFN_ROLE_ARN is empty; set it to the bootstrap stack's CloudFormationRoleArn output."
             exit 1
           fi
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
@@ -81,15 +84,15 @@ jobs:
             exit 1
           fi
       # Fargate runs the tasks on ARM64 (Graviton); build that image under QEMU.
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
         with:
           platforms: arm64
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
       - id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2
       - name: Build or reuse immutable commit image
         shell: bash
         env:

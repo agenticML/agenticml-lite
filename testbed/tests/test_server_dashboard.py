@@ -1,4 +1,5 @@
 """Browser coverage for the server dashboard login, last synced, and overflow."""
+from datetime import datetime, timedelta
 import json
 import re
 import threading
@@ -7,7 +8,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from agenticml.server.app import make_server
 from agenticml.server.db.repos import RunRepo
-from agenticml.server.db.workspaces import WorkspaceRepo
+from agenticml.server.db.workspaces import InviteRepo, WorkspaceRepo
 from agenticml.server.runs import adopt_directory, reconcile
 from agenticml.server.workspaces import prepare_store
 from agenticml.store import RunWriter, layout
@@ -407,12 +408,66 @@ def test_invite_page_sets_password_and_overflow(page, tmp_path, monkeypatch):
         expect(page.get_by_role("heading", name="Choose a password", exact=True)).to_be_visible()
         expect(page).to_have_url(f"{url}/invite")
         assert token not in page.url
+        expect(page.locator(".auth-shell")).to_be_visible()
+        expect(page.locator(".field-underline")).to_have_count(2)
+        expect(page.locator(".auth-brand")).to_be_hidden()
         assert_no_overflow(page)
         page.locator("#password").fill("password1234")
+        page.locator("#password2").fill("password1235")
+        page.get_by_role("button", name="Save password", exact=True).click()
+        expect(page.locator("#error")).to_have_text("Passwords do not match")
+        assert_no_overflow(page)
         page.locator("#password2").fill("password1234")
         page.get_by_role("button", name="Save password", exact=True).click()
         expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
         assert_no_overflow(page)
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()
+
+
+def test_invite_existing_account_page_joins_and_overflow(page, tmp_path, monkeypatch):
+    # The account lives in the default workspace; the invite is into a second
+    # one, so the page offers "Join workspace" and redeeming answers 409 (the
+    # account keeps its password and signs in at /login).
+    page.allow_http_errors = True
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    httpd = make_server(tmp_path / "data", port=0)
+    httpd.users.add("alice", role="admin")
+    beta = WorkspaceRepo(httpd.db).create("beta", owner="alice")
+    prepare_store(httpd.data_dir, beta["id"])
+    # The invite exists first; the account is then created in the default workspace.
+    token = InviteRepo(httpd.db, beta["id"]).create("carol", "member", "alice")
+    httpd.users.add("carol", role="member")
+    httpd.users.set_password("carol", "password1234")
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        page.set_viewport_size({"width": 375, "height": 812})
+        page.goto(f"{url}/invite?token={token}")
+        expect(page.get_by_role("heading", name="You already have an account", exact=True)).to_be_visible()
+        expect(page.get_by_role("button", name="Join workspace", exact=True)).to_be_visible()
+        expect(page.get_by_role("link", name="Sign in", exact=True)).to_have_attribute("href", "/login")
+        expect(page.locator("input[type=password]")).to_have_count(0)
+        expect(page.locator(".auth-shell")).to_be_visible()
+        expect(page).to_have_url(f"{url}/invite")
+        assert token not in page.url
+        assert "carol" not in page.content()
+        assert_no_overflow(page)
+        # A server error shows its message and re-enables the button.
+        page.route("**/invite", lambda route: route.fulfill(
+            status=503, content_type="application/json", body='{"error": "boom"}')
+            if route.request.method == "POST" else route.continue_())
+        page.get_by_role("button", name="Join workspace", exact=True).click()
+        expect(page.locator("#error")).to_have_text("boom")
+        expect(page.get_by_role("button", name="Join workspace", exact=True)).to_be_enabled()
+        assert_no_overflow(page)
+        page.unroute("**/invite")
+        # The real redeem answers 409 for an existing account and lands on /login.
+        page.get_by_role("button", name="Join workspace", exact=True).click()
+        expect(page).to_have_url(f"{url}/login")
     finally:
         httpd.shutdown()
         thread.join(timeout=5)
@@ -546,3 +601,222 @@ def test_metric_picker_sort_filter_remembered_and_overflow(page, tmp_path, monke
         httpd.shutdown()
         thread.join(timeout=5)
         httpd.server_close()
+
+
+@pytest.fixture
+def metric_ui(tmp_path, monkeypatch):
+    """A server with one run that logged ``loss``; ``status`` picks running or finished."""
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    started = []
+
+    def start(status):
+        httpd = make_server(tmp_path / "data", port=0)
+        _, admin = httpd.keys.create("admin", "admin")
+        writer = RunWriter.create(
+            httpd.root, run_id="metric-run",
+            meta={"project": "demo", "name": "metric-run", "task": "train"})
+        writer.write_scalars([(0, {"loss": 1.0}), (1, {"loss": 0.5})])
+        if status == "finished":
+            writer.finish("finished")
+        writer.close()
+        adopt_directory(httpd.root, httpd.root / "runs" / "metric-run", httpd.run_index, remote={
+            "owner": "admin", "status": status, "fingerprint": "a" * 64,
+            "last_sync_at": layout.format_timestamp(),
+        })
+        httpd.run_index.rebuild_metrics("metric-run", httpd.root)
+        thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
+        thread.start()
+        started.append((httpd, thread))
+        return {"url": f"http://127.0.0.1:{httpd.server_address[1]}", "admin": admin}
+
+    yield start
+    for httpd, thread in started:
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()
+
+
+def stub_metrics(page, names, held=None):
+    """Serve ``names`` (a mutable list) as the workspace metric list."""
+    def handle(route):
+        if held is not None:
+            held.append(route)
+            return
+        route.fulfill(status=200, content_type="application/json",
+                      body=json.dumps({"metrics": list(names)}))
+
+    page.route("**/api/w/*/metrics", handle)
+
+
+def run_requests(page):
+    seen = []
+    page.on("request", lambda request: seen.append(request.url) if "/api/w/default/runs?" in request.url
+            or request.url.endswith("/api/w/default/runs") else None)
+    return seen
+
+
+def freeze_clock(page):
+    """Fake timers that only move when the test advances them."""
+    page.clock.install()
+    page.clock.pause_at(datetime.now() + timedelta(minutes=1))
+
+
+def advance_until(page, check, step=5000, attempts=8):
+    """Run the fake clock in steps, giving each response real time, until ``check`` passes."""
+    for _ in range(attempts):
+        page.clock.run_for(step)
+        try:
+            check()
+            return
+        except AssertionError:
+            continue
+    check()
+
+
+def test_metric_picker_new_metric_appears_without_reload(page, metric_ui):
+    server = metric_ui("running")
+    names = []
+    stub_metrics(page, names)
+    page.clock.install()
+    sign_in(page, server, server["admin"])
+    expect(page.get_by_role("link", name="metric-run", exact=True)).to_be_visible()
+    picker = page.get_by_test_id("runs-metric")
+    expect(picker).to_be_hidden()
+    names.append("loss")
+    advance_until(page, lambda: expect(picker).to_be_visible(timeout=700))
+    expect(picker.locator("option")).to_have_text(["None", "loss"])
+    names.append("newmetric")
+    advance_until(page, lambda: expect(picker.locator("option")).to_have_text(
+        ["None", "loss", "newmetric"], timeout=700))
+    picker.select_option("newmetric")
+    expect(picker).to_have_value("newmetric")
+
+
+def test_metric_picker_keeps_the_list_when_the_refresh_fails(page, metric_ui):
+    server = metric_ui("running")
+    names = ["loss"]
+    stub_metrics(page, names)
+    page.clock.install()
+    sign_in(page, server, server["admin"])
+    picker = page.get_by_test_id("runs-metric")
+    expect(picker.locator("option")).to_have_text(["None", "loss"])
+    page.unroute("**/api/w/*/metrics")
+    page.allow_http_errors = True
+    failures = []
+
+    def fail(route):
+        failures.append(route.request.url)
+        route.fulfill(status=503, content_type="application/json", body='{"error": "down"}')
+
+    page.route("**/api/w/*/metrics", fail)
+    for _ in range(6):
+        page.clock.run_for(5000)
+        if failures:
+            break
+        page.wait_for_timeout(300)
+    assert failures, "the metric list was never refreshed"
+    expect(picker).to_be_visible()
+    expect(picker.locator("option")).to_have_text(["None", "loss"])
+
+
+def test_metric_picker_saved_choice_returns_when_metric_appears(page, metric_ui):
+    server = metric_ui("running")
+    names = ["loss"]
+    stub_metrics(page, names)
+    page.add_init_script(
+        "if (!localStorage.getItem('agenticml-runs-metric:default')) "
+        "localStorage.setItem('agenticml-runs-metric:default', "
+        "JSON.stringify({name: 'late', stat: 'min'}));")
+    requests = run_requests(page)
+    page.clock.install()
+    sign_in(page, server, server["admin"])
+    picker = page.get_by_test_id("runs-metric")
+    stat = page.get_by_test_id("runs-metric-stat")
+    expect(picker.locator("option")).to_have_text(["None", "loss"])
+    expect(picker).to_have_value("")
+    expect(stat).to_have_value("min")
+    # The first /runs already carries the saved metric.
+    assert "metrics=late" in requests[0], requests
+    # Changing only the statistic must not overwrite the saved name.
+    stat.select_option("max")
+    saved = page.evaluate("JSON.parse(localStorage.getItem('agenticml-runs-metric:default'))")
+    assert saved == {"name": "late", "stat": "max"}
+    names.append("late")
+    advance_until(page, lambda: expect(picker).to_have_value("late", timeout=700))
+    expect(stat).to_have_value("max")
+
+
+def test_metric_names_are_requested_in_parallel_with_the_first_runs(page, metric_ui):
+    server = metric_ui("finished")
+    held = []
+    stub_metrics(page, ["loss"], held=held)
+    sign_in(page, server, server["admin"])
+    # The runs render while the metric list is still pending.
+    expect(page.get_by_role("link", name="metric-run", exact=True)).to_be_visible()
+    assert len(held) == 1, "the metric list should have been requested exactly once"
+    picker = page.get_by_test_id("runs-metric")
+    expect(picker).to_be_hidden()
+    held[0].fulfill(status=200, content_type="application/json", body=json.dumps({"metrics": ["loss"]}))
+    expect(picker).to_be_visible()
+    expect(picker.locator("option")).to_have_text(["None", "loss"])
+
+
+def test_filter_debounce_is_250ms(page, metric_ui):
+    server = metric_ui("finished")
+    sign_in(page, server, server["admin"])
+    expect(page.get_by_role("link", name="metric-run", exact=True)).to_be_visible()
+    expect(page.get_by_test_id("runs-metric")).to_be_visible()
+    freeze_clock(page)
+    requests = run_requests(page)
+    search = page.get_by_label("Filter runs")
+    search.fill("loss.min<1")
+    page.clock.fast_forward(200)
+    search.fill("loss.min<2")
+    page.clock.fast_forward(200)
+    page.wait_for_timeout(300)
+    assert requests == []
+    with page.expect_response(lambda response: "metrics=loss" in response.url):
+        page.clock.fast_forward(60)
+    page.wait_for_timeout(200)
+    assert len(requests) == 1
+    # "loss" is known now: a further edit redraws without a request.
+    search.fill("loss.min<3")
+    page.clock.fast_forward(600)
+    page.wait_for_timeout(300)
+    assert len(requests) == 1
+    expect(page.get_by_role("link", name="metric-run", exact=True)).to_be_visible()
+
+
+def test_422_falls_back_to_the_picked_metric_and_remembers_the_rejection(page, metric_ui):
+    server = metric_ui("finished")
+    page.allow_http_errors = True
+    sign_in(page, server, server["admin"])
+    picker = page.get_by_test_id("runs-metric")
+    expect(picker).to_be_visible()
+    picker.select_option("loss")
+    expect(page.locator(".run-row.has-picked-metric")).to_have_count(1)
+
+    def stub(route):
+        if "bogus" in route.request.url:
+            route.fulfill(status=422, content_type="text/plain", body="invalid metrics")
+        else:
+            route.continue_()
+
+    page.route("**/api/w/*/runs*", stub)
+    requests = run_requests(page)
+    freeze_clock(page)
+    search = page.get_by_label("Filter runs")
+    search.fill("bogus.min<1")
+    with page.expect_request(lambda request: "bogus" in request.url):
+        page.clock.fast_forward(300)
+    page.wait_for_timeout(500)
+    # One request with the unknown name, one retry with only the picked metric.
+    assert len(requests) == 2 and "bogus" in requests[0] and "bogus" not in requests[1], requests
+    assert requests[1].endswith("metrics=loss")
+    expect(page.get_by_role("alert")).to_have_count(0)
+    expect(picker).to_have_value("loss")
+    # The rejected name is not requested again on this page.
+    search.fill("bogus.min<2")
+    page.clock.fast_forward(600)
+    page.wait_for_timeout(300)
+    assert len(requests) == 2

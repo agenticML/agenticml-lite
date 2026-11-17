@@ -799,15 +799,35 @@ def _push_byref(reader, client, state, candidates, result, save, sizes, overflow
     sizes["artifacts.json"] = len(body)
     if state["files"].get("artifacts.json", {}).get("sha256") == digest:
         return
-    try:
-        client.put_file(reader.run_id, "artifacts.json", body)
-    except Conflict as exc:
-        _check_owner(reader, client, exc.payload)
-        raise
+    _put_atomic(reader, client, state, save, "artifacts.json", body)
     state["files"]["artifacts.json"] = {"size": len(body), "sha256": digest}
     result.files += 1
     result.bytes += len(body)
     save()
+
+
+def _put_atomic(reader, client, state, save, name, body):
+    """PUT an atomic file; on any failure forget its cursor entry.
+
+    The server renames the new bytes into place before it answers, so after a
+    lost response the old acknowledged sha no longer describes the server.
+    Dropping the entry makes the next pass send the local bytes again (the PUT
+    is idempotent) instead of skipping the file by hash. Residual: a kill
+    between the server's rename and the except block below never runs the
+    drop; any client that calls /state recovers the real hashes.
+    """
+    try:
+        return client.put_file(reader.run_id, name, body)
+    except BaseException as exc:
+        if state["files"].pop(name, None) is not None:
+            try:
+                save()
+            except Exception:  # Keep the original failure; the in-memory drop still holds for this pass.
+                logging.getLogger(__name__).warning(
+                    "could not save the sync state after a failed upload of %s", name, exc_info=True)
+        if isinstance(exc, Conflict):
+            _check_owner(reader, client, exc.payload)
+        raise
 
 
 def _check_owner(reader, client, payload):
@@ -818,6 +838,9 @@ def _check_owner(reader, client, payload):
             raise OwnershipError(
                 f"run id {reader.run_id} belongs to user {payload['owner_user']} on this server")
     elif owner and owner != identity["key"]:
+        # Only servers without `user` in whoami (2.0/2.1) get here. A 3.0
+        # server's `owner` is the user name, so this key-name comparison is
+        # meaningless against it (and always has `user`).
         raise OwnershipError(f"run id {reader.run_id} belongs to key {owner} on this server")
 
 
@@ -1009,11 +1032,7 @@ def _sync_locked(reader, host, client, result, *, dry_run=False, prune=False, ar
         snapshot = files[name]
         if not force and state["files"].get(name, {}).get("sha256") == snapshot["sha256"]:
             return
-        try:
-            client.put_file(reader.run_id, name, snapshot["data"])
-        except Conflict as exc:
-            _check_owner(reader, client, exc.payload)
-            raise
+        _put_atomic(reader, client, state, save, name, snapshot["data"])
         state["files"][name] = {"size": snapshot["size"], "sha256": snapshot["sha256"]}
         sent_files.add(name)
         result.files = len(sent_files)

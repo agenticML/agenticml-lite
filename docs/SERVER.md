@@ -120,8 +120,9 @@ Every member of a workspace holds one of four roles within that workspace:
 | Manage workspace members and invites | – | – | yes | yes |
 | Issue / revoke keys for any member | – | – | yes | yes |
 | View workspace name, plan and usage (Settings > Workspace) | – | – | yes | yes |
+| Rename the workspace (Settings > Workspace, `PATCH /api/w/<slug>`) | – | – | yes | yes |
 
-- **`owner`**: The creator of the workspace. A workspace has exactly one owner. The owner cannot be removed or demoted. Only the server operator can rename a workspace (on `/admin` or `PATCH /api/admin/workspaces/<slug>`), transfer ownership (`server workspaces set-owner`) or delete a workspace (`server workspaces delete`).
+- **`owner`**: The creator of the workspace. A workspace has exactly one owner. The owner cannot be removed or demoted. An owner or admin can rename the workspace in **Settings > Workspace** or with `PATCH /api/w/<slug>` and a body of exactly `{"name": "..."}`; the name is trimmed, must be 1 to 256 characters and may not contain control characters, and the slug is never changed. The rename is recorded as `workspace.rename` in the workspace's Activity and in the server log. Only the server operator can change the slug (on `/admin` or `PATCH /api/admin/workspaces/<slug>`), transfer ownership (`server workspaces set-owner`) or delete a workspace (`server workspaces delete`).
 - **`admin`**: Full administrative rights within the workspace (members, invites, keys, notes); can view the workspace's plan and usage.
 - **`member`**: Can sync runs, edit notes, and manage their own sync keys.
 - **`viewer`**: Read-only dashboard access. Viewer sync keys can only call `GET /v2/whoami`; all other `/v2` endpoints return `403 Forbidden`.
@@ -159,12 +160,17 @@ agenticml server workspaces create SLUG [--name NAME] [--owner LOGIN] [--databas
 # Rename a workspace or change its slug
 agenticml server workspaces rename SLUG --name NEW_NAME [--slug NEW_SLUG] [--database URL] [--data DIR]
 
-# Suspend or resume a workspace (suspended workspaces reject all access with 404)
+# Suspend or resume a workspace (suspended workspaces answer 404 on the dashboard and 403 to sync clients)
 agenticml server workspaces suspend SLUG [--database URL] [--data DIR]
 agenticml server workspaces resume SLUG [--database URL] [--data DIR]
 
 # Delete a workspace (requires typed confirmation of the slug; deletes files and objects)
 agenticml server workspaces delete SLUG [--yes-delete SLUG] [--objects URL] [--database URL] [--data DIR]
+
+# Find and retry leftovers of a deletion (workspace ids with files or S3 objects but no database row)
+agenticml server workspaces orphans [--objects URL] [--json] [--database URL] [--data DIR]
+agenticml server workspaces cleanup WORKSPACE_ID [--objects URL] [--database URL] [--data DIR]
+agenticml server workspaces cleanup --all --yes-delete all [--objects URL] [--database URL] [--data DIR]
 
 # Transfer workspace ownership
 agenticml server workspaces set-owner SLUG --owner LOGIN [--database URL] [--data DIR]
@@ -181,6 +187,8 @@ agenticml server workspaces recount SLUG [--database URL] [--data DIR]
 agenticml server workspaces recount --all [--database URL] [--data DIR]
 ```
 
+`set-plan SLUG custom` merges the flags you pass onto the workspace's current limits inside one database transaction: a custom workspace keeps its other limits, and a free workspace starts from the free plan in `--limits FILE` (or `AGENTICML_SERVER_LIMITS`), or from unlimited when there is no limits file. `PATCH /api/admin/workspaces/<slug>` with a partial `limits` object merges the same way, so two administrators editing different limits at once do not lose each other's change. The dashboard's plan dialog always sends all four limits, so there the last save wins; switching a free workspace to custom in it starts from the free plan's numbers. `GET /api/admin/workspaces` returns the free plan's limits as `free_limits` (null without a limits file).
+
 ### Account management CLI
 
 Manage global user accounts using `agenticml server accounts`:
@@ -194,9 +202,17 @@ agenticml server accounts add LOGIN [--display-name NAME] [--server-admin] [--da
 
 # Grant or revoke server admin privileges
 agenticml server accounts set-server-admin LOGIN on|off [--database URL] [--data DIR]
+
+# Erase an account (privacy request): sessions, keys, memberships, pending invites; redacts the
+# server-level audit log. Refused while the account is a server admin or owns a workspace or runs.
+agenticml server accounts delete LOGIN [--yes-delete LOGIN] [--json] [--database URL] [--data DIR]
 ```
 
+`accounts delete` leaves workspace Activity logs alone (they stay with their workspace) and prints the Firebase uid to delete in the Firebase console. `workspaces cleanup --all` removes every id `orphans` lists, so never run it against a restored or drill database; `server verify` and `server status` list orphans as warnings.
+
 ### Workspace membership and user CLI
+
+An account that belongs to no workspace (removed from its last one) can be added again over HTTP (**Settings > Members**) only by an admin of the workspace it last left, and never when it is a server admin. For any other workspace, and for accounts that never had a membership, an operator must run `agenticml server users add LOGIN --workspace SLUG`.
 
 Manage memberships and users within a specific workspace using `agenticml server users`:
 
@@ -224,6 +240,8 @@ agenticml server users set-identity LOGIN [IDENTITY] --workspace SLUG
 ```
 
 `--workspace` defaults to `default`.
+
+Invite and setup links on a self-hosted server carry their token in the query string (`/invite?token=...`, `/setup?token=...`), because the server reads it to choose the page. If such a server sits behind a proxy or load balancer that logs request URLs, those tokens (single use, 72 hours for invites) appear in its logs; exclude query strings from that log. With Firebase sign-in on (the hosted service), `users invite` and the Members page print `/invite#token=...` instead: the fragment is never sent to the server or to any proxy in front of it.
 
 ## API keys and sync authentication
 
@@ -275,6 +293,16 @@ Benefits of PostgreSQL:
 - **Row-Level Security**: Defense-in-depth isolation ensures queries only access rows matching the session's active workspace.
 
 Run files and shadow Git repositories must reside on a shared POSIX network filesystem (such as Amazon EFS mounted with NFSv4.1).
+
+### Database connections per process
+
+Each server process opens a bounded number of connections:
+
+- **Transactions**: at most 24 at once (`TRANSACTION_CONNECTION_LIMIT`). A 25th request waits up to 10 seconds for a free slot, then gets `503` with `Retry-After`, the same answer as a database lock timeout. The pool keeps 16 of them idle. The `/healthz` check never opens a transaction, so it is not held up by this wait.
+- **Session locks**: at most 64 more, each on its own connection (48 for run and object locks, 16 for quota, lineage and import locks), plus one lifetime connection for the server lock.
+- **Hard ceiling** per process: about 90 connections. In practice far fewer are in use: at most 8 uploads receive a body at once, and each holds at most one run or object lock and one inner lock, so a busy process uses roughly 40.
+
+The hosted database (`db.t4g.micro`, about 112 connections by default) is sized for two tasks at that level, which is what a rolling deploy runs. Check `SHOW max_connections;` if you move to a smaller instance or run more than two tasks. A process paused while it holds a lock is a known residual risk, covered in section 8 of [THREAT_MODEL.md](THREAT_MODEL.md).
 
 ## Amazon S3 object storage
 
@@ -329,19 +357,24 @@ Enforce storage and traffic limits per workspace using `--limits`:
 agenticml server serve --limits /etc/agenticml-limits.json
 ```
 
-Example limits configuration file:
+Example limits configuration file (also shipped as `docs/examples/limits.json`; `deploy/aws/limits.json` is the hosted one):
 
 ```json
 {
-  "free": {
-    "storage_bytes": 5000000000,
-    "upload_bytes_per_day": 2000000000,
-    "requests_per_minute": 600,
-    "people": 5,
-    "workspaces_per_account": 1
+  "default_plan": "free",
+  "free_workspaces_per_account": 1,
+  "plans": {
+    "free": {
+      "storage_bytes": 5000000000,
+      "upload_bytes_per_day": 2000000000,
+      "requests_per_minute": 600,
+      "people": 5
+    }
   }
 }
 ```
+
+The file must have exactly these keys: anything else makes the server refuse to start with `invalid limits file`. `free_workspaces_per_account` is how many free workspaces one account may own (`0` disables free workspaces).
 
 ### Limit enforcement
 
@@ -349,7 +382,7 @@ Example limits configuration file:
 - **Daily upload quota**: Bytes uploaded within the current UTC day. Exceeding the quota returns HTTP 403 with the reset time.
 - **Request rate limit**: Requests per minute per workspace across all server processes. Exceeding the rate returns HTTP `429 Too Many Requests` with a `Retry-After` header.
 - **People quota**: Maximum members plus pending invites. Inviting additional members is blocked once the quota is reached.
-- **Free workspaces**: Maximum free-plan workspaces an individual account can own.
+- **Free workspaces per account** (`free_workspaces_per_account`): Maximum free-plan workspaces an individual account can own.
 
 ## Backups and restore
 
@@ -388,6 +421,8 @@ To restore a PostgreSQL server:
    agenticml server serve --data /backups/20261109-0000 --database "$DATABASE_URL"
    ```
 
+After a restore, `agenticml server verify` can list runs whose files are behind the database (`size_mismatch`, `file_hash`) when they were synced while the backup ran. The client that holds such a run repairs it with `agenticml sync RUN --reset`, then `agenticml sync RUN`.
+
 ## Operator diagnostics: `status` and `verify`
 
 Inspect server health and data integrity on the host:
@@ -418,7 +453,7 @@ When starting a 3.0 server against an existing 2.x data directory, the server au
    found 2.x <path> after this server was converted on <date>; move it away (the converted copy is <path>.2x)
    ```
 
-Sync clients on version 2.2 continue to sync to a 3.0 server without modification.
+Sync clients on version 2.2 continue to sync to a 3.0 server without modification. Clients must be 2.2 or newer: older ones are refused with HTTP 426, and 2.0 and 2.1 clients misreport their own runs as foreign if you lower `--min-client-version`.
 
 ## Configuration reference
 
@@ -441,7 +476,7 @@ Sync clients on version 2.2 continue to sync to a 3.0 server without modificatio
 | `--admin-emails LIST` | `AGENTICML_SERVER_ADMIN_EMAILS` | unset | Comma-separated emails granted server admin on verified Firebase sign-in. Ignored without Firebase. |
 | `--legal-base-url URL` | `AGENTICML_SERVER_LEGAL_BASE_URL` | unset | `https://` base URL of your Terms, Acceptable use and Privacy pages (`terms/`, `acceptable-use/`, `privacy/` under it). With Firebase on, the sign-in page (`/login` and `/invite`) then shows "By continuing you agree to the Terms and the Acceptable use policy. See the Privacy policy." with those links. A non-`https://` value stops the server at startup. Ignored without Firebase. Not set means no links. |
 | `--open-signup` | `AGENTICML_SERVER_OPEN_SIGNUP` | off | Allow verified Firebase sign-in to create an account and personal workspace. A verified account with no workspace gets one at sign-in (once; an admin-deleted sign-up workspace is not recreated). |
-| `--min-client-version X.Y` | `AGENTICML_SERVER_MIN_CLIENT_VERSION` | `2.2` | Reject `agenticml-lite` clients older than `X.Y` on `/v2` requests with HTTP 426. |
+| `--min-client-version X.Y` | `AGENTICML_SERVER_MIN_CLIENT_VERSION` | `2.2` | Reject `agenticml-lite` clients older than `X.Y` on `/v2` requests with HTTP 426. Values below `2.2` are unsupported: 2.0 and 2.1 clients misreport their own runs as foreign. |
 
 Additional environment variables:
 - `AGENTICML_SERVER_KEY`: Static admin API key named `env` kept in memory. Bound to the `default` workspace.

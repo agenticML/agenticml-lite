@@ -14,6 +14,13 @@ _DEFAULT_CONNECT_TIMEOUT = '10'
 SESSION_LOCK_LIMIT = 64
 OUTER_LOCK_LIMIT = 48
 INNER_LOCK_LIMIT = 16
+# Per instance (one instance is one pool): at most this many transactions, and so
+# transaction connections, at once. Nothing inside a transaction waits for a lock
+# slot or for another transaction slot, so slots free within statement_timeout and
+# the wait only times out under overload. Must stay above the 16 idle connections
+# the pool keeps.
+TRANSACTION_CONNECTION_LIMIT = 24
+_TRANSACTION_WAIT = 10.0
 _outer_slots = threading.BoundedSemaphore(OUTER_LOCK_LIMIT)
 _inner_slots = threading.BoundedSemaphore(INNER_LOCK_LIMIT)
 _held_lock_connections = threading.local()
@@ -73,6 +80,8 @@ class PostgresDatabase:
     dialect = PostgresDialect()
 
     def __init__(self, url):
+        # Before anything that can raise: close() and __del__ need these.
+        self._tx_slots = threading.BoundedSemaphore(TRANSACTION_CONNECTION_LIMIT)
         self._lock = threading.Lock()
         self._local = threading.local()
         self._idle = []
@@ -179,7 +188,11 @@ class PostgresDatabase:
         connection = None
         discard = False
         mapped = None
+        slot = False
         try:
+            slot = self._tx_slots.acquire(timeout=_TRANSACTION_WAIT)
+            if not slot:
+                raise DatabaseBusy('database is locked')
             while True:
                 with self._lock:
                     if self.closed:
@@ -242,6 +255,8 @@ class PostgresDatabase:
                         self._idle.append(connection)
                 if discard:
                     self._close_connection(connection)
+            if slot:
+                self._tx_slots.release()
         if mapped is not None:
             _raise_plain(mapped)
 

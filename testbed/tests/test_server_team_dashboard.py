@@ -710,3 +710,81 @@ def test_first_password_adds_current_password_field(page, team_server):
     card.get_by_role("button", name="Change password", exact=True).click()
     expect(card.get_by_role("status")).to_have_text("Password updated")
     expect(card.get_by_label("Current password", exact=True)).to_be_visible()
+
+
+def test_owner_renames_workspace_from_settings(page, team_server):
+    sign_in(page, team_server, team_server["admin"])
+    card = open_settings(page, "workspace")
+    rename = card.get_by_role("button", name="Rename", exact=True)
+    rename.click()
+    dialog = page.get_by_role("dialog", name="Rename workspace", exact=True)
+    expect(dialog).to_be_visible()
+    name = dialog.get_by_label("Name", exact=True)
+    expect(name).to_have_value(
+        card.locator(".settings-ws-name").inner_text())
+    name.fill("  Research Lab  ")
+    dialog.get_by_role("button", name="Save", exact=True).click()
+    expect(dialog).to_have_count(0)
+    expect(card.locator(".settings-ws-name")).to_have_text("Research Lab")
+    expect(page.locator(".settings-header .eyebrow")).to_have_text("Workspace · Research Lab")
+    expect(page.locator('.settings-row-name[data-slug="default"]')).to_have_text("Research Lab")
+    expect(rename).to_be_focused()
+    expect(settings_card(page, "activity")).to_contain_text("workspace.rename")
+    stored = WorkspaceRepo(team_server["httpd"].db).get("default")
+    assert stored["name"] == "Research Lab" and stored["slug"] == "default"
+    # The dialog starts from the new name, and the name survives a reload.
+    rename.click()
+    expect(page.get_by_role("dialog", name="Rename workspace", exact=True).get_by_label(
+        "Name", exact=True)).to_have_value("Research Lab")
+    page.keyboard.press("Escape")
+    page.reload()
+    expect(page.get_by_role("heading", name="Settings", exact=True)).to_be_visible()
+    expect(settings_card(page, "workspace").locator(".settings-ws-name")).to_have_text("Research Lab")
+
+
+def test_rename_shows_server_errors_and_keeps_the_dialog(page, team_server):
+    page.allow_http_errors = True
+    sign_in(page, team_server, team_server["admin"])
+    card = open_settings(page, "workspace")
+    page.route("**/api/w/default", lambda route: route.fulfill(
+        status=400, content_type="application/json",
+        body='{"error": "invalid workspace name"}') if route.request.method == "PATCH"
+        else route.continue_())
+    card.get_by_role("button", name="Rename", exact=True).click()
+    dialog = page.get_by_role("dialog", name="Rename workspace", exact=True)
+    dialog.get_by_label("Name", exact=True).fill("Bad")
+    dialog.get_by_role("button", name="Save", exact=True).click()
+    expect(dialog.get_by_role("alert")).to_have_text("invalid workspace name")
+    expect(dialog.get_by_role("button", name="Save", exact=True)).to_be_enabled()
+    expect(card.locator(".settings-ws-name")).not_to_have_text("Bad")
+    dialog.get_by_role("button", name="Cancel", exact=True).click()
+    expect(dialog).to_have_count(0)
+    assert WorkspaceRepo(team_server["httpd"].db).get("default")["name"] != "Bad"
+
+
+@pytest.mark.parametrize("width", [375, 600])
+def test_rename_dialog_fits_narrow_screens(page, team_server, width):
+    page.set_viewport_size({"width": width, "height": 812})
+    sign_in(page, team_server, team_server["admin"])
+    card = open_settings(page, "workspace")
+    assert_no_overflow(page)
+    card.get_by_role("button", name="Rename", exact=True).click()
+    dialog = page.get_by_role("dialog", name="Rename workspace", exact=True)
+    dialog.get_by_label("Name", exact=True).fill("W" * 256)
+    assert_no_overflow(page)
+    assert_dialog_fits(page, dialog)
+    dialog.get_by_role("button", name="Cancel", exact=True).click()
+    assert_no_overflow(page)
+
+
+def test_members_and_viewers_have_no_rename_button(page, team_server):
+    sign_in_password(page, team_server, "alice", PASSWORD)
+    open_settings(page)
+    expect(page.get_by_role("button", name="Rename", exact=True)).to_have_count(0)
+    expect(page.locator("#settings-workspace")).to_have_count(0)
+    page.get_by_role("button", name="Sign out", exact=True).first.click()
+    expect(page.get_by_role("heading", name="Sign in", exact=True)).to_be_visible()
+    sign_in_password(page, team_server, "vera", PASSWORD)
+    open_settings(page)
+    expect(page.get_by_role("button", name="Rename", exact=True)).to_have_count(0)
+    expect(page.locator("#settings-workspace")).to_have_count(0)

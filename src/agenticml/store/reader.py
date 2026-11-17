@@ -29,6 +29,7 @@ result built from it.
 from __future__ import annotations
 
 from collections import OrderedDict
+from contextlib import contextmanager
 import json
 import logging
 import math
@@ -614,6 +615,8 @@ class RunReader:
         self._remote_provider = remote
         self._committed_size = committed_size
         self._lock = threading.RLock()
+        # Per-thread, per public call memo of committed sizes (see _sizes_scope).
+        self._snap = threading.local()
         self._path_cache: dict[str, Path] = {}
         self._meta_path = self._c(self.run_dir / META_NAME)
         if self._meta_path.is_symlink():
@@ -634,10 +637,42 @@ class RunReader:
         self._status = ""
         self._index_cache: tuple[tuple[int, int, int], dict] | None = None
 
+    @contextmanager
+    def _sizes_scope(self):
+        """Memoise committed sizes for one public call on this thread.
+
+        Without it one ``series()`` asks the index twice for the same file,
+        and the two answers can differ. The memo is thread-local, entered
+        inside the reader lock, and dropped when the outermost call returns,
+        so the next call (and other processes' writes) are always seen.
+        """
+        if self._committed_size is None:
+            yield
+            return
+        snap = self._snap
+        depth = getattr(snap, "depth", 0)
+        if depth == 0:
+            snap.sizes = {}
+        snap.depth = depth + 1
+        try:
+            yield
+        finally:
+            snap.depth = depth
+            if depth == 0:
+                snap.sizes = None
+
     def _file_size(self, path):
         size = _file_size(path)
         if self._committed_size is not None:
-            size = min(size, self._committed_size(self.run_id, path.relative_to(self.run_dir).as_posix()))
+            rel = path.relative_to(self.run_dir).as_posix()
+            sizes = getattr(self._snap, "sizes", None)
+            if sizes is None:
+                committed = self._committed_size(self.run_id, rel)
+            else:
+                if rel not in sizes:
+                    sizes[rel] = self._committed_size(self.run_id, rel)
+                committed = sizes[rel]
+            size = min(size, committed)
         return size
 
     def _read_append(self, path):
@@ -707,15 +742,17 @@ class RunReader:
     def record_sizes(self) -> dict:
         """Snapshot complete scalar byte lengths for one bounded sync pass."""
         sizes = {}
-        for key in self.keys():
-            size = self._file_size(self._bin_path(_series_id(self._series_info(key))))
-            sizes[key] = size - size % RECORD_SIZE
+        with self._sizes_scope():
+            for key in self.keys():
+                size = self._file_size(self._bin_path(_series_id(self._series_info(key))))
+                sizes[key] = size - size % RECORD_SIZE
         return sizes
 
     def events(self) -> list:
         """Event objects. A torn last line is omitted; a bad earlier line is skipped."""
         path = self._c(self.run_dir / EVENTS_NAME)
-        maximum = self._file_size(path) if self._committed_size is not None else None
+        with self._sizes_scope():
+            maximum = self._file_size(path) if self._committed_size is not None else None
         return load_events(path, maximum=maximum)
 
     def code_manifest(self) -> list:
@@ -795,7 +832,8 @@ class RunReader:
         """``(step, seconds_since_created_at)`` from ``_time.bin``, torn tail dropped."""
         path = self._c(self.run_dir / SCALARS_DIRNAME / TIME_BIN_NAME)
         try:
-            data = self._read_append(path)
+            with self._sizes_scope():
+                data = self._read_append(path)
         except FileNotFoundError:
             return []
         except OSError as exc:
@@ -813,7 +851,8 @@ class RunReader:
         path = self._c(self.run_dir / SCALARS_DIRNAME / TIME_BIN_NAME)
         if self._committed_size is None:
             return _last_complete_step(path)
-        complete = self._file_size(path) // RECORD_SIZE * RECORD_SIZE
+        with self._sizes_scope():
+            complete = self._file_size(path) // RECORD_SIZE * RECORD_SIZE
         if complete < RECORD_SIZE:
             return None
         try:
@@ -828,7 +867,8 @@ class RunReader:
         """Last complete ``.bin`` record for ``key``, or None if missing or empty."""
         info = self._series_info(key)
         path = self._bin_path(_series_id(info))
-        size = self._file_size(path)
+        with self._sizes_scope():
+            size = self._file_size(path)
         complete = size - (size % RECORD_SIZE)
         if complete < RECORD_SIZE:
             return None
@@ -866,7 +906,8 @@ class RunReader:
             return [], offset
         info = self._series_info(key)
         path = self._bin_path(_series_id(info))
-        size = self._file_size(path)
+        with self._sizes_scope():
+            size = self._file_size(path)
         complete = size - (size % RECORD_SIZE)
         if offset >= complete:
             return [], offset
@@ -910,7 +951,7 @@ class RunReader:
             raise ValueError("max_points must be an integer >= 1")
         start = _bound(start)
         end = _bound(end)
-        with self._lock:
+        with self._lock, self._sizes_scope():
             return self._series_locked(key, max_points, start, end)
 
     def _series_locked(self, key: str, max_points: int, start, end) -> dict:

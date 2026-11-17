@@ -48,7 +48,8 @@ def for_server_dir(server_dir, url=None, *, create=True, actor='server'):
     path = None if _is_postgres(resolved) else _path(resolved)
     key = resolved if path is None else str(path)
     if path is None:
-        # Network I/O and migration/import locks must not block the registry.
+        # Network I/O and migration/import locks must not block the registry
+        # (tests/test_server_many_processes.py::test_registry_available_during_connect).
         with _registry_lock:
             db = _registry.get(key)
         if db is None or db.closed:
@@ -74,9 +75,7 @@ def for_server_dir(server_dir, url=None, *, create=True, actor='server'):
         return db
     with _registry_lock:
         db = _registry.get(key)
-        if not create and path is None and (db is None or db.closed) and not PostgresDatabase.exists(resolved):
-            return None
-        if not create and path is not None:
+        if not create:
             try:
                 path.lstat()
             except FileNotFoundError:

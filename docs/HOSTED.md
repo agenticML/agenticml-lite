@@ -50,7 +50,7 @@ Deploys are automated through GitHub Actions ([.github/workflows/deploy.yml](../
 2. **Rolling CloudFormation deployment**: The deploy workflow deploys the hosted CloudFormation stack with the new image tag. CloudFormation registers the task definition revision and triggers a rolling service update (`minimumHealthyPercent=100`, `maximumPercent=200`, so the new task starts before the old one stops and a single task deploys without downtime); the ECS deployment circuit breaker automatically rolls back if a bad image fails to start.
 3. **Database migrations**: Migrations run automatically during server process startup under PostgreSQL advisory migration locks (`pg_advisory_xact_lock`), safely coordinating concurrent starts.
 4. **Initial deploy and config updates**: The first deploy creates the entire hosted CloudFormation stack in one go (no `desired_count=0` step). Environment configuration changes (Multi-AZ, Firebase settings, open sign-up, or admin emails) are made by updating GitHub environment variables and re-running the deploy workflow. The task count is not a variable: it comes from the workflow's `desired_count` input (`1`, `0` or `2`; default `1`; push runs keep the current count).
-5. **How deploys start**: The workflow runs automatically on every push to `dev` that changes `src/**`, `pyproject.toml`, `deploy/aws/**` (except Markdown and `bootstrap.yaml`) or `.github/workflows/deploy.yml`. Each run waits for the required reviewer on the `hosted` environment; the reviewer reads the commit first and rejects an older waiting run when a newer one is queued. Manual dispatch (`gh workflow run deploy.yml`) works only once `deploy.yml` is on `main`. Until then, roll back by reverting on `dev`.
+5. **How deploys start**: The workflow runs automatically on every push to `dev` that changes `src/**`, `pyproject.toml`, `deploy/aws/**` (except Markdown and `bootstrap.yaml`) or `.github/workflows/deploy.yml`. Each run waits for the required reviewer on the `hosted` environment; the reviewer reads the commit first and rejects an older waiting run when a newer one is queued. Manual dispatch (`gh workflow run deploy.yml --ref dev`) works: `dev` is the default branch and has `deploy.yml`. To roll back, dispatch with `-f ref=<previous sha>` or revert on `dev`.
 
 For deployment commands and runbook procedures, see [deploy/aws/README.md](../deploy/aws/README.md#first-deploy).
 
@@ -107,7 +107,7 @@ The standard path is self-serve administration from `/admin` and the workspace d
 
 1. **Create workspace**: On `/admin`, click **New workspace** and enter the slug, name, and owner email (e.g. `customer@example.com`). If no account exists for that email yet, a credential-less account is created.
 2. **Owner sign-in**: The owner signs in with a verified Firebase sign-in (Google or verified email/password using that email). The first verified sign-in links the account and places them in the workspace as owner.
-3. **Invite team members**: The workspace owner invites team members from **Settings > Members**. An invite generates a one-time link (valid 72 hours). The invitee signs in with Google or email/password using that exact email, which must be verified. Inviting someone who already has an account adds the membership directly without generating an invite link.
+3. **Invite team members**: The workspace owner invites team members from **Settings > Members**. An invite generates a one-time link (valid 72 hours). The invitee signs in with Google or email/password using that exact email, which must be verified. Inviting someone who already has an account adds the membership directly without generating an invite link. An account that was removed from its last workspace can only be added back by an admin of that workspace or by an operator (`agenticml server users add LOGIN --workspace SLUG`); otherwise the invite is refused (403).
 4. **Issue sync keys**: A workspace admin creates sync API keys under **Settings > API keys** for any member (the person must already be a workspace member).
 5. **Multi-workspace accounts**: With Firebase on, there are no passwords to set; adding an account to additional workspaces attaches the membership directly. (The order rule requiring a user to set their password before being added to a second workspace applies to password sign-in only.)
 
@@ -180,7 +180,7 @@ If an account violates terms of service or payment lapses, suspend the workspace
 agenticml server workspaces suspend acme-corp --data /data
 ```
 
-Suspended workspaces immediately block all API requests, dashboard access, and sync uploads. The server returns HTTP `404 Not Found` for all workspace endpoints, preventing disclosure of the workspace's existence.
+A suspended workspace is closed at once. The dashboard and its `/api/w/<slug>/...` endpoints answer `404 Not Found`, exactly as for a workspace that does not exist, so the slug is not disclosed. Sync clients that present one of its keys are refused with `403 Forbidden` (`{"error": "workspace suspended"}`) on every `/v2` request, including `whoami`; `sync --follow` does not retry this error. Data, keys and memberships are kept.
 
 To resume service:
 
@@ -200,7 +200,14 @@ Deleting a workspace removes all database records, deletes on-disk files on EFS,
 agenticml server workspaces delete acme-corp --yes-delete acme-corp --data /data
 ```
 
-All workspace deletions write a permanent entry to the server audit log.
+All workspace deletions write a permanent entry to the server audit log. The order is: database row, audit entry, files on EFS, then S3 objects; every step runs even if an earlier one fails. If a step fails the command still exits 0 (the workspace is gone), prints `Warning: file cleanup failed ...` or `Warning: object cleanup failed ...` on stderr with the retry command, and records a `workspace.cleanup_failed` audit event. Retry with:
+
+```bash
+agenticml server workspaces orphans --data /data
+agenticml server workspaces cleanup WORKSPACE_ID --data /data
+```
+
+`server verify` and `server status` also report leftovers as `workspace_orphan_files` / `workspace_orphan_objects` warnings.
 
 ## Customer support access
 
@@ -218,6 +225,8 @@ The hosted service relies on managed AWS backup mechanisms:
 - **EFS filesystem**: Daily AWS Backup copies retained for 35 days.
 - **S3 objects**: Protected by S3 bucket versioning (noncurrent versions kept 30 days). AWS Backup covers EFS and RDS only.
 
+After a restore from backup, the database is restored to the completion time of the EFS recovery point (the daily backup runs from 05:00 UTC and can take hours; the first Nov 16 drill copy took about 3 hours). A run synced inside that window can have files behind the database: `agenticml server verify` lists them as `size_mismatch` or `file_hash` problems. Each affected user repairs a run with `agenticml sync <run> --reset`, then `agenticml sync <run>` (once per workspace key; a finished run is otherwise "up to date" and never asks the server). Runs that were pruned locally, or that no client has any more, cannot be repaired; they keep the warning or are deleted.
+
 Periodic restore drills must be performed in an isolated test environment as described in [deploy/aws/README.md](../deploy/aws/README.md#restore-drill-and-real-efs-benchmark).
 
 ## Monitoring and incident response
@@ -226,11 +235,11 @@ Periodic restore drills must be performed in an isolated test environment as des
 
 CloudWatch alarms monitor core service health and deliver notifications to the `agenticml-alerts` SNS topic:
 - **ALB 5xx error rate**: Alerts when 5xx response count exceeds 5 within a 5-minute window (`agenticml-hosted-alb_5xx`).
-- **Unhealthy target host**: Alerts if any target host remains unhealthy for 5 consecutive minutes based on ALB health checks on `/healthz` (`agenticml-hosted-unhealthy`). There is no synthetic monitor.
+- **Unhealthy target host**: Alerts if any target host remains unhealthy for 5 consecutive minutes based on ALB health checks on `/healthz` (`agenticml-hosted-unhealthy`). A weekly GitHub Actions check (`monitor.yml`) requests `/healthz` and the docs site's external links and opens an issue labelled `hosted` when one fails; it is not an uptime guarantee, and the alarms here remain the alerting path.
 - **p95 target latency**: Alerts when target response time p95 exceeds 5 seconds over 5 minutes (`agenticml-hosted-latency-p95`).
 - **RDS free storage space**: Alerts when free storage falls below 2 GB (`agenticml-hosted-rds_storage`).
 - **RDS CPU utilization**: Alerts when database CPU utilization exceeds 80% over 5 minutes (`agenticml-hosted-rds_cpu`).
-- **Healthy target count**: Alerts when the ALB `HealthyHostCount` minimum is below 1 for 5 consecutive 60-second periods, treating missing data as breaching (`agenticml-hosted-healthy_hosts`; active only when desired task count is greater than zero).
+- **Healthy target count**: Alerts when the ALB `HealthyHostCount` minimum is below the desired task count (1 or 2) for 5 consecutive 60-second periods, treating missing data as breaching (`agenticml-hosted-healthy_hosts`; active only when desired task count is greater than zero; with two tasks, one missing target alarms too).
 - **Cost and budget alerts**: The daily cost-step function (`agenticml-cost-steps`) emails spend summaries each time month-to-date spend passes another $10 milestone against a $100 monthly budget (with an error alarm on function execution failures), while an AWS Budget alert monitors actual and forecasted monthly spend exceeding 100%.
 
 ### Emergency procedures

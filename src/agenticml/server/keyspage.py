@@ -48,6 +48,14 @@ def command_host(webauth, handler):
     return {"host": "http://" + handler.headers["Host"], "host_source": "request"}
 
 
+def invite_link(base, token, hosted):
+    """The link an invitee opens. On a hosted (Firebase) server the token goes
+    in the URL fragment, which browsers never send, so it stays out of load
+    balancer and proxy access logs; the hosted page reads it client-side. A
+    self-hosted server needs the token in the query to pick the page."""
+    return base.rstrip("/") + ("/invite#token=" if hosted else "/invite?token=") + token
+
+
 def read_json(handler, limit):
     """Read an admitted JSON body; None means an error was already sent."""
     if not handler._csrf_ok():

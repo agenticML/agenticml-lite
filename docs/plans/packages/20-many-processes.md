@@ -225,10 +225,18 @@ passes on both backends.
   under the quota lock. Accepted: Git work admitted before that check is bounded
   by concurrent requests; counting stays exact.
 - Budget per process for package 24 sizing: transaction pool retains 16 idle
-  connections (active transactions are not hard-capped), plus up to 64 request
-  lock connections (48 outer + 16 inner), plus one dedicated lifetime server
-  lock connection per server. Thus 81 is the baseline sizing budget, not a hard
-  connection ceiling; deployment must also allow concurrent active transactions.
+  connections, plus up to 64 request lock connections (48 outer + 16 inner),
+  plus one dedicated lifetime server lock connection per server. Package 30.5
+  added the missing hard cap: at most `TRANSACTION_CONNECTION_LIMIT = 24`
+  transactions at once per `PostgresDatabase` instance (a 10 s wait, then
+  `DatabaseBusy`, 503 with `Retry-After`). The hard per-process ceiling is
+  therefore 24 + 64 + 1 server lock + 1 import/backfill connection, about 90;
+  with 8 body workers about 40 are in use in practice. `db.t4g.micro`
+  (about 112 connections) is fine for two tasks at that level. `/healthz`
+  never opens a transaction, so it cannot wait on a slot.
+- Closed in 30.5: advisory key salting (transaction and session locks are
+  salted by database and schema, with a test for each) and the registry lock
+  (Postgres connect and import run outside it, `test_registry_available_during_connect`).
 - Legacy import's session lock waits up to 600 seconds.
 - Pre-check overshoot for uploads/storage scales with `BODY_CONCURRENCY ×
   processes`; the quota lock makes final accounting exact.

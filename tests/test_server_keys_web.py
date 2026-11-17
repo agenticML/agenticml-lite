@@ -122,6 +122,8 @@ def test_setup_startup_page_and_single_use(tmp_path, caplog):
             assert status == 404 and json.loads(body) == {"error": "not found"}
         status, hdrs, page = call(httpd, "/setup?token=" + token)
         assert status == 200 and b'/static/setup.js' in page
+        assert b'id="setup"' in page and b"auth-shell" in page
+        assert b"Create admin account" in page and b"login-card" not in page
         assert hdrs["Cache-Control"] == "no-store"
         assert hdrs["Referrer-Policy"] == "no-referrer"
         assert token.encode() not in page

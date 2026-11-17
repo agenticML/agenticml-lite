@@ -435,7 +435,7 @@ def test_viewer_whoami_and_write_routes_403(tmp_path, monkeypatch):
         assert not list(httpd.tmp_dir.iterdir())
 
 
-def test_member_ownership_and_compat_state(tmp_path, monkeypatch):
+def test_member_ownership_and_state(tmp_path, monkeypatch):
     monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
     with running(tmp_path / "data") as httpd:
         httpd.users.add("alice", role="member")
@@ -454,8 +454,9 @@ def test_member_ownership_and_compat_state(tmp_path, monkeypatch):
         }).encode(), key=second)[0] == 200
         status, state, _ = request(httpd, "/v2/runs/run-1/state", key=second)
         assert status == 200
-        assert state["owner"] == "two" and state["owner_user"] == "alice"
-        assert state["remote"]["owner"] == "two" and state["remote"]["owner_user"] == "alice"
+        assert state["owner"] == "alice" and state["owner_user"] == "alice"
+        assert state["remote"]["owner"] == "alice" and state["remote"]["owner_user"] == "alice"
+        assert state["remote"]["owner_key"] == "one"
         other = foreign_key(httpd, "other", user="bob")
         status, payload, _ = request(httpd, "/v2/runs/run-1/files/meta.json", "PUT", b"{}", other)
         assert status == 409
@@ -623,8 +624,21 @@ def test_actions_cover_role_table():
     assert ROLES == ("viewer", "member", "admin", "owner")
     assert set(ACTIONS) >= {
         "read", "password", "notes", "sync", "own_keys",
-        "admin_keys", "all_keys", "users", "audit",
+        "admin_keys", "all_keys", "users", "audit", "rename",
     }
+
+
+def test_client_role_mirror_matches_server_actions():
+    import re
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1]
+              / "src" / "agenticml" / "ui" / "static" / "app.js").read_text(encoding="utf-8")
+    block = re.search(r"const ACTION_ROLE = \{(.*?)\};", source, re.S)
+    assert block, "ACTION_ROLE not found in app.js"
+    mirror = dict(re.findall(r'([a-z_]+):\s*"([a-z]+)"', block.group(1)))
+    assert mirror == ACTIONS
+    assert set(mirror.values()) <= set(ROLES)
 
 
 def test_bootstrap_admin_non_admin_named_admin(tmp_path, monkeypatch):
@@ -838,7 +852,7 @@ def test_add_refuses_when_run_scan_truncated(tmp_path, monkeypatch):
     assert users.get("alice") is not None
     with pytest.raises(ClientError, match="reclaim-runs"):
         users.add("zzz")
-    users.add("zzz", reclaim_runs=True)
+    users.add("zzz", reclaim_runs=True, operator=True)
     assert users.get("zzz") is not None
 
 

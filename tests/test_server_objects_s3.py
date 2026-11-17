@@ -413,8 +413,11 @@ def test_cli_delete_objects_option_and_warning(server, aws, monkeypatch, capsys,
     assert WorkspaceRepo(server.db).get('delete-me') is None
     assert aws.list_objects_v2(Bucket='agml-test', Prefix=prefix)['KeyCount'] == int(failed)
     err = capsys.readouterr().err
+    from agenticml.server.db.repos import AuditRepo
+    assert 'workspace.delete' in [e['action'] for e in AuditRepo(server.db, None).tail(50)]
     if failed:
         assert 'Warning: object cleanup failed for workspace ' + row['id'] in err
+        assert 'retry with: agenticml server workspaces cleanup ' + row['id'] in err
 
 
 def test_ingest_unavailable_after_headers_only_closes(server, monkeypatch):

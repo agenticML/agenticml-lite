@@ -687,9 +687,9 @@ def test_atomic_validation_and_state(server):
     linked.symlink_to(run_path(server, "scalars/0.bin"))
     _, other = server.keys.create("reader")
     status, state, _ = request(server, "/v2/runs/run-1/state", key=other)
-    assert status == 200 and state["owner"] == "reader"
+    assert status == 200 and state["owner"] == "admin"
     assert state["owner_user"] == "admin"
-    assert state["remote"]["owner"] == "reader"
+    assert state["remote"]["owner"] == "admin"
     assert state["remote"]["owner_user"] == "admin"
     assert "scalars/1.bin" not in state["files"]
     for name, info in state["files"].items():
@@ -1091,7 +1091,7 @@ def test_state_hashes_snapshot_without_blocking_writes(server, monkeypatch, chan
             release.set()
         status, payload, _ = state.result(timeout=5)
     assert status == 200
-    assert payload["remote"] == {**old_remote, "owner": "one", "owner_user": "admin"}
+    assert payload["remote"] == {**old_remote, "owner": "admin", "owner_user": "admin"}
     assert payload["files"] == {name: {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
                                 for name, data in before.items()}
 
@@ -1479,3 +1479,31 @@ def test_append_delay_requires_hooks_and_pytest(monkeypatch, capsys, enabled, de
     app.IngestServer._after_append_write(None, 'run', 'events.jsonl')
     assert sleeps == expected
     assert bool(capsys.readouterr().out) == bool(expected)
+
+
+def test_compat_owner_is_removed():
+    assert not hasattr(ingest, "compat_owner")
+    assert ingest.owner_fields("alice") == {"owner": "alice", "owner_user": "alice"}
+    assert ingest.owner_fields(None) == {"owner": None, "owner_user": None}
+    assert ingest.owner_fields(4) == {"owner": None, "owner_user": None}
+
+
+def test_owner_is_the_real_user_not_the_key_name(server):
+    assert put_meta(server)[0] == 200
+    # The caller's own run: owner is the user, never the key name ("one").
+    status, state, _ = request(server, "/v2/runs/run-1/state")
+    assert status == 200
+    assert state["owner"] == "admin" and state["owner_user"] == "admin"
+    assert state["remote"]["owner"] == "admin" and state["remote"]["owner_user"] == "admin"
+    assert state["remote"]["owner_key"] == "one"
+    # A user whose key is named like the owner is still a foreign caller.
+    # This behaviour did not change with the removal of the compatibility rule.
+    lookalike = foreign_key(server, "admin", user="bob")
+    status, state, _ = request(server, "/v2/runs/run-1/state", key=lookalike)
+    assert status == 200
+    assert state["owner"] == "admin" and state["owner_user"] == "admin"
+    assert "owner_key" not in state["remote"] and "last_sync_key" not in state["remote"]
+    for path, method, body in (("files/meta.json", "PUT", b"{}"), ("append/events.jsonl?offset=0", "POST", b"{}\n"),
+                               ("commit", "POST", b"{}")):
+        assert request(server, "/v2/runs/run-1/" + path, method, body, lookalike)[0:2] == (
+            409, {"error": "run owned by another user", "owner": "admin", "owner_user": "admin"})

@@ -740,11 +740,21 @@ def _invite_base(args):
     return None
 
 
-def _print_invite(token, base):
+def _hosted_invites(args):
+    """True when links should carry the token in the fragment (Firebase on).
+    A bad Firebase setting here must not break `users invite`."""
+    try:
+        return _firebase_from_args(args) is not None
+    except (ValueError, RuntimeError):
+        return False
+
+
+def _print_invite(token, base, hosted=False):
+    from .server.keyspage import invite_link
     if base:
-        print(f"{base}/invite?token={token}")
+        print(invite_link(base, token, hosted))
     else:
-        print(f"/invite?token={token}")
+        print(invite_link("", token, hosted))
         print("open it on your server's address")
 
 
@@ -790,19 +800,19 @@ def cmd_server_users(args):
             from .server.db.workspaces import AccountRepo
             existing_account = AccountRepo(db).get(args.name)
             user = users.add(args.name, role=args.role, identity=args.identity,
-                             reclaim_runs=args.reclaim_runs)
+                             reclaim_runs=args.reclaim_runs, operator=True)
             log.record(actor, "cli", "user.add", user.name,
                        detail={"role": user.role, "identity": user.identity})
             if not args.no_invite and existing_account is None:
                 token = users.create_invite(args.name, operator=True)
                 log.record(actor, "cli", "user.invite", args.name,
                            detail={"expires_at": users.get(args.name).invite["expires_at"]})
-                _print_invite(token, _invite_base(args))
+                _print_invite(token, _invite_base(args), _hosted_invites(args))
         elif args.users_action == "invite":
             token = users.create_invite(args.name, operator=True)
             log.record(actor, "cli", "user.invite", args.name,
                        detail={"expires_at": users.get(args.name).invite["expires_at"]})
-            _print_invite(token, _invite_base(args))
+            _print_invite(token, _invite_base(args), _hosted_invites(args))
             _print_account_workspaces(db, args.name)
         elif args.users_action == "set-password":
             users.set_password(args.name, _read_cli_password(args), operator=True)
@@ -854,12 +864,27 @@ def cmd_server_workspaces(args):
     from .server.db import DatabaseError, for_server_dir
     from .server.db.workspaces import WorkspaceRepo, AccountRepo
     from .server.workspaces import prepare_store, delete_workspace
+    from .store.errors import ObjectStoreUnavailable
 
     try:
-        data, directory = _server_data_dir(args)
-        db = for_server_dir(directory, args.database)
-        repo = WorkspaceRepo(db)
         action = args.workspaces_action
+        if action in ('orphans', 'cleanup'):
+            # These commands compare files and objects with the database, so a
+            # mistyped --data or a missing --database must never be turned into a
+            # new empty database (every live workspace would look orphaned).
+            from .server.app import resolve_data_dir
+            data = resolve_data_dir(args.data)
+            directory = data / 'server'
+            db = for_server_dir(directory, args.database, create=False)
+            if db is None:
+                raise ValueError(f'no server database found for {data}; check --data and --database')
+            if action == 'cleanup' and not WorkspaceRepo(db).list():
+                raise ValueError('the database has no workspaces; refusing to clean up '
+                                 '(wrong --data/--database, or a database that was not restored?)')
+        else:
+            data, directory = _server_data_dir(args)
+            db = for_server_dir(directory, args.database)
+        repo = WorkspaceRepo(db)
         actor = cli_actor()
         log = AuditLog(directory, db=db, workspace_id=None)
         if action == 'list':
@@ -895,27 +920,27 @@ def cmd_server_workspaces(args):
                     str(row['stored_bytes']) + '/' + (maximum(row['limits']['storage_bytes']) if row['limits'] is not None else 'no limits file'),
                     str(row['upload_bytes']), str(row['people'])] for row in rows])
         elif action == 'set-plan':
-            from .server.limits import Plans, UNLIMITED, parse_size, parse_count
+            from .server.limits import Plans, parse_size, parse_count
             raw = (args.storage, args.uploads_per_day, args.requests_per_minute, args.people)
             if args.plan == 'free' and any(value is not None for value in raw):
                 raise ValueError('free plan cannot have custom limits')
+            # The one read only picks the "needs a limit flag" message; the merge
+            # itself happens inside set_plan's write transaction.
             current = repo.require(args.slug)
-            custom = None
+            patch = None
+            free_limits = None
             if args.plan == 'custom':
                 limits_file = args.limits or os.environ.get('AGENTICML_SERVER_LIMITS')
-                if current['plan'] == 'custom':
-                    custom = json.loads(current['custom_limits'])
-                elif limits_file:
-                    custom = dict(Plans.load(limits_file).free)
-                else:
-                    if all(value is None for value in raw):
+                if current['plan'] != 'custom':
+                    if limits_file:
+                        free_limits = dict(Plans.load(limits_file).free)
+                    elif all(value is None for value in raw):
                         raise ValueError('custom plan requires at least one limit flag without a limits file')
-                    custom = dict(UNLIMITED)
                 keys = ('storage_bytes', 'upload_bytes_per_day', 'requests_per_minute', 'people')
-                for key, value, parse in zip(keys, raw, (parse_size, parse_size, parse_count, parse_count)):
-                    if value is not None:
-                        custom[key] = parse(value)
-            old, new = repo.set_plan(args.slug, args.plan, custom if args.plan == 'custom' else None)
+                patch = {key: parse(value)
+                         for key, value, parse in zip(keys, raw, (parse_size, parse_size, parse_count, parse_count))
+                         if value is not None}
+            old, new = repo.set_plan(args.slug, args.plan, patch, merge=True, free_limits=free_limits)
             def plan_values(row):
                 return {'plan': row['plan'], 'limits': json.loads(row['custom_limits']) if row['custom_limits'] else None}
             log.record(actor, 'cli', 'workspace.plan', new['id'],
@@ -938,10 +963,77 @@ def cmd_server_workspaces(args):
                 raise ValueError('workspace deletion not confirmed')
             from .server.objectstore import open_backend
             backend = open_backend(args.objects if args.objects is not None else os.environ.get('AGENTICML_SERVER_OBJECTS'), data)
-            row = delete_workspace(db, data, args.slug, objects=backend)
+
+            def on_deleted(deleted):
+                log.record(actor, 'cli', 'workspace.delete', deleted['id'], detail={'slug': args.slug})
+
+            row = delete_workspace(db, data, args.slug, objects=backend, on_deleted=on_deleted)
+            retry = f"; retry with: agenticml server workspaces cleanup {row['id']}"
+            if row.get('files_cleanup_failed'):
+                print(f"Warning: file cleanup failed for workspace {row['id']}{retry}", file=sys.stderr)
             if row.get('object_cleanup_failed'):
-                print(f"Warning: object cleanup failed for workspace {row['id']}; bytes are orphaned", file=sys.stderr)
-            log.record(actor, 'cli', 'workspace.delete', row['id'], detail={'slug': args.slug})
+                print(f"Warning: object cleanup failed for workspace {row['id']}{retry}", file=sys.stderr)
+            if row.get('files_cleanup_failed') or row.get('object_cleanup_failed'):
+                log.record(actor, 'cli', 'workspace.cleanup_failed', row['id'],
+                           detail={'files': bool(row.get('files_cleanup_failed')),
+                                   'objects': bool(row.get('object_cleanup_failed'))})
+        elif action == 'orphans':
+            from .server import admin
+            from .server.objectstore import open_backend
+            backend = open_backend(args.objects if args.objects is not None else os.environ.get('AGENTICML_SERVER_OBJECTS'), data)
+            found = admin.orphan_workspaces(data, db, backend)
+            if args.json:
+                print(json.dumps(found))
+            else:
+                rows = [[wid, 'files'] for wid in found['files']] + [[wid, 'objects'] for wid in found['objects']]
+                if rows:
+                    _print_table([['workspace id', 'where']] + rows)
+        elif action == 'cleanup':
+            from .server import admin
+            from .server.db.workspaces import require_workspace_id
+            from .server.objectstore import open_backend
+            from .server.workspaces import discard_store
+            if bool(args.workspace_id) == bool(args.all):
+                raise ValueError('specify a workspace id or --all')
+            if args.all and args.yes_delete != 'all':
+                raise ValueError('cleanup --all needs --yes-delete all; never run it against a restored or drill database')
+            backend = open_backend(args.objects if args.objects is not None else os.environ.get('AGENTICML_SERVER_OBJECTS'), data)
+            if args.all:
+                found = admin.orphan_workspaces(data, db, backend)
+                targets = sorted(set(found['files']) | set(found['objects']))
+            else:
+                targets = [require_workspace_id(args.workspace_id)]
+            failed = False
+            for wid in targets:
+                # Re-check right before deleting: only ids that are not in the database.
+                if repo.by_id(wid) is not None:
+                    if not args.all:
+                        raise ValueError('workspace still exists; use workspaces delete')
+                    print(f'skipped {wid}: workspace exists', file=sys.stderr)
+                    continue
+                try:
+                    files_ok = bool(discard_store(data, wid))
+                except Exception:
+                    files_ok = False
+                objects_ok = None
+                if backend.name == 's3':
+                    try:
+                        backend.delete_workspace(wid)
+                        objects_ok = True
+                    except Exception:
+                        objects_ok = False
+                if files_ok and objects_ok is not False:
+                    print(f'cleaned {wid} ({"files and objects" if objects_ok else "files"})')
+                else:
+                    failed = True
+                    print(f'Warning: cleanup failed for workspace {wid} ('
+                          f'files {"ok" if files_ok else "failed"}'
+                          + ('' if objects_ok is None else f', objects {"ok" if objects_ok else "failed"}')
+                          + '); retry with: agenticml server workspaces cleanup ' + wid, file=sys.stderr)
+                log.record(actor, 'cli', 'workspace.cleanup', wid,
+                           detail={'files': files_ok, 'objects': objects_ok})
+            if failed:
+                return 1
         elif action == 'recount':
             from .server.db.usage import UsageRepo
             if bool(args.slug) == bool(args.all):
@@ -965,7 +1057,7 @@ def cmd_server_workspaces(args):
                 args.slug, status='suspended' if action == 'suspend' else 'active')
             log.record(actor, 'cli', 'workspace.' + action, row['id'], detail={'slug': row['slug']})
         return 0
-    except (OSError, ValueError, EOFError, DatabaseError) as exc:
+    except (OSError, ValueError, EOFError, DatabaseError, ObjectStoreUnavailable) as exc:
         print(f'agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}', file=sys.stderr)
         return 1
 
@@ -1004,12 +1096,39 @@ def cmd_server_accounts(args):
                 cli_actor(), 'cli', 'account.create', account['login'],
                 detail={'server_admin': bool(args.server_admin),
                         'display_name': account['display_name']})
-        else:
+        elif args.accounts_action == 'set-server-admin':
             repo.set_server_admin(args.login, args.value == 'on', source='manual')
             AuditLog(directory, db=db, workspace_id=None).record(
                 cli_actor(), 'cli', 'account.server_admin', args.login, detail={'enabled': args.value == 'on'})
+        elif args.accounts_action == 'delete':
+            def fold(value):
+                return value.lower() if '@' in value else value
+            confirmation = (args.yes_delete if args.yes_delete is not None
+                            else input('Type the account login to delete it: '))
+            if fold(confirmation) != fold(args.login):
+                raise ValueError('account deletion not confirmed')
+            login = fold(args.login)
+            summary = repo.delete(args.login)
+            AuditLog(directory, db=db, workspace_id=None).record(
+                cli_actor(), 'cli', 'account.delete', summary['id'],
+                detail={'memberships': len(summary['memberships']), 'keys': summary['keys'],
+                        'sessions': summary['sessions'], 'invites': summary['invites'],
+                        'audit_redacted': summary['audit_redacted']})
+            if args.json:
+                print(json.dumps(summary))
+            else:
+                print(f"deleted account {login} (id {summary['id']})")
+                print(f"removed {len(summary['memberships'])} memberships, {summary['keys']} keys, "
+                      f"{summary['sessions']} sessions, {summary['invites']} pending invites; "
+                      f"redacted {summary['audit_redacted']} server-level audit rows")
+                if summary['memberships']:
+                    print('former workspaces (their Activity logs still name this login until the '
+                          'workspaces are deleted): ' + ', '.join(summary['memberships']))
+                if summary['firebase_uid']:
+                    print(f"Firebase user still exists: uid {summary['firebase_uid']} ({summary['email']}); "
+                          'delete it in the Firebase console (Authentication > Users)')
         return 0
-    except (OSError, ValueError, DatabaseError) as exc:
+    except (OSError, ValueError, EOFError, DatabaseError) as exc:
         print(f'agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}', file=sys.stderr)
         return 1
 
@@ -1856,7 +1975,8 @@ def main(argv=None):
     p_rebuild.set_defaults(func=cmd_server_metrics_rebuild)
     p_workspaces = server_sub.add_parser('workspaces', help='Manage server workspaces')
     ws_sub = p_workspaces.add_subparsers(dest='workspaces_action', required=True)
-    for action in ('list', 'create', 'rename', 'suspend', 'resume', 'delete', 'set-owner', 'recount', 'usage', 'set-plan'):
+    for action in ('list', 'create', 'rename', 'suspend', 'resume', 'delete', 'set-owner', 'recount', 'usage', 'set-plan',
+                   'orphans', 'cleanup'):
         child = ws_sub.add_parser(action)
         child.add_argument('--data', default=None)
         child.add_argument('--database', default=None, metavar='URL')
@@ -1870,6 +1990,17 @@ def main(argv=None):
         if action == 'recount':
             child.add_argument('slug', nargs='?')
             child.add_argument('--all', action='store_true')
+            continue
+        if action == 'orphans':
+            child.add_argument('--objects', default=None, metavar='URL')
+            child.add_argument('--json', action='store_true')
+            continue
+        if action == 'cleanup':
+            child.add_argument('workspace_id', nargs='?')
+            child.add_argument('--all', action='store_true')
+            child.add_argument('--yes-delete', default=None, metavar='all',
+                               help='Required with --all: type "all"')
+            child.add_argument('--objects', default=None, metavar='URL')
             continue
         child.add_argument('slug')
         if action == 'set-plan':
@@ -1893,7 +2024,7 @@ def main(argv=None):
             child.add_argument('--owner', required=True)
     p_accounts = server_sub.add_parser('accounts', help='Manage global accounts')
     acc_sub = p_accounts.add_subparsers(dest='accounts_action', required=True)
-    for action in ('list', 'add', 'set-server-admin'):
+    for action in ('list', 'add', 'set-server-admin', 'delete'):
         child = acc_sub.add_parser(action)
         child.add_argument('--data', default=None)
         child.add_argument('--database', default=None, metavar='URL')
@@ -1904,6 +2035,10 @@ def main(argv=None):
             child.add_argument('login')
             child.add_argument('--display-name', default=None)
             child.add_argument('--server-admin', action='store_true')
+        elif action == 'delete':
+            child.add_argument('login')
+            child.add_argument('--yes-delete', default=None, metavar='LOGIN')
+            child.add_argument('--json', action='store_true')
         else:
             child.add_argument('login')
             child.add_argument('value', choices=('on', 'off'))

@@ -202,9 +202,9 @@ holds the deploy slot, and later pushes queue behind it (only the newest one
 is kept). If a newer commit is waiting, reject the older run instead of
 approving it, then approve the newer one.
 
-You can also start a run by hand with GitHub CLI, but GitHub only allows
-`workflow_dispatch` for workflows on the default branch, so this works only
-once `deploy.yml` is also on `main`:
+You can also start a run by hand with GitHub CLI. GitHub only allows
+`workflow_dispatch` for workflows on the default branch. That is `dev`, and
+`deploy.yml` is on it, so this works now:
 
 ```sh
 gh workflow run deploy.yml --ref dev
@@ -335,7 +335,15 @@ web and `/setup` return 404.
    **Settings > Members** in the workspace. An invite produces a one-time link
    (72 hours). The person opens it and signs in with Google or email/password
    using that same email, which must be verified. Inviting someone who already
-   has an account adds the membership directly (no link).
+   has an account adds the membership directly (no link). An account that was
+   removed from its last workspace can only be added back by an admin of that
+   workspace or by an operator (`agenticml server users add LOGIN --workspace
+   SLUG`); otherwise the invite is refused (403). On this stack the link
+   looks like `https://app.agenticml.xyz/invite#token=...`: the token sits in the
+   URL fragment, which browsers never send, so it stays out of the load balancer
+   access logs. If a mail client drops the fragment, the person lands on the
+   plain sign-in page without the invite and is told they have no access; they
+   open the full link again in a browser, or the owner sends a new invite.
 5. **Issue sync keys**: A workspace admin creates sync keys for any member in
    **Settings > API keys** in the workspace (the person must be a member, i.e.
    has redeemed their invite or been added directly).
@@ -451,10 +459,34 @@ Check that `ls /data/server` shows no `agenticml.db`. If
 SQLite database on EFS at `/data/server/agenticml.db` instead of the hosted
 PostgreSQL instance.
 
-Keys and invite links print once. Exec sessions are not logged (the cluster has
-no `ExecuteCommandConfiguration`; only CloudTrail records the `ExecuteCommand`
-call and its `--command` string). Never put secrets on `--command` strings and
-never pass passwords with `--stdin` there.
+Keys and invite links print once. Exec session contents are deliberately not
+logged: the cluster has no `ExecuteCommandConfiguration`, because keys and invite
+links printed in a session would be copied into CloudWatch (30-day retention).
+CloudTrail records each `ExecuteCommand` call and its `--command` string. Never
+put secrets on `--command` strings and never pass passwords with `--stdin`
+there. ECS Exec needs no task-role change beyond the SSM messages permissions
+the task role already has.
+
+The task definition enables Fargate's init process (`InitProcessEnabled`), so
+PID 1 in the container is an init process and the `agenticml` server is its
+child. The init process reaps processes that exec sessions leave behind and
+forwards SIGTERM to the server, which drains for up to 120 s on a stop. The
+image has no init of its own and no `ps`. After a deploy, check from a session
+that PID 1 is an init process and that `agenticml` is its child:
+
+```sh
+cat /proc/1/comm
+for p in /proc/[0-9]*; do echo "${p#/proc/} ppid=$(awk '/^PPid/{print $2}' $p/status) $(cat $p/comm)"; done
+```
+
+and check a clean stop: after `aws ecs update-service --cluster
+agenticml-hosted --service agenticml-hosted --force-new-deployment`, the old
+task's exit code is 0 (not 137) and it stopped in well under 120 s:
+
+```sh
+aws ecs describe-tasks --cluster agenticml-hosted --tasks <old task arn> \
+  --query 'tasks[0].[stoppedReason,containers[0].exitCode,stoppingAt,stoppedAt]'
+```
 
 ### Customer workspaces and users (break-glass CLI)
 
@@ -480,6 +512,11 @@ To provision the first customer workspace (`customer-one`):
    agenticml server users invite alice@example.com --workspace customer-one \
      --public-url https://app.agenticml.xyz --data /data
    ```
+   The task has the Firebase settings in its environment, so the link prints as
+   `https://app.agenticml.xyz/invite#token=...` (token in the URL fragment, never
+   sent to the load balancer). Run outside the task without those settings, the
+   command prints the self-hosted `?token=` form, which the hosted page also
+   accepts.
 4. Add team members:
    ```sh
    agenticml server users add bob@example.com --role member --workspace customer-one \
@@ -521,6 +558,69 @@ password sign-in only.)
 A server admin account sees a customer workspace only if explicitly added as a
 workspace member. The `/admin/` portal lists and creates workspaces across the
 server. Keep public signup disabled until setup is complete.
+
+**Accounts with no workspace:** a person removed from their last workspace has an
+account but no membership (a "detached" account). A workspace admin can add such
+an account over HTTP (Settings > Members) only for the workspace it last left, and
+never when it is a server admin. For any other workspace, and for accounts that never
+had a membership, an operator adds it over ECS Exec:
+
+```sh
+agenticml server users add alice@example.com --role member --workspace customer-two --data /data
+```
+
+### Deleting a workspace and retrying cleanup
+
+```sh
+agenticml server workspaces delete customer-one --yes-delete customer-one --data /data
+```
+
+The order is: database row, audit entry (`workspace.delete`), files on EFS, then S3
+objects (`--objects` or `AGENTICML_SERVER_OBJECTS`); every step runs even if another
+fails. The command exits 0 once the row is gone, so **check stderr**: a line
+`Warning: file cleanup failed for workspace <id>; retry with: ...` or
+`Warning: object cleanup failed for workspace <id>; retry with: ...` means data is left
+and a `workspace.cleanup_failed` event was recorded. Retry (safe to repeat; only that
+id, only `workspaces/<id>` and the `<prefix>/<id>/` S3 prefix are touched):
+
+```sh
+agenticml server workspaces orphans --data /data       # lists ids with files or objects but no row
+agenticml server workspaces cleanup <id> --data /data  # refuses ids that are still in the database
+```
+
+`server verify` and `server status` list the same leftovers as
+`workspace_orphan_files` / `workspace_orphan_objects` warnings. `workspaces cleanup --all
+--yes-delete all` removes every listed id; never run it against a restored or drill
+database (see `scripts/restore_drill/README.md`).
+
+### Deleting an account (privacy request)
+
+Erases one person's account on request. Steps, in this order:
+
+1. Find the login and its Firebase uid: `agenticml server accounts list --json --data /data`.
+2. Delete or transfer the person's workspaces. The command refuses an account that owns a
+   workspace (`workspaces set-owner`, or `workspaces delete`) or owns runs (delete those
+   runs or their workspaces first). Personal workspace names derive from the email, so delete
+   the personal workspace rather than transferring it.
+3. If the account is a server admin, run `agenticml server accounts set-server-admin LOGIN off`
+   and remove the email from the admin emails list.
+4. Delete the Firebase user in the Firebase console (Authentication > Users) FIRST. With open
+   sign-up on, a person who can still sign in would otherwise get a fresh account and a new
+   personal workspace right after the deletion.
+5. Run the command over ECS Exec:
+   ```sh
+   agenticml server accounts delete LOGIN --yes-delete LOGIN --data /data
+   ```
+   It removes sessions, keys, pending invites, memberships and failed-login throttle
+   entries, replaces the login in
+   `created_by`/`invited_by` columns with `[deleted account]`, redacts the server-level audit
+   log (actor and target replaced, display name and the personal workspace's name and slug
+   replaced, client address cleared on rows the person acted in) and
+   records one `account.delete` event that names only the account id.
+
+Not touched: load-balancer access logs (kept 90 days), server logs (30 days), and the Activity
+logs of workspaces the person belonged to (they stay with their workspace until it is deleted;
+the command lists the workspaces).
 
 ## Sync from a training machine
 
@@ -821,8 +921,8 @@ is updated. Any event means row-level security is bypassed. CloudWatch keeps
 ## Upgrades, rollback and config
 
 Every push to `dev` that changes the image or the stack queues a deploy of
-that commit; approve it in GitHub Actions. Once `deploy.yml` is on `main`, you
-can also dispatch a reviewed commit SHA by hand. Database
+that commit; approve it in GitHub Actions. You can also dispatch a reviewed
+commit SHA by hand. Database
 migrations and imports run at server startup under PostgreSQL advisory locks
 (`pg_advisory_xact_lock`), safely coordinating concurrent task starts. Rolling
 deploys start the new task before stopping the old one
@@ -835,9 +935,9 @@ Re-running a deploy of the commit that is already live is an empty change set
 and does not restart the task. To roll the service without a new commit, use
 `aws ecs update-service --cluster agenticml-hosted --service agenticml-hosted --force-new-deployment`.
 
-Until dispatch is available, roll back by reverting on `dev`: the push of the
-revert triggers a deploy. With dispatch, run the workflow with
-`-f ref=<previous sha>` (ensure its immutable ECR image tag still exists).
+To roll back, run the workflow with `-f ref=<previous sha>` (ensure its
+immutable ECR image tag still exists), or revert on `dev`: the push of the
+revert triggers a deploy.
 Rolling back does **not** undo database
 migrations. A rollback is safe only if that server version supports the current
 database schema and on-disk format. Otherwise roll forward, or restore a
@@ -847,8 +947,8 @@ moving traffic. Never guess at downgrade compatibility.
 To make configuration changes (Multi-AZ, Firebase settings, open sign-up, admin emails, or the policy base URL):
 1. Update the corresponding variable in the GitHub `hosted` environment.
 2. Re-run the deploy workflow with the currently deployed commit ref or SHA
-   (this needs dispatch; until then, use "Re-run all jobs" on the last
-   deploy run, which reads the variables again and needs approval again).
+   (or use "Re-run all jobs" on the last deploy run, which reads the
+   variables again and needs approval again).
 
 The task count is set per run with the `desired_count` input instead (see
 Operations and scaling).
@@ -900,7 +1000,13 @@ in its own ECS cluster `agenticml-restore-drill`, and is removed afterwards.
    `object_missing` problems and 60 `object_orphan` warnings in `verify
    --deep`), and a database restored to the completion time does (attempt 2: 0
    and 0). A sync made during the backup window can still leave the database
-   ahead of the files for that run; record any warnings. The EFS recovery point
+   ahead of the files for that run (`size_mismatch` or `file_hash` problems in
+   `verify`, expected after restoring). Repair it from the client that holds the
+   run: `agenticml sync <run> --reset`, then `agenticml sync <run>` (once per
+   workspace key; see step 1 of the restore-drill runbook in
+   `scripts/restore_drill/README.md`). Runs that were pruned locally or that no
+   client has cannot be repaired: record them and leave the warning or delete
+   the run. After the repair `verify` reports 0 problems. The EFS recovery point
    can be an on-demand AWS Backup job (tagged, and deleted afterwards) or the
    latest scheduled point. On Nov 16 an on-demand `start-backup-job` was
    refused with AccessDenied for the operator's `aws login` session: use the
@@ -1026,7 +1132,11 @@ definition) afterwards.
 
 Monitor the service with `aws logs tail /ecs/agenticml-hosted --follow`, ECS
 service events, and CloudWatch alarms. ALB access logs expire in 90 days (stored
-in the logs bucket); application logs in CloudWatch expire in 30 days.
+in the logs bucket); application logs in CloudWatch expire in 30 days. Invite
+links on this stack carry the token in the URL fragment, which is never sent to
+the load balancer, so new access logs hold no invite tokens. Links created before
+that change used `?token=`; they are single use, expire in 72 hours and only work
+for the invited verified email, and their log lines age out with the rest.
 
 ### Alarms
 
@@ -1043,9 +1153,13 @@ Alarms publish to the `agenticml-alerts` SNS topic:
 5. `agenticml-hosted-rds_cpu`: RDS CPU utilization > 80% over 5 minutes (period
    300 s, statistic `Average`).
 6. `agenticml-hosted-healthy_hosts`: ALB `HealthyHostCount` for the target
-   group, statistic `Minimum`, below 1 for 5 periods of 60 s, missing data
-   treated as breaching. This alarm exists only while `DesiredCount` is
-   greater than 0. (It replaces `agenticml-hosted-running_tasks`, which needed
+   group, statistic `Minimum`, below `DesiredCount` (1 or 2) for 5 periods of
+   60 s, missing data treated as breaching. With two tasks, one missing
+   target alarms too. This alarm exists only while `DesiredCount` is
+   greater than 0. The threshold follows the stack's value after the service
+   is stable, so when you scale 2 to 1 it reads 2 for a short time after the
+   second task stops; five consecutive minutes are needed, so it normally does
+   not fire. (It replaces `agenticml-hosted-running_tasks`, which needed
    Container Insights; Container Insights is off.)
 
 Additional bootstrap alarms:
@@ -1055,6 +1169,21 @@ Additional bootstrap alarms:
   spend exceeds 100% of the monthly budget.
 
 Confirm the email subscriptions and exercise one alarm to verify alerting.
+
+A weekly GitHub Actions run (`.github/workflows/monitor.yml`, Mondays 06:17 UTC,
+also runnable with `gh workflow run monitor.yml`) requests
+`https://app.agenticml.xyz/healthz` and the docs site's external links. It is
+not an uptime guarantee and does not replace the alarms: on a failure it opens
+one issue titled "Hosted monitor failed" with the label `hosted`, comments on
+it while the failure lasts and closes it when the check passes again. Scheduled
+runs use the default branch (`dev`), so the schedule starts once the workflow
+is there.
+
+All workflow actions are pinned to full commit SHAs (tag in a comment). Update
+the SHA and the comment together; look up a tag's commit with
+`gh api repos/<owner>/<repo>/git/ref/tags/<tag>` and dereference annotated tags.
+After changing the pins, run `publish-testpypi.yml` once before tagging a
+release.
 
 ### Operations and scaling
 
@@ -1066,15 +1195,17 @@ deploy workflow with the `desired_count` input (choices `1`, `0`, `2`; default
 gh workflow run deploy.yml --ref dev -f ref=<deployed sha> -f desired_count=2
 ```
 
-This needs `deploy.yml` on `main` (see First deploy). Until then, to run two
-tasks temporarily:
+As a fallback, to run two tasks temporarily without the workflow:
 
 ```sh
 aws ecs update-service --cluster agenticml-hosted --service agenticml-hosted --desired-count 2
 ```
 
 The next deploy that updates the service sets the count back to the stack's
-value.
+value. `update-service` bypasses CloudFormation, so the `healthy_hosts` alarm
+keeps the threshold of the stack's `DesiredCount`: it stays at 1 with the
+service at 2, and with the stack at 2 and the service at 1 it will alarm. Prefer
+the workflow input.
 
 To suspend an abusive workspace, click **Suspend** on its row on `/admin`. **Archive**
 there suspends it and moves it to the Archived table (data kept; Restore brings it back).

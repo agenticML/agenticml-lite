@@ -16,6 +16,7 @@ import requests
 
 from agenticml import cli
 from agenticml.client import Client, Conflict
+from agenticml.server import admin
 from agenticml.server.app import make_server
 from agenticml.server.keys import KeyStore
 from test_client import fake_http
@@ -1127,3 +1128,254 @@ def test_all_selects_a_host_only_run_once_and_migrates_it(remote, tmp_path):
     assert command(remote, writer, "--all") == 0
     assert set(hosts_of(writer)) == {state_key(remote[1].base_url)}
     assert selected() == []
+
+
+def _apply_then_lose_response(monkeypatch, client, target):
+    """Make put_file for one name land on the server and then fail like a dropped connection."""
+    original = client.put_file
+    calls = []
+
+    def lose(run_id, name, body):
+        result = original(run_id, name, body)
+        if name == target:
+            calls.append(name)
+            raise requests.ConnectionError("response lost")
+        return result
+
+    monkeypatch.setattr(client, "put_file", lose)
+    return original, calls
+
+
+@pytest.mark.parametrize("name", ["scalars/index.json", "meta.json"])
+def test_failed_atomic_upload_drops_cursor_and_restores_server_bytes(remote, tmp_path, monkeypatch, name):
+    writer = writer_at(tmp_path, status=None)
+    try:
+        push(remote, writer)
+        local = writer.run_dir / name
+        server_file = remote[0].root / "runs" / writer.run_id / name
+        old = local.read_bytes()
+        assert server_file.read_bytes() == old
+        changed = json.loads(old)
+        if name == "meta.json":
+            changed["name"] = "renamed"
+        new = json.dumps(changed, indent=1).encode()
+        assert new != old
+        local.write_bytes(new)
+        original, calls = _apply_then_lose_response(monkeypatch, remote[1], name)
+        with pytest.raises(requests.ConnectionError):
+            push(remote, writer)
+        assert calls == [name]
+        assert server_file.read_bytes() == new  # the server holds bytes it never acknowledged
+        assert name not in state(remote, writer)["files"]
+        local.write_bytes(old)
+        monkeypatch.setattr(remote[1], "put_file", original)
+        push(remote, writer)
+        assert server_file.read_bytes() == old
+        identical(remote, writer)
+    finally:
+        writer.close()
+
+
+def test_failed_byref_artifacts_upload_drops_cursor(remote, tmp_path, monkeypatch):
+    source = tmp_path / "model.bin"
+    source.write_bytes(b"weights")
+    other = tmp_path / "other.bin"
+    other.write_bytes(b"more weights")
+    writer = RunWriter.create(tmp_path / "local", run_id="run-1", meta={"project": "demo", "name": "train"})
+    try:
+        writer.add_artifact(source, "model", "model", {}, copy=False)
+        assert push(remote, writer, artifacts=True).files
+        stored = remote[0].root / "runs" / writer.run_id / "artifacts.json"
+        before = stored.read_bytes()
+        assert "artifacts.json" in state(remote, writer)["files"]
+        writer.add_artifact(other, "other", "model", {}, copy=False)
+        original, calls = _apply_then_lose_response(monkeypatch, remote[1], "artifacts.json")
+        with pytest.raises(requests.ConnectionError):
+            push(remote, writer, artifacts=True)
+        assert calls == ["artifacts.json"]
+        assert stored.read_bytes() != before  # the server holds bytes it never acknowledged
+        assert "artifacts.json" not in state(remote, writer)["files"]
+        monkeypatch.setattr(remote[1], "put_file", original)
+        push(remote, writer, artifacts=True)
+        cursor = state(remote, writer)["files"]["artifacts.json"]
+        assert cursor["sha256"] == hashlib.sha256(stored.read_bytes()).hexdigest()
+    finally:
+        writer.close()
+
+
+def test_failed_atomic_upload_conflict_still_reports_owner(remote, tmp_path, monkeypatch):
+    writer = writer_at(tmp_path, status=None)
+    try:
+        push(remote, writer)
+        assert "scalars/index.json" in state(remote, writer)["files"]
+        local = writer.run_dir / "scalars/index.json"
+        local.write_bytes(json.dumps(json.loads(local.read_bytes()), indent=1).encode())
+
+        def refuse(run_id, name, body):
+            raise Conflict({"error": "run owned by another user", "owner": "bob", "owner_user": "bob"})
+
+        monkeypatch.setattr(remote[1], "put_file", refuse)
+        with pytest.raises(sync.OwnershipError, match="belongs to user bob"):
+            push(remote, writer)
+        assert "scalars/index.json" not in state(remote, writer)["files"]
+    finally:
+        writer.close()
+
+
+def test_put_atomic_without_a_cursor_does_not_save():
+    saved = []
+
+    def fail(run_id, name, body):
+        raise requests.ConnectionError("down")
+
+    client = SimpleNamespace(put_file=fail)
+    reader = SimpleNamespace(run_id="run-1")
+    state_ = {"files": {}}
+    with pytest.raises(requests.ConnectionError):
+        sync._put_atomic(reader, client, state_, lambda: saved.append(1), "meta.json", b"{}")
+    assert saved == [] and state_["files"] == {}
+
+
+def test_put_atomic_save_failure_keeps_the_original_error(caplog):
+    def fail(run_id, name, body):
+        raise requests.ConnectionError("down")
+
+    def broken_save():
+        raise OSError("disk full")
+
+    client = SimpleNamespace(put_file=fail)
+    reader = SimpleNamespace(run_id="run-1")
+    state_ = {"files": {"meta.json": {"size": 2, "sha256": "x"}}}
+    with caplog.at_level("WARNING", logger="agenticml.sync"):
+        with pytest.raises(requests.ConnectionError, match="down"):
+            sync._put_atomic(reader, client, state_, broken_save, "meta.json", b"{}")
+    assert state_["files"] == {}
+    assert "could not save the sync state" in caplog.text
+
+
+def test_put_atomic_drops_the_cursor_on_interrupt():
+    def interrupt(run_id, name, body):
+        raise KeyboardInterrupt
+
+    client = SimpleNamespace(put_file=interrupt)
+    state_ = {"files": {"meta.json": {"size": 2, "sha256": "x"}}}
+    with pytest.raises(KeyboardInterrupt):
+        sync._put_atomic(SimpleNamespace(run_id="run-1"), client, state_, lambda: None, "meta.json", b"{}")
+    assert state_["files"] == {}
+
+
+def _problem_kinds(remote):
+    report = admin.verify(remote[0].data_dir)
+    return report, {row["kind"] for row in report["problems"]}
+
+
+def _damage_server_copy(remote, writer, kind):
+    """Make the server's files older than its database, as after an EFS restore from the backup window."""
+    directory = remote[0].root / "runs" / writer.run_id
+    if kind == "short_append":
+        path = directory / "scalars/0.bin"
+        path.write_bytes(path.read_bytes()[:8])
+    elif kind == "missing_append":
+        (directory / "scalars/0.bin").unlink()
+    else:
+        path = directory / "scalars/index.json"
+        data = bytearray(path.read_bytes())
+        position = next(i for i, byte in enumerate(data) if chr(byte) in "012345678")
+        data[position] += 1  # Same length, different JSON.
+        assert json.loads(bytes(data)) != json.loads(path.read_bytes())
+        path.write_bytes(bytes(data))
+
+
+@pytest.mark.parametrize("status", [None, "finished"])
+@pytest.mark.parametrize("kind", ["short_append", "missing_append", "changed_atomic"])
+def test_restored_files_behind_database_are_repaired_by_reset_sync(remote, tmp_path, status, kind):
+    writer = writer_at(tmp_path, status=status, rich=True)
+    try:
+        push(remote, writer)
+        assert admin.verify(remote[0].data_dir)["ok"]
+        _damage_server_copy(remote, writer, kind)
+        report, found = _problem_kinds(remote)
+        assert not report["ok"] and found and found <= {"size_mismatch", "file_hash", "metric_summary"}
+        # The documented repair: forget the cursor, then sync once more.
+        assert command(remote, writer, "--reset", writer.run_id) == 0
+        assert command(remote, writer, writer.run_id) == 0
+        report = admin.verify(remote[0].data_dir)
+        assert report["ok"] and not report["problems"]
+        identical(remote, writer)
+    finally:
+        writer.close()
+
+
+def test_finished_run_without_reset_stays_unrepaired(remote, tmp_path):
+    writer = writer_at(tmp_path, status="finished", rich=True)
+    try:
+        assert push(remote, writer).complete
+        _damage_server_copy(remote, writer, "short_append")
+        assert push(remote, writer).status == "up to date"
+        report, found = _problem_kinds(remote)
+        assert not report["ok"] and "size_mismatch" in found
+    finally:
+        writer.close()
+
+
+@pytest.mark.parametrize("kind", ["short_append", "missing_append"])
+def test_running_run_repairs_append_files_on_its_next_plain_sync(remote, tmp_path, kind):
+    # The commit of a running run is refused with a 409 while a file is shorter
+    # than committed, and the client recovers from /state. No new bytes needed.
+    writer = writer_at(tmp_path, status=None)
+    try:
+        push(remote, writer)
+        _damage_server_copy(remote, writer, kind)
+        assert "size_mismatch" in _problem_kinds(remote)[1]
+        push(remote, writer)
+        assert admin.verify(remote[0].data_dir)["ok"]
+        identical(remote, writer)
+    finally:
+        writer.close()
+
+
+def test_running_run_keeps_a_changed_atomic_file_until_state_or_reset(remote, tmp_path):
+    writer = writer_at(tmp_path, status=None)
+    try:
+        push(remote, writer)
+        _damage_server_copy(remote, writer, "changed_atomic")
+        push(remote, writer)  # Same local sha: the file is skipped, /state is never asked.
+        assert "file_hash" in _problem_kinds(remote)[1]
+        assert command(remote, writer, "--reset", writer.run_id) == 0
+        assert command(remote, writer, writer.run_id) == 0
+        assert admin.verify(remote[0].data_dir)["ok"]
+    finally:
+        writer.close()
+
+
+def test_changed_atomic_file_is_healed_by_any_state_call(remote, tmp_path):
+    writer = writer_at(tmp_path, status=None)
+    try:
+        push(remote, writer)
+        _damage_server_copy(remote, writer, "changed_atomic")
+        assert "file_hash" in _problem_kinds(remote)[1]
+        remote[1].run_state(writer.run_id)
+        assert admin.verify(remote[0].data_dir)["ok"]
+    finally:
+        writer.close()
+
+
+def test_pruned_run_with_short_server_file_cannot_be_repaired(remote, tmp_path):
+    writer = writer_at(tmp_path, count=OVERVIEW_MIN_POINTS + 1)
+    assert command(remote, writer, writer.run_id, "--prune") == 0
+    assert not (writer.run_dir / "scalars/0.bin").exists()
+    _damage_server_copy(remote, writer, "short_append")
+    assert command(remote, writer, "--reset", writer.run_id) == 0
+    assert command(remote, writer, writer.run_id) == 0
+    report, found = _problem_kinds(remote)
+    assert not report["ok"] and "size_mismatch" in found
+
+
+def test_key_named_like_the_owner_is_still_refused(remote, tmp_path, capsys):
+    writer = writer_at(tmp_path)
+    push(remote, writer)
+    before = allowed(remote[0].root / "runs" / writer.run_id)
+    lookalike = foreign_key(remote[0], "admin", user="bob")
+    assert command(remote, writer, writer.run_id, key=lookalike) == 1
+    assert "belongs to user admin" in capsys.readouterr().out
+    assert allowed(remote[0].root / "runs" / writer.run_id) == before

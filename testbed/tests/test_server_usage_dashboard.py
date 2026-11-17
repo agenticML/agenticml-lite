@@ -239,3 +239,58 @@ def test_admin_plan_edit_columns_and_form(page, usage_server):
         "requests_per_minute": 30, "people": 9,
     }
     assert_no_overflow(page)
+
+
+def _open_plan_dialog(page, server):
+    page.set_viewport_size({"width": 375, "height": 812})
+    sign_in_password(page, server, "admin", PASSWORD)
+    expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+    open_settings(page)
+    page.get_by_role("link", name="Admin", exact=True).click()
+    table = page.get_by_role("table", name="Workspaces", exact=True)
+    row = table.get_by_role("row").filter(has=page.locator('td[data-label="Slug"]').filter(
+        has_text=re.compile(r"^default$")))
+    expect(row.locator('td[data-label="Plan"]')).to_have_text("free")
+    row.get_by_role("button", name="Plan", exact=True).click()
+    dialog = page.get_by_role("dialog", name="Edit plan", exact=True)
+    expect(dialog).to_be_visible()
+    return row, dialog
+
+
+def test_admin_plan_edit_prefills_free_limits(page, usage_server):
+    row, dialog = _open_plan_dialog(page, usage_server)
+    dialog.get_by_label("Plan", exact=True).select_option("custom")
+    expect(dialog.get_by_label("Storage bytes", exact=True)).to_have_value("5000000000")
+    expect(dialog.get_by_label("Upload bytes per day", exact=True)).to_have_value("2000000000")
+    expect(dialog.get_by_label("Requests per minute", exact=True)).to_have_value("600")
+    expect(dialog.get_by_label("People", exact=True)).to_have_value("5")
+    assert_no_overflow(page)
+    dialog.get_by_role("button", name="Save", exact=True).click()
+    expect(row.locator('td[data-label="Plan"]')).to_have_text("custom")
+    stored = WorkspaceRepo(usage_server["httpd"].db).get("default")
+    assert json.loads(stored["custom_limits"]) == FREE
+    assert_no_overflow(page)
+
+
+@pytest.fixture
+def no_plans_server(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    httpd = make_server(tmp_path / "data", port=0)
+    _, admin = httpd.keys.create("admin", "admin")
+    httpd.users.set_password("admin", PASSWORD)
+    thread, url = _serve(httpd)
+    try:
+        yield {"url": url, "httpd": httpd, "admin": admin}
+    finally:
+        _stop(httpd, thread)
+
+
+def test_admin_plan_edit_without_a_limits_file_stays_unlimited(page, no_plans_server):
+    row, dialog = _open_plan_dialog(page, no_plans_server)
+    dialog.get_by_label("Plan", exact=True).select_option("custom")
+    for label in ("Storage bytes", "Upload bytes per day", "Requests per minute", "People"):
+        expect(dialog.get_by_label(label, exact=True)).to_have_value("")
+    dialog.get_by_role("button", name="Save", exact=True).click()
+    expect(row.locator('td[data-label="Plan"]')).to_have_text("custom")
+    stored = WorkspaceRepo(no_plans_server["httpd"].db).get("default")
+    assert json.loads(stored["custom_limits"]) == dict.fromkeys(FREE)
