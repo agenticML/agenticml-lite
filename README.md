@@ -1,6 +1,6 @@
 # agenticml-lite
 
-agenticml-lite is a local-first experiment tracker. Training writes metrics, config, code, and media to files on disk, and `agenticml ui` serves a TensorBoard-style dashboard from those files. There is no server, database, or Docker image to run. Upload to an `agenticml server` (self-hosted, or the hosted service in public preview) is optional, with `agenticml login` and `agenticml sync`. Install the package as `agenticml-lite` and import it as `agenticml`. PyPI has 1.0.0, the local tracker. 3.0, with the server and the hosted service, is a pre-release you install from GitHub (see Install).
+agenticml-lite is a local-first experiment tracker. Training writes metrics, config, code, and media to files on disk, and `agenticml ui` serves a TensorBoard-style dashboard from those files. There is no server, database, or Docker image to run. Upload to an `agenticml server` (self-hosted, or the hosted service in public preview) is optional, with `agenticml login` and `agenticml sync`. Install the package as `agenticml-lite` and import it as `agenticml`. PyPI has 3.0.0, which includes the server and the hosted service (see Install).
 
 Documentation: <https://agenticml.github.io/agenticml-lite/>
 
@@ -21,10 +21,10 @@ pip install "agenticml-lite[firebase]" # Firebase Auth token verification (PyJWT
 pip install "agenticml-lite[hosted]"   # Full hosted bundle (postgres, s3, firebase)
 ```
 
-PyPI has only 1.0.0 (local tracking, no sync). The server extras and syncing to a server need 3.0, which is not on PyPI yet. Until it is, install it from GitHub. This follows the `dev` branch, so it changes as development continues:
+`pip install agenticml-lite` installs 3.0.0. The server extras and syncing to a server need 3.0 (1.0.0, the old local-only release, cannot sync). To also sample CPU, memory and disk metrics:
 
 ```bash
-pip install 'agenticml-lite[system] @ git+https://github.com/agenticML/agenticml-lite@dev'
+pip install 'agenticml-lite[system]'
 ```
 
 ## Quickstart
@@ -243,9 +243,9 @@ Run directly:
 Or run as a systemd service: see [deploy/systemd/README.md](deploy/systemd/README.md) and [deploy/systemd/agenticml-server.service](deploy/systemd/agenticml-server.service).
 ```bash
 sudo useradd --system --home /var/lib/agenticml-server --shell /usr/sbin/nologin agenticml
-sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/main/deploy/systemd/agenticml-server.service
+sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v3.0.0/deploy/systemd/agenticml-server.service
 ```
-The unit is fetched from `main` because there is no 3.0 tag yet. Once 3.0.0 is released, use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`). Edit `AGENTICML_SERVER_PUBLIC_URL` in the unit (or `sudo systemctl edit agenticml-server`), then `daemon-reload` and `enable --now`:
+The unit is fetched from the `v3.0.0` tag. Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`). Edit `AGENTICML_SERVER_PUBLIC_URL` in the unit (or `sudo systemctl edit agenticml-server`), then `daemon-reload` and `enable --now`:
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now agenticml-server

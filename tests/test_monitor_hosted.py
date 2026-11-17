@@ -130,6 +130,16 @@ def write_docs(tmp_path, files):
     return tmp_path
 
 
+MAIN_RAW = "https://raw.githubusercontent.com/agenticML/agenticml-lite/main/deploy/systemd/a.service"
+
+
+def test_external_links_skips_the_configured_prefixes(tmp_path, monkeypatch):
+    docs = write_docs(tmp_path, {"a.md": f"Raw: {MAIN_RAW} and https://other.dev/path\n"})
+    assert monitor.external_links(docs) == ["https://other.dev/path", MAIN_RAW]
+    monkeypatch.setattr(monitor, "SKIPPED_PREFIXES", ("https://raw.githubusercontent.com/agenticML/agenticml-lite/main/",))
+    assert monitor.external_links(docs) == ["https://other.dev/path"]
+
+
 def test_external_links_keeps_only_real_deduplicated_urls(tmp_path):
     docs = write_docs(tmp_path, {
         "a.md": (
@@ -150,6 +160,7 @@ def test_external_links_keeps_only_real_deduplicated_urls(tmp_path):
     assert monitor.external_links(docs) == [
         "https://github.com/agenticML/agenticml-lite/issues",
         "https://other.dev/path",
+        MAIN_RAW,
         "https://raw.githubusercontent.com/agenticML/agenticml-lite/v3.0.0/deploy/systemd/a.service",
         "https://real.sample.org/page",
         "https://third.dev/",

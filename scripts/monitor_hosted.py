@@ -48,9 +48,9 @@ IGNORED_HOSTS = frozenset({
     "localhost",
     "127.0.0.1",
 })
-# Raw files on `main` do not exist until 3.0 is merged there. Remove this
-# entry after the 3.0.0 release.
-SKIPPED_PREFIXES = ("https://raw.githubusercontent.com/agenticML/agenticml-lite/main/",)
+# URL prefixes the link check skips. Empty: raw files on `main` exist now that
+# 3.0 is merged there. Add a prefix here when a link cannot resolve yet.
+SKIPPED_PREFIXES = ()
 GITHUB_HOSTS = frozenset({"github.com", "raw.githubusercontent.com", "api.github.com"})
 
 URL_RE = re.compile(r"(?<![+\w])https?://[^\s)\]<>\"'`]+")

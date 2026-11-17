@@ -14,9 +14,10 @@ ROOT = Path(__file__).parents[1]
 DOCS = ROOT / 'website/src/content/docs'
 LIMITS = json.loads((ROOT / 'deploy/aws/limits.json').read_text(encoding='utf-8'))
 
-# False until 3.0.0 is tagged and published; flipped in 29.9, which moves the
-# raw.githubusercontent.com URLs back to the tag.
-PUBLISHED_3_0 = False
+# True: 3.0.0 is tagged and published (flipped in 29.9, which moved the
+# raw.githubusercontent.com URLs to the v3.0.0 tag). Set it to False to check
+# that no v3.0.0 raw URL is used before the tag exists.
+PUBLISHED_3_0 = True
 
 
 def _text(relative):
@@ -128,6 +129,37 @@ def test_no_v3_0_0_raw_url_until_published():
         )
     ]
     assert not bad, bad
+
+
+# Pages that must install from PyPI, not from a git URL or the `dev` branch.
+INSTALL_DOC_FILES = [
+    'README.md', 'docs/SERVER.md', 'docs/HOSTED.md',
+    'deploy/systemd/README.md', 'deploy/aws/README.md',
+]
+# The one deliberate git install: the 2.2 client of the compatibility check.
+GIT_INSTALL_ALLOWED = 'agenticml-lite@bd0d499'
+
+
+def test_no_git_install_remains_in_the_docs():
+    """3.0.0 is on PyPI, so no doc installs it from GitHub or follows `dev`.
+    Fails if a file it reads is missing."""
+    paths = [p for p in sorted(DOCS.rglob('*')) if p.suffix in ('.md', '.mdx')]
+    assert paths, 'no docs site pages found'
+    for relative in INSTALL_DOC_FILES:
+        path = ROOT / relative
+        assert path.is_file(), f'missing {relative}'
+        paths.append(path)
+    git_install = re.compile(r'git\+https://github\.com/agenticML\S*|agenticml-lite@dev\b|@dev\b')
+    bad = []
+    for path in paths:
+        for match in git_install.findall(path.read_text(encoding='utf-8')):
+            if match.rstrip("'\"`)") == 'git+https://github.com/agenticML/agenticml-lite@bd0d499' \
+                    and path == ROOT / 'deploy/aws/README.md':
+                continue
+            bad.append(f'{path.relative_to(ROOT)}: {match}')
+    assert not bad, bad
+    pin = (ROOT / 'deploy/aws/README.md').read_text(encoding='utf-8')
+    assert GIT_INSTALL_ALLOWED in pin, 'the 2.2 client pin is gone; update this test'
 
 
 def _login_key_examples(text):

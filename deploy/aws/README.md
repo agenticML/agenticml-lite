@@ -626,11 +626,10 @@ the command lists the workspaces).
 
 ### Installation
 
-Version 3.0.0 is not yet published on PyPI. Install `agenticml-lite` with
-system metrics support directly from the `dev` branch:
+Install `agenticml-lite` 3.0.0 from PyPI with system metrics support:
 
 ```sh
-pip install 'agenticml-lite[system] @ git+https://github.com/agenticML/agenticml-lite@dev'
+pip install 'agenticml-lite[system]'
 ```
 
 ### Environment configuration
@@ -749,10 +748,10 @@ local run, `verify` compares local runs with the server (file sizes and
 sha256, referenced objects, status, fingerprint), and `isolation` probes
 another workspace with this workspace's key. It reads the key from
 `AGENTICML_API_KEY` (or asks for it) and never prints it. The script lives in
-the repository. On a training machine without a checkout, fetch it from `dev`:
+the repository. On a training machine without a checkout, fetch it from the `v3.0.0` tag:
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/agenticML/agenticml-lite/dev/scripts/hosted_check.py
+curl -fsSLO https://raw.githubusercontent.com/agenticML/agenticml-lite/v3.0.0/scripts/hosted_check.py
 ```
 
 The commands below use the setup from "Environment configuration" above
