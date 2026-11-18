@@ -330,6 +330,9 @@ Getting the hosted service live on AWS, step by step: [AWS deployment roadmap](a
 - Version 2.2.0, transient Git failures answer 503, runs no longer track
   their own store files, and the dashboard last-admin-key rule counts only
   usable keys: [plan](packages/backlog-2.2-fixes.md); status: done (2.2 PR).
+- Timeout-sensitive tests flaked in the Postgres CI job (many-process
+  e2e and metrics tests): [plan](packages/fix-flaky-postgres-timeouts.md),
+  found in PR #83; status: in review.
 
 ### Later (unscheduled)
 

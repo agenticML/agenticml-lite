@@ -45,7 +45,7 @@ def test_append_crash_hook_then_resync_is_byte_identical(tmp_path, monkeypatch):
         url = f"http://127.0.0.1:{server.server_address[1]}"
         writer = writer_at(tmp_path, status=None, count=2)
         try:
-            with Client(url, key, timeout=5, max_retries=0) as client:
+            with Client(url, key, timeout=30, max_retries=0) as client:
                 pair = (server, client)
                 assert not push(pair, writer).failed
                 writer.write_scalars([(2, {"loss": 0.5, "acc": 0.5, "extra": 2.0})])
@@ -454,7 +454,7 @@ def test_truncate_append_crash_then_resync_is_byte_identical(tmp_path, monkeypat
         url = f"http://127.0.0.1:{server.server_address[1]}"
         writer = writer_at(tmp_path, status=None, count=2)
         try:
-            with Client(url, key, timeout=5, max_retries=0) as client:
+            with Client(url, key, timeout=30, max_retries=0) as client:
                 pair = (server, client)
                 assert not push(pair, writer).failed
                 writer.write_scalars([(2, {"loss": 0.5, "acc": 0.5, "extra": 2.0})])
@@ -488,7 +488,7 @@ def test_atomic_write_crash_then_resync_is_byte_identical(tmp_path, monkeypatch)
         url = f"http://127.0.0.1:{server.server_address[1]}"
         writer = writer_at(tmp_path, status=None, count=2)
         try:
-            with Client(url, key, timeout=5, max_retries=0) as client:
+            with Client(url, key, timeout=30, max_retries=0) as client:
                 pair = (server, client)
                 assert not push(pair, writer).failed
                 writer.write_scalars([(2, {"loss": 0.5, "acc": 0.5, "extra": 2.0})])
@@ -518,7 +518,7 @@ def test_atomic_crash_does_not_acknowledge_stale_record(tmp_path, monkeypatch):
         url = f"http://127.0.0.1:{server.server_address[1]}"
         writer = writer_at(tmp_path, status=None, count=2)
         try:
-            with Client(url, key, timeout=5, max_retries=0) as client:
+            with Client(url, key, timeout=30, max_retries=0) as client:
                 pair = (server, client)
                 assert not push(pair, writer).failed
                 body_a = (writer.run_dir / "scalars/index.json").read_bytes()

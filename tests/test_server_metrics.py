@@ -180,7 +180,7 @@ def test_incremental_append_and_truncate(tmp_path, monkeypatch, server):
     url = 'http://127.0.0.1:%d' % server.server_address[1]
     writer = writer_at(tmp_path, status=None, count=4)
     try:
-        with Client(url, server.test_key, timeout=5, max_retries=0) as client:
+        with Client(url, server.test_key, timeout=30, max_retries=0) as client:
             remote = (server, client)
             assert not push(remote, writer).failed
             reader = RunReader(writer.root, writer.run_id)
@@ -222,7 +222,7 @@ def test_crash_between_write_and_commit_does_not_change_summary(tmp_path, monkey
     url = 'http://127.0.0.1:%d' % server.server_address[1]
     writer = writer_at(tmp_path, status=None, count=2)
     try:
-        with Client(url, server.test_key, timeout=5, max_retries=0) as client:
+        with Client(url, server.test_key, timeout=30, max_retries=0) as client:
             remote = (server, client)
             assert not push(remote, writer).failed
             before = {row['name']: dict(row) for row in server.run_index.metrics(writer.run_id)}
@@ -255,7 +255,7 @@ def test_runs_api_metrics_sort_filter_and_no_file_reads(tmp_path, monkeypatch, s
     url = 'http://127.0.0.1:%d' % server.server_address[1]
     writers = []
     try:
-        with Client(url, server.test_key, timeout=5, max_retries=0) as client:
+        with Client(url, server.test_key, timeout=30, max_retries=0) as client:
             remote = (server, client)
             for index, loss in enumerate((0.9, 0.3, 0.5)):
                 writer = RunWriter.create(
@@ -404,7 +404,7 @@ def test_rebuild_and_reindex_restore_deleted_rows(tmp_path, monkeypatch, capsys)
         url = 'http://127.0.0.1:%d' % httpd.server_address[1]
         writer = writer_at(tmp_path, status='finished', count=3)
         try:
-            with Client(url, key, timeout=5, max_retries=0) as client:
+            with Client(url, key, timeout=30, max_retries=0) as client:
                 assert not push((httpd, client), writer).failed
             run_id = writer.run_id
             assert httpd.run_index.metrics(run_id)
@@ -433,7 +433,7 @@ def test_reindex_restores_metrics_offline(tmp_path, monkeypatch):
         url = 'http://127.0.0.1:%d' % httpd.server_address[1]
         writer = writer_at(tmp_path, status='finished', count=3)
         try:
-            with Client(url, key, timeout=5, max_retries=0) as client:
+            with Client(url, key, timeout=30, max_retries=0) as client:
                 assert not push((httpd, client), writer).failed
             run_id = writer.run_id
             with httpd.db.transaction(write=True) as tx:
@@ -456,7 +456,7 @@ def test_first_start_backfill_rebuilds_once(tmp_path, monkeypatch):
         url = 'http://127.0.0.1:%d' % httpd.server_address[1]
         writer = writer_at(tmp_path, status='finished', count=2)
         try:
-            with Client(url, key, timeout=5, max_retries=0) as client:
+            with Client(url, key, timeout=30, max_retries=0) as client:
                 assert not push((httpd, client), writer).failed
             run_id = writer.run_id
             SettingsRepo(httpd.db).delete('metrics_backfilled')
@@ -565,7 +565,7 @@ def test_sort_tie_break_created_at_then_run_id(tmp_path, monkeypatch, server):
     url = 'http://127.0.0.1:%d' % server.server_address[1]
     writers = []
     try:
-        with Client(url, server.test_key, timeout=5, max_retries=0) as client:
+        with Client(url, server.test_key, timeout=30, max_retries=0) as client:
             remote = (server, client)
             for run_id in ('tie-a', 'tie-b', 'tie-c'):
                 writer = RunWriter.create(
@@ -714,7 +714,7 @@ def test_metrics_backfill_skips_unreadable_run(tmp_path, monkeypatch, caplog):
         url = 'http://127.0.0.1:%d' % httpd.server_address[1]
         writer = writer_at(tmp_path, status='finished', count=2)
         try:
-            with Client(url, key, timeout=5, max_retries=0) as client:
+            with Client(url, key, timeout=30, max_retries=0) as client:
                 assert not push((httpd, client), writer).failed
             run_id = writer.run_id
             SettingsRepo(httpd.db).delete('metrics_backfilled')

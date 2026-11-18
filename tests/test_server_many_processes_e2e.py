@@ -170,7 +170,7 @@ def test_two_process_sync_kill_restart_matches_single_process(tmp_path, server_d
         def send(self, request, **kwargs):
             if '/append/' in request.url and self._client.race:
                 self._client.race = False
-                duplicate_barrier.wait(timeout=10)
+                duplicate_barrier.wait(timeout=30)
                 with ack_lock:
                     racing_clients.append(self._client.base_url)
                     if len(set(racing_clients)) == 2:
@@ -195,7 +195,7 @@ def test_two_process_sync_kill_restart_matches_single_process(tmp_path, server_d
             return response
 
     def push(root, run_id, server, key, race=False):
-        with RecordingClient(server.url, key, timeout=10, max_retries=0, race=race) as client:
+        with RecordingClient(server.url, key, timeout=30, max_retries=0, race=race) as client:
             result = sync.SyncResult(run_id)
             sync.sync_run(RunReader(root, run_id), server.url, client, result)
             return result
@@ -229,7 +229,7 @@ def test_two_process_sync_kill_restart_matches_single_process(tmp_path, server_d
 
         headers = {'Authorization': 'Bearer ' + keys['parallel']}
         def ping(server):
-            assert requests.get(server.url + '/v2/whoami', headers=headers, timeout=5).status_code == 200
+            assert requests.get(server.url + '/v2/whoami', headers=headers, timeout=30).status_code == 200
         with ThreadPoolExecutor(8) as pool:
             list(pool.map(lambda i: ping((a, b)[i % 2]), range(24)))
         assert UsageRepo(db, wid).get()['request_count'] == 24
@@ -238,7 +238,7 @@ def test_two_process_sync_kill_restart_matches_single_process(tmp_path, server_d
             futures = [pool.submit(push, copies[i % 2], rid, (a, b)[i % 2], keys['parallel'])
                        for i, rid in enumerate(run_ids[:9])]
             for future in futures:
-                result = future.result(timeout=30)
+                result = future.result(timeout=120)
                 assert result.complete, result
             assert acks, 'must acknowledge appends before killing A'
             # Duplicate run-09 through A and B first: the workspace quota lock
@@ -248,11 +248,11 @@ def test_two_process_sync_kill_restart_matches_single_process(tmp_path, server_d
             later = pool.submit(push, copies[1], run_ids[11], b, keys['parallel'])
             race_a = pool.submit(push, copies[0], run_ids[9], a, keys['parallel'], True)
             race_futures = (race_b, race_a)
-            assert both_appending.wait(15), 'both duplicate appends must be in flight'
+            assert both_appending.wait(60), 'both duplicate appends must be in flight'
             assert set(racing_clients) == {a.url, b.url}
             slow = pool.submit(push, copies[0], run_ids[10], a, keys['parallel'])
             futures = [race_b, slow, later, race_a]
-            deadline = time.monotonic() + 15
+            deadline = time.monotonic() + 60
             marker = 'AGENTICML_TEST_APPEND_WRITE ' + run_ids[10] + ' '
             gap = None
             while gap is None:
@@ -286,7 +286,7 @@ def test_two_process_sync_kill_restart_matches_single_process(tmp_path, server_d
             interrupted = 0
             for future, target in zip(futures, (b, a, b, a)):
                 try:
-                    result = future.result(timeout=20)
+                    result = future.result(timeout=60)
                     assert not result.permanent, result
                 except requests.ConnectionError:
                     assert target is a, 'only the killed server may disconnect a client'

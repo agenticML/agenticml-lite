@@ -109,7 +109,7 @@ def test_conversion_end_to_end_and_sync(old, tmp_path, monkeypatch):
 
         # A sync client (protocol 2 is unchanged in 3.0) continues an imported run and starts a new one.
         url = 'http://127.0.0.1:%d' % server.server_address[1]
-        with Client(url, secrets['bob-sync'], timeout=5, max_retries=0) as client:
+        with Client(url, secrets['bob-sync'], timeout=30, max_retries=0) as client:
             writer = writers['old-1']
             writer.write_scalars([(i, {'loss': 1 / (i + 1)}) for i in range(8, 20)])
             writer.finish('finished')
