@@ -489,6 +489,73 @@ The endpoint `GET /api/admin/stats` (server admins only; others get 404 like eve
 
 Usage history works the same self-hosted (SQLite) and hosted (Postgres). Totals stay in the server's database, and nothing is sent anywhere.
 
+## Capacity metrics
+
+Metrics are off by default (`--metrics off`); with `off`, nothing is sent anywhere. With `--metrics cloudwatch` (or `AGENTICML_SERVER_METRICS=cloudwatch`), the server sends 12 metrics to Amazon CloudWatch once a minute with `PutMetricData`, in the namespace `AgenticML/Server` and with no dimensions (no per-task, workspace, user, or route values; no paths, slugs, logins, or keys).
+
+### Measured metrics
+
+Published once a minute:
+- `Requests`: requests finished in the minute (health checks on `/healthz` are not counted).
+- `Errors4xx`: finished requests with HTTP status 400–499.
+- `Errors5xx`: finished requests with HTTP status 500–599.
+- `Rejected`: connections refused at the server's 64-connection cap.
+- `Latency`: server time per request in milliseconds, excluding time spent receiving request bodies and sending responses (published as values and counts so CloudWatch can show p50/p95/p99).
+- `InFlightPeak`: most requests in progress at once in the minute.
+- `DbConnectionsPeak`: most database connections the process held at once in the minute.
+
+Published every 15 minutes (usage totals from [Usage history](#usage-history)):
+- `Accounts`: total accounts.
+- `ActiveUsers7d`: accounts active in the last 7 days.
+- `WorkspacesActive`: active workspaces.
+- `StoredBytes`: total committed bytes stored across all workspaces.
+- `UploadBytesToday`: bytes uploaded since midnight UTC.
+
+### Multi-process behaviour
+
+Several server processes publish to the same metrics: counts add up and latency values merge. For the usage totals, each process sends the same values; use CloudWatch statistic `Maximum` to view them.
+
+### Requirements
+
+Requirements for `cloudwatch`:
+1. The `[cloudwatch]` extra:
+   ```bash
+   pip install 'agenticml-lite[cloudwatch]'
+   ```
+   This installs `boto3`. The `[hosted]` extra includes it.
+2. An AWS region in `AWS_REGION` or `AWS_DEFAULT_REGION`.
+3. AWS credentials allowed `cloudwatch:PutMetricData`. This permission can be limited with the condition `cloudwatch:namespace` = `AgenticML/Server`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "cloudwatch:PutMetricData",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": "AgenticML/Server"
+        }
+      }
+    }
+  ]
+}
+```
+
+Without the `[cloudwatch]` extra or a region, the server refuses to start with a message saying so.
+
+The CLI flag overrides the environment variable; a blank environment variable counts as unset. Any value other than `off` or `cloudwatch` causes the server to refuse to start with `AGENTICML_SERVER_METRICS must be off or cloudwatch`. Only `agenticml server serve` has this option (not `server up`).
+
+### Unreachable CloudWatch
+
+If CloudWatch is unreachable, the server logs a warning (at most every 10 minutes for the same message), drops that minute's numbers, and keeps serving.
+
+### Cost
+
+Custom metrics on AWS cost about $0.30 each per month after the first 10 free in an account, so about $1–4 a month. The API calls (one a minute per process) fit in the CloudWatch free tier.
+
 ## Upgrading from 2.x to 3.0
 
 When starting a 3.0 server against an existing 2.x data directory, the server automatically migrates data in place on first start:
@@ -524,6 +591,7 @@ Sync clients on version 2.2 continue to sync to a 3.0 server without modificatio
 | `--firebase-api-key KEY` | `AGENTICML_SERVER_FIREBASE_API_KEY` | unset | Firebase web API key for dashboard sign-in. |
 | `--firebase-auth-domain HOST` | `AGENTICML_SERVER_FIREBASE_AUTH_DOMAIN` | unset | Firebase auth domain (defaults to `<project>.firebaseapp.com`). |
 | `--limits FILE` | `AGENTICML_SERVER_LIMITS` | unset | Path to JSON file defining workspace usage limits and plans. |
+| `--metrics MODE` | `AGENTICML_SERVER_METRICS` | `off` | Capacity metrics mode: `off` or `cloudwatch`. Flag wins over env; blank counts as unset. Any other value refuses to start. Only `server serve` has it. |
 | `--admin-emails LIST` | `AGENTICML_SERVER_ADMIN_EMAILS` | unset | Comma-separated emails granted server admin on verified Firebase sign-in. Ignored without Firebase. |
 | `--legal-base-url URL` | `AGENTICML_SERVER_LEGAL_BASE_URL` | unset | `https://` base URL of your Terms, Acceptable use and Privacy pages (`terms/`, `acceptable-use/`, `privacy/` under it). With Firebase on, the sign-in page (`/login` and `/invite`) then shows "By continuing you agree to the Terms and the Acceptable use policy. See the Privacy policy." with those links. A non-`https://` value stops the server at startup. Ignored without Firebase. Not set means no links. |
 | `--open-signup` | `AGENTICML_SERVER_OPEN_SIGNUP` | off | Allow verified Firebase sign-in to create an account and personal workspace. A verified account with no workspace gets one at sign-in (once; an admin-deleted sign-up workspace is not recreated). |

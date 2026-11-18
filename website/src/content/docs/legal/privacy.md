@@ -56,7 +56,7 @@ We host and operate the service using the following third-party service provider
   - **Amazon RDS PostgreSQL:** Storing accounts, workspaces, keys, sessions, audit events, metric summaries, and committed file sizes.
   - **Amazon EFS:** Storing raw experiment run files and lineage Git repositories.
   - **Amazon S3:** Storing content-addressed artifact objects and media blobs.
-  - **AWS Secrets Manager and Amazon CloudWatch:** Secrets Manager holds the database password; CloudWatch keeps server application logs and health alarms.
+  - **AWS Secrets Manager and Amazon CloudWatch:** Secrets Manager holds the database password; CloudWatch keeps server application logs and health alarms. CloudWatch also keeps server-wide operational metrics (request counts, latency, connection counts, and totals of accounts, active accounts, workspaces and stored and uploaded data); they contain no personal data or workspace identifiers, and CloudWatch keeps metrics for up to 15 months.
   - **AWS Backup:** Daily backup copies of the database and the EFS file system, kept for up to 35 days.
   - **Other AWS services** (Elastic Container Registry for the server image, SNS and Budgets for operator alert emails, Certificate Manager, KMS) process no Customer Data.
 - **Google Firebase Authentication:** Sign-in. When you sign in, your browser talks to Google directly (`apis.google.com`, `googleapis.com` and the Firebase sign-in domain), so Google receives your IP address and browser details, and the email and password you type for email sign-in. We never receive your password; we receive a signed Firebase token that we verify, and we store your email, display name and Firebase user ID from it. The dashboard itself loads no Google or other third-party code.

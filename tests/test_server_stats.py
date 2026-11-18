@@ -483,7 +483,8 @@ def test_serve_runs_the_refresher_around_the_server(monkeypatch, interval, expec
     server = SimpleNamespace(
         db='the-db', keys=SimpleNamespace(list=lambda: ['admin']), server_address=('127.0.0.1', 1),
         data_dir='data', public_url=None, serve_forever=lambda: None,
-        server_close=lambda **kwargs: events.append('close'))
+        server_close=lambda **kwargs: (kwargs['before_db_close']() if 'before_db_close' in kwargs else None,
+                                       events.append('close')))
     monkeypatch.setattr(app, 'make_server', lambda *args: server)
     monkeypatch.setattr(app, 'StatsRefresher', Recorder)
     app.serve(stats_interval=interval)

@@ -4,11 +4,14 @@ No AWS calls: the templates are parsed with PyYAML (CloudFormation short tags
 become ``{"Fn::X": value}`` mappings, as in the JSON form) and inspected.
 """
 import fnmatch
+import json
 import re
 from pathlib import Path
 
 import pytest
 import yaml
+
+from agenticml.server import capacity
 
 ROOT = Path(__file__).parents[1]
 TEMPLATE_DIR = ROOT / 'deploy/aws/cloudformation'
@@ -648,6 +651,7 @@ def test_hosted_trusted_proxy_is_the_alb_subnets_only(hosted):
     assert env['AGENTICML_SERVER_LEGAL_BASE_URL'] == {'Ref': 'LegalBaseUrl'}
     assert env['AGENTICML_SERVER_PUBLIC_URL'] == {'Fn::Sub': 'https://${Hostname}'}
     assert env['AGENTICML_SERVER_OBJECTS'] == {'Fn::Sub': 's3://${ObjectsBucket}/hosted'}
+    assert env['AGENTICML_SERVER_METRICS'] == 'cloudwatch'
     assert env['AWS_REGION'] == {'Ref': 'AWS::Region'}
     assert fn_sub_text(env['AGENTICML_SERVER_DATABASE_URL']) == (
         'postgresql://agenticml@${DbInstance.Endpoint.Address}:5432/agenticml'
@@ -737,8 +741,13 @@ def test_hosted_task_policy_is_scoped(hosted):
     assert {a for s in stmts for a in actions_of(s) if a.startswith('ssmmessages:')} == {
         'ssmmessages:CreateControlChannel', 'ssmmessages:CreateDataChannel',
         'ssmmessages:OpenControlChannel', 'ssmmessages:OpenDataChannel'}
-    # Nothing outside S3, EFS and the SSM message channel.
-    assert {a.split(':')[0] for a in by_action} == {'s3', 'elasticfilesystem', 'ssmmessages'}
+    # Capacity metrics: only PutMetricData, only in the server's namespace.
+    (metrics,) = by_action['cloudwatch:PutMetricData']
+    assert actions_of(metrics) == ['cloudwatch:PutMetricData'] and metrics['Effect'] == 'Allow'
+    assert metrics['Resource'] == '*'
+    assert metrics['Condition'] == {'StringEquals': {'cloudwatch:namespace': capacity.NAMESPACE}}
+    # Nothing outside S3, EFS, the SSM message channel and CloudWatch metrics.
+    assert {a.split(':')[0] for a in by_action} == {'s3', 'elasticfilesystem', 'ssmmessages', 'cloudwatch'}
 
 
 def test_hosted_roles_are_named_inside_the_cloudformation_roles_scope(hosted, bootstrap):
@@ -772,7 +781,7 @@ def test_hosted_resource_names_match_the_cloudformation_role_scope(hosted, boots
     assert fnmatch.fnmatch(log_group, fn_sub_text(stmts['LogGroups']['Resource']).split('log-group:')[1])
     alarm_pattern = fn_sub_text(stmts['Alarms']['Resource']).split('alarm:')[1]
     names = alarms_of(hosted)
-    assert len(names) == 6
+    assert len(names) == 9
     for name in names:
         assert fnmatch.fnmatch(name, alarm_pattern), name
     bucket_pattern = fn_sub_text(stmts['Buckets']['Resource']).split(':::')[1]
@@ -793,7 +802,8 @@ def test_hosted_alarms_notify_the_imported_topic(hosted):
     alarms = alarms_of(hosted)
     assert set(alarms) == {'agenticml-hosted-alb_5xx', 'agenticml-hosted-unhealthy', 'agenticml-hosted-rds_storage',
                            'agenticml-hosted-rds_cpu', 'agenticml-hosted-healthy_hosts',
-                           'agenticml-hosted-latency-p95'}
+                           'agenticml-hosted-latency-p95', 'agenticml-hosted-rds_cpu_credits',
+                           'agenticml-hosted-rds_connections', 'agenticml-hosted-ecs_memory'}
     for alarm in alarms.values():
         assert alarm['AlarmActions'] == [topic] and alarm['OKActions'] == [topic]
     summary = {n.removeprefix('agenticml-hosted-'): (a['Namespace'], a['MetricName'], a.get('Statistic'),
@@ -808,7 +818,17 @@ def test_hosted_alarms_notify_the_imported_topic(hosted):
         'rds_cpu': ('AWS/RDS', 'CPUUtilization', 'Average', None, 'GreaterThanThreshold', 80, 300, 1, 'notBreaching'),
         'healthy_hosts': ('AWS/ApplicationELB', 'HealthyHostCount', 'Minimum', None, 'LessThanThreshold', {'Ref': 'DesiredCount'}, 60, 5, 'breaching'),
         'latency-p95': ('AWS/ApplicationELB', 'TargetResponseTime', None, 'p95', 'GreaterThanThreshold', 5, 300, 1, 'notBreaching'),
+        'rds_cpu_credits': ('AWS/RDS', 'CPUCreditBalance', 'Minimum', None, 'LessThanThreshold', 20, 300, 3, 'notBreaching'),
+        'rds_connections': ('AWS/RDS', 'DatabaseConnections', 'Maximum', None, 'GreaterThanThreshold', 90, 300, 1, 'notBreaching'),
+        'ecs_memory': ('AWS/ECS', 'MemoryUtilization', 'Maximum', None, 'GreaterThanThreshold', 85, 300, 2, 'notBreaching'),
     }
+    db = [{'Name': 'DBInstanceIdentifier', 'Value': {'Ref': 'DbInstance'}}]
+    assert alarms['agenticml-hosted-rds_cpu_credits']['Dimensions'] == db
+    assert alarms['agenticml-hosted-rds_connections']['Dimensions'] == db
+    # ECS/ContainerInsights stays off: the memory alarm reads the free service metric.
+    assert alarms['agenticml-hosted-ecs_memory']['Dimensions'] == [
+        {'Name': 'ClusterName', 'Value': {'Ref': 'Cluster'}},
+        {'Name': 'ServiceName', 'Value': {'Fn::GetAtt': 'Service.Name'}}]
     # healthy_hosts (fewer healthy targets than tasks wanted for 5 minutes) only
     # exists while DesiredCount is not 0, so scaling to 0 does not leave it in
     # ALARM. A new MaxValue needs a review of the threshold wording.
@@ -824,6 +844,61 @@ def test_hosted_alarms_notify_the_imported_topic(hosted):
         {'Name': 'LoadBalancer', 'Value': {'Fn::GetAtt': 'LoadBalancer.LoadBalancerFullName'}},
         {'Name': 'TargetGroup', 'Value': {'Fn::GetAtt': 'TargetGroup.TargetGroupFullName'}}]
     assert not any(conditions.values())
+
+
+def test_bootstrap_dashboard_matches_the_hosted_names(bootstrap, hosted):
+    dashboard = only(bootstrap, 'AWS::CloudWatch::Dashboard')['Properties']
+    assert dashboard['DashboardName'] == 'agenticml-hosted'
+    template = fn_sub_text(dashboard['DashboardBody'])
+    assert set(re.findall(r'\$\{([^}]*)\}', template)) == {'AWS::Region'}
+    body = json.loads(template.replace('${AWS::Region}', 'eu-north-1'))
+    metrics = [m for w in body['widgets'] for m in w['properties']['metrics']]
+    assert {w['properties']['region'] for w in body['widgets']} == {'eu-north-1'}
+    # The names the dashboard refers to are the ones hosted.yaml defines.
+    props = lambda type_: only(hosted, type_)['Properties']
+    cluster, service = props('AWS::ECS::Cluster')['ClusterName'], props('AWS::ECS::Service')['ServiceName']
+    database = props('AWS::RDS::DBInstance')['DBInstanceIdentifier']
+    assert (cluster, service, database) == ('agenticml-hosted',) * 3
+    ecs = [m for m in metrics if m[0] == 'AWS/ECS']
+    assert {m[1] for m in ecs} == {'CPUUtilization', 'MemoryUtilization'}
+    assert all(m[2:6] == ['ClusterName', cluster, 'ServiceName', service] for m in ecs)
+    rds = [m for m in metrics if m[0] == 'AWS/RDS']
+    assert {m[1] for m in rds} == {'DatabaseConnections', 'CPUUtilization', 'CPUCreditBalance'}
+    assert all(m[2:4] == ['DBInstanceIdentifier', database] for m in rds)
+    # The namespace is the one the task policy allows.
+    (put,) = [s for s in statements(props('AWS::IAM::Policy')['PolicyDocument'])
+              if 'cloudwatch:PutMetricData' in actions_of(s)]
+    namespace = put['Condition']['StringEquals']['cloudwatch:namespace']
+    own = [m for m in metrics if m[0] not in ('AWS/ECS', 'AWS/RDS')]
+    assert namespace == capacity.NAMESPACE
+    assert {m[0] for m in own} == {capacity.NAMESPACE}
+    assert {m[1] for m in own} == set(capacity.METRIC_NAMES)
+    assert {m[-1]['stat'] for m in own if m[1] == 'Latency'} == {'p50', 'p95', 'p99'}
+    # Nothing in the hosted stack imports or refers to the dashboard.
+    assert 'Dashboard' not in (TEMPLATE_DIR / 'hosted.yaml').read_text()
+
+
+def test_bootstrap_dashboard_statistics_and_periods(bootstrap):
+    dashboard = only(bootstrap, 'AWS::CloudWatch::Dashboard')['Properties']
+    body = json.loads(fn_sub_text(dashboard['DashboardBody']).replace('${AWS::Region}', 'eu-north-1'))
+    shown = {}
+    for widget in body['widgets']:
+        props = widget['properties']
+        for line in props['metrics']:
+            options = line[-1] if isinstance(line[-1], dict) else {}
+            stat = options.get('stat', props.get('stat'))
+            period = options.get('period', props.get('period'))
+            shown.setdefault((line[0], line[1]), set()).add((stat, period))
+    ns = capacity.NAMESPACE
+    expected = {(ns, name): {('Sum', 60)} for name in ('Requests', 'Errors4xx', 'Errors5xx', 'Rejected')}
+    expected.update({(ns, 'Latency'): {('p50', 60), ('p95', 60), ('p99', 60)}})
+    expected.update({(ns, name): {('Maximum', 60), ('Sum', 60)} for name in ('InFlightPeak', 'DbConnectionsPeak')})
+    expected.update({(ns, name): {('Maximum', 3600)} for name in (
+        'Accounts', 'ActiveUsers7d', 'WorkspacesActive', 'StoredBytes', 'UploadBytesToday')})
+    expected[('AWS/RDS', 'CPUCreditBalance')] = {('Minimum', 300)}
+    for key, want in expected.items():
+        assert shown[key] == want, key
+    assert {name for (namespace, name) in shown if namespace == ns} == set(capacity.METRIC_NAMES)
 
 
 def test_hosted_backup_plan(hosted):

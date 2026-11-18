@@ -28,6 +28,8 @@ from .workspaces import default_workspace_id, prepare_store, store_root
 from .runs import reconcile, store_paths_safe
 from .audit import AuditLog
 from .stats import STATS_REFRESH, StatsRefresher
+from .capacity import FINAL_JOIN, MODE_MESSAGE, MetricsPublisher, RequestMetrics, cloudwatch_client
+from .capacity import logger as capacity_logger
 from .webauth import IDENTITY_PRESETS, WebAuth
 
 logger = logging.getLogger("agenticml.server")
@@ -274,6 +276,7 @@ class IngestServer(DashboardServer):
 
         require_open_signup(open_signup, firebase, plans)
         self.min_client = parse_min_client(min_client_version)
+        self.request_metrics = RequestMetrics()
         self.data_dir = Path(data)
         self.tmp_dir = self.data_dir / "server" / "tmp"
         db = db if db is not None else for_server_dir(self.data_dir / "server")
@@ -323,6 +326,9 @@ class IngestServer(DashboardServer):
             header = IDENTITY_PRESETS[self.web.identity_header][0] if self.web.identity_header else "none"
             ranges = ", ".join(str(network) for network in self.web.trusted_proxies) or "none"
             logger.info("identity header %s; trusted proxies %s", header, ranges)
+
+    def on_rejected(self):
+        self.request_metrics.rejected()
 
     def _after_append_write(self, run_id, path):
         """Test hook: runs after an append is fsynced and before the size commit."""
@@ -445,7 +451,8 @@ class IngestServer(DashboardServer):
                 self.lineage_locks[key] = lock
             return self._combined_lock(lock, f"lineage:{workspace_id}:{project_key}")
 
-    def server_close(self, *, drain=0.0):
+    def server_close(self, *, drain=0.0, before_db_close=None):
+        """Drain, join handlers, run ``before_db_close``, then close the database and lock."""
         if drain > 0:
             try:
                 self.socket.close()
@@ -487,11 +494,15 @@ class IngestServer(DashboardServer):
         self._closing_workers.clear()
         # If joining workers is interrupted, keep the lock: those workers can
         # still be applying writes while the caller handles the interruption.
-        if self.db is not None:
-            self.db.close()
-        if self._server_lock is not None:
-            self._server_lock.close()
-            self._server_lock = None
+        try:
+            if before_db_close is not None:
+                before_db_close()
+        finally:
+            if self.db is not None:
+                self.db.close()
+            if self._server_lock is not None:
+                self._server_lock.close()
+                self._server_lock = None
 
 
 class IPv6IngestServer(IngestServer):
@@ -562,8 +573,15 @@ def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None
           trusted_proxies=(), identity_header=None, database=None,
           firebase=None, cert_source=None, plans=None, open_signup=False, objects=None,
           min_client_version=None, admin_emails=frozenset(), legal_base_url=None,
-          stats_interval=STATS_REFRESH):
+          stats_interval=STATS_REFRESH, metrics=None):
     """Run until interrupted, with an optional environment admin key."""
+    if metrics not in (None, "off", "cloudwatch"):
+        raise ValueError(MODE_MESSAGE)
+    # Fail before anything is bound or locked when boto3 is missing.
+    metrics_client = final_client = None
+    if metrics == "cloudwatch":
+        metrics_client = cloudwatch_client()
+        final_client = cloudwatch_client(final=True)
     extra = {}
     if objects is not None:
         extra["objects"] = objects
@@ -589,6 +607,7 @@ def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None
     previous_handler = None
     stopping = False
     refresher = None
+    publisher = None
 
     def terminate(signum, frame):
         nonlocal stopping
@@ -614,14 +633,30 @@ def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None
             logger.warning(
                 "browsers reach the dashboard only through a Host it accepts; "
                 "set --public-url behind a proxy")
+        if metrics_client is not None:
+            publisher = MetricsPublisher(server, metrics_client, final_client=final_client)
+            publisher.start()
         if on_ready is not None:
             on_ready(server)
         server.serve_forever()
     finally:
+        def stop_background():
+            # After the drain, so requests that finished meanwhile are in the
+            # last flush; before the database closes.
+            try:
+                if refresher is not None:
+                    refresher.stop()
+            finally:
+                if publisher is not None:
+                    if not publisher.stop(FINAL_JOIN):
+                        capacity_logger.warning('capacity metrics: the last minute was not published '
+                                                '(CloudWatch did not answer in time)')
+
         try:
-            if refresher is not None:
-                refresher.stop()
-            server.server_close(drain=SHUTDOWN_DRAIN)
+            hook = {}
+            if refresher is not None or publisher is not None:
+                hook["before_db_close"] = stop_background
+            server.server_close(drain=SHUTDOWN_DRAIN, **hook)
         finally:
             if previous_handler is not None:
                 signal.signal(signal.SIGTERM, previous_handler)

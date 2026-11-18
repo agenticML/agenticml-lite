@@ -86,6 +86,8 @@ class PostgresDatabase:
         self._local = threading.local()
         self._idle = []
         self._connections = set()
+        self._lock_connections = 0
+        self._peak = 0
         self.closed = False
         self._url = url
         try:
@@ -203,6 +205,7 @@ class PostgresDatabase:
                         stale = connection
                     else:
                         stale = None
+                        self._note_use()
                 if stale is None:
                     break
                 self._close_connection(stale)
@@ -215,6 +218,7 @@ class PostgresDatabase:
                         if self.closed:
                             raise DatabaseError('database is closed')
                         self._connections.add(connection)
+                        self._note_use()
                 try:
                     connection.execute('BEGIN ISOLATION LEVEL READ COMMITTED' +
                                        ('' if write else ' READ ONLY'))
@@ -290,6 +294,9 @@ class PostgresDatabase:
             if self.closed:
                 raise DatabaseError('database is closed')
             connection = self._new_connection(lock=True)
+            with self._lock:
+                self._lock_connections += 1
+                self._note_use()
             if not try_lock:
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
@@ -344,10 +351,28 @@ class PostgresDatabase:
                     pass
                 finally:
                     self._close_connection(connection)
+                    with self._lock:
+                        self._lock_connections -= 1
             if not dedicated:
                 slots.release()
         if mapped is not None:
             _raise_plain(mapped)
+
+    def _in_use(self):
+        return len(self._connections) - len(self._idle) + self._lock_connections
+
+    def _note_use(self):
+        """Raise the peak; the caller holds ``self._lock``."""
+        self._peak = max(self._peak, self._in_use())
+
+    def pool_stats(self, reset=False):
+        """Connections this process holds now and the most at once since the last reset."""
+        with self._lock:
+            in_use = self._in_use()
+            stats = {'in_use': in_use, 'peak': max(self._peak, in_use)}
+            if reset:
+                self._peak = in_use
+            return stats
 
     def confirm_session_locks(self):
         """Abort if a session-lock connection held on this thread has died."""

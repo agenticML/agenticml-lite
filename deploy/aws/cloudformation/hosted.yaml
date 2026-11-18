@@ -603,6 +603,14 @@ Resources:
               - ssmmessages:OpenControlChannel
               - ssmmessages:OpenDataChannel
             Resource: "*"
+          # PutMetricData has no resource-level permissions; the namespace
+          # condition limits it to the server's capacity metrics.
+          - Effect: Allow
+            Action: cloudwatch:PutMetricData
+            Resource: "*"
+            Condition:
+              StringEquals:
+                cloudwatch:namespace: AgenticML/Server
 
   # ---- Load balancer ----------------------------------------------------
   LoadBalancer:
@@ -743,6 +751,8 @@ Resources:
               Value: /etc/agenticml/limits.json
             - Name: AGENTICML_SERVER_TRUSTED_PROXY
               Value: !Join [",", [!GetAtt AlbSubnetA.CidrBlock, !GetAtt AlbSubnetB.CidrBlock]]
+            - Name: AGENTICML_SERVER_METRICS
+              Value: cloudwatch
             - Name: AWS_REGION
               Value: !Ref AWS::Region
           Secrets:
@@ -945,6 +955,66 @@ Resources:
       Threshold: 5
       Period: 300
       EvaluationPeriods: 1
+      TreatMissingData: notBreaching
+      AlarmActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
+      OKActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
+
+  # A t4g.micro earns 12 credits an hour and holds at most 288. RDS t4g runs in
+  # Unlimited mode, so it is not throttled when the balance is low: below 20
+  # credits it soon bursts on billed surplus credits instead. A new or restored
+  # instance starts at 0 credits, so this alarm stays in ALARM until it has
+  # earned 20 (about two hours).
+  RdsCpuCreditsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: agenticml-hosted-rds_cpu_credits
+      Namespace: AWS/RDS
+      MetricName: CPUCreditBalance
+      Statistic: Minimum
+      Dimensions:
+        - {Name: DBInstanceIdentifier, Value: !Ref DbInstance}
+      ComparisonOperator: LessThanThreshold
+      Threshold: 20
+      Period: 300
+      EvaluationPeriods: 3
+      TreatMissingData: notBreaching
+      AlarmActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
+      OKActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
+
+  # About 80% of the roughly 112 connections a db.t4g.micro allows.
+  RdsConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: agenticml-hosted-rds_connections
+      Namespace: AWS/RDS
+      MetricName: DatabaseConnections
+      Statistic: Maximum
+      Dimensions:
+        - {Name: DBInstanceIdentifier, Value: !Ref DbInstance}
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 90
+      Period: 300
+      EvaluationPeriods: 1
+      TreatMissingData: notBreaching
+      AlarmActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
+      OKActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
+
+  # The free ECS service metric (Container Insights stays off); no data while
+  # the service is scaled to zero.
+  EcsMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: agenticml-hosted-ecs_memory
+      Namespace: AWS/ECS
+      MetricName: MemoryUtilization
+      Statistic: Maximum
+      Dimensions:
+        - {Name: ClusterName, Value: !Ref Cluster}
+        - {Name: ServiceName, Value: !GetAtt Service.Name}
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 85
+      Period: 300
+      EvaluationPeriods: 2
       TreatMissingData: notBreaching
       AlarmActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
       OKActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]

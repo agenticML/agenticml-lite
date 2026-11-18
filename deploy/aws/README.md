@@ -60,6 +60,10 @@ foundation that must exist before the deploy workflow can run:
   a per-service breakdown and month-end forecast (`GetCostForecast`). On the 2nd
   of each month, emails the previous month's final total. Skips queries on the
   1st because Cost Explorer data lags by a day.
+- **CloudWatch dashboard** `agenticml-hosted`: holds widgets for requests and
+  errors, latency (p50/p95/p99), load (in-flight and database connections, plus
+  RDS DatabaseConnections), ECS CPU and memory with RDS CPU, RDS CPU credits,
+  and usage totals.
 
 Deploy the bootstrap stack:
 
@@ -244,7 +248,7 @@ curl --fail https://app.agenticml.xyz/healthz
 aws logs tail /ecs/agenticml-hosted --since 10m
 ```
 
-The stack configures six CloudWatch alarms (described in detail under Incidents,
+The stack configures nine CloudWatch alarms (described in detail under Incidents,
 launch evidence and cost below).
 
 ## If the first create fails
@@ -1160,6 +1164,17 @@ Alarms publish to the `agenticml-alerts` SNS topic:
    second task stops; five consecutive minutes are needed, so it normally does
    not fire. (It replaces `agenticml-hosted-running_tasks`, which needed
    Container Insights; Container Insights is off.)
+7. `agenticml-hosted-rds_cpu_credits`: RDS `CPUCreditBalance` minimum below 20
+   for three 5-minute periods. RDS t4g instances run in Unlimited mode: when
+   credits run out the database is not throttled but bursts on surplus credits,
+   which are billed. A new or restored database instance starts with 0 credits,
+   so after a restore this alarm stays in ALARM for about two hours until it has
+   earned 20.
+8. `agenticml-hosted-rds_connections`: RDS `DatabaseConnections` maximum above
+   90 in 5 minutes (about 80% of the roughly 112 connections `db.t4g.micro`
+   allows).
+9. `agenticml-hosted-ecs_memory`: ECS service `MemoryUtilization` maximum above
+   85% for two 5-minute periods (AWS/ECS metric; Container Insights stays off).
 
 Additional bootstrap alarms:
 - `agenticml-cost-steps-errors`: CloudWatch alarm on the `agenticml-cost-steps`
@@ -1183,6 +1198,22 @@ the SHA and the comment together; look up a tag's commit with
 `gh api repos/<owner>/<repo>/git/ref/tags/<tag>` and dereference annotated tags.
 After changing the pins, run `publish-testpypi.yml` once before tagging a
 release.
+
+### Capacity dashboard and metrics
+
+The hosted task runs with `AGENTICML_SERVER_METRICS=cloudwatch`. The task role may call `cloudwatch:PutMetricData` only for the namespace `AgenticML/Server`, publishing 12 custom metrics with no dimensions (requests, errors, latency, in-flight requests, process database connections, and usage totals).
+
+The bootstrap stack holds a CloudWatch dashboard named `agenticml-hosted`. It contains widgets for:
+- Requests and errors (`Requests`, `Errors4xx`, `Errors5xx`, `Rejected`).
+- Latency (`Latency` p50, p95, p99).
+- Load (`InFlightPeak`, `DbConnectionsPeak`, and RDS `DatabaseConnections`).
+- ECS CPU and memory alongside RDS CPU.
+- RDS CPU credits (`CPUCreditBalance`).
+- Usage totals (`Accounts`, `ActiveUsers7d`, `WorkspacesActive`, `StoredBytes`, `UploadBytesToday`).
+
+Re-applying the bootstrap stack from a laptop with admin credentials creates or updates the dashboard, using the existing bootstrap deploy command in this README; hosted deploys do not depend on it.
+
+Open the dashboard in the CloudWatch console under Dashboards, `agenticml-hosted`. The custom metric widgets show data after the next hosted deploy with metrics on.
 
 ### Operations and scaling
 
@@ -1247,7 +1278,7 @@ Attach evidence to roadmap Backlog entries before closing them.
 
 ### Cost estimate
 
-Estimated monthly cost in `us-east-2` (on demand) is about **$62–66/month**
+Estimated monthly cost in `us-east-2` (on demand) is about **$63–70/month**
 total:
 - One ARM64 Fargate task (0.5 vCPU, 1 GB RAM): ~$14.40
 - Application Load Balancer: ~$17–18
@@ -1255,7 +1286,7 @@ total:
 - RDS PostgreSQL `db.t4g.micro` with 20 GB gp3 storage: ~$14
 - EFS: ~$1–2
 - S3 and ECR: ~$1–2
-- CloudWatch logs and the six alarms: ~$1–2
+- CloudWatch logs, nine alarms, and custom metrics (about $1–4): ~$2–6
 - AWS Backup: ~$1
 - Secrets Manager: ~$0.40
 - Cost alerts (Cost Explorer API queries): ~$0.60

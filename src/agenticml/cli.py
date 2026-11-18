@@ -559,6 +559,17 @@ def _legal_base_url_from_args(args):
     return normalize_legal_base_url(raw)
 
 
+def _metrics_from_args(args):
+    """``off`` or ``cloudwatch`` from ``--metrics`` or the environment (flag wins)."""
+    raw = getattr(args, "metrics", None)
+    if raw is None:
+        raw = os.environ.get("AGENTICML_SERVER_METRICS", "")
+    raw = raw.strip().lower()
+    if raw not in ("", "off", "cloudwatch"):
+        raise ValueError("AGENTICML_SERVER_METRICS must be off or cloudwatch")
+    return raw or "off"
+
+
 def cmd_server_serve(args):
     from .server import serve
     from .server.db.errors import DatabaseError
@@ -595,6 +606,9 @@ def cmd_server_serve(args):
         legal_base_url = _legal_base_url_from_args(args)
         if legal_base_url:
             extra["legal_base_url"] = legal_base_url
+        metrics = _metrics_from_args(args)
+        if metrics != "off":
+            extra["metrics"] = metrics
         min_client = args.min_client_version
         if min_client is None:
             min_client = os.environ.get("AGENTICML_SERVER_MIN_CLIENT_VERSION") or None
@@ -1976,6 +1990,9 @@ def main(argv=None):
     p_serve.add_argument("--min-client-version", default=None, metavar="X.Y",
                          help="Reject agenticml-lite clients older than this on /v2 "
                               "(default: AGENTICML_SERVER_MIN_CLIENT_VERSION or 2.2)")
+    p_serve.add_argument("--metrics", default=None, metavar="MODE",
+                         help="Publish capacity metrics: off or cloudwatch "
+                              "(default: AGENTICML_SERVER_METRICS or off)")
     p_serve.set_defaults(func=cmd_server_serve)
     p_up = server_sub.add_parser("up", help="Serve on loopback through Tailscale Funnel")
     p_up.add_argument("--data", default=None, help="Data directory (default: AGENTICML_SERVER_DATA or ~/.agenticml-server)")

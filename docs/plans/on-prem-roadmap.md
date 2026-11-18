@@ -337,7 +337,7 @@ Backlog.
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | 31 | Usage history: `accounts.last_active_at`, daily `stats_daily` snapshots refreshed hourly inside the server, `GET /api/admin/stats`, `agenticml server stats`, Usage section with growth charts on `/admin` | 3.0 | Sonnet | M | [plan](packages/31-usage-history.md) | in review (draft PR) |
-| 32 | Capacity metrics: per-minute request count, latency and in-flight requests by route name, database connections in use, and the 31 totals, written as CloudWatch Embedded Metric Format log lines; a CloudWatch dashboard and alarms on database CPU credits, database connections and ECS memory in `hosted.yaml` | 31 | Sonnet | M | – | not started |
+| 32 | Capacity metrics: per-minute requests, errors, latency percentiles, peak requests in progress and database connections, and the 31 totals, sent with `PutMetricData` (`--metrics cloudwatch`, off by default); alarms on database CPU credits, database connections and ECS memory in `hosted.yaml`; a CloudWatch dashboard in `bootstrap.yaml` | 31 | Sonnet | M | [plan](packages/32-capacity-metrics.md) | in review (draft PR) |
 | 33 | ECS autoscaling: target tracking on CPU (about 60%), minimum 1 and a maximum of 3–4 tasks; database room for more tasks (`db.t4g.small` or RDS Proxy); deploys stop resetting the task count; healthy-hosts alarm from the minimum; load test with `scripts/bench_server.py` | 32, owner's two-task check | Sonnet; owner runs it | M | – | not started |
 
 - **31** answers "are we growing?" with no AWS change and no data sent
@@ -345,10 +345,11 @@ Backlog.
   active accounts over 1, 7 and 30 days, workspaces by state, stored and
   uploaded bytes, runs), refreshed every hour, and `/admin` charts them.
   It works the same self-hosted.
-- **32** answers "what is the bottleneck?": route names, never raw paths
-  (the access log stays method-only), and no per-workspace dimensions in
-  CloudWatch (cost and privacy); about 15 custom metrics, roughly
-  $5–8/month.
+- **32** answers "what is the bottleneck?": 12 metrics with no dimensions
+  (no raw paths, no per-task, per-workspace or per-user values; cost and
+  privacy), about $1–4/month after the free ten. The dashboard lives in
+  the bootstrap stack, so hosted deploys never wait for a bootstrap
+  re-apply.
 - **33** scales the app tier once 32 shows CPU is the limit. Each Fargate
   task is one Python process; the database stays shared, so 33 first
   makes room for more connections than two tasks use.
@@ -427,6 +428,24 @@ on Nov 17, 2026; none of the entries below blocked it.
 
 ### Owner steps
 
+- **Capacity dashboard and metrics** (package 32, Nov 18, 2026). Do after
+  the 3.1 PR is merged to `dev` and deployed.
+  - Where: `deploy/aws/README.md`, "Capacity dashboard and metrics"; the
+    bootstrap deploy command near the top of that README.
+  - Problem: the `agenticml-hosted` CloudWatch dashboard lives in the
+    bootstrap stack, which only the owner applies (laptop, admin
+    credentials). The hosted deploy turns on `--metrics cloudwatch` but
+    cannot create the dashboard.
+  - Fix: (1) re-apply the bootstrap stack with the existing command;
+    (2) after the next hosted deploy, open CloudWatch → Dashboards →
+    `agenticml-hosted` and check that `Requests`, `Latency` and
+    `DbConnectionsPeak` show data within a few minutes, and the usage
+    totals within 15 minutes; (3) `aws logs tail /ecs/agenticml-hosted
+    --since 15m | grep -i "capacity metrics"` shows no warnings;
+    (4) confirm the three new alarms are in OK (`rds_cpu_credits`,
+    `rds_connections`, `ecs_memory`).
+  - Done when: the dashboard shows the custom metrics and the nine hosted
+    alarms are OK, recorded here.
 - **Release follow-ups (owner)** (3.0.0 released Nov 17, 2026). Low priority.
   - Where: repository Settings → Environments → `pypi`; tags.
   - Problem: the `pypi` environment has no required reviewer, so any pushed
