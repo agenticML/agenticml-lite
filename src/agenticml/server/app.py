@@ -27,6 +27,7 @@ from .db.workspaces import WorkspaceRepo, require_workspace_id
 from .workspaces import default_workspace_id, prepare_store, store_root
 from .runs import reconcile, store_paths_safe
 from .audit import AuditLog
+from .stats import STATS_REFRESH, StatsRefresher
 from .webauth import IDENTITY_PRESETS, WebAuth
 
 logger = logging.getLogger("agenticml.server")
@@ -560,7 +561,8 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
 def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None,
           trusted_proxies=(), identity_header=None, database=None,
           firebase=None, cert_source=None, plans=None, open_signup=False, objects=None,
-          min_client_version=None, admin_emails=frozenset(), legal_base_url=None):
+          min_client_version=None, admin_emails=frozenset(), legal_base_url=None,
+          stats_interval=STATS_REFRESH):
     """Run until interrupted, with an optional environment admin key."""
     extra = {}
     if objects is not None:
@@ -586,6 +588,7 @@ def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None
         trusted_proxies, identity_header, **extra)
     previous_handler = None
     stopping = False
+    refresher = None
 
     def terminate(signum, frame):
         nonlocal stopping
@@ -594,6 +597,9 @@ def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None
             threading.Thread(target=server.shutdown, daemon=True).start()
 
     try:
+        if stats_interval:
+            refresher = StatsRefresher(server.db, stats_interval)
+            refresher.start()
         if threading.current_thread() is threading.main_thread():
             previous_handler = signal.signal(signal.SIGTERM, terminate)
         if not server.keys.list():
@@ -613,6 +619,8 @@ def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None
         server.serve_forever()
     finally:
         try:
+            if refresher is not None:
+                refresher.stop()
             server.server_close(drain=SHUTDOWN_DRAIN)
         finally:
             if previous_handler is not None:

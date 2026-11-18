@@ -5363,11 +5363,19 @@ async function adminPage(version) {
   let refreshSequence = 0;
   let freeLimits = null;
   let activeDialog;
+  let usageSequence = 0;
+  let usageCharts = [];
   const closeDialog = () => {
     activeDialog?.close();
   };
+  // MetricChart holds a ResizeObserver and a theme listener: release them on re-render and leave.
+  const destroyUsageCharts = () => {
+    usageCharts.forEach((chart) => chart.destroy());
+    usageCharts = [];
+  };
   const dispose = () => {
     disposed = true;
+    destroyUsageCharts();
     closeDialog();
   };
   cleanup = dispose;
@@ -5382,6 +5390,7 @@ async function adminPage(version) {
   const admins = el("div", { class: "table-scroll" });
   const activity = el("div", { class: "table-scroll" });
   const notice = el("p", { class: "muted", role: "status", "aria-live": "polite", hidden: true });
+  const usageBody = el("div", { class: "stack" });
   const columns = ["Slug", "Name", "Status", "Plan", "Storage", "Uploads today", "People", "Members", "Created", "Actions"];
   const archivedColumns = ["Slug", "Name", "Plan", "Storage", "Archived", "Actions"];
   const adminColumns = ["Login", "Source", "Sign-in", "Actions"];
@@ -5792,8 +5801,90 @@ async function adminPage(version) {
       el("tbody", { role: "rowgroup" }, ...rows)));
   }
 
+  const DAY_MS = 86400000;
+  const usageDate = (step) => new Date(Math.round(step) * DAY_MS).toLocaleDateString(
+    "en-US", { month: "short", day: "numeric", timeZone: "UTC" });
+
+  function renderUsage(data) {
+    const totals = data?.totals;
+    if (totals === null || typeof totals !== "object" || Array.isArray(totals))
+      throw new Error("Could not load usage");
+    const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
+    const tile = (label, value, note) => el("div", {},
+      el("dt", { text: label }),
+      el("dd", {}, value, note ? el("span", { class: "usage-note", text: note }) : null));
+    const history = (Array.isArray(data.history) ? data.history : [])
+      .filter((row) => row !== null && typeof row === "object" && typeof row.day === "string");
+    const tiles = el("dl", { class: "usage-tiles" },
+      tile("Accounts", String(number(totals.accounts)), `+${number(totals.new_accounts_7d)} in 7 days`),
+      tile("Active users", String(number(totals.active_7d)),
+        `1 day: ${number(totals.active_1d)} · 30 days: ${number(totals.active_30d)}`),
+      tile("Workspaces", String(number(totals.workspaces_active)),
+        `${number(totals.workspaces_suspended)} suspended · ${number(totals.workspaces_archived)} archived`),
+      tile("Storage", formatGb(number(totals.stored_bytes)),
+        `Uploads today: ${formatGb(number(totals.upload_bytes_today))}`),
+      tile("Runs", String(number(totals.runs))));
+    destroyUsageCharts();
+    if (history.length < 2) {
+      usageBody.replaceChildren(tiles,
+        el("p", { class: "muted", text: "Growth charts appear after two daily snapshots." }));
+      return;
+    }
+    const specs = [
+      { title: "Accounts", key: "accounts", value: (row) => number(row.accounts) },
+      { title: "Active users (7 days)", key: "active_7d", value: (row) => number(row.active_7d) },
+      { title: "Storage (GB)", key: "stored_bytes", value: (row) => number(row.stored_bytes) / 1e9 },
+    ];
+    const canvases = specs.map((spec) => ({
+      spec,
+      canvas: el("canvas", { "aria-label": `${spec.title} by day` }),
+    }));
+    usageBody.replaceChildren(tiles,
+      el("div", { class: "chart-grid" }, ...canvases.map(({ spec, canvas }) =>
+        el("div", { class: "card chart-card" },
+          el("header", {}, el("h3", { text: spec.title })),
+          el("div", { class: "chart-host" }, canvas)))));
+    for (const { spec, canvas } of canvases) {
+      const points = history.map((row) => ({
+        step: Date.parse(`${row.day}T00:00:00Z`) / DAY_MS, value: spec.value(row),
+      })).filter((point) => Number.isFinite(point.step));
+      usageCharts.push(new MetricChart(canvas, {
+        runs: [{ id: spec.key }],
+        metrics: { [spec.key]: { [spec.key]: points } },
+        activeMetric: spec.key,
+        compact: true,
+        xFormat: usageDate,
+      }));
+    }
+  }
+
+  // Loaded on its own: a failure here shows in this section only.
+  async function loadUsage() {
+    const sequence = ++usageSequence;
+    const current = () => epoch === version && sequence === usageSequence && !disposed;
+    try {
+      const response = await fetch(api("/admin/stats"), { signal, credentials: "same-origin" });
+      if (!current()) return;
+      if (response.status === 401) {
+        dispose();
+        location.assign("/login");
+        return;
+      }
+      const data = await response.json().catch(() => null);
+      if (!current()) return;
+      if (!response.ok) throw new Error(
+        (typeof data?.error === "string" && data.error) || `Could not load usage (${response.status})`);
+      renderUsage(data);
+    } catch (reason) {
+      if (!current()) return;
+      destroyUsageCharts();
+      showError(usageBody, reason);
+    }
+  }
+
   async function refresh() {
     const sequence = ++refreshSequence;
+    loadUsage();
     const [listResponse, auditResponse, adminsResponse] = await Promise.all([
       fetch(api("/admin/workspaces"), { signal, credentials: "same-origin" }),
       fetch(`${api("/admin/audit")}?${new URLSearchParams({ limit: "200" })}`, {
@@ -5900,6 +5991,9 @@ async function adminPage(version) {
       el("div", { class: "inline" },
         createButton)),
     notice,
+    el("div", { class: "stack" },
+      el("div", { class: "heading" }, el("h2", { text: "Usage" })),
+      usageBody),
     content,
     archivedSection,
     el("div", { class: "stack" },

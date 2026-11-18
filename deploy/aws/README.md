@@ -1222,6 +1222,15 @@ aws ecs execute-command --cluster agenticml-hosted --task "$task" --container se
   --command 'agenticml server workspaces usage --data /data'
 ```
 
+To inspect server-wide totals, top workspaces, and daily usage history over ECS Exec:
+
+```sh
+aws ecs execute-command --cluster agenticml-hosted --task "$task" --container server --interactive \
+  --command 'agenticml server stats --data /data'
+```
+
+`/admin` shows the same totals and growth charts.
+
 ### Launch checklist (package 24.3)
 
 Before considering the hosted service live:

@@ -4146,6 +4146,12 @@ pre,
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
 }
+.usage-tiles .usage-note {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-3);
+  font: var(--fs-xs) var(--font-sans);
+}
 .usage-meter {
   height: 4px;
   margin-top: var(--s-2);

@@ -11,6 +11,7 @@ plans live next to it:
 - Release 2.1: sketched below, with package plans in `packages/`.
 - Release 2.2: [on-prem-teams-plan.md](on-prem-teams-plan.md)
 - Release 3.0: [on-prem-3.0-plan.md](on-prem-3.0-plan.md)
+- Release 3.1: sketched below, with package plans in `packages/`.
 
 ## Product direction
 
@@ -37,6 +38,7 @@ plans live next to it:
 | **2.1** | Full fidelity | Lineage code diffs on the server, by-reference artifacts, EFS performance check, operator tooling | A run synced to the server is indistinguishable from the local one in the dashboard, apart from notes |
 | **2.2** | Teams | Users and roles, per-user keys, dashboard sign-in through a trusted identity proxy, audit log | Two users with different roles share one server, each with the access their role allows, and every write is attributed |
 | **3.0** | Database storage, workspaces and hosted service | Server state in SQLite or Postgres, workspaces with accounts and memberships on one hostname, Firebase sign-in and self-serve sign-up with free limits, many server processes, S3 objects, metric summaries, AWS deployment, agenticml-server retired | Exit criteria 1–6 in the [3.0 plan](on-prem-3.0-plan.md); released Nov 17, 2026 as 3.0.0 (tag `v3.0.0`, [PyPI](https://pypi.org/project/agenticml-lite/3.0.0/), [GitHub release](https://github.com/agenticML/agenticml-lite/releases/tag/v3.0.0)) |
+| **3.1** | Scale and visibility | Usage history on `/admin` and `agenticml server stats`, capacity metrics with a CloudWatch dashboard and alarms, ECS autoscaling for the hosted service | A server admin sees accounts, active users, workspaces and stored data over time; the hosted service shows request, latency, task and database load on one dashboard; under a load test it scales between 1 and its maximum task count with no failed requests |
 | Later | Scale and lifecycle | Unscheduled; see below | – |
 
 Decision (Nov 5, 2026): the server ships only as the `agenticml-lite`
@@ -322,6 +324,34 @@ Getting the hosted service live on AWS, step by step: [AWS deployment roadmap](a
   says things that are wrong, so truth fixes come first. Sign-up is not
   promoted on the site until the policies are live (29.7). It runs beside
   24.3; only 29.7 and 29.9 touch code or `pyproject.toml`.
+
+### 3.1: scale and visibility
+
+Started Nov 17, 2026 (owner: "we need metrics to track users and total data
+used, to help us scale, and visibility"). Today the hosted service runs a
+fixed 1 task (2 by hand), the database is sized for two tasks, and only
+per-workspace counters exist, with no history. Order: 31, then 32, then 33.
+33 also waits for the owner's "Two-task rolling deploy check" in the
+Backlog.
+
+| # | Package | Depends on | Coder | Size | Plan | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| 31 | Usage history: `accounts.last_active_at`, daily `stats_daily` snapshots refreshed hourly inside the server, `GET /api/admin/stats`, `agenticml server stats`, Usage section with growth charts on `/admin` | 3.0 | Sonnet | M | [plan](packages/31-usage-history.md) | in review (draft PR) |
+| 32 | Capacity metrics: per-minute request count, latency and in-flight requests by route name, database connections in use, and the 31 totals, written as CloudWatch Embedded Metric Format log lines; a CloudWatch dashboard and alarms on database CPU credits, database connections and ECS memory in `hosted.yaml` | 31 | Sonnet | M | – | not started |
+| 33 | ECS autoscaling: target tracking on CPU (about 60%), minimum 1 and a maximum of 3–4 tasks; database room for more tasks (`db.t4g.small` or RDS Proxy); deploys stop resetting the task count; healthy-hosts alarm from the minimum; load test with `scripts/bench_server.py` | 32, owner's two-task check | Sonnet; owner runs it | M | – | not started |
+
+- **31** answers "are we growing?" with no AWS change and no data sent
+  anywhere: the server keeps one row of totals per UTC day (accounts,
+  active accounts over 1, 7 and 30 days, workspaces by state, stored and
+  uploaded bytes, runs), refreshed every hour, and `/admin` charts them.
+  It works the same self-hosted.
+- **32** answers "what is the bottleneck?": route names, never raw paths
+  (the access log stays method-only), and no per-workspace dimensions in
+  CloudWatch (cost and privacy); about 15 custom metrics, roughly
+  $5–8/month.
+- **33** scales the app tier once 32 shows CPU is the limit. Each Fargate
+  task is one Python process; the database stays shared, so 33 first
+  makes room for more connections than two tasks use.
 
 ### Maintenance fixes
 

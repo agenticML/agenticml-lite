@@ -438,6 +438,57 @@ agenticml server verify [--workspace SLUG] [--deep] [--data DIR] [--database URL
 - `status` displays workspace counts, run counts by status, committed storage, and key activity.
 - `verify` checks file sizes against database committed records, tests object presence, and checks lineage refs. Adding `--deep` streams and re-hashes all S3 objects (local filesystem objects are always hashed). Exits `0` when clean, `1` on corruption or missing data, and `2` on usage errors.
 
+## Usage history
+
+Server admins see server-wide totals and their daily history on `/admin`, in the "Usage" section at the top of the page. It displays five tiles and three growth charts:
+
+- **Tiles**:
+  - **Accounts**: total accounts, with new accounts created in the last 7 days ("+N in 7 days").
+  - **Active users**: 7-day count, with 1-day and 30-day counts.
+  - **Workspaces**: active workspaces, with suspended and archived counts.
+  - **Storage**: stored bytes, with uploads today.
+  - **Runs**: total runs.
+- **Growth charts**: Accounts, Active users (7 days), and Storage (GB). Charts appear once there are two daily snapshots.
+
+### Definitions
+
+- **Accounts**: all accounts. New accounts are accounts created in the last 1 or 7 days.
+- **Active**: an account that used a dashboard session or an API key (for example a sync client) in the last 1, 7, or 30 days. The environment admin key (`AGENTICML_SERVER_KEY`) has no account and does not count. Each account's last activity time is stored (`accounts.last_active_at`) and moves at most once an hour.
+- **Workspaces**: active, suspended (not archived), and archived. Custom workspaces are workspaces on the custom plan, not archived.
+- **Stored bytes**: committed bytes of all workspaces, archived included.
+- **Uploads today**: bytes uploaded since midnight UTC.
+- **Runs**: all runs.
+
+### Daily history
+
+The server keeps one row of these totals per UTC day in the `stats_daily` table. A loop inside the server process refreshes today's row every hour (and once at startup), so a finished day holds its totals as of its last refresh; that day's upload bytes are those counted up to that refresh. Days the server was not running have no row. Several server processes on one Postgres database never write the same day twice.
+
+The history holds totals only: no emails, logins, or workspace names.
+
+### Usage CLI
+
+Inspect current totals and daily history using `agenticml server stats`:
+
+```bash
+# Print totals, five largest workspaces by storage, and 30-day history
+agenticml server stats [--data DIR] [--database URL] [--json] [--days N]
+
+# Save today's row now and print it
+agenticml server stats snapshot [--data DIR] [--database URL] [--json]
+```
+
+- `stats` prints the current totals, the five largest workspaces by stored bytes (slug, name, size), and the daily history for the last `N` days (default 30, from 1 to 3650).
+- `stats snapshot` saves today's row now and prints it.
+- Exit codes: `0` on success, `1` on database error, and `2` on usage error (for example no server database at `--data`, or `--days` out of range).
+
+### Admin API
+
+The endpoint `GET /api/admin/stats` (server admins only; others get 404 like every admin route) returns `{"totals", "top_workspaces", "history" (90 days), "refresh_seconds": 3600}`.
+
+### Privacy
+
+Usage history works the same self-hosted (SQLite) and hosted (Postgres). Totals stay in the server's database, and nothing is sent anywhere.
+
 ## Upgrading from 2.x to 3.0
 
 When starting a 3.0 server against an existing 2.x data directory, the server automatically migrates data in place on first start:

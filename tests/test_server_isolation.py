@@ -109,6 +109,7 @@ EXAMPLES = {
     },
     "admin_server_admins_remove": {"method": "DELETE", "path": "/api/admin/server-admins/{login}"},
     "admin_audit": {"method": "GET", "path": "/api/admin/audit"},
+    "admin_stats": {"method": "GET", "path": "/api/admin/stats"},
     "healthz": {"method": "GET", "path": "/healthz"},
     "login_get": {"method": "GET", "path": "/login"},
     "login_post": {
