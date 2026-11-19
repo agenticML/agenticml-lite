@@ -117,6 +117,54 @@ def test_no_email_address_in_template(name):
     assert not re.findall(r'[A-Za-z0-9._+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+', text)
 
 
+def _find_in_map_key_values(template, key, where):
+    """Every value a FindInMap key can take: a literal, an allowed parameter value or an allowed region."""
+    if isinstance(key, str):
+        return [key]
+    assert isinstance(key, dict) and set(key) == {'Ref'}, (
+        f'{where}: FindInMap key {key!r} must be a literal or a Ref to a parameter with AllowedValues '
+        'or to AWS::Region; extend this test to handle other keys')
+    name = key['Ref']
+    if name == 'AWS::Region':
+        rule = template.get('Rules', {}).get('SupportedRegion')
+        assert rule, f'{where}: FindInMap by AWS::Region needs a SupportedRegion rule listing the regions'
+        regions = set()
+        for assertion in rule['Assertions']:
+            contains = assertion['Assert']['Fn::Contains']
+            assert contains[1] == {'Ref': 'AWS::Region'}, assertion
+            regions.update(contains[0])
+        return sorted(regions)
+    parameter = template.get('Parameters', {}).get(name)
+    assert parameter is not None and 'AllowedValues' in parameter, (
+        f'{where}: FindInMap key Ref {name} is not a parameter with AllowedValues, so the lookup cannot be '
+        'proved to resolve; give the parameter AllowedValues or handle it in this test')
+    return [str(v) for v in parameter['AllowedValues']]
+
+
+@pytest.mark.parametrize('name', TEMPLATE_NAMES)
+def test_every_find_in_map_resolves_for_every_allowed_parameter_value(name):
+    # CloudFormation resolves every FindInMap, also in an Fn::If branch that is not taken, so a missing
+    # key fails CreateChangeSet ("Unable to get mapping for ...") whatever the conditions say.
+    template = load_template(name)
+    mappings = template.get('Mappings', {})
+    for node in walk(template):
+        if not (isinstance(node, dict) and 'Fn::FindInMap' in node):
+            continue
+        map_name, top_key, second_key = node['Fn::FindInMap']
+        assert isinstance(map_name, str) and map_name in mappings, f'{name}: unknown mapping {map_name!r}'
+        where = f'{name}: {map_name}'
+        for top in _find_in_map_key_values(template, top_key, where):
+            assert top in mappings[map_name], f'{where}: no top-level key {top!r}'
+            for second in _find_in_map_key_values(template, second_key, where):
+                assert second in mappings[map_name][top], f'{where}: no entry for {top!r} / {second!r}'
+
+
+def test_find_in_map_walker_finds_the_lookups(hosted):
+    # Guards the test above against passing on an empty walk.
+    found = [n['Fn::FindInMap'][0] for n in walk(hosted) if isinstance(n, dict) and 'Fn::FindInMap' in n]
+    assert sorted(found) == ['ConnectionBudget', 'ConnectionsAlarm', 'ElbAccount']
+
+
 def test_no_email_address_in_deploy_workflow():
     workflow = ROOT / '.github/workflows/deploy.yml'
     if workflow.exists():
@@ -421,8 +469,6 @@ DB_CLASSES = ['db.t4g.micro', 'db.t4g.small', 'db.t4g.medium']
 # LEAST(DBInstanceClassMemory / 9531392, 5000), minus 5 reserved superuser slots, minus about 10 for
 # operators, backups and monitoring.
 USABLE_CONNECTIONS = {'db.t4g.micro': 64, 'db.t4g.small': 144, 'db.t4g.medium': 300}
-# Most tasks per class: the micro class has room for two only.
-ALLOWED_TASKS = {'db.t4g.micro': ('2',), 'db.t4g.small': ('2', '3', '4'), 'db.t4g.medium': ('2', '3', '4')}
 
 def fn_sub_text(value):
     """The template string of an Fn::Sub (plain or with a variable map)."""
@@ -922,9 +968,12 @@ def test_hosted_desired_count_zero_stops_the_service_whatever_max_task_count_is(
 def test_hosted_connection_budget_fits_the_database_during_a_rolling_deploy(hosted):
     budgets = hosted['Mappings']['ConnectionBudget']
     assert set(budgets) == set(DB_CLASSES) == set(hosted['Parameters']['DbInstanceClass']['AllowedValues'])
+    task_counts = hosted['Parameters']['MaxTaskCount']['AllowedValues']
+    assert set(task_counts) == {'1', '2', '3', '4'}
     for db_class, usable in USABLE_CONNECTIONS.items():
-        # Only the task counts the class has room for are in the mapping ("1" is never looked up).
-        assert set(budgets[db_class]) == set(ALLOWED_TASKS[db_class]) <= set(hosted['Parameters']['MaxTaskCount']['AllowedValues'])
+        # CloudFormation resolves FindInMap even in an Fn::If branch that is not taken, so every class has an
+        # entry for every MaxTaskCount (the micro rule still refuses 3 and 4).
+        assert set(budgets[db_class]) == set(task_counts)
         for tasks, budget in budgets[db_class].items():
             n = int(tasks)
             # floor(usable / (2n)): the 2 covers the rolling deploy (MaximumPercent 200).
@@ -933,9 +982,9 @@ def test_hosted_connection_budget_fits_the_database_during_a_rolling_deploy(host
             transaction, outer, inner = connection_limits(int(budget))
             assert transaction + outer + inner + 1 == int(budget)
     assert budgets == {
-        'db.t4g.micro': {'2': '16'},
-        'db.t4g.small': {'2': '36', '3': '24', '4': '18'},
-        'db.t4g.medium': {'2': '75', '3': '50', '4': '37'}}
+        'db.t4g.micro': {'1': '32', '2': '16', '3': '10', '4': '8'},
+        'db.t4g.small': {'1': '72', '2': '36', '3': '24', '4': '18'},
+        'db.t4g.medium': {'1': '150', '2': '75', '3': '50', '4': '37'}}
     # The variable exists only while autoscaling is on, and reads the mapping by class and task count.
     (entry,) = [e for e in env_of(hosted) if isinstance(e, dict) and 'Fn::If' in e
                 and e['Fn::If'][0] == 'HasScaling']
@@ -947,7 +996,7 @@ def test_hosted_connection_budget_fits_the_database_during_a_rolling_deploy(host
 
 
 def test_hosted_micro_database_allows_two_tasks_at_most(hosted):
-    # A rule keeps MaxTaskCount 3 and 4 off db.t4g.micro (the mapping has no such entry).
+    # A rule keeps MaxTaskCount 3 and 4 off db.t4g.micro (the mapping still has entries for them, so that the lookup resolves).
     rule = hosted['Rules']['MoreTasksNeedABiggerDatabase']
     assert rule['RuleCondition'] == {'Fn::Equals': [{'Ref': 'DbInstanceClass'}, 'db.t4g.micro']}
     (assertion,) = rule['Assertions']
