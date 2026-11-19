@@ -42,6 +42,9 @@ media = [
 firebase = [
   "PyJWT[crypto]>=2.8",
 ]
+oidc = [
+  "PyJWT[crypto]>=2.8",
+]
 postgres = [
   "psycopg[binary]>=3.1",
 ]

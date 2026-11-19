@@ -269,12 +269,13 @@ class IngestServer(DashboardServer):
     def __init__(self, data, host, port, public_url=None, env_key=None,
                  trusted_proxies=(), identity_header=None, db=None,
                  firebase=None, cert_source=None, plans=None, open_signup=False,
-                 min_client_version=None, admin_emails=frozenset(), legal_base_url=None):
+                 min_client_version=None, admin_emails=frozenset(), legal_base_url=None,
+                 oidc=None, signup_email_domains=frozenset()):
         from .clientwindow import parse_min_client
         from .firebase import require_open_signup
         from .ingest import IngestHandler
 
-        require_open_signup(open_signup, firebase, plans)
+        require_open_signup(open_signup, firebase, plans, oidc)
         self.min_client = parse_min_client(min_client_version)
         self.request_metrics = RequestMetrics()
         self.data_dir = Path(data)
@@ -299,7 +300,8 @@ class IngestServer(DashboardServer):
             trusted_proxies=trusted_proxies, identity_header=identity_header,
             firebase=firebase, cert_source=cert_source, plans=plans,
             open_signup=open_signup, admin_emails=admin_emails,
-            legal_base_url=legal_base_url)
+            legal_base_url=legal_base_url, oidc=oidc,
+            signup_email_domains=signup_email_domains)
         self.store_file_mode = 0o666 & ~_read_umask()
         self.limits = Limits()
         self.lineage_enabled = shutil.which("git") is not None
@@ -513,13 +515,13 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
                 trusted_proxies=(), identity_header=None, database=None,
                 firebase=None, cert_source=None, plans=None, open_signup=False, objects=None,
                 min_client_version=None, admin_emails=frozenset(), legal_base_url=None,
-                db_connections=None):
+                db_connections=None, oidc=None, signup_email_domains=frozenset()):
     """Prepare and lock the data directory; port=0 chooses a free port."""
     from .firebase import require_open_signup
     from .limits import Plans
     if plans is not None and not isinstance(plans, Plans):
         plans = Plans.load(plans)
-    require_open_signup(open_signup, firebase, plans)
+    require_open_signup(open_signup, firebase, plans, oidc)
     from .clientwindow import parse_min_client
     parse_min_client(min_client_version)
     validate_env_key(env_key)
@@ -575,7 +577,8 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
         server = cls(data, host, port, public_url, env_key, trusted_proxies, identity_header, db=db,
                      firebase=firebase, cert_source=cert_source, plans=plans,
                      open_signup=open_signup, min_client_version=min_client_version,
-                     admin_emails=admin_emails, legal_base_url=legal_base_url)
+                     admin_emails=admin_emails, legal_base_url=legal_base_url,
+                     oidc=oidc, signup_email_domains=signup_email_domains)
         server.objects = backend
         server._server_lock = handle
         for workspace in server.workspaces.list():
@@ -596,7 +599,8 @@ def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None
           trusted_proxies=(), identity_header=None, database=None,
           firebase=None, cert_source=None, plans=None, open_signup=False, objects=None,
           min_client_version=None, admin_emails=frozenset(), legal_base_url=None,
-          stats_interval=STATS_REFRESH, metrics=None, db_connections=None):
+          stats_interval=STATS_REFRESH, metrics=None, db_connections=None,
+          oidc=None, signup_email_domains=frozenset()):
     """Run until interrupted, with an optional environment admin key."""
     if metrics not in (None, "off", "cloudwatch"):
         raise ValueError(MODE_MESSAGE)
@@ -626,6 +630,10 @@ def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None
         extra["legal_base_url"] = legal_base_url
     if db_connections is not None:
         extra["db_connections"] = db_connections
+    if oidc is not None:
+        extra["oidc"] = oidc
+    if signup_email_domains:
+        extra["signup_email_domains"] = frozenset(signup_email_domains)
     server = make_server(
         data, host, port, public_url, os.environ.get("AGENTICML_SERVER_KEY"),
         trusted_proxies, identity_header, **extra)

@@ -188,6 +188,41 @@ denies a stranger; admin email becomes server admin; domain restriction;
 every edge case above; Firebase regression suite unchanged; ui test of
 `/login` and `/invite` at 375px.
 
+### 35.1 as built (Nov 19, 2026)
+
+Deviations accepted in review. 35.2 and 35.3 must follow these, not the
+steps above:
+
+- A successful callback answers **200 with a meta-refresh page**, not a 302,
+  because the session cookie is `SameSite=Strict`. A Playwright test with the
+  provider on another site (`localhost` against `127.0.0.1`) proves the
+  cross-site return works.
+- **Invites go through `POST /auth/oidc/start`** (form body `invite`, `next`;
+  4 KB cap; a cross-site `Origin` or `Sec-Fetch-Site` is refused). `GET
+  /auth/oidc/start` refuses an `invite` parameter, so the token never
+  appears in a request line or a load balancer log. The OIDC pages send
+  `Referrer-Policy: same-origin`. The 302 to the provider and the success
+  page send `no-referrer`.
+- **Starts are limited** to 30 per minute per client address (in memory,
+  per process; 429 with `Retry-After`). There are at most 2000 pending
+  states, and each browser has at most 8 binding cookies
+  (`__Host-aml_oidc_<0-7>`).
+- **Moving from Firebase to OIDC**: an account still linked to a Firebase
+  uid is relinked to `oidc:<sub>` on a verified, matching email, also when
+  an invite is redeemed. This is audited as `account.relink`. An account
+  already linked to a different `oidc:` uid is refused, and the operator
+  fixes it.
+- An `email` claim that is not a valid address is dropped and treated as
+  unverified. It never overwrites the stored email.
+- `--signup-email-domains` also withholds the personal workspace from an
+  existing account outside the listed domains. Accounts on the admin list
+  are exempt.
+- A list `aud` must also have `azp` equal to the client id. Discovery and
+  JWKS `max-age` are clamped to the same 5-minute floor as Firebase.
+- `server up` needs Tailscale. **35.2 writes its own systemd unit and env
+  file** (as `deploy/systemd/agenticml-server.service` does) and does not
+  use `server up --install`.
+
 ## 35.2 † Template
 
 Files: `deploy/aws-self-hosted/agenticml.yaml`, `deploy/aws-self-hosted/README.md`

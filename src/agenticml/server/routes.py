@@ -67,12 +67,16 @@ _ROUTES.extend([
     _r("POST", r"/invite", "public", None, "invite", "invite_post"),
     _r("POST", r"/auth/firebase", "public", None, "firebase_auth", "auth_firebase"),
     _r("GET", r"/auth/firebase/config", "public", None, "firebase_config", "auth_firebase_config"),
+    _r("GET", r"/auth/oidc/start", "public", None, "oidc_start", "auth_oidc_start"),
+    _r("POST", r"/auth/oidc/start", "public", None, "oidc_start", "auth_oidc_start_post"),
+    _r("GET", r"/auth/oidc/callback", "public", None, "oidc_callback", "auth_oidc_callback"),
     _r("GET", r"/static/login.js", "public", None, "public_asset", "static_login_js"),
     _r("GET", r"/static/setup.js", "public", None, "public_asset", "static_setup_js"),
     _r("GET", r"/static/invite.js", "public", None, "public_asset", "static_invite_js"),
     _r("GET", r"/static/signout.js", "public", None, "public_asset", "static_signout_js"),
     _r("GET", r"/static/theme.js", "public", None, "public_asset", "static_theme_js"),
     _r("GET", r"/static/firebase-login.js", "public", None, "public_asset", "static_firebase_login_js"),
+    _r("GET", r"/static/oidc-login.js", "public", None, "public_asset", "static_oidc_login_js"),
     _r("GET", r"/static/vendor/firebase/firebase-app-compat.js", "public", None, "public_asset", "static_firebase_app"),
     _r("GET", r"/static/vendor/firebase/firebase-auth-compat.js", "public", None, "public_asset", "static_firebase_auth"),
     _r("GET", r"/static/app.css", "public", None, "public_asset", "static_app_css"),
@@ -549,11 +553,11 @@ def _admin_workspaces(webauth, handler, route, match):
         try:
             # One transaction: a refused workspace never leaves a new owner
             # account behind. A new owner is created only for an email, and
-            # only when Firebase can later link it.
+            # only when the sign-in provider can later link it.
             with handler.server.db.transaction(write=True) as tx:
                 tx.advisory_lock("users")
                 owner_created = (
-                    webauth.firebase is not None and is_email_login(owner)
+                    webauth.external_signin and is_email_login(owner)
                     and accounts.get(owner, tx) is None)
                 row = repo.create(
                     slug, name, owner, tx,
@@ -721,7 +725,8 @@ def _server_admin_public(row):
         "display_name": row.get("display_name") or login,
         "email": email,
         "source": "list" if row.get("server_admin_source") == "list" else "manual",
-        "signin": ("firebase" if row.get("firebase_uid") is not None
+        "signin": (("oidc" if str(row["firebase_uid"]).startswith("oidc:") else "firebase")
+                   if row.get("firebase_uid") is not None
                    else "identity" if row.get("identity") is not None
                    else "password" if row.get("password") is not None else "pending"),
         "firebase": row.get("firebase_uid") is not None,
@@ -759,7 +764,7 @@ def _admin_server_admins(webauth, handler, route, match):
                 tx.advisory_lock("users")
                 account = accounts.get(login, tx)
                 if account is None:
-                    if webauth.firebase is None or not is_email_login(login):
+                    if not webauth.external_signin or not is_email_login(login):
                         raise ClientError("unknown account")
                     account = accounts.create(login, None, principal.user, tx)
                     created = True
@@ -941,7 +946,7 @@ def _invites(webauth, handler, route, match):
             handler._json({"added": True, "login": login, "role": role,
                            "invite_url": None, "expires_at": None}, 201)
             return
-        url = invite_link(command_host(webauth, handler)["host"], token, webauth.firebase is not None)
+        url = invite_link(command_host(webauth, handler)["host"], token, webauth.external_signin)
         handler._json({"added": False, "login": login, "role": role,
                        "invite_url": url, "expires_at": expires_at}, 201)
         return

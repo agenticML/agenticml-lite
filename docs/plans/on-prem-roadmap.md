@@ -375,8 +375,8 @@ touch 34's files, and 35.3 waits for 34.3.
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 35 † | Deploy in your own AWS account | 3.2 | Sonnet; prose Antigravity; owner releases and deploys | L | [plan](packages/35-aws-self-deploy.md) | plan ready |
-| 35.1 † | Server: OIDC sign-in (authorization code + PKCE), open sign-up, admin emails and invites on OIDC, `--signup-email-domains`, `[oidc]` extra | 3.0 | Sonnet | M–L | [plan](packages/35-aws-self-deploy.md) | plan ready |
+| 35 † | Deploy in your own AWS account | 3.2 | Sonnet; prose Antigravity; owner releases and deploys | L | [plan](packages/35-aws-self-deploy.md) | in progress |
+| 35.1 † | Server: OIDC sign-in (authorization code + PKCE), open sign-up, admin emails and invites on OIDC, `--signup-email-domains`, `[oidc]` extra | 3.0 | Sonnet | M–L | [plan](packages/35-aws-self-deploy.md) | done ([#88](https://github.com/agenticML/agenticml-lite/pull/88); Sonnet coded; supervisor reviewed in three rounds with adversarial review passes and did the † second review; checked on Postgres 16 locally) |
 | 35.2 † | Template `deploy/aws-self-hosted/agenticml.yaml` (VPC optional, ALB, ACM, Route 53, Cognito, EC2 Auto Scaling group of 1, data volume with daily snapshots), static tests, cfn-lint in CI | 35.1 options | Sonnet | M | [plan](packages/35-aws-self-deploy.md) | plan ready |
 | 35.3 | Docs: "Deploy on AWS" page, SERVER.md OIDC section, threat model, README, facts test | 35.2, 34.3 | Antigravity; supervisor checks | S–M | [plan](packages/35-aws-self-deploy.md) | plan ready |
 | 35.4 | Version 3.3.0; template on the GitHub release; Launch Stack link (owner: public S3 bucket) | 35.3, 34.4 | Sonnet; owner tags and publishes | S | [plan](packages/35-aws-self-deploy.md) | plan ready |

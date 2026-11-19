@@ -505,6 +505,37 @@ def _firebase_from_args(args):
     return parse_firebase_config(project, api_key, auth_domain)
 
 
+def _oidc_from_args(args):
+    """OIDC settings from the ``--oidc-*`` flags or the environment (flag wins)."""
+    from .server.oidc import parse_oidc_config
+
+    def pick(attr, env):
+        value = getattr(args, attr, None)
+        if value is None:
+            value = os.environ.get(env) or None
+        return value
+
+    return parse_oidc_config(
+        pick("oidc_issuer", "AGENTICML_SERVER_OIDC_ISSUER"),
+        pick("oidc_client_id", "AGENTICML_SERVER_OIDC_CLIENT_ID"),
+        pick("oidc_logout_url", "AGENTICML_SERVER_OIDC_LOGOUT_URL"),
+        pick("oidc_label", "AGENTICML_SERVER_OIDC_LABEL"))
+
+
+def _signup_domains_from_args(args):
+    """Domains for ``--signup-email-domains`` or the environment (flag wins).
+
+    A bad entry refuses to start: dropping it could leave open sign-up wider
+    than the operator meant.
+    """
+    from .server.webauth import parse_signup_email_domains
+
+    raw = getattr(args, "signup_email_domains", None)
+    if raw is None:
+        raw = os.environ.get("AGENTICML_SERVER_SIGNUP_EMAIL_DOMAINS", "")
+    return parse_signup_email_domains(raw)
+
+
 def _limits_from_args(args):
     from .server.limits import Plans
 
@@ -515,12 +546,23 @@ def _limits_from_args(args):
     return path, Plans.load(path)
 
 
-def _open_signup_from_args(args, firebase, plans=None):
+def _open_signup_from_args(args, firebase, plans=None, oidc=None):
     from .server.firebase import require_open_signup
 
     open_signup = bool(getattr(args, "open_signup", False) or _env_flag("AGENTICML_SERVER_OPEN_SIGNUP"))
-    require_open_signup(open_signup, firebase, plans)
+    require_open_signup(open_signup, firebase, plans, oidc)
     return open_signup
+
+
+def _external_signin_from_args(args):
+    """The Firebase and OIDC settings, never both: (firebase, oidc)."""
+    from .server.oidc import OIDC_FIREBASE
+
+    firebase = _firebase_from_args(args)
+    oidc = _oidc_from_args(args)
+    if firebase is not None and oidc is not None:
+        raise ValueError(OIDC_FIREBASE)
+    return firebase, oidc
 
 
 def _admin_emails_from_args(args):
@@ -609,14 +651,19 @@ def cmd_server_serve(args):
         _, plans = _limits_from_args(args)
         if plans is not None:
             extra["plans"] = plans
-        firebase = _firebase_from_args(args)
+        firebase, oidc = _external_signin_from_args(args)
         if firebase is not None:
             extra["firebase"] = firebase
-        if _open_signup_from_args(args, firebase, plans):
+        if oidc is not None:
+            extra["oidc"] = oidc
+        if _open_signup_from_args(args, firebase, plans, oidc):
             extra["open_signup"] = True
         admin_emails = _admin_emails_from_args(args)
         if admin_emails:
             extra["admin_emails"] = admin_emails
+        signup_domains = _signup_domains_from_args(args)
+        if signup_domains:
+            extra["signup_email_domains"] = signup_domains
         legal_base_url = _legal_base_url_from_args(args)
         if legal_base_url:
             extra["legal_base_url"] = legal_base_url
@@ -667,14 +714,19 @@ def cmd_server_up(args):
             extra["plans"] = plans
         if limits_file is not None:
             extra["limits"] = limits_file
-        firebase = _firebase_from_args(args)
+        firebase, oidc = _external_signin_from_args(args)
         if firebase is not None:
             extra["firebase"] = firebase
-        if _open_signup_from_args(args, firebase, plans):
+        if oidc is not None:
+            extra["oidc"] = oidc
+        if _open_signup_from_args(args, firebase, plans, oidc):
             extra["open_signup"] = True
         admin_emails = _admin_emails_from_args(args)
         if admin_emails:
             extra["admin_emails"] = admin_emails
+        signup_domains = _signup_domains_from_args(args)
+        if signup_domains:
+            extra["signup_email_domains"] = signup_domains
         up(args.data, args.port, install=args.install, force=args.force, **extra)
     except KeyboardInterrupt:
         pass
@@ -772,10 +824,10 @@ def _invite_base(args):
 
 
 def _hosted_invites(args):
-    """True when links should carry the token in the fragment (Firebase on).
-    A bad Firebase setting here must not break `users invite`."""
+    """True when links should carry the token in the fragment (Firebase or OIDC on).
+    A bad Firebase or OIDC setting here must not break `users invite`."""
     try:
-        return _firebase_from_args(args) is not None
+        return _firebase_from_args(args) is not None or _oidc_from_args(args) is not None
     except (ValueError, RuntimeError):
         return False
 
@@ -1113,7 +1165,8 @@ def cmd_server_accounts(args):
                         row['login'], row['display_name'] or '',
                         str(row['server_admin']),
                         (row.get('server_admin_source') or 'manual') if row['server_admin'] else '-',
-                        'yes' if row.get('firebase_uid') else 'no',
+                        ('oidc' if str(row.get('firebase_uid')).startswith('oidc:') else 'yes')
+                        if row.get('firebase_uid') else 'no',
                         str(row.get('email_verified') or 0),
                         row['created_at'] or '',
                     ])
@@ -1155,7 +1208,10 @@ def cmd_server_accounts(args):
                 if summary['memberships']:
                     print('former workspaces (their Activity logs still name this login until the '
                           'workspaces are deleted): ' + ', '.join(summary['memberships']))
-                if summary['firebase_uid']:
+                if str(summary['firebase_uid'] or '').startswith('oidc:'):
+                    print(f"The sign-in provider user still exists ({summary['email']}); "
+                          'delete the user in your identity provider')
+                elif summary['firebase_uid']:
                     print(f"Firebase user still exists: uid {summary['firebase_uid']} ({summary['email']}); "
                           'delete it in the Firebase console (Authentication > Users)')
         return 0
@@ -1995,11 +2051,28 @@ def main(argv=None):
     p_serve.add_argument("--firebase-auth-domain", default=None, metavar="HOST",
                         help="Firebase auth domain (default: AGENTICML_SERVER_FIREBASE_AUTH_DOMAIN or <project>.firebaseapp.com)")
     p_serve.add_argument("--limits", default=None, metavar="FILE", help="Workspace limits JSON (default: AGENTICML_SERVER_LIMITS)")
+    p_serve.add_argument("--oidc-issuer", default=None, metavar="URL",
+                        help="Sign in with this OpenID Connect issuer (Cognito, Okta, Entra ID, ...); "
+                             "needs --public-url and the [oidc] extra "
+                             "(default: AGENTICML_SERVER_OIDC_ISSUER)")
+    p_serve.add_argument("--oidc-client-id", default=None, metavar="ID",
+                        help="OIDC public client id; the redirect URI to register is "
+                             "<public-url>/auth/oidc/callback (default: AGENTICML_SERVER_OIDC_CLIENT_ID)")
+    p_serve.add_argument("--oidc-logout-url", default=None, metavar="URL",
+                        help="Provider sign-out URL; sign-out then goes there with client_id and "
+                             "logout_uri=<public-url>/login (Cognito's parameters; other providers may "
+                             "need post_logout_redirect_uri). Optional "
+                             "(default: AGENTICML_SERVER_OIDC_LOGOUT_URL)")
+    p_serve.add_argument("--oidc-label", default=None, metavar="TEXT",
+                        help="Sign-in button text (default: AGENTICML_SERVER_OIDC_LABEL or 'Sign in')")
     p_serve.add_argument("--open-signup", action="store_true",
-                        help="Allow verified Firebase sign-in to create an account (default: AGENTICML_SERVER_OPEN_SIGNUP)")
+                        help="Allow verified Firebase or OIDC sign-in to create an account (default: AGENTICML_SERVER_OPEN_SIGNUP)")
+    p_serve.add_argument("--signup-email-domains", default=None, metavar="LIST",
+                        help="Comma-separated email domains (exact match, no subdomains) that open sign-up "
+                             "serves; others get no account (default: AGENTICML_SERVER_SIGNUP_EMAIL_DOMAINS)")
     p_serve.add_argument("--admin-emails", default=None, metavar="LIST",
                         help="Comma-separated emails that become server admins at their next verified "
-                             "Firebase sign-in (default: AGENTICML_SERVER_ADMIN_EMAILS)")
+                             "Firebase or OIDC sign-in (default: AGENTICML_SERVER_ADMIN_EMAILS)")
     p_serve.add_argument("--legal-base-url", default=None, metavar="URL",
                          help="https:// base URL of the Terms, Acceptable use and Privacy pages "
                               "linked from the Firebase sign-in page; unset shows no links "
@@ -2028,11 +2101,22 @@ def main(argv=None):
                      help="Firebase auth domain (default: AGENTICML_SERVER_FIREBASE_AUTH_DOMAIN or <project>.firebaseapp.com)")
     p_up.add_argument("--limits", default=None, metavar="FILE",
                      help="Workspace limits JSON (default: AGENTICML_SERVER_LIMITS)")
+    p_up.add_argument("--oidc-issuer", default=None, metavar="URL",
+                     help="Sign in with this OpenID Connect issuer (default: AGENTICML_SERVER_OIDC_ISSUER)")
+    p_up.add_argument("--oidc-client-id", default=None, metavar="ID",
+                     help="OIDC public client id (default: AGENTICML_SERVER_OIDC_CLIENT_ID)")
+    p_up.add_argument("--oidc-logout-url", default=None, metavar="URL",
+                     help="Provider sign-out URL (default: AGENTICML_SERVER_OIDC_LOGOUT_URL)")
+    p_up.add_argument("--oidc-label", default=None, metavar="TEXT",
+                     help="Sign-in button text (default: AGENTICML_SERVER_OIDC_LABEL or 'Sign in')")
     p_up.add_argument("--open-signup", action="store_true",
-                     help="Allow verified Firebase sign-in to create an account (default: AGENTICML_SERVER_OPEN_SIGNUP)")
+                     help="Allow verified Firebase or OIDC sign-in to create an account (default: AGENTICML_SERVER_OPEN_SIGNUP)")
+    p_up.add_argument("--signup-email-domains", default=None, metavar="LIST",
+                     help="Comma-separated email domains that open sign-up serves "
+                          "(default: AGENTICML_SERVER_SIGNUP_EMAIL_DOMAINS)")
     p_up.add_argument("--admin-emails", default=None, metavar="LIST",
                      help="Comma-separated emails that become server admins at their next verified "
-                          "Firebase sign-in (default: AGENTICML_SERVER_ADMIN_EMAILS)")
+                          "Firebase or OIDC sign-in (default: AGENTICML_SERVER_ADMIN_EMAILS)")
     p_up.set_defaults(func=cmd_server_up)
     for action, func, help_text in (
             ("status", cmd_server_status, "Show runs, sizes, and key activity per workspace"),

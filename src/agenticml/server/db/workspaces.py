@@ -206,6 +206,38 @@ class AccountRepo:
         return bool(account and account['password'] is None and account['identity'] is None
                     and account['firebase_uid'] is None and account['created_by'] != 'legacy run owner')
 
+    @staticmethod
+    def external_uid(account):
+        """The sign-in provider's id for an account row, or None.
+
+        One provider per server: a Firebase uid as is, an OIDC subject as
+        ``oidc:<sub>``. Both live in the ``firebase_uid`` column (no migration).
+        """
+        return account.get('firebase_uid') if account else None
+
+    @staticmethod
+    def legacy_firebase_uid(account):
+        """A Firebase-era uid on the row (anything not ``oidc:<sub>``), else None.
+
+        After a server switches from Firebase to OIDC such an account can no
+        longer sign in; a verified OIDC email may relink it (``relink_external``).
+        """
+        uid = AccountRepo.external_uid(account)
+        return uid if isinstance(uid, str) and uid and not uid.startswith('oidc:') else None
+
+    def relink_external(self, account_id, uid, email, verified, tx):
+        """Point an account whose Firebase uid is legacy at an OIDC uid."""
+        tx.advisory_lock('users')
+        row = tx.fetchone('SELECT * FROM accounts WHERE id=?', (account_id,))
+        if row is None:
+            raise ClientError('unknown account')
+        if self.legacy_firebase_uid(dict(row)) is None:
+            raise ClientError('account is not linked to a legacy provider')
+        if tx.fetchone('SELECT id FROM accounts WHERE firebase_uid=?', (uid,)):
+            raise ClientError('firebase uid already linked')
+        tx.execute('UPDATE accounts SET firebase_uid=?, email=?, email_verified=? WHERE id=?',
+                   (uid, email.lower() if isinstance(email, str) else email, 1 if verified else 0, account_id))
+
     def link_firebase(self, account_id, uid, email, verified, tx):
         tx.advisory_lock('users')
         row = tx.fetchone('SELECT * FROM accounts WHERE id=?', (account_id,))
@@ -224,6 +256,11 @@ class AccountRepo:
             raise ClientError('unknown account')
         tx.execute('UPDATE accounts SET email=?, email_verified=? WHERE id=?',
                    (email.lower() if isinstance(email, str) else email, 1 if verified else 0, account_id))
+
+    # Provider-neutral names for the sign-in code shared by Firebase and OIDC.
+    by_external_uid = by_firebase_uid
+    link_external = link_firebase
+    refresh_external_email = refresh_firebase_email
 
     def set_server_admin(self, login, enabled, *, source='manual', tx=None):
         """Grant or revoke server admin; returns the updated account row.
@@ -811,7 +848,8 @@ class InviteRepo(WorkspaceBound):
             return dict(row)
 
     @staticmethod
-    def redeem_firebase(db, token, uid, email, verified, display_name=None):
+    def redeem_firebase(db, token, uid, email, verified, display_name=None, relink_legacy=False,
+                        relinked=None):
         """Accept a workspace invite for a Firebase identity in one transaction.
 
         The uid's account (already linked, claimable by email, or newly created
@@ -853,6 +891,16 @@ class InviteRepo(WorkspaceBound):
             account = accounts.by_firebase_uid(uid, tx)
             if account is None and accounts.claimable(email, tx):
                 account = accounts.get(email, tx)
+            if account is None and relink_legacy:
+                # Switched from Firebase to OIDC: the email's account still
+                # holds a Firebase uid nobody can sign in with any more.
+                legacy = accounts.get(email, tx)
+                old_uid = accounts.legacy_firebase_uid(legacy)
+                if old_uid is not None:
+                    accounts.relink_external(legacy['id'], uid, email, verified, tx)
+                    account = accounts.by_firebase_uid(uid, tx)
+                    if relinked is not None:
+                        relinked.append(old_uid)    # only here, inside this transaction
             if account is None:
                 existing = accounts.get(email, tx)
                 if existing is not None and (
@@ -886,3 +934,13 @@ class InviteRepo(WorkspaceBound):
             tx.execute('DELETE FROM invites WHERE workspace_id=? AND login=?',
                        (invite['workspace_id'], invite['login']))
             return dict(tx.fetchone('SELECT * FROM accounts WHERE id=?', (account['id'],)))
+
+    @staticmethod
+    def redeem_external(db, token, uid, email, verified, display_name=None, relink_legacy=False,
+                        relinked=None):
+        """``redeem_firebase`` for either provider; ``relink_legacy`` is for OIDC servers.
+
+        ``relinked`` (a list) receives the old uid when, and only when, this call relinked.
+        """
+        return InviteRepo.redeem_firebase(
+            db, token, uid, email, verified, display_name, relink_legacy, relinked)
