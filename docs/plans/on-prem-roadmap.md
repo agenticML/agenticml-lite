@@ -372,11 +372,11 @@ example or docs). It does not depend on 3.1 (packages 31–33, merged in
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 34 † | Private-network deployment (no Tailscale) | 3.0 | Sonnet; prose Antigravity; owner releases | M | [plan](packages/34-private-network.md) | in progress |
+| 34 † | Private-network deployment (no Tailscale) | 3.0 | Sonnet; prose Antigravity; owner releases | M | [plan](packages/34-private-network.md) | done (this PR; owner steps 34.4 publish and 34.5 left) |
 | 34.1 † | Client trust: `--ca-bundle`, saved bundle, `AGENTICML_CA_BUNDLE`, saved `insecure` per host, certificate errors without retries and with clear text, redirect text | 3.0 | Sonnet | M | [plan](packages/34-private-network.md) | done (this PR; Sonnet coded; supervisor reviewed with two adversarial review passes and did the † second review) |
 | 34.2 † | Deploy kit (`deploy/private-network/`: Caddy, nginx, env file, checklist incl. first admin, CA, SELinux, backups), sync unit lines, end-to-end test through a TLS proxy with a private CA | 34.1 | Sonnet | M | [plan](packages/34-private-network.md) | done (this PR; Sonnet coded; supervisor reviewed, checked the Caddyfile with `caddy validate` and did the † second review) |
-| 34.3 | Docs: SERVER.md section and troubleshooting, THREAT_MODEL.md, PROTOCOL.md, website page and facts test, README, systemd README | 34.1, 34.2 | Antigravity; supervisor checks | S–M | [plan](packages/34-private-network.md) | in progress |
-| 34.4 | Version 3.2.0; docs require `agenticml-lite>=3.2` and the kit from the matching tag | 34.3 | Sonnet; owner tags and publishes | S | [plan](packages/34-private-network.md) | plan ready |
+| 34.3 | Docs: SERVER.md section and troubleshooting, THREAT_MODEL.md, PROTOCOL.md, website page and facts test, README, systemd README | 34.1, 34.2 | Antigravity; supervisor checks | S–M | [plan](packages/34-private-network.md) | done (this PR; Antigravity drafted, Sonnet corrected the fact-check findings, supervisor checked against the code) |
+| 34.4 | Version 3.2.0; docs require `agenticml-lite>=3.2` and the kit from the matching tag | 34.3 | Sonnet; owner tags and publishes | S | [plan](packages/34-private-network.md) | done in code (this PR: version 3.2.0, Releases page); owner tags and publishes |
 | 34.5 | First lab install from the docs (Backlog owner step) | 34.4 | Owner | S | [plan](packages/34-private-network.md) | not started |
 
 ### Maintenance fixes
@@ -507,8 +507,24 @@ on Nov 17, 2026; none of the entries below blocked it.
   - Done when: a load test scales out and back in with no failed syncs,
     the real `max_connections` is recorded here, and the mappings match
     it.
+- **3.2.0 release** (package 34.4, owner). Do after this PR is merged to
+  `dev` and `dev` is merged to `main`.
+  - Where: tags; repository Settings → Environments → `pypi`; the docs.
+  - Problem: the code says 3.2.0, but PyPI serves 3.0.0, so the install lines
+    that say what `pip install` gets (README, Releases page "Which version
+    should I use?", `getting-started/installation.md`, `index.mdx`,
+    `server/upgrade.md`, `hosted/quickstart.md`, `deploy/aws/README.md`) and
+    the unit-file URLs with `v3.0.0` still name 3.0.0. 3.1 was never
+    released separately and ships inside 3.2.0.
+  - Fix: (1) add the `pypi` required reviewer (see "Release follow-ups");
+    (2) tag `v3.2.0` on `main` and approve the Publish run; (3) then flip the
+    install lines, the "Which version" table and the `v3.0.0` unit URLs to
+    3.2.0, set the Releases page status to the release date, and update
+    `PUBLISHED_3_0` in `tests/test_website_facts.py` if needed.
+  - Done when: 3.2.0 is on PyPI and the docs name it, and
+    `pip install 'agenticml-lite>=3.2'` works on a clean machine.
 - **First lab install on a private network** (package 34.5, owner; after the
-  3.2.0 release in 34.4).
+  "3.2.0 release" step above).
   - Where: the lab's server VM; `deploy/private-network/README.md`.
   - Problem: the private-network setup has only been tested in CI, never on
     a real lab network.
