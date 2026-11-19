@@ -10,7 +10,7 @@ sidebar:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `AGENTICML_DIR` | `~/.agenticml` | Store root. `init(dir=)` and `--dir` win. |
-| `AGENTICML_MODE` | `local` | `local`, `offline` (alias of `local`), or `disabled`. |
+| `AGENTICML_MODE` | `local` | `local`, `offline` (alias of `local`), or `disabled`. Other values warn and use `local`. |
 | `AGENTICML_HOST` | unset | Server for `login`, `whoami`, and `sync`. |
 | `AGENTICML_API_KEY` | unset | Key for `sync` and `whoami`. `login` ignores it. |
 | `AGENTICML_CONFIG_DIR` | `~/.config/agenticml` | Credential directory. Wins over `XDG_CONFIG_HOME`. |

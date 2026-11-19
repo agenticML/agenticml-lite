@@ -359,6 +359,21 @@ Backlog.
   ships off (`MaxTaskCount` 1); the owner turns it on after the bootstrap
   re-apply and the two-task check.
 
+### Outreach
+
+Started Nov 19, 2026 (owner: "i want to increase the github stars, and
+other outreach on my repo, and the platform"). On that day the repo had
+0 stars and 8 unique visitors in 14 days, while PyPI had about 300
+downloads a month. Background, launch steps and owner steps:
+[outreach plan](outreach.md). Ships with the next release; the README
+part can go to `main` early as a docs-only PR.
+
+| # | Package | Depends on | Coder | Size | Plan | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| 35 | Repo outreach: README, comparison table, images, community files, dashboard GitHub link | 3.1 | Sonnet; supervisor reviews | M | [plan](packages/35-repo-outreach.md) | in review |
+| 35.1 | README rework with screenshot and comparison table, `scripts/make_readme_images.py` (dashboard screenshot, social preview), CONTRIBUTING, code of conduct, issue and PR templates, PyPI keywords and classifiers | – | Sonnet | S–M | [plan](packages/35-repo-outreach.md) | in review |
+| 35.2 | GitHub link in the dashboard top bar; docs and GitHub line from `agenticml ui` | – | Sonnet | S | [plan](packages/35-repo-outreach.md) | in review |
+
 ### Maintenance fixes
 
 - Empty object and lineage upload framing: [plan](packages/fix-empty-uploads.md),

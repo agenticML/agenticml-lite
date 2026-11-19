@@ -15,6 +15,8 @@ Put the tracker inside the launcher so every rank runs your script:
 torchrun --nproc_per_node 4 -m agenticml run -- train.py
 ```
 
+To track every rank instead of rank 0 only, pass `--all-ranks` or set `AGENTICML_ALL_RANKS=1` (`only_main_process=False` in Python).
+
 ## Resuming a run
 
 Pass the same id to resume:
@@ -29,8 +31,14 @@ agenticml.init(project="demo", name="exp1", id=run_id, resume="allow")
 | `"allow"` | Opens the run, or creates it if missing. |
 | `"must"` | Errors if the run is missing. |
 
-A pruned run (see [Storage](/agenticml-lite/reference/storage/)) cannot be resumed.
+A pruned run (see [Storage](/agenticml-lite/reference/storage/)) cannot be resumed (its overview is present, but the raw series file is gone).
+
+Under `agenticml run`, use `--id` and `--resume` instead. They are described in [Resuming a run](/agenticml-lite/guides/zero-code/#resuming-a-run).
+
+```bash
+agenticml run --id 20261101T130355-1cded4a7 --resume must -- python train.py
+```
 
 ## Disabling tracking
 
-`mode="disabled"` or `AGENTICML_MODE=disabled` turns `log`, `finish`, artifacts, and the `track_*` helpers into no-ops, so you can leave tracking code in place.
+`mode="disabled"` or `AGENTICML_MODE=disabled` turns `log`, `finish`, artifacts, and the `track_*` helpers into no-ops, so you can leave tracking code in place. With `verbose=True`, `init` prints `agenticml: tracking disabled`.
