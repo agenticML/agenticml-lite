@@ -395,12 +395,12 @@ touch 34's files, and 36.3 and 36.4 build on 34 (merged into this branch from PR
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 36 † | Deploy in your own AWS account | 3.2 | Sonnet; prose Antigravity; owner releases and deploys | L | [plan](packages/36-aws-self-deploy.md) | in progress |
+| 36 † | Deploy in your own AWS account | 3.2 | Sonnet; prose Antigravity; owner releases and deploys | L | [plan](packages/36-aws-self-deploy.md) | done in code (this PR; owner steps 36.4 publish and 36.5 first deploy left) |
 | 36.1 † | Server: OIDC sign-in (authorization code + PKCE), open sign-up, admin emails and invites on OIDC, `--signup-email-domains`, `[oidc]` extra | 3.0 | Sonnet | M–L | [plan](packages/36-aws-self-deploy.md) | done ([#88](https://github.com/agenticML/agenticml-lite/pull/88); Sonnet coded; supervisor reviewed in three rounds with adversarial review passes and did the † second review; checked on Postgres 16 locally) |
 | 36.2 † | Template `deploy/aws-self-hosted/agenticml.yaml` (VPC optional, ALB, ACM, Route 53, Cognito, EC2 Auto Scaling group of 1, data volume with daily snapshots), static tests, cfn-lint in CI | 36.1 options | Sonnet | M | [plan](packages/36-aws-self-deploy.md) | done ([#88](https://github.com/agenticML/agenticml-lite/pull/88); Sonnet coded; supervisor reviewed in three rounds with adversarial review passes and did the † second review; cfn-lint clean; AWS behaviour checked statically only until 36.5) |
-| 36.3 | Docs: "Deploy on AWS" page, SERVER.md OIDC section, threat model, README, facts test | 36.2, 34.3 | Antigravity; supervisor checks | S–M | [plan](packages/36-aws-self-deploy.md) | plan ready |
-| 36.4 | Version 3.3.0; template on the GitHub release; Launch Stack link (owner: public S3 bucket) | 36.3, 34.4 | Sonnet; owner tags and publishes | S | [plan](packages/36-aws-self-deploy.md) | plan ready |
-| 36.5 | First real deploy in an AWS account (owner step) | 36.4 | Owner | S | [plan](packages/36-aws-self-deploy.md) | not started |
+| 36.3 | Docs: "Deploy on AWS" page, SERVER.md OIDC section, threat model, README, facts test | 36.2, 34.3 | Antigravity; supervisor checks | S–M | [plan](packages/36-aws-self-deploy.md) | done ([#88](https://github.com/agenticML/agenticml-lite/pull/88); Antigravity drafted; two fact-check rounds against the code with adversarial verification; supervisor corrected two wordings) |
+| 36.4 | Version 3.3.0; template on the GitHub release; Launch Stack link (owner: public S3 bucket) | 36.3, 34.4 | Sonnet; owner tags and publishes | S | [plan](packages/36-aws-self-deploy.md) | done in code ([#88](https://github.com/agenticML/agenticml-lite/pull/88): version 3.3.0, `release-assets.yml` attaches the template to a published release, version tied to the template default by a test); owner tags, publishes and adds the Launch Stack bucket (Backlog) |
+| 36.5 | First real deploy in an AWS account (Backlog owner step) | 36.4 | Owner | S | [plan](packages/36-aws-self-deploy.md) | not started |
 
 ### Maintenance fixes
 
@@ -557,6 +557,68 @@ on Nov 17, 2026; none of the entries below blocked it.
     `agenticml server verify`; note every step that did not match the docs.
   - Done when: both machines' runs show in the dashboard, `server verify`
     reports 0 problems, and each mismatch is fixed or recorded here.
+- **3.3.0 release and Launch Stack link** (package 36.4, owner). Do after
+  the "3.2.0 release" step. PR #88 is stacked on #86 (3.2), so merge #86
+  first.
+  - Where: tags; `pypi` environment; a new public S3 bucket; the docs page
+    `server/deploy-on-aws.md`.
+  - Problem: the template's default `AgenticmlVersion` is 3.3.0, so a deploy
+    fails until 3.3.0 is on PyPI. The docs can only offer "upload the
+    template" until the template sits in a public S3 bucket, because a
+    CloudFormation quick-create link needs an S3 URL.
+  - Fix:
+    (1) Tag `v3.3.0` on `main` after `v3.2.0`, and approve the Publish run.
+    Then publish the GitHub release for the tag yourself (the UI or `gh
+    release create`, not with a workflow's `GITHUB_TOKEN`). The
+    `release-assets.yml` workflow then attaches `agenticml.yaml`, after
+    checking that the template's default version equals the tag.
+    (2) Create a bucket, for example `agenticml-templates`. Allow public
+    read only on `self-hosted/*`, keep Block Public Access off for that
+    prefix only, and do not allow listing.
+    (3) Upload `self-hosted/3.3.0/agenticml.yaml` and
+    `self-hosted/latest/agenticml.yaml`.
+    (4) Add the Launch Stack button to the docs page:
+    `https://console.aws.amazon.com/cloudformation/home#/stacks/quickcreate?templateURL=<bucket URL>/self-hosted/latest/agenticml.yaml&stackName=agenticml`.
+  - Done when: 3.3.0 is on PyPI, the release has `agenticml.yaml`, and the
+    Launch Stack link opens the quick-create page in a clean account.
+- **First real deploy of the AWS template** (package 36.5, owner; after the
+  step above). The template is checked only statically: cfn-lint, 73 tests
+  and stubbed bootstrap runs.
+  - Where: a clean AWS account or region, and a Route 53 zone.
+  - Problem: these behaviours have never run on AWS:
+    - the AL2023 packages (`python3.11`, `python3.11-pip`,
+      `aws-cfn-bootstrap`), and that uid/gid 5400 is free;
+    - `cfn-signal` and the ASG creation policy;
+    - the EBS attach and the NVMe by-id link;
+    - `xfs_growfs` as `ExecStartPre=+`;
+    - ACM DNS validation and the alias record;
+    - Cognito Lite with deletion protection, the pre-sign-up trigger, the
+      classic hosted UI, and sign-up with `WriteAttributes [email, name]`;
+    - the logout redirect;
+    - the rolling update and instance replacement;
+    - DLM;
+    - the existing-VPC path (`SubnetZone`);
+    - a restore with `DataSnapshotId`.
+  - Fix: follow `server/deploy-on-aws.md` exactly, and check each item in
+    turn:
+    (1) `SignUp=open` with `AllowedEmailDomains`: the admin email signs up
+    and owns `default`; a second in-domain email gets its own workspace; an
+    out-of-domain email is refused by Cognito.
+    (2) Create a key and `sync --follow` one run from a laptop.
+    (3) Stack update to a new `AgenticmlVersion` (or the same version with a
+    changed `BackupRetentionDays`, to check that nothing rolls): the data is
+    still there.
+    (4) Terminate the instance by hand: the ASG replaces it and the data is
+    intact.
+    (5) Raise `DataVolumeSize`, reboot, and `df` shows the new size.
+    (6) Restore drill: a new stack from a DLM snapshot with
+    `DataSnapshotId`; sign in again; `server verify` reports 0 problems.
+    (7) Repeat a short launch into an existing VPC with `Scheme=internal`.
+    (8) Delete both stacks: the final snapshot exists and the pool is
+    retained.
+    Record the cost after 7 days.
+  - Done when: every step passes, or each mismatch is fixed in the template
+    with a test, and the cost is recorded here.
 - **Release follow-ups (owner)** (3.0.0 released Nov 17, 2026). Low priority.
   - Where: repository Settings → Environments → `pypi`; tags.
   - Problem: the `pypi` environment has no required reviewer, so any pushed

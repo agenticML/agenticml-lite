@@ -112,6 +112,38 @@ def section(script, start, end):
 
 # ------------------------------------------------------------------ template
 
+def test_template_default_version_is_the_package_version(template):
+    """Protects a stack launched with defaults from installing a version other
+    than the release the template was published with."""
+    import agenticml
+    pyproject = re.search(r'^version = "([^"]+)"', (ROOT / 'pyproject.toml').read_text(), re.M).group(1)
+    default = template['Parameters']['AgenticmlVersion']['Default']
+    assert default == agenticml.__version__ == pyproject
+
+
+def test_release_workflow_attaches_the_template_to_the_release():
+    """Protects the Deploy on AWS page ("download agenticml.yaml from the
+    GitHub release"): the workflow that runs when a release is published must
+    upload exactly this template, with write access on that job only."""
+    path = ROOT / '.github/workflows/release-assets.yml'
+    workflow = yaml.safe_load(path.read_text())
+    triggers = workflow.get('on', workflow.get(True))
+    assert triggers == {'release': {'types': ['published']}}
+    assert workflow['permissions'] == {'contents': 'read'}
+    (job,) = workflow['jobs'].values()
+    assert job['permissions'] == {'contents': 'write'}
+    for step in job['steps']:
+        if 'uses' in step:
+            assert re.search(r'@[0-9a-f]{40}$', step['uses']), step['uses']
+    uploads = [s['run'] for s in job['steps'] if 'gh release upload' in s.get('run', '')]
+    assert len(uploads) == 1
+    assert 'deploy/aws-self-hosted/agenticml.yaml' in uploads[0]
+    assert (ROOT / 'deploy/aws-self-hosted/agenticml.yaml').is_file()
+    # The release is named by the event, passed through env, never pasted into the script.
+    assert '${{' not in uploads[0]
+    assert {'GH_TOKEN', 'TAG'} <= {k for s in job['steps'] if 'gh release upload' in s.get('run', '') for k in s['env']}
+
+
 def test_template_fits_without_a_bucket(text):
     assert len(text.encode()) < TEMPLATE_SIZE_LIMIT
 

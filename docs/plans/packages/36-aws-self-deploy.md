@@ -1,6 +1,6 @@
 # Package 36: deploy in your own AWS account (release 3.3)
 
-Nov 19, 2026 · supervisor plan · status: plan ready
+Nov 19, 2026 · supervisor plan · status: done in code (Nov 19, 2026); owner steps 36.4 publish and 36.5 first deploy in the roadmap Backlog
 
 ## Goal
 
