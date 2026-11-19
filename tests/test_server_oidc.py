@@ -14,7 +14,7 @@ from agenticml.server.db.workspaces import AccountRepo, InviteRepo, MembershipRe
 from agenticml.server.keycache import Claims
 from agenticml.server.oidc import (
     CALLBACK_PATH, OIDC_EXTRA, START_PATH, OidcConfig, OidcStates, OidcTokenInvalid,
-    parse_oidc_config, pkce_challenge, safe_next, binding_slot, verify_id_token)
+    parse_oidc_config, pkce_challenge, safe_next, binding_slot, uid_for, verify_id_token)
 from agenticml.server.webauth import parse_signup_email_domains
 from oidc_fake import (
     CLIENT_ID, KEY, KID, OMIT, OTHER_KEY, FakeProvider, cookie_pair, finish_flow, header,
@@ -156,7 +156,7 @@ def _verify(token, nonce='n-1', now=NOW, keys=None):
 
 def test_valid_token_returns_claims():
     assert _verify(_token()) == Claims(
-        uid='oidc:sub-1', email='ada@example.com', email_verified=True, name='Ada',
+        uid=uid_for(ISSUER, 'sub-1'), email='ada@example.com', email_verified=True, name='Ada',
         provider='oidc')
 
 
@@ -202,11 +202,11 @@ def test_claim_checks_refuse(overrides, reason):
 
 def test_audience_list_with_matching_azp_is_accepted():
     claims = _verify(_token(aud=[CLIENT_ID, 'another'], azp=CLIENT_ID))
-    assert claims.uid == 'oidc:sub-1'
+    assert claims.uid == uid_for(ISSUER, 'sub-1')
 
 
 def test_leeway_accepts_just_expired_token():
-    assert _verify(_token(exp=NOW - 30)).uid == 'oidc:sub-1'
+    assert _verify(_token(exp=NOW - 30)).uid == uid_for(ISSUER, 'sub-1')
 
 
 def test_signature_alg_and_kid_checks():
@@ -294,8 +294,8 @@ def test_happy_path_open_signup_creates_personal_workspace(tmp_path, provider, c
         assert name == 'aml_session' and token and flags['samesite'] == 'Strict'
         assert flags['httponly'] is True
         account = _account(httpd, 'ada@example.com')
-        assert account['firebase_uid'] == 'oidc:sub-1'
-        assert AccountRepo.external_uid(account) == 'oidc:sub-1'
+        assert account['firebase_uid'] == uid_for(provider.issuer, 'sub-1')
+        assert AccountRepo.external_uid(account) == uid_for(provider.issuer, 'sub-1')
         assert account['email'] == 'ada@example.com' and account['email_verified'] == 1
         assert account['created_by'] == 'signup'
         workspaces = AccountRepo(httpd.db).workspaces('ada@example.com')
@@ -481,7 +481,7 @@ def test_existing_account_claimed_by_verified_email(tmp_path, provider):
         MembershipRepo(httpd.db, httpd.default_workspace_id).add(pending['id'], 'member')
         status, _, _, session = sign_in(httpd, provider)
         assert status == 200 and session
-        assert repo.get('ada@example.com')['firebase_uid'] == 'oidc:sub-1'
+        assert repo.get('ada@example.com')['firebase_uid'] == uid_for(provider.issuer, 'sub-1')
 
 
 def _legacy_firebase_account(httpd, login, uid='old-firebase-uid', *, member=True):
@@ -507,7 +507,7 @@ def test_firebase_to_oidc_switch_relinks_by_verified_email(tmp_path, provider):
         status, _, _, session = sign_in(httpd, provider)
         assert status == 200 and session
         account = AccountRepo(httpd.db).get('bob@example.com')
-        assert account['firebase_uid'] == 'oidc:sub-2'
+        assert account['firebase_uid'] == uid_for(provider.issuer, 'sub-2')
         assert account['email'] == 'bob@example.com' and account['email_verified'] == 1
         events = AuditRepo(httpd.db, None).tail(20)
         relinks = [row for row in events if row['action'] == 'account.relink']
@@ -532,11 +532,11 @@ def test_no_relink_for_an_unverified_email(tmp_path, provider, verified):
 
 def test_no_relink_of_an_account_linked_to_another_oidc_uid(tmp_path, provider):
     with oidc_server(tmp_path / 'data', provider) as httpd:
-        _legacy_firebase_account(httpd, 'bob@example.com', uid='oidc:someone-else')
+        _legacy_firebase_account(httpd, 'bob@example.com', uid=uid_for(provider.issuer, 'someone-else'))
         _bob(provider)
         status, _, _, session = sign_in(httpd, provider)
         assert status == 403 and session is None
-        assert AccountRepo(httpd.db).get('bob@example.com')['firebase_uid'] == 'oidc:someone-else'
+        assert AccountRepo(httpd.db).get('bob@example.com')['firebase_uid'] == uid_for(provider.issuer, 'someone-else')
         assert not [r for r in AuditRepo(httpd.db, None).tail(20) if r['action'] == 'account.relink']
 
 
@@ -565,7 +565,7 @@ def test_relink_also_applies_when_redeeming_an_invite(tmp_path, provider):
         status, _, _, session = sign_in(httpd, provider, invite=token)
         assert status == 200 and session
         account = AccountRepo(httpd.db).get('bob@example.com')
-        assert account['firebase_uid'] == 'oidc:sub-2'
+        assert account['firebase_uid'] == uid_for(provider.issuer, 'sub-2')
         assert MembershipRepo(httpd.db, httpd.default_workspace_id).get(account['id']) is not None
         assert InviteRepo.find_pending(httpd.db, token) is None          # redeemed
         rows = _relink_rows(httpd)
@@ -574,11 +574,11 @@ def test_relink_also_applies_when_redeeming_an_invite(tmp_path, provider):
 
 def test_invite_redeem_leaves_another_oidc_uid_alone(tmp_path, provider):
     with oidc_server(tmp_path / 'data', provider) as httpd:
-        token = _invite_then_legacy_account(httpd, 'bob@example.com', 'oidc:someone-else')
+        token = _invite_then_legacy_account(httpd, 'bob@example.com', uid_for(provider.issuer, 'someone-else'))
         _bob(provider)
         status, _, _, session = sign_in(httpd, provider, invite=token)
         assert status == 403 and session is None
-        assert AccountRepo(httpd.db).get('bob@example.com')['firebase_uid'] == 'oidc:someone-else'
+        assert AccountRepo(httpd.db).get('bob@example.com')['firebase_uid'] == uid_for(provider.issuer, 'someone-else')
         assert not _relink_rows(httpd)
         assert InviteRepo.find_pending(httpd.db, token) is not None
 
@@ -619,7 +619,7 @@ def test_oidc_uid_cannot_collide_with_a_firebase_uid(tmp_path, provider):
             repo.link_firebase(other['id'], 'sub-1', 'someone@example.com', True, tx)
         status, _, _, session = sign_in(httpd, provider)
         assert status == 200 and session
-        assert repo.get('ada@example.com')['firebase_uid'] == 'oidc:sub-1'
+        assert repo.get('ada@example.com')['firebase_uid'] == uid_for(provider.issuer, 'sub-1')
         assert repo.get('someone@example.com')['firebase_uid'] == 'sub-1'
 
 
@@ -716,7 +716,7 @@ def test_invite_redeemed_through_state_and_never_in_provider_url(tmp_path, provi
         assert all(invite not in json.dumps(item) for item in provider.requests)
         assert InviteRepo.find_pending(httpd.db, invite) is None
         account = _account(httpd, 'ada@example.com')
-        assert account['firebase_uid'] == 'oidc:sub-1'
+        assert account['firebase_uid'] == uid_for(provider.issuer, 'sub-1')
         assert MembershipRepo(httpd.db, httpd.default_workspace_id).get(account['id']) is not None
 
 
@@ -1157,7 +1157,7 @@ def test_systemd_unit_carries_the_oidc_options(tmp_path):
                                    'a' * 250 + '@example.com', 'two@@example.com'])
 def test_email_claim_must_be_an_address(email):
     claims = _verify(_token(email=email))
-    assert claims.email is None and claims.uid == 'oidc:sub-1'
+    assert claims.email is None and claims.uid == uid_for(ISSUER, 'sub-1')
 
 
 def test_non_address_email_cannot_create_an_account_or_match_the_admin_list(tmp_path, provider):
@@ -1328,7 +1328,7 @@ def test_signup_domains_and_existing_accounts_personal_workspace(tmp_path, provi
         status, _, _, session = sign_in(httpd, provider)
         assert status == 200 and session
         assert _workspace_slugs(httpd, 'guest@other.org') == []
-        assert repo.get('guest@other.org')['firebase_uid'] == 'oidc:g'
+        assert repo.get('guest@other.org')['firebase_uid'] == uid_for(provider.issuer, 'g')
         # In domain: gets one.
         provider.identity = {'sub': 'a', 'email': 'ada@example.com', 'email_verified': True, 'name': 'A'}
         assert sign_in(httpd, provider)[0] == 200
@@ -1579,3 +1579,191 @@ def test_state_queries_match_exactly_the_prefix_rows(tmp_path, provider, monkeyp
         assert [n for n in names if n.startswith('oidc_state:')].__len__() == 2
         for name in others:
             assert name in names and settings.get(name) == 'keep'
+
+
+# --- package 36.2 review: issuer-tagged uids, bootstrap owner, first-admin line ------
+
+def test_uid_carries_the_issuer_tag():
+    import hashlib
+    tag = hashlib.sha256(ISSUER.encode()).hexdigest()[:12]
+    assert _verify(_token()).uid == f'oidc:{tag}:sub-1'
+    assert uid_for(ISSUER, 'sub-1') == f'oidc:{tag}:sub-1'
+    assert uid_for('https://idp.example.com/other', 'sub-1') != uid_for(ISSUER, 'sub-1')
+
+
+def test_relinkable_uid_rules():
+    new = uid_for(ISSUER, 'sub-9')
+    old_pool = uid_for('https://idp.example.com/old-pool', 'sub-1')
+    for stored, expected in (
+            (None, None), ('', None),
+            ('old-firebase-uid', 'old-firebase-uid'),         # Firebase era
+            (old_pool, old_pool),                             # another issuer
+            ('oidc:sub-1', 'oidc:sub-1'),                     # untagged, so another issuer
+            (uid_for(ISSUER, 'sub-1'), None),                 # same issuer, other subject
+            (new, None)):
+        assert AccountRepo.relinkable_uid({'firebase_uid': stored}, new) == expected
+    assert AccountRepo.relinkable_uid(None, new) is None
+
+
+def test_a_new_identity_pool_relinks_accounts_by_verified_email(tmp_path, provider):
+    """A re-created pool has the same emails and new subjects: nobody is locked out."""
+    with oidc_server(tmp_path / 'data', provider) as httpd:
+        _legacy_firebase_account(httpd, 'bob@example.com',
+                                 uid=uid_for('https://idp.example.com/old-pool', 'sub-OLD'))
+        _bob(provider)
+        status, _, _, session = sign_in(httpd, provider)
+        assert status == 200 and session
+        account = AccountRepo(httpd.db).get('bob@example.com')
+        assert account['firebase_uid'] == uid_for(provider.issuer, 'sub-2')
+        rows = _relink_rows(httpd)
+        assert len(rows) == 1 and rows[0]['detail'] == {'from': 'oidc', 'to': 'oidc'}
+        assert sign_in(httpd, provider)[0] == 200
+        assert len(_relink_rows(httpd)) == 1
+
+
+def test_a_new_identity_pool_does_not_relink_an_unverified_email(tmp_path, provider):
+    with oidc_server(tmp_path / 'data', provider) as httpd:
+        old = uid_for('https://idp.example.com/old-pool', 'sub-OLD')
+        _legacy_firebase_account(httpd, 'bob@example.com', uid=old)
+        _bob(provider, verified=False)
+        status, _, _, session = sign_in(httpd, provider)
+        assert status == 403 and session is None
+        assert AccountRepo(httpd.db).get('bob@example.com')['firebase_uid'] == old
+        assert not _relink_rows(httpd)
+
+
+def test_same_issuer_other_subject_is_still_refused(tmp_path, provider):
+    with oidc_server(tmp_path / 'data', provider) as httpd:
+        mine = uid_for(provider.issuer, 'someone-else')
+        _legacy_firebase_account(httpd, 'bob@example.com', uid=mine)
+        _bob(provider)
+        status, _, _, session = sign_in(httpd, provider)
+        assert status == 403 and session is None
+        assert AccountRepo(httpd.db).get('bob@example.com')['firebase_uid'] == mine
+        assert not _relink_rows(httpd)
+
+
+def test_invite_redeem_relinks_an_account_of_another_issuer(tmp_path, provider):
+    with oidc_server(tmp_path / 'data', provider) as httpd:
+        token = _invite_then_legacy_account(
+            httpd, 'bob@example.com', uid_for('https://idp.example.com/old-pool', 'sub-OLD'))
+        _bob(provider)
+        status, _, _, session = sign_in(httpd, provider, invite=token)
+        assert status == 200 and session
+        assert AccountRepo(httpd.db).get('bob@example.com')['firebase_uid'] == uid_for(provider.issuer, 'sub-2')
+        assert _relink_rows(httpd)[0]['detail'] == {'from': 'oidc', 'to': 'oidc'}
+
+
+def test_cli_created_owner_is_claimed_by_the_first_oidc_sign_in(tmp_path, provider, capsys):
+    """What the AWS template does at first boot (invite-only default, no sign-up).
+
+    ``accounts add`` makes a credential-less account, ``workspaces set-owner``
+    makes it owner of ``default``; the admin's verified OIDC sign-in then
+    claims it and lands in ``default`` as owner.
+    """
+    data = tmp_path / 'data'
+    assert cli.main(['server', 'accounts', 'list', '--data', str(data), '--json']) == 0
+    assert json.loads(capsys.readouterr().out) == []
+    assert cli.main(['server', 'accounts', 'add', 'ada@example.com', '--data', str(data)]) == 0
+    assert cli.main(['server', 'workspaces', 'set-owner', 'default', '--owner', 'ada@example.com',
+                     '--data', str(data)]) == 0
+    capsys.readouterr()
+    with oidc_server(data, provider, admin_emails=frozenset({'ada@example.com'})) as httpd:
+        status, _, _, session = sign_in(httpd, provider)
+        assert status == 200 and session
+        account = _account(httpd, 'ada@example.com')
+        assert account['firebase_uid'] == uid_for(provider.issuer, 'sub-1')
+        assert [(w['slug'], w['role']) for w in AccountRepo(httpd.db).workspaces('ada@example.com')] == [
+            ('default', 'owner')]
+        status, payload = _session(httpd, session)
+        assert payload['server_admin'] is True
+        assert [w['slug'] for w in payload['workspaces']] == ['default']
+        # A second person is still refused on an invite-only server.
+        provider.identity = {'sub': 'sub-9', 'email': 'eve@example.com',
+                             'email_verified': True, 'name': 'Eve'}
+        assert sign_in(httpd, provider)[0] == 403
+
+
+def test_account_add_refuses_a_duplicate_and_set_owner_is_repeatable(tmp_path, capsys):
+    data = str(tmp_path / 'data')
+    assert cli.main(['server', 'accounts', 'add', 'ada@example.com', '--data', data]) == 0
+    assert cli.main(['server', 'accounts', 'add', 'ada@example.com', '--data', data]) == 1
+    for _ in range(2):
+        assert cli.main(['server', 'workspaces', 'set-owner', 'default', '--owner',
+                         'ada@example.com', '--data', data]) == 0
+
+
+def _arm(tmp_path, caplog, **kwargs):
+    caplog.set_level('INFO')
+    httpd = make_server(tmp_path / 'data', port=0, public_url='http://127.0.0.1:1', **kwargs)
+    httpd.server_close()
+    return caplog.text
+
+
+def test_external_signin_never_prints_a_setup_link(tmp_path, caplog, provider):
+    config = parse_oidc_config(provider.issuer, CLIENT_ID)
+    text = _arm(tmp_path, caplog, oidc=config, admin_emails=frozenset({'ada@example.com'}))
+    assert '/setup?token=' not in text and 'No admin user yet' not in text
+    assert 'first admin: sign in with an email listed in --admin-emails' in text
+
+
+def test_external_signin_without_admin_emails_says_nothing_about_a_first_admin(tmp_path, caplog, provider):
+    config = parse_oidc_config(provider.issuer, CLIENT_ID)
+    text = _arm(tmp_path, caplog, oidc=config)
+    assert '/setup?token=' not in text and 'first admin' not in text
+
+
+def test_local_server_keeps_its_setup_link(tmp_path, caplog):
+    text = _arm(tmp_path, caplog)
+    assert 'No admin user yet. Open http://127.0.0.1:1/setup?token=' in text
+    assert 'first admin: sign in' not in text
+
+
+def test_first_admin_line_is_silent_when_a_server_admin_exists(tmp_path, caplog, provider):
+    config = parse_oidc_config(provider.issuer, CLIENT_ID)
+    admins = frozenset({'ada@example.com'})
+    caplog.set_level('INFO')
+    httpd = make_server(tmp_path / 'data', port=0, public_url='http://127.0.0.1:1',
+                        oidc=config, admin_emails=admins)
+    try:
+        assert 'first admin: sign in' in caplog.text
+        repo = AccountRepo(httpd.db)
+        repo.create('ada@example.com')
+        repo.set_server_admin('ada@example.com', True, source='manual')
+    finally:
+        httpd.server_close()
+    caplog.clear()
+    httpd = make_server(tmp_path / 'data', port=0, public_url='http://127.0.0.1:1',
+                        oidc=config, admin_emails=admins)
+    httpd.server_close()
+    assert 'first admin' not in caplog.text and '/setup?token=' not in caplog.text
+
+
+def test_relink_external_refuses_a_uid_that_is_not_relinkable(tmp_path):
+    from agenticml.server.db import for_server_dir
+    from agenticml.server.keys import ClientError
+    (tmp_path / 'data').mkdir()
+    db = for_server_dir(tmp_path / 'data', None)
+    repo = AccountRepo(db)
+    new = uid_for(ISSUER, 'sub-new')
+
+    def attempt(uid, target, login):
+        account = repo.create(login)
+        if uid is not None:
+            with db.transaction(write=True) as tx:
+                repo.link_firebase(account['id'], uid, account['login'], True, tx)
+        with pytest.raises(ClientError) as exc:
+            with db.transaction(write=True) as tx:
+                repo.relink_external(account['id'], target, account['login'], True, tx)
+        assert 'not linked to another provider' in str(exc.value)
+        assert repo.get(account['login'])['firebase_uid'] == uid
+
+    attempt(uid_for(ISSUER, 'sub-old'), new, 'a@example.com')      # same issuer, different sub
+    attempt(new, new, 'b@example.com')                             # the uid it already has
+    attempt(None, new, 'c@example.com')                            # never linked: a plain link, not a relink
+    # And a relinkable one does relink.
+    account = repo.create('ok@example.com')
+    with db.transaction(write=True) as tx:
+        repo.link_firebase(account['id'], 'old-firebase-uid', 'ok@example.com', True, tx)
+        repo.relink_external(account['id'], uid_for(ISSUER, 'sub-final'), 'ok@example.com', True, tx)
+    assert repo.get('ok@example.com')['firebase_uid'] == uid_for(ISSUER, 'sub-final')

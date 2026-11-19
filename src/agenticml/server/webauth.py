@@ -149,6 +149,11 @@ def _bucket(address):
     return str(addr)
 
 
+def _uid_provider(uid):
+    """``oidc`` or ``firebase``: which kind of provider a stored uid came from."""
+    return "oidc" if isinstance(uid, str) and uid.startswith("oidc:") else "firebase"
+
+
 class MemoryBuckets:
     def __init__(self):
         self.entries = OrderedDict()
@@ -544,6 +549,11 @@ class WebAuth:
 
     def arm_setup(self, base_url):
         if self.external_signin:
+            # /setup is off with Firebase or OIDC (it answers 404): never print its link.
+            from .db.workspaces import AccountRepo
+            if self.admin_emails and not any(
+                    row["server_admin"] for row in AccountRepo(self.keys.db).list()):
+                logger.warning("first admin: sign in with an email listed in --admin-emails")
             return
         if self.keys.workspace_id is None:
             return
@@ -1325,7 +1335,7 @@ class WebAuth:
                     relink_legacy=claims.provider == "oidc", relinked=relinked_from)
                 # Audit only what the transaction reports it did.
                 if relinked_from:
-                    relinks.append((account["login"], "firebase"))
+                    relinks.append((account["login"], _uid_provider(relinked_from[0])))
             except InviteEmailMismatch:
                 return failed(403, wrong_invite)
             except InviteAccountExists:
@@ -1439,11 +1449,12 @@ class WebAuth:
             return found
         if not (email_verified_for_link(claims) and claims.email):
             return None
-        # After a Firebase -> OIDC switch the old accounts hold a Firebase uid
-        # that cannot sign in any more: a verified email relinks them. An
-        # account already linked to another ``oidc:`` uid is left alone.
+        # After a Firebase -> OIDC switch (or a move to another OIDC issuer, for
+        # example a re-created identity pool) the old accounts hold a uid that
+        # cannot sign in any more: a verified email relinks them. An account
+        # linked to the same issuer under another subject is left alone.
         relink = (not accounts.claimable(claims.email, tx) and claims.provider == "oidc"
-                  and accounts.legacy_firebase_uid(accounts.get(claims.email, tx)) is not None)
+                  and accounts.relinkable_uid(accounts.get(claims.email, tx), claims.uid) is not None)
         if not (relink or accounts.claimable(claims.email, tx)):
             return None
         account = accounts.get(claims.email, tx)
@@ -1451,10 +1462,11 @@ class WebAuth:
             return None
         try:
             if relink:
+                old_provider = _uid_provider(accounts.relinkable_uid(account, claims.uid))
                 accounts.relink_external(
                     account["id"], claims.uid, claims.email, email_verified_for_link(claims), tx)
                 if relinks is not None:
-                    relinks.append((account["login"], "firebase"))
+                    relinks.append((account["login"], old_provider))
             else:
                 accounts.link_external(
                     account["id"], claims.uid, claims.email, email_verified_for_link(claims), tx)

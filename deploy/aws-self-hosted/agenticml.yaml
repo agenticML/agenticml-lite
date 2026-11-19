@@ -1,0 +1,870 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  AgenticML server in your own AWS account: one Graviton instance with SQLite
+  on an encrypted data volume, an HTTPS load balancer, and Amazon Cognito
+  sign-in. Needs a domain name. Create it with CAPABILITY_IAM.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: Address}
+        Parameters: [DomainName, HostedZoneId, CertificateArn]
+      - Label: {default: Sign-in and sign-up}
+        Parameters: [AdminEmail, SignUp, AllowedEmailDomains, CognitoDomainPrefix]
+      - Label: {default: Server}
+        Parameters: [AgenticmlVersion, InstanceType, DataVolumeSize, BackupRetentionDays, WorkspaceStorageGB, PeoplePerWorkspace, DataSnapshotId]
+      - Label: {default: Network (optional)}
+        Parameters: [Scheme, AllowedCidr, VpcId, PublicSubnetIds, AssignPublicIp]
+    ParameterLabels:
+      DomainName: {default: Domain name of the server}
+      HostedZoneId: {default: Route 53 hosted zone ID (creates the certificate and DNS record)}
+      CertificateArn: {default: Existing ACM certificate ARN (instead of a hosted zone)}
+      AdminEmail: {default: First administrator's email}
+      SignUp: {default: Who can sign up}
+      AllowedEmailDomains: {default: Email domains allowed to sign up (optional)}
+      CognitoDomainPrefix: {default: Cognito sign-in domain prefix (optional)}
+      AgenticmlVersion: {default: agenticml-lite version}
+      InstanceType: {default: Instance type}
+      DataVolumeSize: {default: Data volume size (GiB)}
+      BackupRetentionDays: {default: Daily snapshots to keep}
+      WorkspaceStorageGB: {default: Storage per workspace (GB)}
+      PeoplePerWorkspace: {default: People per workspace}
+      DataSnapshotId: {default: Snapshot to restore the data from (new stacks only)}
+      Scheme: {default: Load balancer scheme}
+      AllowedCidr: {default: Address range allowed to reach the server}
+      VpcId: {default: Existing VPC (empty creates one)}
+      PublicSubnetIds: {default: Subnets of the existing VPC (at least two)}
+      AssignPublicIp: {default: Give the instance a public IP}
+
+Parameters:
+  DomainName:
+    Type: String
+    AllowedPattern: '^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$'
+    Description: Name people use to reach the server, for example aml.example.com. Lower case.
+  HostedZoneId:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^Z[A-Z0-9]{5,31}$'
+    Description: Route 53 hosted zone of the domain. The stack then creates and validates the certificate and the DNS record. Give this or CertificateArn, not both.
+  CertificateArn:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^arn:[a-z-]+:acm:[a-z0-9-]+:[0-9]{12}:certificate/[A-Za-z0-9-]+$'
+    Description: ARN of an issued ACM certificate for the domain, in this region. After the stack is created, add a CNAME from the domain to the AlbDnsName output.
+  AdminEmail:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$'
+    Description: Sign up at the server URL with this email to become its administrator. It owns the default workspace from the start.
+  SignUp:
+    Type: String
+    Default: invite-only
+    AllowedValues: [invite-only, open]
+    Description: invite-only lets in the administrator and invited people. open gives every verified email its own workspace.
+  AllowedEmailDomains:
+    Type: String
+    Default: ""
+    MaxLength: 1000
+    AllowedPattern: '^$|^@?(?=[^,]{1,253}(,|$))([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(,@?(?=[^,]{1,253}(,|$))([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$'
+    Description: Comma-separated domains without spaces, such as example.com. Empty means no restriction. Otherwise only these domains (and the administrator) can sign up, in the server and in Cognito. Invitees must also be in these domains, because Cognito refuses a sign-up from any other domain, invited or not.
+  CognitoDomainPrefix:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
+    Description: Prefix of the Cognito sign-in domain. Empty derives one from the stack ID. Must be unused in the region and must not contain aws, amazon or cognito.
+  AgenticmlVersion:
+    Type: String
+    Default: 3.3.0
+    AllowedPattern: '^\d+\.\d+\.\d+$'
+    Description: Version of agenticml-lite installed from PyPI. Changing it replaces the instance, with a few minutes of downtime. The data stays.
+  InstanceType:
+    Type: String
+    Default: t4g.small
+    AllowedValues: [t4g.micro, t4g.small, t4g.medium, t4g.large, m7g.medium, m7g.large, m7g.xlarge, c7g.large]
+    Description: Graviton instance type.
+  DataVolumeSize:
+    Type: String
+    Default: "50"
+    MaxLength: 5
+    AllowedPattern: '^[1-9][0-9]{1,4}$'
+    Description: Size of the data volume in GiB, a whole number from 10. Raising it later grows the volume at once; the file system grows at the next instance restart or replacement. A volume never shrinks.
+  BackupRetentionDays:
+    Type: String
+    Default: "14"
+    MaxLength: 3
+    AllowedPattern: '^[1-9][0-9]{0,2}$'
+    Description: Daily snapshots of the data volume to keep, a whole number.
+  WorkspaceStorageGB:
+    Type: String
+    Default: "20"
+    MaxLength: 6
+    AllowedPattern: '^[1-9][0-9]{0,5}$'
+    Description: Storage limit of each workspace, in GB, a whole number. Written to the limits file. Keep the total of all workspaces within DataVolumeSize.
+  PeoplePerWorkspace:
+    Type: String
+    Default: "50"
+    MaxLength: 5
+    AllowedPattern: '^[1-9][0-9]{0,4}$'
+    Description: Most members plus pending invites in a workspace, a whole number.
+  DataSnapshotId:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^snap-[0-9a-f]{8,17}$'
+    Description: To restore, create a NEW stack with the ID of a snapshot of the old data volume. People sign in again with the same email. Leave empty otherwise, and never change it on an existing stack.
+  Scheme:
+    Type: String
+    Default: internet-facing
+    AllowedValues: [internet-facing, internal]
+    Description: internal keeps the load balancer private; use it with an existing VPC and an AllowedCidr that reaches it.
+  AllowedCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: '^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])/(3[0-2]|[12]?[0-9])$'
+    Description: IPv4 range allowed to reach the load balancer on ports 80 and 443.
+  VpcId:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^vpc-[0-9a-f]{8,17}$'
+    Description: Empty creates a VPC with two public subnets. Otherwise the VPC to use; then PublicSubnetIds is required.
+  PublicSubnetIds:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^subnet-[0-9a-f]{8,17}(,subnet-[0-9a-f]{8,17})+$'
+    Description: Comma-separated subnet IDs without spaces, at least two, exactly one per availability zone, only with an existing VPC. The load balancer uses all of them; the instance and the data volume use the FIRST one, and the server trusts the load balancer in these subnets. Never change the first subnet or its zone after creation, or the data volume is replaced by an empty one; to move, restore from a snapshot into a new stack with DataSnapshotId.
+  AssignPublicIp:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: The instance needs internet access for PyPI and Cognito. It must be true in the VPC this stack creates (it has no NAT). Use false only in an existing VPC with a NAT gateway or endpoints.
+
+Rules:
+  DomainOrCertificate:
+    Assertions:
+      - Assert: !Or
+          - !And [!Equals [!Ref HostedZoneId, ""], !Not [!Equals [!Ref CertificateArn, ""]]]
+          - !And [!Not [!Equals [!Ref HostedZoneId, ""]], !Equals [!Ref CertificateArn, ""]]
+        AssertDescription: Give exactly one of HostedZoneId and CertificateArn.
+  ExistingVpcNeedsSubnets:
+    RuleCondition: !Not [!Equals [!Ref VpcId, ""]]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref PublicSubnetIds, ""]]
+        AssertDescription: PublicSubnetIds is required with an existing VPC.
+  NewVpcTakesNoSubnets:
+    RuleCondition: !Equals [!Ref VpcId, ""]
+    Assertions:
+      - Assert: !Equals [!Ref PublicSubnetIds, ""]
+        AssertDescription: PublicSubnetIds goes with an existing VpcId only.
+      - Assert: !Equals [!Ref AssignPublicIp, "true"]
+        AssertDescription: The VPC this stack creates has no NAT, so AssignPublicIp must be true.
+
+Conditions:
+  CreateVpc: !Equals [!Ref VpcId, ""]
+  ExistingVpc: !Not [!Equals [!Ref VpcId, ""]]
+  CreateCertificate: !Not [!Equals [!Ref HostedZoneId, ""]]
+  PublicIp: !Equals [!Ref AssignPublicIp, "true"]
+  RestrictDomains: !Not [!Equals [!Ref AllowedEmailDomains, ""]]
+  CustomCognitoPrefix: !Not [!Equals [!Ref CognitoDomainPrefix, ""]]
+  FromSnapshot: !Not [!Equals [!Ref DataSnapshotId, ""]]
+
+Resources:
+  # ---- Network: only when no VpcId is given ------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Condition: CreateVpc
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: !Ref "AWS::StackName"}]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: CreateVpc
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref Vpc
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateVpc
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateVpc
+    DependsOn: DefaultRoute
+    Properties:
+      SubnetId: !Ref SubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  SubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateVpc
+    DependsOn: DefaultRoute
+    Properties:
+      SubnetId: !Ref SubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # With an existing VPC, a volume must sit in the zone of the instance's
+  # subnet, and CloudFormation cannot look that up natively. This checks the
+  # subnets and returns the first subnet's zone and the subnets' CIDR blocks.
+  SubnetZoneRole:
+    Type: AWS::IAM::Role
+    Condition: ExistingVpc
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: "sts:AssumeRole"}
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: describe-subnets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - {Effect: Allow, Action: "ec2:DescribeSubnets", Resource: "*"}
+
+  SubnetZoneFunction:
+    Type: AWS::Lambda::Function
+    Condition: ExistingVpc
+    Properties:
+      Description: Finds the zone of the first subnet and the subnets' CIDR blocks, and checks the subnets.
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt SubnetZoneRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+
+          def handler(event, context):
+              status, data, reason = cfnresponse.SUCCESS, {}, None
+              try:
+                  if event["RequestType"] != "Delete":
+                      props = event["ResourceProperties"]
+                      ids = props["SubnetIds"].split(",")
+                      found = boto3.client("ec2").describe_subnets(SubnetIds=ids)["Subnets"]
+                      if any(s["VpcId"] != props["VpcId"] for s in found):
+                          raise ValueError("every subnet must belong to VpcId")
+                      zones = {s["AvailabilityZone"] for s in found}
+                      if len(zones) < 2:
+                          raise ValueError("use subnets in at least two zones")
+                      if len(zones) != len(found):
+                          raise ValueError("use one subnet per availability zone")
+                      first = [s for s in found if s["SubnetId"] == ids[0]][0]
+                      data["AvailabilityZone"] = first["AvailabilityZone"]
+                      data["FirstSubnetId"] = ids[0]
+                      data["SubnetIds"] = ",".join(ids)
+                      data["CidrBlocks"] = ",".join(s["CidrBlock"] for s in found)
+              except Exception as exc:
+                  print(exc)
+                  status, reason = cfnresponse.FAILED, str(exc)[:200]
+              cfnresponse.send(event, context, status, data, reason=reason)
+
+  SubnetZone:
+    Type: Custom::SubnetZone
+    Condition: ExistingVpc
+    Properties:
+      ServiceToken: !GetAtt SubnetZoneFunction.Arn
+      VpcId: !Ref VpcId
+      SubnetIds: !Ref PublicSubnetIds
+
+  # ---- Security groups ---------------------------------------------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: AgenticML load balancer
+      VpcId: !If [CreateVpc, !Ref Vpc, !Ref VpcId]
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: !Ref AllowedCidr, Description: HTTPS}
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: !Ref AllowedCidr, Description: Redirect to HTTPS}
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: AgenticML server instance, reachable from the load balancer only
+      VpcId: !If [CreateVpc, !Ref Vpc, !Ref VpcId]
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 8080, ToPort: 8080, SourceSecurityGroupId: !Ref AlbSecurityGroup, Description: Load balancer}
+
+  # ---- Load balancer, certificate, DNS -----------------------------------
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: !Ref Scheme
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      Subnets: !If [CreateVpc, [!Ref SubnetA, !Ref SubnetB], !Split [",", !GetAtt SubnetZone.SubnetIds]]
+      LoadBalancerAttributes:
+        - {Key: idle_timeout.timeout_seconds, Value: "300"}
+        - {Key: routing.http.drop_invalid_header_fields.enabled, Value: "true"}
+        - {Key: access_logs.s3.enabled, Value: "false"}
+      # Ordering only: the routes (which wait for the internet gateway) must
+      # exist before the balancer is created.
+      # (DependsOn cannot name a resource that a condition may remove.)
+      Tags:
+        - {Key: agenticml:network, Value: !If [CreateVpc, !Ref SubnetARoutes, existing]}
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 8080
+      Protocol: HTTP
+      TargetType: instance
+      VpcId: !If [CreateVpc, !Ref Vpc, !Ref VpcId]
+      HealthCheckPath: /healthz
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: {HttpCode: "200"}
+      TargetGroupAttributes:
+        - {Key: deregistration_delay.timeout_seconds, Value: "30"}
+
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: CreateCertificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - {DomainName: !Ref DomainName, HostedZoneId: !Ref HostedZoneId}
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !If [CreateCertificate, !Ref Certificate, !Ref CertificateArn]
+      DefaultActions:
+        - {Type: forward, TargetGroupArn: !Ref TargetGroup}
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig: {Protocol: HTTPS, Port: "443", StatusCode: HTTP_301}
+
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: CreateCertificate
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+
+  # ---- Cognito sign-in ---------------------------------------------------
+  # Classic hosted UI: it needs no branding resource and works on the Lite tier.
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      UserPoolName: !Ref "AWS::StackName"
+      UserPoolTier: LITE
+      DeletionProtection: ACTIVE
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      UsernameConfiguration: {CaseSensitive: false}
+      MfaConfiguration: "OFF"
+      AccountRecoverySetting:
+        RecoveryMechanisms: [{Name: verified_email, Priority: 1}]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      UserAttributeUpdateSettings:
+        AttributesRequireVerificationBeforeUpdate: [email]
+      LambdaConfig: !If
+        - RestrictDomains
+        - {PreSignUp: !GetAtt PreSignUpFunction.Arn}
+        - !Ref "AWS::NoValue"
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !If
+        - CustomCognitoPrefix
+        - !Ref CognitoDomainPrefix
+        - !Join ["-", [aml, !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]]]
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: agenticml
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs: [!Sub "https://${DomainName}/auth/oidc/callback"]
+      LogoutURLs: [!Sub "https://${DomainName}/login"]
+      ExplicitAuthFlows: [ALLOW_USER_SRP_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      # The hosted UI sign-up writes email. Changing it later needs a
+      # verification code for the new address (UserAttributeUpdateSettings).
+      WriteAttributes: [email, name]
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+
+  PreSignUpRole:
+    Type: AWS::IAM::Role
+    Condition: RestrictDomains
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: "sts:AssumeRole"}
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  PreSignUpFunction:
+    Type: AWS::Lambda::Function
+    Condition: RestrictDomains
+    Properties:
+      Description: Lets only the allowed email domains and the administrator sign up.
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 5
+      Role: !GetAtt PreSignUpRole.Arn
+      Environment:
+        Variables:
+          ALLOWED_DOMAINS: !Ref AllowedEmailDomains
+          ADMIN_EMAIL: !Ref AdminEmail
+      Code:
+        ZipFile: |
+          import os
+
+
+          def handler(event, context):
+              email = event["request"]["userAttributes"].get("email", "").strip().lower()
+              allowed = [d.strip().lower().lstrip("@") for d in os.environ["ALLOWED_DOMAINS"].split(",")]
+              _, at, domain = email.rpartition("@")
+              if email == os.environ["ADMIN_EMAIL"].strip().lower() or (at and domain in allowed):
+                  return event
+              raise Exception("Sign-up is limited to approved email domains.")
+
+  PreSignUpPermission:
+    Type: AWS::Lambda::Permission
+    Condition: RestrictDomains
+    Properties:
+      FunctionName: !Ref PreSignUpFunction
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  # ---- Data volume and backups -------------------------------------------
+  DataVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      AvailabilityZone: !If [CreateVpc, !GetAtt SubnetA.AvailabilityZone, !GetAtt SubnetZone.AvailabilityZone]
+      Size: !Ref DataVolumeSize
+      SnapshotId: !If [FromSnapshot, !Ref DataSnapshotId, !Ref "AWS::NoValue"]
+      VolumeType: gp3
+      Encrypted: true
+      Tags:
+        - {Key: agenticml:data, Value: !Ref "AWS::StackName"}
+        - {Key: Name, Value: !Sub "${AWS::StackName}-data"}
+
+  SnapshotRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: dlm.amazonaws.com}, Action: "sts:AssumeRole"}
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole
+
+  SnapshotPolicy:
+    Type: AWS::DLM::LifecyclePolicy
+    Properties:
+      Description: Daily snapshots of the AgenticML data volume
+      State: ENABLED
+      ExecutionRoleArn: !GetAtt SnapshotRole.Arn
+      PolicyDetails:
+        PolicyType: EBS_SNAPSHOT_MANAGEMENT
+        ResourceTypes: [VOLUME]
+        TargetTags:
+          - {Key: agenticml:data, Value: !Ref "AWS::StackName"}
+        Schedules:
+          - Name: daily
+            CopyTags: true
+            CreateRule: {Interval: 24, IntervalUnit: HOURS, Times: ["03:00"]}
+            RetainRule: {Count: !Ref BackupRetentionDays}
+
+  # ---- Instance ----------------------------------------------------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: "sts:AssumeRole"}
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: data-volume
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "ec2:AttachVolume"
+                Resource: !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/${DataVolume}
+              - Effect: Allow
+                Action: "ec2:AttachVolume"
+                Resource: !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                Condition:
+                  StringEquals: {"ec2:ResourceTag/agenticml:stack": !Ref "AWS::StackName"}
+              - {Effect: Allow, Action: "ec2:DescribeVolumes", Resource: "*"}
+              - Effect: Allow
+                Action: "cloudformation:SignalResource"
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64}}"
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: {Arn: !GetAtt InstanceProfile.Arn}
+        MetadataOptions: {HttpEndpoint: enabled, HttpTokens: required, HttpPutResponseHopLimit: 1}
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: {VolumeSize: 12, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true}
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: !If [PublicIp, true, false]
+            Groups: [!Ref InstanceSecurityGroup]
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - {Key: agenticml:stack, Value: !Ref "AWS::StackName"}
+              - {Key: Name, Value: !Ref "AWS::StackName"}
+          - ResourceType: volume
+            Tags:
+              - {Key: agenticml:stack, Value: !Ref "AWS::StackName"}
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              # This script and the files it writes hold no credentials.
+              set -Eeuo pipefail
+              exec >> /var/log/agenticml-bootstrap.log 2>&1
+              echo "bootstrap started $(date -u +%FT%TZ)"
+
+              signal() {
+                /opt/aws/bin/cfn-signal "$@" --stack '${AWS::StackName}' --resource AutoScalingGroup --region '${AWS::Region}'
+              }
+              trap 'rc=$?; if [ "$rc" -ne 0 ]; then signal --success false --reason "bootstrap failed, see /var/log/agenticml-bootstrap.log" || true; fi' EXIT
+
+              dnf install -y python3.11 python3.11-pip aws-cfn-bootstrap xfsprogs
+
+              TOKEN=$(curl -fsS -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')
+              INSTANCE_ID=$(curl -fsS -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+              export AWS_DEFAULT_REGION='${AWS::Region}'
+
+              # Attach the data volume. A replaced instance may still hold it:
+              # wait for it to detach, up to about 5 minutes, then fail. A
+              # failed describe call is retried like any other wait.
+              VOLUME_ID='${DataVolume}'
+              attached=no
+              for _ in $(seq 1 30); do
+                state=$(aws ec2 describe-volumes --volume-ids "$VOLUME_ID" --query 'Volumes[0].State' --output text) || state=error
+                holder=$(aws ec2 describe-volumes --volume-ids "$VOLUME_ID" --query 'Volumes[0].Attachments[0].InstanceId' --output text) || holder=error
+                if [ "$holder" = "$INSTANCE_ID" ]; then
+                  attached=yes
+                  break
+                fi
+                if [ "$state" = available ]; then
+                  aws ec2 attach-volume --volume-id "$VOLUME_ID" --instance-id "$INSTANCE_ID" --device /dev/sdf || echo "attach failed, retrying"
+                else
+                  echo "volume is $state (held by $holder), waiting"
+                fi
+                sleep 10
+              done
+              if [ "$attached" != yes ]; then
+                echo "ERROR: the data volume $VOLUME_ID did not attach within 5 minutes"
+                exit 1
+              fi
+
+              VOLUME_NODASH=$(printf '%s' "$VOLUME_ID" | tr -d '-')
+              LINK=/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$VOLUME_NODASH
+              for _ in $(seq 1 60); do
+                if [ -e "$LINK" ]; then
+                  break
+                fi
+                sleep 1
+              done
+              if [ ! -e "$LINK" ]; then
+                echo "ERROR: no device $LINK"
+                exit 1
+              fi
+              DEVICE=$(readlink -f "$LINK")
+
+              # Format only a blank device. blkid exits 2 for a device with
+              # nothing on it. A device it can read is left alone, and so is
+              # one with a partition table or anything else it cannot name
+              # (exit 0 and no file system type).
+              RESTORED_FROM='${DataSnapshotId}'
+              rc=0
+              FSTYPE=$(blkid -p -o value -s TYPE "$DEVICE") || rc=$?
+              if [ "$rc" -eq 0 ] && [ -n "$FSTYPE" ]; then
+                echo "found a $FSTYPE file system on $DEVICE, not formatting"
+              elif [ "$rc" -eq 0 ]; then
+                echo "ERROR: $DEVICE has a partition table or an unknown format, not formatting"
+                exit 1
+              elif [ "$rc" -eq 2 ]; then
+                if [ -n "$RESTORED_FROM" ]; then
+                  echo "ERROR: $DEVICE should hold the data of snapshot $RESTORED_FROM but is blank, not formatting"
+                  exit 1
+                fi
+                mkfs.xfs -L aml-data "$DEVICE"
+              else
+                echo "ERROR: blkid failed with $rc on $DEVICE, not formatting"
+                exit 1
+              fi
+
+              DATA_UUID=$(blkid -p -o value -s UUID "$DEVICE")
+              mkdir -p /var/lib/agenticml-server
+              if ! grep -q ' /var/lib/agenticml-server ' /etc/fstab; then
+                echo "UUID=$DATA_UUID /var/lib/agenticml-server xfs defaults,nofail 0 2" >> /etc/fstab
+              fi
+              systemctl daemon-reload
+              if ! mountpoint -q /var/lib/agenticml-server; then
+                mount /var/lib/agenticml-server
+              fi
+              mountpoint -q /var/lib/agenticml-server
+
+              # Fixed ids: a replacement instance must own the volume's files.
+              AML_ID=5400
+              if ! getent group agenticml > /dev/null; then
+                groupadd --system --gid "$AML_ID" agenticml
+              fi
+              if ! getent passwd agenticml > /dev/null; then
+                useradd --system --uid "$AML_ID" --gid "$AML_ID" --home /var/lib/agenticml-server --no-create-home --shell /usr/sbin/nologin agenticml
+              fi
+              if [ "$(id -u agenticml)" != "$AML_ID" ] || [ "$(id -g agenticml)" != "$AML_ID" ]; then
+                echo "ERROR: the agenticml user does not have id $AML_ID"
+                exit 1
+              fi
+              if [ "$(stat -c %U /var/lib/agenticml-server)" != agenticml ]; then
+                chown -R agenticml:agenticml /var/lib/agenticml-server
+              fi
+              chmod 0700 /var/lib/agenticml-server
+
+              python3.11 -m venv /opt/agenticml
+              /opt/agenticml/bin/pip install --no-cache-dir 'agenticml-lite[oidc]==${AgenticmlVersion}'
+
+              install -d -m 0755 /etc/agenticml
+              STORAGE_BYTES=$((${WorkspaceStorageGB} * 1000000000))
+              cat > /etc/agenticml-limits.json <<EOF
+              {
+                "default_plan": "free",
+                "free_workspaces_per_account": 1,
+                "plans": {
+                  "free": {
+                    "storage_bytes": $STORAGE_BYTES,
+                    "upload_bytes_per_day": $STORAGE_BYTES,
+                    "requests_per_minute": 600,
+                    "people": ${PeoplePerWorkspace}
+                  }
+                }
+              }
+              EOF
+
+              cat > /etc/agenticml-server.env <<'EOF'
+              AGENTICML_SERVER_PUBLIC_URL=https://${DomainName}
+              AGENTICML_SERVER_TRUSTED_PROXIES=${TrustedProxies}
+              AGENTICML_SERVER_OIDC_ISSUER=https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+              AGENTICML_SERVER_OIDC_CLIENT_ID=${UserPoolClient}
+              AGENTICML_SERVER_OIDC_LOGOUT_URL=https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/logout
+              AGENTICML_SERVER_ADMIN_EMAILS=${AdminEmail}
+              AGENTICML_SERVER_LIMITS=/etc/agenticml-limits.json
+              EOF
+              SIGNUP='${SignUp}'
+              SIGNUP_DOMAINS='${AllowedEmailDomains}'
+              if [ "$SIGNUP" = open ]; then
+                echo 'AGENTICML_SERVER_OPEN_SIGNUP=1' >> /etc/agenticml-server.env
+              fi
+              if [ -n "$SIGNUP_DOMAINS" ]; then
+                echo "AGENTICML_SERVER_SIGNUP_EMAIL_DOMAINS=$SIGNUP_DOMAINS" >> /etc/agenticml-server.env
+              fi
+              chown root:root /etc/agenticml-server.env
+              chmod 0600 /etc/agenticml-server.env
+
+              # A new store gets the administrator's account as owner of the
+              # default workspace, so the first sign-in lands in a workspace
+              # even on an invite-only server. This runs before the service
+              # starts (the store is locked while it runs), and only when the
+              # store has no account yet, so a replacement instance leaves
+              # existing data alone.
+              ADMIN_LOGIN=$(printf '%s' '${AdminEmail}' | tr '[:upper:]' '[:lower:]')
+              aml() {
+                (umask 077; runuser -u agenticml -- /opt/agenticml/bin/agenticml server "$@" --data /var/lib/agenticml-server)
+              }
+              ACCOUNTS=$(aml accounts list --json)
+              if [ "$ACCOUNTS" = '[]' ]; then
+                aml accounts add "$ADMIN_LOGIN"
+                aml workspaces set-owner default --owner "$ADMIN_LOGIN"
+              fi
+
+              cat > /etc/systemd/system/agenticml-server.service <<'EOF'
+              [Unit]
+              Description=AgenticML server
+              Wants=network-online.target
+              After=network-online.target
+              RequiresMountsFor=/var/lib/agenticml-server
+
+              [Service]
+              Type=exec
+              User=agenticml
+              Group=agenticml
+              # Grow the file system to the volume (as root, whatever User= says).
+              ExecStartPre=+/usr/sbin/xfs_growfs /var/lib/agenticml-server
+              ExecStart=/opt/agenticml/bin/agenticml server serve --data /var/lib/agenticml-server --host 0.0.0.0 --port 8080
+              EnvironmentFile=/etc/agenticml-server.env
+              Restart=on-failure
+              RestartSec=5
+              KillSignal=SIGTERM
+              TimeoutStopSec=30
+              NoNewPrivileges=yes
+              ProtectSystem=strict
+              StateDirectory=agenticml-server
+              StateDirectoryMode=0700
+              UMask=0077
+              PrivateTmp=yes
+              ProtectHome=yes
+              CapabilityBoundingSet=
+              RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+              [Install]
+              WantedBy=multi-user.target
+              EOF
+              systemctl daemon-reload
+              systemctl enable --now agenticml-server
+
+              healthy=no
+              for _ in $(seq 1 60); do
+                if curl -fsS --max-time 3 http://127.0.0.1:8080/healthz > /dev/null; then
+                  healthy=yes
+                  break
+                fi
+                sleep 5
+              done
+              if [ "$healthy" != yes ]; then
+                echo "ERROR: the server did not answer /healthz"
+                journalctl -u agenticml-server --no-pager | tail -n 50
+                exit 1
+              fi
+              echo "bootstrap finished $(date -u +%FT%TZ)"
+              signal --success true
+              trap - EXIT
+            - TrustedProxies: !If [CreateVpc, "10.42.0.0/24,10.42.1.0/24", !GetAtt SubnetZone.CidrBlocks]
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: HttpsListener
+    CreationPolicy:
+      ResourceSignal: {Count: 1, Timeout: PT20M}
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 0
+        MaxBatchSize: 1
+        WaitOnResourceSignals: true
+        PauseTime: PT20M
+    Properties:
+      MinSize: "1"
+      MaxSize: "1"
+      DesiredCapacity: "1"
+      # One zone, because the data volume lives in one.
+      VPCZoneIdentifier:
+        - !If [CreateVpc, !Ref SubnetA, !GetAtt SubnetZone.FirstSubnetId]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      TargetGroupARNs: [!Ref TargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 600
+      Tags:
+        - {Key: agenticml:stack, Value: !Ref "AWS::StackName", PropagateAtLaunch: false}
+        # Ordering only: routes must exist before the instance boots and
+        # installs packages.
+        - Key: agenticml:network
+          Value: !If [CreateVpc, !Join [",", [!Ref SubnetARoutes, !Ref SubnetBRoutes]], existing]
+          PropagateAtLaunch: false
+
+Outputs:
+  Url:
+    Description: Address of the server.
+    Value: !Sub https://${DomainName}
+  FirstSteps:
+    Description: First sign-in.
+    Value: !Sub "Open https://${DomainName}, choose Sign in, and sign up with ${AdminEmail}. That account is the server administrator."
+  SyncCommand:
+    Description: Connect a training machine, after creating a key in the dashboard.
+    Value: !Sub "pip install agenticml-lite && agenticml login --host https://${DomainName}"
+  AlbDnsName:
+    Description: Point a CNAME for the domain here when you gave a certificate instead of a hosted zone.
+    Value: !GetAtt LoadBalancer.DNSName
+  DataVolumeId:
+    Description: Data volume. Snapshots stay when the stack is deleted.
+    Value: !Ref DataVolume
+  CognitoUserPoolId:
+    Description: User pool. It stays when the stack is deleted.
+    Value: !Ref UserPool
+  SessionManagerCommand:
+    Description: Shell on the instance, without SSH.
+    Value: !Sub "aws ssm start-session --region ${AWS::Region} --target $(aws ec2 describe-instances --region ${AWS::Region} --filters Name=tag:agenticml:stack,Values=${AWS::StackName} Name=instance-state-name,Values=running --query 'Reservations[0].Instances[0].InstanceId' --output text)"

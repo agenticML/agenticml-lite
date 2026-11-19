@@ -37,6 +37,21 @@ SCOPE = 'openid email profile'
 DEFAULT_LABEL = 'Sign in'
 PROVIDER = 'oidc'
 UID_PREFIX = 'oidc:'
+
+
+def issuer_tag(issuer):
+    """Twelve hex digits that name an issuer inside a stored uid."""
+    return hashlib.sha256(issuer.encode('utf-8')).hexdigest()[:12]
+
+
+def uid_for(issuer, sub):
+    """The stored uid of an OIDC subject: ``oidc:<issuer tag>:<sub>``.
+
+    The tag keeps accounts of one identity pool apart from those of another,
+    so a re-created pool (new subjects) can relink by verified email.
+    """
+    return f'{UID_PREFIX}{issuer_tag(issuer)}:{sub}'
+
 STATE_TTL = 600
 STATE_CAP = 2000
 STATE_PREFIX = 'oidc_state:'
@@ -354,7 +369,7 @@ def verify_id_token(token, config, *, nonce, now=None, keys=None) -> Claims:
     if email is None:
         verified = False
     return Claims(
-        uid=UID_PREFIX + sub, email=email,
+        uid=uid_for(config.issuer, sub), email=email,
         email_verified=verified,
         name=string_or_none(payload.get('name')), provider=PROVIDER)
 

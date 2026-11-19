@@ -211,28 +211,37 @@ class AccountRepo:
         """The sign-in provider's id for an account row, or None.
 
         One provider per server: a Firebase uid as is, an OIDC subject as
-        ``oidc:<sub>``. Both live in the ``firebase_uid`` column (no migration).
+        ``oidc:<issuer tag>:<sub>``. Both live in the ``firebase_uid`` column (no migration).
         """
         return account.get('firebase_uid') if account else None
 
     @staticmethod
-    def legacy_firebase_uid(account):
-        """A Firebase-era uid on the row (anything not ``oidc:<sub>``), else None.
+    def relinkable_uid(account, new_uid):
+        """The uid on the row that a verified OIDC sign-in may replace, else None.
 
-        After a server switches from Firebase to OIDC such an account can no
-        longer sign in; a verified OIDC email may relink it (``relink_external``).
+        That is a Firebase-era uid (anything not ``oidc:``) or an ``oidc:`` uid
+        of a DIFFERENT issuer (its ``oidc:<tag>:`` prefix is not the one of
+        ``new_uid``; this covers a re-created identity pool). The same issuer
+        with another subject is never relinkable: the operator fixes that.
         """
         uid = AccountRepo.external_uid(account)
-        return uid if isinstance(uid, str) and uid and not uid.startswith('oidc:') else None
+        if not (isinstance(uid, str) and uid):
+            return None
+        if not uid.startswith('oidc:'):
+            return uid
+        prefix = new_uid.split(':', 2)
+        if len(prefix) < 3 or prefix[0] != 'oidc':
+            return uid
+        return None if uid.startswith(f'oidc:{prefix[1]}:') else uid
 
     def relink_external(self, account_id, uid, email, verified, tx):
-        """Point an account whose Firebase uid is legacy at an OIDC uid."""
+        """Point an account whose uid is relinkable (see ``relinkable_uid``) at an OIDC uid."""
         tx.advisory_lock('users')
         row = tx.fetchone('SELECT * FROM accounts WHERE id=?', (account_id,))
         if row is None:
             raise ClientError('unknown account')
-        if self.legacy_firebase_uid(dict(row)) is None:
-            raise ClientError('account is not linked to a legacy provider')
+        if self.relinkable_uid(dict(row), uid) is None:
+            raise ClientError('account is not linked to another provider')
         if tx.fetchone('SELECT id FROM accounts WHERE firebase_uid=?', (uid,)):
             raise ClientError('firebase uid already linked')
         tx.execute('UPDATE accounts SET firebase_uid=?, email=?, email_verified=? WHERE id=?',
@@ -895,7 +904,7 @@ class InviteRepo(WorkspaceBound):
                 # Switched from Firebase to OIDC: the email's account still
                 # holds a Firebase uid nobody can sign in with any more.
                 legacy = accounts.get(email, tx)
-                old_uid = accounts.legacy_firebase_uid(legacy)
+                old_uid = accounts.relinkable_uid(legacy, uid)
                 if old_uid is not None:
                     accounts.relink_external(legacy['id'], uid, email, verified, tx)
                     account = accounts.by_firebase_uid(uid, tx)
