@@ -422,9 +422,12 @@ def test_redirect_refuses_to_follow_or_send_key():
     with fake_http(sink) as (_sink, sink_url):
         with fake_http(bounce(sink_url + "/steal")) as (_httpd, url):
             with Client(base_url=url, api_key="secret-key") as client:
-                with pytest.raises(ValueError, match="server redirected; refusing to send the API key") as caught:
+                with pytest.raises(ValueError, match=(
+                        r"server redirected to another URL; use the final https:// URL as --host "
+                        r"\(refusing to send the API key on a redirect\)")) as caught:
                     client.whoami()
                 assert "steal" not in str(caught.value)
+                assert sink_url not in str(caught.value)
                 assert "secret-key" not in str(caught.value)
                 assert "secret-key" not in repr(client)
     assert stolen == []

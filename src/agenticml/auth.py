@@ -9,6 +9,7 @@ import secrets
 import stat
 import sys
 import unicodedata
+from collections import namedtuple
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -181,7 +182,29 @@ def normalize_api_key(key):
     return stripped
 
 
-def _resolve(host=None, api_key=None, *, insecure=False, use_env=True):
+Connection = namedtuple(
+    "Connection", ("host", "key", "source", "http_ok", "ca_bundle", "ca_source"), defaults=(None,)
+)
+
+
+class CABundleError(ValueError):
+    """A CA bundle that cannot be used. The text is fixed and safe to print."""
+
+
+def _saved_entry(data, host):
+    entry = data["hosts"].get(host, {})
+    return entry if isinstance(entry, dict) else {}
+
+
+def resolve_connection(host=None, api_key=None, *, insecure=False, ca_bundle=None,
+                       use_env=True, use_saved=True) -> Connection:
+    """Host, key, and trust settings for one command.
+
+    ``ca_bundle`` is the unvalidated choice, most specific first: the argument,
+    the bundle saved for this exact host, ``AGENTICML_CA_BUNDLE``, else None.
+    ``http_ok`` is true when the argument or the host's saved entry allows plain
+    http. ``use_saved=False`` ignores the saved entry's trust settings (login).
+    """
     data = read_credentials()
     env_host = os.environ.get("AGENTICML_HOST")
     file_host = data.get("default_host")
@@ -193,14 +216,18 @@ def _resolve(host=None, api_key=None, *, insecure=False, use_env=True):
         raw_host, host_source = file_host, "file"
     else:
         raise ValueError("no server host; run `agenticml login --host URL`")
-    resolved_host = normalize_host(raw_host, insecure=insecure)
+    resolved_host = normalize_host(raw_host, insecure=True)
+    entry = _saved_entry(data, resolved_host)
+    http_ok = bool(insecure) or (use_saved and entry.get("insecure") is True)
+    if not http_ok:
+        # Raises the usual refusal for a non-local http host.
+        normalize_host(raw_host, insecure=False)
     if api_key is not None:
         key, source = api_key, "flag"
     elif use_env and "AGENTICML_API_KEY" in os.environ:
         key, source = os.environ["AGENTICML_API_KEY"], "env"
     else:
-        entry = data["hosts"].get(resolved_host, {})
-        key = entry.get("api_key") if isinstance(entry, dict) else None
+        key = entry.get("api_key")
         source = "file"
     if source in ("flag", "env") and host_source == "file":
         print(
@@ -208,12 +235,88 @@ def _resolve(host=None, api_key=None, *, insecure=False, use_env=True):
             file=sys.stderr,
             flush=True,
         )
-    return resolved_host, key, source
+    saved_bundle = entry.get("ca_bundle") if use_saved else None
+    env_bundle = os.environ.get("AGENTICML_CA_BUNDLE")
+    if ca_bundle is not None:
+        chosen, ca_source = ca_bundle, "flag"
+    elif isinstance(saved_bundle, str) and saved_bundle:
+        chosen, ca_source = saved_bundle, "saved"
+    elif env_bundle:
+        chosen, ca_source = env_bundle, "env"
+    else:
+        chosen, ca_source = None, None
+    return Connection(resolved_host, key, source, http_ok, chosen, ca_source)
+
+
+def _resolve(host=None, api_key=None, *, insecure=False, use_env=True):
+    conn = resolve_connection(host, api_key, insecure=insecure, use_env=use_env)
+    return conn.host, conn.key, conn.source
 
 
 def resolve(host=None, api_key=None, *, insecure=False, use_env=True) -> tuple[str, str | None]:
     resolved_host, key, _source = _resolve(host, api_key, insecure=insecure, use_env=use_env)
     return resolved_host, key
+
+
+def _absolute_path(path) -> str:
+    return os.path.abspath(os.path.expanduser(str(path)))
+
+
+def load_ca_bundle(path, *, saved=False) -> str:
+    """Validate a CA bundle and return the path of the final regular file.
+
+    Call this only where a Client is about to be created for an https host.
+    ``saved=True`` marks a value from the credentials file, which must be absolute.
+    """
+    if not isinstance(path, str) or not path:
+        raise CABundleError("CA bundle not found or unreadable: ?")
+    shown = _clean_detail(path)
+    expanded = os.path.expanduser(path)
+    if saved and not os.path.isabs(expanded):
+        raise CABundleError(
+            f"CA bundle path in the credentials file is not absolute: {shown}; "
+            "run `agenticml login --ca-bundle PATH` again"
+        )
+    absolute = os.path.abspath(expanded)
+    final = os.path.realpath(absolute)
+    try:
+        info = os.stat(final)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("not a regular file")
+        with open(final, "rb"):
+            pass
+        parent = os.stat(os.path.dirname(final))
+    except OSError:
+        raise CABundleError(f"CA bundle not found or unreadable: {shown}") from None
+    if _posix():
+        folder = _clean_detail(os.path.dirname(final))
+        for item, what in ((info, "file"), (parent, "directory")):
+            if item.st_uid not in (os.getuid(), 0):
+                if what == "file":
+                    raise CABundleError(f"CA bundle is not owned by you or root: {shown}")
+                raise CABundleError(
+                    f"CA bundle directory is not owned by you or root: {folder}")
+            if stat.S_IMODE(item.st_mode) & 0o022:
+                if what == "file":
+                    raise CABundleError(f"CA bundle is writable by others: {shown}; chmod go-w")
+                raise CABundleError(
+                    f"CA bundle directory is writable by others: {folder}; chmod go-w {folder}")
+    return final
+
+
+def warn_plain_http(host: str) -> None:
+    """Say once per command that the key travels unencrypted to a non-local host."""
+    parts = urlsplit(host)
+    if parts.scheme == "http" and (parts.hostname or "") not in _LOCAL_HTTP:
+        print(f"warning: sending the API key over plain http to {host}",
+              file=sys.stderr, flush=True)
+
+
+def trusted_bundle(conn: Connection) -> str | None:
+    """The validated bundle path for an https connection, else None."""
+    if conn.ca_bundle is None or not conn.host.startswith("https://"):
+        return None
+    return load_ca_bundle(conn.ca_bundle, saved=conn.ca_source == "saved")
 
 
 def key_prefix(key: str) -> str:
@@ -237,6 +340,15 @@ def _exposes_header(exc: BaseException) -> bool:
 
 
 def _report(command, exc):
+    from .client import CABundleUnavailable, tls_hint
+
+    if isinstance(exc, CABundleUnavailable):
+        print(f"agenticml {command}: {exc}", file=sys.stderr)
+        return 1
+    hint = tls_hint(exc)
+    if hint:
+        print(f"agenticml {command}: {hint}", file=sys.stderr)
+        return 1
     if not _exposes_header(exc) and isinstance(exc, (PermissionError, ValueError)):
         print(f"agenticml {command}: {exc}", file=sys.stderr)
         return 1
@@ -257,19 +369,36 @@ def cmd_login(args):
     try:
         # Login does not adopt AGENTICML_API_KEY. A flag key still warns in resolve
         # when the host is taken from the credentials file.
-        host, _ = resolve(args.host, args.key, insecure=args.insecure, use_env=False)
+        # Login trusts only its own flags (plus AGENTICML_CA_BUNDLE), never the saved entry.
+        flag_bundle = getattr(args, "ca_bundle", None)
+        conn = resolve_connection(
+            args.host, args.key, insecure=args.insecure, ca_bundle=flag_bundle,
+            use_env=False, use_saved=False,
+        )
+        host = conn.host
+        https = host.startswith("https://")
+        # A bundle given to login is validated and saved even with --no-verify.
+        bundle = None
+        if https and (flag_bundle is not None or not args.no_verify):
+            bundle = trusted_bundle(conn)
         key = args.key
         if key is None:
             key = getpass.getpass("API key: ") if sys.stdin.isatty() else sys.stdin.readline()
         key = normalize_api_key(key)
         if not args.no_verify:
-            client = Client(base_url=host, api_key=key, insecure=args.insecure)
+            warn_plain_http(host)
+            client = Client(base_url=host, api_key=key, insecure=conn.http_ok, ca_bundle=bundle)
             try:
                 info = client.whoami()
             finally:
                 client.close()
+        entry = {"api_key": key}
+        if https and flag_bundle is not None:
+            entry["ca_bundle"] = _absolute_path(flag_bundle)
+        elif not https and args.insecure and urlsplit(host).hostname not in _LOCAL_HTTP:
+            entry["insecure"] = True
         data = read_credentials()
-        data["hosts"][host] = {"api_key": key}
+        data["hosts"][host] = entry
         data["default_host"] = host
         write_credentials(data)
     except KeyboardInterrupt:
@@ -333,7 +462,10 @@ def cmd_whoami(args):
     from .client import Client, ProtocolError
 
     try:
-        host, key, source = _resolve(args.host, insecure=args.insecure)
+        conn = resolve_connection(
+            args.host, insecure=args.insecure, ca_bundle=getattr(args, "ca_bundle", None)
+        )
+        host, key, source = conn.host, conn.key, conn.source
         if not isinstance(key, str) or not key.strip():
             print(f"{host}: not logged in", file=sys.stderr)
             return 1
@@ -341,7 +473,9 @@ def cmd_whoami(args):
         if args.offline:
             print(f"{host}  key={key_prefix(key)}  source={source}  unchecked (offline)")
             return 0
-        client = Client(base_url=host, api_key=key, insecure=args.insecure)
+        bundle = trusted_bundle(conn)
+        warn_plain_http(host)
+        client = Client(base_url=host, api_key=key, insecure=conn.http_ok, ca_bundle=bundle)
         try:
             info = client.whoami()
         finally:

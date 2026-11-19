@@ -19,6 +19,12 @@ After=network-online.target
 [Service]
 Type=exec
 ExecStart=%h/.local/bin/agenticml sync --follow
+# Private network with an internal CA (deploy/private-network/README.md): the
+# bundle saved by `agenticml login --ca-bundle PATH` is used with no extra
+# setting. Set this only if login was run without --ca-bundle:
+# Environment=AGENTICML_CA_BUNDLE=/etc/ssl/certs/lab-ca.pem
+# If HTTPS_PROXY is set on this machine, keep the lab server off the proxy:
+# Environment=NO_PROXY=agenticml.lab.internal
 Restart=on-failure
 RestartSec=30
 # Exit status 3 means the API key was rejected: fix it with agenticml login.

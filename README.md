@@ -254,6 +254,7 @@ sudo systemctl enable --now agenticml-server
 Put a TLS reverse proxy in front:
 - **Workstation:** `agenticml server up` makes the server reachable from the public internet through Tailscale Funnel. Manual steps: `tailscale serve --bg 8080` and set `AGENTICML_SERVER_PUBLIC_URL=https://<machine>.<tailnet>.ts.net`.
 - **Production:** Caddy, Nginx, or an AWS Application Load Balancer. Set the public URL to the proxied HTTPS URL.
+- **Private network (no Tailscale):** run inside a lab VPC behind Caddy or nginx with an internal CA. See [Private network (no Tailscale)](docs/SERVER.md#private-network-no-tailscale).
 
 ### Workspaces and roles
 

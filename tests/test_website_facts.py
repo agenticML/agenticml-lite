@@ -209,3 +209,11 @@ def test_login_key_detector_catches_examples():
     assert _login_key_examples('Run `agenticml login --key abc` now.')
     assert not _login_key_examples('```bash\nagenticml export --key loss\n```')
     assert not _login_key_examples('Use the `agenticml login` prompt. Avoid `--key`.')
+
+
+def test_private_network_page_has_the_key_facts():
+    """Protects readers of the private-network page: the client flag and
+    variable, the proxy body limit and the minimum version must be on it."""
+    text = _text('server/private-network.md')
+    for needle in ('--ca-bundle', 'AGENTICML_CA_BUNDLE', 'client_max_body_size 4g', 'agenticml-lite>=3.2'):
+        assert needle in text, f'server/private-network.md does not mention {needle}'

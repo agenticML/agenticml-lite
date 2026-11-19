@@ -24,9 +24,9 @@ from pathlib import Path
 import requests
 from requests import HTTPError
 
-from .auth import resolve
+from .auth import resolve_connection, trusted_bundle, warn_plain_http
 from . import lineage
-from .client import Conflict, ProtocolError, SyncStopped
+from .client import CABundleUnavailable, Conflict, ProtocolError, SyncStopped, tls_hint
 from .store.gc import prunable_series, prune_run, run_fingerprint
 from .store.layout import (
     RECORD_SIZE, _LOCK_UNSUPPORTED, _open_regular_fd, fsync_dir, open_nofollow,
@@ -1204,10 +1204,13 @@ def _short_error(exc):
             if detail:
                 return f"HTTP {code}: {detail}"
         return f"HTTP {code}"
-    if isinstance(exc, ProtocolError):
+    if isinstance(exc, (ProtocolError, CABundleUnavailable)):
         return str(exc)
     if isinstance(exc, (ValueError, FileNotFoundError, Conflict)):
         return _clean_detail(str(exc).splitlines()[0])
+    hint = tls_hint(exc)
+    if hint:
+        return hint
     return type(exc).__name__
 
 
@@ -1385,7 +1388,7 @@ def _selected_ids(root, host, explicit, include_all, prune=False, key=None, feat
     return _order_runs_lineage(root, selected)
 
 
-def _follow(args, root, host, api_key):
+def _follow(args, root, host, api_key, ca_bundle=None, http_ok=False):
     from .client import Client
 
     interval = args.interval if args.interval is not None else FOLLOW_INTERVAL
@@ -1421,7 +1424,9 @@ def _follow(args, root, host, api_key):
             for sig in (signal.SIGTERM, signal.SIGINT):
                 previous[sig] = signal.getsignal(sig)
                 signal.signal(sig, handle)
-        client = Client(base_url=host, api_key=api_key, insecure=args.insecure, stop=stop)
+        warn_plain_http(host)
+        client = Client(base_url=host, api_key=api_key, insecure=http_ok, stop=stop,
+                        ca_bundle=ca_bundle)
         # Only for the count below; the identity (and so the workspace) is
         # read in the loop, so use the dry-run cursor guess here.
         selected = _selected_ids(root, host, run_ids, include_all, prune=prune, dry_run=True)
@@ -1579,7 +1584,8 @@ def cmd_sync(args):
         if not args.run_ids:
             print("agenticml sync: --reset requires explicit run ids", file=sys.stderr)
             return 2
-        host, _ = resolve(args.host, args.api_key, insecure=args.insecure)
+        host = resolve_connection(args.host, args.api_key, insecure=args.insecure,
+                                  ca_bundle=getattr(args, "ca_bundle", None)).host
         root = resolve_root(args.dir)
         for run_id in args.run_ids:
             try:
@@ -1598,29 +1604,37 @@ def cmd_sync(args):
         return 2
     if follow:
         try:
-            host, api_key = resolve(args.host, args.api_key, insecure=args.insecure)
+            conn = resolve_connection(args.host, args.api_key, insecure=args.insecure,
+                                      ca_bundle=getattr(args, "ca_bundle", None))
+            host, api_key = conn.host, conn.key
             if not api_key:
                 print("not logged in — run `agenticml login`", file=sys.stderr)
                 return 1
             root = resolve_root(args.dir)
+            bundle = trusted_bundle(conn)
         except Exception as exc:
             print(f"agenticml sync: {_short_error(exc)}", file=sys.stderr)
             return 1
-        return _follow(args, root, host, api_key)
+        return _follow(args, root, host, api_key, bundle, conn.http_ok)
     client = None
     results = {}
     failures = 0
     active = None
     failure_log = _FailureLog()
     try:
-        host, api_key = resolve(args.host, args.api_key, insecure=args.insecure)
+        conn = resolve_connection(args.host, args.api_key, insecure=args.insecure,
+                                  ca_bundle=getattr(args, "ca_bundle", None))
+        host, api_key = conn.host, conn.key
         if not args.dry_run and not api_key:
             print("not logged in — run `agenticml login`", file=sys.stderr)
             return 1
         root = resolve_root(args.dir)
         if not args.dry_run:
             from .client import Client
-            client = Client(base_url=host, api_key=api_key, insecure=args.insecure)
+            bundle = trusted_bundle(conn)
+            warn_plain_http(host)
+            client = Client(base_url=host, api_key=api_key, insecure=conn.http_ok,
+                            ca_bundle=bundle)
             _identity(client)
         prune = getattr(args, "prune", False)
         artifacts = getattr(args, "artifacts", False)

@@ -31,6 +31,33 @@ This works on every version. The `agenticml --version` command works from 3.0. O
 
 ---
 
+## 3.2.0
+
+**Status:** Not yet released.
+
+Version 3.1 was not released separately; 3.2.0 includes the 3.1 work below. Install from PyPI once it is published:
+
+```bash
+pip install 'agenticml-lite[system]'
+```
+
+### Private networks
+
+Run the server and dashboard inside a private network, with no Tailscale, behind a TLS proxy that uses an internal certificate. See [Private network](/agenticml-lite/server/private-network/).
+
+- **CA bundle:** `agenticml login`, `sync` and `whoami` take `--ca-bundle PATH`. `login --ca-bundle` saves the bundle for that host. `AGENTICML_CA_BUNDLE` sets one for every https host that has no saved bundle.
+- **Plain http per host:** `agenticml login --insecure` to a non-local `http://` host remembers that consent for that exact host only. Other hosts are still refused.
+- **Clear TLS errors:** A failed certificate check, or an `https://` URL that points at a port that does not speak TLS, fails at once with a hint instead of retrying. Other handshake failures are retried a few times, then show a "TLS handshake failed" hint. A redirect error says to use the final `https://` URL.
+- **Deploy kit:** `deploy/private-network/` has a Caddyfile, an nginx configuration, an environment file for the server unit, and a step-by-step README. The server and every training machine need `agenticml-lite>=3.2`.
+
+### Usage history and scale
+
+- **Usage history:** The server keeps one row of totals per day (accounts, active accounts, workspaces, stored and uploaded bytes, runs). `/admin` charts them, and `agenticml server stats` prints them. This works on a self-hosted server too.
+- **Capacity metrics:** With `--metrics cloudwatch`, the server sends request, error, latency, load and connection metrics to Amazon CloudWatch once a minute. They are off by default. The AWS deployment adds alarms and a CloudWatch dashboard.
+- **Autoscaling for the hosted service:** The ECS service can scale on CPU between `DesiredCount` and a new `MaxTaskCount` (1 to 4). The default, 1, keeps autoscaling off. Each task gets a database connection budget sized by the new `DbInstanceClass` parameter.
+
+---
+
 ## 3.0.0
 
 **Status:** Released Nov 17, 2026 (tag `v3.0.0`). On PyPI. The hosted service is in public preview.

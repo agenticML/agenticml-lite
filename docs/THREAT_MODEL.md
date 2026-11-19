@@ -18,7 +18,11 @@ The server protects seven primary assets:
 
 Trust boundaries define the isolation model across single-tenant and multi-tenant configurations:
 
-1. **Client / Training Node ↔ Reverse proxy ↔ Server**: The server speaks HTTP on a private interface behind a TLS-terminating reverse proxy (e.g. AWS ALB, Tailscale, or Caddy). The server trusts `X-Forwarded-For` and proxy identity headers only when requests originate from configured `--trusted-proxy` CIDR ranges.
+1. **Client / Training Node ↔ Reverse proxy ↔ Server**: The server speaks HTTP on a private interface behind a TLS-terminating reverse proxy (e.g. AWS ALB, Tailscale, Caddy, or nginx). The server trusts `X-Forwarded-For` and proxy identity headers only when requests originate from configured `--trusted-proxy` CIDR ranges. In private-network deployments:
+   - `--trusted-proxy` is configured strictly as the proxy's exact `/32` address (`127.0.0.1/32`), never a subnet.
+   - Reverse proxies must strip incoming client-supplied identity headers (`X-Forwarded-Email`, `X-Amzn-Oidc-Identity`, `Tailscale-User-Login`).
+   - Enable `--identity-header` only when an authenticating proxy (such as oauth2-proxy) sits directly in front of the server and is the only trusted proxy; the server cannot tell whether the proxy authenticated the user.
+   - Reverse proxies must exclude query strings from access logs to prevent recording one-time setup and invite tokens.
 2. **Workspace ↔ Workspace (Multi-tenancy)**: In hosted or multi-workspace environments, multiple organizations and teams share the same hostname, database, and infrastructure. One workspace must never access, list, modify, or detect the existence of another workspace's runs, keys, files, or objects.
 3. **Dashboard user ↔ Server**: Users authenticate via local username/password, trusted identity proxy headers, or Firebase Authentication tokens. Sessions are tracked via database-backed session cookies.
 4. **Server admin ↔ Workspace data**: Server administrators possess global management privileges (creating and suspending workspaces, setting quotas), but are not granted ambient read access to customer runs or experiment files.
@@ -117,6 +121,16 @@ Trust boundaries define the isolation model across single-tenant and multi-tenan
   - **Last server admin guard**: The last server admin who can sign in (password, identity proxy or Firebase) is never removed by the list, web, or CLI; a pending admin that has never signed in does not count.
   - **No ambient workspace access**: Server administrators see no workspace data without membership. An admin without workspace membership lands on `/workspaces` with an Admin button and Sign out and cannot access customer runs, files, or objects.
 
+### 11. Client transport security and trust controls
+
+- **Threat**: Interception, eavesdropping, or tampering with training data and machine credentials in transit; exfiltration of API keys via plain HTTP or HTTP redirects; local privilege escalation through untrusted CA bundles; or information leakage through exception details.
+- **Controls**:
+  - **Certificate verification is never disabled**: TLS certificate verification is always enforced on HTTPS connections; there is no flag, environment variable, or setting to turn verification off.
+  - **Per-exact-host HTTP consent**: Non-local plain `http://` URLs are rejected by default. Passing `--insecure` on `agenticml login` records consent strictly for that exact normalized host and port; subsequent commands to other hosts still require HTTPS. Commands that send API keys over plain HTTP emit an explicit warning to stderr (`warning: sending the API key over plain http to <host>`).
+  - **CA bundle ownership and permissions**: Custom CA bundles and their parent directories must be regular files owned by the current user or root, and neither the file nor its directory may be writable by group or other users (`mode & 0o022 == 0`). Saved bundle paths must be absolute.
+  - **No redirects followed**: The client strictly refuses HTTP 3xx redirects on all requests, aborting immediately without transmitting the bearer API key to a redirected location. The target `Location` header is never reflected in error messages.
+  - **Fixed-text TLS error messages**: TLS and certificate errors display sanitized, fixed hint strings. Raw exception text from `requests` or `ssl` is never echoed, preventing leakage of internal network details or exception parameters.
+
 ## Out of scope
 
 The following threats are outside the system's defensive boundary:
@@ -139,9 +153,11 @@ The following threats are outside the system's defensive boundary:
 | `server/lineage.py` | Bounded Git bundle headers, isolated quarantine validation, immutable ref updates, and sanitized Git execution environments. |
 | `store/layout.py` | Path traversal prevention, `O_NOFOLLOW` file operations, regular file checks (`S_ISREG`), and hard link rejection. |
 | `ui/server.py` | Dashboard sessions, CSRF headers (`X-AgenticML-Request`), Origin checks, Host header validation, and role-based note editing. |
+| `auth.py` | Connection resolution (`resolve_connection`), CA bundle validation and POSIX mode checks (`load_ca_bundle`), per-exact-host insecure HTTP consent, credentials file permissions, and plain HTTP warnings. |
+| `client.py` | TLS verification enforcement, fixed-text TLS failure hints (`tls_hint`), redirect rejection without credential leakage, and body streaming. |
 
 ## Known limits
 
 - **Audit log rotation**: While audit events are written to the database or an append-only file, cryptographic hash-chaining is not implemented. In self-hosted mode, operators should configure log rotation.
 - **Stale writer residual window**: As documented above, a process paused longer than database keepalive timeouts could write to file storage after losing its lease; all readers treat uncommitted bytes as untrusted until committed in the database.
-- **Client TLS termination**: The server process speaks plain HTTP and relies on an external TLS-terminating reverse proxy or ALB in production.
+- **Client TLS termination**: The server process speaks plain HTTP and relies on an external TLS-terminating reverse proxy or ALB in production. On private networks, reverse proxies must strictly enforce the private-network conditions (exact `/32` trusted proxy, stripping identity headers, and omitting query strings from access logs).
