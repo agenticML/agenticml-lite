@@ -12,6 +12,7 @@ plans live next to it:
 - Release 2.2: [on-prem-teams-plan.md](on-prem-teams-plan.md)
 - Release 3.0: [on-prem-3.0-plan.md](on-prem-3.0-plan.md)
 - Release 3.1: sketched below, with package plans in `packages/`.
+- Release 3.3: [packages/35-aws-self-deploy.md](packages/35-aws-self-deploy.md).
 
 ## Product direction
 
@@ -39,6 +40,7 @@ plans live next to it:
 | **2.2** | Teams | Users and roles, per-user keys, dashboard sign-in through a trusted identity proxy, audit log | Two users with different roles share one server, each with the access their role allows, and every write is attributed |
 | **3.0** | Database storage, workspaces and hosted service | Server state in SQLite or Postgres, workspaces with accounts and memberships on one hostname, Firebase sign-in and self-serve sign-up with free limits, many server processes, S3 objects, metric summaries, AWS deployment, agenticml-server retired | Exit criteria 1–6 in the [3.0 plan](on-prem-3.0-plan.md); released Nov 17, 2026 as 3.0.0 (tag `v3.0.0`, [PyPI](https://pypi.org/project/agenticml-lite/3.0.0/), [GitHub release](https://github.com/agenticML/agenticml-lite/releases/tag/v3.0.0)) |
 | **3.1** | Scale and visibility | Usage history on `/admin` and `agenticml server stats`, capacity metrics with a CloudWatch dashboard and alarms, ECS autoscaling for the hosted service | A server admin sees accounts, active users, workspaces and stored data over time; the hosted service shows request, latency, task and database load on one dashboard; under a load test it scales between 1 and its maximum task count with no failed requests |
+| **3.3** | Deploy in your own AWS account | One CloudFormation template (EC2 + SQLite from PyPI, ALB + ACM, Cognito sign-up and sign-in) and OIDC sign-in in the server | A deployer with an AWS account and a Route 53 domain launches the template, signs up with the admin email and syncs a run, with no other setup |
 | Later | Scale and lifecycle | Unscheduled; see below | – |
 
 Decision (Nov 5, 2026): the server ships only as the `agenticml-lite`
@@ -358,6 +360,27 @@ Backlog.
   at most 2 tasks; 3–4 tasks need `db.t4g.small` (about +$12/month). It
   ships off (`MaxTaskCount` 1); the owner turns it on after the bootstrap
   re-apply and the two-task check.
+
+### 3.3: deploy in your own AWS account
+
+Added Nov 19, 2026 at the owner's request ("make things a lot simpler for
+onboarding … a CloudFormation script for users who want to deploy; target
+users that have an AWS environment"). Today, self-serve sign-up needs a
+Firebase project, and our AWS templates are tied to our account. Decisions
+D35.1–D35.7 are in the plan: one EC2 instance with SQLite installed from
+PyPI (no image), ALB + ACM, Amazon Cognito through a generic OIDC client
+in the server (which also starts the Later "Enterprise SSO" entry), and
+about $45–55/month. It comes after 3.2 (package 34); 35.1 and 35.2 do not
+touch 34's files, and 35.3 waits for 34.3.
+
+| # | Package | Depends on | Coder | Size | Plan | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| 35 † | Deploy in your own AWS account | 3.2 | Sonnet; prose Antigravity; owner releases and deploys | L | [plan](packages/35-aws-self-deploy.md) | plan ready |
+| 35.1 † | Server: OIDC sign-in (authorization code + PKCE), open sign-up, admin emails and invites on OIDC, `--signup-email-domains`, `[oidc]` extra | 3.0 | Sonnet | M–L | [plan](packages/35-aws-self-deploy.md) | plan ready |
+| 35.2 † | Template `deploy/aws-self-hosted/agenticml.yaml` (VPC optional, ALB, ACM, Route 53, Cognito, EC2 Auto Scaling group of 1, data volume with daily snapshots), static tests, cfn-lint in CI | 35.1 options | Sonnet | M | [plan](packages/35-aws-self-deploy.md) | plan ready |
+| 35.3 | Docs: "Deploy on AWS" page, SERVER.md OIDC section, threat model, README, facts test | 35.2, 34.3 | Antigravity; supervisor checks | S–M | [plan](packages/35-aws-self-deploy.md) | plan ready |
+| 35.4 | Version 3.3.0; template on the GitHub release; Launch Stack link (owner: public S3 bucket) | 35.3, 34.4 | Sonnet; owner tags and publishes | S | [plan](packages/35-aws-self-deploy.md) | plan ready |
+| 35.5 | First real deploy in an AWS account (owner step) | 35.4 | Owner | S | [plan](packages/35-aws-self-deploy.md) | not started |
 
 ### Maintenance fixes
 
