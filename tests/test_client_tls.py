@@ -684,17 +684,28 @@ def test_follow_survives_a_bundle_that_disappears_and_recovers(
     chunks, thread, box = start_follow(monkeypatch, runs)
     wait_until(lambda: tls_server.hits, thread, box, follow_ctx, msg="no whoami reached the server")
     # The identity is cached per client, so use a fresh failure path: remove the
-    # file, then force the next request through by dropping the cached identity.
+    # file, then force requests through by dropping the cached identity.  The
+    # follow thread polls every 0.03 s, so a request already in flight (or the
+    # first whoami, whose hit the server logs before the client caches the
+    # reply) can finish after a one-off reset and re-cache the identity, and
+    # nothing would ever re-read the bundle.  So repeat the reset on every poll
+    # until the retry line shows up.
     bundle.unlink()
-    for client in follow_ctx["clients"]:
-        # A pooled keep-alive TLS connection would never re-read the deleted file.
-        client.session.close()
-        client.__dict__.pop("_sync_identity", None)
 
     def lines():
         return [t for t in chunks["out"] if "server unreachable" in t]
 
-    wait_until(lambda: lines(), thread, box, follow_ctx, msg="no retry line after the bundle vanished")
+    def reset_clients():
+        for client in list(follow_ctx["clients"]):
+            # A pooled keep-alive TLS connection would never re-read the deleted file.
+            client.session.close()
+            client.__dict__.pop("_sync_identity", None)
+
+    def vanished_noticed():
+        reset_clients()
+        return lines()
+
+    wait_until(vanished_noticed, thread, box, follow_ctx, msg="no retry line after the bundle vanished")
     assert thread.is_alive()
     for text in lines():
         assert text.startswith("server unreachable (CA bundle not found or unreadable: ")
@@ -702,9 +713,14 @@ def test_follow_survives_a_bundle_that_disappears_and_recovers(
         assert "OSError" not in text
     before = len(tls_server.hits)
     copy_bundle(certs.ca1, bundle)
-    for client in follow_ctx["clients"]:
-        client.session.close()
-    wait_until(lambda: len(tls_server.hits) > before, thread, box, follow_ctx,
+
+    def recovered():
+        # Drop any connection opened before the bundle came back, on every poll.
+        for client in list(follow_ctx["clients"]):
+            client.session.close()
+        return len(tls_server.hits) > before
+
+    wait_until(recovered, thread, box, follow_ctx,
                msg="follow did not recover after the bundle came back")
     stop_follow(follow_ctx)
     assert join_follow(thread, box, follow_ctx) == 0
