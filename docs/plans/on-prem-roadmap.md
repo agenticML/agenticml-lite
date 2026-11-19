@@ -493,6 +493,10 @@ on Nov 17, 2026; none of the entries below blocked it.
   - Done when: the variable is gone, a deploy log shows `***` for
     `ADMIN_EMAILS`, admin sign-in still works, and whether old logs were
     deleted is recorded here.
+  - Progress: (1) and (2) done Nov 19, 2026 (secret set 14:13 UTC, variable
+    deleted). Until this PR is merged, do not approve a deploy from `dev`:
+    the old workflow would read the now-empty variable and drop the admin
+    list.
 - **Capacity dashboard and metrics** (package 32, Nov 18, 2026). Do after
   the 3.1 PR is merged to `dev` and deployed.
   - Where: `deploy/aws/README.md`, "Capacity dashboard and metrics"; the
