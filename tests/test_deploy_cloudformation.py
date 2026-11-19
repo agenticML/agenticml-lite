@@ -5,7 +5,10 @@ become ``{"Fn::X": value}`` mappings, as in the JSON form) and inspected.
 """
 import fnmatch
 import json
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -1170,12 +1173,69 @@ def test_deploy_workflow_run_blocks_take_values_from_env_only():
         assert '${{' not in block, block
 
 
-def test_deploy_workflow_passes_the_admin_emails_variable_as_a_parameter_override():
+def test_deploy_workflow_passes_the_admin_emails_secret_as_a_parameter_override():
     steps = load_workflow('deploy.yml')['jobs']['deploy']['steps']
     (deploy,) = [s for s in steps if 'ADMIN_EMAILS' in s.get('env', {})]
-    assert deploy['env']['ADMIN_EMAILS'] == '${{ vars.HOSTED_ADMIN_EMAILS }}'
+    assert deploy['env']['ADMIN_EMAILS'] == '${{ secrets.HOSTED_ADMIN_EMAILS }}'
     assert 'AdminEmails="$ADMIN_EMAILS"' in deploy['run']
     assert '${{' not in deploy['run']
+
+
+def _deploy_step():
+    steps = load_workflow('deploy.yml')['jobs']['deploy']['steps']
+    (deploy,) = [s for s in steps if 'ADMIN_EMAILS' in s.get('env', {})]
+    return deploy
+
+
+def _check_step():
+    steps = load_workflow('deploy.yml')['jobs']['deploy']['steps']
+    (check,) = [s for s in steps if s.get('name') == 'Check required variables']
+    return check
+
+
+def test_deploy_workflow_masks_each_admin_email_before_the_deploy():
+    run = _deploy_step()['run']
+    assert '::add-mask::' in run
+    assert run.index('::add-mask::') < run.index('aws cloudformation deploy')
+
+
+def test_deploy_workflow_reads_the_admin_emails_variable_only_as_a_flag():
+    text = (ROOT / '.github/workflows/deploy.yml').read_text()
+    uses = re.findall(r'vars\.HOSTED_ADMIN_EMAILS.*', text)
+    assert uses
+    for use in uses:
+        assert re.match(r"vars\.HOSTED_ADMIN_EMAILS != ''", use), use
+
+
+def _run_bash(block, env):
+    result = subprocess.run(['bash', '-c', block], env=env, capture_output=True, text=True)
+    return result.returncode, result.stdout
+
+
+@pytest.mark.skipif(shutil.which('bash') is None, reason='bash is not installed')
+@pytest.mark.parametrize('flag, fails', [('true', True), ('false', False)])
+def test_deploy_workflow_check_step_refuses_a_leftover_admin_emails_variable(flag, fails):
+    env = {'PATH': os.environ['PATH'], 'DEPLOY_ROLE_ARN': 'arn:aws:iam::123456789012:role/deploy',
+           'CFN_ROLE_ARN': 'arn:aws:iam::123456789012:role/cfn', 'ADMIN_EMAILS_VARIABLE_SET': flag}
+    code, stdout = _run_bash(_check_step()['run'], env)
+    if fails:
+        assert code != 0
+        assert 'HOSTED_ADMIN_EMAILS' in stdout
+    else:
+        assert code == 0
+
+
+@pytest.mark.skipif(shutil.which('bash') is None, reason='bash is not installed')
+def test_deploy_workflow_masking_prints_one_mask_per_address():
+    run = _deploy_step()['run']
+    masking = run[:run.index('overrides=(')]
+    base = {'PATH': os.environ['PATH']}
+    code, stdout = _run_bash(masking, {**base, 'ADMIN_EMAILS': 'a@example.com,b@example.com'})
+    assert code == 0
+    assert stdout.splitlines() == ['::add-mask::a@example.com', '::add-mask::b@example.com']
+    code, stdout = _run_bash(masking, {**base, 'ADMIN_EMAILS': ''})
+    assert code == 0
+    assert stdout == ''
 
 
 def test_deploy_workflow_passes_the_legal_base_url_variable_as_a_parameter_override():

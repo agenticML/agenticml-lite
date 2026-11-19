@@ -157,11 +157,21 @@ gh variable set AWS_CFN_ROLE_ARN --env hosted --body "<CloudFormationRoleArn>"
 gh variable set AWS_REGION --env hosted --body "us-east-2"
 gh variable set HOSTED_MULTI_AZ --env hosted --body "false"
 gh variable set HOSTED_OPEN_SIGNUP --env hosted --body "false"
-gh variable set HOSTED_ADMIN_EMAILS --env hosted --body "you@example.com"
 ```
 
 Leave `HOSTED_FIREBASE_PROJECT` and `HOSTED_FIREBASE_API_KEY` unset until Firebase is
 ready; the workflow passes unset variables to the template as empty strings.
+
+4. **Environment secret**: Set the admin emails as a secret, not a variable:
+
+```sh
+gh secret set HOSTED_ADMIN_EMAILS --env hosted
+```
+
+`gh` prompts for the value (comma-separated, no spaces; for example
+`you@example.com`), so it stays out of your shell history. Run logs of this
+public repository print variables, while secrets show as `***`. GitHub cannot
+show a secret's value again, so keep the list somewhere safe.
 
 | Variable | Value | Default |
 | --- | --- | --- |
@@ -172,7 +182,6 @@ ready; the workflow passes unset variables to the template as empty strings.
 | `HOSTED_FIREBASE_PROJECT` | Firebase project ID (empty = Firebase off) | (empty) |
 | `HOSTED_FIREBASE_API_KEY` | Public Firebase web API key | (empty) |
 | `HOSTED_OPEN_SIGNUP` | `true` or `false` | `false` |
-| `HOSTED_ADMIN_EMAILS` | Comma-separated admin emails (no spaces; empty = none) | (empty) |
 | `HOSTED_LEGAL_BASE_URL` | `https://` base URL of the policy pages (`terms/`, `acceptable-use/`, `privacy/` under it); the sign-in page links to them. Set it only after the policies are published; empty = no links. A value with a query, fragment or credentials is rejected at deploy; the server also refuses to start on a bad value | (empty) |
 
 `HOSTED_OPEN_SIGNUP=true` requires a non-empty `HOSTED_FIREBASE_PROJECT`;
@@ -180,8 +189,29 @@ otherwise CloudFormation template assertions fail before any resource changes.
 The task count is no longer a variable: it comes from the deploy workflow's
 `desired_count` and `max_task_count` inputs (see First deploy and Operations and
 scaling). Delete `HOSTED_DESIRED_COUNT` if it is already set; nothing reads it.
-No secrets are needed. The database password is generated and stored in an
-RDS-managed secret.
+
+| Secret | Value | Default |
+| --- | --- | --- |
+| `HOSTED_ADMIN_EMAILS` | Comma-separated admin emails (no spaces; empty = none) | (empty) |
+
+`HOSTED_ADMIN_EMAILS` is a secret, never a variable: the deploy stops at "Check
+required variables" while a `HOSTED_ADMIN_EMAILS` *variable* exists. The
+database password is generated and stored in an RDS-managed secret.
+
+### Moving the admin emails from a variable to a secret
+
+Existing deployments that set `HOSTED_ADMIN_EMAILS` as a variable must move it
+before the next deploy:
+
+```sh
+gh secret set HOSTED_ADMIN_EMAILS --env hosted
+gh variable delete HOSTED_ADMIN_EMAILS --env hosted
+```
+
+Enter the same value at the prompt. Old run logs still contain the address. To
+remove it, delete those runs' logs (`gh run list --workflow deploy.yml --limit 200`, then
+`gh api -X DELETE repos/<owner>/<repo>/actions/runs/<id>/logs`), or delete the
+runs in the Actions tab.
 
 ## First deploy
 
@@ -300,10 +330,12 @@ The hosted service uses its own Firebase project, `agenticml-hosted`
    (without Firebase Hosting) and note its `projectId` and `apiKey`.
 2. Set `HOSTED_FIREBASE_PROJECT`, `HOSTED_FIREBASE_API_KEY`, and
    `HOSTED_ADMIN_EMAILS` (comma-separated, no spaces; your Google email
-   address, e.g. `you@example.com`) in the GitHub `hosted` environment
-   variables. Keep `HOSTED_OPEN_SIGNUP=false`.
-3. Re-run the deploy workflow and approve it. The variables are read when the
-   job runs, so re-running the latest deploy run picks them up.
+   address, e.g. `you@example.com`) in the GitHub `hosted` environment:
+   the first two as variables, `HOSTED_ADMIN_EMAILS` as a secret
+   (`gh secret set HOSTED_ADMIN_EMAILS --env hosted`). Keep
+   `HOSTED_OPEN_SIGNUP=false`.
+3. Re-run the deploy workflow and approve it. The variables and the secret are
+   read when the job runs, so re-running the latest deploy run picks them up.
 
 ### Self-serve administration and customer workspaces (main path)
 
@@ -370,7 +402,7 @@ workspace per account.
 
 The `/setup` endpoint only exists with Firebase off. With Firebase on, `/setup`
 returns 404, and the first server admin comes from `HOSTED_ADMIN_EMAILS` (set the
-variable, deploy, and sign in with Google as described above).
+secret, deploy, and sign in with Google as described above).
 
 When running with Firebase off, the server logs a one-time `/setup` link at
 startup while no administrator exists. Retrieve the link from CloudWatch:
@@ -950,7 +982,8 @@ matched database, files, and object recovery point into an isolated stack before
 moving traffic. Never guess at downgrade compatibility.
 
 To make configuration changes (Multi-AZ, Firebase settings, open sign-up, admin emails, or the policy base URL):
-1. Update the corresponding variable in the GitHub `hosted` environment.
+1. Update the corresponding variable in the GitHub `hosted` environment (the
+   admin emails are the secret `HOSTED_ADMIN_EMAILS`).
 2. Re-run the deploy workflow with the currently deployed commit ref or SHA
    (or use "Re-run all jobs" on the last deploy run, which reads the
    variables again and needs approval again).

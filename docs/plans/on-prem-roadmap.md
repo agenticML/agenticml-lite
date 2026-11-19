@@ -390,6 +390,12 @@ example or docs). It does not depend on 3.1 (packages 31–33, merged in
   e2e and metrics tests): [plan](packages/fix-flaky-postgres-timeouts.md),
   found in [#83](https://github.com/agenticML/agenticml-lite/pull/83);
   status: done ([#85](https://github.com/agenticML/agenticml-lite/pull/85)).
+- The hosted deploy log printed the admin email addresses
+  (`HOSTED_ADMIN_EMAILS` variable) in this public repository's Actions logs:
+  [plan](packages/fix-admin-emails-in-deploy-log.md), found in deploy run
+  44499848598 (Nov 19, 2026); the value moves to an environment secret and
+  each address is masked; status: done (this PR; owner step in the
+  Backlog).
 
 ### Later (unscheduled)
 
@@ -466,6 +472,27 @@ on Nov 17, 2026; none of the entries below blocked it.
 
 ### Owner steps
 
+- **Move the admin emails to a secret** (fix
+  [admin emails in the deploy log](packages/fix-admin-emails-in-deploy-log.md),
+  Nov 19, 2026). High priority: do it before the next hosted deploy; deploys
+  stop at "Check required variables" until it is done.
+  - Where: repository Settings → Environments → `hosted`; Actions run logs of
+    `deploy.yml`.
+  - Problem: the `HOSTED_ADMIN_EMAILS` variable was printed in every deploy
+    run log, and the repository is public. The fix reads it from an
+    environment secret instead, but the value can only be moved by the owner,
+    and the old run logs still contain the address.
+  - Fix: (1) `gh secret set HOSTED_ADMIN_EMAILS --env hosted` with the same
+    value (it prompts); (2) `gh variable delete HOSTED_ADMIN_EMAILS --env
+    hosted`; (3) approve the next deploy and check that its log shows
+    `ADMIN_EMAILS: ***` and that you still have server admin after signing in
+    again; (4) optional: delete the logs of earlier deploy runs
+    (`gh run list --workflow deploy.yml --limit 200`, then
+    `gh api -X DELETE repos/agenticML/agenticml-lite/actions/runs/<id>/logs`
+    for each, or delete the runs in the Actions tab).
+  - Done when: the variable is gone, a deploy log shows `***` for
+    `ADMIN_EMAILS`, admin sign-in still works, and whether old logs were
+    deleted is recorded here.
 - **Capacity dashboard and metrics** (package 32, Nov 18, 2026). Do after
   the 3.1 PR is merged to `dev` and deployed.
   - Where: `deploy/aws/README.md`, "Capacity dashboard and metrics"; the
