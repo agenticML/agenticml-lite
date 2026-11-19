@@ -2127,13 +2127,15 @@ def main(argv=None):
     p_sync.add_argument("--prune", action="store_true", help="Delete raw series (.bin) with valid overviews after sync")
     p_sync.add_argument("--reset", action="store_true", help="Forget this host's saved cursor for the given runs; the next sync resumes from the server")
     p_sync.add_argument("--insecure", action="store_true", help="Allow http:// to a non-local host")
+    p_sync.add_argument("--ca-bundle", default=None, metavar="PATH", help="PEM file of CA certificates to trust for this https host (default: the saved bundle, AGENTICML_CA_BUNDLE, or the system roots)")
     p_sync.set_defaults(func=cmd_sync)
 
     p_login = sub.add_parser("login", help="Validate and save an API key")
     p_login.add_argument("--host", default=None, help="Server base URL")
     p_login.add_argument("--key", default=None, help="API key (default: prompt or stdin)")
     p_login.add_argument("--no-verify", action="store_true", help="Save without checking the server")
-    p_login.add_argument("--insecure", action="store_true", help="Allow http:// to a non-local host")
+    p_login.add_argument("--insecure", action="store_true", help="Allow http:// to a non-local host and remember that for this host")
+    p_login.add_argument("--ca-bundle", default=None, metavar="PATH", help="PEM file of CA certificates to trust for this https host; saved with the key")
     p_login.set_defaults(func=cmd_login)
 
     p_logout = sub.add_parser("logout", help="Remove saved credentials for a host")
@@ -2144,6 +2146,7 @@ def main(argv=None):
     p_whoami.add_argument("--host", default=None, help="Server base URL")
     p_whoami.add_argument("--offline", action="store_true", help="Skip server verification")
     p_whoami.add_argument("--insecure", action="store_true", help="Allow http:// to a non-local host")
+    p_whoami.add_argument("--ca-bundle", default=None, metavar="PATH", help="PEM file of CA certificates to trust for this https host (default: the saved bundle, AGENTICML_CA_BUNDLE, or the system roots)")
     p_whoami.set_defaults(func=cmd_whoami)
 
     p_edit = sub.add_parser("edit", help="Change tags, notes, group, job type, config, or summary on a finished run")

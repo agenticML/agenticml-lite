@@ -37,6 +37,7 @@ plans live next to it:
 | **2.1** | Full fidelity | Lineage code diffs on the server, by-reference artifacts, EFS performance check, operator tooling | A run synced to the server is indistinguishable from the local one in the dashboard, apart from notes |
 | **2.2** | Teams | Users and roles, per-user keys, dashboard sign-in through a trusted identity proxy, audit log | Two users with different roles share one server, each with the access their role allows, and every write is attributed |
 | **3.0** | Database storage, workspaces and hosted service | Server state in SQLite or Postgres, workspaces with accounts and memberships on one hostname, Firebase sign-in and self-serve sign-up with free limits, many server processes, S3 objects, metric summaries, AWS deployment, agenticml-server retired | Exit criteria 1–6 in the [3.0 plan](on-prem-3.0-plan.md); released Nov 17, 2026 as 3.0.0 (tag `v3.0.0`, [PyPI](https://pypi.org/project/agenticml-lite/3.0.0/), [GitHub release](https://github.com/agenticML/agenticml-lite/releases/tag/v3.0.0)) |
+| **3.2** | Private networks | Run the server and dashboard inside a lab VPC without Tailscale: CA bundle and per-host http trust on the client, a TLS proxy kit (Caddy, nginx), an end-to-end test through a TLS proxy, a private-network docs page | A lab follows the docs to sync from its training machines and sign in from its browsers over HTTPS with an internal certificate, with nothing reaching in from the internet |
 | Later | Scale and lifecycle | Unscheduled; see below | – |
 
 Decision (Nov 5, 2026): the server ships only as the `agenticml-lite`
@@ -323,6 +324,25 @@ Getting the hosted service live on AWS, step by step: [AWS deployment roadmap](a
   promoted on the site until the policies are live (29.7). It runs beside
   24.3; only 29.7 and 29.9 touch code or `pyproject.toml`.
 
+### 3.2: private networks
+
+Added Nov 19, 2026 at the owner's request: a lab whose machines are all in a
+private VPC, with Tailscale not allowed, wants the server and dashboard.
+Sync is outbound HTTPS to any URL, so the server runs inside the VPC behind
+a TLS proxy; this release closes the gaps found in the code (no way to trust
+an internal CA, `--insecure` on every command, unclear TLS errors, no proxy
+example or docs). It does not depend on 3.1 (packages 31–33, in
+[#84](https://github.com/agenticML/agenticml-lite/pull/84)).
+
+| # | Package | Depends on | Coder | Size | Plan | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| 34 † | Private-network deployment (no Tailscale) | 3.0 | Sonnet; prose Antigravity; owner releases | M | [plan](packages/34-private-network.md) | in progress |
+| 34.1 † | Client trust: `--ca-bundle`, saved bundle, `AGENTICML_CA_BUNDLE`, saved `insecure` per host, certificate errors without retries and with clear text, redirect text | 3.0 | Sonnet | M | [plan](packages/34-private-network.md) | done (this PR; Sonnet coded; supervisor reviewed with two adversarial review passes and did the † second review) |
+| 34.2 † | Deploy kit (`deploy/private-network/`: Caddy, nginx, env file, checklist incl. first admin, CA, SELinux, backups), sync unit lines, end-to-end test through a TLS proxy with a private CA | 34.1 | Sonnet | M | [plan](packages/34-private-network.md) | in progress |
+| 34.3 | Docs: SERVER.md section and troubleshooting, THREAT_MODEL.md, PROTOCOL.md, website page and facts test, README, systemd README | 34.1, 34.2 | Antigravity; supervisor checks | S–M | [plan](packages/34-private-network.md) | in progress |
+| 34.4 | Version 3.2.0; docs require `agenticml-lite>=3.2` and the kit from the matching tag | 34.3 | Sonnet; owner tags and publishes | S | [plan](packages/34-private-network.md) | plan ready |
+| 34.5 | First lab install from the docs (Backlog owner step) | 34.4 | Owner | S | [plan](packages/34-private-network.md) | not started |
+
 ### Maintenance fixes
 
 - Empty object and lineage upload framing: [plan](packages/fix-empty-uploads.md),
@@ -382,6 +402,15 @@ Getting the hosted service live on AWS, step by step: [AWS deployment roadmap](a
   "Hosted service monitoring" entry). Until then account deletion is an
   operator step: `agenticml server accounts delete` (package 30.2) and the
   runbook section "Deleting an account (privacy request)".
+- Built-in TLS for `server serve` (`--tls-cert`, `--tls-key`), so a small
+  lab needs no proxy (moved out of package 34, decision D1). The
+  dashboard's slow-client defences read raw sockets and must be reworked for
+  TLS sockets first; security-sensitive.
+- Sync bundles for air-gapped labs (package 34, decision D5):
+  `agenticml sync --to-bundle FILE` and `agenticml server import FILE`
+  carrying runs, objects, lineage and the owner. Only if a lab has no network
+  path from its training machines to any server; `server reindex` copy-in
+  loses the owner, objects, lineage and notes.
 - Metric picker refresh while no run is live (package 30.3 left it out):
   `/metrics` is refreshed only while the runs page polls, which stops when no
   run is `running`.
@@ -401,6 +430,17 @@ on Nov 17, 2026; none of the entries below blocked it.
 
 ### Owner steps
 
+- **First lab install on a private network** (package 34.5, owner; after the
+  3.2.0 release in 34.4).
+  - Where: the lab's server VM; `deploy/private-network/README.md`.
+  - Problem: the private-network setup has only been tested in CI, never on
+    a real lab network.
+  - Fix: follow the README on the lab's VM (internal certificate, proxy,
+    systemd units) and confirm the Caddy root certificate path; sync from two
+    training machines with `login --ca-bundle` and the sync unit; sign in from a lab browser; run
+    `agenticml server verify`; note every step that did not match the docs.
+  - Done when: both machines' runs show in the dashboard, `server verify`
+    reports 0 problems, and each mismatch is fixed or recorded here.
 - **Release follow-ups (owner)** (3.0.0 released Nov 17, 2026). Low priority.
   - Where: repository Settings → Environments → `pypi`; tags.
   - Problem: the `pypi` environment has no required reviewer, so any pushed
