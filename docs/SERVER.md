@@ -298,11 +298,27 @@ Run files and shadow Git repositories must reside on a shared POSIX network file
 
 Each server process opens a bounded number of connections:
 
-- **Transactions**: at most 24 at once (`TRANSACTION_CONNECTION_LIMIT`). A 25th request waits up to 10 seconds for a free slot, then gets `503` with `Retry-After`, the same answer as a database lock timeout. The pool keeps 16 of them idle. The `/healthz` check never opens a transaction, so it is not held up by this wait.
-- **Session locks**: at most 64 more, each on its own connection (48 for run and object locks, 16 for quota, lineage and import locks), plus one lifetime connection for the server lock.
-- **Hard ceiling** per process: about 90 connections. In practice far fewer are in use: at most 8 uploads receive a body at once, and each holds at most one run or object lock and one inner lock, so a busy process uses roughly 40.
+- **Transactions**: at most 24 at once (`TRANSACTION_CONNECTION_LIMIT`) without a budget. A request waits up to 10 seconds for a free slot, then gets HTTP `503` with `Retry-After: 5`. The pool keeps at most `min(16, transaction limit)` idle connections (16 when unset). The `/healthz` check never opens a transaction, so it is not held up by this wait.
+- **Session locks**: at most 64 more without a budget, each on its own connection (48 for run and object locks, 16 for quota, lineage and import locks), plus one lifetime connection for the server lock. A request waiting for a lock slot waits up to 30 seconds before returning HTTP `503` with `Retry-After: 5`.
+- **Ceiling without a budget**: 89 connections (24 transaction + 48 run/object + 16 quota/lineage + 1 server lock). The 8-concurrent-bodies limit does not bound lock holding, because locks are taken after the body is received. Real connection use follows load and is usually far below the ceiling.
 
-The hosted database (`db.t4g.micro`, about 112 connections by default) is sized for two tasks at that level, which is what a rolling deploy runs. Check `SHOW max_connections;` if you move to a smaller instance or run more than two tasks. A process paused while it holds a lock is a known residual risk, covered in section 8 of [THREAT_MODEL.md](THREAT_MODEL.md).
+RDS sets `max_connections` from the instance's memory after the OS reserve, so `db.t4g.micro` gives roughly 75 usable connections, not 112. Run `SHOW max_connections;` to see the real value. A process paused while it holds a lock is a known residual risk, covered in section 8 of [THREAT_MODEL.md](THREAT_MODEL.md).
+
+#### Connection budget (`--db-connections`)
+
+To bound connections on a shared or smaller database, set `--db-connections N` or the environment variable `AGENTICML_SERVER_DB_CONNECTIONS`.
+
+- **Value**: a whole number from 8 to 1000. It sets the most Postgres connections one server process opens, including its one lifetime server-lock connection.
+- **Defaults and precedence**: unset (the default) uses the limits above (89 connections). The CLI flag overrides the environment variable; a blank environment variable counts as unset. An invalid value stops the server with `AGENTICML_SERVER_DB_CONNECTIONS must be a whole number from 8 to 1000`. Only `agenticml server serve` accepts this option.
+- **Backend support**: Postgres only. With SQLite, the setting is ignored and one INFO log line is emitted.
+- **Budget split**: for a budget `B`, let `W = B - 1`:
+  - Quota and lineage locks: `max(round(W × 0.18), min(4, W − 3))`. This pool keeps at least 4 connections when the budget allows, so two lineage uploads never block upload quota locks.
+  - Transactions: `max(2, round(W × 0.27))`.
+  - Run and object locks: the rest of `W`.
+  - Server lock: 1 connection.
+  - Example: a budget of 16 allocates 4 transaction connections, 7 run/object locks, 4 quota/lineage locks, and 1 server lock.
+- **Exhaustion**: when the budget is exhausted, a request waits (up to 10 seconds for a transaction connection, up to 30 seconds for a lock) and then gets HTTP `503` with `Retry-After: 5`. Sync clients retry 503 automatically.
+- **Idle pool**: keeps at most `min(16, transaction limit)` connections.
 
 ## Amazon S3 object storage
 
@@ -438,6 +454,124 @@ agenticml server verify [--workspace SLUG] [--deep] [--data DIR] [--database URL
 - `status` displays workspace counts, run counts by status, committed storage, and key activity.
 - `verify` checks file sizes against database committed records, tests object presence, and checks lineage refs. Adding `--deep` streams and re-hashes all S3 objects (local filesystem objects are always hashed). Exits `0` when clean, `1` on corruption or missing data, and `2` on usage errors.
 
+## Usage history
+
+Server admins see server-wide totals and their daily history on `/admin`, in the "Usage" section at the top of the page. It displays five tiles and three growth charts:
+
+- **Tiles**:
+  - **Accounts**: total accounts, with new accounts created in the last 7 days ("+N in 7 days").
+  - **Active users**: 7-day count, with 1-day and 30-day counts.
+  - **Workspaces**: active workspaces, with suspended and archived counts.
+  - **Storage**: stored bytes, with uploads today.
+  - **Runs**: total runs.
+- **Growth charts**: Accounts, Active users (7 days), and Storage (GB). Charts appear once there are two daily snapshots.
+
+### Definitions
+
+- **Accounts**: all accounts. New accounts are accounts created in the last 1 or 7 days.
+- **Active**: an account that used a dashboard session or an API key (for example a sync client) in the last 1, 7, or 30 days. The environment admin key (`AGENTICML_SERVER_KEY`) has no account and does not count. Each account's last activity time is stored (`accounts.last_active_at`) and moves at most once an hour.
+- **Workspaces**: active, suspended (not archived), and archived. Custom workspaces are workspaces on the custom plan, not archived.
+- **Stored bytes**: committed bytes of all workspaces, archived included.
+- **Uploads today**: bytes uploaded since midnight UTC.
+- **Runs**: all runs.
+
+### Daily history
+
+The server keeps one row of these totals per UTC day in the `stats_daily` table. A loop inside the server process refreshes today's row every hour (and once at startup), so a finished day holds its totals as of its last refresh; that day's upload bytes are those counted up to that refresh. Days the server was not running have no row. Several server processes on one Postgres database never write the same day twice.
+
+The history holds totals only: no emails, logins, or workspace names.
+
+### Usage CLI
+
+Inspect current totals and daily history using `agenticml server stats`:
+
+```bash
+# Print totals, five largest workspaces by storage, and 30-day history
+agenticml server stats [--data DIR] [--database URL] [--json] [--days N]
+
+# Save today's row now and print it
+agenticml server stats snapshot [--data DIR] [--database URL] [--json]
+```
+
+- `stats` prints the current totals, the five largest workspaces by stored bytes (slug, name, size), and the daily history for the last `N` days (default 30, from 1 to 3650).
+- `stats snapshot` saves today's row now and prints it.
+- Exit codes: `0` on success, `1` on database error, and `2` on usage error (for example no server database at `--data`, or `--days` out of range).
+
+### Admin API
+
+The endpoint `GET /api/admin/stats` (server admins only; others get 404 like every admin route) returns `{"totals", "top_workspaces", "history" (90 days), "refresh_seconds": 3600}`.
+
+### Privacy
+
+Usage history works the same self-hosted (SQLite) and hosted (Postgres). Totals stay in the server's database, and nothing is sent anywhere.
+
+## Capacity metrics
+
+Metrics are off by default (`--metrics off`); with `off`, nothing is sent anywhere. With `--metrics cloudwatch` (or `AGENTICML_SERVER_METRICS=cloudwatch`), the server sends 12 metrics to Amazon CloudWatch once a minute with `PutMetricData`, in the namespace `AgenticML/Server` and with no dimensions (no per-task, workspace, user, or route values; no paths, slugs, logins, or keys).
+
+### Measured metrics
+
+Published once a minute:
+- `Requests`: requests finished in the minute (health checks on `/healthz` are not counted).
+- `Errors4xx`: finished requests with HTTP status 400–499.
+- `Errors5xx`: finished requests with HTTP status 500–599.
+- `Rejected`: connections refused at the server's 64-connection cap.
+- `Latency`: server time per request in milliseconds, excluding time spent receiving request bodies and sending responses (published as values and counts so CloudWatch can show p50/p95/p99).
+- `InFlightPeak`: most requests in progress at once in the minute.
+- `DbConnectionsPeak`: most database connections the process held at once in the minute.
+
+Published every 15 minutes (usage totals from [Usage history](#usage-history)):
+- `Accounts`: total accounts.
+- `ActiveUsers7d`: accounts active in the last 7 days.
+- `WorkspacesActive`: active workspaces.
+- `StoredBytes`: total committed bytes stored across all workspaces.
+- `UploadBytesToday`: bytes uploaded since midnight UTC.
+
+### Multi-process behaviour
+
+Several server processes publish to the same metrics: counts add up and latency values merge. For the usage totals, each process sends the same values; use CloudWatch statistic `Maximum` to view them.
+
+### Requirements
+
+Requirements for `cloudwatch`:
+1. The `[cloudwatch]` extra:
+   ```bash
+   pip install 'agenticml-lite[cloudwatch]'
+   ```
+   This installs `boto3`. The `[hosted]` extra includes it.
+2. An AWS region in `AWS_REGION` or `AWS_DEFAULT_REGION`.
+3. AWS credentials allowed `cloudwatch:PutMetricData`. This permission can be limited with the condition `cloudwatch:namespace` = `AgenticML/Server`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "cloudwatch:PutMetricData",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": "AgenticML/Server"
+        }
+      }
+    }
+  ]
+}
+```
+
+Without the `[cloudwatch]` extra or a region, the server refuses to start with a message saying so.
+
+The CLI flag overrides the environment variable; a blank environment variable counts as unset. Any value other than `off` or `cloudwatch` causes the server to refuse to start with `AGENTICML_SERVER_METRICS must be off or cloudwatch`. Only `agenticml server serve` has this option (not `server up`).
+
+### Unreachable CloudWatch
+
+If CloudWatch is unreachable, the server logs a warning (at most every 10 minutes for the same message), drops that minute's numbers, and keeps serving.
+
+### Cost
+
+Custom metrics on AWS cost about $0.30 each per month after the first 10 free in an account, so about $1–4 a month. The API calls (one a minute per process) fit in the CloudWatch free tier.
+
 ## Upgrading from 2.x to 3.0
 
 When starting a 3.0 server against an existing 2.x data directory, the server automatically migrates data in place on first start:
@@ -463,6 +597,7 @@ Sync clients on version 2.2 continue to sync to a 3.0 server without modificatio
 | --- | --- | --- | --- |
 | `--data DIR` | `AGENTICML_SERVER_DATA` | `~/.agenticml-server` | Path to server data directory. |
 | `--database URL` | `AGENTICML_SERVER_DATABASE_URL` | `sqlite:///<data>/server/agenticml.db` | Database connection URL (`sqlite:///path` or `postgresql://...`). |
+| `--db-connections N` | `AGENTICML_SERVER_DB_CONNECTIONS` | unset (`89`) | Most Postgres connections one server process opens (8 to 1000). Flag wins over env; blank counts as unset. Ignored with SQLite. |
 | `--objects URL` | `AGENTICML_SERVER_OBJECTS` | `file://` | Object storage backend (`file://` or `s3://bucket/prefix`). |
 | `--host HOST` | | `127.0.0.1` | Network interface to bind. |
 | `--port PORT` | | `8080` | TCP port to listen on. |
@@ -473,6 +608,7 @@ Sync clients on version 2.2 continue to sync to a 3.0 server without modificatio
 | `--firebase-api-key KEY` | `AGENTICML_SERVER_FIREBASE_API_KEY` | unset | Firebase web API key for dashboard sign-in. |
 | `--firebase-auth-domain HOST` | `AGENTICML_SERVER_FIREBASE_AUTH_DOMAIN` | unset | Firebase auth domain (defaults to `<project>.firebaseapp.com`). |
 | `--limits FILE` | `AGENTICML_SERVER_LIMITS` | unset | Path to JSON file defining workspace usage limits and plans. |
+| `--metrics MODE` | `AGENTICML_SERVER_METRICS` | `off` | Capacity metrics mode: `off` or `cloudwatch`. Flag wins over env; blank counts as unset. Any other value refuses to start. Only `server serve` has it. |
 | `--admin-emails LIST` | `AGENTICML_SERVER_ADMIN_EMAILS` | unset | Comma-separated emails granted server admin on verified Firebase sign-in. Ignored without Firebase. |
 | `--legal-base-url URL` | `AGENTICML_SERVER_LEGAL_BASE_URL` | unset | `https://` base URL of your Terms, Acceptable use and Privacy pages (`terms/`, `acceptable-use/`, `privacy/` under it). With Firebase on, the sign-in page (`/login` and `/invite`) then shows "By continuing you agree to the Terms and the Acceptable use policy. See the Privacy policy." with those links. A non-`https://` value stops the server at startup. Ignored without Firebase. Not set means no links. |
 | `--open-signup` | `AGENTICML_SERVER_OPEN_SIGNUP` | off | Allow verified Firebase sign-in to create an account and personal workspace. A verified account with no workspace gets one at sign-in (once; an admin-deleted sign-up workspace is not recreated). |

@@ -80,7 +80,7 @@ def add_admin(data):
 
 
 def steal(url, key, writer):
-    with Client(url, key, timeout=5, max_retries=0) as client:
+    with Client(url, key, timeout=30, max_retries=0) as client:
         try:
             push((None, client), writer)
         except sync.OwnershipError as exc:
@@ -140,9 +140,9 @@ def teams(tmp_path_factory):
             admin_writer.close()
             bob_writer = writer_at(local / "bob", run_id="bob-run")
             bob_writer.close()
-            with Client(url, admin_key["key"], timeout=5, max_retries=0) as client:
+            with Client(url, admin_key["key"], timeout=30, max_retries=0) as client:
                 assert push((httpd, client), admin_writer).complete
-            with Client(url, bob_key["key"], timeout=5, max_retries=0) as client:
+            with Client(url, bob_key["key"], timeout=30, max_retries=0) as client:
                 assert push((httpd, client), bob_writer).complete
 
             note = json.dumps({"text": "hello from bob", "revision": None}).encode()

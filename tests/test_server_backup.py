@@ -30,7 +30,7 @@ def cli_flags():
 
 
 def push_all(url, key, writers, *, complete=True):
-    with Client(url, key, timeout=5, max_retries=0) as client:
+    with Client(url, key, timeout=30, max_retries=0) as client:
         for writer in writers:
             result = sync.SyncResult(writer.run_id)
             sync.sync_run(RunReader(writer.root, writer.run_id), url, client, result)

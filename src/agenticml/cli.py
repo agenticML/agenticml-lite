@@ -559,6 +559,31 @@ def _legal_base_url_from_args(args):
     return normalize_legal_base_url(raw)
 
 
+def _metrics_from_args(args):
+    """``off`` or ``cloudwatch`` from ``--metrics`` or the environment (flag wins)."""
+    raw = getattr(args, "metrics", None)
+    if raw is None:
+        raw = os.environ.get("AGENTICML_SERVER_METRICS", "")
+    raw = raw.strip().lower()
+    if raw not in ("", "off", "cloudwatch"):
+        raise ValueError("AGENTICML_SERVER_METRICS must be off or cloudwatch")
+    return raw or "off"
+
+
+def _db_connections_from_args(args):
+    """The per-process Postgres connection budget, or None (flag wins; blank is unset)."""
+    raw = getattr(args, "db_connections", None)
+    if raw is None:
+        raw = os.environ.get("AGENTICML_SERVER_DB_CONNECTIONS", "")
+    raw = str(raw).strip()
+    if not raw:
+        return None
+    message = "AGENTICML_SERVER_DB_CONNECTIONS must be a whole number from 8 to 1000"
+    if not (raw.isascii() and raw.isdigit() and 8 <= int(raw) <= 1000):
+        raise ValueError(message)
+    return int(raw)
+
+
 def cmd_server_serve(args):
     from .server import serve
     from .server.db.errors import DatabaseError
@@ -595,6 +620,12 @@ def cmd_server_serve(args):
         legal_base_url = _legal_base_url_from_args(args)
         if legal_base_url:
             extra["legal_base_url"] = legal_base_url
+        metrics = _metrics_from_args(args)
+        if metrics != "off":
+            extra["metrics"] = metrics
+        db_connections = _db_connections_from_args(args)
+        if db_connections is not None:
+            extra["db_connections"] = db_connections
         min_client = args.min_client_version
         if min_client is None:
             min_client = os.environ.get("AGENTICML_SERVER_MIN_CLIENT_VERSION") or None
@@ -1171,6 +1202,78 @@ def cmd_server_status(args):
 
 def cmd_server_verify(args):
     return _cmd_server_report(args, verify=True)
+
+
+def cmd_server_stats(args):
+    from .server.app import resolve_data_dir
+    from .server.db import for_server_dir
+    from .server.db.errors import DatabaseError
+    from .server.db.stats import StatsRepo
+    from .store.gc import _format_bytes
+
+    try:
+        data = resolve_data_dir(args.data)
+        db = for_server_dir(data / "server", args.database, create=False)
+        if db is None:
+            raise ValueError(f"no server database found for {data}; check --data and --database")
+        repo = StatsRepo(db)
+        if args.action == "snapshot":
+            row = repo.snapshot()
+            if args.json:
+                print(json.dumps(row, indent=2, sort_keys=True))
+            else:
+                print(f"snapshot saved for {row['day']}")
+            return 0
+        if not 1 <= args.days <= 3650:
+            raise ValueError("--days must be between 1 and 3650")
+        totals = repo.totals()
+        top = repo.top_workspaces()
+        history = repo.history(args.days)
+        if args.json:
+            print(json.dumps({"totals": totals, "top_workspaces": top, "history": history},
+                             indent=2, sort_keys=True))
+            return 0
+        print("Totals")
+        _print_table([[label, value] for label, value in (
+            ("as of", totals["as_of"]),
+            ("accounts", str(totals["accounts"])),
+            ("new accounts, 1 day", str(totals["new_accounts_1d"])),
+            ("new accounts, 7 days", str(totals["new_accounts_7d"])),
+            ("active accounts, 1 day", str(totals["active_1d"])),
+            ("active accounts, 7 days", str(totals["active_7d"])),
+            ("active accounts, 30 days", str(totals["active_30d"])),
+            ("workspaces active", str(totals["workspaces_active"])),
+            ("workspaces suspended", str(totals["workspaces_suspended"])),
+            ("workspaces archived", str(totals["workspaces_archived"])),
+            ("workspaces on custom plan", str(totals["workspaces_custom"])),
+            ("stored", _format_bytes(totals["stored_bytes"])),
+            ("uploaded today", _format_bytes(totals["upload_bytes_today"])),
+            ("runs", str(totals["runs"])))], indent="  ")
+        print("\nLargest workspaces")
+        if top:
+            _print_table([["slug", "name", "stored"]] + [
+                [row["slug"], row["name"], _format_bytes(row["stored_bytes"])
+                 + (" (archived)" if row["archived"] else "")] for row in top], indent="  ")
+        else:
+            print("  none")
+        print(f"\nHistory, last {args.days} days")
+        if history:
+            _print_table([["day", "accounts", "active 7d", "workspaces", "stored", "uploads", "runs"]] + [
+                [row["day"], str(row["accounts"]), str(row["active_7d"]), str(row["workspaces_active"]),
+                 _format_bytes(row["stored_bytes"]), _format_bytes(row["upload_bytes"]), str(row["runs"])]
+                for row in history], indent="  ")
+        else:
+            print("  no daily snapshots yet")
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+    except DatabaseError as exc:
+        print(f"agenticml server: {exc}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, OverflowError) as exc:
+        print(f"agenticml server: {(str(exc).splitlines() or [type(exc).__name__])[0]}", file=sys.stderr)
+        return 2
+    return 0
 
 
 def cmd_server_backup(args):
@@ -1904,6 +2007,12 @@ def main(argv=None):
     p_serve.add_argument("--min-client-version", default=None, metavar="X.Y",
                          help="Reject agenticml-lite clients older than this on /v2 "
                               "(default: AGENTICML_SERVER_MIN_CLIENT_VERSION or 2.2)")
+    p_serve.add_argument("--metrics", default=None, metavar="MODE",
+                         help="Publish capacity metrics: off or cloudwatch "
+                              "(default: AGENTICML_SERVER_METRICS or off)")
+    p_serve.add_argument("--db-connections", default=None, metavar="N",
+                         help="Most Postgres connections one server process opens "
+                              "(default: AGENTICML_SERVER_DB_CONNECTIONS or 89)")
     p_serve.set_defaults(func=cmd_server_serve)
     p_up = server_sub.add_parser("up", help="Serve on loopback through Tailscale Funnel")
     p_up.add_argument("--data", default=None, help="Data directory (default: AGENTICML_SERVER_DATA or ~/.agenticml-server)")
@@ -1940,6 +2049,14 @@ def main(argv=None):
                                help="Re-hash every S3 object (file objects are always hashed)")
         child.add_argument("--json", action="store_true")
         child.set_defaults(func=func)
+    p_stats = server_sub.add_parser(
+        "stats", help="Show server-wide totals and daily history, or save today's snapshot")
+    p_stats.add_argument("action", nargs="?", choices=("show", "snapshot"), default="show")
+    p_stats.add_argument("--data", default=None)
+    p_stats.add_argument("--database", default=None, metavar="URL", help="Server database (default: AGENTICML_SERVER_DATABASE_URL or local SQLite)")
+    p_stats.add_argument("--json", action="store_true")
+    p_stats.add_argument("--days", type=int, default=30, help="History window for show (default: 30)")
+    p_stats.set_defaults(func=cmd_server_stats)
     p_backup = server_sub.add_parser(
         "backup", help="Copy the database and files of a running server to a directory",
         formatter_class=argparse.RawDescriptionHelpFormatter,

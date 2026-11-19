@@ -4,11 +4,15 @@ No AWS calls: the templates are parsed with PyYAML (CloudFormation short tags
 become ``{"Fn::X": value}`` mappings, as in the JSON form) and inspected.
 """
 import fnmatch
+import json
 import re
 from pathlib import Path
 
 import pytest
 import yaml
+
+from agenticml.server import capacity
+from agenticml.server.db.postgres import connection_limits
 
 ROOT = Path(__file__).parents[1]
 TEMPLATE_DIR = ROOT / 'deploy/aws/cloudformation'
@@ -111,6 +115,54 @@ def test_no_iam_wildcard_actions(name):
 def test_no_email_address_in_template(name):
     text = (TEMPLATE_DIR / name).read_text()
     assert not re.findall(r'[A-Za-z0-9._+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+', text)
+
+
+def _find_in_map_key_values(template, key, where):
+    """Every value a FindInMap key can take: a literal, an allowed parameter value or an allowed region."""
+    if isinstance(key, str):
+        return [key]
+    assert isinstance(key, dict) and set(key) == {'Ref'}, (
+        f'{where}: FindInMap key {key!r} must be a literal or a Ref to a parameter with AllowedValues '
+        'or to AWS::Region; extend this test to handle other keys')
+    name = key['Ref']
+    if name == 'AWS::Region':
+        rule = template.get('Rules', {}).get('SupportedRegion')
+        assert rule, f'{where}: FindInMap by AWS::Region needs a SupportedRegion rule listing the regions'
+        regions = set()
+        for assertion in rule['Assertions']:
+            contains = assertion['Assert']['Fn::Contains']
+            assert contains[1] == {'Ref': 'AWS::Region'}, assertion
+            regions.update(contains[0])
+        return sorted(regions)
+    parameter = template.get('Parameters', {}).get(name)
+    assert parameter is not None and 'AllowedValues' in parameter, (
+        f'{where}: FindInMap key Ref {name} is not a parameter with AllowedValues, so the lookup cannot be '
+        'proved to resolve; give the parameter AllowedValues or handle it in this test')
+    return [str(v) for v in parameter['AllowedValues']]
+
+
+@pytest.mark.parametrize('name', TEMPLATE_NAMES)
+def test_every_find_in_map_resolves_for_every_allowed_parameter_value(name):
+    # CloudFormation resolves every FindInMap, also in an Fn::If branch that is not taken, so a missing
+    # key fails CreateChangeSet ("Unable to get mapping for ...") whatever the conditions say.
+    template = load_template(name)
+    mappings = template.get('Mappings', {})
+    for node in walk(template):
+        if not (isinstance(node, dict) and 'Fn::FindInMap' in node):
+            continue
+        map_name, top_key, second_key = node['Fn::FindInMap']
+        assert isinstance(map_name, str) and map_name in mappings, f'{name}: unknown mapping {map_name!r}'
+        where = f'{name}: {map_name}'
+        for top in _find_in_map_key_values(template, top_key, where):
+            assert top in mappings[map_name], f'{where}: no top-level key {top!r}'
+            for second in _find_in_map_key_values(template, second_key, where):
+                assert second in mappings[map_name][top], f'{where}: no entry for {top!r} / {second!r}'
+
+
+def test_find_in_map_walker_finds_the_lookups(hosted):
+    # Guards the test above against passing on an empty walk.
+    found = [n['Fn::FindInMap'][0] for n in walk(hosted) if isinstance(n, dict) and 'Fn::FindInMap' in n]
+    assert sorted(found) == ['ConnectionBudget', 'ConnectionsAlarm', 'ElbAccount']
 
 
 def test_no_email_address_in_deploy_workflow():
@@ -274,7 +326,38 @@ def test_cloudformation_role_creates_only_the_stacks_service_linked_roles(bootst
     # EFS mount targets need the EFS one in a fresh account.
     assert set(linked['Condition']['StringEquals']['iam:AWSServiceName']) == {
         'ecs.amazonaws.com', 'elasticloadbalancing.amazonaws.com', 'rds.amazonaws.com',
-        'backup.amazonaws.com', 'elasticfilesystem.amazonaws.com'}
+        'backup.amazonaws.com', 'elasticfilesystem.amazonaws.com',
+        'ecs.application-autoscaling.amazonaws.com'}
+
+
+def test_cloudformation_role_manages_autoscaling_with_explicit_actions(bootstrap):
+    stmts = {s['Sid']: s for s in role_statements(bootstrap['Resources']['CloudFormationRole']) if 'Sid' in s}
+    scaling = stmts['Scaling']
+    assert scaling['Effect'] == 'Allow' and scaling['Resource'] == '*'
+    assert scaling['Condition'] == {'StringEquals': {'aws:RequestedRegion': {'Ref': 'AWS::Region'}}}
+    assert set(actions_of(scaling)) == {
+        'application-autoscaling:' + a for a in (
+            'RegisterScalableTarget', 'DeregisterScalableTarget', 'DescribeScalableTargets',
+            'DescribeScalingPolicies', 'DescribeScalingActivities', 'DescribeScheduledActions', 'PutScalingPolicy',
+            'DeleteScalingPolicy', 'TagResource', 'UntagResource', 'ListTagsForResource')}
+    assert not any('*' in a for a in actions_of(scaling))
+    # The scaling policy handler reads the metric: GetMetricData, any resource, this region only.
+    metrics = stmts['ScalingMetrics']
+    assert metrics['Effect'] == 'Allow' and actions_of(metrics) == ['cloudwatch:GetMetricData']
+    assert metrics['Resource'] == '*'
+    assert metrics['Condition'] == {'StringEquals': {'aws:RequestedRegion': {'Ref': 'AWS::Region'}}}
+    alarms = stmts['ScalingAlarms']
+    assert alarms['Effect'] == 'Allow'
+    assert set(actions_of(alarms)) == {'cloudwatch:PutMetricAlarm', 'cloudwatch:DeleteAlarms'}
+    # The alarms target tracking creates: TargetTracking-<resource id>-AlarmHigh-<id>.
+    pattern = fn_sub_text(alarms['Resource']).split('alarm:')[1]
+    assert fnmatch.fnmatch('TargetTracking-service/agenticml-hosted/agenticml-hosted-AlarmHigh-0a1b2c3d', pattern)
+    assert not fnmatch.fnmatch('TargetTracking-service/other/other-AlarmHigh-0a1b2c3d', pattern)
+    # The existing Alarms statement keeps its single agenticml-hosted-* resource.
+    assert fn_sub_text(stmts['Alarms']['Resource']).endswith(':alarm:agenticml-hosted-*')
+    # The deploy role gains nothing for scaling.
+    deploy = role_statements(bootstrap['Resources']['DeployRole'])
+    assert not [a for s in deploy for a in actions_of(s) if a.startswith('application-autoscaling:')]
 
 
 def test_certificate_is_dns_validated_without_hosted_zone(bootstrap):
@@ -381,6 +464,12 @@ def test_bootstrap_outputs_are_exported(bootstrap):
 
 # ----------------------------------------------------------------------- hosted
 
+DB_CLASSES = ['db.t4g.micro', 'db.t4g.small', 'db.t4g.medium']
+# Conservative estimate of the max_connections left for the application per class: about 70% of RDS's
+# LEAST(DBInstanceClassMemory / 9531392, 5000), minus 5 reserved superuser slots, minus about 10 for
+# operators, backups and monitoring.
+USABLE_CONNECTIONS = {'db.t4g.micro': 64, 'db.t4g.small': 144, 'db.t4g.medium': 300}
+
 def fn_sub_text(value):
     """The template string of an Fn::Sub (plain or with a variable map)."""
     inner = value['Fn::Sub']
@@ -404,13 +493,21 @@ def test_hosted_template_fits_the_deploy_upload_limit():
 
 def test_hosted_parameters(hosted):
     params = hosted['Parameters']
-    assert set(params) == {'ImageTag', 'Hostname', 'DesiredCount', 'MultiAZ', 'FirebaseProject',
-                           'FirebaseApiKey', 'OpenSignup', 'AdminEmails', 'LegalBaseUrl', 'VpcCidr'}
+    assert set(params) == {'ImageTag', 'Hostname', 'DesiredCount', 'MaxTaskCount', 'DbInstanceClass', 'MultiAZ',
+                           'FirebaseProject', 'FirebaseApiKey', 'OpenSignup', 'AdminEmails', 'LegalBaseUrl',
+                           'VpcCidr'}
     assert 'Default' not in params['ImageTag']
     assert params['Hostname']['Default'] == 'app.agenticml.xyz'
     # Lean default (package 24.5): one task; rolling deploys still start the new one first.
     assert params['DesiredCount']['Default'] == 1 and params['DesiredCount']['MinValue'] == 0
     assert params['DesiredCount']['MaxValue'] == 2
+    # Autoscaling is off by default: one means no scaling resources.
+    assert params['MaxTaskCount']['Type'] == 'String' and params['MaxTaskCount']['Default'] == '1'
+    assert params['MaxTaskCount']['AllowedValues'] == ['1', '2', '3', '4']
+    # The database class sets the connection ceiling, so it is a closed list.
+    assert params['DbInstanceClass']['Type'] == 'String' and params['DbInstanceClass']['Default'] == 'db.t4g.micro'
+    assert params['DbInstanceClass']['AllowedValues'] == DB_CLASSES
+    assert 'in place' in params['DbInstanceClass']['Description'] and 'max_connections' in params['DbInstanceClass']['Description']
     assert params['MultiAZ']['Default'] == 'false'
     assert params['FirebaseProject']['Default'] == '' and params['FirebaseApiKey']['Default'] == ''
     assert params['OpenSignup']['Default'] == 'false'
@@ -465,7 +562,8 @@ def test_hosted_database_is_protected(hosted):
     assert props['ManageMasterUserPassword'] is True
     assert 'MasterUserPassword' not in props
     assert props['MultiAZ'] == {'Ref': 'MultiAZ'}
-    assert (props['Engine'], props['EngineVersion'], props['DBInstanceClass']) == ('postgres', '16', 'db.t4g.micro')
+    assert (props['Engine'], props['EngineVersion'], props['DBInstanceClass']) == (
+        'postgres', '16', {'Ref': 'DbInstanceClass'})
     assert (props['StorageType'], props['AllocatedStorage'], props['MaxAllocatedStorage']) == ('gp3', '20', 100)
     assert props['BackupRetentionPeriod'] == 7
     group = only(hosted, 'AWS::RDS::DBParameterGroup')['Properties']
@@ -609,7 +707,8 @@ def test_hosted_service_runs_in_task_subnets_with_public_ip(hosted):
     assert network['SecurityGroups'] == [{'Ref': 'TaskSecurityGroup'}]
     assert service['LaunchType'] == 'FARGATE' and service['PlatformVersion'] == '1.4.0'
     assert service['EnableExecuteCommand'] is True
-    assert service['DesiredCount'] == {'Ref': 'DesiredCount'}
+    # While autoscaling is on, the autoscaler owns the running count.
+    assert service['DesiredCount'] == {'Fn::If': ['HasScaling', {'Ref': 'AWS::NoValue'}, {'Ref': 'DesiredCount'}]}
     assert service['HealthCheckGracePeriodSeconds'] == 60
     assert service['DeploymentConfiguration'] == {
         'MinimumHealthyPercent': 100, 'MaximumPercent': 200,
@@ -648,6 +747,7 @@ def test_hosted_trusted_proxy_is_the_alb_subnets_only(hosted):
     assert env['AGENTICML_SERVER_LEGAL_BASE_URL'] == {'Ref': 'LegalBaseUrl'}
     assert env['AGENTICML_SERVER_PUBLIC_URL'] == {'Fn::Sub': 'https://${Hostname}'}
     assert env['AGENTICML_SERVER_OBJECTS'] == {'Fn::Sub': 's3://${ObjectsBucket}/hosted'}
+    assert env['AGENTICML_SERVER_METRICS'] == 'cloudwatch'
     assert env['AWS_REGION'] == {'Ref': 'AWS::Region'}
     assert fn_sub_text(env['AGENTICML_SERVER_DATABASE_URL']) == (
         'postgresql://agenticml@${DbInstance.Endpoint.Address}:5432/agenticml'
@@ -667,7 +767,10 @@ def test_hosted_firebase_is_conditional_and_open_signup_needs_it(hosted):
     for entry in env_of(hosted):
         if 'Fn::If' in entry:
             condition, present, absent = entry['Fn::If']
-            assert condition == 'HasFirebase' and absent == {'Ref': 'AWS::NoValue'}
+            assert absent == {'Ref': 'AWS::NoValue'}
+            if condition == 'HasScaling':
+                continue
+            assert condition == 'HasFirebase'
             conditional[present['Name']] = present['Value']
     assert conditional == {'AGENTICML_SERVER_FIREBASE_PROJECT': {'Ref': 'FirebaseProject'},
                            'AGENTICML_SERVER_FIREBASE_API_KEY': {'Ref': 'FirebaseApiKey'}}
@@ -737,8 +840,13 @@ def test_hosted_task_policy_is_scoped(hosted):
     assert {a for s in stmts for a in actions_of(s) if a.startswith('ssmmessages:')} == {
         'ssmmessages:CreateControlChannel', 'ssmmessages:CreateDataChannel',
         'ssmmessages:OpenControlChannel', 'ssmmessages:OpenDataChannel'}
-    # Nothing outside S3, EFS and the SSM message channel.
-    assert {a.split(':')[0] for a in by_action} == {'s3', 'elasticfilesystem', 'ssmmessages'}
+    # Capacity metrics: only PutMetricData, only in the server's namespace.
+    (metrics,) = by_action['cloudwatch:PutMetricData']
+    assert actions_of(metrics) == ['cloudwatch:PutMetricData'] and metrics['Effect'] == 'Allow'
+    assert metrics['Resource'] == '*'
+    assert metrics['Condition'] == {'StringEquals': {'cloudwatch:namespace': capacity.NAMESPACE}}
+    # Nothing outside S3, EFS, the SSM message channel and CloudWatch metrics.
+    assert {a.split(':')[0] for a in by_action} == {'s3', 'elasticfilesystem', 'ssmmessages', 'cloudwatch'}
 
 
 def test_hosted_roles_are_named_inside_the_cloudformation_roles_scope(hosted, bootstrap):
@@ -772,7 +880,7 @@ def test_hosted_resource_names_match_the_cloudformation_role_scope(hosted, boots
     assert fnmatch.fnmatch(log_group, fn_sub_text(stmts['LogGroups']['Resource']).split('log-group:')[1])
     alarm_pattern = fn_sub_text(stmts['Alarms']['Resource']).split('alarm:')[1]
     names = alarms_of(hosted)
-    assert len(names) == 6
+    assert len(names) == 9
     for name in names:
         assert fnmatch.fnmatch(name, alarm_pattern), name
     bucket_pattern = fn_sub_text(stmts['Buckets']['Resource']).split(':::')[1]
@@ -781,11 +889,131 @@ def test_hosted_resource_names_match_the_cloudformation_role_scope(hosted, boots
         assert fnmatch.fnmatch(f'agenticml-hosted-{logical.lower()}-abc123def456', bucket_pattern)
     # Everything the stack creates stays in services the CloudFormation role covers.
     role_services = {a.split(':')[0] for s in stmts.values() if s['Effect'] == 'Allow' for a in actions_of(s)}
-    needed = {'AWS::EC2': 'ec2', 'AWS::ElasticLoadBalancingV2': 'elasticloadbalancing', 'AWS::ECS': 'ecs',
+    needed = {'AWS::ApplicationAutoScaling': 'application-autoscaling', 'AWS::EC2': 'ec2', 'AWS::ElasticLoadBalancingV2': 'elasticloadbalancing', 'AWS::ECS': 'ecs',
               'AWS::RDS': 'rds', 'AWS::EFS': 'elasticfilesystem', 'AWS::S3': 's3', 'AWS::Logs': 'logs',
               'AWS::CloudWatch': 'cloudwatch', 'AWS::Backup': 'backup', 'AWS::IAM': 'iam'}
     for resource in hosted['Resources'].values():
         assert needed[resource['Type'].rsplit('::', 1)[0]] in role_services, resource['Type']
+
+
+def test_hosted_autoscaling_is_off_at_one_task_and_creates_two_resources_above(hosted):
+    # Scaling needs tasks: DesiredCount 0 always stops the service (no target, no budget).
+    assert hosted['Conditions']['HasScaling'] == {'Fn::And': [
+        {'Fn::Not': [{'Fn::Equals': [{'Ref': 'MaxTaskCount'}, '1']}]}, {'Condition': 'HasTasks'}]}
+    assert hosted['Conditions']['HasTasks'] == {'Fn::Not': [{'Fn::Equals': [{'Ref': 'DesiredCount'}, 0]}]}
+    scaling = {k: v for k, v in hosted['Resources'].items() if v['Type'].startswith('AWS::ApplicationAutoScaling::')}
+    assert set(scaling) == {'ScalableTarget', 'CpuScalingPolicy'}
+    assert all(r['Condition'] == 'HasScaling' for r in scaling.values())
+    target = scaling['ScalableTarget']
+    # No DependsOn (cfn-lint W3005): the GetAtt on Service.Name in ResourceId already orders it after the service.
+    assert target['Type'] == 'AWS::ApplicationAutoScaling::ScalableTarget' and 'DependsOn' not in target
+    props = target['Properties']
+    assert props == {
+        'ServiceNamespace': 'ecs', 'ScalableDimension': 'ecs:service:DesiredCount',
+        'ResourceId': {'Fn::Sub': 'service/${Cluster}/${Service.Name}'},
+        'MinCapacity': {'Ref': 'DesiredCount'}, 'MaxCapacity': {'Ref': 'MaxTaskCount'}}
+    assert 'RoleARN' not in props
+    policy = scaling['CpuScalingPolicy']
+    assert policy['Type'] == 'AWS::ApplicationAutoScaling::ScalingPolicy'
+    assert policy['Properties'] == {
+        'PolicyName': 'agenticml-hosted-cpu', 'PolicyType': 'TargetTrackingScaling',
+        'ScalingTargetId': {'Ref': 'ScalableTarget'},
+        'TargetTrackingScalingPolicyConfiguration': {
+            'TargetValue': 60,
+            'PredefinedMetricSpecification': {'PredefinedMetricType': 'ECSServiceAverageCPUUtilization'},
+            'ScaleOutCooldown': 60, 'ScaleInCooldown': 300}}
+    # The service name in the resource id is the one the cluster and service really have.
+    assert hosted['Resources']['Cluster']['Properties']['ClusterName'] == 'agenticml-hosted'
+    assert hosted['Resources']['Service']['Properties']['ServiceName'] == 'agenticml-hosted'
+
+
+def evaluate_conditions(hosted, max_tasks, desired):
+    """Resolve the hosted template's conditions for MaxTaskCount and DesiredCount (the ones HasScaling reads)."""
+    params = {'MaxTaskCount': max_tasks, 'DesiredCount': desired}
+    conditions = hosted['Conditions']
+
+    def ev(node):
+        (fn, arg), = node.items()
+        if fn == 'Condition':
+            return ev(conditions[arg])
+        if fn == 'Fn::Not':
+            return not ev(arg[0])
+        if fn == 'Fn::And':
+            return all(ev(a) for a in arg)
+        if fn == 'Fn::Equals':
+            left, right = [params[a['Ref']] if isinstance(a, dict) else a for a in arg]
+            return left == right
+        raise AssertionError(fn)
+    return {name: ev(node) for name, node in conditions.items() if name in ('HasScaling', 'HasTasks')}
+
+
+def test_hosted_desired_count_zero_stops_the_service_whatever_max_task_count_is(hosted):
+    # DesiredCount 0 with a large MaxTaskCount: no scalable target, no budget variable, DesiredCount on the service.
+    assert evaluate_conditions(hosted, '3', 0) == {'HasScaling': False, 'HasTasks': False}
+    assert evaluate_conditions(hosted, '1', 0) == {'HasScaling': False, 'HasTasks': False}
+    assert evaluate_conditions(hosted, '1', 1) == {'HasScaling': False, 'HasTasks': True}
+    assert evaluate_conditions(hosted, '3', 1) == {'HasScaling': True, 'HasTasks': True}
+    service = only(hosted, 'AWS::ECS::Service')['Properties']
+    # The service takes DesiredCount unless HasScaling: so with 0 tasks it always carries DesiredCount 0.
+    assert service['DesiredCount'] == {'Fn::If': ['HasScaling', {'Ref': 'AWS::NoValue'}, {'Ref': 'DesiredCount'}]}
+    for logical_id in ('ScalableTarget', 'CpuScalingPolicy'):
+        assert hosted['Resources'][logical_id]['Condition'] == 'HasScaling'
+    # The budget variable and the scaling resources hang on the same condition.
+    (entry,) = [e for e in env_of(hosted) if isinstance(e, dict) and 'Fn::If' in e
+                and e['Fn::If'][0] == 'HasScaling']
+    assert entry['Fn::If'][1]['Name'] == 'AGENTICML_SERVER_DB_CONNECTIONS'
+    assert '0 stops the service' in hosted['Parameters']['DesiredCount']['Description']
+
+
+def test_hosted_connection_budget_fits_the_database_during_a_rolling_deploy(hosted):
+    budgets = hosted['Mappings']['ConnectionBudget']
+    assert set(budgets) == set(DB_CLASSES) == set(hosted['Parameters']['DbInstanceClass']['AllowedValues'])
+    task_counts = hosted['Parameters']['MaxTaskCount']['AllowedValues']
+    assert set(task_counts) == {'1', '2', '3', '4'}
+    for db_class, usable in USABLE_CONNECTIONS.items():
+        # CloudFormation resolves FindInMap even in an Fn::If branch that is not taken, so every class has an
+        # entry for every MaxTaskCount (the micro rule still refuses 3 and 4).
+        assert set(budgets[db_class]) == set(task_counts)
+        for tasks, budget in budgets[db_class].items():
+            n = int(tasks)
+            # floor(usable / (2n)): the 2 covers the rolling deploy (MaximumPercent 200).
+            assert budget == str(usable // (2 * n)), (db_class, tasks)
+            assert 2 * n * int(budget) <= usable, (db_class, tasks)
+            transaction, outer, inner = connection_limits(int(budget))
+            assert transaction + outer + inner + 1 == int(budget)
+    assert budgets == {
+        'db.t4g.micro': {'1': '32', '2': '16', '3': '10', '4': '8'},
+        'db.t4g.small': {'1': '72', '2': '36', '3': '24', '4': '18'},
+        'db.t4g.medium': {'1': '150', '2': '75', '3': '50', '4': '37'}}
+    # The variable exists only while autoscaling is on, and reads the mapping by class and task count.
+    (entry,) = [e for e in env_of(hosted) if isinstance(e, dict) and 'Fn::If' in e
+                and e['Fn::If'][0] == 'HasScaling']
+    assert entry['Fn::If'] == [
+        'HasScaling',
+        {'Name': 'AGENTICML_SERVER_DB_CONNECTIONS',
+         'Value': {'Fn::FindInMap': ['ConnectionBudget', {'Ref': 'DbInstanceClass'}, {'Ref': 'MaxTaskCount'}]}},
+        {'Ref': 'AWS::NoValue'}]
+
+
+def test_hosted_micro_database_allows_two_tasks_at_most(hosted):
+    # A rule keeps MaxTaskCount 3 and 4 off db.t4g.micro (the mapping still has entries for them, so that the lookup resolves).
+    rule = hosted['Rules']['MoreTasksNeedABiggerDatabase']
+    assert rule['RuleCondition'] == {'Fn::Equals': [{'Ref': 'DbInstanceClass'}, 'db.t4g.micro']}
+    (assertion,) = rule['Assertions']
+    assert assertion['Assert'] == {'Fn::Contains': [['1', '2'], {'Ref': 'MaxTaskCount'}]}
+    assert 'db.t4g.small' in assertion['AssertDescription']
+
+
+def test_hosted_connections_alarm_follows_the_database_class(hosted):
+    # About 80% of the estimated max_connections of each class (usable is that minus operators' room).
+    thresholds = hosted['Mappings']['ConnectionsAlarm']
+    assert thresholds == {'db.t4g.micro': {'Threshold': '60'}, 'db.t4g.small': {'Threshold': '130'},
+                          'db.t4g.medium': {'Threshold': '270'}}
+    alarm = alarms_of(hosted)['agenticml-hosted-rds_connections']
+    assert alarm['Threshold'] == {'Fn::FindInMap': ['ConnectionsAlarm', {'Ref': 'DbInstanceClass'}, 'Threshold']}
+    for db_class, usable in USABLE_CONNECTIONS.items():
+        # Below the usable estimate, so the alarm fires before the budgets are exhausted.
+        assert int(thresholds[db_class]['Threshold']) <= usable
 
 
 def test_hosted_alarms_notify_the_imported_topic(hosted):
@@ -793,7 +1021,8 @@ def test_hosted_alarms_notify_the_imported_topic(hosted):
     alarms = alarms_of(hosted)
     assert set(alarms) == {'agenticml-hosted-alb_5xx', 'agenticml-hosted-unhealthy', 'agenticml-hosted-rds_storage',
                            'agenticml-hosted-rds_cpu', 'agenticml-hosted-healthy_hosts',
-                           'agenticml-hosted-latency-p95'}
+                           'agenticml-hosted-latency-p95', 'agenticml-hosted-rds_cpu_credits',
+                           'agenticml-hosted-rds_connections', 'agenticml-hosted-ecs_memory'}
     for alarm in alarms.values():
         assert alarm['AlarmActions'] == [topic] and alarm['OKActions'] == [topic]
     summary = {n.removeprefix('agenticml-hosted-'): (a['Namespace'], a['MetricName'], a.get('Statistic'),
@@ -808,7 +1037,17 @@ def test_hosted_alarms_notify_the_imported_topic(hosted):
         'rds_cpu': ('AWS/RDS', 'CPUUtilization', 'Average', None, 'GreaterThanThreshold', 80, 300, 1, 'notBreaching'),
         'healthy_hosts': ('AWS/ApplicationELB', 'HealthyHostCount', 'Minimum', None, 'LessThanThreshold', {'Ref': 'DesiredCount'}, 60, 5, 'breaching'),
         'latency-p95': ('AWS/ApplicationELB', 'TargetResponseTime', None, 'p95', 'GreaterThanThreshold', 5, 300, 1, 'notBreaching'),
+        'rds_cpu_credits': ('AWS/RDS', 'CPUCreditBalance', 'Minimum', None, 'LessThanThreshold', 20, 300, 3, 'notBreaching'),
+        'rds_connections': ('AWS/RDS', 'DatabaseConnections', 'Maximum', None, 'GreaterThanThreshold', {'Fn::FindInMap': ['ConnectionsAlarm', {'Ref': 'DbInstanceClass'}, 'Threshold']}, 300, 1, 'notBreaching'),
+        'ecs_memory': ('AWS/ECS', 'MemoryUtilization', 'Maximum', None, 'GreaterThanThreshold', 85, 300, 2, 'notBreaching'),
     }
+    db = [{'Name': 'DBInstanceIdentifier', 'Value': {'Ref': 'DbInstance'}}]
+    assert alarms['agenticml-hosted-rds_cpu_credits']['Dimensions'] == db
+    assert alarms['agenticml-hosted-rds_connections']['Dimensions'] == db
+    # ECS/ContainerInsights stays off: the memory alarm reads the free service metric.
+    assert alarms['agenticml-hosted-ecs_memory']['Dimensions'] == [
+        {'Name': 'ClusterName', 'Value': {'Ref': 'Cluster'}},
+        {'Name': 'ServiceName', 'Value': {'Fn::GetAtt': 'Service.Name'}}]
     # healthy_hosts (fewer healthy targets than tasks wanted for 5 minutes) only
     # exists while DesiredCount is not 0, so scaling to 0 does not leave it in
     # ALARM. A new MaxValue needs a review of the threshold wording.
@@ -824,6 +1063,61 @@ def test_hosted_alarms_notify_the_imported_topic(hosted):
         {'Name': 'LoadBalancer', 'Value': {'Fn::GetAtt': 'LoadBalancer.LoadBalancerFullName'}},
         {'Name': 'TargetGroup', 'Value': {'Fn::GetAtt': 'TargetGroup.TargetGroupFullName'}}]
     assert not any(conditions.values())
+
+
+def test_bootstrap_dashboard_matches_the_hosted_names(bootstrap, hosted):
+    dashboard = only(bootstrap, 'AWS::CloudWatch::Dashboard')['Properties']
+    assert dashboard['DashboardName'] == 'agenticml-hosted'
+    template = fn_sub_text(dashboard['DashboardBody'])
+    assert set(re.findall(r'\$\{([^}]*)\}', template)) == {'AWS::Region'}
+    body = json.loads(template.replace('${AWS::Region}', 'eu-north-1'))
+    metrics = [m for w in body['widgets'] for m in w['properties']['metrics']]
+    assert {w['properties']['region'] for w in body['widgets']} == {'eu-north-1'}
+    # The names the dashboard refers to are the ones hosted.yaml defines.
+    props = lambda type_: only(hosted, type_)['Properties']
+    cluster, service = props('AWS::ECS::Cluster')['ClusterName'], props('AWS::ECS::Service')['ServiceName']
+    database = props('AWS::RDS::DBInstance')['DBInstanceIdentifier']
+    assert (cluster, service, database) == ('agenticml-hosted',) * 3
+    ecs = [m for m in metrics if m[0] == 'AWS/ECS']
+    assert {m[1] for m in ecs} == {'CPUUtilization', 'MemoryUtilization'}
+    assert all(m[2:6] == ['ClusterName', cluster, 'ServiceName', service] for m in ecs)
+    rds = [m for m in metrics if m[0] == 'AWS/RDS']
+    assert {m[1] for m in rds} == {'DatabaseConnections', 'CPUUtilization', 'CPUCreditBalance'}
+    assert all(m[2:4] == ['DBInstanceIdentifier', database] for m in rds)
+    # The namespace is the one the task policy allows.
+    (put,) = [s for s in statements(props('AWS::IAM::Policy')['PolicyDocument'])
+              if 'cloudwatch:PutMetricData' in actions_of(s)]
+    namespace = put['Condition']['StringEquals']['cloudwatch:namespace']
+    own = [m for m in metrics if m[0] not in ('AWS/ECS', 'AWS/RDS')]
+    assert namespace == capacity.NAMESPACE
+    assert {m[0] for m in own} == {capacity.NAMESPACE}
+    assert {m[1] for m in own} == set(capacity.METRIC_NAMES)
+    assert {m[-1]['stat'] for m in own if m[1] == 'Latency'} == {'p50', 'p95', 'p99'}
+    # Nothing in the hosted stack imports or refers to the dashboard.
+    assert 'Dashboard' not in (TEMPLATE_DIR / 'hosted.yaml').read_text()
+
+
+def test_bootstrap_dashboard_statistics_and_periods(bootstrap):
+    dashboard = only(bootstrap, 'AWS::CloudWatch::Dashboard')['Properties']
+    body = json.loads(fn_sub_text(dashboard['DashboardBody']).replace('${AWS::Region}', 'eu-north-1'))
+    shown = {}
+    for widget in body['widgets']:
+        props = widget['properties']
+        for line in props['metrics']:
+            options = line[-1] if isinstance(line[-1], dict) else {}
+            stat = options.get('stat', props.get('stat'))
+            period = options.get('period', props.get('period'))
+            shown.setdefault((line[0], line[1]), set()).add((stat, period))
+    ns = capacity.NAMESPACE
+    expected = {(ns, name): {('Sum', 60)} for name in ('Requests', 'Errors4xx', 'Errors5xx', 'Rejected')}
+    expected.update({(ns, 'Latency'): {('p50', 60), ('p95', 60), ('p99', 60)}})
+    expected.update({(ns, name): {('Maximum', 60), ('Sum', 60)} for name in ('InFlightPeak', 'DbConnectionsPeak')})
+    expected.update({(ns, name): {('Maximum', 3600)} for name in (
+        'Accounts', 'ActiveUsers7d', 'WorkspacesActive', 'StoredBytes', 'UploadBytesToday')})
+    expected[('AWS/RDS', 'CPUCreditBalance')] = {('Minimum', 300)}
+    for key, want in expected.items():
+        assert shown[key] == want, key
+    assert {name for (namespace, name) in shown if namespace == ns} == set(capacity.METRIC_NAMES)
 
 
 def test_hosted_backup_plan(hosted):
@@ -998,3 +1292,48 @@ def test_ecs_exec_policy_is_stated_in_the_runbook_and_threat_model():
     assert 'InitProcessEnabled' in readme
     assert 'deliberately not logged' in threat and 'CloudWatch' in threat
     assert 'directly as PID 1' not in (ROOT / 'deploy/aws/entrypoint.sh').read_text()
+
+
+def test_deploy_workflow_max_task_count_is_an_optional_input_passed_through_env():
+    workflow = load_workflow('deploy.yml')
+    option = workflow[True]['workflow_dispatch']['inputs']['max_task_count']
+    assert option['type'] == 'choice' and option['default'] == 'keep'
+    assert option['options'] == ['keep', '1', '2', '3', '4']
+    steps = workflow['jobs']['deploy']['steps']
+    (deploy,) = [s for s in steps if 'MAX_TASK_COUNT' in s.get('env', {})]
+    assert deploy['env']['MAX_TASK_COUNT'] == '${{ inputs.max_task_count }}'
+    # Push runs (no input) and "keep" leave the parameter out, so the stack keeps its value.
+    assert ('if [ -n "$MAX_TASK_COUNT" ] && [ "$MAX_TASK_COUNT" != keep ]; then\n'
+            '  overrides+=(MaxTaskCount="$MAX_TASK_COUNT")') in deploy['run']
+    assert '${{' not in deploy['run']
+    assert len([s for s in steps if 'describe-stack-events' in s.get('run', '')]) == 1
+
+
+def test_deploy_workflow_final_check_follows_the_stacks_scaling_parameters():
+    steps = load_workflow('deploy.yml')['jobs']['deploy']['steps']
+    (check,) = [s for s in steps if 'runningCount' in s.get('run', '')]
+    run = check['run']
+    assert '${{' not in run and 'describe-stack-events' not in run
+    # The stack's own MaxTaskCount and DesiredCount parameters (resolved values) decide.
+    assert "ParameterKey=='MaxTaskCount'" in run and "ParameterKey=='DesiredCount'" in run
+    assert run.count('describe-stacks') >= 3
+    # Autoscaling on (MaxTaskCount above 1 and DesiredCount above 0): up to 30 x 10 s, running == desired >= minimum.
+    assert 'if [ "$max_tasks" -gt 1 ] && [ "$min_tasks" -gt 0 ]; then' in run
+    assert 'attempts=30' in run and 'attempts=12' in run and 'sleep 10' in run
+    assert 'if [ "$running" = "$desired" ]; then' in run
+    assert 'if [ "$scaling" = true ] && [ "$desired" -ge "$min_tasks" ]; then' in run
+    # Otherwise the service must run exactly DesiredCount; a left-over scale-out fails with the fix to run.
+    assert 'if [ "$scaling" = false ] && [ "$desired" = "$min_tasks" ]; then' in run
+    assert 'if [ "$scaling" = false ] && [ "$desired" != "$min_tasks" ]; then' in run
+    assert '::error::' in run and 'aws ecs update-service' in run and '--desired-count $min_tasks' in run
+    assert 'redeploy with desired_count' in run
+    # Values come from the job env only.
+    env = load_workflow('deploy.yml')['jobs']['deploy']['env']
+    assert {'STACK_NAME', 'ECS_CLUSTER', 'ECS_SERVICE'} <= set(env)
+    assert len([s for s in steps if 'describe-stack-events' in s.get('run', '')]) == 1
+
+
+def test_deploy_role_can_describe_the_hosted_stack_for_the_final_check(bootstrap):
+    stmts = {s['Sid']: s for s in role_statements(bootstrap['Resources']['DeployRole']) if 'Sid' in s}
+    assert 'cloudformation:DescribeStacks' in actions_of(stmts['HostedStack'])
+    assert stmts['HostedStack']['Resource']['Fn::Sub'].endswith(':stack/agenticml-hosted/*')

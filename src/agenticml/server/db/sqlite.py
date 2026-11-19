@@ -130,6 +130,7 @@ class SqliteDatabase:
         self._local = threading.local()
         self._idle = []
         self._connections = set()
+        self._peak = 0
         self.closed = False
         try:
             if not self.path.parent.is_dir():
@@ -197,6 +198,7 @@ class SqliteDatabase:
                 if self.closed:
                     raise DatabaseError('database is closed')
                 connection = self._idle.pop() if self._idle else self._new_connection()
+                self._peak = max(self._peak, len(self._connections) - len(self._idle))
             connection.execute('BEGIN IMMEDIATE' if write else 'BEGIN')
             yield Tx(connection, self.dialect)
             connection.commit()
@@ -225,6 +227,15 @@ class SqliteDatabase:
                             pass
                     else:
                         self._idle.append(connection)
+
+    def pool_stats(self, reset=False):
+        """Connections in use now and the most at once since the last reset."""
+        with self._lock:
+            in_use = len(self._connections) - len(self._idle)
+            stats = {'in_use': in_use, 'peak': max(self._peak, in_use)}
+            if reset:
+                self._peak = in_use
+            return stats
 
     def confirm_session_locks(self):
         return

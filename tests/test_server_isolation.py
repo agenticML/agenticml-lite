@@ -109,6 +109,7 @@ EXAMPLES = {
     },
     "admin_server_admins_remove": {"method": "DELETE", "path": "/api/admin/server-admins/{login}"},
     "admin_audit": {"method": "GET", "path": "/api/admin/audit"},
+    "admin_stats": {"method": "GET", "path": "/api/admin/stats"},
     "healthz": {"method": "GET", "path": "/healthz"},
     "login_get": {"method": "GET", "path": "/login"},
     "login_post": {
@@ -285,7 +286,7 @@ def _write_run(root, run_id, marker):
 def _sync_run(server, key, writer):
     url = "http://127.0.0.1:%d" % server.server_address[1]
     result = sync.SyncResult(writer.run_id)
-    with Client(url, key, timeout=5, max_retries=0) as client:
+    with Client(url, key, timeout=30, max_retries=0) as client:
         sync.sync_run(RunReader(writer.root, writer.run_id), client.base_url, client, result)
         assert not result.failed, result.warnings
     return result
@@ -294,7 +295,7 @@ def _sync_run(server, key, writer):
 def _put_object(server, key, blob):
     url = "http://127.0.0.1:%d" % server.server_address[1]
     sha = hashlib.sha256(blob).hexdigest()
-    with Client(url, key, timeout=5, max_retries=0) as client:
+    with Client(url, key, timeout=30, max_retries=0) as client:
         client.put_object(sha, io.BytesIO(blob), len(blob))
     return sha
 

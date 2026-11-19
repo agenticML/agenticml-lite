@@ -1,6 +1,6 @@
 # Package 30: Backlog cleanup before the 3.0 release to `main`
 
-Nov 17, 2026 · Supervisor plan · Release 3.0 · Status: in review ([#79](https://github.com/agenticML/agenticml-lite/pull/79))
+Nov 17, 2026 · Supervisor plan · Release 3.0 · Status: done ([#79](https://github.com/agenticML/agenticml-lite/pull/79), merged Nov 17, 2026; released in 3.0.0)
 
 The AWS roadmap is done (PR #77). Before `dev` is merged into `main` and
 3.0.0 is tagged, every entry in the roadmap Backlog is either fixed,
