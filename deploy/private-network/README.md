@@ -86,7 +86,7 @@ URL). On the server, `curl http://127.0.0.1:8080/healthz` must answer.
 ## 4. Proxy
 
 Install Caddy or nginx and use the matching file. Both strip the identity
-headers and keep the `Host` header with its port.
+headers and pass the `Host` header unchanged.
 
 **Caddy** (internal certificate, no certificate files to manage):
 
@@ -105,9 +105,13 @@ of AgenticML must:
 - not redirect the sync URL (the client refuses any redirect);
 - send every request body with its `Content-Length`, without re-chunking
   (the server answers 411 otherwise);
-- allow bodies up to 4 GiB and read and send timeouts of at least 3 hours;
-- pass the `Host` header with its port, equal to the public URL's host and
-  port;
+- allow object uploads (large files and artifacts) up to 4 GiB, and read and
+  send timeouts of at least 3 hours (run files are capped at 16 MiB,
+  appends at 64 MiB, lineage bundles at 256 MiB);
+- pass the `Host` header unchanged, so it carries the public URL's host
+  name (the server does not compare the port; the browser's `Origin`
+  must equal the public URL, so the port in the public URL must be the
+  one users type);
 - drop `X-Forwarded-Email`, `X-Amzn-Oidc-Identity` and `Tailscale-User-Login`
   from clients;
 - keep query strings out of access logs, because setup and invite tokens are

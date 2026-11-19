@@ -14,7 +14,7 @@ agenticml.lab.internal {
 	# by the caddy user only):
 	# tls /etc/ssl/lab.crt /etc/ssl/lab.key
 
-	# Caddy passes the Host header unchanged (with its port), forwards request
+	# Caddy passes the Host header unchanged, forwards request
 	# bodies as they arrive without buffering them, and has no read or write
 	# timeout by default. Uploads of several GiB therefore need no extra
 	# settings here.

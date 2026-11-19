@@ -21,6 +21,22 @@ re-encoding records.
   `copy=False` artifacts. A 2.0 server returns an empty list (`[]`). Clients
   must only enable features that the server explicitly advertises.
 
+### Client TLS
+
+Clients use TLS for every non-local host, unless the user has consented to plain http for that exact host (see below). Client transport enforcement follows these rules:
+
+- **CA bundle order**: When validating server certificates, the client resolves trusted CA roots in this order (most specific first):
+  1. `--ca-bundle PATH` CLI option (on `login`, `sync`, `whoami`)
+  2. The bundle saved for that exact host by `login --ca-bundle`
+  3. `AGENTICML_CA_BUNDLE` environment variable
+  4. System default CA roots (which honours `REQUESTS_CA_BUNDLE`)
+
+  `login` ignores the bundle saved for the host: it uses `--ca-bundle`, then `AGENTICML_CA_BUNDLE`, then the system roots. A successful `login` replaces the saved entry for the host, so pass `--ca-bundle` on every `login`. The list above applies to `sync` and `whoami`.
+
+  A custom CA bundle replaces default system root certificates. Certificate verification can never be turned off. The bundle file and its directory must be owned by the user or root and not writable by group or others.
+- **No redirects followed**: The client strictly refuses HTTP 3xx redirects on all requests, aborting immediately without sending the bearer API key to a redirected target. Clients must configure and connect directly to the canonical public `https://` URL.
+- **Per-host insecure HTTP**: Non-local plain `http://` URLs are rejected by default. Passing `--insecure` on `agenticml login` records consent for that exact host in credentials, allowing subsequent `sync` and `whoami` commands to that host without `--insecure`. Commands that send the key over plain HTTP print `warning: sending the API key over plain http to <host>`.
+
 ## Authentication
 
 Every endpoint except `GET /healthz` requires an HTTP `Authorization` header:

@@ -43,8 +43,10 @@ What works without changes:
     a loopback name, `http://<Host>` is also accepted.
 - **The Host check is dashboard-only.** It (403 "forbidden host") applies
   to dashboard routes only, not to `/v2` (`server/ingest.py` 128-144). It
-  accepts only loopback names and the public URL's host, including any
-  non-443 port (`ui/server.py` 270-282).
+  accepts only loopback names and the public URL's host name; the port is
+  not compared (`ui/server.py` 221-236 `_canonical_host`, `_host_permitted`).
+  The port matters only for the `Origin` check (`_origin_ok`): the
+  browser's scheme, host and port must equal the public URL's.
 - **The first admin is created through a `/setup` link.** It is written
   to the server log at startup (`webauth.py` 464-481), and only while there
   is no admin user, no admin-scope key and no `AGENTICML_SERVER_KEY`
@@ -87,11 +89,14 @@ Gaps this package closes:
    - **No redirect on the sync URL.** The client refuses any 3xx.
    - **`Content-Length` on every body, no re-chunking.** Otherwise the
      server answers 411 (`ingest.py` 408-418).
-   - **Bodies up to 4 GiB** (`OBJECT_BODY_LIMIT`, `app.py` 35).
+   - **Object bodies up to 4 GiB** (`OBJECT_BODY_LIMIT`, `app.py` 35).
+     Run files are capped at 16 MiB, appends at 64 MiB and lineage
+     bundles at 256 MiB (`app.py` 33-57).
    - **Long read timeouts.** The body deadline is about 30 s +
      size / 512 KiB/s, roughly 2.3 h at 4 GiB (`app.py` 40-41, 121-125).
-   - **Host header with its port.** It must equal the public URL's
-     authority.
+   - **Host header unchanged.** Its host name must be the public URL's
+     host name; the port is not compared. The port in the public URL must
+     be the one users type, because the browser's `Origin` must equal it.
    - **`--trusted-proxy` set to the proxy itself.** Then the login
      throttle and the audit log see the real client address.
    - **Identity headers stripped** unless an authenticating proxy sets them
@@ -192,7 +197,9 @@ Files: `src/agenticml/auth.py`, `src/agenticml/client.py`,
      on `session.verify`.
    - When None, pass nothing, so requests' defaults stay.
    - In `_request`, catch `requests.exceptions.SSLError` *before* the
-     `ConnectionError` clause and re-raise it at once (no retry).
+     `ConnectionError` clause and re-raise it at once (no retry) when it is a
+     certificate failure or a peer that does not speak TLS; other handshake
+     failures keep the normal retries (amended in review, see Build notes).
 4. **`tls_failure(exc)`** (`client.py`). It walks `exc`, `.args`,
    `.reason` and `__cause__`/`__context__`. It returns `"cert"` when it
    finds `ssl.SSLCertVerificationError`, `"tls"` for any other
@@ -314,7 +321,7 @@ Files:
    - `client_max_body_size 4g`, `proxy_request_buffering off`,
      `proxy_http_version 1.1`;
    - `proxy_read_timeout 3h` and `proxy_send_timeout 3h`;
-   - `proxy_set_header Host $http_host` (keeps a non-443 port);
+   - `proxy_set_header Host $http_host` (passes the client's Host unchanged);
    - `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for` and
      `X-Forwarded-Proto https`;
    - `proxy_set_header X-Forwarded-Email ""`, `X-Amzn-Oidc-Identity ""` and
@@ -549,3 +556,31 @@ confirms the Caddy root path. Each mismatch becomes a fix with a test.
     carry runs, objects, lineage and the owner.
   - Today's `server reindex` copy-in loses the owner, objects, lineage
     and notes.
+
+## Build notes (Nov 19, 2026)
+
+Decisions and deviations recorded while building, by the supervisor:
+
+- **Retries (34.1).** Review showed that urllib3 also raises `SSLError` for
+  transient handshake failures (a peer closing at accept, a reloading
+  proxy). Only certificate failures and protocol mismatches
+  (`WRONG_VERSION_NUMBER`, `HTTP_REQUEST`, `UNKNOWN_PROTOCOL`,
+  `WRONG_SSL_VERSION`) skip the retry; everything else is retried as before.
+- **Vanished bundle (34.1).** A bundle that disappears while `sync --follow`
+  runs raises `CABundleUnavailable` (a `ConnectionError`), so follow keeps
+  retrying with `CA bundle not found or unreadable: <path>` in its retry
+  line.
+- **Extra bundle checks (34.1).** The bundle's owner (you or root) is checked
+  as well as its mode, with separate texts for the file and its directory.
+  `resolve_connection` has a `use_saved` keyword (login passes `False`) and
+  the result carries `ca_source`.
+- **Host port (34.2, 34.3).** The dashboard's Host check compares host names
+  only (`_canonical_host` strips the port); the port matters for the Origin
+  check. The kit still passes `Host $http_host` unchanged.
+- **Sync keys (34.2).** The checklist creates keys with `--user NAME`: a key
+  without it falls to the only user, or fails when there are several.
+- **Version (34.4).** 3.1 (packages 31–33) was merged to `dev` but never
+  released, so 3.2.0 carries both; the Releases page says so. Install lines
+  that state what PyPI serves stay at 3.0.0 until 3.2.0 is published (Backlog
+  owner step "3.2.0 release").
+

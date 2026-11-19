@@ -95,6 +95,80 @@ sudo systemctl status agenticml-server
 sudo journalctl -u agenticml-server -f
 ```
 
+## Private network (no Tailscale)
+
+Run the server and dashboard inside a private VPC or lab network without Tailscale or internet connectivity. All traffic starts inside the network, terminated by a local TLS reverse proxy with an internal certificate.
+
+```
+training machines ──HTTPS :443──▶ TLS proxy (internal cert) ──▶ agenticml server serve
+lab users' browsers ──HTTPS :443──┘        Caddy or nginx            127.0.0.1:8080, SQLite on local disk
+```
+
+The server binds loopback (`127.0.0.1:8080`) and speaks HTTP. TLS ends at the reverse proxy.
+
+### Setup checklist
+
+See [deploy/private-network/README.md](../deploy/private-network/README.md) for the complete operator guide. In brief:
+
+1. **Prerequisites**: Python 3.10+ on the server and training machines. Install `git` on the server for lineage code diffs. Run NTP or chrony across all machines to prevent TLS clock errors. Assign a DNS name (or `/etc/hosts` entry) to the server.
+2. **Install `agenticml-lite>=3.2`**: Install on the server (`/opt/agenticml`) and training machines. For machines without internet access, download wheels on a connected machine with matching OS and Python minor version via `pip download -d wheelhouse 'agenticml-lite>=3.2'`, transfer the directory, and install using `sudo /opt/agenticml/bin/python -m pip install --no-index --find-links wheelhouse 'agenticml-lite>=3.2'`. Fetch deployment configs from the matching release tag.
+3. **Configure systemd service**: Install `agenticml-server.service` and copy `deploy/private-network/agenticml-server.env.example` to `/etc/agenticml-server.env` (`0600`, root). Set `AGENTICML_SERVER_PUBLIC_URL` to your canonical HTTPS URL (including any non-443 port) and `AGENTICML_SERVER_TRUSTED_PROXIES=127.0.0.1/32`. Do not set `AGENTICML_SERVER_KEY`, which disables the first-admin setup link.
+4. **Configure reverse proxy**: Set up Caddy (using `tls internal` or your own certificates) or nginx using configs from `deploy/private-network/`. Under SELinux, run `sudo setsebool -P httpd_can_network_connect 1`.
+5. **Distribute CA certificate**: For Caddy's internal CA, copy the root certificate (`/var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt`) or your internal PKI root CA to `/etc/ssl/certs/lab-ca.pem` on each training machine. Install the CA in users' browsers or OS certificate stores. Back up Caddy's data directory so regenerated roots do not invalidate clients.
+6. **Create first admin**: Before exposing port 443 to users, retrieve the one-time setup link from `sudo journalctl -u agenticml-server | grep 'setup?token'` and complete admin registration in a browser. Alternatively, run `sudo -u agenticml /opt/agenticml/bin/agenticml server users add NAME --role admin --public-url https://... --data /var/lib/agenticml-server`.
+7. **Issue sync keys**: Issue sync keys from the dashboard Keys page or CLI (`sudo -u agenticml /opt/agenticml/bin/agenticml server keys create --name box-1 --scope sync --user NAME --data /var/lib/agenticml-server`). The machine's runs are owned by that user; a key created on the dashboard Keys page belongs to the signed-in person.
+8. **Configure training machines**: Run `agenticml login --host https://... --ca-bundle /etc/ssl/certs/lab-ca.pem`. Verify with `agenticml whoami` and `agenticml sync --all`. Install the user service `agenticml-sync.service` for continuous synchronization.
+9. **Firewall rules**: Allow inbound connections to port 443 (and port 80 for browser redirects) on the proxy. Port 8080 must stay on loopback.
+10. **Automate backups**: Add a nightly cron job running `agenticml server backup` as the `agenticml` user.
+
+### Reverse proxy rules
+
+A reverse proxy in front of the server must satisfy these requirements:
+
+- **No redirects on sync requests**: The client rejects HTTP 3xx redirects to prevent sending API keys across hosts or schemes. Sync clients must connect directly to the final `https://` URL.
+- **Forward Content-Length without re-chunking**: Streaming upload requests must retain their `Content-Length`. Re-chunking request bodies causes the server to return HTTP 411 Length Required.
+- **Support 4 GiB request bodies**: Object uploads (large files and artifacts) can be up to 4 GiB in one request (`OBJECT_BODY_LIMIT`). Run files are capped at 16 MiB, appends at 64 MiB and lineage bundles at 256 MiB. Set `client_max_body_size 4g` in nginx.
+- **Long timeouts**: Set proxy read and send timeouts to at least 3 hours (`proxy_read_timeout 3h`, `proxy_send_timeout 3h`). Server body timeouts allow approximately 30 seconds plus 2 seconds per MiB (~2.3 hours for 4 GiB).
+- **Forward the Host header**: Forward `Host` unchanged (`proxy_set_header Host $http_host` in nginx). Its host name must be the public URL's host name; the server does not compare the port. The port in `AGENTICML_SERVER_PUBLIC_URL` must be the one users type, because the browser's `Origin` (scheme, host and port) must equal it.
+- **Strip identity headers**: Drop incoming `X-Forwarded-Email`, `X-Amzn-Oidc-Identity`, and `Tailscale-User-Login` headers from clients so untrusted clients cannot spoof authenticated identities.
+- **Filter query strings from access logs**: Setup and invite tokens travel in query strings (`/setup?token=...`, `/invite?token=...`). Omit query strings from proxy access logs.
+- **Strict trusted proxy CIDR**: Configure `AGENTICML_SERVER_TRUSTED_PROXIES` with the proxy's exact IP as `/32` (`127.0.0.1/32`), never a broad subnet.
+
+### Sign-in options
+
+- **Local passwords and invite links (default)**: Users accept one-time invite links generated by administrators and sign in with local passwords (`scrypt`). Firebase remains disabled (`AGENTICML_SERVER_FIREBASE_PROJECT` unset).
+- **Single sign-on with oauth2-proxy (variant)**: To authenticate users via an external identity provider, chain `client -> TLS proxy -> oauth2-proxy -> agenticml server serve`:
+  1. Configure `--identity-header oauth2-proxy` (or `AGENTICML_SERVER_IDENTITY_HEADER=oauth2-proxy`) and set `AGENTICML_SERVER_TRUSTED_PROXIES` strictly to oauth2-proxy's `/32` address.
+  2. The outer TLS proxy must strip any incoming `X-Forwarded-Email` header from clients.
+  3. oauth2-proxy must skip authentication for `/v2/` and `/healthz` routes; sync clients authenticate using Bearer API keys and cannot negotiate browser SSO flows.
+  4. Map user accounts to emails using `sudo -u agenticml /opt/agenticml/bin/agenticml server users set-identity LOGIN email@example.com --data /var/lib/agenticml-server`.
+
+### Proxy bypass with NO_PROXY
+
+If training machines define `HTTPS_PROXY` in their environment, add the server hostname to `NO_PROXY`:
+
+```bash
+export NO_PROXY=agenticml.lab.internal
+```
+
+Add the same setting to `~/.config/systemd/user/agenticml-sync.service` (`Environment=NO_PROXY=agenticml.lab.internal`) so sync traffic reaches the internal server directly.
+
+### Client CA bundles and host trust
+
+When connecting to internal HTTPS servers signed by private CAs:
+
+- **CA bundle precedence**:
+  1. `--ca-bundle PATH` flag on `agenticml login`, `sync`, `whoami`
+  2. CA bundle saved for that exact host by `agenticml login --ca-bundle`
+  3. `AGENTICML_CA_BUNDLE` environment variable
+  4. System default CA roots (honours `REQUESTS_CA_BUNDLE`)
+
+  `login` ignores the bundle saved for the host: it uses `--ca-bundle`, then `AGENTICML_CA_BUNDLE`, then the system roots. A successful `login` replaces the saved entry for the host, so pass `--ca-bundle` on every `login`. Items 1-4 apply to `sync` and `whoami`.
+- **Why save bundles per host**: Specifying a CA bundle replaces the default roots rather than adding to them. A workstation syncing to both an internal lab server and the public hosted service (`app.agenticml.xyz`) should save the bundle per host using `agenticml login --ca-bundle` rather than exporting `AGENTICML_CA_BUNDLE` globally, which would cause public certificate verification to fail.
+- **Verification cannot be disabled**: There is no flag or option to disable TLS certificate checks.
+- **File ownership and permissions**: Custom CA bundles and their parent directories must be owned by the user or root and must not be group- or world-writable (`mode & 0o022 == 0`).
+- **Plain HTTP trust**: Running `agenticml login --insecure` to a non-local `http://` host records consent for that exact host in `credentials.json`. Subsequent `sync` and `whoami` commands to that saved host do not require the `--insecure` flag. Older saved entries require one more `login --insecure` to store this flag. Commands that transmit API keys over plain HTTP emit `warning: sending the API key over plain http to <host>`. Running `login` again for a host replaces its saved entry, so repeat `--ca-bundle` or `--insecure`.
+
 ## Workspaces and routing
 
 All data on the server is scoped to a workspace.
@@ -620,6 +694,24 @@ Additional environment variables:
 - `AGENTICML_SERVER_S3_KMS_KEY_ID`: AWS KMS Key ID or ARN for S3 server-side encryption (`aws:kms`).
 - `AGENTICML_REMOTE_STALE_SECONDS`: Inactivity threshold before an active run is marked `stale` (default `600`).
 
+### Client options
+
+Options on `agenticml login`, `agenticml sync`, and `agenticml whoami`:
+
+| Flag | Environment variable | Default | Description |
+| --- | --- | --- | --- |
+| `--ca-bundle PATH` | `AGENTICML_CA_BUNDLE` | unset | Path to a custom CA bundle file for TLS certificate verification. |
+
+Trust resolution order (most specific first):
+1. `--ca-bundle PATH` CLI option
+2. CA bundle saved for the exact host by `agenticml login --ca-bundle`
+3. `AGENTICML_CA_BUNDLE` environment variable
+4. System default CA bundle (honours `REQUESTS_CA_BUNDLE`)
+
+`login` ignores the bundle saved for the host: it uses `--ca-bundle`, then `AGENTICML_CA_BUNDLE`, then the system roots. A successful `login` replaces the saved entry for the host, so pass `--ca-bundle` on every `login`. The list above applies to `sync` and `whoami`.
+
+A custom CA bundle replaces default system root certificates. Save the bundle per host via `login --ca-bundle` when syncing to both private and public HTTPS endpoints. Certificate verification can never be turned off. CA bundle files and parent directories must be owned by the user or root and must not be group- or world-writable (`mode & 0o022 == 0`).
+
 ## Network filesystems (EFS)
 
 Every append, atomic write, and object put on the server does `os.fsync` plus a directory fsync. That is the main extra cost when `<data>` is on EFS or another network filesystem. `server/tmp` and `store` must already be on the same filesystem (the server refuses to start otherwise). Run a single server process per data directory when using SQLite. NFSv4 emulates `flock` on `server.lock`; AWS documents NFSv4.1 (`nfsvers=4.1`) for EFS, and that is the recommended mount.
@@ -708,7 +800,80 @@ Machines behind the same NAT or HTTP proxy share one throttle bucket, even if th
 Another server process has the SQLite data directory open. Check `systemctl status agenticml-server` or look for running `agenticml server serve` processes on the host. Stop the conflicting process. If multiple processes are required, use PostgreSQL via `--database`.
 
 ### HTTP 403 ("forbidden host") on dashboard
-The dashboard accepts requests only from loopback addresses unless `--public-url` is configured. When operating behind a reverse proxy, set `AGENTICML_SERVER_PUBLIC_URL=https://<your-hostname>` in the server environment (or `/etc/agenticml-server.env` under systemd).
+The dashboard accepts requests only from loopback addresses unless `--public-url` is configured. The incoming `Host` header must carry the public URL's host name (or a loopback name); the port is not compared here. When operating behind a reverse proxy, set `AGENTICML_SERVER_PUBLIC_URL=https://<your-hostname>` in the server environment (or `/etc/agenticml-server.env` under systemd) and configure the proxy to forward the `Host` header unchanged (`proxy_set_header Host $http_host;` in nginx).
+
+### HTTP 403 ("cross-site request refused") on dashboard
+The dashboard rejected a state-changing POST request because the request's `Origin` does not match `AGENTICML_SERVER_PUBLIC_URL`. The browser's scheme, host and port must all equal `AGENTICML_SERVER_PUBLIC_URL`. Ensure the browser visits the exact scheme, host, and port configured there (include the port in the public URL if it is not 443).
+
+### TLS certificate check failed
+The client prints:
+```
+TLS certificate check failed (untrusted CA, wrong host name, expired, or a wrong clock); pass --ca-bundle PATH or set AGENTICML_CA_BUNDLE, and use the name in the certificate
+```
+The TLS certificate presented by the server or proxy could not be validated. Common causes:
+- The certificate was issued by an internal CA not trusted by the client. Pass `--ca-bundle PATH` or set `AGENTICML_CA_BUNDLE`.
+- The hostname in `--host` does not match the Subject Alternative Names (SAN) in the certificate. Connect using the exact DNS name in the certificate.
+- The certificate has expired, or the client or server system clock is wrong. Check clocks using `timedatectl` or `chronyc tracking`.
+
+Diagnose the TLS connection with `openssl`:
+```bash
+openssl s_client -connect agenticml.lab.internal:443 -CAfile lab-ca.pem
+```
+
+A certificate failure, or an `https://` URL that points at a port that does not speak TLS, is not retried by one-shot commands (`sync`, `whoami`, `login`). Continuous follow mode (`sync --follow`) keeps retrying with backoff and shows the hint in its status line:
+```
+server unreachable (TLS certificate check failed (untrusted CA, wrong host name, expired, or a wrong clock); pass --ca-bundle PATH or set AGENTICML_CA_BUNDLE, and use the name in the certificate); retrying in 30s
+```
+
+### TLS handshake failed
+The client prints:
+```
+TLS handshake failed (the server closed the connection, or this is not an https port)
+```
+The client could not establish a TLS connection. Other handshake failures (for example the peer closing the connection) are retried a few times before this hint appears. Check whether the server closed the connection abruptly, or whether an `https://` URL was mistakenly pointed at a plain HTTP port (e.g. connecting directly to backend port 8080 over HTTPS instead of port 443 on the TLS proxy).
+
+### "server redirected to another URL"
+The client prints:
+```
+server redirected to another URL; use the final https:// URL as --host (refusing to send the API key on a redirect)
+```
+The server or reverse proxy returned an HTTP 3xx redirect (such as an HTTP-to-HTTPS redirect or adding a trailing slash). The client refuses to follow redirects to prevent exposing API keys. Update `--host` to the final canonical `https://` URL.
+
+### CA bundle file and permission errors
+The client validates custom CA bundles before use:
+- `CA bundle not found or unreadable: <path>`: The file does not exist, is a directory, or lacks read permissions.
+- `CA bundle is not owned by you or root: <path>`
+- `CA bundle directory is not owned by you or root: <dir>`
+- `CA bundle is writable by others: <path>; chmod go-w`: The bundle file has group- or world-writable permissions.
+- `CA bundle directory is writable by others: <dir>; chmod go-w <dir>`: The directory containing the bundle is group- or world-writable.
+- ``CA bundle path in the credentials file is not absolute: <path>; run `agenticml login --ca-bundle PATH` again`` (the fix is to run login again with an absolute path)
+
+The bundle file and its directory must be owned by the user or root and must not be writable by group or others. Fix permissions:
+```bash
+chmod go-w <path>
+chmod go-w <dir>
+```
+
+### Proxy errors: HTTP 411, 413, or 408
+- **HTTP 411 Length Required**: The reverse proxy re-chunked the body and omitted `Content-Length`. The server requires `Content-Length` on upload requests. In nginx, configure `proxy_http_version 1.1;` and `proxy_request_buffering off;`.
+- **HTTP 413 Payload Too Large / Request Entity Too Large**: The reverse proxy's body size limit is below 4 GiB. In nginx, set `client_max_body_size 4g;`.
+- **HTTP 408 Request Timeout**: The server received the body too slowly. It allows about 30 s plus 2 s per MiB, so an upload slower than about 512 KiB/s fails. It also happens when the connection ended before the whole body arrived. Keep `proxy_request_buffering off;` and the 3 hour `proxy_read_timeout 3h;` and `proxy_send_timeout 3h;`, which prevent proxy-side 504 errors on long uploads.
+
+### HTTP 502 under SELinux
+Under SELinux, the reverse proxy is blocked from connecting to loopback network ports by default. Enable network connections for the proxy:
+```bash
+sudo setsebool -P httpd_can_network_connect 1
+```
+Ensure certificate files are stored in `/etc/pki` or `/etc/ssl` and restore proper file labels:
+```bash
+sudo restorecon -Rv /etc/ssl /etc/pki
+```
+
+### Browser certificate warnings
+Web browsers display certificate warnings when opening the dashboard if the internal CA root is not trusted. Install the lab CA in the browser or OS store on every client workstation.
+
+### Client version check skipped
+A proxy that strips the User-Agent header makes the server skip its client-version check (HTTP 426). Ensure the reverse proxy forwards `User-Agent` if client version enforcement is desired.
 
 ### HTTP 426 ("this server needs agenticml-lite >= X.Y")
 The sync client is running an older `agenticml-lite` version below `--min-client-version` (default 2.2). Update the client package on the training machine:
