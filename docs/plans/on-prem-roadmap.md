@@ -11,6 +11,7 @@ plans live next to it:
 - Release 2.1: sketched below, with package plans in `packages/`.
 - Release 2.2: [on-prem-teams-plan.md](on-prem-teams-plan.md)
 - Release 3.0: [on-prem-3.0-plan.md](on-prem-3.0-plan.md)
+- Release 3.1: sketched below, with package plans in `packages/`.
 
 ## Product direction
 
@@ -37,6 +38,7 @@ plans live next to it:
 | **2.1** | Full fidelity | Lineage code diffs on the server, by-reference artifacts, EFS performance check, operator tooling | A run synced to the server is indistinguishable from the local one in the dashboard, apart from notes |
 | **2.2** | Teams | Users and roles, per-user keys, dashboard sign-in through a trusted identity proxy, audit log | Two users with different roles share one server, each with the access their role allows, and every write is attributed |
 | **3.0** | Database storage, workspaces and hosted service | Server state in SQLite or Postgres, workspaces with accounts and memberships on one hostname, Firebase sign-in and self-serve sign-up with free limits, many server processes, S3 objects, metric summaries, AWS deployment, agenticml-server retired | Exit criteria 1–6 in the [3.0 plan](on-prem-3.0-plan.md); released Nov 17, 2026 as 3.0.0 (tag `v3.0.0`, [PyPI](https://pypi.org/project/agenticml-lite/3.0.0/), [GitHub release](https://github.com/agenticML/agenticml-lite/releases/tag/v3.0.0)) |
+| **3.1** | Scale and visibility | Usage history on `/admin` and `agenticml server stats`, capacity metrics with a CloudWatch dashboard and alarms, ECS autoscaling for the hosted service | A server admin sees accounts, active users, workspaces and stored data over time; the hosted service shows request, latency, task and database load on one dashboard; under a load test it scales between 1 and its maximum task count with no failed requests |
 | Later | Scale and lifecycle | Unscheduled; see below | – |
 
 Decision (Nov 5, 2026): the server ships only as the `agenticml-lite`
@@ -323,6 +325,40 @@ Getting the hosted service live on AWS, step by step: [AWS deployment roadmap](a
   promoted on the site until the policies are live (29.7). It runs beside
   24.3; only 29.7 and 29.9 touch code or `pyproject.toml`.
 
+### 3.1: scale and visibility
+
+Started Nov 17, 2026 (owner: "we need metrics to track users and total data
+used, to help us scale, and visibility"). Today the hosted service runs a
+fixed 1 task (2 by hand), the database is sized for two tasks, and only
+per-workspace counters exist, with no history. Order: 31, then 32, then 33.
+33 also waits for the owner's "Two-task rolling deploy check" in the
+Backlog.
+
+| # | Package | Depends on | Coder | Size | Plan | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| 31 | Usage history: `accounts.last_active_at`, daily `stats_daily` snapshots refreshed hourly inside the server, `GET /api/admin/stats`, `agenticml server stats`, Usage section with growth charts on `/admin` | 3.0 | Sonnet | M | [plan](packages/31-usage-history.md) | in review |
+| 32 | Capacity metrics: per-minute requests, errors, latency percentiles, peak requests in progress and database connections, and the 31 totals, sent with `PutMetricData` (`--metrics cloudwatch`, off by default); alarms on database CPU credits, database connections and ECS memory in `hosted.yaml`; a CloudWatch dashboard in `bootstrap.yaml` | 31 | Sonnet | M | [plan](packages/32-capacity-metrics.md) | in review |
+| 33 | ECS autoscaling: target tracking on service CPU (60%) between `DesiredCount` (minimum) and a new `MaxTaskCount` (1–4, default 1 = off); a per-process Postgres connection budget (`AGENTICML_SERVER_DB_CONNECTIONS`) sized by `DbInstanceClass` (new parameter; micro allows at most 2 tasks) so every task fits the database even during deploys; deploys stop resetting the count; `max_task_count` deploy input | 32, owner's two-task check | Sonnet; owner runs it | M | [plan](packages/33-autoscaling.md) | in review |
+
+- **31** answers "are we growing?" with no AWS change and no data sent
+  anywhere: the server keeps one row of totals per UTC day (accounts,
+  active accounts over 1, 7 and 30 days, workspaces by state, stored and
+  uploaded bytes, runs), refreshed every hour, and `/admin` charts them.
+  It works the same self-hosted.
+- **32** answers "what is the bottleneck?": 12 metrics with no dimensions
+  (no raw paths, no per-task, per-workspace or per-user values; cost and
+  privacy), about $1–4/month after the free ten. The dashboard lives in
+  the bootstrap stack, so hosted deploys never wait for a bootstrap
+  re-apply.
+- **33** scales the app tier on CPU. Each Fargate task is one Python
+  process; the database stays shared, so each task gets a connection
+  budget of `floor(usable / (2 × max tasks))` (covering rolling-deploy
+  surges), with usable connections estimated per instance class. RDS
+  gives `db.t4g.micro` only about 75 usable connections, so micro allows
+  at most 2 tasks; 3–4 tasks need `db.t4g.small` (about +$12/month). It
+  ships off (`MaxTaskCount` 1); the owner turns it on after the bootstrap
+  re-apply and the two-task check.
+
 ### Maintenance fixes
 
 - Empty object and lineage upload framing: [plan](packages/fix-empty-uploads.md),
@@ -401,6 +437,47 @@ on Nov 17, 2026; none of the entries below blocked it.
 
 ### Owner steps
 
+- **Capacity dashboard and metrics** (package 32, Nov 18, 2026). Do after
+  the 3.1 PR is merged to `dev` and deployed.
+  - Where: `deploy/aws/README.md`, "Capacity dashboard and metrics"; the
+    bootstrap deploy command near the top of that README.
+  - Problem: the `agenticml-hosted` CloudWatch dashboard lives in the
+    bootstrap stack, which only the owner applies (laptop, admin
+    credentials). The hosted deploy turns on `--metrics cloudwatch` but
+    cannot create the dashboard.
+  - Fix: (1) re-apply the bootstrap stack with the existing command;
+    (2) after the next hosted deploy, open CloudWatch → Dashboards →
+    `agenticml-hosted` and check that `Requests`, `Latency` and
+    `DbConnectionsPeak` show data within a few minutes, and the usage
+    totals within 15 minutes; (3) `aws logs tail /ecs/agenticml-hosted
+    --since 15m | grep -i "capacity metrics"` shows no warnings;
+    (4) confirm the three new alarms are in OK (`rds_cpu_credits`,
+    `rds_connections`, `ecs_memory`).
+  - Done when: the dashboard shows the custom metrics and the nine hosted
+    alarms are OK, recorded here.
+- **Turn on autoscaling** (package 33, Nov 19, 2026). After the capacity
+  dashboard step above (same bootstrap re-apply) and the two-task rolling
+  deploy check below.
+  - Where: `deploy/aws/README.md`, "Operations and scaling".
+  - Problem: autoscaling ships off (`MaxTaskCount` 1). The connection
+    budgets per instance class are estimates (micro 64 usable, small 144,
+    medium 300) until checked on the real database.
+  - Fix: (1) `SHOW max_connections;` on the hosted database (ECS Exec);
+    if the usable number is below the estimate for the class, lower the
+    `ConnectionBudget` and `ConnectionsAlarm` mappings in `hosted.yaml`
+    first; (2) for more than 2 tasks, set `DbInstanceClass` to
+    `db.t4g.small` at a quiet time (a few minutes of downtime) and repeat
+    (1); (3) `gh workflow run deploy.yml --ref dev -f max_task_count=2`
+    (or 3–4 on small); (4) load test with several sync clients in parallel
+    (for example `scripts/hosted_check.py make-run` from a few machines,
+    or `bench_server.py` on Fargate as in the README) and watch the
+    package 32 dashboard: the service scales out above 60% CPU and back
+    in after load stops, `Rejected` and `Errors5xx` stay near 0, and
+    `DbConnectionsPeak` and RDS `DatabaseConnections` stay under the
+    budget and the alarm.
+  - Done when: a load test scales out and back in with no failed syncs,
+    the real `max_connections` is recorded here, and the mappings match
+    it.
 - **Release follow-ups (owner)** (3.0.0 released Nov 17, 2026). Low priority.
   - Where: repository Settings → Environments → `pypi`; tags.
   - Problem: the `pypi` environment has no required reviewer, so any pushed

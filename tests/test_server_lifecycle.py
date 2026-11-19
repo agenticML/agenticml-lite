@@ -174,9 +174,9 @@ def test_serve_restores_handler_and_ignores_repeated_sigterm(monkeypatch, interr
     monkeypatch.setattr(app, "make_server", lambda *args: server)
     if interrupt_close:
         with pytest.raises(KeyboardInterrupt):
-            app.serve()
+            app.serve(stats_interval=0)
     else:
-        app.serve()
+        app.serve(stats_interval=0)
     assert signal.getsignal(signal.SIGTERM) is previous
     assert closed == [app.SHUTDOWN_DRAIN]
     assert len(workers) == 1
@@ -202,7 +202,7 @@ def test_serve_off_main_thread_skips_signal_install(monkeypatch):
 
     def run():
         try:
-            app.serve()
+            app.serve(stats_interval=0)
         except BaseException as exc:
             errors.append(exc)
 

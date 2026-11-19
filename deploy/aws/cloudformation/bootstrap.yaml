@@ -2,8 +2,8 @@ AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::LanguageExtensions
 Description: >-
   AgenticML hosted service, stack 1 of 2. Created once by the owner with admin
-  credentials: image repository, GitHub deploy roles, TLS certificate and
-  account cost alerts. The deploy workflow manages the other stack.
+  credentials: image repository, GitHub deploy roles, TLS certificate,
+  account cost alerts and the hosted capacity dashboard. The deploy workflow manages the other stack.
 
 Parameters:
   AlertEmails:
@@ -352,10 +352,42 @@ Resources:
                   - cloudwatch:TagResource
                   - cloudwatch:UntagResource
                 Resource: !Sub arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:agenticml-hosted-*
+              - Sid: ScalingAlarms
+                Effect: Allow
+                Action:
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:PutMetricAlarm
+                # The alarms target tracking manages for the hosted service's autoscaling.
+                Resource: !Sub arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:TargetTracking-service/agenticml-hosted/agenticml-hosted-*
               - Sid: AlarmsDescribe
                 Effect: Allow
                 Action: cloudwatch:DescribeAlarms
                 Resource: "*" # describe calls have no resource ARN
+              - Sid: Scaling
+                Effect: Allow
+                Action:
+                  - application-autoscaling:DeleteScalingPolicy
+                  - application-autoscaling:DeregisterScalableTarget
+                  - application-autoscaling:DescribeScalableTargets
+                  - application-autoscaling:DescribeScalingActivities
+                  - application-autoscaling:DescribeScalingPolicies
+                  - application-autoscaling:DescribeScheduledActions
+                  - application-autoscaling:ListTagsForResource
+                  - application-autoscaling:PutScalingPolicy
+                  - application-autoscaling:RegisterScalableTarget
+                  - application-autoscaling:TagResource
+                  - application-autoscaling:UntagResource
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              - Sid: ScalingMetrics
+                Effect: Allow
+                Action: cloudwatch:GetMetricData # the scaling policy handler reads the metric when it creates the policy
+                Resource: "*" # this call has no resource ARN
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
               - Sid: Backup
                 Effect: Allow
                 Action:
@@ -454,6 +486,7 @@ Resources:
                       - rds.amazonaws.com
                       - backup.amazonaws.com
                       - elasticfilesystem.amazonaws.com
+                      - ecs.application-autoscaling.amazonaws.com
               - Sid: NotTheBootstrapRoles
                 Effect: Deny
                 Action:
@@ -750,6 +783,59 @@ Resources:
       TreatMissingData: notBreaching
       AlarmActions: [!Ref AlertsTopic]
       OKActions: [!Ref AlertsTopic]
+
+  # Capacity dashboard. The hosted names are fixed (cluster, service and
+  # database `agenticml-hosted`); nothing in the hosted stack depends on it.
+  # AgenticML/Server holds the metrics the server publishes (--metrics cloudwatch).
+  HostedDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: agenticml-hosted
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {"type": "metric", "x": 0, "y": 0, "width": 12, "height": 6, "properties": {
+              "title": "Requests per minute", "region": "${AWS::Region}", "view": "timeSeries",
+              "stat": "Sum", "period": 60, "metrics": [
+                ["AgenticML/Server", "Requests", {"label": "Requests"}],
+                ["AgenticML/Server", "Errors4xx", {"label": "4xx"}],
+                ["AgenticML/Server", "Errors5xx", {"label": "5xx"}],
+                ["AgenticML/Server", "Rejected", {"label": "Rejected at the connection cap"}]]}},
+            {"type": "metric", "x": 12, "y": 0, "width": 12, "height": 6, "properties": {
+              "title": "Server latency (ms)", "region": "${AWS::Region}", "view": "timeSeries",
+              "period": 60, "metrics": [
+                ["AgenticML/Server", "Latency", {"stat": "p50", "label": "p50"}],
+                ["AgenticML/Server", "Latency", {"stat": "p95", "label": "p95"}],
+                ["AgenticML/Server", "Latency", {"stat": "p99", "label": "p99"}]]}},
+            {"type": "metric", "x": 0, "y": 6, "width": 12, "height": 6, "properties": {
+              "title": "Load", "region": "${AWS::Region}", "view": "timeSeries", "period": 60, "metrics": [
+                ["AgenticML/Server", "InFlightPeak", {"stat": "Maximum", "label": "Requests in progress (busiest task)"}],
+                ["AgenticML/Server", "InFlightPeak", {"stat": "Sum", "label": "Requests in progress (all tasks)"}],
+                ["AgenticML/Server", "DbConnectionsPeak", {"stat": "Maximum", "label": "Server database connections (busiest task)"}],
+                ["AgenticML/Server", "DbConnectionsPeak", {"stat": "Sum", "label": "Server database connections (all tasks)"}],
+                ["AWS/RDS", "DatabaseConnections", "DBInstanceIdentifier", "agenticml-hosted", {"stat": "Maximum", "label": "RDS connections"}]]}},
+            {"type": "metric", "x": 12, "y": 6, "width": 12, "height": 6, "properties": {
+              "title": "CPU and memory (%)", "region": "${AWS::Region}", "view": "timeSeries", "period": 60,
+              "yAxis": {"left": {"min": 0, "max": 100}}, "metrics": [
+                ["AWS/ECS", "CPUUtilization", "ClusterName", "agenticml-hosted", "ServiceName", "agenticml-hosted", {"stat": "Average", "label": "ECS CPU average"}],
+                ["AWS/ECS", "CPUUtilization", "ClusterName", "agenticml-hosted", "ServiceName", "agenticml-hosted", {"stat": "Maximum", "label": "ECS CPU maximum"}],
+                ["AWS/ECS", "MemoryUtilization", "ClusterName", "agenticml-hosted", "ServiceName", "agenticml-hosted", {"stat": "Average", "label": "ECS memory average"}],
+                ["AWS/ECS", "MemoryUtilization", "ClusterName", "agenticml-hosted", "ServiceName", "agenticml-hosted", {"stat": "Maximum", "label": "ECS memory maximum"}],
+                ["AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "agenticml-hosted", {"stat": "Average", "label": "RDS CPU"}]]}},
+            {"type": "metric", "x": 0, "y": 12, "width": 12, "height": 6, "properties": {
+              "title": "RDS CPU credit balance", "region": "${AWS::Region}", "view": "timeSeries",
+              "stat": "Minimum", "period": 300, "metrics": [
+                ["AWS/RDS", "CPUCreditBalance", "DBInstanceIdentifier", "agenticml-hosted", {"label": "Credits"}]]}},
+            {"type": "metric", "x": 12, "y": 12, "width": 12, "height": 6, "properties": {
+              "title": "Usage (hourly)", "region": "${AWS::Region}", "view": "timeSeries",
+              "stat": "Maximum", "period": 3600, "metrics": [
+                ["AgenticML/Server", "Accounts", {"label": "Accounts"}],
+                ["AgenticML/Server", "ActiveUsers7d", {"label": "Active users (7 days)"}],
+                ["AgenticML/Server", "WorkspacesActive", {"label": "Active workspaces"}],
+                ["AgenticML/Server", "StoredBytes", {"label": "Stored bytes", "yAxis": "right"}],
+                ["AgenticML/Server", "UploadBytesToday", {"label": "Uploaded today (bytes)", "yAxis": "right"}]]}}
+          ]
+        }
 
 Outputs:
   DeployRoleArn:

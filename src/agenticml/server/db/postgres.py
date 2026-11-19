@@ -17,13 +17,66 @@ INNER_LOCK_LIMIT = 16
 # Per instance (one instance is one pool): at most this many transactions, and so
 # transaction connections, at once. Nothing inside a transaction waits for a lock
 # slot or for another transaction slot, so slots free within statement_timeout and
-# the wait only times out under overload. Must stay above the 16 idle connections
-# the pool keeps.
+# the wait only times out under overload. The idle pool keeps at most 16 of them
+# (fewer under a small budget).
 TRANSACTION_CONNECTION_LIMIT = 24
 _TRANSACTION_WAIT = 10.0
 _outer_slots = threading.BoundedSemaphore(OUTER_LOCK_LIMIT)
 _inner_slots = threading.BoundedSemaphore(INNER_LOCK_LIMIT)
 _held_lock_connections = threading.local()
+DEFAULT_LIMITS = (TRANSACTION_CONNECTION_LIMIT, OUTER_LOCK_LIMIT, INNER_LOCK_LIMIT)
+MIN_BUDGET = 8
+MAX_BUDGET = 1000
+_budget_lock = threading.Lock()
+
+
+def connection_limits(budget):
+    """(transaction, outer, inner) for a per-process budget; None keeps the defaults.
+
+    The budget includes the lifetime server-lock connection.
+    """
+    if budget is None:
+        return DEFAULT_LIMITS
+    if type(budget) is not int or not MIN_BUDGET <= budget <= MAX_BUDGET:
+        raise ValueError(f'database connection budget must be a whole number from {MIN_BUDGET} to {MAX_BUDGET}')
+    work = budget - 1
+    # The inner pool (quota/lineage locks) keeps room beyond the two lineage
+    # receives the server runs at once (app.py lineage_receives).
+    inner = max(round(work * 0.18), min(4, work - 3))
+    transaction = max(2, round(work * 0.27))
+    return transaction, work - inner - transaction, inner
+
+
+def current_limits():
+    """The live (transaction, outer, inner) limits."""
+    with _budget_lock:
+        return (TRANSACTION_CONNECTION_LIMIT, _outer_slots._initial_value,
+                _inner_slots._initial_value)
+
+
+def limits_state():
+    """The live limits, to hand back to restore_limits_state."""
+    with _budget_lock:
+        return TRANSACTION_CONNECTION_LIMIT, _outer_slots, _inner_slots
+
+
+def restore_limits_state(state):
+    global TRANSACTION_CONNECTION_LIMIT, _outer_slots, _inner_slots
+    with _budget_lock:
+        TRANSACTION_CONNECTION_LIMIT, _outer_slots, _inner_slots = state
+
+
+def configure_connection_budget(budget):
+    """Set the per-process connection limits once at startup; None restores the defaults.
+
+    Holders of the old lock semaphores release into the old ones.
+    """
+    global TRANSACTION_CONNECTION_LIMIT, _outer_slots, _inner_slots
+    transaction, outer, inner = connection_limits(budget)
+    with _budget_lock:
+        TRANSACTION_CONNECTION_LIMIT = transaction
+        _outer_slots = threading.BoundedSemaphore(outer)
+        _inner_slots = threading.BoundedSemaphore(inner)
 
 
 def _conninfo_with_timeout(url):
@@ -82,10 +135,15 @@ class PostgresDatabase:
     def __init__(self, url):
         # Before anything that can raise: close() and __del__ need these.
         self._tx_slots = threading.BoundedSemaphore(TRANSACTION_CONNECTION_LIMIT)
+        self.limits = current_limits()
+        self.transaction_limit = self.limits[0]
+        self._idle_cap = min(16, self.transaction_limit)
         self._lock = threading.Lock()
         self._local = threading.local()
         self._idle = []
         self._connections = set()
+        self._lock_connections = 0
+        self._peak = 0
         self.closed = False
         self._url = url
         try:
@@ -203,6 +261,7 @@ class PostgresDatabase:
                         stale = connection
                     else:
                         stale = None
+                        self._note_use()
                 if stale is None:
                     break
                 self._close_connection(stale)
@@ -215,6 +274,7 @@ class PostgresDatabase:
                         if self.closed:
                             raise DatabaseError('database is closed')
                         self._connections.add(connection)
+                        self._note_use()
                 try:
                     connection.execute('BEGIN ISOLATION LEVEL READ COMMITTED' +
                                        ('' if write else ' READ ONLY'))
@@ -248,7 +308,7 @@ class PostgresDatabase:
                 with self._lock:
                     discard = (discard or connection.closed or connection.broken or self.closed
                                or connection.pgconn.transaction_status != self._psycopg.pq.TransactionStatus.IDLE
-                               or len(self._idle) >= 16)
+                               or len(self._idle) >= self._idle_cap)
                     if discard:
                         self._connections.discard(connection)
                     else:
@@ -290,6 +350,9 @@ class PostgresDatabase:
             if self.closed:
                 raise DatabaseError('database is closed')
             connection = self._new_connection(lock=True)
+            with self._lock:
+                self._lock_connections += 1
+                self._note_use()
             if not try_lock:
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
@@ -344,10 +407,28 @@ class PostgresDatabase:
                     pass
                 finally:
                     self._close_connection(connection)
+                    with self._lock:
+                        self._lock_connections -= 1
             if not dedicated:
                 slots.release()
         if mapped is not None:
             _raise_plain(mapped)
+
+    def _in_use(self):
+        return len(self._connections) - len(self._idle) + self._lock_connections
+
+    def _note_use(self):
+        """Raise the peak; the caller holds ``self._lock``."""
+        self._peak = max(self._peak, self._in_use())
+
+    def pool_stats(self, reset=False):
+        """Connections this process holds now and the most at once since the last reset."""
+        with self._lock:
+            in_use = self._in_use()
+            stats = {'in_use': in_use, 'peak': max(self._peak, in_use)}
+            if reset:
+                self._peak = in_use
+            return stats
 
     def confirm_session_locks(self):
         """Abort if a session-lock connection held on this thread has died."""

@@ -9,6 +9,16 @@ def utc_day():
     return datetime.now(timezone.utc).date().isoformat()
 
 
+def database_now(db, tx=None):
+    """UTC now from the database clock on Postgres, else from the process."""
+    if db.dialect.name == 'postgres':
+        if tx is None:
+            with db.transaction() as tx:
+                return database_now(db, tx)
+        return tx.fetchone('SELECT clock_timestamp()')[0].astimezone(timezone.utc)
+    return datetime.now(timezone.utc)
+
+
 class UsageRepo(WorkspaceBound):
     def __init__(self, db, workspace_id, *, clock=None):
         self.clock = clock
@@ -17,12 +27,10 @@ class UsageRepo(WorkspaceBound):
 
     def now(self, tx=None):
         """Use the database UTC clock for production Postgres periods."""
-        if self.db.dialect.name == 'postgres':
-            if tx is None:
-                with self._tx() as tx:
-                    return self.now(tx)
-            return tx.fetchone('SELECT clock_timestamp()')[0].astimezone(timezone.utc)
-        return datetime.now(timezone.utc)
+        if tx is None and self.db.dialect.name == 'postgres':
+            with self._tx() as tx:
+                return self.now(tx)
+        return database_now(self.db, tx)
 
     def day(self, tx=None):
         if self.clock is not None:
