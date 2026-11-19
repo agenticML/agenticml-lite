@@ -344,6 +344,9 @@ def test_login_http_requires_insecure_except_localhost(credentials, capsys):
     assert not credentials.exists()
     assert main(["login", "--host", "http://Example.com/", "--key", KEY, "--no-verify", "--insecure"]) == 0
     assert auth.resolve(insecure=True) == ("http://example.com", KEY)
+    # The consent is saved for that exact host, so the flag is no longer needed there.
+    assert auth.resolve() == ("http://example.com", KEY)
+    assert main(["whoami", "--offline"]) == 0
     assert main(["login", "--host", "HTTP://LocalHost:80/", "--key", "local-key", "--no-verify"]) == 0
     assert auth.resolve("http://localhost") == ("http://localhost", "local-key")
 

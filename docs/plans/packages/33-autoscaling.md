@@ -217,10 +217,15 @@ def connection_limits(budget):
 - **Mappings** (top-level keys are the full class name, which
   CloudFormation allows and cfn-lint accepts; `Fn::Select`/`Fn::Split` are
   not allowed in a `FindInMap` key):
-  - `ConnectionBudget`: class, then task count:
-    `db.t4g.micro: {"2": "16"}`, `db.t4g.small: {"2": "36", "3": "24", "4":
-    "18"}`, `db.t4g.medium: {"2": "75", "3": "50", "4": "37"}`. One task is
-    never looked up, because the variable is only set `HasScaling`.
+  - `ConnectionBudget`: class, then task count, every class for every
+    `MaxTaskCount` value: `db.t4g.micro: {"1": "32", "2": "16", "3": "10",
+    "4": "8"}`, `db.t4g.small: {"1": "72", "2": "36", "3": "24", "4":
+    "18"}`, `db.t4g.medium: {"1": "150", "2": "75", "3": "50", "4": "37"}`
+    (floor(usable / (2 * tasks))). CloudFormation resolves a `FindInMap`
+    even in an `Fn::If` branch that is not taken, so every pair needs an
+    entry. The "1" entries are never set as the variable (only while
+    `HasScaling`), and the micro "3" and "4" exist only so the lookup
+    resolves: the rule still refuses them.
   - `ConnectionsAlarm`: class, then `Threshold`: micro `"60"`, small
     `"130"`, medium `"270"`.
 - **Service**: `DesiredCount: !If [HasScaling, !Ref AWS::NoValue, !Ref
@@ -493,6 +498,14 @@ refused; stronger tests (real backend counts, serve wiring, time-bounded
 "never hangs" tests). A second review of the fixes found two more low
 issues (the refusal compared only the transaction limit; the time bound
 could still hang pytest at exit), both fixed.
+
+Deploy fix (Nov 19, 2026): the first deploy of dev 470a8e7 failed at
+CreateChangeSet with `Template error: Unable to get mapping for
+ConnectionBudget::db.t4g.micro::1`, because the mapping had no entry for
+micro with `MaxTaskCount` 1 and `FindInMap` is resolved in the untaken
+`Fn::If` branch too. Nothing in the stack changed. The fix fills every
+class x task count pair and adds a generic test that every `FindInMap` in
+both templates resolves for every allowed parameter value.
 
 ## Done when
 

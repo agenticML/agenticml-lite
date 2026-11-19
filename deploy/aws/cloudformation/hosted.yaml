@@ -95,13 +95,16 @@ Mappings:
   # LEAST(DBInstanceClassMemory / 9531392, 5000) (the OS and RDS take part of the
   # memory), minus 5 reserved superuser slots, minus about 10 for operators,
   # backups and monitoring: micro 64, small 144, medium 300. Check with
-  # SHOW max_connections after a class change. The micro entry stops at 2 tasks
-  # (a rule enforces it); 1 task is never looked up, because the variable is only
-  # set while autoscaling is on.
+  # SHOW max_connections after a class change. CloudFormation resolves every
+  # FindInMap, even in an Fn::If branch that is not taken, so every
+  # DbInstanceClass x MaxTaskCount pair needs an entry. The "1" entries are
+  # never set as the variable (it is only set while autoscaling is on), and the
+  # micro "3" and "4" entries exist only so the lookup resolves: the
+  # MoreTasksNeedABiggerDatabase rule still refuses them.
   ConnectionBudget:
-    db.t4g.micro: {"2": "16"}
-    db.t4g.small: {"2": "36", "3": "24", "4": "18"}
-    db.t4g.medium: {"2": "75", "3": "50", "4": "37"}
+    db.t4g.micro: {"1": "32", "2": "16", "3": "10", "4": "8"}
+    db.t4g.small: {"1": "72", "2": "36", "3": "24", "4": "18"}
+    db.t4g.medium: {"1": "150", "2": "75", "3": "50", "4": "37"}
   # About 80% of the estimated max_connections of each class: the
   # RdsConnectionsAlarm threshold.
   ConnectionsAlarm:
