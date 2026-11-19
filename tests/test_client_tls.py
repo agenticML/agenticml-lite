@@ -574,9 +574,11 @@ def test_https_url_on_a_plain_http_port_gives_the_handshake_hint(
     host = non_tls_port
     save(host)
     code, _out, err = run(["whoami"], capsys)
+    # Whether OpenSSL reports a protocol mismatch (no retry) or a reset (retried)
+    # depends on the build, so only the outcome is asserted here; the retry rule is
+    # covered by test_tls_permanent_*.
     assert code == 1
     assert HANDSHAKE_HINT in err and CERT_HINT not in err
-    assert no_sleep == []
     empty = tmp_path / "runs"
     empty.mkdir()
     code, _out, err = run(["sync", "--all", "--dir", str(empty)], capsys)
@@ -685,6 +687,8 @@ def test_follow_survives_a_bundle_that_disappears_and_recovers(
     # file, then force the next request through by dropping the cached identity.
     bundle.unlink()
     for client in follow_ctx["clients"]:
+        # A pooled keep-alive TLS connection would never re-read the deleted file.
+        client.session.close()
         client.__dict__.pop("_sync_identity", None)
 
     def lines():
@@ -698,6 +702,8 @@ def test_follow_survives_a_bundle_that_disappears_and_recovers(
         assert "OSError" not in text
     before = len(tls_server.hits)
     copy_bundle(certs.ca1, bundle)
+    for client in follow_ctx["clients"]:
+        client.session.close()
     wait_until(lambda: len(tls_server.hits) > before, thread, box, follow_ctx,
                msg="follow did not recover after the bundle came back")
     stop_follow(follow_ctx)
@@ -747,3 +753,86 @@ def test_verifying_login_over_plain_http_warns_once(monkeypatch, capsys):
     assert err.count(f"warning: sending the API key over plain http to {host}") == 1
     assert KEY not in err
     assert saved_entry(host) == {"api_key": KEY, "insecure": True}
+
+
+# --- which TLS failures are retried -----------------------------------------------
+
+
+def _ssl_error(reason, text=None):
+    error = ssl.SSLError(1, text or f"[SSL: {reason}] {reason.lower().replace('_', ' ')} (_ssl.c:1)")
+    error.reason = reason
+    return error
+
+
+def _wrapped(inner):
+    """The way requests wraps an ssl error: SSLError > MaxRetryError(reason=SSLError) > ssl."""
+    pool_error = urllib3.exceptions.SSLError(inner)
+    retry = urllib3.exceptions.MaxRetryError(None, "/v2/whoami", reason=pool_error)
+    return requests.exceptions.SSLError(retry)
+
+
+PERMANENT_CHAINS = {
+    "wrong version": lambda: _wrapped(_ssl_error("WRONG_VERSION_NUMBER")),
+    "http request": lambda: _wrapped(_ssl_error("HTTP_REQUEST")),
+    "unknown protocol": lambda: _wrapped(_ssl_error("UNKNOWN_PROTOCOL")),
+    "wrong ssl version": lambda: _wrapped(_ssl_error("WRONG_SSL_VERSION")),
+    "record layer": lambda: _wrapped(_ssl_error("RECORD_LAYER_FAILURE")),
+    "packet length": lambda: _wrapped(_ssl_error("PACKET_LENGTH_TOO_LONG")),
+    "message only": lambda: _wrapped(ssl.SSLError("[SSL] Record Layer Failure (_ssl.c:1)")),
+    "urllib3 keeps the message": lambda: requests.exceptions.SSLError(
+        urllib3.exceptions.SSLError("[SSL: WRONG_VERSION_NUMBER] wrong version number")),
+    "certificate": lambda: _wrapped(ssl.SSLCertVerificationError(1, "verify failed")),
+}
+TRANSIENT_CHAINS = {
+    "eof": lambda: _wrapped(ssl.SSLEOFError(8, "EOF occurred in violation of protocol")),
+    "reset": lambda: requests.exceptions.SSLError(
+        urllib3.exceptions.MaxRetryError(
+            None, "/x", reason=urllib3.exceptions.ProtocolError(ConnectionResetError(104)))),
+    "alert": lambda: _wrapped(_ssl_error("SSLV3_ALERT_HANDSHAKE_FAILURE")),
+}
+
+
+@pytest.mark.parametrize("name", sorted(PERMANENT_CHAINS))
+def test_tls_permanent_failures(name):
+    assert client_mod._tls_permanent(PERMANENT_CHAINS[name]()) is True
+
+
+@pytest.mark.parametrize("name", sorted(TRANSIENT_CHAINS))
+def test_tls_permanent_is_false_for_transient_failures(name):
+    assert client_mod._tls_permanent(TRANSIENT_CHAINS[name]()) is False
+
+
+def test_tls_permanent_is_false_for_a_plain_connection_reset():
+    reset = requests.exceptions.ConnectionError(
+        urllib3.exceptions.MaxRetryError(None, "/x", reason=ConnectionResetError(104, "reset")))
+    assert client_mod._tls_permanent(reset) is False
+
+
+@pytest.mark.parametrize("name", sorted(PERMANENT_CHAINS))
+def test_client_raises_at_once_for_permanent_tls_failures(name, no_sleep, monkeypatch):
+    calls = []
+
+    def boom(*args, **kwargs):
+        calls.append(1)
+        raise PERMANENT_CHAINS[name]()
+
+    with Client(base_url="https://lab.test", api_key=KEY, max_retries=3) as client:
+        monkeypatch.setattr(client.session, "request", boom)
+        with pytest.raises(requests.exceptions.SSLError):
+            client.whoami()
+    assert len(calls) == 1 and no_sleep == []
+
+
+@pytest.mark.parametrize("name", sorted(TRANSIENT_CHAINS))
+def test_client_retries_transient_tls_failures(name, no_sleep, monkeypatch):
+    calls = []
+
+    def boom(*args, **kwargs):
+        calls.append(1)
+        raise TRANSIENT_CHAINS[name]()
+
+    with Client(base_url="https://lab.test", api_key=KEY, max_retries=2) as client:
+        monkeypatch.setattr(client.session, "request", boom)
+        with pytest.raises(requests.exceptions.SSLError):
+            client.whoami()
+    assert len(calls) == 3 and len(no_sleep) == 2

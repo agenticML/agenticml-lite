@@ -7,6 +7,7 @@ import ssl
 import time
 
 import requests
+import urllib3
 from requests.adapters import HTTPAdapter
 
 from . import __version__
@@ -45,9 +46,12 @@ _TLS_HANDSHAKE_HINT = (
     "TLS handshake failed (the server closed the connection, or this is not an https port)"
 )
 _TLS_WALK_LIMIT = 50
-# ssl reasons that show the peer does not speak TLS: retrying cannot help.
+# Phrases (lowercase, "_" as a space) that show the peer does not speak TLS, or that
+# its records are garbled: retrying cannot help. OpenSSL builds differ in which
+# reason a TLS client gets from a plain-http port.
 _TLS_PROTOCOL_MISMATCH = (
-    "WRONG_VERSION_NUMBER", "HTTP_REQUEST", "UNKNOWN_PROTOCOL", "WRONG_SSL_VERSION",
+    "wrong version number", "http request", "unknown protocol", "wrong ssl version",
+    "record layer failure", "packet length too long",
 )
 
 
@@ -82,17 +86,24 @@ def tls_failure(exc):
     return "tls" if found_tls else None
 
 
+def _protocol_mismatch(text):
+    text = text.lower().replace("_", " ")
+    return any(phrase in text for phrase in _TLS_PROTOCOL_MISMATCH)
+
+
 def _tls_permanent(exc):
     """True when a TLS failure cannot fix itself on a retry: a bad certificate, or a
     peer that does not speak TLS. Transient failures (a peer closing at accept, a
-    reloading proxy) are not permanent. The ssl error text is only inspected."""
+    reloading proxy) are not permanent. Error text is only inspected, never printed."""
     if tls_failure(exc) == "cert":
         return True
     for item in _exception_chain(exc):
-        if isinstance(item, ssl.SSLError):
+        if isinstance(item, (ssl.SSLError, requests.exceptions.SSLError,
+                             urllib3.exceptions.SSLError)):
             reason = getattr(item, "reason", None)
-            text = reason if isinstance(reason, str) else str(item)
-            if any(code in text for code in _TLS_PROTOCOL_MISMATCH):
+            if isinstance(reason, str) and _protocol_mismatch(reason):
+                return True
+            if _protocol_mismatch(str(item)):
                 return True
     return False
 
