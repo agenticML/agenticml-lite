@@ -116,6 +116,65 @@ def plain_url():
         yield f"http://127.0.0.1:{httpd.server_address[1]}"
 
 
+_BAD_REQUEST = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+
+
+@pytest.fixture
+def non_tls_port():
+    """A raw TCP listener that answers any bytes with an http 400, without a reset.
+
+    http.server reads only the first line of a ClientHello and closes with unread
+    data, so the kernel may send a RST before the client reads the answer. This
+    one replies at once, half-closes, and drains until the client closes, so a TLS
+    client always sees the plain-text reply (WRONG_VERSION_NUMBER).
+    """
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(16)
+    sockets = [listener]
+    threads = []
+    lock = threading.Lock()
+
+    def serve(conn):
+        try:
+            conn.settimeout(2)
+            conn.sendall(_BAD_REQUEST)
+            conn.shutdown(socket.SHUT_WR)
+            while conn.recv(4096):
+                pass
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    def accept_loop():
+        while True:
+            try:
+                conn, _addr = listener.accept()
+            except OSError:
+                return
+            worker = threading.Thread(target=serve, args=(conn,), daemon=True)
+            with lock:
+                threads.append(worker)
+            worker.start()
+
+    acceptor = threading.Thread(target=accept_loop, daemon=True)
+    acceptor.start()
+    try:
+        yield f"https://127.0.0.1:{listener.getsockname()[1]}"
+    finally:
+        try:
+            listener.shutdown(socket.SHUT_RDWR)  # wakes the blocked accept()
+        except OSError:
+            pass
+        listener.close()
+        acceptor.join(timeout=5)
+        with lock:
+            pending = list(threads)
+        for worker in pending:
+            worker.join(timeout=5)
+
+
 @pytest.fixture
 def no_sleep(monkeypatch):
     calls = []
@@ -511,8 +570,8 @@ def test_local_http_does_not_warn(plain_url, capsys):
 
 
 def test_https_url_on_a_plain_http_port_gives_the_handshake_hint(
-        plain_url, no_sleep, tmp_path, capsys):
-    host = plain_url.replace("http://", "https://")
+        non_tls_port, no_sleep, tmp_path, capsys):
+    host = non_tls_port
     save(host)
     code, _out, err = run(["whoami"], capsys)
     assert code == 1
