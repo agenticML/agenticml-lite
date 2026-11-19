@@ -570,6 +570,20 @@ def _metrics_from_args(args):
     return raw or "off"
 
 
+def _db_connections_from_args(args):
+    """The per-process Postgres connection budget, or None (flag wins; blank is unset)."""
+    raw = getattr(args, "db_connections", None)
+    if raw is None:
+        raw = os.environ.get("AGENTICML_SERVER_DB_CONNECTIONS", "")
+    raw = str(raw).strip()
+    if not raw:
+        return None
+    message = "AGENTICML_SERVER_DB_CONNECTIONS must be a whole number from 8 to 1000"
+    if not (raw.isascii() and raw.isdigit() and 8 <= int(raw) <= 1000):
+        raise ValueError(message)
+    return int(raw)
+
+
 def cmd_server_serve(args):
     from .server import serve
     from .server.db.errors import DatabaseError
@@ -609,6 +623,9 @@ def cmd_server_serve(args):
         metrics = _metrics_from_args(args)
         if metrics != "off":
             extra["metrics"] = metrics
+        db_connections = _db_connections_from_args(args)
+        if db_connections is not None:
+            extra["db_connections"] = db_connections
         min_client = args.min_client_version
         if min_client is None:
             min_client = os.environ.get("AGENTICML_SERVER_MIN_CLIENT_VERSION") or None
@@ -1993,6 +2010,9 @@ def main(argv=None):
     p_serve.add_argument("--metrics", default=None, metavar="MODE",
                          help="Publish capacity metrics: off or cloudwatch "
                               "(default: AGENTICML_SERVER_METRICS or off)")
+    p_serve.add_argument("--db-connections", default=None, metavar="N",
+                         help="Most Postgres connections one server process opens "
+                              "(default: AGENTICML_SERVER_DB_CONNECTIONS or 89)")
     p_serve.set_defaults(func=cmd_server_serve)
     p_up = server_sub.add_parser("up", help="Serve on loopback through Tailscale Funnel")
     p_up.add_argument("--data", default=None, help="Data directory (default: AGENTICML_SERVER_DATA or ~/.agenticml-server)")

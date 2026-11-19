@@ -512,7 +512,8 @@ class IPv6IngestServer(IngestServer):
 def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None,
                 trusted_proxies=(), identity_header=None, database=None,
                 firebase=None, cert_source=None, plans=None, open_signup=False, objects=None,
-                min_client_version=None, admin_emails=frozenset(), legal_base_url=None):
+                min_client_version=None, admin_emails=frozenset(), legal_base_url=None,
+                db_connections=None):
     """Prepare and lock the data directory; port=0 chooses a free port."""
     from .firebase import require_open_signup
     from .limits import Plans
@@ -543,7 +544,29 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
               else acquire_server_lock(data / "server"))
     db = None
     try:
+        from .db import open_postgres, postgres
+        url = resolve_url(data, database)
+        on_postgres = _is_postgres(url)
+        wanted = postgres.connection_limits(db_connections)
+        previous = postgres.limits_state()
+        cached = open_postgres(url) if on_postgres else None
+        if cached is not None:
+            # An open instance keeps the limits it was created under and belongs
+            # to its other owner: leave it and the process-wide locks alone.
+            if cached.limits != wanted:
+                raise ValueError("the database is already open in this process "
+                                 "with other connection limits")
+        else:
+            postgres.configure_connection_budget(db_connections if on_postgres else None)
+        if db_connections is not None and not on_postgres:
+            logger.info("database connection budget applies to Postgres only")
         db = for_server_dir(data / "server", database)
+        if on_postgres and db.limits != wanted:
+            # Backstop: the instance was opened by another thread meanwhile.
+            db = None
+            postgres.restore_limits_state(previous)
+            raise ValueError("the database is already open in this process "
+                             "with other connection limits")
         if db.dialect.name == "postgres":
             handle = ExitStack()
             handle.enter_context(db.server_lock(shared=True))
@@ -573,7 +596,7 @@ def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None
           trusted_proxies=(), identity_header=None, database=None,
           firebase=None, cert_source=None, plans=None, open_signup=False, objects=None,
           min_client_version=None, admin_emails=frozenset(), legal_base_url=None,
-          stats_interval=STATS_REFRESH, metrics=None):
+          stats_interval=STATS_REFRESH, metrics=None, db_connections=None):
     """Run until interrupted, with an optional environment admin key."""
     if metrics not in (None, "off", "cloudwatch"):
         raise ValueError(MODE_MESSAGE)
@@ -601,6 +624,8 @@ def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None
         extra["admin_emails"] = frozenset(admin_emails)
     if legal_base_url is not None:
         extra["legal_base_url"] = legal_base_url
+    if db_connections is not None:
+        extra["db_connections"] = db_connections
     server = make_server(
         data, host, port, public_url, os.environ.get("AGENTICML_SERVER_KEY"),
         trusted_proxies, identity_header, **extra)

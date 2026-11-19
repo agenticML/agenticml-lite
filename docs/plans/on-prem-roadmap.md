@@ -338,7 +338,7 @@ Backlog.
 | --- | --- | --- | --- | --- | --- | --- |
 | 31 | Usage history: `accounts.last_active_at`, daily `stats_daily` snapshots refreshed hourly inside the server, `GET /api/admin/stats`, `agenticml server stats`, Usage section with growth charts on `/admin` | 3.0 | Sonnet | M | [plan](packages/31-usage-history.md) | in review (draft PR) |
 | 32 | Capacity metrics: per-minute requests, errors, latency percentiles, peak requests in progress and database connections, and the 31 totals, sent with `PutMetricData` (`--metrics cloudwatch`, off by default); alarms on database CPU credits, database connections and ECS memory in `hosted.yaml`; a CloudWatch dashboard in `bootstrap.yaml` | 31 | Sonnet | M | [plan](packages/32-capacity-metrics.md) | in review (draft PR) |
-| 33 | ECS autoscaling: target tracking on CPU (about 60%), minimum 1 and a maximum of 3–4 tasks; database room for more tasks (`db.t4g.small` or RDS Proxy); deploys stop resetting the task count; healthy-hosts alarm from the minimum; load test with `scripts/bench_server.py` | 32, owner's two-task check | Sonnet; owner runs it | M | – | not started |
+| 33 | ECS autoscaling: target tracking on service CPU (60%) between `DesiredCount` (minimum) and a new `MaxTaskCount` (1–4, default 1 = off); a per-process Postgres connection budget (`AGENTICML_SERVER_DB_CONNECTIONS`) sized by `DbInstanceClass` (new parameter; micro allows at most 2 tasks) so every task fits the database even during deploys; deploys stop resetting the count; `max_task_count` deploy input | 32, owner's two-task check | Sonnet; owner runs it | M | [plan](packages/33-autoscaling.md) | in review (draft PR) |
 
 - **31** answers "are we growing?" with no AWS change and no data sent
   anywhere: the server keeps one row of totals per UTC day (accounts,
@@ -350,9 +350,14 @@ Backlog.
   privacy), about $1–4/month after the free ten. The dashboard lives in
   the bootstrap stack, so hosted deploys never wait for a bootstrap
   re-apply.
-- **33** scales the app tier once 32 shows CPU is the limit. Each Fargate
-  task is one Python process; the database stays shared, so 33 first
-  makes room for more connections than two tasks use.
+- **33** scales the app tier on CPU. Each Fargate task is one Python
+  process; the database stays shared, so each task gets a connection
+  budget of `floor(usable / (2 × max tasks))` (covering rolling-deploy
+  surges), with usable connections estimated per instance class. RDS
+  gives `db.t4g.micro` only about 75 usable connections, so micro allows
+  at most 2 tasks; 3–4 tasks need `db.t4g.small` (about +$12/month). It
+  ships off (`MaxTaskCount` 1); the owner turns it on after the bootstrap
+  re-apply and the two-task check.
 
 ### Maintenance fixes
 
@@ -446,6 +451,29 @@ on Nov 17, 2026; none of the entries below blocked it.
     `rds_connections`, `ecs_memory`).
   - Done when: the dashboard shows the custom metrics and the nine hosted
     alarms are OK, recorded here.
+- **Turn on autoscaling** (package 33, Nov 19, 2026). After the capacity
+  dashboard step above (same bootstrap re-apply) and the two-task rolling
+  deploy check below.
+  - Where: `deploy/aws/README.md`, "Operations and scaling".
+  - Problem: autoscaling ships off (`MaxTaskCount` 1). The connection
+    budgets per instance class are estimates (micro 64 usable, small 144,
+    medium 300) until checked on the real database.
+  - Fix: (1) `SHOW max_connections;` on the hosted database (ECS Exec);
+    if the usable number is below the estimate for the class, lower the
+    `ConnectionBudget` and `ConnectionsAlarm` mappings in `hosted.yaml`
+    first; (2) for more than 2 tasks, set `DbInstanceClass` to
+    `db.t4g.small` at a quiet time (a few minutes of downtime) and repeat
+    (1); (3) `gh workflow run deploy.yml --ref dev -f max_task_count=2`
+    (or 3–4 on small); (4) load test with several sync clients in parallel
+    (for example `scripts/hosted_check.py make-run` from a few machines,
+    or `bench_server.py` on Fargate as in the README) and watch the
+    package 32 dashboard: the service scales out above 60% CPU and back
+    in after load stops, `Rejected` and `Errors5xx` stay near 0, and
+    `DbConnectionsPeak` and RDS `DatabaseConnections` stay under the
+    budget and the alarm.
+  - Done when: a load test scales out and back in with no failed syncs,
+    the real `max_connections` is recorded here, and the mappings match
+    it.
 - **Release follow-ups (owner)** (3.0.0 released Nov 17, 2026). Low priority.
   - Where: repository Settings → Environments → `pypi`; tags.
   - Problem: the `pypi` environment has no required reviewer, so any pushed

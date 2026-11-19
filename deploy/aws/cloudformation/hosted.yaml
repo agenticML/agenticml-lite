@@ -19,7 +19,17 @@ Parameters:
     Default: 1
     MinValue: 0
     MaxValue: 2
-    Description: Service tasks; rolling deploys start the new task before stopping the old one.
+    Description: Service tasks (the minimum while MaxTaskCount is above 1); rolling deploys start the new task before stopping the old one. 0 stops the service and removes the autoscaling resources and the connection budget, whatever MaxTaskCount is.
+  MaxTaskCount:
+    Type: String
+    Default: "1"
+    AllowedValues: ["1", "2", "3", "4"]
+    Description: Most tasks autoscaling may run; 1 turns autoscaling off. DesiredCount is the minimum. Above 2 needs a DbInstanceClass of db.t4g.small or larger.
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+    AllowedValues: [db.t4g.micro, db.t4g.small, db.t4g.medium]
+    Description: RDS instance class. Changing it modifies the database in place with a few minutes of downtime (single-AZ); run SHOW max_connections afterwards. Sets the per-task connection budget and the connections alarm.
   MultiAZ:
     Type: String
     Default: "false"
@@ -57,6 +67,11 @@ Parameters:
     Description: Dedicated /16; proxy trust is limited to the load balancer subnets.
 
 Rules:
+  MoreTasksNeedABiggerDatabase:
+    RuleCondition: !Equals [!Ref DbInstanceClass, db.t4g.micro]
+    Assertions:
+      - Assert: !Contains [["1", "2"], !Ref MaxTaskCount]
+        AssertDescription: db.t4g.micro has room for 2 tasks at most; more tasks need DbInstanceClass db.t4g.small or larger.
   OpenSignupNeedsFirebase:
     RuleCondition: !Equals [!Ref OpenSignup, "true"]
     Assertions:
@@ -73,10 +88,33 @@ Mappings:
   ElbAccount:
     us-east-2:
       Id: "033677994240"
+  # Most Postgres connections one server process may open, per database class
+  # and MaxTaskCount: floor(usable / (2 * tasks)). The 2 covers a rolling deploy
+  # (MaximumPercent 200 runs up to twice the tasks). usable is a conservative
+  # estimate of max_connections left for the application: about 70% of RDS's
+  # LEAST(DBInstanceClassMemory / 9531392, 5000) (the OS and RDS take part of the
+  # memory), minus 5 reserved superuser slots, minus about 10 for operators,
+  # backups and monitoring: micro 64, small 144, medium 300. Check with
+  # SHOW max_connections after a class change. The micro entry stops at 2 tasks
+  # (a rule enforces it); 1 task is never looked up, because the variable is only
+  # set while autoscaling is on.
+  ConnectionBudget:
+    db.t4g.micro: {"2": "16"}
+    db.t4g.small: {"2": "36", "3": "24", "4": "18"}
+    db.t4g.medium: {"2": "75", "3": "50", "4": "37"}
+  # About 80% of the estimated max_connections of each class: the
+  # RdsConnectionsAlarm threshold.
+  ConnectionsAlarm:
+    db.t4g.micro: {Threshold: "60"}
+    db.t4g.small: {Threshold: "130"}
+    db.t4g.medium: {Threshold: "270"}
 
 Conditions:
   HasFirebase: !Not [!Equals [!Ref FirebaseProject, ""]]
   HasTasks: !Not [!Equals [!Ref DesiredCount, 0]]
+  # Scaling needs tasks: DesiredCount 0 stops the service and removes the
+  # scaling resources and the budget, whatever MaxTaskCount is.
+  HasScaling: !And [!Not [!Equals [!Ref MaxTaskCount, "1"]], !Condition HasTasks]
 
 Resources:
   # ---- Network ----------------------------------------------------------
@@ -406,7 +444,7 @@ Resources:
       DBInstanceIdentifier: agenticml-hosted
       Engine: postgres
       EngineVersion: "16"
-      DBInstanceClass: db.t4g.micro
+      DBInstanceClass: !Ref DbInstanceClass
       DBName: agenticml
       MasterUsername: agenticml
       ManageMasterUserPassword: true
@@ -753,6 +791,10 @@ Resources:
               Value: !Join [",", [!GetAtt AlbSubnetA.CidrBlock, !GetAtt AlbSubnetB.CidrBlock]]
             - Name: AGENTICML_SERVER_METRICS
               Value: cloudwatch
+            - !If
+              - HasScaling
+              - {Name: AGENTICML_SERVER_DB_CONNECTIONS, Value: !FindInMap [ConnectionBudget, !Ref DbInstanceClass, !Ref MaxTaskCount]}
+              - !Ref AWS::NoValue
             - Name: AWS_REGION
               Value: !Ref AWS::Region
           Secrets:
@@ -776,7 +818,10 @@ Resources:
       ServiceName: agenticml-hosted
       Cluster: !Ref Cluster
       TaskDefinition: !Ref TaskDefinition
-      DesiredCount: !Ref DesiredCount
+      # While autoscaling is on (MaxTaskCount above 1 and DesiredCount above 0),
+      # the autoscaler owns the running count: leaving DesiredCount out means a
+      # deploy does not reset a scaled-out service. DesiredCount 0 always sets 0.
+      DesiredCount: !If [HasScaling, !Ref AWS::NoValue, !Ref DesiredCount]
       LaunchType: FARGATE
       PlatformVersion: 1.4.0
       EnableExecuteCommand: true
@@ -794,6 +839,34 @@ Resources:
           SecurityGroups: [!Ref TaskSecurityGroup]
       LoadBalancers:
         - {TargetGroupArn: !Ref TargetGroup, ContainerName: server, ContainerPort: 8080}
+
+  # Autoscaling (MaxTaskCount above 1): average service CPU, 60% target. The
+  # service-linked role is used (and created once) by Application Auto
+  # Scaling, so there is no RoleARN and no iam:PassRole. The service name in
+  # ResourceId makes the target wait for the service.
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Condition: HasScaling
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub service/${Cluster}/${Service.Name}
+      MinCapacity: !Ref DesiredCount
+      MaxCapacity: !Ref MaxTaskCount
+
+  CpuScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Condition: HasScaling
+    Properties:
+      PolicyName: agenticml-hosted-cpu
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 300
 
   # ---- Backups ----------------------------------------------------------
   # The vault name is fixed (required), so after a failed first create the
@@ -913,8 +986,9 @@ Resources:
       AlarmActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
       OKActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
 
-  # Fewer healthy targets than DesiredCount for 5 minutes means the service is
-  # down or degraded (with two tasks, one missing task alarms too). Uses the
+  # Fewer healthy targets than DesiredCount (the minimum, with autoscaling) for
+  # 5 minutes means the service is down or degraded (with two tasks, one
+  # missing task alarms too). Extra tasks above the minimum never alarm. Uses the
   # free load balancer metric (Container Insights is off); no alarm while the
   # service is scaled to zero. Created or updated after the service is stable
   # (DependsOn Service), so a first create or a scale-up does not alarm while
@@ -981,7 +1055,8 @@ Resources:
       AlarmActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
       OKActions: [!ImportValue agenticml-hosted-bootstrap-AlertsTopicArn]
 
-  # About 80% of the roughly 112 connections a db.t4g.micro allows.
+  # About 80% of the estimated max_connections of the database class (see the
+  # ConnectionsAlarm mapping): 60, 130 or 270 for micro, small or medium.
   RdsConnectionsAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -992,7 +1067,7 @@ Resources:
       Dimensions:
         - {Name: DBInstanceIdentifier, Value: !Ref DbInstance}
       ComparisonOperator: GreaterThanThreshold
-      Threshold: 90
+      Threshold: !FindInMap [ConnectionsAlarm, !Ref DbInstanceClass, Threshold]
       Period: 300
       EvaluationPeriods: 1
       TreatMissingData: notBreaching

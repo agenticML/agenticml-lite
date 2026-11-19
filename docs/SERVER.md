@@ -298,11 +298,27 @@ Run files and shadow Git repositories must reside on a shared POSIX network file
 
 Each server process opens a bounded number of connections:
 
-- **Transactions**: at most 24 at once (`TRANSACTION_CONNECTION_LIMIT`). A 25th request waits up to 10 seconds for a free slot, then gets `503` with `Retry-After`, the same answer as a database lock timeout. The pool keeps 16 of them idle. The `/healthz` check never opens a transaction, so it is not held up by this wait.
-- **Session locks**: at most 64 more, each on its own connection (48 for run and object locks, 16 for quota, lineage and import locks), plus one lifetime connection for the server lock.
-- **Hard ceiling** per process: about 90 connections. In practice far fewer are in use: at most 8 uploads receive a body at once, and each holds at most one run or object lock and one inner lock, so a busy process uses roughly 40.
+- **Transactions**: at most 24 at once (`TRANSACTION_CONNECTION_LIMIT`) without a budget. A request waits up to 10 seconds for a free slot, then gets HTTP `503` with `Retry-After: 5`. The pool keeps at most `min(16, transaction limit)` idle connections (16 when unset). The `/healthz` check never opens a transaction, so it is not held up by this wait.
+- **Session locks**: at most 64 more without a budget, each on its own connection (48 for run and object locks, 16 for quota, lineage and import locks), plus one lifetime connection for the server lock. A request waiting for a lock slot waits up to 30 seconds before returning HTTP `503` with `Retry-After: 5`.
+- **Ceiling without a budget**: 89 connections (24 transaction + 48 run/object + 16 quota/lineage + 1 server lock). The 8-concurrent-bodies limit does not bound lock holding, because locks are taken after the body is received. Real connection use follows load and is usually far below the ceiling.
 
-The hosted database (`db.t4g.micro`, about 112 connections by default) is sized for two tasks at that level, which is what a rolling deploy runs. Check `SHOW max_connections;` if you move to a smaller instance or run more than two tasks. A process paused while it holds a lock is a known residual risk, covered in section 8 of [THREAT_MODEL.md](THREAT_MODEL.md).
+RDS sets `max_connections` from the instance's memory after the OS reserve, so `db.t4g.micro` gives roughly 75 usable connections, not 112. Run `SHOW max_connections;` to see the real value. A process paused while it holds a lock is a known residual risk, covered in section 8 of [THREAT_MODEL.md](THREAT_MODEL.md).
+
+#### Connection budget (`--db-connections`)
+
+To bound connections on a shared or smaller database, set `--db-connections N` or the environment variable `AGENTICML_SERVER_DB_CONNECTIONS`.
+
+- **Value**: a whole number from 8 to 1000. It sets the most Postgres connections one server process opens, including its one lifetime server-lock connection.
+- **Defaults and precedence**: unset (the default) uses the limits above (89 connections). The CLI flag overrides the environment variable; a blank environment variable counts as unset. An invalid value stops the server with `AGENTICML_SERVER_DB_CONNECTIONS must be a whole number from 8 to 1000`. Only `agenticml server serve` accepts this option.
+- **Backend support**: Postgres only. With SQLite, the setting is ignored and one INFO log line is emitted.
+- **Budget split**: for a budget `B`, let `W = B - 1`:
+  - Quota and lineage locks: `max(round(W × 0.18), min(4, W − 3))`. This pool keeps at least 4 connections when the budget allows, so two lineage uploads never block upload quota locks.
+  - Transactions: `max(2, round(W × 0.27))`.
+  - Run and object locks: the rest of `W`.
+  - Server lock: 1 connection.
+  - Example: a budget of 16 allocates 4 transaction connections, 7 run/object locks, 4 quota/lineage locks, and 1 server lock.
+- **Exhaustion**: when the budget is exhausted, a request waits (up to 10 seconds for a transaction connection, up to 30 seconds for a lock) and then gets HTTP `503` with `Retry-After: 5`. Sync clients retry 503 automatically.
+- **Idle pool**: keeps at most `min(16, transaction limit)` connections.
 
 ## Amazon S3 object storage
 
@@ -581,6 +597,7 @@ Sync clients on version 2.2 continue to sync to a 3.0 server without modificatio
 | --- | --- | --- | --- |
 | `--data DIR` | `AGENTICML_SERVER_DATA` | `~/.agenticml-server` | Path to server data directory. |
 | `--database URL` | `AGENTICML_SERVER_DATABASE_URL` | `sqlite:///<data>/server/agenticml.db` | Database connection URL (`sqlite:///path` or `postgresql://...`). |
+| `--db-connections N` | `AGENTICML_SERVER_DB_CONNECTIONS` | unset (`89`) | Most Postgres connections one server process opens (8 to 1000). Flag wins over env; blank counts as unset. Ignored with SQLite. |
 | `--objects URL` | `AGENTICML_SERVER_OBJECTS` | `file://` | Object storage backend (`file://` or `s3://bucket/prefix`). |
 | `--host HOST` | | `127.0.0.1` | Network interface to bind. |
 | `--port PORT` | | `8080` | TCP port to listen on. |

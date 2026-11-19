@@ -352,10 +352,42 @@ Resources:
                   - cloudwatch:TagResource
                   - cloudwatch:UntagResource
                 Resource: !Sub arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:agenticml-hosted-*
+              - Sid: ScalingAlarms
+                Effect: Allow
+                Action:
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:PutMetricAlarm
+                # The alarms target tracking manages for the hosted service's autoscaling.
+                Resource: !Sub arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:TargetTracking-service/agenticml-hosted/agenticml-hosted-*
               - Sid: AlarmsDescribe
                 Effect: Allow
                 Action: cloudwatch:DescribeAlarms
                 Resource: "*" # describe calls have no resource ARN
+              - Sid: Scaling
+                Effect: Allow
+                Action:
+                  - application-autoscaling:DeleteScalingPolicy
+                  - application-autoscaling:DeregisterScalableTarget
+                  - application-autoscaling:DescribeScalableTargets
+                  - application-autoscaling:DescribeScalingActivities
+                  - application-autoscaling:DescribeScalingPolicies
+                  - application-autoscaling:DescribeScheduledActions
+                  - application-autoscaling:ListTagsForResource
+                  - application-autoscaling:PutScalingPolicy
+                  - application-autoscaling:RegisterScalableTarget
+                  - application-autoscaling:TagResource
+                  - application-autoscaling:UntagResource
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              - Sid: ScalingMetrics
+                Effect: Allow
+                Action: cloudwatch:GetMetricData # the scaling policy handler reads the metric when it creates the policy
+                Resource: "*" # this call has no resource ARN
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
               - Sid: Backup
                 Effect: Allow
                 Action:
@@ -454,6 +486,7 @@ Resources:
                       - rds.amazonaws.com
                       - backup.amazonaws.com
                       - elasticfilesystem.amazonaws.com
+                      - ecs.application-autoscaling.amazonaws.com
               - Sid: NotTheBootstrapRoles
                 Effect: Deny
                 Action:

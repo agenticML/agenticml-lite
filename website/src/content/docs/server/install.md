@@ -111,6 +111,7 @@ The unit's `StateDirectory=agenticml-server` automatically manages `/var/lib/age
 | --- | --- | --- | --- |
 | `--data DIR` | `AGENTICML_SERVER_DATA` | `~/.agenticml-server` | Path to server data directory. |
 | `--database URL` | `AGENTICML_SERVER_DATABASE_URL` | `sqlite:///<data>/server/agenticml.db` | Server database connection URL. |
+| `--db-connections N` | `AGENTICML_SERVER_DB_CONNECTIONS` | unset (`89`) | Most Postgres connections one server process opens (8 to 1000). Ignored with SQLite. |
 | `--objects URL` | `AGENTICML_SERVER_OBJECTS` | `file://` | Object store backend (`file://` or `s3://bucket/prefix`). |
 | `--host HOST` | | `127.0.0.1` | Network interface to bind. |
 | `--port PORT` | | `8080` | Port to listen on. |
