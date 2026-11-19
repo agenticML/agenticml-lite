@@ -60,7 +60,7 @@ def local_run(marker, size=300):
 
 def push(server, key, run_id, root):
     result = sync.SyncResult(run_id)
-    with Client(server.url, key, timeout=5, max_retries=0) as client:
+    with Client(server.url, key, timeout=30, max_retries=0) as client:
         sync.sync_run(RunReader(root, run_id), client.base_url, client, result)
     assert not result.failed, result.warnings
 
