@@ -1,4 +1,4 @@
-"""A local fake OpenID Connect provider and server helpers (package 35.1).
+"""A local fake OpenID Connect provider and server helpers (package 36.1).
 
 Stdlib HTTP server: discovery, JWKS from a generated RSA key, an authorize
 endpoint that approves at once, and a token endpoint that checks the PKCE

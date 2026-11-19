@@ -1,4 +1,4 @@
-"""Browser coverage for OIDC sign-in (package 35.1): /login, /invite, callback pages."""
+"""Browser coverage for OIDC sign-in (package 36.1): /login, /invite, callback pages."""
 from pathlib import Path
 import re
 import sys

@@ -1,4 +1,4 @@
-"""OIDC sign-in (package 35.1): flow, token checks, sign-up modes, sign-out."""
+"""OIDC sign-in (package 36.1): flow, token checks, sign-up modes, sign-out."""
 from urllib.parse import parse_qs, urlsplit
 import json
 import re

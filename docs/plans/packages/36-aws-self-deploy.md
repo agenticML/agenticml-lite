@@ -1,4 +1,4 @@
-# Package 35: deploy in your own AWS account (release 3.3)
+# Package 36: deploy in your own AWS account (release 3.3)
 
 Nov 19, 2026 · supervisor plan · status: plan ready
 
@@ -23,7 +23,7 @@ sign-up also needs Firebase (`require_open_signup` in
 
 ## Decisions (taken by the supervisor, recommended options; owner may change)
 
-- **D35.1 Compute: one EC2 instance, SQLite, PyPI.** One Graviton instance
+- **D36.1 Compute: one EC2 instance, SQLite, PyPI.** One Graviton instance
   (default `t4g.small`) in an Auto Scaling group of exactly 1, so a dead
   instance is replaced automatically. It installs
   `agenticml-lite[oidc]==<version>` from PyPI into a venv and runs the
@@ -33,7 +33,7 @@ sign-up also needs Firebase (`require_open_signup` in
   Fargate + RDS + S3, and SQLite covers a team (the 3.0 benchmarks). The
   scale-out variant that reuses `hosted.yaml` would need a public image, so
   it goes to Later.
-- **D35.2 Sign-in: Amazon Cognito through a generic OIDC client in the
+- **D36.2 Sign-in: Amazon Cognito through a generic OIDC client in the
   server.** CloudFormation can create Cognito (user pool, managed login,
   email verification, password reset), and Cognito sends its own emails, so
   there is no SMTP. It is free up to 10,000 monthly active users on the Lite
@@ -45,28 +45,28 @@ sign-up also needs Firebase (`require_open_signup` in
   carries the Cognito `sub` (not an email), unknown identities get 403
   instead of sign-up, and requests on paths without the authenticate action
   could forge the header.
-- **D35.3 TLS and DNS: ALB + ACM.** If the deployer gives a Route 53 hosted
+- **D36.3 TLS and DNS: ALB + ACM.** If the deployer gives a Route 53 hosted
   zone, the stack creates and DNS-validates the certificate and the alias
   record. Otherwise they pass an existing ACM certificate ARN and add a
   CNAME themselves. A domain is required: the Cognito callback needs a
   stable `https://` URL, and a no-domain mode through CloudFront goes to
   Later.
-- **D35.4 Sign-up modes.** Cognito's own sign-up is always on. The
+- **D36.4 Sign-up modes.** Cognito's own sign-up is always on. The
   AgenticML server decides who gets in, as it already does with Firebase.
   `SignUp=open` turns on `--open-signup` (every verified email gets a
   personal workspace). `SignUp=invite-only` lets in only invited emails and
   the admin email. `AllowedEmailDomains` (for example `example.com`)
   restricts open sign-up in the server and, through a small pre-sign-up
   Lambda, in Cognito, so outsiders cannot create Cognito logins either.
-- **D35.5 First admin: `AdminEmail` parameter → `--admin-emails`.** The
+- **D36.5 First admin: `AdminEmail` parameter → `--admin-emails`.** The
   deployer signs up at the URL with that email and becomes server admin with
   a personal workspace. They never see `/setup` or a key.
-- **D35.6 Storage of the OIDC subject.** One sign-in provider per server
+- **D36.6 Storage of the OIDC subject.** One sign-in provider per server
   (Firebase, OIDC or identity header, never two). The OIDC subject is stored
   in the existing `accounts.firebase_uid` column as `oidc:<sub>`, so it
   cannot collide with a Firebase uid. This package has no column rename or
   migration. Code reads it through a helper named `external_uid`.
-- **D35.7 Admin access: SSM Session Manager.** No SSH key and no port 22.
+- **D36.7 Admin access: SSM Session Manager.** No SSH key and no port 22.
   The instance role has `AmazonSSMManagedInstanceCore`, so operators run
   `agenticml server …` commands through Session Manager.
 
@@ -74,18 +74,18 @@ sign-up also needs Firebase (`require_open_signup` in
 
 | Part | What | Coder | Size |
 | --- | --- | --- | --- |
-| 35.1 † | Server: OIDC sign-in, open sign-up / admin emails / invites on OIDC, `--signup-email-domains`, `[oidc]` extra | Sonnet | M–L |
-| 35.2 † | Template `deploy/aws-self-hosted/agenticml.yaml`, static tests, cfn-lint in CI | Sonnet | M |
-| 35.3 | Docs: website "Deploy on AWS" page, SERVER.md, deploy README, threat model, README, facts test | Antigravity; supervisor checks | S–M |
-| 35.4 | Version 3.3.0; template attached to the GitHub release; Launch Stack link (owner: public S3 bucket) | Sonnet; owner tags and publishes | S |
-| 35.5 | First real deploy in an AWS account (owner's go; supervisor may drive it with owner credentials) | Owner | S |
+| 36.1 † | Server: OIDC sign-in, open sign-up / admin emails / invites on OIDC, `--signup-email-domains`, `[oidc]` extra | Sonnet | M–L |
+| 36.2 † | Template `deploy/aws-self-hosted/agenticml.yaml`, static tests, cfn-lint in CI | Sonnet | M |
+| 36.3 | Docs: website "Deploy on AWS" page, SERVER.md, deploy README, threat model, README, facts test | Antigravity; supervisor checks | S–M |
+| 36.4 | Version 3.3.0; template attached to the GitHub release; Launch Stack link (owner: public S3 bucket) | Sonnet; owner tags and publishes | S |
+| 36.5 | First real deploy in an AWS account (owner's go; supervisor may drive it with owner credentials) | Owner | S |
 
-Order: 35.1 → 35.2 → 35.3 → 35.4 → 35.5. 35.1 and 35.2 touch different
-files, so 35.2 can start once 35.1's flags and route names are fixed (step
-35.1-1 below). 35.3 waits for package 34.3 (both edit SERVER.md and
-THREAT_MODEL.md). 35.4 comes after 3.2.0 (package 34.4).
+Order: 36.1 → 36.2 → 36.3 → 36.4 → 36.5. 36.1 and 36.2 touch different
+files, so 36.2 can start once 36.1's flags and route names are fixed (step
+36.1-1 below). 36.3 waits for package 34.3 (both edit SERVER.md and
+THREAT_MODEL.md). 36.4 comes after 3.2.0 (package 34.4).
 
-## 35.1 † Server: OIDC sign-in
+## 36.1 † Server: OIDC sign-in
 
 Files: new `src/agenticml/server/oidc.py`; `webauth.py`, `app.py`, `cli.py`
 (serve options), `firebase.py` (`require_open_signup`), `up.py`
@@ -98,7 +98,7 @@ cryptography pins as `firebase`; `hosted` unchanged); tests
 
 Steps:
 
-1. **Options** (fix these names first; 35.2 depends on them):
+1. **Options** (fix these names first; 36.2 depends on them):
    `--oidc-issuer URL` / `AGENTICML_SERVER_OIDC_ISSUER`,
    `--oidc-client-id` / `AGENTICML_SERVER_OIDC_CLIENT_ID`,
    `--oidc-logout-url URL` / `AGENTICML_SERVER_OIDC_LOGOUT_URL` (optional;
@@ -188,9 +188,9 @@ denies a stranger; admin email becomes server admin; domain restriction;
 every edge case above; Firebase regression suite unchanged; ui test of
 `/login` and `/invite` at 375px.
 
-### 35.1 as built (Nov 19, 2026)
+### 36.1 as built (Nov 19, 2026)
 
-Deviations accepted in review. 35.2 and 35.3 must follow these, not the
+Deviations accepted in review. 36.2 and 36.3 must follow these, not the
 steps above:
 
 - A successful callback answers **200 with a meta-refresh page**, not a 302,
@@ -219,11 +219,11 @@ steps above:
   are exempt.
 - A list `aud` must also have `azp` equal to the client id. Discovery and
   JWKS `max-age` are clamped to the same 5-minute floor as Firebase.
-- `server up` needs Tailscale. **35.2 writes its own systemd unit and env
+- `server up` needs Tailscale. **36.2 writes its own systemd unit and env
   file** (as `deploy/systemd/agenticml-server.service` does) and does not
   use `server up --install`.
 
-## 35.2 † Template
+## 36.2 † Template
 
 Files: `deploy/aws-self-hosted/agenticml.yaml`, `deploy/aws-self-hosted/README.md`
 (short; points to the docs page), `tests/test_deploy_self_hosted.py`,
@@ -326,10 +326,10 @@ options or a shared constant), UserData passes `bash -n` (and
 `git grep` style check that nothing names our account, ECR, `agenticml.xyz`
 or us-east-2.
 
-## 35.3 Docs (Antigravity drafts, supervisor checks against the code)
+## 36.3 Docs (Antigravity drafts, supervisor checks against the code)
 
 - Website: new page `server/deploy-on-aws.md`: what you get, cost table,
-  Launch Stack button (35.4) and CLI command, parameter table, first
+  Launch Stack button (36.4) and CLI command, parameter table, first
   sign-in, inviting people, connecting training machines (`login`,
   `sync --follow`), upgrades (stack update with a new version), backups and
   restore from a snapshot, deleting the stack (the snapshot stays), private
@@ -343,7 +343,7 @@ or us-east-2.
 - README: one line and a link. `tests/test_website_facts.py`: the template
   path exists and the default version matches the package version.
 
-## 35.4 Release
+## 36.4 Release
 
 Version 3.3.0. The release workflow attaches `agenticml.yaml` to the GitHub
 release. Owner step: a public-read S3 bucket (for example
@@ -353,7 +353,7 @@ release. Owner step: a public-read S3 bucket (for example
 Until the bucket exists, the docs say "download the template, then upload
 it in the CloudFormation console".
 
-## 35.5 First real deploy (owner)
+## 36.5 First real deploy (owner)
 
 In a clean account or region: launch with `SignUp=open` and a Route 53
 zone; sign up as the admin email → server admin plus personal workspace;
@@ -370,7 +370,7 @@ delete the stack → the final snapshot exists. Record cost after 7 days.
 - The local workflow, the SDK and the sync protocol do not change. A 3.2
   client syncs to a 3.3 server.
 - Firebase servers (our hosted service) behave exactly as before.
-- Security-sensitive (†): 35.1 and 35.2 need a second read-only review (the
+- Security-sensitive (†): 36.1 and 36.2 need a second read-only review (the
   supervisor, per the standing rule while Codex and Cursor are disabled).
 - 375px with zero horizontal overflow on every changed page.
 
@@ -385,7 +385,7 @@ delete the stack → the final snapshot exists. Record cost after 7 days.
 
 - A deployer with an AWS account and a Route 53 domain launches one
   template, signs up with the admin email and syncs a run, with no other
-  setup (35.5 recorded in the Backlog/roadmap).
+  setup (36.5 recorded in the Backlog/roadmap).
 - Every test above passes, and the Firebase suites are unchanged and green.
 - The docs page exists and the facts test covers it.
 

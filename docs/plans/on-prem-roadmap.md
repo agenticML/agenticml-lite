@@ -12,7 +12,7 @@ plans live next to it:
 - Release 2.2: [on-prem-teams-plan.md](on-prem-teams-plan.md)
 - Release 3.0: [on-prem-3.0-plan.md](on-prem-3.0-plan.md)
 - Release 3.1: sketched below, with package plans in `packages/`.
-- Release 3.3: [packages/35-aws-self-deploy.md](packages/35-aws-self-deploy.md).
+- Release 3.3: [packages/36-aws-self-deploy.md](packages/36-aws-self-deploy.md).
 
 ## Product direction
 
@@ -387,20 +387,20 @@ Added Nov 19, 2026 at the owner's request ("make things a lot simpler for
 onboarding … a CloudFormation script for users who want to deploy; target
 users that have an AWS environment"). Today, self-serve sign-up needs a
 Firebase project, and our AWS templates are tied to our account. Decisions
-D35.1–D35.7 are in the plan: one EC2 instance with SQLite installed from
+D36.1–D36.7 are in the plan: one EC2 instance with SQLite installed from
 PyPI (no image), ALB + ACM, Amazon Cognito through a generic OIDC client
 in the server (which also starts the Later "Enterprise SSO" entry), and
-about $45–55/month. It comes after 3.2 (package 34); 35.1 and 35.2 do not
-touch 34's files, and 35.3 waits for 34.3.
+about $45–55/month. It comes after 3.2 (package 34); 36.1 and 36.2 do not
+touch 34's files, and 36.3 and 36.4 build on 34 (merged into this branch from PR #86, which must merge first).
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 35 † | Deploy in your own AWS account | 3.2 | Sonnet; prose Antigravity; owner releases and deploys | L | [plan](packages/35-aws-self-deploy.md) | in progress |
-| 35.1 † | Server: OIDC sign-in (authorization code + PKCE), open sign-up, admin emails and invites on OIDC, `--signup-email-domains`, `[oidc]` extra | 3.0 | Sonnet | M–L | [plan](packages/35-aws-self-deploy.md) | done ([#88](https://github.com/agenticML/agenticml-lite/pull/88); Sonnet coded; supervisor reviewed in three rounds with adversarial review passes and did the † second review; checked on Postgres 16 locally) |
-| 35.2 † | Template `deploy/aws-self-hosted/agenticml.yaml` (VPC optional, ALB, ACM, Route 53, Cognito, EC2 Auto Scaling group of 1, data volume with daily snapshots), static tests, cfn-lint in CI | 35.1 options | Sonnet | M | [plan](packages/35-aws-self-deploy.md) | plan ready |
-| 35.3 | Docs: "Deploy on AWS" page, SERVER.md OIDC section, threat model, README, facts test | 35.2, 34.3 | Antigravity; supervisor checks | S–M | [plan](packages/35-aws-self-deploy.md) | plan ready |
-| 35.4 | Version 3.3.0; template on the GitHub release; Launch Stack link (owner: public S3 bucket) | 35.3, 34.4 | Sonnet; owner tags and publishes | S | [plan](packages/35-aws-self-deploy.md) | plan ready |
-| 35.5 | First real deploy in an AWS account (owner step) | 35.4 | Owner | S | [plan](packages/35-aws-self-deploy.md) | not started |
+| 36 † | Deploy in your own AWS account | 3.2 | Sonnet; prose Antigravity; owner releases and deploys | L | [plan](packages/36-aws-self-deploy.md) | in progress |
+| 36.1 † | Server: OIDC sign-in (authorization code + PKCE), open sign-up, admin emails and invites on OIDC, `--signup-email-domains`, `[oidc]` extra | 3.0 | Sonnet | M–L | [plan](packages/36-aws-self-deploy.md) | done ([#88](https://github.com/agenticML/agenticml-lite/pull/88); Sonnet coded; supervisor reviewed in three rounds with adversarial review passes and did the † second review; checked on Postgres 16 locally) |
+| 36.2 † | Template `deploy/aws-self-hosted/agenticml.yaml` (VPC optional, ALB, ACM, Route 53, Cognito, EC2 Auto Scaling group of 1, data volume with daily snapshots), static tests, cfn-lint in CI | 36.1 options | Sonnet | M | [plan](packages/36-aws-self-deploy.md) | plan ready |
+| 36.3 | Docs: "Deploy on AWS" page, SERVER.md OIDC section, threat model, README, facts test | 36.2, 34.3 | Antigravity; supervisor checks | S–M | [plan](packages/36-aws-self-deploy.md) | plan ready |
+| 36.4 | Version 3.3.0; template on the GitHub release; Launch Stack link (owner: public S3 bucket) | 36.3, 34.4 | Sonnet; owner tags and publishes | S | [plan](packages/36-aws-self-deploy.md) | plan ready |
+| 36.5 | First real deploy in an AWS account (owner step) | 36.4 | Owner | S | [plan](packages/36-aws-self-deploy.md) | not started |
 
 ### Maintenance fixes
 
