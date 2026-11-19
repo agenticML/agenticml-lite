@@ -1,0 +1,48 @@
+# Caddy in front of `agenticml server serve` on a private network.
+# Copy to /etc/caddy/Caddyfile, then: sudo systemctl reload caddy
+#
+# The name must be the host of AGENTICML_SERVER_PUBLIC_URL and must resolve
+# on every machine that uses the server (DNS or /etc/hosts). If the public
+# URL has a non-443 port, write the site as `agenticml.lab.internal:8443`
+# and keep the same port in AGENTICML_SERVER_PUBLIC_URL.
+
+agenticml.lab.internal {
+	# Certificate from Caddy's own internal CA. Caddy's root certificate is
+	# what every client has to trust (see README.md, step 5).
+	tls internal
+	# For a lab with its own PKI, use this instead (the key must be readable
+	# by the caddy user only):
+	# tls /etc/ssl/lab.crt /etc/ssl/lab.key
+
+	# Caddy passes the Host header unchanged, forwards request
+	# bodies as they arrive without buffering them, and has no read or write
+	# timeout by default. Uploads of several GiB therefore need no extra
+	# settings here.
+	reverse_proxy 127.0.0.1:8080 {
+		# The server trusts identity headers from the address in
+		# AGENTICML_SERVER_TRUSTED_PROXIES, which is this proxy. Never pass
+		# a client-sent one through.
+		header_up -X-Forwarded-Email
+		header_up -X-Amzn-Oidc-Identity
+		header_up -Tailscale-User-Login
+	}
+
+	# Caddy writes no access log unless a `log` block is added. If you add one,
+	# leave the query string out: setup and invite tokens travel in it, and
+	# Caddy's default log entry includes the full request URI. Filter the
+	# query out of the log (see Caddy's `filter` log encoder) or do not log
+	# requests.
+}
+
+# Caddy also listens on :80 and redirects browsers to https. That is fine for
+# browsers. Sync and login must use the https:// URL, because the client
+# refuses redirects. If port 80 is blocked or already in use, add this global
+# option in a block at the very top of this file:
+#
+# {
+# 	auto_https disable_redirects
+# }
+#
+# Do not set `trusted_proxies` in Caddy unless another proxy sits in front of
+# it. Without it, Caddy ignores a client-sent X-Forwarded-For and sets its own
+# from the connection, which is what the server needs.

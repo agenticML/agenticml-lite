@@ -17,7 +17,7 @@ pip install agenticml-lite
 
 Syncing to a server needs version 2.2 or newer. 1.0.0 cannot sync.
 
-Using the hosted service at `app.agenticml.xyz`? Follow the [hosted quickstart](/agenticml-lite/hosted/quickstart/) instead.
+Using the hosted service at `app.agenticml.xyz`? Follow the [hosted quickstart](/agenticml-lite/hosted/quickstart/) instead. Syncing to a server on a private network with an internal CA? See [Private networks](/agenticml-lite/server/private-network/).
 
 Log in with your server URL:
 

@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import math
 import os
+import ssl
 import time
 
 import requests
+import urllib3
 from requests.adapters import HTTPAdapter
 
 from . import __version__
-from .auth import normalize_api_key, normalize_host
+from .auth import _clean_detail, normalize_api_key, normalize_host
 
 _CONNECT_TIMEOUT = 10
 _MIB = 1024 * 1024
@@ -33,6 +35,94 @@ class Conflict(Exception):
         self.payload = payload if isinstance(payload, dict) else {}
         error = self.payload.get("error")
         super().__init__(error if isinstance(error, str) else "conflict")
+
+
+_TLS_CERT_HINT = (
+    "TLS certificate check failed (untrusted CA, wrong host name, expired, or a wrong "
+    "clock); pass --ca-bundle PATH or set AGENTICML_CA_BUNDLE, and use the name in "
+    "the certificate"
+)
+_TLS_HANDSHAKE_HINT = (
+    "TLS handshake failed (the server closed the connection, or this is not an https port)"
+)
+_TLS_WALK_LIMIT = 50
+# Phrases (lowercase, "_" as a space) that show the peer does not speak TLS, or that
+# its records are garbled: retrying cannot help. OpenSSL builds differ in which
+# reason a TLS client gets from a plain-http port.
+_TLS_PROTOCOL_MISMATCH = (
+    "wrong version number", "http request", "unknown protocol", "wrong ssl version",
+    "record layer failure", "packet length too long",
+)
+
+
+def _exception_chain(exc):
+    """Yield ``exc`` and what it wraps: args, ``reason``, ``__cause__``, ``__context__``.
+
+    requests wraps the ``ssl`` error inside urllib3 errors.
+    """
+    seen = set()
+    pending = [exc]
+    while pending and len(seen) < _TLS_WALK_LIMIT:
+        item = pending.pop()
+        if id(item) in seen or not isinstance(item, BaseException):
+            continue
+        seen.add(id(item))
+        yield item
+        pending.extend(getattr(item, "args", ()) or ())
+        for name in ("reason", "__cause__", "__context__"):
+            nested = getattr(item, name, None)
+            if nested is not None:
+                pending.append(nested)
+
+
+def tls_failure(exc):
+    """``"cert"`` for a certificate check failure, ``"tls"`` for another SSLError, else None."""
+    found_tls = False
+    for item in _exception_chain(exc):
+        if isinstance(item, ssl.SSLCertVerificationError):
+            return "cert"
+        if isinstance(item, requests.exceptions.SSLError):
+            found_tls = True
+    return "tls" if found_tls else None
+
+
+def _protocol_mismatch(text):
+    text = text.lower().replace("_", " ")
+    return any(phrase in text for phrase in _TLS_PROTOCOL_MISMATCH)
+
+
+def _tls_permanent(exc):
+    """True when a TLS failure cannot fix itself on a retry: a bad certificate, or a
+    peer that does not speak TLS. Transient failures (a peer closing at accept, a
+    reloading proxy) are not permanent. Error text is only inspected, never printed."""
+    if tls_failure(exc) == "cert":
+        return True
+    for item in _exception_chain(exc):
+        if isinstance(item, (ssl.SSLError, requests.exceptions.SSLError,
+                             urllib3.exceptions.SSLError)):
+            reason = getattr(item, "reason", None)
+            if isinstance(reason, str) and _protocol_mismatch(reason):
+                return True
+            if _protocol_mismatch(str(item)):
+                return True
+    return False
+
+
+class CABundleUnavailable(requests.ConnectionError):
+    """The validated CA bundle vanished or became unreadable while a command ran."""
+
+    def __init__(self, path):
+        super().__init__(f"CA bundle not found or unreadable: {_clean_detail(str(path))}")
+
+
+def tls_hint(exc):
+    """Fixed hint text for a TLS failure, or None. Never includes the exception text."""
+    kind = tls_failure(exc)
+    if kind == "cert":
+        return _TLS_CERT_HINT
+    if kind == "tls":
+        return _TLS_HANDSHAKE_HINT
+    return None
 
 
 def _session():
@@ -67,7 +157,7 @@ def _json_object(response):
 
 class Client:
     def __init__(self, base_url=None, api_key=None, *, timeout=30,
-                 max_retries=3, insecure=False, stop=None):
+                 max_retries=3, insecure=False, stop=None, ca_bundle=None):
         resolved = base_url if base_url is not None else (os.environ.get("AGENTICML_HOST") or None)
         if not resolved:
             raise ValueError("no server host: pass base_url or set AGENTICML_HOST")
@@ -80,6 +170,7 @@ class Client:
         self.max_retries = max_retries
         self.api_key = resolved_key
         self.stop = stop
+        self.ca_bundle = ca_bundle
         self.session = _session()
         if resolved_key:
             self.session.headers["Authorization"] = f"Bearer {resolved_key}"
@@ -111,6 +202,9 @@ class Client:
     def _request(self, method, url, *, timeout=None, rewind=None, **kwargs):
         timeout = timeout if timeout is not None else (_CONNECT_TIMEOUT, self.timeout)
         attempts = 1 + max(self.max_retries, 0)
+        if self.ca_bundle is not None:
+            # A per-request verify wins over REQUESTS_CA_BUNDLE; session.verify does not.
+            kwargs["verify"] = self.ca_bundle
         last_error = None
         for attempt in range(attempts):
             if self.stop is not None and self.stop.is_set():
@@ -127,16 +221,28 @@ class Client:
                 requests.Timeout,
                 requests.exceptions.ChunkedEncodingError,
             ) as exc:
+                if isinstance(exc, requests.exceptions.SSLError) and _tls_permanent(exc):
+                    # A bad certificate or a non-TLS port does not fix itself within a retry.
+                    raise
                 last_error = exc
                 if attempt + 1 == attempts:
                     raise
                 self._backoff(attempt)
                 continue
+            except OSError as exc:
+                # requests raises a bare OSError when the verify path is gone.
+                if (self.ca_bundle is None or isinstance(exc, requests.RequestException)
+                        or os.path.isfile(self.ca_bundle)):
+                    raise
+                raise CABundleUnavailable(self.ca_bundle) from None
             if 300 <= response.status_code < 400:
                 # Location is omitted: it would name a target that might be
                 # sensitive, and the API key must not follow it.
                 response.close()
-                raise ValueError("server redirected; refusing to send the API key")
+                raise ValueError(
+                    "server redirected to another URL; use the final https:// URL as "
+                    "--host (refusing to send the API key on a redirect)"
+                )
             if response.status_code in _RETRY_STATUSES:
                 if attempt + 1 == attempts:
                     response.raise_for_status()
