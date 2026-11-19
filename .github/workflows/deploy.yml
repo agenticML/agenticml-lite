@@ -28,6 +28,12 @@ on:
         type: choice
         options: ['1', '0', '2']
         default: '1'
+      max_task_count:
+        description: Most tasks autoscaling may run (1 turns it off; keep leaves the stack's value)
+        required: false
+        type: choice
+        options: ['keep', '1', '2', '3', '4']
+        default: 'keep'
 permissions:
   contents: read
   id-token: write
@@ -120,6 +126,7 @@ jobs:
         env:
           CFN_ROLE_ARN: ${{ vars.AWS_CFN_ROLE_ARN }}
           DESIRED_COUNT: ${{ inputs.desired_count }}
+          MAX_TASK_COUNT: ${{ inputs.max_task_count }}
           MULTI_AZ: ${{ vars.HOSTED_MULTI_AZ || 'false' }}
           FIREBASE_PROJECT: ${{ vars.HOSTED_FIREBASE_PROJECT }}
           FIREBASE_API_KEY: ${{ vars.HOSTED_FIREBASE_API_KEY }}
@@ -143,6 +150,10 @@ jobs:
           # current count, and a new one gets the template default (1).
           if [ -n "$DESIRED_COUNT" ]; then
             overrides+=(DesiredCount="$DESIRED_COUNT")
+          fi
+          # Likewise for MaxTaskCount; keep (or a push run) leaves the stack's value.
+          if [ -n "$MAX_TASK_COUNT" ] && [ "$MAX_TASK_COUNT" != keep ]; then
+            overrides+=(MaxTaskCount="$MAX_TASK_COUNT")
           fi
           aws cloudformation deploy \
             --stack-name "$STACK_NAME" \
@@ -172,10 +183,24 @@ jobs:
               --query "Stacks[0].Outputs[?OutputKey=='${key}'].OutputValue" --output text)
             echo "${key}: ${value}"
           done
+          # The stack's own parameters decide what the service count must be.
+          max_tasks=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Parameters[?ParameterKey=='MaxTaskCount'].ParameterValue" --output text)
+          min_tasks=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Parameters[?ParameterKey=='DesiredCount'].ParameterValue" --output text)
+          # Autoscaling is on when MaxTaskCount is above 1 and DesiredCount (the minimum) above 0.
+          # Then the autoscaler owns the count, so a scale-out may need more time; otherwise the
+          # service must run exactly DesiredCount tasks.
+          scaling=false
+          attempts=12
+          if [ "$max_tasks" -gt 1 ] && [ "$min_tasks" -gt 0 ]; then
+            scaling=true
+            attempts=30
+          fi
           # CloudFormation already waits for the service to stabilise; retry briefly in case of a lag.
           running=''
           desired=''
-          for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+          for _ in $(seq 1 "$attempts"); do
             if ! counts=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
               --query 'services[0].[runningCount,desiredCount]' --output text); then
               sleep 10
@@ -183,10 +208,21 @@ jobs:
             fi
             read -r running desired <<< "$counts"
             if [ "$running" = "$desired" ]; then
-              echo "Service $ECS_SERVICE is running $running of $desired tasks."
-              exit 0
+              if [ "$scaling" = true ] && [ "$desired" -ge "$min_tasks" ]; then
+                echo "Service $ECS_SERVICE is running $running of $desired tasks (autoscaling, minimum $min_tasks)."
+                exit 0
+              fi
+              if [ "$scaling" = false ] && [ "$desired" = "$min_tasks" ]; then
+                echo "Service $ECS_SERVICE is running $running of $desired tasks."
+                exit 0
+              fi
             fi
             sleep 10
           done
-          echo "::error::Service $ECS_SERVICE runs $running tasks, expected $desired."
+          if [ "$scaling" = false ] && [ "$desired" != "$min_tasks" ]; then
+            # E.g. a scale-out left over from turning autoscaling off (MaxTaskCount 1).
+            echo "::error::Service $ECS_SERVICE has desiredCount $desired but DesiredCount is $min_tasks. Run: aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --desired-count $min_tasks, or redeploy with desired_count."
+            exit 1
+          fi
+          echo "::error::Service $ECS_SERVICE runs $running of $desired desired tasks (DesiredCount $min_tasks, MaxTaskCount $max_tasks)."
           exit 1

@@ -46,7 +46,8 @@ foundation that must exist before the deploy workflow can run:
   initiate and execute change sets on the hosted stack, and pass the
   CloudFormation role.
 - **CloudFormation role** `agenticml-hosted-cloudformation`: assumed by the
-  CloudFormation service to create and update resources in the hosted stack.
+  CloudFormation service to create and update resources in the hosted stack,
+  and to manage the service's autoscaling.
 - **ACM certificate** for `app.agenticml.xyz`: uses DNS validation with
   `DeletionPolicy: Retain`.
 - **Alerts topic** `agenticml-alerts`: unencrypted SNS topic (AWS Budgets cannot
@@ -60,6 +61,10 @@ foundation that must exist before the deploy workflow can run:
   a per-service breakdown and month-end forecast (`GetCostForecast`). On the 2nd
   of each month, emails the previous month's final total. Skips queries on the
   1st because Cost Explorer data lags by a day.
+- **CloudWatch dashboard** `agenticml-hosted`: holds widgets for requests and
+  errors, latency (p50/p95/p99), load (in-flight and database connections, plus
+  RDS DatabaseConnections), ECS CPU and memory with RDS CPU, RDS CPU credits,
+  and usage totals.
 
 Deploy the bootstrap stack:
 
@@ -173,8 +178,9 @@ ready; the workflow passes unset variables to the template as empty strings.
 `HOSTED_OPEN_SIGNUP=true` requires a non-empty `HOSTED_FIREBASE_PROJECT`;
 otherwise CloudFormation template assertions fail before any resource changes.
 The task count is no longer a variable: it comes from the deploy workflow's
-`desired_count` input (see First deploy). Delete `HOSTED_DESIRED_COUNT` if it
-is already set; nothing reads it. No secrets are needed. The database password is generated and stored in an
+`desired_count` and `max_task_count` inputs (see First deploy and Operations and
+scaling). Delete `HOSTED_DESIRED_COUNT` if it is already set; nothing reads it.
+No secrets are needed. The database password is generated and stored in an
 RDS-managed secret.
 
 ## First deploy
@@ -244,7 +250,7 @@ curl --fail https://app.agenticml.xyz/healthz
 aws logs tail /ecs/agenticml-hosted --since 10m
 ```
 
-The stack configures six CloudWatch alarms (described in detail under Incidents,
+The stack configures nine CloudWatch alarms (described in detail under Incidents,
 launch evidence and cost below).
 
 ## If the first create fails
@@ -1152,14 +1158,25 @@ Alarms publish to the `agenticml-alerts` SNS topic:
 5. `agenticml-hosted-rds_cpu`: RDS CPU utilization > 80% over 5 minutes (period
    300 s, statistic `Average`).
 6. `agenticml-hosted-healthy_hosts`: ALB `HealthyHostCount` for the target
-   group, statistic `Minimum`, below `DesiredCount` (1 or 2) for 5 periods of
-   60 s, missing data treated as breaching. With two tasks, one missing
-   target alarms too. This alarm exists only while `DesiredCount` is
-   greater than 0. The threshold follows the stack's value after the service
-   is stable, so when you scale 2 to 1 it reads 2 for a short time after the
-   second task stops; five consecutive minutes are needed, so it normally does
-   not fire. (It replaces `agenticml-hosted-running_tasks`, which needed
-   Container Insights; Container Insights is off.)
+   group, statistic `Minimum`, below `DesiredCount` (the minimum, when
+   autoscaling is on) for 5 periods of 60 s, missing data treated as
+   breaching. Alarms when there are fewer healthy targets than `DesiredCount`
+   for 5 minutes; extra tasks above the minimum never alarm. This alarm exists
+   only while `DesiredCount` is greater than 0. The threshold follows the
+   stack's value after the service is stable. (It replaces
+   `agenticml-hosted-running_tasks`, which needed Container Insights; Container
+   Insights is off.)
+7. `agenticml-hosted-rds_cpu_credits`: RDS `CPUCreditBalance` minimum below 20
+   for three 5-minute periods. RDS t4g instances run in Unlimited mode: when
+   credits run out the database is not throttled but bursts on surplus credits,
+   which are billed. A new or restored database instance starts with 0 credits,
+   so after a restore this alarm stays in ALARM for about two hours until it has
+   earned 20.
+8. `agenticml-hosted-rds_connections`: RDS `DatabaseConnections` maximum above
+   the class threshold in 5 minutes: 60 (`db.t4g.micro`), 130 (`db.t4g.small`),
+   270 (`db.t4g.medium`), about 80% of the estimated `max_connections`.
+9. `agenticml-hosted-ecs_memory`: ECS service `MemoryUtilization` maximum above
+   85% for two 5-minute periods (AWS/ECS metric; Container Insights stays off).
 
 Additional bootstrap alarms:
 - `agenticml-cost-steps-errors`: CloudWatch alarm on the `agenticml-cost-steps`
@@ -1184,27 +1201,115 @@ the SHA and the comment together; look up a tag's commit with
 After changing the pins, run `publish-testpypi.yml` once before tagging a
 release.
 
+### Capacity dashboard and metrics
+
+The hosted task runs with `AGENTICML_SERVER_METRICS=cloudwatch`. The task role may call `cloudwatch:PutMetricData` only for the namespace `AgenticML/Server`, publishing 12 custom metrics with no dimensions (requests, errors, latency, in-flight requests, process database connections, and usage totals).
+
+The bootstrap stack holds a CloudWatch dashboard named `agenticml-hosted`. It contains widgets for:
+- Requests and errors (`Requests`, `Errors4xx`, `Errors5xx`, `Rejected`).
+- Latency (`Latency` p50, p95, p99).
+- Load (`InFlightPeak`, `DbConnectionsPeak`, and RDS `DatabaseConnections`).
+- ECS CPU and memory alongside RDS CPU.
+- RDS CPU credits (`CPUCreditBalance`).
+- Usage totals (`Accounts`, `ActiveUsers7d`, `WorkspacesActive`, `StoredBytes`, `UploadBytesToday`).
+
+Re-applying the bootstrap stack from a laptop with admin credentials creates or updates the dashboard, using the existing bootstrap deploy command in this README; hosted deploys do not depend on it.
+
+Open the dashboard in the CloudWatch console under Dashboards, `agenticml-hosted`. The custom metric widgets show data after the next hosted deploy with metrics on.
+
 ### Operations and scaling
 
-The service runs one Fargate task by default. To change the task count, run the
-deploy workflow with the `desired_count` input (choices `1`, `0`, `2`; default
-`1`; push-triggered runs keep the current count):
+The service runs one Fargate task by default. It can scale tasks automatically or run a fixed task count.
+
+#### Scaling settings and database budgets
+
+The hosted stack defines two scaling parameters:
+- `MaxTaskCount`: most tasks autoscaling may run (`1` to `4`, default `1`). `1` turns autoscaling off.
+- `DbInstanceClass`: RDS database instance class (`db.t4g.micro` default, `db.t4g.small`, or `db.t4g.medium`).
+
+`DesiredCount` is the minimum task count while autoscaling is on. Autoscaling is on when `MaxTaskCount` is above 1 and `DesiredCount` is above 0. It uses an ECS target tracking policy on average service CPU:
+- Target average CPU: 60%.
+- Scale-out cooldown: 60 seconds.
+- Scale-in cooldown: 300 seconds.
+- Range: between `DesiredCount` and `MaxTaskCount`.
+
+While autoscaling is on, deploys leave the running task count to the autoscaler. Setting `desired_count=0` always stops the service and removes the autoscaling resources.
+
+Each task gets a database connection budget (`AGENTICML_SERVER_DB_CONNECTIONS`) so all tasks fit the database even during a rolling deploy, which briefly runs up to twice the tasks:
+
+`budget = floor(usable / (2 × MaxTaskCount))`
+
+Usable connections are estimated at 64 (`db.t4g.micro`), 144 (`db.t4g.small`), and 300 (`db.t4g.medium`). Budgets per task:
+- `db.t4g.micro`: 2 tasks = 16.
+- `db.t4g.small`: 2 tasks = 36; 3 tasks = 24; 4 tasks = 18.
+- `db.t4g.medium`: 2 tasks = 75; 3 tasks = 50; 4 tasks = 37.
+
+`db.t4g.micro` allows at most 2 tasks (a CloudFormation template rule refuses more). Running 3 or 4 tasks requires `db.t4g.small` or larger.
+
+Changing `DbInstanceClass` modifies the database in place, with a few minutes of downtime on single-AZ instances. Run `SHOW max_connections;` over ECS Exec afterwards to see the real value. `DbInstanceClass` has no workflow input yet; change it with parameter overrides in `aws cloudformation deploy`, matching other stack parameter updates.
+
+#### Deploy workflow and task count
+
+The deploy workflow provides two scaling inputs:
+- `desired_count`: `0`, `1`, or `2` (default `1`). Sets the minimum task count when autoscaling is on, or the fixed count when off.
+- `max_task_count`: `keep`, `1`, `2`, `3`, or `4` (default `keep`). `keep` retains the stack's current value; push-triggered runs keep it too. `1` turns autoscaling off.
 
 ```sh
-gh workflow run deploy.yml --ref dev -f ref=<deployed sha> -f desired_count=2
+gh workflow run deploy.yml --ref dev -f ref=<deployed sha> -f desired_count=1 -f max_task_count=2
 ```
 
-As a fallback, to run two tasks temporarily without the workflow:
+The workflow's final check verifies running tasks:
+- With autoscaling on: waits up to 5 minutes for the running count to match.
+- With autoscaling off: fails if the service's desired count differs from `DesiredCount` (for example, a scale-out left over after turning autoscaling off). It tells you to run:
+  ```sh
+  aws ecs update-service --cluster agenticml-hosted --service agenticml-hosted --desired-count <DesiredCount>
+  ```
+  or redeploy with `desired_count`.
 
-```sh
-aws ecs update-service --cluster agenticml-hosted --service agenticml-hosted --desired-count 2
-```
+#### Manual updates and caveats
 
-The next deploy that updates the service sets the count back to the stack's
-value. `update-service` bypasses CloudFormation, so the `healthy_hosts` alarm
-keeps the threshold of the stack's `DesiredCount`: it stays at 1 with the
-service at 2, and with the stack at 2 and the service at 1 it will alarm. Prefer
-the workflow input.
+Do not rely on `aws ecs update-service` for routine scaling:
+- With autoscaling on: any manual desired count set with `aws ecs update-service` is quickly overridden by the autoscaler.
+- With autoscaling off: `update-service` bypasses CloudFormation. The `healthy_hosts` alarm retains the threshold from the stack's `DesiredCount`, and the next workflow deploy sets the count back to the stack's value. Prefer the workflow input.
+
+#### Turning autoscaling on
+
+Follow these steps in order:
+1. Re-apply the bootstrap stack from your laptop with admin credentials. This adds the deploy role's Application Auto Scaling permissions and creates the ECS autoscaling service-linked role. (The package 32 capacity dashboard needs this same re-apply.) Without this step, deploying autoscaling fails with `AccessDenied` and CloudFormation rolls back.
+2. Complete the two-task rolling deploy check in the roadmap Backlog.
+3. For more than 2 tasks, change `DbInstanceClass` to `db.t4g.small` first.
+4. Run the deploy workflow with `max_task_count=2` (or `3` or `4`):
+   ```sh
+   gh workflow run deploy.yml --ref dev -f max_task_count=2
+   ```
+
+#### Turning autoscaling off safely
+
+Turn autoscaling off in two steps. CloudFormation updates the service before it removes the scaling target, so an unexpected scale-out could happen in between:
+1. Lower the live target to the minimum:
+   ```sh
+   aws application-autoscaling register-scalable-target \
+     --service-namespace ecs \
+     --resource-id service/agenticml-hosted/agenticml-hosted \
+     --scalable-dimension ecs:service:DesiredCount \
+     --min-capacity <DesiredCount> \
+     --max-capacity <DesiredCount>
+   ```
+   Wait until the service has scaled in.
+2. Deploy with `-f max_task_count=1`:
+   ```sh
+   gh workflow run deploy.yml --ref dev -f max_task_count=1
+   ```
+
+Do toggles at low load. During the deploy that changes `MaxTaskCount`, old and new tasks run with different connection budgets.
+
+#### What to watch
+
+Monitor the package 32 CloudWatch dashboard and ALB metrics:
+- Custom metrics: `DbConnectionsPeak`, `Rejected`, `Errors5xx`, and `Latency`.
+- ALB metric: `TargetResponseTime`.
+
+Do not watch CPU alone. Requests waiting for a database connection or lock slot do not raise CPU, so CPU-based autoscaling cannot see them.
 
 To suspend an abusive workspace, click **Suspend** on its row on `/admin`. **Archive**
 there suspends it and moves it to the Archived table (data kept; Restore brings it back).
@@ -1222,6 +1327,15 @@ aws ecs execute-command --cluster agenticml-hosted --task "$task" --container se
   --command 'agenticml server workspaces usage --data /data'
 ```
 
+To inspect server-wide totals, top workspaces, and daily usage history over ECS Exec:
+
+```sh
+aws ecs execute-command --cluster agenticml-hosted --task "$task" --container server --interactive \
+  --command 'agenticml server stats --data /data'
+```
+
+`/admin` shows the same totals and growth charts.
+
 ### Launch checklist (package 24.3)
 
 Before considering the hosted service live:
@@ -1238,7 +1352,7 @@ Attach evidence to roadmap Backlog entries before closing them.
 
 ### Cost estimate
 
-Estimated monthly cost in `us-east-2` (on demand) is about **$62–66/month**
+Estimated monthly cost in `us-east-2` (on demand) is about **$63–70/month**
 total:
 - One ARM64 Fargate task (0.5 vCPU, 1 GB RAM): ~$14.40
 - Application Load Balancer: ~$17–18
@@ -1246,7 +1360,7 @@ total:
 - RDS PostgreSQL `db.t4g.micro` with 20 GB gp3 storage: ~$14
 - EFS: ~$1–2
 - S3 and ECR: ~$1–2
-- CloudWatch logs and the six alarms: ~$1–2
+- CloudWatch logs, nine alarms, and custom metrics (about $1–4): ~$2–6
 - AWS Backup: ~$1
 - Secrets Manager: ~$0.40
 - Cost alerts (Cost Explorer API queries): ~$0.60
@@ -1256,8 +1370,9 @@ zone fees. The bootstrap budget stays at $100 with $10 steps; to alert earlier,
 lower `MonthlyBudget` to 75 by redeploying the bootstrap stack.
 
 Ways to scale up later:
-- A second task (~$18)
-- `db.t4g.small` (~$12)
+- An extra task: about $0.025 an hour while it runs (Fargate 0.5 vCPU / 1 GB ARM plus its public IPv4 address)
+- Target-tracking CloudWatch alarms: about $0.20 a month for the two alarms
+- `db.t4g.small`: adds about $12 a month
 - Multi-AZ RDS (roughly doubles the RDS cost)
 
 ## Teardown

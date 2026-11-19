@@ -41,6 +41,15 @@ def connect(url):
     return SqliteDatabase(_path(url))
 
 
+def open_postgres(url):
+    """The cached open PostgresDatabase for a URL, or None; opens nothing."""
+    if not _is_postgres(url):
+        return None
+    with _registry_lock:
+        db = _registry.get(url)
+    return None if db is None or db.closed else db
+
+
 def for_server_dir(server_dir, url=None, *, create=True, actor='server'):
     directory = Path(server_dir)
     resolved = url if url is not None else (os.environ.get('AGENTICML_SERVER_DATABASE_URL')

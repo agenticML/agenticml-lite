@@ -405,7 +405,10 @@ def test_membership_roles_invites_and_key_sessions(two):
     assert bind_sync(server, server.keys.verify(ka)).principal.role == 'owner'
     assert request(server, '/v2/objects/missing', 'POST', b'{"objects": []}', secret)[0] == 403
     account_before = AccountRepo(server.db).get('alice')
-    assert account_before == alice  # Membership never rewrites the global account.
+    # Membership never rewrites the global account; the key use only marked alice active.
+    assert {k: v for k, v in account_before.items() if k != 'last_active_at'} == {
+        k: v for k, v in alice.items() if k != 'last_active_at'}
+    assert account_before['last_active_at'] is not None
     token = InviteRepo(server.db, a['id']).create('NEW@Example.com', 'member', 'alice')
     assert InviteRepo(server.db, a['id']).list()[0]['login'] == 'new@example.com'
     with pytest.raises(InviteInvalid):

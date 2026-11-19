@@ -1098,6 +1098,9 @@ class DashboardServer(ThreadingHTTPServer):
         self.connection_lock = threading.Lock()
         super().__init__((host, port), handler_class or DashboardHandler)
 
+    def on_rejected(self):
+        """Hook: a connection was refused at the connection cap."""
+
     def handle_error(self, request, client_address):
         if self.verbose:
             super().handle_error(request, client_address)
@@ -1143,6 +1146,7 @@ class DashboardServer(ThreadingHTTPServer):
             if admitted:
                 self.connections[request] = "headers"
         if not admitted:
+            self.on_rejected()
             try:
                 # One nonblocking send: a client that does not read must never
                 # stall the accept loop, even while all handlers are busy.
@@ -1316,6 +1320,9 @@ def _parse_note_body(data: bytes):
 
 class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "AgenticML"
+    # Seconds spent receiving request bytes and sending response bytes; the
+    # ingest server keeps them out of its latency metric.
+    _m_transfer = 0.0
 
     class _HeaderReader(io.RawIOBase):
         """Apply the remaining header budget before every socket read."""
@@ -1358,9 +1365,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             server = self.handler.server
             if not server._set_connection_state(self.handler.connection, "writing"):
                 raise BrokenPipeError("connection evicted")
+            started = time.monotonic()
             try:
                 return self.raw.write(b)
             finally:
+                # Client transfer time, kept out of the latency metric.
+                self.handler._m_transfer += time.monotonic() - started
                 server._set_connection_state(self.handler.connection, "busy")
 
         def __getattr__(self, name):
@@ -1635,11 +1645,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 except OSError as exc:
                     self.close_connection = True
                     raise TimeoutError("note put deadline exceeded") from exc
+                started = time.monotonic()
                 try:
                     chunk = reader(min(_CHUNK, remaining))
                 except (TimeoutError, socket.timeout, BlockingIOError) as exc:
                     self.close_connection = True
                     raise TimeoutError("note put deadline exceeded") from exc
+                finally:
+                    self._m_transfer += time.monotonic() - started
                 if not chunk:
                     break
                 chunks.append(chunk)

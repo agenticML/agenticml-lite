@@ -105,6 +105,10 @@ def _hash_prefix(handle, size):
 
 
 class IngestHandler(DashboardHandler):
+    _m_start = None
+    _m_status = None
+    _m_skip = False
+
     def _begin(self, status, content_type, length, headers=None):
         if self.close_connection:
             headers = {name: value for name, value in (headers or {}).items()
@@ -124,6 +128,64 @@ class IngestHandler(DashboardHandler):
         self._started = False
         self.headers = self.MessageClass()
         self._error({"error": "invalid request"}, code)
+
+    def handle_one_request(self):
+        self._m_start = None
+        self._m_status = None
+        self._m_skip = False
+        self._m_transfer = 0.0
+        try:
+            super().handle_one_request()
+        finally:
+            if self._m_start is not None:
+                # Server time: what the client spent sending the request and
+                # reading the reply is not ours.
+                seconds = max(0.0, time.monotonic() - self._m_start - self._m_transfer)
+                self.server.request_metrics.request_finished(self._m_status, seconds)
+                self._m_start = None
+
+    def _metrics_start(self):
+        if self._m_start is None and not self._m_skip:
+            self._m_start = time.monotonic()
+            self.server.request_metrics.request_started()
+
+    def _health_target(self):
+        """True when the request line is a GET of the ingest health route."""
+        try:
+            words = self.raw_requestline.decode("iso-8859-1").split()
+            target = words[1]
+        except (IndexError, AttributeError):
+            return False
+        if words[0] != "GET" or target.partition("?")[0] != "/healthz":
+            return False
+        try:
+            return urlsplit(target).path == "/healthz"
+        except ValueError:
+            return False
+
+    def parse_request(self):
+        # Load-balancer health checks are not requests: no count, no in-flight.
+        health = self._health_target()
+        if not health:
+            self._metrics_start()
+        began = time.monotonic()
+        transfer = self._m_transfer
+        try:
+            parsed = super().parse_request()
+        finally:
+            # Reading the headers is the client's time (replies sent while
+            # parsing are inside this span already).
+            self._m_transfer = transfer + (time.monotonic() - began)
+        if health and parsed and self.command == "GET":
+            self._m_skip = True
+        return parsed
+
+    def send_response(self, code, message=None):
+        # A reply before parse_request (414) still counts as a request.
+        self._metrics_start()
+        if not self._m_skip:
+            self._m_status = code
+        super().send_response(code, message)
 
     def _dashboard_request(self):
         """True when the raw target is not /healthz or /v2, before ingest path policy."""
@@ -431,7 +493,11 @@ class IngestHandler(DashboardHandler):
                 if left <= 0:
                     raise TimeoutError("body deadline exceeded")
                 self.connection.settimeout(left if previous is None else min(left, previous))
-                chunk = self.rfile.read1(min(_CHUNK, remaining))
+                received = time.monotonic()
+                try:
+                    chunk = self.rfile.read1(min(_CHUNK, remaining))
+                finally:
+                    self._m_transfer += time.monotonic() - received
                 if not chunk:
                     raise TimeoutError("short body")
                 remaining -= len(chunk)

@@ -113,6 +113,7 @@ _ROUTES.extend([
     _r("DELETE", r"/api/admin/server-admins/" + _LOGIN, "server_admin", None,
        "admin_server_admins", "admin_server_admins_remove"),
     _r("GET", r"/api/admin/audit", "server_admin", None, "admin_audit", "admin_audit"),
+    _r("GET", r"/api/admin/stats", "server_admin", None, "admin_stats", "admin_stats"),
 ])
 for sub, name, target in _RUN_SUBS:
     _ROUTES.append(_ws("GET", r"runs/" + _RUN + sub, "read", "dashboard_get", name, target))
@@ -812,6 +813,22 @@ def _admin_server_admins(webauth, handler, route, match):
     handler._json({"error": "method not allowed"}, 405, headers)
 
 
+def _admin_stats(webauth, handler, route, match):
+    from .db import DatabaseError
+    from .db.stats import StatsRepo
+    from .stats import STATS_REFRESH
+
+    headers = webauth._headers()
+    stats = StatsRepo(handler.server.db)
+    try:
+        body = {"totals": stats.totals(), "top_workspaces": stats.top_workspaces(),
+                "history": stats.history(90), "refresh_seconds": STATS_REFRESH}
+    except (OSError, DatabaseError):
+        handler._json({"error": "usage statistics unavailable"}, 503, headers)
+        return
+    handler._json(body, headers=headers)
+
+
 def _admin_audit(webauth, handler, route, match):
     import re
     from urllib.parse import parse_qs, urlsplit
@@ -967,6 +984,7 @@ HANDLERS = {
     "admin_workspaces": _admin_workspaces,
     "admin_server_admins": _admin_server_admins,
     "admin_audit": _admin_audit,
+    "admin_stats": _admin_stats,
     "static_file": _static_file,
     "usage": _usage,
 }

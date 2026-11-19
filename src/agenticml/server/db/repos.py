@@ -24,6 +24,7 @@ from ..users import (UserRecord, UserNameTaken, UserNotFound, IdentityTaken, Inv
 
 from .workspaces import AccountRepo, WorkspaceBound, WorkspaceRepo, require_workspace_id, validate_login
 
+from .stats import mark_account_active
 from .usage import UsageRepo
 
 logger = logging.getLogger('agenticml.server.db.repos')
@@ -427,9 +428,16 @@ class KeyRepo(WorkspaceBound):
     def touch(self, record, now, threshold):
         with self.db.transaction(write=True) as tx:
             tx.bind_workspace(require_workspace_id(record.workspace_id or self.workspace_id))
-            tx.execute('UPDATE keys SET last_used_at=? WHERE workspace_id=? AND name=? AND sha256=? '
-                       'AND (last_used_at IS NULL OR last_used_at < ?)',
-                       (now, record.workspace_id, record.name, record.sha256, threshold))
+            updated = tx.execute('UPDATE keys SET last_used_at=? WHERE workspace_id=? AND name=? AND sha256=? '
+                                 'AND (last_used_at IS NULL OR last_used_at < ?)',
+                                 (now, record.workspace_id, record.name, record.sha256, threshold))
+            if updated.rowcount:
+                account_id = record.account_id
+                if account_id is None:
+                    row = tx.fetchone('SELECT account_id FROM keys WHERE workspace_id=? AND name=? AND sha256=?',
+                                      (record.workspace_id, record.name, record.sha256))
+                    account_id = row[0] if row is not None else None
+                mark_account_active(tx, account_id, layout.parse_timestamp(now).timestamp())
 
     def prepare_setup(self, env):
         with self._tx(write=True) as tx:
@@ -469,6 +477,7 @@ class SessionRepo:
                        'key_name, key_sha256, created, last_seen, created_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                        (digest, entry['id'], entry.get('workspace_id'), entry['generation'], entry['via'],
                         entry['key'], entry['key_sha256'], entry['created'], entry['last_seen'], order))
+            mark_account_active(tx, entry['id'], entry['last_seen'])
 
     def get(self, digest):
         with self._tx() as tx:
@@ -481,8 +490,12 @@ class SessionRepo:
 
     def touch(self, digest, now):
         with self._tx(write=True) as tx:
-            tx.execute('UPDATE sessions SET last_seen=? WHERE token_sha256=? AND last_seen<=?',
-                       (now, digest, now - 60))
+            updated = tx.execute('UPDATE sessions SET last_seen=? WHERE token_sha256=? AND last_seen<=?',
+                                 (now, digest, now - 60))
+            if updated.rowcount:
+                row = tx.fetchone('SELECT account_id FROM sessions WHERE token_sha256=?', (digest,))
+                if row is not None:
+                    mark_account_active(tx, row[0], now)
 
     def delete(self, digest):
         with self._tx(write=True) as tx:

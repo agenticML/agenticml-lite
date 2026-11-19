@@ -111,6 +111,7 @@ The unit's `StateDirectory=agenticml-server` automatically manages `/var/lib/age
 | --- | --- | --- | --- |
 | `--data DIR` | `AGENTICML_SERVER_DATA` | `~/.agenticml-server` | Path to server data directory. |
 | `--database URL` | `AGENTICML_SERVER_DATABASE_URL` | `sqlite:///<data>/server/agenticml.db` | Server database connection URL. |
+| `--db-connections N` | `AGENTICML_SERVER_DB_CONNECTIONS` | unset (`89`) | Most Postgres connections one server process opens (8 to 1000). Ignored with SQLite. |
 | `--objects URL` | `AGENTICML_SERVER_OBJECTS` | `file://` | Object store backend (`file://` or `s3://bucket/prefix`). |
 | `--host HOST` | | `127.0.0.1` | Network interface to bind. |
 | `--port PORT` | | `8080` | Port to listen on. |
@@ -121,6 +122,7 @@ The unit's `StateDirectory=agenticml-server` automatically manages `/var/lib/age
 | `--firebase-api-key KEY` | `AGENTICML_SERVER_FIREBASE_API_KEY` | unset | Firebase web API key. |
 | `--firebase-auth-domain HOST` | `AGENTICML_SERVER_FIREBASE_AUTH_DOMAIN` | unset | Firebase auth domain. |
 | `--limits FILE` | `AGENTICML_SERVER_LIMITS` | unset | JSON file defining workspace usage limits. |
+| `--metrics MODE` | `AGENTICML_SERVER_METRICS` | `off` | Capacity metrics mode: `off` or `cloudwatch`. |
 | `--open-signup` | `AGENTICML_SERVER_OPEN_SIGNUP` | off | Allow verified Firebase sign-in to create an account and workspace. |
 | `--admin-emails LIST` | `AGENTICML_SERVER_ADMIN_EMAILS` | unset | Comma-separated emails granted server admin at their next verified Firebase sign-in. Ignored without Firebase. |
 | `--min-client-version X.Y` | `AGENTICML_SERVER_MIN_CLIENT_VERSION` | `2.2` | Reject `agenticml-lite` clients older than `X.Y` on `/v2` requests with HTTP 426. |
