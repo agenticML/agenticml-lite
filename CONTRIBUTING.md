@@ -48,8 +48,8 @@ macOS is not a CI target.
 
 ## Branches and pull requests
 
-- Open pull requests against `dev`.
-- `main` gets releases. Do not target it with feature work.
+- Open pull requests against `main`.
+- Releases are `v*` tags on `main`.
 - Keep a pull request to one change, and say in the description which tests you ran. The pull request template has a checklist.
 - If a change touches the dashboard, say that you checked it at 375px.
 

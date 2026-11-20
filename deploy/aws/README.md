@@ -147,8 +147,8 @@ In GitHub repository Settings → Environments, create the `hosted` environment.
 
 1. **Require reviewers**: Enable required reviewers and assign team members.
    Workflow files cannot configure reviewers; this must be set in the UI.
-2. **Deployment branches and tags**: Restrict permitted branches/tags to `main`,
-   `dev`, and tags matching `v*`.
+2. **Deployment branches and tags**: Restrict permitted branches/tags to `main`
+   and tags matching `v*`.
 3. **Environment variables**: Set the following variables with `gh`:
 
 ```sh
@@ -224,30 +224,30 @@ only applies after the bootstrap stack is redeployed):
 aws iam create-service-linked-role --aws-service-name elasticfilesystem.amazonaws.com
 ```
 
-The deploy workflow runs automatically on every push to `dev` that changes
+The deploy workflow runs automatically on every push to `main` that changes
 `src/**`, `pyproject.toml`, `deploy/aws/**` (except Markdown files and
 `bootstrap.yaml`) or `.github/workflows/deploy.yml`. Each run waits for the
 required reviewer on the `hosted` environment. So the first deploy is: merge
-to `dev`, then approve the waiting "Deploy hosted service" run in GitHub
+to `main`, then approve the waiting "Deploy hosted service" run in GitHub
 Actions. Push runs keep the stack's current task count (one on the first
 create).
 
 Before approving, read the commit the run deploys: anyone who can push to
-`dev` controls what it runs, so keep `dev` protected. The first waiting run
+`main` controls what it runs, so keep `main` protected. The first waiting run
 holds the deploy slot, and later pushes queue behind it (only the newest one
 is kept). If a newer commit is waiting, reject the older run instead of
 approving it, then approve the newer one.
 
 You can also start a run by hand with GitHub CLI. GitHub only allows
-`workflow_dispatch` for workflows on the default branch. That is `dev`, and
+`workflow_dispatch` for workflows on the default branch. That is `main`, and
 `deploy.yml` is on it, so this works now:
 
 ```sh
-gh workflow run deploy.yml --ref dev
-gh workflow run deploy.yml --ref dev -f ref=<sha> -f desired_count=1
+gh workflow run deploy.yml --ref main
+gh workflow run deploy.yml --ref main -f ref=<sha> -f desired_count=1
 ```
 
-You can also run against `main` or a `v*` tag. An optional commit SHA passed
+You can also run against a `v*` tag. An optional commit SHA passed
 via `-f ref=<sha>` must be an ancestor already present on the selected branch
 or tag; the workflow checks `git merge-base --is-ancestor` and refuses other
 commits. `desired_count` accepts `1` (default), `0` or `2`.
@@ -957,7 +957,7 @@ is updated. Any event means row-level security is bypassed. CloudWatch keeps
 
 ## Upgrades, rollback and config
 
-Every push to `dev` that changes the image or the stack queues a deploy of
+Every push to `main` that changes the image or the stack queues a deploy of
 that commit; approve it in GitHub Actions. You can also dispatch a reviewed
 commit SHA by hand. Database
 migrations and imports run at server startup under PostgreSQL advisory locks
@@ -973,7 +973,7 @@ and does not restart the task. To roll the service without a new commit, use
 `aws ecs update-service --cluster agenticml-hosted --service agenticml-hosted --force-new-deployment`.
 
 To roll back, run the workflow with `-f ref=<previous sha>` (ensure its
-immutable ECR image tag still exists), or revert on `dev`: the push of the
+immutable ECR image tag still exists), or revert on `main`: the push of the
 revert triggers a deploy.
 Rolling back does **not** undo database
 migrations. A rollback is safe only if that server version supports the current
@@ -1225,7 +1225,7 @@ also runnable with `gh workflow run monitor.yml`) requests
 not an uptime guarantee and does not replace the alarms: on a failure it opens
 one issue titled "Hosted monitor failed" with the label `hosted`, comments on
 it while the failure lasts and closes it when the check passes again. Scheduled
-runs use the default branch (`dev`), so the schedule starts once the workflow
+runs use the default branch (`main`), so the schedule starts once the workflow
 is there.
 
 All workflow actions are pinned to full commit SHAs (tag in a comment). Update
@@ -1288,7 +1288,7 @@ The deploy workflow provides two scaling inputs:
 - `max_task_count`: `keep`, `1`, `2`, `3`, or `4` (default `keep`). `keep` retains the stack's current value; push-triggered runs keep it too. `1` turns autoscaling off.
 
 ```sh
-gh workflow run deploy.yml --ref dev -f ref=<deployed sha> -f desired_count=1 -f max_task_count=2
+gh workflow run deploy.yml --ref main -f ref=<deployed sha> -f desired_count=1 -f max_task_count=2
 ```
 
 The workflow's final check verifies running tasks:
@@ -1313,7 +1313,7 @@ Follow these steps in order:
 3. For more than 2 tasks, change `DbInstanceClass` to `db.t4g.small` first.
 4. Run the deploy workflow with `max_task_count=2` (or `3` or `4`):
    ```sh
-   gh workflow run deploy.yml --ref dev -f max_task_count=2
+   gh workflow run deploy.yml --ref main -f max_task_count=2
    ```
 
 #### Turning autoscaling off safely
@@ -1331,7 +1331,7 @@ Turn autoscaling off in two steps. CloudFormation updates the service before it 
    Wait until the service has scaled in.
 2. Deploy with `-f max_task_count=1`:
    ```sh
-   gh workflow run deploy.yml --ref dev -f max_task_count=1
+   gh workflow run deploy.yml --ref main -f max_task_count=1
    ```
 
 Do toggles at low load. During the deploy that changes `MaxTaskCount`, old and new tasks run with different connection budgets.

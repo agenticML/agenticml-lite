@@ -2,13 +2,13 @@
 # one, look up the tag's commit (dereference annotated tags) and change the SHA
 # and the comment together.
 name: Deploy hosted service
-# A push to dev that changes the image or the stack queues a deploy of that
+# A push to main that changes the image or the stack queues a deploy of that
 # commit; like every run it waits for the hosted environment's reviewer.
 # Push runs use the workflow file of the pushed commit, so this works before
 # the file reaches the default branch (which workflow_dispatch needs).
 on:
   push:
-    branches: [dev]
+    branches: [main]
     paths:
       - src/**
       - pyproject.toml
