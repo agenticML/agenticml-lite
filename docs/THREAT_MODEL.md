@@ -118,7 +118,7 @@ Trust boundaries define the isolation model across single-tenant and multi-tenan
   - **Verified email matching**: Only a Firebase-verified email address (Google OAuth or email/password with email verified) matches the list (compared case-insensitively). Unverified emails and untrusted identity providers are rejected.
   - **No account takeover**: The list never takes over an account that has a password or another identity. Accounts created by the list get a personal workspace only when open sign-up is on, at most once, within the free limits.
   - **Scoped revocation**: List removal revokes only list-granted rights, at the next sign-in (use `/admin` Remove to revoke at once). Rights granted on `/admin` or via the CLI are kept.
-  - **Last server admin guard**: The last server admin who can sign in (password, identity proxy or Firebase) is never removed by the list, web, or CLI; a pending admin that has never signed in does not count.
+  - **Last server admin guard**: The last server admin who can sign in (password, identity proxy, Firebase or OIDC) is never removed by the list, web, or CLI; a pending admin that has never signed in does not count.
   - **No ambient workspace access**: Server administrators see no workspace data without membership. An admin without workspace membership lands on `/workspaces` with an Admin button and Sign out and cannot access customer runs, files, or objects.
 
 ### 11. Client transport security and trust controls
@@ -130,6 +130,29 @@ Trust boundaries define the isolation model across single-tenant and multi-tenan
   - **CA bundle ownership and permissions**: Custom CA bundles and their parent directories must be regular files owned by the current user or root, and neither the file nor its directory may be writable by group or other users (`mode & 0o022 == 0`). Saved bundle paths must be absolute.
   - **No redirects followed**: The client strictly refuses HTTP 3xx redirects on all requests, aborting immediately without transmitting the bearer API key to a redirected location. The target `Location` header is never reflected in error messages.
   - **Fixed-text TLS error messages**: TLS and certificate errors display sanitized, fixed hint strings. Raw exception text from `requests` or `ssl` is never echoed, preventing leakage of internal network details or exception parameters.
+
+### 12. OIDC sign-in
+
+- **Threat**: An attacker attempts to forge tokens, tamper with authentication state, hijack accounts during provider migrations, intercept invite tokens from URLs, or bypass sign-up restrictions.
+- **Controls**:
+  - **Issuer as trust root**: The configured `--oidc-issuer` is the trust root. The server validates the provider discovery document (`.well-known/openid-configuration`), verifies that the issuer claims match the configured URL, and caches discovery and JWKS public keys by the response's `Cache-Control` max-age, clamped between 5 minutes and 24 hours; a failed fetch is not retried for 30 seconds; an unknown key id causes at most one refetch per 60 seconds.
+  - **Single-use hashed state**: State tokens are generated cryptographically, stored server-side in the database under a SHA-256 hash, and bound to a per-slot browser cookie (`__Host-aml_oidc_<0-7>`). State records expire after 10 minutes and are consumed on first callback (single-use).
+  - **PKCE, nonce, and RS256 token verification**: The server generates the S256 challenge and sends the verifier to the token endpoint; the provider checks it. The server checks the nonce in the ID token and accepts RS256 only. Symmetric algorithms (`HS256`) and `alg=none` are rejected. The server validates `iss` and `aud` (when `aud` is a list, `azp` must equal the client ID). For Cognito tokens, `token_use == "id"` is enforced.
+  - **Rate limiting on start**: Calls to `/auth/oidc/start` are limited to 30 per minute per client address (in-memory bucket per process, returning HTTP 429 with `Retry-After`). The server bounds pending states to at most 2,000 and each browser to at most 8 pending cookies.
+  - **Invite token privacy**: Invites are accepted only through `POST /auth/oidc/start`, with the token in the form body (capped at 4 KB; a cross-site `Origin`/`Sec-Fetch-Site` is refused). `GET /auth/oidc/start` rejects an `invite` parameter. Invite links carry the token in the URL fragment, which browsers do not send, and the token is never passed to the identity provider, so it does not appear in request lines or load balancer logs. OIDC servers never produce legacy `/invite?token=` links (which put the token in the query). If a client visits such a link, the server serves the sign-in page without reading the token; client-side JavaScript moves the token from the query into the form, switches the form method to POST, and removes the query from the browser address bar with `history.replaceState`.
+  - **Email claim validation**: An `email` claim that does not parse as a valid address is ignored and treated as unverified. It never overwrites a stored account email.
+  - **UID format and linking rules**: The stored identifier is `oidc:<issuer tag>:<sub>`, where the tag is 12 hex digits derived from the issuer URL. A verified email links an OIDC sign-in only to an account that has no password, identity or provider link yet; accounts with a password or a proxy identity and no provider link are not linked. An account linked to a Firebase uid, or to an OIDC uid from a different issuer (for example a re-created Cognito user pool), is relinked at the next sign-in with the same verified email, audited as `account.relink`. The same issuer with a different subject is refused. `/setup` is off with OIDC; the first admin comes from `--admin-emails`.
+
+### 13. Self-deployed AWS stack
+
+- **Threat**: Unauthorized network access, metadata exfiltration, data volume loss, or unauthorized account creation in a customer-deployed AWS environment.
+- **Controls**:
+  - **Network isolation**: The EC2 instance security group admits traffic on port 8080 only from the Application Load Balancer security group. Port 22 is closed and SSH keys are disabled. Administrative access is restricted to AWS Systems Manager Session Manager.
+  - **Instance metadata and storage encryption**: IMDSv2 is enforced with a hop limit of 1. The root volume and gp3 data volume are encrypted with AWS KMS. The instance IAM role follows least privilege, granting `AmazonSSMManagedInstanceCore` and scoped EC2 volume attachment permissions.
+  - **Trusted proxy subnets**: The server configures `--trusted-proxy` strictly to the ALB subnets, preventing spoofed `X-Forwarded-For` headers from untrusted network clients.
+  - **Cognito sign-up and pre-sign-up filter**: Sign-up is enabled on the public Cognito user pool. When `AllowedEmailDomains` is configured, an inline pre-sign-up Lambda trigger always admits the `AdminEmail` and rejects sign-ups from outside those domains; it also blocks invitees outside the domains. The server enforces the domain check independently on open sign-up. Note that `AllowedEmailDomains` gates sign-up only; an admitted user updating their email later is governed by Cognito email verification.
+  - **Single writer during upgrades**: The Auto Scaling group maintains `MinSize=1`, `MaxSize=1`, and `DesiredCapacity=1`, with `AutoScalingRollingUpdate` specifying `MinInstancesInService=0` and `MaxBatchSize=1`. An existing instance terminates and detaches the data volume before a replacement instance attaches it, guaranteeing a single writer on SQLite.
+  - **Crash-consistent snapshots**: Daily Amazon Data Lifecycle Manager (DLM) snapshots capture the EBS data volume while the server runs. Snapshots are crash-consistent; integrity is verified after restore with `agenticml server verify`. Point-in-time consistent backups can be taken at any time with `agenticml server backup`.
 
 ## Out of scope
 
@@ -146,6 +169,8 @@ The following threats are outside the system's defensive boundary:
 | `server/access.py` | Workspace membership authorization (`require_workspace_member`, `require_workspace_manager`), role enforcement (`owner`, `admin`, `member`, `viewer`), uniform 404 responses. |
 | `server/keys.py` | Key creation, SHA-256 hashing, constant-time comparison, workspace binding, and immediate revocation. |
 | `server/firebase.py` | RS256 Firebase ID token signature verification, audience/issuer validation, verified email checks, and open sign-up account provisioning. |
+| `server/oidc.py` | OpenID Connect discovery and JWKS caching, RS256 token verification, PKCE S256 challenge generation; the provider checks the verifier, hashed state lifecycle, and provider logout redirects. |
+| `server/webauth.py` | External sign-in dispatch (`_external_sign_in`), `oidc:<issuer tag>:<sub>` UID mapping, verified email relinking, `--signup-email-domains` enforcement, session cookies, and login rate limiting. |
 | `server/limits.py` | Quota enforcement for storage, daily upload volume, request rates, member counts, and free workspace allocations. |
 | `server/objectstore.py` | Local and S3 object storage, per-workspace path partitioning, streaming SHA-256 verification, SSE-S3/SSE-KMS encryption, and workspace-scoped inventory checks. |
 | `server/ingest.py` | Protocol v2 routing, bearer key authentication, workspace resolution from key, client support window enforcement (HTTP 426), body size limits, and concurrency caps. |

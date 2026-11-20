@@ -174,15 +174,16 @@ def _invite_is_live(user):
     return expires > datetime.now(timezone.utc)
 
 
-def bootstrap_admin(data, public_url, *, install=False, database=None, firebase=None):
+def bootstrap_admin(data, public_url, *, install=False, database=None, firebase=None, oidc=None):
     """Create the first admin user with an invite if needed. Returns the data dir."""
     from .audit import AuditLog, cli_actor
 
     data = resolve_data_dir(data)
     prepare_data_dir(data)
-    if firebase is not None:
-        print("run `agenticml server accounts add <your-email> --server-admin`, "
-              "then sign in with Firebase.", flush=True)
+    if firebase is not None or oidc is not None:
+        print("run `agenticml server accounts add <your-email> --server-admin` "
+              "(or set --admin-emails), then sign in with "
+              f"{'Firebase' if firebase is not None else 'your identity provider'}.", flush=True)
         return data
     actor = cli_actor()
     from .db import for_server_dir
@@ -324,7 +325,9 @@ def _systemd_quote(value):
     value = str(value)
     if any((ord(c) < 32 and c not in "\t\n\r") or ord(c) == 127 for c in value):
         raise UpError(_SYSTEMD_CONTROL)
-    needs_quotes = value == "" or "'" in value or re.search(r'[\s"\\]', value) is not None
+    # A bare ";" word ends the command in ExecStart, so it must be quoted too.
+    needs_quotes = (value in ("", ";") or "'" in value
+                    or re.search(r'[\s"\\]', value) is not None)
     if needs_quotes:
         inner = (value.replace("\\", "\\\\").replace('"', '\\"')
                  .replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
@@ -572,7 +575,8 @@ def _environment_file_assignment(name, value):
 
 
 def write_systemd_unit(data, port, *, home=None, force=False, database=None, firebase=None,
-                       open_signup=False, limits=None, admin_emails=frozenset()):
+                       open_signup=False, limits=None, admin_emails=frozenset(), oidc=None,
+                       signup_email_domains=frozenset()):
     home = Path(home or Path.home())
     path = systemd_unit_path(home)
     env_path = systemd_env_path(home)
@@ -592,8 +596,17 @@ def write_systemd_unit(data, port, *, home=None, force=False, database=None, fir
         exec_start += ' --firebase-project ' + _systemd_quote(firebase.project)
         exec_start += ' --firebase-api-key ' + _systemd_quote(firebase.api_key)
         exec_start += ' --firebase-auth-domain ' + _systemd_quote(firebase.auth_domain)
+    if oidc is not None:
+        exec_start += ' --oidc-issuer ' + _systemd_quote(oidc.issuer)
+        exec_start += ' --oidc-client-id ' + _systemd_quote(oidc.client_id)
+        if oidc.logout_url:
+            exec_start += ' --oidc-logout-url ' + _systemd_quote(oidc.logout_url)
+        exec_start += ' --oidc-label ' + _systemd_quote(oidc.label)
     if open_signup:
         exec_start += ' --open-signup'
+    if signup_email_domains:
+        exec_start += ' --signup-email-domains ' + _systemd_quote(
+            ','.join(sorted(signup_email_domains)))
     if admin_emails:
         exec_start += ' --admin-emails ' + _systemd_quote(','.join(sorted(admin_emails)))
     if limits:
@@ -628,7 +641,8 @@ def write_systemd_unit(data, port, *, home=None, force=False, database=None, fir
 
 
 def write_launchd_plist(data, port, *, home=None, force=False, database=None, firebase=None,
-                        open_signup=False, limits=None, admin_emails=frozenset()):
+                        open_signup=False, limits=None, admin_emails=frozenset(), oidc=None,
+                        signup_email_domains=frozenset()):
     home = Path(home or Path.home())
     if database is not None:
         _require_single_line_database(database)
@@ -656,8 +670,17 @@ def write_launchd_plist(data, port, *, home=None, force=False, database=None, fi
             '--firebase-api-key', firebase.api_key,
             '--firebase-auth-domain', firebase.auth_domain,
         ])
+    if oidc is not None:
+        payload['ProgramArguments'].extend([
+            '--oidc-issuer', oidc.issuer, '--oidc-client-id', oidc.client_id,
+            '--oidc-label', oidc.label])
+        if oidc.logout_url:
+            payload['ProgramArguments'].extend(['--oidc-logout-url', oidc.logout_url])
     if open_signup:
         payload['ProgramArguments'].append('--open-signup')
+    if signup_email_domains:
+        payload['ProgramArguments'].extend(
+            ['--signup-email-domains', ','.join(sorted(signup_email_domains))])
     if admin_emails:
         payload['ProgramArguments'].extend(['--admin-emails', ','.join(sorted(admin_emails))])
     if limits:
@@ -668,10 +691,14 @@ def write_launchd_plist(data, port, *, home=None, force=False, database=None, fi
 
 
 def install_unit(data, port, *, force=False, database=None, firebase=None, open_signup=False,
-                 limits=None, admin_emails=frozenset()):
+                 limits=None, admin_emails=frozenset(), oidc=None, signup_email_domains=frozenset()):
     extra = {}
     if firebase is not None:
         extra['firebase'] = firebase
+    if oidc is not None:
+        extra['oidc'] = oidc
+    if signup_email_domains:
+        extra['signup_email_domains'] = frozenset(signup_email_domains)
     if open_signup:
         extra['open_signup'] = True
     if limits:
@@ -686,13 +713,14 @@ def install_unit(data, port, *, force=False, database=None, firebase=None, open_
 
 
 def up(data=None, port=8080, *, install=False, force=False, database=None, firebase=None,
-       plans=None, limits=None, open_signup=False, admin_emails=frozenset()):
+       plans=None, limits=None, open_signup=False, admin_emails=frozenset(), oidc=None,
+       signup_email_domains=frozenset()):
     from .firebase import require_open_signup
     from .limits import Plans
 
     if plans is None and limits:
         plans = Plans.load(limits)
-    require_open_signup(open_signup, firebase, plans)
+    require_open_signup(open_signup, firebase, plans, oidc)
     if install and open_signup and not limits:
         from .firebase import OPEN_SIGNUP_REQUIRES_LIMITS
         raise ValueError(OPEN_SIGNUP_REQUIRES_LIMITS)
@@ -706,6 +734,8 @@ def up(data=None, port=8080, *, install=False, force=False, database=None, fireb
         extra_bootstrap["database"] = database
     if firebase is not None:
         extra_bootstrap["firebase"] = firebase
+    if oidc is not None:
+        extra_bootstrap["oidc"] = oidc
     data = bootstrap_admin(data, public_url, install=install, **extra_bootstrap)
     if install:
         # Package 19 URLs can hold passwords; persist an explicit --database
@@ -715,6 +745,10 @@ def up(data=None, port=8080, *, install=False, force=False, database=None, fireb
             install_extra['database'] = explicit_database
         if firebase is not None:
             install_extra['firebase'] = firebase
+        if oidc is not None:
+            install_extra['oidc'] = oidc
+        if signup_email_domains:
+            install_extra['signup_email_domains'] = frozenset(signup_email_domains)
         if open_signup:
             install_extra['open_signup'] = True
         if limits:
@@ -748,6 +782,10 @@ def up(data=None, port=8080, *, install=False, force=False, database=None, fireb
             serve_extra["database"] = database
         if firebase is not None:
             serve_extra["firebase"] = firebase
+        if oidc is not None:
+            serve_extra["oidc"] = oidc
+        if signup_email_domains:
+            serve_extra["signup_email_domains"] = frozenset(signup_email_domains)
         if plans is not None:
             serve_extra["plans"] = plans
         if open_signup:

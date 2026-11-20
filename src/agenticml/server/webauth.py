@@ -1,7 +1,7 @@
 """Dashboard login, persistent sessions, identity proxy, and the request gate."""
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import OrderedDict, namedtuple
 from html import escape as html_escape
 from http.cookies import CookieError, SimpleCookie
 import hashlib
@@ -12,6 +12,7 @@ import json
 import logging
 import math
 from pathlib import Path
+import re
 import secrets
 import socket
 import threading
@@ -28,6 +29,7 @@ from agenticml.ui.server import (
 )
 from . import keyspage
 from .db import DatabaseError
+from .oidc import CALLBACK_PATH, START_PATH
 from .keys import ClientError, KeyStoreUnavailable, validate_name
 from .users import (
     InviteInvalid, Principal, ScryptUnavailable, UserNameTaken, UserRecord, UserStore,
@@ -106,6 +108,30 @@ def parse_identity_header(value):
     return value
 
 
+_EMAIL_DOMAIN = re.compile(
+    r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def parse_signup_email_domains(raw):
+    """Parse ``a.com,b.org`` into a frozenset; a leading ``@`` is allowed.
+
+    An entry that is not a plain domain raises ValueError: silently dropping
+    it could leave open sign-up wider than intended.
+    """
+    domains = set()
+    for part in (raw or "").split(","):
+        entry = part.strip().lower()
+        if entry.startswith("@"):
+            entry = entry[1:]
+        if not entry:
+            continue
+        if _EMAIL_DOMAIN.fullmatch(entry) is None:
+            raise ValueError(f"invalid --signup-email-domains entry {part.strip()!r}: "
+                             "use plain domains such as example.com")
+        domains.add(entry)
+    return frozenset(domains)
+
+
 def _bucket(address):
     """Collapse an address onto its throttle key.
 
@@ -121,6 +147,11 @@ def _bucket(address):
             return str(addr.ipv4_mapped)
         return str(ipaddress.ip_network((addr, 64), strict=False))
     return str(addr)
+
+
+def _uid_provider(uid):
+    """``oidc`` or ``firebase``: which kind of provider a stored uid came from."""
+    return "oidc" if isinstance(uid, str) and uid.startswith("oidc:") else "firebase"
 
 
 class MemoryBuckets:
@@ -360,6 +391,9 @@ _FIREBASE_ASSETS = {
     "/static/vendor/firebase/firebase-auth-compat.js": (
         _LOGIN_STATIC / "vendor/firebase/firebase-auth-compat.js", _JS),
 }
+_OIDC_ASSETS = {
+    "/static/oidc-login.js": (_LOGIN_STATIC / "oidc-login.js", _JS),
+}
 _ASSETS = {
     "/static/login.js": (_LOGIN_STATIC / "login.js", _JS),
     "/static/setup.js": (_LOGIN_STATIC / "setup.js", _JS),
@@ -370,6 +404,7 @@ _ASSETS = {
     "/static/InstrumentSans.woff2": (_STATIC / "InstrumentSans.woff2", _FILES["InstrumentSans.woff2"]),
     "/static/JetBrainsMono.woff2": (_STATIC / "JetBrainsMono.woff2", _FILES["JetBrainsMono.woff2"]),
     **_FIREBASE_ASSETS,
+    **_OIDC_ASSETS,
 }
 
 
@@ -411,13 +446,31 @@ def normalize_legal_base_url(value):
     return value if value.endswith("/") else value + "/"
 
 
+# Page text for the answers of ``_external_sign_in`` (keyed by reason or error).
+_OIDC_MESSAGES = {
+    "sign_in_failed": "Sign-in failed. Try again.",
+    "no_account": "Your account has no access to this server. Ask a workspace admin for an invite.",
+    "email_unverified": "Verify your email with your sign-in provider, then sign in again.",
+    "invite_invalid": "This invite is no longer valid. Ask for a new one.",
+    "account_exists": "An account with this email already exists. Sign in with it or ask a server admin.",
+    "this invite is for a different or unverified email":
+        "This invite is for a different or unverified email. Sign in with the invited email.",
+    "too many failed logins; try again later": "Too many failed sign-ins. Try again later.",
+}
+# What ``WebAuth._external_sign_in`` decided: the caller renders it. ``outcome``
+# feeds the address throttle ("success", "failed" or "ignored"); ``cookie`` is
+# the new session token on success.
+SignInResult = namedtuple("SignInResult", "outcome status body headers cookie close")
+
+
 class WebAuth:
     """Owns /login, /logout, /invite, /setup, sessions, and the request gate."""
 
     def __init__(self, keys, public_url=None, clock=time.time, throttle_clock=time.time,
                  users=None, trusted_proxies=(), identity_header=None,
                  firebase=None, cert_source=None, plans=None, open_signup=False,
-                 admin_emails=frozenset(), legal_base_url=None):
+                 admin_emails=frozenset(), legal_base_url=None, oidc=None,
+                 signup_email_domains=frozenset(), oidc_provider=None):
         self.keys = keys
         self.users = users if users is not None else UserStore(keys.server_dir, db=keys.db, workspace_id=keys.workspace_id or '0' * 32)
         self.public_url = public_url
@@ -434,8 +487,9 @@ class WebAuth:
         self.open_signup = bool(open_signup)
         self.admin_emails = frozenset(
             email.lower() for email in (admin_emails or ()) if isinstance(email, str) and email)
-        if self.admin_emails and self.firebase is None:
-            logger.warning("--admin-emails is ignored without --firebase-project")
+        self.oidc = oidc
+        if self.admin_emails and self.firebase is None and self.oidc is None:
+            logger.warning("--admin-emails is ignored without --firebase-project or --oidc-issuer")
             self.admin_emails = frozenset()
         if self.admin_emails:
             logger.info("server admin emails configured: %d", len(self.admin_emails))
@@ -452,8 +506,35 @@ class WebAuth:
             if self.cert_source is None:
                 from .firebase import CertificateSource
                 self.cert_source = CertificateSource()
+        self.oidc_provider = None
+        self.oidc_states = None
+        self.oidc_start_limiter = None
+        if self.oidc is not None:
+            from .oidc import (
+                OIDC_EXTRA, OIDC_FIREBASE, OIDC_IDENTITY, OIDC_PUBLIC_URL, OidcProvider,
+                OidcStates, StartLimiter, oidc_available)
+            if self.firebase is not None:
+                raise ValueError(OIDC_FIREBASE)
+            if self.identity_header is not None:
+                raise ValueError(OIDC_IDENTITY)
+            if not oidc_available():
+                raise ValueError(OIDC_EXTRA)
+            if not self.public_url:
+                raise ValueError(OIDC_PUBLIC_URL)
+            public = urlsplit(self.public_url)
+            if public.scheme != "https" and public.hostname not in ("127.0.0.1", "localhost", "::1"):
+                raise ValueError("OIDC sign-in needs an https:// public URL")
+            self.oidc_provider = oidc_provider or OidcProvider(self.oidc, self.public_url)
+            self.oidc_states = OidcStates(keys.db)
+            self.oidc_start_limiter = StartLimiter()
+            logger.info("OIDC sign-in enabled for issuer %s", self.oidc.issuer)
+        self.signup_email_domains = frozenset(
+            domain.lower() for domain in (signup_email_domains or ())
+            if isinstance(domain, str) and domain)
+        if self.signup_email_domains and not open_signup:
+            logger.warning("--signup-email-domains only limits --open-signup, which is off")
         from .firebase import require_open_signup
-        require_open_signup(self.open_signup, self.firebase, plans)
+        require_open_signup(self.open_signup, self.firebase, plans, self.oidc)
         self._lock = threading.Lock()
         from .db.repos import SessionRepo
         self.sessions = SessionRepo(keys.db)
@@ -461,8 +542,18 @@ class WebAuth:
         self._setup_used = False
         self._setup_lock = threading.Lock()
 
+    @property
+    def external_signin(self):
+        """True when an external provider (Firebase or OIDC) signs members in."""
+        return self.firebase is not None or self.oidc is not None
+
     def arm_setup(self, base_url):
-        if self.firebase is not None:
+        if self.external_signin:
+            # /setup is off with Firebase or OIDC (it answers 404): never print its link.
+            from .db.workspaces import AccountRepo
+            if self.admin_emails and not any(
+                    row["server_admin"] for row in AccountRepo(self.keys.db).list()):
+                logger.warning("first admin: sign in with an email listed in --admin-emails")
             return
         if self.keys.workspace_id is None:
             return
@@ -590,8 +681,17 @@ class WebAuth:
                     handler.close_connection = True
                     handler._json({"error": "method not allowed"}, 405)
                 return True
+            if self.oidc is not None and path in (START_PATH, CALLBACK_PATH):
+                if path == START_PATH and handler.command in ("GET", "POST"):
+                    self._oidc_start(handler)
+                elif path == CALLBACK_PATH and handler.command == "GET":
+                    self._oidc_callback(handler)
+                else:
+                    handler.close_connection = True
+                    handler._json({"error": "method not allowed"}, 405)
+                return True
             if path == "/setup":
-                if self.firebase is not None:
+                if self.external_signin:
                     handler.close_connection = True
                     handler._json({"error": "not found"}, 404)
                     return True
@@ -606,9 +706,9 @@ class WebAuth:
                     handler._json({"error": "method not allowed"}, 405)
                 return True
             if path == "/invite":
-                if self.firebase is not None:
+                if self.external_signin:
                     if handler.command == "GET":
-                        self._firebase_login_page(handler)
+                        self._external_login_page(handler)
                     elif handler.command == "POST":
                         handler.close_connection = True
                         handler._json({"error": "not found"}, 404)
@@ -625,11 +725,17 @@ class WebAuth:
                     handler._json({"error": "method not allowed"}, 405)
                 return True
             if handler.command == "GET" and path in _ASSETS:
-                if path not in _FIREBASE_ASSETS or self.firebase is not None:
+                if path in _FIREBASE_ASSETS:
+                    served = self.firebase is not None
+                elif path in _OIDC_ASSETS:
+                    served = self.oidc is not None
+                else:
+                    served = True
+                if served:
                     self._asset(handler, path)
                     return True
             if handler.command == "POST" and path == "/login":
-                if self.firebase is not None:
+                if self.external_signin:
                     handler.close_connection = True
                     handler._json({"error": "not found"}, 404)
                     return True
@@ -706,7 +812,7 @@ class WebAuth:
         except ClientError:
             name = None
         detail = {"method": method}
-        if method == "firebase":
+        if method in ("firebase", "oidc"):
             detail["provider"] = provider
         self._audit(handler, "login.failed", name, detail,
                     actor="anonymous", via=method)
@@ -731,6 +837,9 @@ class WebAuth:
         return "; ".join(parts)
 
     def _read_cookie(self, handler):
+        return self._read_named_cookie(handler, self._cookie_name())
+
+    def _read_named_cookie(self, handler, name):
         raw = handler.headers.get("Cookie")
         if not raw:
             return None
@@ -739,7 +848,7 @@ class WebAuth:
             jar.load(raw)
         except CookieError:
             return None
-        morsel = jar.get(self._cookie_name())
+        morsel = jar.get(name)
         if morsel is None:
             return None
         value = morsel.value
@@ -1080,9 +1189,15 @@ class WebAuth:
         file, content_type = _ASSETS[path]
         handler._send(file.read_bytes(), content_type, headers={"Cache-Control": "no-store"})
 
-    def _login_page(self, handler):
-        if self.firebase is not None:
+    def _external_login_page(self, handler):
+        if self.oidc is not None:
+            self._oidc_page(handler)
+        else:
             self._firebase_login_page(handler)
+
+    def _login_page(self, handler):
+        if self.external_signin:
+            self._external_login_page(handler)
             return
         body = (_LOGIN_STATIC / "login.html").read_bytes()
         handler._send(body, "text/html; charset=utf-8", headers=self._headers())
@@ -1112,10 +1227,7 @@ class WebAuth:
         handler._json(config, headers=self._headers())
 
     def _firebase_auth(self, handler):
-        from .db.workspaces import AccountRepo, InviteRepo
-        from .firebase import (
-            FirebaseTokenInvalid, FirebaseUnavailable, email_verified_for_link, verify_id_token)
-        from .users import InviteAccountExists, InviteEmailMismatch, InviteInvalid
+        from .firebase import FirebaseTokenInvalid, FirebaseUnavailable, verify_id_token
 
         if self.firebase is None:
             handler.close_connection = True
@@ -1130,7 +1242,6 @@ class WebAuth:
         ticket = self._throttle_or_refuse(handler, address)
         if ticket is None:
             return
-        uid_ticket = None
         outcome = "ignored"
         try:
             payload = self._read_login_payload(handler)
@@ -1156,210 +1267,235 @@ class WebAuth:
             except FirebaseUnavailable:
                 handler._json({"error": "sign-in unavailable"}, 503, self._headers())
                 return
-            retry_after, uid_ticket = self.throttle.begin("uid:" + claims.uid)
-            if uid_ticket is None:
-                self.throttle.finish(ticket, "ignored")
-                ticket = None
+            result = self._external_sign_in(handler, claims, "firebase", invite)
+            outcome = result.outcome
+            if result.close:
                 handler.close_connection = True
+            if result.cookie is None:
+                handler._json(result.body, result.status, self._headers(result.headers))
+            else:
                 handler._json(
-                    {"error": "too many failed logins; try again later"},
-                    429, self._headers({"Retry-After": str(retry_after)}),
-                )
-                return
-            pending = InviteRepo.find_pending(self.keys.db, invite) if invite else None
-            if invite is not None and pending is None:
-                logger.info("login failed")
-                outcome = "failed"
-                self._audit_login_failed(handler, method="firebase", provider=claims.provider)
-                handler._json(
-                    {"error": "this invite is no longer valid", "reason": "invite_invalid"},
-                    403, self._headers())
-                return
-            if pending is not None:
-                from .db.workspaces import emails_equal, is_email_login
-                if (not email_verified_for_link(claims) or not is_email_login(pending["login"])
-                        or not emails_equal(claims.email, pending["login"])):
-                    logger.info("login failed")
-                    outcome = "failed"
-                    self._audit_login_failed(handler, method="firebase", provider=claims.provider)
-                    handler._json(
-                        {"error": "this invite is for a different or unverified email"},
-                        403, self._headers())
-                    return
-            accounts = AccountRepo(self.keys.db)
-            account = None
-            if pending is not None:
-                try:
-                    account = InviteRepo.redeem_firebase(
-                        self.keys.db, invite, claims.uid, claims.email,
-                        email_verified_for_link(claims), claims.name)
-                except InviteEmailMismatch:
-                    logger.info("login failed")
-                    outcome = "failed"
-                    self._audit_login_failed(handler, method="firebase", provider=claims.provider)
-                    handler._json(
-                        {"error": "this invite is for a different or unverified email"},
-                        403, self._headers())
-                    return
-                except InviteAccountExists:
-                    logger.info("login failed")
-                    outcome = "failed"
-                    self._audit_login_failed(handler, method="firebase", provider=claims.provider)
-                    handler._json(
-                        {"error": "an account with this email already exists; "
-                                 "sign in with it or ask a server admin",
-                         "reason": "account_exists"},
-                        403, self._headers())
-                    return
-                except InviteInvalid:
-                    logger.info("login failed")
-                    outcome = "failed"
-                    self._audit_login_failed(handler, method="firebase", provider=claims.provider)
-                    handler._json(
-                        {"error": "this invite is no longer valid", "reason": "invite_invalid"},
-                        403, self._headers())
-                    return
-            signed_up = False
-            created_workspace = None
-            unverified = False
-            listed = bool(
-                self.admin_emails and email_verified_for_link(claims) and claims.email
-                and claims.email.lower() in self.admin_emails)
-            admin_created = False
-            if account is None:
-                with self.keys.db.transaction(write=True) as tx:
-                    tx.cross_workspace("sign-up creation")
-                    tx.advisory_lock("users")
-                    account = self._firebase_find_or_claim(accounts, claims, tx)
-                    plans = getattr(handler.server, "plans", None)
-                    if account is None and listed:
-                        account = self._firebase_admin_create(accounts, claims, tx)
-                        admin_created = account is not None
-                        if admin_created and self.open_signup:
-                            created_workspace = self._create_signup_workspace(
-                                account, claims, tx, plans)
-                            self._mark_personal_workspace(account, created_workspace, tx)
-                    elif account is None and self.open_signup:
-                        if email_verified_for_link(claims) and claims.email:
-                            account, created_workspace = self._firebase_open_signup(
-                                accounts, claims, tx, plans)
-                            signed_up = account is not None
-                        else:
-                            unverified = True
-                    elif account is not None and self.open_signup:
-                        created_workspace = self._personal_workspace_if_none(
-                            account, claims, tx, plans)
-            if unverified:
-                logger.info("login failed")
-                outcome = "failed"
-                self._audit_login_failed(
-                    handler, method="firebase", provider=claims.provider)
-                handler._json(
-                    {"error": "verify your email", "reason": "email_unverified"},
-                    403, self._headers())
-                return
-            if account is None:
-                logger.info("login failed")
-                outcome = "failed"
-                self._audit_login_failed(handler, method="firebase", provider=claims.provider)
-                handler._json(
-                    {"error": "no access", "reason": "no_account"}, 403, self._headers())
-                return
-            created_workspace = self._prepare_created_workspace(
-                handler, created_workspace, account)
-            if signed_up:
-                self._audit(handler, "account.signup", account["login"],
-                            actor=account["login"], via="signup")
-            if created_workspace is not None:
-                self._audit(
-                    handler, "workspace.create", created_workspace["id"],
-                    {"slug": created_workspace["slug"], "name": created_workspace["name"]},
-                    actor=account["login"], via="signup")
-            if admin_created:
-                self._audit(handler, "account.create", account["login"],
-                            {"created_by": "admin-emails"},
-                            actor=account["login"], via="admin-emails")
-            admin_change = None
-            with self.keys.db.transaction(write=True) as tx:
-                tx.advisory_lock("users")
-                accounts.refresh_firebase_email(
-                    account["id"], claims.email, email_verified_for_link(claims), tx)
-                admin_change = self._apply_admin_list(accounts, account, listed, tx)
-                account = dict(tx.fetchone(
-                    "SELECT * FROM accounts WHERE id=?", (account["id"],)))
-            if admin_change is not None:
-                self._audit(handler, "account.server_admin", account["login"],
-                            {"enabled": admin_change, "source": "admin-emails"},
-                            actor=account["login"], via="admin-emails")
-            self._between_verify_and_session(account)
-            cookie, entry = self._session_cookie_for(
-                account["login"], "firebase",
-                expected=(account["id"], account["generation"]))
-            if entry is None:
-                outcome = "failed"
-                self._audit_login_failed(handler, method="firebase", provider=claims.provider)
-                self._refuse_stale_credentials(handler)
-                return
-            outcome = "success"
-            if not self._attach(handler, entry):
-                outcome = "failed"
-                self._audit_login_failed(handler, method="firebase", provider=claims.provider)
-                handler._json({"error": "sign-in failed"}, 401, self._headers())
-                return
-            self._audit(handler, "login.ok", account["login"],
-                        {"method": "firebase", "provider": claims.provider},
-                        actor=account["login"], via="firebase")
-            handler._json(
-                {"ok": True, "user": account["login"]},
-                headers=self._headers({"Set-Cookie": self._cookie(cookie)}),
-            )
+                    result.body,
+                    headers=self._headers({"Set-Cookie": self._cookie(result.cookie)}))
         finally:
             if ticket is not None:
                 self.throttle.finish(ticket, outcome)
-            if uid_ticket is not None:
-                self.throttle.finish(uid_ticket, outcome)
 
-    def _firebase_find_or_claim(self, accounts, claims, tx):
+    def _external_sign_in(self, handler, claims, method, invite=None):
+        """Everything after a verified external token: Firebase and OIDC share it.
+
+        Throttles the provider uid, redeems an invite, finds or claims the
+        account, applies the admin list and open sign-up, creates the personal
+        workspace, audits, and mints the session. It sends nothing: the caller
+        renders the returned ``SignInResult`` (JSON for Firebase, a page for
+        OIDC) and finishes its own address throttle ticket with ``outcome``.
+        """
+        retry_after, uid_ticket = self.throttle.begin("uid:" + claims.uid)
+        if uid_ticket is None:
+            return SignInResult(
+                "ignored", 429, {"error": "too many failed logins; try again later"},
+                {"Retry-After": str(retry_after)}, None, True)
+        outcome = "ignored"
+        try:
+            result = self._external_sign_in_checked(handler, claims, method, invite)
+            outcome = result.outcome
+            return result
+        finally:
+            self.throttle.finish(uid_ticket, outcome)
+
+    def _external_sign_in_checked(self, handler, claims, method, invite):
+        from .db.workspaces import AccountRepo, InviteRepo
+        from .firebase import email_verified_for_link
+        from .users import InviteAccountExists, InviteEmailMismatch, InviteInvalid
+
+        def failed(status, body):
+            logger.info("login failed")
+            self._audit_login_failed(handler, method=method, provider=claims.provider)
+            return SignInResult("failed", status, body, {}, None, False)
+
+        invite_gone = {"error": "this invite is no longer valid", "reason": "invite_invalid"}
+        wrong_invite = {"error": "this invite is for a different or unverified email"}
+        pending = InviteRepo.find_pending(self.keys.db, invite) if invite else None
+        if invite is not None and pending is None:
+            return failed(403, invite_gone)
+        if pending is not None:
+            from .db.workspaces import emails_equal, is_email_login
+            if (not email_verified_for_link(claims) or not is_email_login(pending["login"])
+                    or not emails_equal(claims.email, pending["login"])):
+                return failed(403, wrong_invite)
+        accounts = AccountRepo(self.keys.db)
+        account = None
+        relinks = []
+        if pending is not None:
+            relinked_from = []
+            try:
+                account = InviteRepo.redeem_external(
+                    self.keys.db, invite, claims.uid, claims.email,
+                    email_verified_for_link(claims), claims.name,
+                    relink_legacy=claims.provider == "oidc", relinked=relinked_from)
+                # Audit only what the transaction reports it did.
+                if relinked_from:
+                    relinks.append((account["login"], _uid_provider(relinked_from[0])))
+            except InviteEmailMismatch:
+                return failed(403, wrong_invite)
+            except InviteAccountExists:
+                return failed(403, {
+                    "error": "an account with this email already exists; "
+                             "sign in with it or ask a server admin",
+                    "reason": "account_exists"})
+            except InviteInvalid:
+                return failed(403, invite_gone)
+        signed_up = False
+        created_workspace = None
+        unverified = False
+        listed = bool(
+            self.admin_emails and email_verified_for_link(claims) and claims.email
+            and claims.email.lower() in self.admin_emails)
+        admin_created = False
+        if account is None:
+            with self.keys.db.transaction(write=True) as tx:
+                tx.cross_workspace("sign-up creation")
+                tx.advisory_lock("users")
+                account = self._external_find_or_claim(accounts, claims, tx, relinks)
+                plans = getattr(handler.server, "plans", None)
+                if account is None and listed:
+                    account = self._external_admin_create(accounts, claims, tx)
+                    admin_created = account is not None
+                    if admin_created and self.open_signup:
+                        created_workspace = self._create_signup_workspace(
+                            account, claims, tx, plans)
+                        self._mark_personal_workspace(account, created_workspace, tx)
+                elif account is None and self.open_signup:
+                    if email_verified_for_link(claims) and claims.email:
+                        # An email outside --signup-email-domains gets no account.
+                        if self._signup_domain_ok(claims.email):
+                            account, created_workspace = self._external_open_signup(
+                                accounts, claims, tx, plans)
+                            signed_up = account is not None
+                    else:
+                        unverified = True
+                elif (account is not None and self.open_signup
+                        and (listed or self._signup_domain_ok(claims.email))):
+                    created_workspace = self._personal_workspace_if_none(
+                        account, claims, tx, plans)
+        if unverified:
+            return failed(403, {"error": "verify your email", "reason": "email_unverified"})
+        if account is None:
+            return failed(403, {"error": "no access", "reason": "no_account"})
+        created_workspace = self._prepare_created_workspace(
+            handler, created_workspace, account)
+        for login, old_provider in relinks:
+            self._audit(handler, "account.relink", login,
+                        {"from": old_provider, "to": claims.provider},
+                        actor=login, via=method)
+        if signed_up:
+            self._audit(handler, "account.signup", account["login"],
+                        actor=account["login"], via="signup")
+        if created_workspace is not None:
+            self._audit(
+                handler, "workspace.create", created_workspace["id"],
+                {"slug": created_workspace["slug"], "name": created_workspace["name"]},
+                actor=account["login"], via="signup")
+        if admin_created:
+            self._audit(handler, "account.create", account["login"],
+                        {"created_by": "admin-emails"},
+                        actor=account["login"], via="admin-emails")
+        admin_change = None
+        with self.keys.db.transaction(write=True) as tx:
+            tx.advisory_lock("users")
+            # An OIDC token without a usable email must not wipe the stored one.
+            if claims.email is not None or claims.provider != "oidc":
+                accounts.refresh_external_email(
+                    account["id"], claims.email, email_verified_for_link(claims), tx)
+            admin_change = self._apply_admin_list(accounts, account, listed, tx)
+            account = dict(tx.fetchone(
+                "SELECT * FROM accounts WHERE id=?", (account["id"],)))
+        if admin_change is not None:
+            self._audit(handler, "account.server_admin", account["login"],
+                        {"enabled": admin_change, "source": "admin-emails"},
+                        actor=account["login"], via="admin-emails")
+        self._between_verify_and_session(account)
+        cookie, entry = self._session_cookie_for(
+            account["login"], method,
+            expected=(account["id"], account["generation"]))
+        if entry is None:
+            self._audit_login_failed(handler, method=method, provider=claims.provider)
+            logger.info("login failed")
+            return SignInResult(
+                "failed", 401, {"error": "invalid user name or password"}, {}, None, False)
+        if not self._attach(handler, entry):
+            self._audit_login_failed(handler, method=method, provider=claims.provider)
+            return SignInResult("failed", 401, {"error": "sign-in failed"}, {}, None, False)
+        self._audit(handler, "login.ok", account["login"],
+                    {"method": method, "provider": claims.provider},
+                    actor=account["login"], via=method)
+        return SignInResult(
+            "success", 200, {"ok": True, "user": account["login"]}, {}, cookie, False)
+
+    def _signup_domain_ok(self, email):
+        """True when open sign-up may serve this email under --signup-email-domains."""
+        if not self.signup_email_domains:
+            return True
+        if not isinstance(email, str) or email.count("@") != 1:
+            return False
+        return email.rsplit("@", 1)[1].lower() in self.signup_email_domains
+
+    def _external_find_or_claim(self, accounts, claims, tx, relinks=None):
         from .db.workspaces import emails_equal
         from .firebase import email_verified_for_link
 
-        found = accounts.by_firebase_uid(claims.uid, tx)
+        found = accounts.by_external_uid(claims.uid, tx)
         if found is not None:
             return found
-        if not (email_verified_for_link(claims) and claims.email and accounts.claimable(claims.email, tx)):
+        if not (email_verified_for_link(claims) and claims.email):
+            return None
+        # After a Firebase -> OIDC switch (or a move to another OIDC issuer, for
+        # example a re-created identity pool) the old accounts hold a uid that
+        # cannot sign in any more: a verified email relinks them. An account
+        # linked to the same issuer under another subject is left alone.
+        relink = (not accounts.claimable(claims.email, tx) and claims.provider == "oidc"
+                  and accounts.relinkable_uid(accounts.get(claims.email, tx), claims.uid) is not None)
+        if not (relink or accounts.claimable(claims.email, tx)):
             return None
         account = accounts.get(claims.email, tx)
         if account is None or not emails_equal(account["login"], claims.email):
             return None
         try:
-            accounts.link_firebase(
-                account["id"], claims.uid, claims.email, email_verified_for_link(claims), tx)
+            if relink:
+                old_provider = _uid_provider(accounts.relinkable_uid(account, claims.uid))
+                accounts.relink_external(
+                    account["id"], claims.uid, claims.email, email_verified_for_link(claims), tx)
+                if relinks is not None:
+                    relinks.append((account["login"], old_provider))
+            else:
+                accounts.link_external(
+                    account["id"], claims.uid, claims.email, email_verified_for_link(claims), tx)
         except (ClientError, DatabaseError):
-            found = accounts.by_firebase_uid(claims.uid, tx)
+            found = accounts.by_external_uid(claims.uid, tx)
             if found is not None:
                 return found
             raise
-        return accounts.by_firebase_uid(claims.uid, tx) or accounts.get(claims.email, tx)
+        return accounts.by_external_uid(claims.uid, tx) or accounts.get(claims.email, tx)
 
-    def _firebase_open_signup(self, accounts, claims, tx, plans):
+    def _external_open_signup(self, accounts, claims, tx, plans):
         if accounts.get(claims.email, tx) is not None:
             return None, None
         display = claims.name if isinstance(claims.name, str) and claims.name.strip() else (
             claims.email.split("@", 1)[0] or "workspace")
         account = accounts.create(claims.email, display, "signup", tx)
-        accounts.link_firebase(account["id"], claims.uid, claims.email, True, tx)
-        account = accounts.by_firebase_uid(claims.uid, tx) or accounts.get(claims.email, tx)
+        accounts.link_external(account["id"], claims.uid, claims.email, True, tx)
+        account = accounts.by_external_uid(claims.uid, tx) or accounts.get(claims.email, tx)
         return account, self._create_signup_workspace(account, claims, tx, plans)
 
-    def _firebase_admin_create(self, accounts, claims, tx):
+    def _external_admin_create(self, accounts, claims, tx):
         """Create the account of a listed, verified email (the caller adds the workspace)."""
         if accounts.get(claims.email, tx) is not None:
             return None
         display = claims.name if isinstance(claims.name, str) and claims.name.strip() else (
             claims.email.split("@", 1)[0] or "workspace")
         account = accounts.create(claims.email, display, "admin-emails", tx)
-        accounts.link_firebase(account["id"], claims.uid, claims.email, True, tx)
-        return accounts.by_firebase_uid(claims.uid, tx) or accounts.get(claims.email, tx)
+        accounts.link_external(account["id"], claims.uid, claims.email, True, tx)
+        return accounts.by_external_uid(claims.uid, tx) or accounts.get(claims.email, tx)
 
     def _apply_admin_list(self, accounts, account, listed, tx):
         """Grant or revoke list-sourced server admin; return the new state or None."""
@@ -1479,7 +1615,8 @@ class WebAuth:
         SettingsRepo(self.keys.db).delete(marker)
         return created_workspace
 
-    def _read_login_payload(self, handler):
+    def _read_login_body(self, handler):
+        """The admitted request body (at most ``LOGIN_BODY_MAX``); None means a reply was sent."""
         length = handler._put_length(LOGIN_BODY_MAX)
         if length is None:
             return None
@@ -1500,6 +1637,12 @@ class WebAuth:
         if len(body) != length:
             handler.close_connection = True
             raise ValueError("short body")
+        return body
+
+    def _read_login_payload(self, handler):
+        body = self._read_login_body(handler)
+        if body is None:
+            return None
         try:
             payload = json.loads(body.decode("utf-8"), parse_constant=_reject_nonfinite)
         except (UnicodeDecodeError, ValueError, RecursionError) as exc:
@@ -1644,10 +1787,232 @@ class WebAuth:
         if session is not None:
             self._audit(handler, "logout", session["user"],
                         actor=session["user"], via=session["via"])
+        redirect = None
+        if (self.oidc_provider is not None and session is not None
+                and session["via"] == "oidc"):
+            redirect = self.oidc_provider.logout_url
+        if redirect is not None:
+            # The page script sends the browser to the provider's sign-out
+            # (it ends the provider session, then returns to /login).
+            handler._json({"ok": True, "redirect": redirect},
+                          headers=self._headers({"Set-Cookie": self._cookie("", max_age=0)}))
+            return
         handler._send(
             b"", "text/plain; charset=utf-8", 204,
             self._headers({"Set-Cookie": self._cookie("", max_age=0)}),
         )
+
+    def _oidc_cookie_name(self, state) -> str:
+        """The binding cookie slot of this sign-in (a handful of slots, so two tabs rarely
+        share one and a page cannot make the browser hold an unbounded number)."""
+        from .oidc import binding_slot
+        return ("__Host-aml_oidc_" if self._secure() else "aml_oidc_") + str(binding_slot(state))
+
+    def _oidc_cookie(self, state, value: str, max_age: int) -> str:
+        # Lax, not Strict: the provider sends the browser back with a
+        # cross-site top-level GET, which must carry the binding cookie.
+        parts = [f"{self._oidc_cookie_name(state)}={value}"]
+        if self._secure():
+            parts.append("Secure")
+        parts.extend(["HttpOnly", "SameSite=Lax", "Path=/", f"Max-Age={max_age}"])
+        return "; ".join(parts)
+
+    def _oidc_page(self, handler, message=None, status=200, headers=None, invite=None):
+        """The sign-in page. ``invite`` (a validated token) is kept in the form so a retry
+        after a failed sign-in still redeems it; the form then POSTs, never GETs."""
+        from .oidc import DEFAULT_LABEL, INVITE_PATTERN
+        label = self.oidc.label if self.oidc is not None else DEFAULT_LABEL
+        if invite is not None and not INVITE_PATTERN.fullmatch(invite):
+            invite = None
+        body = (_LOGIN_STATIC / "oidc-login.html").read_text(encoding="utf-8")
+        body = (body.replace("{{label}}", html_escape(label, quote=True))
+                .replace("{{message}}", html_escape(message or "", quote=True))
+                .replace("{{error_hidden}}", "" if message else " hidden")
+                .replace("{{method}}", "post" if invite else "get")
+                .replace("{{invite}}", html_escape(invite or "", quote=True))
+                .replace("{{invite_disabled}}", "" if invite else " disabled")).encode("utf-8")
+        # same-origin, not no-referrer: with no-referrer a browser sends
+        # "Origin: null" on this page's form POST, which the origin check refuses.
+        handler._send(
+            body, "text/html; charset=utf-8", status,
+            self._headers({"Referrer-Policy": "same-origin", **(headers or {})}))
+
+    def _oidc_query(self, handler):
+        return parse_qs(urlsplit(handler.path).query, keep_blank_values=True)
+
+    def _oidc_form_ok(self, handler):
+        """Origin rule for the form POST to /auth/oidc/start.
+
+        A plain form cannot carry the X-AgenticML-Request header that POST /login
+        needs, so the browser's own headers decide: a present Origin must be ours
+        and a present Sec-Fetch-Site must be same-origin. A cross-site form is
+        refused. Login CSRF would be harmless here (the victim still signs in as
+        themselves at the provider), so a client that sends neither header is let in.
+        """
+        origins = handler.headers.get_all("Origin")
+        if origins and (len(origins) != 1 or not handler._origin_ok(origins[0])):
+            return False
+        sites = handler.headers.get_all("Sec-Fetch-Site")
+        if sites and (len(sites) != 1 or sites[0].strip() not in ("same-origin", "none")):
+            return False
+        return True
+
+    def _oidc_start(self, handler):
+        """Begin sign-in (GET, or POST when an invite is carried): store state, nonce and
+        PKCE verifier, redirect to the provider."""
+        from .oidc import INVITE_PATTERN, STATE_TTL, OidcUnavailable, new_secret, safe_next
+
+        allowed, wait = self.oidc_start_limiter.allow(
+            _bucket(self.client_address(handler)), self.clock())
+        if not allowed:
+            handler.close_connection = True
+            self._oidc_page(handler, "Too many sign-in attempts. Try again in a minute.", 429,
+                            {"Retry-After": str(wait)})
+            return
+        if handler.command == "POST":
+            if not self._oidc_form_ok(handler):
+                handler.close_connection = True
+                self._oidc_page(handler, "Sign-in must start from this site's sign-in page.", 403)
+                return
+            if handler.headers.get_content_type() != "application/x-www-form-urlencoded":
+                handler.close_connection = True
+                handler._error({"error": "application/x-www-form-urlencoded required"}, 415)
+                return
+            body = self._read_login_body(handler)
+            if body is None:
+                return
+            try:
+                fields = parse_qs(body.decode("ascii"), keep_blank_values=True)
+            except (UnicodeDecodeError, ValueError):
+                raise ValueError("invalid form") from None
+        else:
+            fields = self._oidc_query(handler)
+            if "invite" in fields:
+                # An invite token in a GET query would reach access logs: the
+                # sign-in page POSTs it instead.
+                self._oidc_page(
+                    handler, "Open your invite link again to sign in with it.", 400)
+                return
+        invites = fields.get("invite", [])
+        invite = invites[0] if invites else None
+        if len(invites) > 1 or (
+                invite is not None and invite != "" and not INVITE_PATTERN.fullmatch(invite)):
+            self._oidc_page(handler, "This invite is no longer valid. Ask for a new one.", 400)
+            return
+        invite = invite or None
+        next_path = safe_next((fields.get("next") or ["/"])[0])
+        state, binding = new_secret(), new_secret()
+        nonce, verifier = new_secret(), new_secret(48)
+        try:
+            url = self.oidc_provider.authorization_url(state, nonce, verifier, now=self.clock())
+        except OidcUnavailable:
+            self._oidc_page(
+                handler, "Sign-in is temporarily unavailable. Try again in a minute.", 503)
+            return
+        self.oidc_states.create(state, binding, nonce, verifier, invite, next_path, self.clock())
+        handler._send(
+            b"", "text/plain; charset=utf-8", 302,
+            self._headers({
+                "Location": url, "Referrer-Policy": "no-referrer",
+                "Set-Cookie": self._oidc_cookie(state, binding, STATE_TTL)}))
+
+    def _oidc_callback(self, handler):
+        """Finish sign-in: check state and cookie, exchange the code, verify, sign in."""
+        from .oidc import OidcTokenInvalid, OidcUnavailable
+
+        address = self.client_address(handler)
+        query = self._oidc_query(handler)
+        states = query.get("state", [])
+        state = states[0] if len(states) == 1 else None
+        if not (isinstance(state, str) and state.isascii() and 0 < len(state) <= 256):
+            state = None
+        # Only this sign-in's own binding cookie is read and cleared.
+        clear = None if state is None else self._oidc_cookie(state, "", 0)
+        retry_after, ticket = self.throttle.begin(address)
+        if ticket is None:
+            handler.close_connection = True
+            self._oidc_page(
+                handler, "Too many failed sign-ins. Try again later.", 429,
+                {"Retry-After": str(retry_after), **({"Set-Cookie": clear} if clear else {})})
+            return
+        outcome = "ignored"
+        invite = None
+
+        def page(message, status, headers=None):
+            extra = {**(headers or {}), **({"Set-Cookie": clear} if clear else {})}
+            # Keep the invite for "Try again" (only for a browser that owns this sign-in).
+            self._oidc_page(handler, message, status, extra, invite=invite)
+
+        try:
+            now = self.clock()
+            record = self.oidc_states.consume(state, now)
+            bound = record is not None and self.oidc_states.binding_matches(
+                record, self._read_named_cookie(handler, self._oidc_cookie_name(state)))
+            if bound:
+                invite = record.get("invite")
+            if query.get("error"):
+                # The provider refused or the user cancelled: say so generically.
+                logger.info("oidc sign-in refused by the provider")
+                page("Sign-in was cancelled or refused. Try again.", 400)
+                return
+            codes = query.get("code", [])
+            code = codes[0] if len(codes) == 1 else None
+            if (not bound or not isinstance(code, str) or not code or len(code) > 2048
+                    or not code.isascii()):
+                logger.info("login failed")
+                logger.debug("oidc callback refused: state, cookie or code")
+                outcome = "failed"
+                self._audit_login_failed(handler, method="oidc")
+                page("Sign-in expired or did not start in this browser. Try again.", 400)
+                return
+            try:
+                token = self.oidc_provider.exchange_code(code, record["verifier"], now=now)
+                claims = self.oidc_provider.verify(token, record["nonce"], now=now)
+            except OidcTokenInvalid as exc:
+                logger.info("login failed")
+                logger.debug("oidc token invalid: %s", exc.reason)
+                outcome = "failed"
+                self._audit_login_failed(handler, method="oidc")
+                page(_OIDC_MESSAGES["sign_in_failed"], 401)
+                return
+            except OidcUnavailable:
+                page("Sign-in is temporarily unavailable. Try again in a minute.", 503)
+                return
+            result = self._external_sign_in(handler, claims, "oidc", record.get("invite"))
+            outcome = result.outcome
+            if result.cookie is None:
+                if result.close:
+                    handler.close_connection = True
+                reason = result.body.get("reason")
+                message = _OIDC_MESSAGES.get(reason) or _OIDC_MESSAGES.get(
+                    result.body.get("error"), _OIDC_MESSAGES["sign_in_failed"])
+                if reason == "invite_invalid":
+                    invite = None      # a dead invite is not worth retrying
+                page(message, result.status, result.headers)
+                return
+            target = html_escape(record.get("next") or "/", quote=True)
+            body = (
+                "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"/>"
+                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>"
+                f"<meta http-equiv=\"refresh\" content=\"0;url={target}\"/>"
+                "<title>agenticml · Signed in</title>"
+                "<link rel=\"stylesheet\" href=\"/static/app.css\"/>"
+                "<script src=\"/static/theme.js\"></script></head>"
+                "<body class=\"login-page\"><main class=\"login-card\">"
+                "<p class=\"eyebrow\">agenticml</p><h1>Signed in</h1>"
+                f"<p><a href=\"{target}\">Continue</a></p></main></body></html>"
+            ).encode("utf-8")
+            # A page that redirects (not a 302): the session cookie is
+            # SameSite=Strict, and a redirect chain that began at the provider
+            # is cross-site, so the browser would not send it on the next hop.
+            handler._send(
+                body, "text/html; charset=utf-8", 200,
+                self._headers({
+                    "Referrer-Policy": "no-referrer",
+                    "Set-Cookie": [clear, self._cookie(result.cookie)] if clear
+                    else self._cookie(result.cookie)}))
+        finally:
+            self.throttle.finish(ticket, outcome)
 
     def _workspace_cookie(self, handler):
         raw = handler.headers.get("Cookie")
@@ -1732,7 +2097,8 @@ class WebAuth:
             "user": principal.user,
             "role": "admin" if principal.role == "owner" else principal.role,
             "via": principal.via,
-            "auth": "firebase" if self.firebase is not None else "password",
+            "auth": ("firebase" if self.firebase is not None
+                     else "oidc" if self.oidc is not None else "password"),
             "key": key,
             "scope": "admin" if principal.via == "key" else None,
             "can": {

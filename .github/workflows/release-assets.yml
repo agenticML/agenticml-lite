@@ -1,0 +1,45 @@
+# Actions are pinned to full commit SHAs, with the tag in a comment. To update
+# one, look up the tag's commit (dereference annotated tags) and change the SHA
+# and the comment together.
+#
+# Publish to PyPI (publish.yml) runs on a v* tag and does not create the GitHub
+# release; the owner publishes it. When that happens, this workflow attaches
+# the CloudFormation template for your own AWS account to the release as
+# agenticml.yaml. It is a separate workflow so that publishing a release never
+# runs the PyPI upload a second time.
+name: Release assets
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  template:
+    name: Attach the AWS template
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # upload an asset to the release
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      # The template installs the version it names by default, so it must be
+      # the version of the tag it is attached to.
+      - name: Check the template default matches the tag
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          default=$(sed -n '/^  AgenticmlVersion:/,/^  [A-Za-z]*:$/ s/^    Default: *//p' deploy/aws-self-hosted/agenticml.yaml)
+          echo "tag=$TAG template default=$default"
+          test "$TAG" = "v$default"
+
+      - name: Attach agenticml.yaml to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release upload "$TAG" deploy/aws-self-hosted/agenticml.yaml --clobber --repo "$GITHUB_REPOSITORY"

@@ -31,6 +31,20 @@ This works on every version. The `agenticml --version` command works from 3.0. O
 
 ---
 
+## 3.3.0
+
+**Status:** Not yet released.
+
+### Deploy in your own AWS account
+
+Deploy an AgenticML server in your own AWS account with a single CloudFormation template. See [Deploy on AWS](/agenticml-lite/server/deploy-on-aws/).
+
+- **CloudFormation template:** One template (`deploy/aws-self-hosted/agenticml.yaml`) creates a Graviton EC2 instance running SQLite on an encrypted EBS data volume, an HTTPS Application Load Balancer with an ACM certificate, and Amazon Cognito for user management.
+- **OIDC sign-in:** The server supports OpenID Connect (Cognito, Okta, Entra ID) using authorization code flow with PKCE and public clients, via the `[oidc]` extra.
+- **Sign-up email domains:** `--signup-email-domains` limits open sign-up and personal workspace provisioning to approved email domains (exact match).
+
+---
+
 ## 3.2.0
 
 **Status:** Not yet released.
