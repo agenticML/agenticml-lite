@@ -17,7 +17,7 @@ pip install agenticml-lite
 
 Syncing to a server needs version 2.2 or newer. 1.0.0 cannot sync.
 
-Using the hosted service at `app.agenticml.xyz`? Follow the [hosted quickstart](/agenticml-lite/hosted/quickstart/) instead.
+Using the hosted service at `app.agenticml.xyz`? Follow the [hosted quickstart](/agenticml-lite/hosted/quickstart/) instead. Syncing to a server on a private network with an internal CA? See [Private networks](/agenticml-lite/server/private-network/).
 
 Log in with your server URL:
 
@@ -33,13 +33,15 @@ echo "$AGENTICML_API_KEY" | agenticml login --host https://aml.example.com
 
 Do not pass keys with `--key` on the command line; CLI arguments are visible to other users in `ps`.
 
-Credentials are stored in `~/.config/agenticml/credentials.json` (permissions `0600`). Verify the login:
+`login` checks the key against the server unless you pass `--no-verify`. It needs `--host` unless a default host is already saved; `AGENTICML_HOST` has no default. Credentials are stored in `~/.config/agenticml/credentials.json` (permissions `0600`). The directory is `AGENTICML_CONFIG_DIR`, else `$XDG_CONFIG_HOME/agenticml`, else `~/.config/agenticml`. Verify the login:
 
 ```bash
 agenticml whoami
 ```
 
 The response confirms the key name, owning user, assigned role, and bound workspace slug. If the API key is invalid or revoked, `agenticml whoami` exits with status code `1`.
+
+`sync` takes the key from `--api-key`, then `AGENTICML_API_KEY`, then the saved file. `whoami` uses `AGENTICML_API_KEY`, then the file. `whoami --offline` skips the server check. `agenticml logout` removes the saved key for one host. On `login`, `whoami`, and `sync`, `--insecure` allows `http://` to a non-local host; localhost does not need it.
 
 ### Syncing to multiple workspaces
 
@@ -48,6 +50,8 @@ The CLI saves one API key per server URL. If a machine needs to sync runs to mul
 ```bash
 AGENTICML_API_KEY=aml_... agenticml sync --all
 ```
+
+The sync cursor (`runs/<id>/sync.json`) is kept per server and workspace, so one store can sync a run to several workspaces of one server, each with its own key.
 
 ## Synchronizing runs
 
@@ -64,6 +68,17 @@ To sync a specific run:
 ```bash
 agenticml sync RUN_ID
 ```
+
+### What sync does
+
+Sync copies each run's store files byte for byte (`meta.json`, `events.jsonl`, scalars, overviews, indexes) plus the objects they reference (code, media, copied artifacts) to the server over [protocol v2](https://github.com/agenticML/agenticml-lite/blob/main/docs/PROTOCOL.md). A per-file cursor in `runs/<id>/sync.json` tracks accepted bytes, so an interrupted sync resumes from the last accepted request.
+
+- `--all` selects runs that are incomplete or changed.
+- `--watch N` repeats every N seconds until every selected run has synced, failed permanently, or gone stale.
+- `--dry-run` prints counts without sending or saving state.
+- `--reset RUN_ID ...` forgets those runs' cursors for this host, in every workspace, and the next sync resumes from the server's copy. It rejects `--all`.
+
+Run notes (`notes.md`) are not uploaded. A run id already owned by another user on the server fails with an error naming that user (`run id <id> belongs to user <name> on this server`). Ownership is per user, so any key of the owning user may write to the run.
 
 ### Continuous follow mode
 

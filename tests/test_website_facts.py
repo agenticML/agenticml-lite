@@ -209,3 +209,32 @@ def test_login_key_detector_catches_examples():
     assert _login_key_examples('Run `agenticml login --key abc` now.')
     assert not _login_key_examples('```bash\nagenticml export --key loss\n```')
     assert not _login_key_examples('Use the `agenticml login` prompt. Avoid `--key`.')
+
+
+def test_private_network_page_has_the_key_facts():
+    """Protects readers of the private-network page: the client flag and
+    variable, the proxy body limit and the minimum version must be on it."""
+    text = _text('server/private-network.md')
+    for needle in ('--ca-bundle', 'AGENTICML_CA_BUNDLE', 'client_max_body_size 4g', 'agenticml-lite>=3.2'):
+        assert needle in text, f'server/private-network.md does not mention {needle}'
+
+
+def test_deploy_on_aws_page_has_the_key_facts():
+    """Protects readers of the Deploy on AWS page: the template path, every
+    template parameter, the restore snapshot parameter and the commands that
+    set up the data directory must be on it, and no key goes on a command line."""
+    import yaml
+    from test_deploy_cloudformation import CfnLoader
+
+    template = yaml.load((ROOT / 'deploy/aws-self-hosted/agenticml.yaml').read_text(), Loader=CfnLoader)
+    parameters = sorted(template['Parameters'])
+    assert 'DataSnapshotId' in parameters
+    page = 'server/deploy-on-aws.md'
+    text = _text(page)
+    needles = [
+        'deploy/aws-self-hosted/agenticml.yaml', *parameters, 'DataSnapshotId',
+        '/etc/agenticml-server.env', 'install -d -o agenticml', 'sudo -u agenticml',
+    ]
+    missing = [needle for needle in needles if needle not in text]
+    assert not missing, f'{page} does not mention {missing}'
+    assert not _login_key_examples(text), _login_key_examples(text)

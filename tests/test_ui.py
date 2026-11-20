@@ -579,6 +579,33 @@ def test_serve_passes_read_only(tmp_path, monkeypatch):
     assert seen['args'][-1] is True
 
 
+def test_serve_prints_docs_and_github_line_after_the_url(tmp_path, monkeypatch, capsys):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    @contextmanager
+    def fake_server(*args):
+        yield SimpleNamespace(server_address=('127.0.0.1', 6006), serve_forever=lambda: None)
+
+    monkeypatch.setattr(server, 'make_server', fake_server)
+    server.serve(tmp_path)
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == 'AgenticML UI: http://127.0.0.1:6006'
+    assert lines[1].startswith('Docs: https://agenticml.github.io/agenticml-lite/ ')
+    assert lines[1].endswith('Star us on GitHub: https://github.com/agenticML/agenticml-lite')
+    assert len(lines) == 2
+
+
+def test_serve_promo_line_falls_back_to_ascii(monkeypatch):
+    class Ascii:
+        encoding = 'ascii'
+
+    monkeypatch.setattr(server.sys, 'stdout', Ascii())
+    line = server._promo_line()
+    assert line.isascii()
+    assert 'Docs: https://agenticml.github.io/agenticml-lite/ | Star us on GitHub:' in line
+
+
 def test_summary_keeps_scalar_string_keys_in_order():
     value = {1: 'no', 'a': 1, 'b': {'n': 1}, 'c': True, 'd': None, 'e': 'x', 'f': 1.5}
     assert server._summary(value) == {'a': 1, 'c': True, 'd': None, 'e': 'x', 'f': 1.5}

@@ -40,6 +40,9 @@ pip install "agenticml-lite[s3]"
 # Firebase ID token verification (PyJWT with cryptography)
 pip install "agenticml-lite[firebase]"
 
+# OIDC ID token verification (PyJWT with cryptography)
+pip install "agenticml-lite[oidc]"
+
 # Hosted bundle: postgres, s3, and firebase
 pip install "agenticml-lite[hosted]"
 ```
@@ -51,6 +54,8 @@ Start the server using `agenticml server serve`:
 ```bash
 agenticml server serve --data /var/lib/agenticml-server --host 127.0.0.1 --port 8080 --public-url https://aml.example.com
 ```
+
+To deploy in your own AWS account with a CloudFormation template (EC2, SQLite, ALB, Cognito), see [Deploy on AWS](https://agenticml.github.io/agenticml-lite/server/deploy-on-aws/).
 
 ### Quick start on a workstation: `server up`
 
@@ -95,6 +100,108 @@ sudo systemctl status agenticml-server
 sudo journalctl -u agenticml-server -f
 ```
 
+## Private network (no Tailscale)
+
+Run the server and dashboard inside a private VPC or lab network without Tailscale or internet connectivity. All traffic starts inside the network, terminated by a local TLS reverse proxy with an internal certificate.
+
+```
+training machines ──HTTPS :443──▶ TLS proxy (internal cert) ──▶ agenticml server serve
+lab users' browsers ──HTTPS :443──┘        Caddy or nginx            127.0.0.1:8080, SQLite on local disk
+```
+
+The server binds loopback (`127.0.0.1:8080`) and speaks HTTP. TLS ends at the reverse proxy.
+
+### Setup checklist
+
+See [deploy/private-network/README.md](../deploy/private-network/README.md) for the complete operator guide. In brief:
+
+1. **Prerequisites**: Python 3.10+ on the server and training machines. Install `git` on the server for lineage code diffs. Run NTP or chrony across all machines to prevent TLS clock errors. Assign a DNS name (or `/etc/hosts` entry) to the server.
+2. **Install `agenticml-lite>=3.2`**: Install on the server (`/opt/agenticml`) and training machines. For machines without internet access, download wheels on a connected machine with matching OS and Python minor version via `pip download -d wheelhouse 'agenticml-lite>=3.2'`, transfer the directory, and install using `sudo /opt/agenticml/bin/python -m pip install --no-index --find-links wheelhouse 'agenticml-lite>=3.2'`. Fetch deployment configs from the matching release tag.
+3. **Configure systemd service**: Install `agenticml-server.service` and copy `deploy/private-network/agenticml-server.env.example` to `/etc/agenticml-server.env` (`0600`, root). Set `AGENTICML_SERVER_PUBLIC_URL` to your canonical HTTPS URL (including any non-443 port) and `AGENTICML_SERVER_TRUSTED_PROXIES=127.0.0.1/32`. Do not set `AGENTICML_SERVER_KEY`, which disables the first-admin setup link.
+4. **Configure reverse proxy**: Set up Caddy (using `tls internal` or your own certificates) or nginx using configs from `deploy/private-network/`. Under SELinux, run `sudo setsebool -P httpd_can_network_connect 1`.
+5. **Distribute CA certificate**: For Caddy's internal CA, copy the root certificate (`/var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt`) or your internal PKI root CA to `/etc/ssl/certs/lab-ca.pem` on each training machine. Install the CA in users' browsers or OS certificate stores. Back up Caddy's data directory so regenerated roots do not invalidate clients.
+6. **Create first admin**: Before exposing port 443 to users, retrieve the one-time setup link from `sudo journalctl -u agenticml-server | grep 'setup?token'` and complete admin registration in a browser. Alternatively, run `sudo -u agenticml /opt/agenticml/bin/agenticml server users add NAME --role admin --public-url https://... --data /var/lib/agenticml-server`.
+7. **Issue sync keys**: Issue sync keys from the dashboard Keys page or CLI (`sudo -u agenticml /opt/agenticml/bin/agenticml server keys create --name box-1 --scope sync --user NAME --data /var/lib/agenticml-server`). The machine's runs are owned by that user; a key created on the dashboard Keys page belongs to the signed-in person.
+8. **Configure training machines**: Run `agenticml login --host https://... --ca-bundle /etc/ssl/certs/lab-ca.pem`. Verify with `agenticml whoami` and `agenticml sync --all`. Install the user service `agenticml-sync.service` for continuous synchronization.
+9. **Firewall rules**: Allow inbound connections to port 443 (and port 80 for browser redirects) on the proxy. Port 8080 must stay on loopback.
+10. **Automate backups**: Add a nightly cron job running `agenticml server backup` as the `agenticml` user.
+
+### Reverse proxy rules
+
+A reverse proxy in front of the server must satisfy these requirements:
+
+- **No redirects on sync requests**: The client rejects HTTP 3xx redirects to prevent sending API keys across hosts or schemes. Sync clients must connect directly to the final `https://` URL.
+- **Forward Content-Length without re-chunking**: Streaming upload requests must retain their `Content-Length`. Re-chunking request bodies causes the server to return HTTP 411 Length Required.
+- **Support 4 GiB request bodies**: Object uploads (large files and artifacts) can be up to 4 GiB in one request (`OBJECT_BODY_LIMIT`). Run files are capped at 16 MiB, appends at 64 MiB and lineage bundles at 256 MiB. Set `client_max_body_size 4g` in nginx.
+- **Long timeouts**: Set proxy read and send timeouts to at least 3 hours (`proxy_read_timeout 3h`, `proxy_send_timeout 3h`). Server body timeouts allow approximately 30 seconds plus 2 seconds per MiB (~2.3 hours for 4 GiB).
+- **Forward the Host header**: Forward `Host` unchanged (`proxy_set_header Host $http_host` in nginx). Its host name must be the public URL's host name; the server does not compare the port. The port in `AGENTICML_SERVER_PUBLIC_URL` must be the one users type, because the browser's `Origin` (scheme, host and port) must equal it.
+- **Strip identity headers**: Drop incoming `X-Forwarded-Email`, `X-Amzn-Oidc-Identity`, and `Tailscale-User-Login` headers from clients so untrusted clients cannot spoof authenticated identities.
+- **Filter query strings from access logs**: Setup and invite tokens travel in query strings (`/setup?token=...`, `/invite?token=...`). Omit query strings from proxy access logs.
+- **Strict trusted proxy CIDR**: Configure `AGENTICML_SERVER_TRUSTED_PROXIES` with the proxy's exact IP as `/32` (`127.0.0.1/32`), never a broad subnet.
+
+### Sign-in options
+
+- **Local passwords and invite links (default)**: Users accept one-time invite links generated by administrators and sign in with local passwords (`scrypt`). Firebase remains disabled (`AGENTICML_SERVER_FIREBASE_PROJECT` unset).
+- **Single sign-on with oauth2-proxy (variant)**: To authenticate users via an external identity provider, chain `client -> TLS proxy -> oauth2-proxy -> agenticml server serve`:
+  1. Configure `--identity-header oauth2-proxy` (or `AGENTICML_SERVER_IDENTITY_HEADER=oauth2-proxy`) and set `AGENTICML_SERVER_TRUSTED_PROXIES` strictly to oauth2-proxy's `/32` address.
+  2. The outer TLS proxy must strip any incoming `X-Forwarded-Email` header from clients.
+  3. oauth2-proxy must skip authentication for `/v2/` and `/healthz` routes; sync clients authenticate using Bearer API keys and cannot negotiate browser SSO flows.
+  4. Map user accounts to emails using `sudo -u agenticml /opt/agenticml/bin/agenticml server users set-identity LOGIN email@example.com --data /var/lib/agenticml-server`.
+
+### Sign-in with an OIDC provider (Cognito, Okta, Entra ID)
+
+The server supports single sign-on with OpenID Connect (OIDC) identity providers such as Amazon Cognito, Okta, and Microsoft Entra ID.
+
+The integration uses the standard OpenID Connect authorization code flow with PKCE (RFC 7636, S256 code challenge) and a public client (no client secret is required or supported).
+
+Requirements and behavior:
+- **Dependency**: Install the `[oidc]` extra (`pip install 'agenticml-lite[oidc]'`). The server refuses to start without it when `--oidc-issuer` is set.
+- **Provider registration**: Register a public application client at the provider with:
+  - Callback URL (redirect URI): `<public-url>/auth/oidc/callback` (for example `https://aml.example.com/auth/oidc/callback`)
+  - Post-logout redirect URI: `<public-url>/login` (only used with `--oidc-logout-url`)
+  - Required scopes: `openid email profile`
+- **ID token requirements**: The ID token must be RS256-signed and carry `email` with `email_verified: true`. Without a verified email, nobody can be linked, signed up, listed as admin or invited. Cognito with email verification sets it. Okta and Entra ID have not been tested yet; only the Cognito path is the documented deployment. Entra ID needs a verified-email claim configured.
+- **Sign-out**:
+  - The post-logout redirect URI `<public-url>/login` is only used with `--oidc-logout-url`.
+  - That option is optional and sends `client_id` and `logout_uri` as query parameters, which is Cognito's form. Okta and Entra ID use `post_logout_redirect_uri`, so provider sign-out there works only if the provider accepts these parameters.
+  - Without the option, sign-out ends the AgenticML session only.
+- **HTTPS required**: `--public-url` must use the `https://` scheme (except `http://127.0.0.1` and `localhost` in local testing).
+- **One provider per server**: Configure at most one sign-in provider. Running OIDC together with Firebase (`--firebase-project`) or an identity proxy header (`--identity-header`) is refused at startup.
+- **Open sign-up and admin emails**: Both `--open-signup` and `--admin-emails` work with OIDC. A user completing a verified OIDC sign-in gets a personal workspace if open sign-up is enabled, and becomes server administrator if their email matches `--admin-emails`. `/setup` is off with OIDC; the first admin comes from `--admin-emails`.
+- **Domain restrictions (`--signup-email-domains`)**: Comma-separated list of allowed domains (e.g. `example.com,example.org`). Open sign-up provisions accounts only for email addresses whose domain matches exactly (case-insensitive, no subdomain wildcards). It also withholds the personal workspace from existing accounts whose email is outside the listed domains. Accounts on the `--admin-emails` list are exempt from domain restrictions.
+- **Invites accepted via POST**: When inviting users, invite links use the fragment format (`/invite#token=...`). The client accepts the invite by submitting `POST /auth/oidc/start` with the token in the form body. `GET /auth/oidc/start` explicitly rejects invite tokens, preventing tokens from appearing in query strings or load balancer logs.
+- **Account linking and relinking rules**:
+  - The stored identifier is `oidc:<issuer tag>:<sub>`, where the tag is 12 hex digits derived from the issuer URL.
+  - A verified email links an OIDC sign-in only to an account that has no password, identity or provider link yet. Accounts with a password or a proxy identity and no provider link are not linked.
+  - An account linked to a Firebase uid, or to an OIDC uid from a different issuer (for example a re-created Cognito user pool), is relinked at the next sign-in with the same verified email, audited as `account.relink`.
+  - The same issuer with a different subject is refused.
+
+### Proxy bypass with NO_PROXY
+
+If training machines define `HTTPS_PROXY` in their environment, add the server hostname to `NO_PROXY`:
+
+```bash
+export NO_PROXY=agenticml.lab.internal
+```
+
+Add the same setting to `~/.config/systemd/user/agenticml-sync.service` (`Environment=NO_PROXY=agenticml.lab.internal`) so sync traffic reaches the internal server directly.
+
+### Client CA bundles and host trust
+
+When connecting to internal HTTPS servers signed by private CAs:
+
+- **CA bundle precedence**:
+  1. `--ca-bundle PATH` flag on `agenticml login`, `sync`, `whoami`
+  2. CA bundle saved for that exact host by `agenticml login --ca-bundle`
+  3. `AGENTICML_CA_BUNDLE` environment variable
+  4. System default CA roots (honours `REQUESTS_CA_BUNDLE`)
+
+  `login` ignores the bundle saved for the host: it uses `--ca-bundle`, then `AGENTICML_CA_BUNDLE`, then the system roots. A successful `login` replaces the saved entry for the host, so pass `--ca-bundle` on every `login`. Items 1-4 apply to `sync` and `whoami`.
+- **Why save bundles per host**: Specifying a CA bundle replaces the default roots rather than adding to them. A workstation syncing to both an internal lab server and the public hosted service (`app.agenticml.xyz`) should save the bundle per host using `agenticml login --ca-bundle` rather than exporting `AGENTICML_CA_BUNDLE` globally, which would cause public certificate verification to fail.
+- **Verification cannot be disabled**: There is no flag or option to disable TLS certificate checks.
+- **File ownership and permissions**: Custom CA bundles and their parent directories must be owned by the user or root and must not be group- or world-writable (`mode & 0o022 == 0`).
+- **Plain HTTP trust**: Running `agenticml login --insecure` to a non-local `http://` host records consent for that exact host in `credentials.json`. Subsequent `sync` and `whoami` commands to that saved host do not require the `--insecure` flag. Older saved entries require one more `login --insecure` to store this flag. Commands that transmit API keys over plain HTTP emit `warning: sending the API key over plain http to <host>`. Running `login` again for a host replaces its saved entry, so repeat `--ca-bundle` or `--insecure`.
+
 ## Workspaces and routing
 
 All data on the server is scoped to a workspace.
@@ -138,11 +245,11 @@ A global account can have the `server_admin` flag set. Server administrators:
 
 Server administrator privileges can be granted through three paths:
 
-- **Admin emails (`--admin-emails` / `AGENTICML_SERVER_ADMIN_EMAILS`)**: Comma-separated list of emails, matched case-insensitively. Requires Firebase authentication (`--firebase-project`). Without Firebase, the list is ignored with a startup warning. Invalid entries are dropped with a warning. When a user completes a verified Firebase sign-in (Google OAuth or email/password with verified email) matching the list, their account is created if none exists and granted server admin with source `list`. With `--open-signup` the account also gets the free personal workspace (once); without it, no workspace is created. If an email is removed from the list, list-granted server admin is revoked at that person's next sign-in.
-- **Web administration (`/admin`)**: The "Server admins" section lists all server administrators (login, source, and sign-in state). Administrators can add server admins by email or login. Adding an email without an existing account creates a credential-less account that links on its first verified Firebase sign-in (`source` is `manual`). Administrators can remove server admins immediately; an email still in `--admin-emails` will regain server admin at its next sign-in.
+- **Admin emails (`--admin-emails` / `AGENTICML_SERVER_ADMIN_EMAILS`)**: Comma-separated list of emails, matched case-insensitively. Requires Firebase or OIDC authentication (`--firebase-project` or `--oidc-issuer`). Without Firebase or OIDC, the list is ignored with a startup warning. Invalid entries are dropped with a warning. When a user completes a verified Firebase or OIDC sign-in (Google OAuth, OIDC, or email/password with verified email) matching the list, their account is created if none exists and granted server admin with source `list`. With `--open-signup` the account also gets the free personal workspace (once); without it, no workspace is created. If an email is removed from the list, list-granted server admin is revoked at that person's next sign-in.
+- **Web administration (`/admin`)**: The "Server admins" section lists all server administrators (login, source, and sign-in state). Administrators can add server admins by email or login. Adding an email without an existing account creates a credential-less account that links on its first verified Firebase or OIDC sign-in (`source` is `manual`). Administrators can remove server admins immediately; an email still in `--admin-emails` will regain server admin at its next sign-in.
 - **Server CLI (`agenticml server accounts set-server-admin`)**: `set-server-admin LOGIN on|off` and `accounts add LOGIN --server-admin` grant or revoke server admin with source `manual`. Manual grants survive removal of an email from `--admin-emails`.
 
-**Last server admin rule**: The last server administrator who can sign in (has a password, an identity, or a linked Firebase account) can never be removed through the list, the web interface, or the CLI; a pending admin that has never signed in does not count and can always be removed (`agenticml server accounts set-server-admin LOGIN off` fails with "cannot remove the last server admin").
+**Last server admin rule**: The last server administrator who can sign in (has a password, an identity, or a linked Firebase or OIDC account) can never be removed through the list, the web interface, or the CLI; a pending admin that has never signed in does not count and can always be removed (`agenticml server accounts set-server-admin LOGIN off` fails with "cannot remove the last server admin").
 
 **CLI source column**: `agenticml server accounts list` displays a `source` column (`list`, `manual`, or `-`). The JSON output (`--json`) includes `server_admin_source`.
 
@@ -241,7 +348,7 @@ agenticml server users set-identity LOGIN [IDENTITY] --workspace SLUG
 
 `--workspace` defaults to `default`.
 
-Invite and setup links on a self-hosted server carry their token in the query string (`/invite?token=...`, `/setup?token=...`), because the server reads it to choose the page. If such a server sits behind a proxy or load balancer that logs request URLs, those tokens (single use, 72 hours for invites) appear in its logs; exclude query strings from that log. With Firebase sign-in on (the hosted service), `users invite` and the Members page print `/invite#token=...` instead: the fragment is never sent to the server or to any proxy in front of it.
+Invite and setup links on a self-hosted server carry their token in the query string (`/invite?token=...`, `/setup?token=...`), because the server reads it to choose the page. If such a server sits behind a proxy or load balancer that logs request URLs, those tokens (single use, 72 hours for invites) appear in its logs; exclude query strings from that log. With Firebase or OIDC sign-in on, `users invite` and the Members page print `/invite#token=...` instead: the fragment is never sent to the server or to any proxy in front of it.
 
 ## API keys and sync authentication
 
@@ -607,11 +714,16 @@ Sync clients on version 2.2 continue to sync to a 3.0 server without modificatio
 | `--firebase-project ID` | `AGENTICML_SERVER_FIREBASE_PROJECT` | unset | Firebase project ID for token verification. |
 | `--firebase-api-key KEY` | `AGENTICML_SERVER_FIREBASE_API_KEY` | unset | Firebase web API key for dashboard sign-in. |
 | `--firebase-auth-domain HOST` | `AGENTICML_SERVER_FIREBASE_AUTH_DOMAIN` | unset | Firebase auth domain (defaults to `<project>.firebaseapp.com`). |
+| `--oidc-issuer URL` | `AGENTICML_SERVER_OIDC_ISSUER` | unset | Sign in with this OpenID Connect issuer (Cognito, Okta, Entra ID, etc.); needs `--public-url` and the `[oidc]` extra. |
+| `--oidc-client-id ID` | `AGENTICML_SERVER_OIDC_CLIENT_ID` | unset | OIDC public client ID; redirect URI to register is `<public-url>/auth/oidc/callback`. |
+| `--oidc-logout-url URL` | `AGENTICML_SERVER_OIDC_LOGOUT_URL` | unset | Provider sign-out URL; sign-out redirects there with `client_id` and `logout_uri=<public-url>/login`. Optional. |
+| `--oidc-label TEXT` | `AGENTICML_SERVER_OIDC_LABEL` | `Sign in` | Sign-in button text on the login page. |
+| `--signup-email-domains LIST` | `AGENTICML_SERVER_SIGNUP_EMAIL_DOMAINS` | unset | Comma-separated email domains (exact match, no subdomains) that open sign-up serves; others get no account. |
 | `--limits FILE` | `AGENTICML_SERVER_LIMITS` | unset | Path to JSON file defining workspace usage limits and plans. |
 | `--metrics MODE` | `AGENTICML_SERVER_METRICS` | `off` | Capacity metrics mode: `off` or `cloudwatch`. Flag wins over env; blank counts as unset. Any other value refuses to start. Only `server serve` has it. |
-| `--admin-emails LIST` | `AGENTICML_SERVER_ADMIN_EMAILS` | unset | Comma-separated emails granted server admin on verified Firebase sign-in. Ignored without Firebase. |
+| `--admin-emails LIST` | `AGENTICML_SERVER_ADMIN_EMAILS` | unset | Comma-separated emails granted server admin on verified Firebase or OIDC sign-in. Ignored without Firebase or OIDC. |
 | `--legal-base-url URL` | `AGENTICML_SERVER_LEGAL_BASE_URL` | unset | `https://` base URL of your Terms, Acceptable use and Privacy pages (`terms/`, `acceptable-use/`, `privacy/` under it). With Firebase on, the sign-in page (`/login` and `/invite`) then shows "By continuing you agree to the Terms and the Acceptable use policy. See the Privacy policy." with those links. A non-`https://` value stops the server at startup. Ignored without Firebase. Not set means no links. |
-| `--open-signup` | `AGENTICML_SERVER_OPEN_SIGNUP` | off | Allow verified Firebase sign-in to create an account and personal workspace. A verified account with no workspace gets one at sign-in (once; an admin-deleted sign-up workspace is not recreated). |
+| `--open-signup` | `AGENTICML_SERVER_OPEN_SIGNUP` | off | Allow verified Firebase or OIDC sign-in to create an account and personal workspace. A verified account with no workspace gets one at sign-in (once; an admin-deleted sign-up workspace is not recreated). |
 | `--min-client-version X.Y` | `AGENTICML_SERVER_MIN_CLIENT_VERSION` | `2.2` | Reject `agenticml-lite` clients older than `X.Y` on `/v2` requests with HTTP 426. Values below `2.2` are unsupported: 2.0 and 2.1 clients misreport their own runs as foreign. |
 
 Additional environment variables:
@@ -619,6 +731,24 @@ Additional environment variables:
 - `AGENTICML_SERVER_S3_ENDPOINT_URL`: Custom S3 endpoint URL for MinIO, LocalStack, or VPC endpoints.
 - `AGENTICML_SERVER_S3_KMS_KEY_ID`: AWS KMS Key ID or ARN for S3 server-side encryption (`aws:kms`).
 - `AGENTICML_REMOTE_STALE_SECONDS`: Inactivity threshold before an active run is marked `stale` (default `600`).
+
+### Client options
+
+Options on `agenticml login`, `agenticml sync`, and `agenticml whoami`:
+
+| Flag | Environment variable | Default | Description |
+| --- | --- | --- | --- |
+| `--ca-bundle PATH` | `AGENTICML_CA_BUNDLE` | unset | Path to a custom CA bundle file for TLS certificate verification. |
+
+Trust resolution order (most specific first):
+1. `--ca-bundle PATH` CLI option
+2. CA bundle saved for the exact host by `agenticml login --ca-bundle`
+3. `AGENTICML_CA_BUNDLE` environment variable
+4. System default CA bundle (honours `REQUESTS_CA_BUNDLE`)
+
+`login` ignores the bundle saved for the host: it uses `--ca-bundle`, then `AGENTICML_CA_BUNDLE`, then the system roots. A successful `login` replaces the saved entry for the host, so pass `--ca-bundle` on every `login`. The list above applies to `sync` and `whoami`.
+
+A custom CA bundle replaces default system root certificates. Save the bundle per host via `login --ca-bundle` when syncing to both private and public HTTPS endpoints. Certificate verification can never be turned off. CA bundle files and parent directories must be owned by the user or root and must not be group- or world-writable (`mode & 0o022 == 0`).
 
 ## Network filesystems (EFS)
 
@@ -708,7 +838,80 @@ Machines behind the same NAT or HTTP proxy share one throttle bucket, even if th
 Another server process has the SQLite data directory open. Check `systemctl status agenticml-server` or look for running `agenticml server serve` processes on the host. Stop the conflicting process. If multiple processes are required, use PostgreSQL via `--database`.
 
 ### HTTP 403 ("forbidden host") on dashboard
-The dashboard accepts requests only from loopback addresses unless `--public-url` is configured. When operating behind a reverse proxy, set `AGENTICML_SERVER_PUBLIC_URL=https://<your-hostname>` in the server environment (or `/etc/agenticml-server.env` under systemd).
+The dashboard accepts requests only from loopback addresses unless `--public-url` is configured. The incoming `Host` header must carry the public URL's host name (or a loopback name); the port is not compared here. When operating behind a reverse proxy, set `AGENTICML_SERVER_PUBLIC_URL=https://<your-hostname>` in the server environment (or `/etc/agenticml-server.env` under systemd) and configure the proxy to forward the `Host` header unchanged (`proxy_set_header Host $http_host;` in nginx).
+
+### HTTP 403 ("cross-site request refused") on dashboard
+The dashboard rejected a state-changing POST request because the request's `Origin` does not match `AGENTICML_SERVER_PUBLIC_URL`. The browser's scheme, host and port must all equal `AGENTICML_SERVER_PUBLIC_URL`. Ensure the browser visits the exact scheme, host, and port configured there (include the port in the public URL if it is not 443).
+
+### TLS certificate check failed
+The client prints:
+```
+TLS certificate check failed (untrusted CA, wrong host name, expired, or a wrong clock); pass --ca-bundle PATH or set AGENTICML_CA_BUNDLE, and use the name in the certificate
+```
+The TLS certificate presented by the server or proxy could not be validated. Common causes:
+- The certificate was issued by an internal CA not trusted by the client. Pass `--ca-bundle PATH` or set `AGENTICML_CA_BUNDLE`.
+- The hostname in `--host` does not match the Subject Alternative Names (SAN) in the certificate. Connect using the exact DNS name in the certificate.
+- The certificate has expired, or the client or server system clock is wrong. Check clocks using `timedatectl` or `chronyc tracking`.
+
+Diagnose the TLS connection with `openssl`:
+```bash
+openssl s_client -connect agenticml.lab.internal:443 -CAfile lab-ca.pem
+```
+
+A certificate failure, or an `https://` URL that points at a port that does not speak TLS, is not retried by one-shot commands (`sync`, `whoami`, `login`). Continuous follow mode (`sync --follow`) keeps retrying with backoff and shows the hint in its status line:
+```
+server unreachable (TLS certificate check failed (untrusted CA, wrong host name, expired, or a wrong clock); pass --ca-bundle PATH or set AGENTICML_CA_BUNDLE, and use the name in the certificate); retrying in 30s
+```
+
+### TLS handshake failed
+The client prints:
+```
+TLS handshake failed (the server closed the connection, or this is not an https port)
+```
+The client could not establish a TLS connection. Other handshake failures (for example the peer closing the connection) are retried a few times before this hint appears. Check whether the server closed the connection abruptly, or whether an `https://` URL was mistakenly pointed at a plain HTTP port (e.g. connecting directly to backend port 8080 over HTTPS instead of port 443 on the TLS proxy).
+
+### "server redirected to another URL"
+The client prints:
+```
+server redirected to another URL; use the final https:// URL as --host (refusing to send the API key on a redirect)
+```
+The server or reverse proxy returned an HTTP 3xx redirect (such as an HTTP-to-HTTPS redirect or adding a trailing slash). The client refuses to follow redirects to prevent exposing API keys. Update `--host` to the final canonical `https://` URL.
+
+### CA bundle file and permission errors
+The client validates custom CA bundles before use:
+- `CA bundle not found or unreadable: <path>`: The file does not exist, is a directory, or lacks read permissions.
+- `CA bundle is not owned by you or root: <path>`
+- `CA bundle directory is not owned by you or root: <dir>`
+- `CA bundle is writable by others: <path>; chmod go-w`: The bundle file has group- or world-writable permissions.
+- `CA bundle directory is writable by others: <dir>; chmod go-w <dir>`: The directory containing the bundle is group- or world-writable.
+- ``CA bundle path in the credentials file is not absolute: <path>; run `agenticml login --ca-bundle PATH` again`` (the fix is to run login again with an absolute path)
+
+The bundle file and its directory must be owned by the user or root and must not be writable by group or others. Fix permissions:
+```bash
+chmod go-w <path>
+chmod go-w <dir>
+```
+
+### Proxy errors: HTTP 411, 413, or 408
+- **HTTP 411 Length Required**: The reverse proxy re-chunked the body and omitted `Content-Length`. The server requires `Content-Length` on upload requests. In nginx, configure `proxy_http_version 1.1;` and `proxy_request_buffering off;`.
+- **HTTP 413 Payload Too Large / Request Entity Too Large**: The reverse proxy's body size limit is below 4 GiB. In nginx, set `client_max_body_size 4g;`.
+- **HTTP 408 Request Timeout**: The server received the body too slowly. It allows about 30 s plus 2 s per MiB, so an upload slower than about 512 KiB/s fails. It also happens when the connection ended before the whole body arrived. Keep `proxy_request_buffering off;` and the 3 hour `proxy_read_timeout 3h;` and `proxy_send_timeout 3h;`, which prevent proxy-side 504 errors on long uploads.
+
+### HTTP 502 under SELinux
+Under SELinux, the reverse proxy is blocked from connecting to loopback network ports by default. Enable network connections for the proxy:
+```bash
+sudo setsebool -P httpd_can_network_connect 1
+```
+Ensure certificate files are stored in `/etc/pki` or `/etc/ssl` and restore proper file labels:
+```bash
+sudo restorecon -Rv /etc/ssl /etc/pki
+```
+
+### Browser certificate warnings
+Web browsers display certificate warnings when opening the dashboard if the internal CA root is not trusted. Install the lab CA in the browser or OS store on every client workstation.
+
+### Client version check skipped
+A proxy that strips the User-Agent header makes the server skip its client-version check (HTTP 426). Ensure the reverse proxy forwards `User-Agent` if client version enforcement is desired.
 
 ### HTTP 426 ("this server needs agenticml-lite >= X.Y")
 The sync client is running an older `agenticml-lite` version below `--min-client-version` (default 2.2). Update the client package on the training machine:

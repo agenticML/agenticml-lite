@@ -61,6 +61,8 @@ jobs:
         env:
           DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           CFN_ROLE_ARN: ${{ vars.AWS_CFN_ROLE_ARN }}
+          # Only true or false: the address itself must never reach the log.
+          ADMIN_EMAILS_VARIABLE_SET: ${{ vars.HOSTED_ADMIN_EMAILS != '' }}
         run: |
           set -euo pipefail
           if [ -z "$DEPLOY_ROLE_ARN" ]; then
@@ -69,6 +71,12 @@ jobs:
           fi
           if [ -z "$CFN_ROLE_ARN" ]; then
             echo "::error::GitHub environment variable AWS_CFN_ROLE_ARN is empty; set it to the bootstrap stack's CloudFormationRoleArn output."
+            exit 1
+          fi
+          # Run logs of this public repository print variables, so the admin
+          # emails must be a secret. Refuse to deploy while the variable exists.
+          if [ "$ADMIN_EMAILS_VARIABLE_SET" = true ]; then
+            echo "::error::The hosted environment still has a HOSTED_ADMIN_EMAILS variable, and run logs of this public repository print variables. Create an environment secret with the same value (gh secret set HOSTED_ADMIN_EMAILS --env hosted), then delete the variable (gh variable delete HOSTED_ADMIN_EMAILS --env hosted)."
             exit 1
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -131,10 +139,18 @@ jobs:
           FIREBASE_PROJECT: ${{ vars.HOSTED_FIREBASE_PROJECT }}
           FIREBASE_API_KEY: ${{ vars.HOSTED_FIREBASE_API_KEY }}
           OPEN_SIGNUP: ${{ vars.HOSTED_OPEN_SIGNUP || 'false' }}
-          ADMIN_EMAILS: ${{ vars.HOSTED_ADMIN_EMAILS }}
+          ADMIN_EMAILS: ${{ secrets.HOSTED_ADMIN_EMAILS }}
           LEGAL_BASE_URL: ${{ vars.HOSTED_LEGAL_BASE_URL }}
         run: |
           set -euo pipefail
+          # GitHub masks only the whole secret string; mask each address too,
+          # in case one is printed alone (for example in a CloudFormation error).
+          IFS=',' read -r -a admin_emails <<< "$ADMIN_EMAILS"
+          for address in "${admin_emails[@]}"; do
+            if [ -n "$address" ]; then
+              echo "::add-mask::$address"
+            fi
+          done
           # Each Key="$value" is one argument, so an empty value reaches the
           # template as an empty string ("FirebaseProject=").
           overrides=(

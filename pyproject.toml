@@ -4,18 +4,28 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agenticml-lite"
-version = "3.0.0"
+version = "3.3.0"
 description = "Lean, local-first experiment tracker for AgenticML. Installs as `agenticml-lite`, imports as `agenticml`."
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Gaurav Singh", email = "gaurav.singh@agenticml.xyz" }]
 requires-python = ">=3.10"
-keywords = ["mlops", "experiment-tracking", "machine-learning", "agentic"]
+keywords = [
+  "experiment-tracking",
+  "mlops",
+  "machine-learning",
+  "deep-learning",
+  "pytorch",
+  "tensorboard",
+  "wandb-alternative",
+  "self-hosted",
+  "local-first",
+]
 dependencies = [
   "requests>=2.31",
 ]
 classifiers = [
-  "Development Status :: 2 - Pre-Alpha",
+  "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
@@ -40,6 +50,9 @@ media = [
   "Pillow>=10.0",
 ]
 firebase = [
+  "PyJWT[crypto]>=2.8",
+]
+oidc = [
   "PyJWT[crypto]>=2.8",
 ]
 postgres = [

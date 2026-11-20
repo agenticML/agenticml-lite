@@ -32,27 +32,31 @@ Every form runs the target in-process as `__main__` inside one tracked run. Pick
 | `agenticml run --project demo -- python -u train.py` | You need Python flags or a specific interpreter. `agenticml-lite` must be installed there. |
 | `python -m agenticml run train.py` | `agenticml` is not on `PATH`, for example inside `torchrun` or `accelerate launch`. |
 
+`agenticml run train.py`, `agenticml run -- python train.py` and `agenticml python train.py` do the same thing. `agenticml python` re-executes under another interpreter when needed.
+
 Rules for every form:
 
 - agenticml options (`--project`, `--name`, …) come before the script or module. Everything after the target is passed to your script untouched.
 - The `--` separator is needed only in front of `python ...`.
-- The default run name is the script's repo-relative path, unless `--name` is given.
-- Only Python files are supported: no `python -c` and no stdin scripts.
+- The default run name is the script's repo-relative path (the module's file path for `-m`), unless `--name` is given.
+- Only agenticml's `run` forms take agenticml options. The bare `agenticml python` form does not, so set `AGENTICML_*` environment variables there.
+- Multi-GPU: launch as `torchrun ... -m agenticml run -- train.py`. Only rank 0 logs.
+- Only Python files are supported: no `python -c` and no stdin scripts. To track a shell script, call `agenticml run -- python ...` from inside it.
 
 ## What gets captured
 
 | What | Where it comes from | Turn off |
 | --- | --- | --- |
 | Config | `argparse` and `@hydra.main` | `--no-capture-args` (`AGENTICML_CAPTURE_ARGS=0`) |
-| Code snapshot | imported project modules and files opened for reading | `--no-code` (`AGENTICML_TRACK_CODE=0`) |
+| Code snapshot | imported project modules and files opened for reading | `--no-code` (`AGENTICML_TRACK_CODE=0`; `track_source=False` on `Run`) |
 | Model, optimizer, loss, dataloader | PyTorch construction hooks | `--no-auto-track` (`AGENTICML_AUTO_TRACK=0`) |
 | `auto/loss`, `auto/lr`, `auto/epoch` | `backward()` and `optimizer.step()` | `--no-auto-metrics` (`AGENTICML_AUTO_METRICS=0`); `--log-every N` |
-| TensorBoard | `SummaryWriter` / `tensorboardX` | `--no-tensorboard` (`AGENTICML_SYNC_TENSORBOARD=0`) |
+| TensorBoard | `SummaryWriter` / `tensorboardX` (scalars, images, figures, hparams) | `--no-tensorboard` (`AGENTICML_SYNC_TENSORBOARD=0`) |
 | System metrics | psutil, plus pynvml when installed | `--no-system-metrics` (`AGENTICML_SYSTEM_METRICS=0`); `--system-metrics-interval S` |
 | Lineage | shadow-Git snapshot | `--no-lineage` (`AGENTICML_LINEAGE=0`) |
 | Environment | environment metadata | `--no-env` (`AGENTICML_CAPTURE_ENV=0`) |
 
-Loss is unscaled under `GradScaler` and averaged over gradient-accumulation steps. Keys passed to `init(config=...)` win over captured hyperparameters. Defaults differ between the SDK and CLI for two switches: `auto_metrics` and `sync_tensorboard` are off by default in `agenticml.init()` and on under `agenticml run`.
+Loss is unscaled under `GradScaler` and averaged over gradient-accumulation steps. With several optimizers, the metrics are prefixed (`auto/<name>/loss`, `auto/<name>/lr`); `auto/epoch` stays unprefixed. TensorBoard event files are still written. Keys passed to `init(config=...)` win over captured hyperparameters. Defaults differ between the SDK and CLI for two switches: `auto_metrics` and `sync_tensorboard` are off by default in `agenticml.init()` and on under `agenticml run`.
 
 ## Options and environment variables
 
@@ -141,6 +145,10 @@ A missing or unreadable parent is still recorded, with a warning. A parent in an
 ## Exit status
 
 A script that calls `agenticml.init()` joins the launcher's run. Exit code 0 finishes the run as `finished`; any other exit finishes it as `crashed`, with `_exit_code` and `_exception` in the summary. Your script's exit code is preserved, and SIGTERM finishes the run and exits 143.
+
+## Try it on the toy example
+
+`examples/train_toy.py` is a pure-Python toy training loop. Under `agenticml run` it captures config, code, and system information, but no training metrics: the loop has no framework hooks. `python examples/train_toy.py --explicit` runs the same loop calling the Python API itself to log metrics. See [examples/README.md](https://github.com/agenticML/agenticml-lite/blob/main/examples/README.md).
 
 <details>
 <summary><h2>Advanced</h2></summary>

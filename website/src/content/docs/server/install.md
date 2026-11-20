@@ -78,6 +78,8 @@ To share the server securely across your Tailscale network:
 
 Use Caddy, Nginx, or an AWS Application Load Balancer to terminate TLS and forward requests to `127.0.0.1:8080`. Always configure `--public-url` (or `AGENTICML_SERVER_PUBLIC_URL`) to match the public HTTPS endpoint for Host and Origin validation.
 
+For isolated VPCs or internal lab networks without Tailscale or internet access, see [Private networks](/agenticml-lite/server/private-network/).
+
 ## Systemd service
 
 For production deployments on Linux, run the server as a systemd system service using the unit provided in `deploy/systemd/agenticml-server.service`:

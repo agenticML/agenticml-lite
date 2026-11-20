@@ -6,12 +6,15 @@ Never log ID tokens.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 import logging
-import math
 import re
 import threading
 import time
+
+from . import keycache
+from .keycache import (  # noqa: F401  (re-exported: other modules and tests import them here)
+    BODY_DEADLINE, FAILURE_COOLDOWN, HTTP_TIMEOUT, LEEWAY, MAX_MAX_AGE, MIN_MAX_AGE,
+    UNKNOWN_KID_INTERVAL, WAITER_TIMEOUT, Claims, KeyCache, KeyUnavailable, TokenInvalid)
 
 logger = logging.getLogger('agenticml.server.firebase')
 
@@ -20,29 +23,25 @@ CERTS_URL = ('https://www.googleapis.com/robot/v1/metadata/x509/'
 FIREBASE_EXTRA = ("Firebase sign-in needs the [firebase] extra: "
                   "pip install 'agenticml-lite[firebase]'")
 FIREBASE_IDENTITY = "Firebase sign-in cannot be combined with --identity-header"
-OPEN_SIGNUP_REQUIRES_FIREBASE = "open sign-up requires --firebase-project"
+OPEN_SIGNUP_REQUIRES_FIREBASE = "open sign-up requires --firebase-project or --oidc-issuer"
 OPEN_SIGNUP_REQUIRES_LIMITS = "open sign-up requires --limits"
 
 
-def require_open_signup(open_signup, firebase=None, plans=None):
+def require_open_signup(open_signup, firebase=None, plans=None, oidc=None):
     if not open_signup:
         return
-    if firebase is None:
+    if firebase is None and oidc is None:
         raise ValueError(OPEN_SIGNUP_REQUIRES_FIREBASE)
     if plans is None:
         raise ValueError(OPEN_SIGNUP_REQUIRES_LIMITS)
-LEEWAY = 60
+
+
 AUTH_MAX_AGE = 600
-MIN_MAX_AGE = 300
-MAX_MAX_AGE = 24 * 60 * 60
-MAX_CERTS_BODY = 64 * 1024
-HTTP_TIMEOUT = 5
-BODY_DEADLINE = 10
-WAITER_TIMEOUT = 15
-FAILURE_COOLDOWN = 30
-UNKNOWN_KID_INTERVAL = 60
+MAX_CERTS_BODY = keycache.MAX_BODY
 TRUSTED_EMAIL_PROVIDERS = frozenset({'google.com', 'password'})
-_MAX_AGE = re.compile(r'(?:^|,)\s*max-age\s*=\s*"?(\d+)"?', re.IGNORECASE)
+# The OIDC provider (``oidc.py``) is a trust root of its own: the configured
+# issuer vouches for ``email_verified``.
+OIDC_PROVIDER = 'oidc'
 _PROJECT_ID = re.compile(r'[a-z0-9-]{4,40}')
 _HOSTNAME = re.compile(
     r'(?=.{1,253}$)'
@@ -55,29 +54,15 @@ _default_source = None
 _default_lock = threading.Lock()
 
 
-class FirebaseTokenInvalid(ValueError):
+class FirebaseTokenInvalid(TokenInvalid):
     """Token failed verification. ``reason`` is for the server log only."""
 
-    def __init__(self, reason):
-        super().__init__(reason)
-        self.reason = reason
 
-
-class FirebaseUnavailable(RuntimeError):
+class FirebaseUnavailable(KeyUnavailable):
     """Certificate fetch or parse failed; callers map this to 503."""
 
     def __init__(self, reason='certificate fetch failed'):
         super().__init__(reason)
-        self.reason = reason
-
-
-@dataclass(frozen=True)
-class Claims:
-    uid: str
-    email: str | None
-    email_verified: bool
-    name: str | None
-    provider: str | None
 
 
 @dataclass(frozen=True)
@@ -130,154 +115,48 @@ def _jwt():
 
 
 def _parse_max_age(header):
-    if not isinstance(header, str):
-        return MIN_MAX_AGE
-    match = _MAX_AGE.search(header)
-    if match is None:
-        return MIN_MAX_AGE
-    return max(MIN_MAX_AGE, min(int(match.group(1)), MAX_MAX_AGE))
+    return keycache.parse_max_age(header)
 
 
 def _capped_body(response, limit=MAX_CERTS_BODY, *, deadline=None, clock=time.monotonic):
-    headers = getattr(response, 'headers', None) or {}
-    raw = headers.get('Content-Length')
-    if raw is None and hasattr(headers, 'get'):
-        raw = headers.get('content-length')
-    try:
-        declared = int(raw) if raw is not None else None
-    except (TypeError, ValueError):
-        declared = None
-    if declared is not None and declared > limit:
-        raise FirebaseUnavailable('certificate fetch failed')
-    chunks = []
-    size = 0
-    for chunk in response.iter_content(8192):
-        if deadline is not None and clock() >= deadline:
-            raise FirebaseUnavailable('certificate fetch failed')
-        if not chunk:
-            continue
-        size += len(chunk)
-        if size > limit:
-            raise FirebaseUnavailable('certificate fetch failed')
-        chunks.append(chunk)
-    return b''.join(chunks)
+    return keycache.capped_body(
+        response, limit, deadline=deadline, clock=clock,
+        error=FirebaseUnavailable, reason='certificate fetch failed')
 
 
-class _HttpCerts:
-    def __init__(self, status_code, headers, body):
-        self.status_code = status_code
-        self.headers = headers
-        self._body = body
-
-    def json(self):
-        return json.loads(self._body)
+_HttpCerts = keycache.FetchedResponse
 
 
 def _http_fetch():
-    import requests
-    try:
-        response = requests.get(
-            CERTS_URL, timeout=HTTP_TIMEOUT, allow_redirects=False, stream=True)
-    except requests.RequestException as exc:
-        logger.warning('firebase certificate fetch failed: %s', type(exc).__name__)
-        raise FirebaseUnavailable('certificate fetch failed') from exc
-    try:
-        body = _capped_body(response, deadline=time.monotonic() + BODY_DEADLINE)
-        return _HttpCerts(response.status_code, response.headers, body)
-    except FirebaseUnavailable:
-        raise
-    except Exception as exc:
-        logger.warning('firebase certificate fetch failed: %s', type(exc).__name__)
-        raise FirebaseUnavailable('certificate fetch failed') from exc
-    finally:
-        response.close()
+    return keycache.http_fetch(
+        CERTS_URL, error=FirebaseUnavailable, reason='certificate fetch failed',
+        label='firebase certificate fetch failed', limit=MAX_CERTS_BODY)
 
 
-class CertificateSource:
+class CertificateSource(KeyCache):
     """Cached Google x509 certs. ``fetch`` is injectable so tests stay offline.
 
-    HTTP runs outside ``self._lock`` with single-flight: one fetch in flight,
-    other callers wait for it or use the last good certs while those are
-    valid. A fetch failure is remembered for ``FAILURE_COOLDOWN`` seconds so
-    a down Google does not block every ``POST /auth/firebase`` for 5 s.
-    Unknown-kid refetch stays at most once per ``UNKNOWN_KID_INTERVAL``.
+    The cache (single-flight fetch, failure cooldown, unknown-kid interval) is
+    ``keycache.KeyCache``; this class loads and validates the certificate map.
     """
 
+    invalid_error = FirebaseTokenInvalid
+    unavailable_error = FirebaseUnavailable
+    unavailable_reason = 'certificate fetch failed'
+
     def __init__(self, fetch=None):
+        super().__init__()
         self._fetch = fetch
-        self._lock = threading.Lock()
-        self._certs = {}
-        self._expires_at = 0.0
-        self._last_fetch = 0.0
-        self._last_failure = None
-        self._inflight = None
 
-    def get(self, kid, now=None):
-        now = time.time() if now is None else now
-        event = None
-        try:
-            while True:
-                with self._lock:
-                    cached = self._cached(kid, now)
-                    if cached is not None:
-                        return cached
-                    if now < self._expires_at and now - self._last_fetch < UNKNOWN_KID_INTERVAL:
-                        raise FirebaseTokenInvalid('unknown kid')
-                    if (now >= self._expires_at and self._last_failure is not None
-                            and now - self._last_failure < FAILURE_COOLDOWN):
-                        raise FirebaseUnavailable('certificate fetch failed')
-                    if self._inflight is not None:
-                        wait_for, is_leader = self._inflight, False
-                    else:
-                        wait_for = threading.Event()
-                        self._inflight = wait_for
-                        event = wait_for
-                        is_leader = True
-                if not is_leader:
-                    if not wait_for.wait(timeout=WAITER_TIMEOUT):
-                        raise FirebaseUnavailable('certificate fetch failed')
-                    continue
-                break
-            try:
-                payload, max_age = self._load()
-                error = None
-            except FirebaseUnavailable as exc:
-                payload, max_age, error = None, None, exc
-            with self._lock:
-                self._last_fetch = now
-                if error is None:
-                    self._certs = payload
-                    self._expires_at = now + max_age
-                    self._last_failure = None
-                else:
-                    self._last_failure = now
-                if self._inflight is event:
-                    self._inflight = None
-                if kid in self._certs and now < self._expires_at:
-                    result = self._certs[kid]
-                    outcome = None
-                elif now < self._expires_at:
-                    result, outcome = None, FirebaseTokenInvalid('unknown kid')
-                elif error is not None:
-                    result, outcome = None, error
-                else:
-                    result, outcome = None, FirebaseTokenInvalid('unknown kid')
-            event.set()
-            event = None
-            if outcome is not None:
-                raise outcome
-            return result
-        finally:
-            if event is not None:
-                with self._lock:
-                    if self._inflight is event:
-                        self._inflight = None
-                event.set()
+    # The tuning constants are read from this module so they can be patched here.
+    def _waiter_timeout(self):
+        return WAITER_TIMEOUT
 
-    def _cached(self, kid, now):
-        if now < self._expires_at and kid in self._certs:
-            return self._certs[kid]
-        return None
+    def _failure_cooldown(self):
+        return FAILURE_COOLDOWN
+
+    def _unknown_interval(self):
+        return UNKNOWN_KID_INTERVAL
 
     def _load(self):
         try:
@@ -329,27 +208,17 @@ def _public_key(pem):
         raise FirebaseTokenInvalid('invalid key') from exc
 
 
-def _string_or_none(value):
-    return value if isinstance(value, str) and value else None
+_string_or_none = keycache.string_or_none
 
 
 def _unix_time(value, claim):
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise FirebaseTokenInvalid(claim)
-    try:
-        number = float(value)
-        if not math.isfinite(number):
-            raise FirebaseTokenInvalid(claim)
-    except FirebaseTokenInvalid:
-        raise
-    except (OverflowError, ValueError):
-        raise FirebaseTokenInvalid(claim)
-    return number
+    return keycache.unix_time(value, claim, FirebaseTokenInvalid)
 
 
 def email_verified_for_link(claims):
     """True when the token email can be trusted for linking or invite acceptance."""
-    return bool(claims.email_verified and claims.provider in TRUSTED_EMAIL_PROVIDERS)
+    return bool(claims.email_verified
+                and (claims.provider in TRUSTED_EMAIL_PROVIDERS or claims.provider == OIDC_PROVIDER))
 
 
 def verify_id_token(token, project, *, now=None, keys=None) -> Claims:

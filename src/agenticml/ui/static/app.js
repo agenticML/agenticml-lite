@@ -569,22 +569,45 @@ applyTheme();
 document.querySelector("#host").textContent = `local · ${location.host}`;
 let serverMode = false;
 let serverSession = null;
+// Firebase and OIDC servers sign members in with an external provider: no
+// passwords here, and no re-invite links for existing members.
+const externalAuth = (session) => session?.auth === "firebase" || session?.auth === "oidc";
+function inviteText() {
+  if (serverSession?.auth === "firebase") {
+    return "This invite link is shown once. They sign in with Google or email and password, using this email; the email must be verified.";
+  }
+  if (serverSession?.auth === "oidc") {
+    return "This invite link is shown once. They sign in with your identity provider, using this email; the email must be verified.";
+  }
+  return "This invite link is shown once. They choose their own password.";
+}
 function viaLabel(via) {
   return via === "proxy"
     ? "Signed in through your identity proxy"
     : via === "key"
       ? "admin key"
-      : via || "—";
+      : via === "oidc"
+        ? "OIDC"
+        : via || "—";
 }
 // Same few lines as server/static/signout.js (the picker page): that file is not
 // served by local `agenticml ui`, and this module is account-scoped on the server.
 async function signOut() {
-  await fetch("/logout", {
+  const response = await fetch("/logout", {
     method: "POST",
     credentials: "same-origin",
     headers: { "X-AgenticML-Request": "1" },
   });
-  location.assign("/login");
+  let target = "/login";
+  // An OIDC server answers 200 with the provider's sign-out address.
+  if (response.status === 200) {
+    try {
+      const data = await response.json();
+      const url = new URL(data.redirect);
+      if (url.protocol === "https:" || url.protocol === "http:") target = url.href;
+    } catch {}
+  }
+  location.assign(target);
 }
 const sessionReady = fetch(api("/account/session"), { credentials: "same-origin" })
   .then(async (response) => {
@@ -657,7 +680,7 @@ function trapTab(host, event) {
 function accountDetails(session, { card = false } = {}) {
   const error = el("p", { class: "error", role: "alert", hidden: true });
   const status = el("p", { class: "muted", role: "status", hidden: true });
-  const firebaseAuth = session.auth === "firebase";
+  const firebaseAuth = externalAuth(session);
   let current = null;
   let next = null;
   let form = null;
@@ -4761,9 +4784,7 @@ async function mountTeam(cards, version, disposers = [], workspaceName = null) {
     const value = el("code", { class: "key-value", text: data.invite_url });
     body.replaceChildren(
       el("p", {
-        text: serverSession?.auth === "firebase"
-          ? "This invite link is shown once. They sign in with Google or email and password, using this email; the email must be verified."
-          : "This invite link is shown once. They choose their own password.",
+        text: inviteText(),
       }),
       value, copyCode("Copy invite link", value),
       el("p", {
@@ -4882,9 +4903,7 @@ async function mountTeam(cards, version, disposers = [], workspaceName = null) {
       inviteCopies.push([copy, "Copy invite link"]);
       inviteResult.append(
         el("p", {
-          text: serverSession?.auth === "firebase"
-            ? "This invite link is shown once. They sign in with Google or email and password, using this email; the email must be verified."
-            : "This invite link is shown once. They choose their own password.",
+          text: inviteText(),
         }),
         value, copy,
         el("p", {
@@ -5161,8 +5180,8 @@ async function mountTeam(cards, version, disposers = [], workspaceName = null) {
         user.keys == null ? "–" : String(user.keys),
         user.runs == null ? "–" : String(user.runs),
         el("div", { class: "team-actions" },
-          // Firebase members sign in at /login; the server refuses a re-invite there.
-          owner || user.name === data.me || serverSession?.auth === "firebase"
+          // Firebase and OIDC members sign in at /login; the server refuses a re-invite there.
+          owner || user.name === data.me || externalAuth(serverSession)
             ? null
             : button("Invite link", () => inviteUser(user), "secondary"),
           owner ? null : button("Remove", () => removeUser(user), "secondary")),
@@ -5606,7 +5625,7 @@ async function adminPage(version) {
       el("label", { class: "field-label", htmlFor: login.id, text: "Email or login" }), login,
       el("p", {
         class: "muted",
-        text: serverSession?.auth === "firebase"
+        text: externalAuth(serverSession)
           ? "If no account exists for this email, one is created; it is linked when they first sign in."
           : "The account must already exist.",
       }),
@@ -5706,6 +5725,7 @@ async function adminPage(version) {
   function signinCell(admin) {
     switch (admin.signin) {
       case "firebase": return "Firebase";
+      case "oidc": return "OIDC";
       case "identity": return "Identity proxy";
       case "password": return "Password";
       default: return chip("pending", "warn");

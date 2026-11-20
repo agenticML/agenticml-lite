@@ -1131,6 +1131,30 @@ def test_mobile_pages_have_no_horizontal_scroll(page, ui_server, width):
         assert overflow <= 0, f"{route} scrolls horizontally by {overflow}px"
 
 
+def test_github_link_in_top_bar_and_no_overflow_at_375px(page, ui_server):
+    link = page.locator("#nav-github")
+    home(page, ui_server)
+    expect(link).to_be_visible()
+    expect(link).to_have_attribute("href", "https://github.com/agenticML/agenticml-lite")
+    expect(link).to_have_attribute("target", "_blank")
+    expect(link).to_have_attribute("rel", "noopener")
+    expect(link).to_have_attribute("aria-label", "agenticml-lite on GitHub")
+    expect(link.locator("svg[aria-hidden='true']")).to_be_visible()
+    expect(link.locator(".nav-github-label")).to_be_visible()
+    page.set_viewport_size({"width": 375, "height": 812})
+    page.reload()
+    expect(page.locator(".run-row")).to_have_count(5)
+    expect(link).to_be_visible()
+    expect(link.locator(".nav-github-label")).to_be_hidden()
+    box = link.bounding_box()
+    assert box and box["height"] > 0 and box["width"] > 0
+    assert page.get_by_role("link", name="agenticml-lite on GitHub").count() == 1
+    topbar = page.locator(".topbar").bounding_box()
+    assert topbar["height"] <= 60, f"top bar wrapped: {topbar['height']}px"
+    overflow = page.evaluate("Math.max(document.documentElement.scrollWidth-document.documentElement.clientWidth, document.body.scrollWidth-document.body.clientWidth)")
+    assert overflow <= 0, f"top bar scrolls horizontally by {overflow}px"
+
+
 def test_metrics_chunk_keys_and_overview_points(page, tmp_path, ui_server_factory):
     root = tmp_path / "many-metrics"
     writer = RunWriter.create(root, meta={"name": "many", "project": "stress"})

@@ -543,6 +543,22 @@ kbd {
   font: var(--fs-sm) var(--font-mono);
   color: var(--text-3);
 }
+#nav-github {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+.nav-github-icon {
+  flex: none;
+}
+/* Server topbar (all nav links and the session visible) fills the row between
+   the wrapping breakpoint (760px) and 900px, so drop the link there. */
+@media (min-width: 761px) and (max-width: 900px) {
+  .topbar:has(#session:not([hidden])) #nav-github {
+    display: none;
+  }
+}
 .topbar-session {
   display: inline-flex;
   align-items: center;
@@ -3356,6 +3372,10 @@ pre,
 }
 @media (max-width: 480px) {
   .topbar-host {
+    display: none;
+  }
+  /* Icon only; the aria-label keeps the accessible name. */
+  .nav-github-label {
     display: none;
   }
   .topbar-session-label {

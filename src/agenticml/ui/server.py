@@ -22,6 +22,7 @@ import select
 import socket
 import stat
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -1431,7 +1432,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         extra = {} if headers is None else dict(headers)
         self.send_header("Content-Security-Policy", extra.pop("Content-Security-Policy", _CSP))
         for name, value in extra.items():
-            self.send_header(name, value)
+            # A list sends the header once per item (two Set-Cookie lines).
+            for item in value if isinstance(value, (list, tuple)) else (value,):
+                self.send_header(name, item)
         self.end_headers()
 
     def _send(self, body, content_type, status=200, headers=None):
@@ -1995,6 +1998,20 @@ def make_server(root, host="127.0.0.1", port=6006, read_only=False) -> Threading
     return cls(root, host, port, read_only)
 
 
+_DOCS_URL = "https://agenticml.github.io/agenticml-lite/"
+_REPO_URL = "https://github.com/agenticML/agenticml-lite"
+
+
+def _promo_line() -> str:
+    """Docs and repo links for the startup output; ASCII separator if the terminal can't show a middle dot."""
+    separator = "\u00b7"
+    try:
+        separator.encode(getattr(sys.stdout, "encoding", None) or "ascii")
+    except (UnicodeEncodeError, LookupError):
+        separator = "|"
+    return f"Docs: {_DOCS_URL} {separator} Star us on GitHub: {_REPO_URL}"
+
+
 def serve(root, host="127.0.0.1", port=6006, open_browser=False, read_only=False) -> None:
     """Serve until Ctrl-C. No subprocesses or background services.
 
@@ -2015,6 +2032,7 @@ def serve(root, host="127.0.0.1", port=6006, open_browser=False, read_only=False
         address, bound_port = server.server_address[:2]
         url = f"http://{_browser_host(address)}:{bound_port}"
         print(f"AgenticML UI: {url}", flush=True)
+        print(_promo_line(), flush=True)
         if open_browser:
             webbrowser.open(url)
         server.serve_forever()
