@@ -39,9 +39,9 @@ plans live next to it:
 | **2.1** | Full fidelity | Lineage code diffs on the server, by-reference artifacts, EFS performance check, operator tooling | A run synced to the server is indistinguishable from the local one in the dashboard, apart from notes |
 | **2.2** | Teams | Users and roles, per-user keys, dashboard sign-in through a trusted identity proxy, audit log | Two users with different roles share one server, each with the access their role allows, and every write is attributed |
 | **3.0** | Database storage, workspaces and hosted service | Server state in SQLite or Postgres, workspaces with accounts and memberships on one hostname, Firebase sign-in and self-serve sign-up with free limits, many server processes, S3 objects, metric summaries, AWS deployment, agenticml-server retired | Exit criteria 1–6 in the [3.0 plan](on-prem-3.0-plan.md); released Nov 17, 2026 as 3.0.0 (tag `v3.0.0`, [PyPI](https://pypi.org/project/agenticml-lite/3.0.0/), [GitHub release](https://github.com/agenticML/agenticml-lite/releases/tag/v3.0.0)) |
-| **3.1** | Scale and visibility | Usage history on `/admin` and `agenticml server stats`, capacity metrics with a CloudWatch dashboard and alarms, ECS autoscaling for the hosted service | A server admin sees accounts, active users, workspaces and stored data over time; the hosted service shows request, latency, task and database load on one dashboard; under a load test it scales between 1 and its maximum task count with no failed requests |
-| **3.2** | Private networks | Run the server and dashboard inside a lab VPC without Tailscale: CA bundle and per-host http trust on the client, a TLS proxy kit (Caddy, nginx), an end-to-end test through a TLS proxy, a private-network docs page | A lab follows the docs to sync from its training machines and sign in from its browsers over HTTPS with an internal certificate, with nothing reaching in from the internet |
-| **3.3** | Deploy in your own AWS account | One CloudFormation template (EC2 + SQLite from PyPI, ALB + ACM, Cognito sign-up and sign-in) and OIDC sign-in in the server | A deployer with an AWS account and a Route 53 domain launches the template, signs up with the admin email and syncs a run, with no other setup |
+| **3.1** | Scale and visibility | Usage history on `/admin` and `agenticml server stats`, capacity metrics with a CloudWatch dashboard and alarms, ECS autoscaling for the hosted service | A server admin sees accounts, active users, workspaces and stored data over time; the hosted service shows request, latency, task and database load on one dashboard; under a load test it scales between 1 and its maximum task count with no failed requests; released in 3.3.0 (Nov 20, 2026), not published on its own |
+| **3.2** | Private networks | Run the server and dashboard inside a lab VPC without Tailscale: CA bundle and per-host http trust on the client, a TLS proxy kit (Caddy, nginx), an end-to-end test through a TLS proxy, a private-network docs page | A lab follows the docs to sync from its training machines and sign in from its browsers over HTTPS with an internal certificate, with nothing reaching in from the internet; released in 3.3.0 (Nov 20, 2026), not published on its own |
+| **3.3** | Deploy in your own AWS account | One CloudFormation template (EC2 + SQLite from PyPI, ALB + ACM, Cognito sign-up and sign-in) and OIDC sign-in in the server | A deployer with an AWS account and a Route 53 domain launches the template, signs up with the admin email and syncs a run, with no other setup; released Nov 20, 2026 as 3.3.0 (tag `v3.3.0`, [PyPI](https://pypi.org/project/agenticml-lite/3.3.0/), [GitHub release](https://github.com/agenticML/agenticml-lite/releases/tag/v3.3.0)) |
 | Later | Scale and lifecycle | Unscheduled; see below | – |
 
 Decision (Nov 5, 2026): the server ships only as the `agenticml-lite`
@@ -374,11 +374,11 @@ example or docs). It does not depend on 3.1 (packages 31–33, merged in
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 34 † | Private-network deployment (no Tailscale) | 3.0 | Sonnet; prose Antigravity; owner releases | M | [plan](packages/34-private-network.md) | done ([#86](https://github.com/agenticML/agenticml-lite/pull/86), merged Nov 19, 2026; owner steps 34.4 publish and 34.5 left) |
+| 34 † | Private-network deployment (no Tailscale) | 3.0 | Sonnet; prose Antigravity; owner releases | M | [plan](packages/34-private-network.md) | done ([#86](https://github.com/agenticML/agenticml-lite/pull/86), merged Nov 19, 2026; 34.4 published in 3.3.0 (Nov 20, 2026); owner step 34.5 left) |
 | 34.1 † | Client trust: `--ca-bundle`, saved bundle, `AGENTICML_CA_BUNDLE`, saved `insecure` per host, certificate errors without retries and with clear text, redirect text | 3.0 | Sonnet | M | [plan](packages/34-private-network.md) | done ([#86](https://github.com/agenticML/agenticml-lite/pull/86), merged Nov 19, 2026; Sonnet coded; supervisor reviewed with two adversarial review passes and did the † second review) |
 | 34.2 † | Deploy kit (`deploy/private-network/`: Caddy, nginx, env file, checklist incl. first admin, CA, SELinux, backups), sync unit lines, end-to-end test through a TLS proxy with a private CA | 34.1 | Sonnet | M | [plan](packages/34-private-network.md) | done ([#86](https://github.com/agenticML/agenticml-lite/pull/86), merged Nov 19, 2026; Sonnet coded; supervisor reviewed, checked the Caddyfile with `caddy validate` and did the † second review) |
 | 34.3 | Docs: SERVER.md section and troubleshooting, THREAT_MODEL.md, PROTOCOL.md, website page and facts test, README, systemd README | 34.1, 34.2 | Antigravity; supervisor checks | S–M | [plan](packages/34-private-network.md) | done ([#86](https://github.com/agenticML/agenticml-lite/pull/86), merged Nov 19, 2026; Antigravity drafted, Sonnet corrected the fact-check findings, supervisor checked against the code) |
-| 34.4 | Version 3.2.0; docs require `agenticml-lite>=3.2` and the kit from the matching tag | 34.3 | Sonnet; owner tags and publishes | S | [plan](packages/34-private-network.md) | done in code ([#86](https://github.com/agenticML/agenticml-lite/pull/86), merged Nov 19, 2026: version 3.2.0, Releases page); owner tags and publishes |
+| 34.4 | Version 3.2.0; docs require `agenticml-lite>=3.2` and the kit from the matching tag | 34.3 | Sonnet; owner tags and publishes | S | [plan](packages/34-private-network.md) | done ([#86](https://github.com/agenticML/agenticml-lite/pull/86), merged Nov 19, 2026: version 3.2.0, Releases page; released in 3.3.0, Nov 20, 2026: no separate 3.2.0 tag or upload) |
 | 34.5 | First lab install from the docs (Backlog owner step) | 34.4 | Owner | S | [plan](packages/34-private-network.md) | not started |
 
 ### 3.3: deploy in your own AWS account
@@ -391,15 +391,15 @@ D36.1–D36.7 are in the plan: one EC2 instance with SQLite installed from
 PyPI (no image), ALB + ACM, Amazon Cognito through a generic OIDC client
 in the server (which also starts the Later "Enterprise SSO" entry), and
 about $45–55/month. It comes after 3.2 (package 34); 36.1 and 36.2 do not
-touch 34's files, and 36.3 and 36.4 build on 34 (merged into this branch from PR #86, which must merge first).
+touch 34's files, and 36.3 and 36.4 build on 34 (merged from PR #86).
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 36 † | Deploy in your own AWS account | 3.2 | Sonnet; prose Antigravity; owner releases and deploys | L | [plan](packages/36-aws-self-deploy.md) | done in code (this PR; owner steps 36.4 publish and 36.5 first deploy left) |
+| 36 † | Deploy in your own AWS account | 3.2 | Sonnet; prose Antigravity; owner releases and deploys | L | [plan](packages/36-aws-self-deploy.md) | done ([#88](https://github.com/agenticML/agenticml-lite/pull/88), merged Nov 20, 2026; released as 3.3.0 on Nov 20, 2026; owner steps 36.4 Launch Stack bucket and 36.5 first deploy left) |
 | 36.1 † | Server: OIDC sign-in (authorization code + PKCE), open sign-up, admin emails and invites on OIDC, `--signup-email-domains`, `[oidc]` extra | 3.0 | Sonnet | M–L | [plan](packages/36-aws-self-deploy.md) | done ([#88](https://github.com/agenticML/agenticml-lite/pull/88); Sonnet coded; supervisor reviewed in three rounds with adversarial review passes and did the † second review; checked on Postgres 16 locally) |
 | 36.2 † | Template `deploy/aws-self-hosted/agenticml.yaml` (VPC optional, ALB, ACM, Route 53, Cognito, EC2 Auto Scaling group of 1, data volume with daily snapshots), static tests, cfn-lint in CI | 36.1 options | Sonnet | M | [plan](packages/36-aws-self-deploy.md) | done ([#88](https://github.com/agenticML/agenticml-lite/pull/88); Sonnet coded; supervisor reviewed in three rounds with adversarial review passes and did the † second review; cfn-lint clean; AWS behaviour checked statically only until 36.5) |
 | 36.3 | Docs: "Deploy on AWS" page, SERVER.md OIDC section, threat model, README, facts test | 36.2, 34.3 | Antigravity; supervisor checks | S–M | [plan](packages/36-aws-self-deploy.md) | done ([#88](https://github.com/agenticML/agenticml-lite/pull/88); Antigravity drafted; two fact-check rounds against the code with adversarial verification; supervisor corrected two wordings) |
-| 36.4 | Version 3.3.0; template on the GitHub release; Launch Stack link (owner: public S3 bucket) | 36.3, 34.4 | Sonnet; owner tags and publishes | S | [plan](packages/36-aws-self-deploy.md) | done in code ([#88](https://github.com/agenticML/agenticml-lite/pull/88): version 3.3.0, `release-assets.yml` attaches the template to a published release, version tied to the template default by a test); owner tags, publishes and adds the Launch Stack bucket (Backlog) |
+| 36.4 | Version 3.3.0; template on the GitHub release; Launch Stack link (owner: public S3 bucket) | 36.3, 34.4 | Sonnet; owner tags and publishes | S | [plan](packages/36-aws-self-deploy.md) | done ([#88](https://github.com/agenticML/agenticml-lite/pull/88), released Nov 20, 2026: tag `v3.3.0`, PyPI 3.3.0, `agenticml.yaml` on the release; `release-assets.yml` attaches the template to a published release, version tied to the template default by a test); owner: Launch Stack bucket (Backlog) |
 | 36.5 | First real deploy in an AWS account (Backlog owner step) | 36.4 | Owner | S | [plan](packages/36-aws-self-deploy.md) | not started |
 
 ### Outreach
@@ -413,9 +413,9 @@ part can go to `main` early as a docs-only PR.
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 35 | Repo outreach: README, comparison table, images, community files, dashboard GitHub link | 3.1 | Sonnet; supervisor reviews | M | [plan](packages/35-repo-outreach.md) | in review |
-| 35.1 | README rework with screenshot and comparison table, `scripts/make_readme_images.py` (dashboard screenshot, social preview), CONTRIBUTING, code of conduct, issue and PR templates, PyPI keywords and classifiers | – | Sonnet | S–M | [plan](packages/35-repo-outreach.md) | in review |
-| 35.2 | GitHub link in the dashboard top bar; docs and GitHub line from `agenticml ui` | – | Sonnet | S | [plan](packages/35-repo-outreach.md) | in review |
+| 35 | Repo outreach: README, comparison table, images, community files, dashboard GitHub link | 3.1 | Sonnet; supervisor reviews | M | [plan](packages/35-repo-outreach.md) | done ([#90](https://github.com/agenticML/agenticml-lite/pull/90), merged Nov 20, 2026; released in 3.3.0) |
+| 35.1 | README rework with screenshot and comparison table, `scripts/make_readme_images.py` (dashboard screenshot, social preview), CONTRIBUTING, code of conduct, issue and PR templates, PyPI keywords and classifiers | – | Sonnet | S–M | [plan](packages/35-repo-outreach.md) | done ([#90](https://github.com/agenticML/agenticml-lite/pull/90), merged Nov 20, 2026; released in 3.3.0) |
+| 35.2 | GitHub link in the dashboard top bar; docs and GitHub line from `agenticml ui` | – | Sonnet | S | [plan](packages/35-repo-outreach.md) | done ([#90](https://github.com/agenticML/agenticml-lite/pull/90), merged Nov 20, 2026; released in 3.3.0) |
 
 ### Maintenance fixes
 
@@ -439,6 +439,10 @@ part can go to `main` early as a docs-only PR.
   the Tests workflow still triggered on pushes to `dev`, so merges to `main`
   would not have reached app.agenticml.xyz: [plan](packages/fix-main-branch-flow.md);
   status: in review (PR to `main`).
+- Record the 3.3.0 release in the docs and roadmap (3.3.0 on PyPI and as tag
+  `v3.3.0`; install lines, raw URLs, Releases page) and test that raw URLs
+  name published tags and the Releases page names the package version:
+  [plan](packages/release-3-3-0-docs.md); status: in review.
 
 ### Later (unscheduled)
 
@@ -504,7 +508,7 @@ part can go to `main` early as a docs-only PR.
 
 Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
-priority.
+priority. 3.3.0 (with 3.1 and 3.2) was released on Nov 20, 2026.
 
 Package 30 (Nov 17, 2026) cleared the Backlog before the 3.0 release: 21
 entries were fixed in parts 30.1–30.6 (for two of them, the many-process
@@ -584,24 +588,8 @@ on Nov 17, 2026; none of the entries below blocked it.
   - Done when: a load test scales out and back in with no failed syncs,
     the real `max_connections` is recorded here, and the mappings match
     it.
-- **3.2.0 release** (package 34.4, owner). Do after `dev` is merged to
-  `main` ([#93](https://github.com/agenticML/agenticml-lite/pull/93)).
-  - Where: tags; repository Settings → Environments → `pypi`; the docs.
-  - Problem: the code says 3.2.0, but PyPI serves 3.0.0, so the install lines
-    that say what `pip install` gets (README, Releases page "Which version
-    should I use?", `getting-started/installation.md`, `index.mdx`,
-    `server/upgrade.md`, `hosted/quickstart.md`, `deploy/aws/README.md`) and
-    the unit-file URLs with `v3.0.0` still name 3.0.0. 3.1 was never
-    released separately and ships inside 3.2.0.
-  - Fix: (1) add the `pypi` required reviewer (see "Release follow-ups");
-    (2) tag `v3.2.0` on `main` and approve the Publish run; (3) then flip the
-    install lines, the "Which version" table and the `v3.0.0` unit URLs to
-    3.2.0, set the Releases page status to the release date, and update
-    `PUBLISHED_3_0` in `tests/test_website_facts.py` if needed.
-  - Done when: 3.2.0 is on PyPI and the docs name it, and
-    `pip install 'agenticml-lite>=3.2'` works on a clean machine.
-- **First lab install on a private network** (package 34.5, owner; after the
-  "3.2.0 release" step above).
+- **First lab install on a private network** (package 34.5, owner; 3.3.0 is on
+  PyPI).
   - Where: the lab's server VM; `deploy/private-network/README.md`.
   - Problem: the private-network setup has only been tested in CI, never on
     a real lab network.
@@ -611,30 +599,23 @@ on Nov 17, 2026; none of the entries below blocked it.
     `agenticml server verify`; note every step that did not match the docs.
   - Done when: both machines' runs show in the dashboard, `server verify`
     reports 0 problems, and each mismatch is fixed or recorded here.
-- **3.3.0 release and Launch Stack link** (package 36.4, owner). Do after
-  the "3.2.0 release" step. PR #88 is stacked on #86 (3.2), so merge #86
-  first.
-  - Where: tags; `pypi` environment; a new public S3 bucket; the docs page
-    `server/deploy-on-aws.md`.
-  - Problem: the template's default `AgenticmlVersion` is 3.3.0, so a deploy
-    fails until 3.3.0 is on PyPI. The docs can only offer "upload the
-    template" until the template sits in a public S3 bucket, because a
-    CloudFormation quick-create link needs an S3 URL.
+- **Launch Stack link** (package 36.4, owner). 3.3.0 was released on Nov 20,
+  2026 (tag, PyPI, `agenticml.yaml` on the release).
+  - Where: a new public S3 bucket; the docs page `server/deploy-on-aws.md`.
+  - Problem: the docs can only offer "upload the template" until the
+    template sits in a public S3 bucket, because a CloudFormation
+    quick-create link needs an S3 URL.
   - Fix:
-    (1) Tag `v3.3.0` on `main` after `v3.2.0`, and approve the Publish run.
-    Then publish the GitHub release for the tag yourself (the UI or `gh
-    release create`, not with a workflow's `GITHUB_TOKEN`). The
-    `release-assets.yml` workflow then attaches `agenticml.yaml`, after
-    checking that the template's default version equals the tag.
-    (2) Create a bucket, for example `agenticml-templates`. Allow public
+    (1) Create a bucket, for example `agenticml-templates`. Allow public
     read only on `self-hosted/*`, keep Block Public Access off for that
     prefix only, and do not allow listing.
-    (3) Upload `self-hosted/3.3.0/agenticml.yaml` and
+    (2) Upload `self-hosted/3.3.0/agenticml.yaml` and
     `self-hosted/latest/agenticml.yaml`.
-    (4) Add the Launch Stack button to the docs page:
+    (3) Add the Launch Stack button to the docs page:
     `https://console.aws.amazon.com/cloudformation/home#/stacks/quickcreate?templateURL=<bucket URL>/self-hosted/latest/agenticml.yaml&stackName=agenticml`.
-  - Done when: 3.3.0 is on PyPI, the release has `agenticml.yaml`, and the
-    Launch Stack link opens the quick-create page in a clean account.
+  - Done when: the Launch Stack link opens the quick-create page in a clean
+    account. 3.3.0 was released on Nov 20, 2026 (tag, PyPI, `agenticml.yaml`
+    on the release).
 - **First real deploy of the AWS template** (package 36.5, owner; after the
   step above). The template is checked only statically: cfn-lint, 73 tests
   and stubbed bootstrap runs.

@@ -11,13 +11,13 @@ Use this table to choose the version for your setup:
 
 | Path | Version | Install command |
 | --- | --- | --- |
-| Local tracking only | 3.0.0 from PyPI | `pip install agenticml-lite` |
-| Self-hosted server | 3.0.0 from PyPI | `pip install 'agenticml-lite[system]'` |
-| Hosted service | 3.0.0 from PyPI | `pip install 'agenticml-lite[system]'` |
+| Local tracking only | 3.3.0 from PyPI | `pip install agenticml-lite` |
+| Self-hosted server | 3.3.0 from PyPI | `pip install 'agenticml-lite[system]'` |
+| Hosted service | 3.3.0 from PyPI | `pip install 'agenticml-lite[system]'` |
 
-`pip install agenticml-lite` installs 3.0.0, which includes the server and hosted service support. To stay on 1.0.0, run `pip install agenticml-lite==1.0.0`. Version 1.0.0 supports local tracking only. It cannot sync to a 2.x or 3.0 server.
+`pip install agenticml-lite` installs 3.3.0, which includes the server and hosted service support. To stay on 1.0.0, run `pip install agenticml-lite==1.0.0`. Version 1.0.0 supports local tracking only. It cannot sync to a 2.x or 3.0 server.
 
-A 2.2 client has not been checked against the hosted service. Use the 3.0 client.
+A 2.2 client has not been checked against the hosted service. Use 3.0 or newer.
 
 ### Check your version
 
@@ -33,7 +33,15 @@ This works on every version. The `agenticml --version` command works from 3.0. O
 
 ## 3.3.0
 
-**Status:** Not yet released.
+**Status:** Released Nov 20, 2026 (tag `v3.3.0`). On PyPI.
+
+This release includes the 3.1 and 3.2 work below, which was not published on its own.
+
+Install from PyPI:
+
+```bash
+pip install 'agenticml-lite[system]'
+```
 
 ### Deploy in your own AWS account
 
@@ -42,18 +50,15 @@ Deploy an AgenticML server in your own AWS account with a single CloudFormation 
 - **CloudFormation template:** One template (`deploy/aws-self-hosted/agenticml.yaml`) creates a Graviton EC2 instance running SQLite on an encrypted EBS data volume, an HTTPS Application Load Balancer with an ACM certificate, and Amazon Cognito for user management.
 - **OIDC sign-in:** The server supports OpenID Connect (Cognito, Okta, Entra ID) using authorization code flow with PKCE and public clients, via the `[oidc]` extra.
 - **Sign-up email domains:** `--signup-email-domains` limits open sign-up and personal workspace provisioning to approved email domains (exact match).
+- **Template on the release:** The [GitHub release](https://github.com/agenticML/agenticml-lite/releases/tag/v3.3.0) has the template as `agenticml.yaml`.
 
 ---
 
 ## 3.2.0
 
-**Status:** Not yet released.
+**Status:** Not published on its own; included in 3.3.0.
 
-Version 3.1 was not released separately; 3.2.0 includes the 3.1 work below. Install from PyPI once it is published:
-
-```bash
-pip install 'agenticml-lite[system]'
-```
+Version 3.1 was not released separately either. Install 3.3.0 to get this work.
 
 ### Private networks
 

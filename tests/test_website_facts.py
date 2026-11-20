@@ -131,6 +131,71 @@ def test_no_v3_0_0_raw_url_until_published():
     assert not bad, bad
 
 
+# The published release tags. Update it after each release: a raw.githubusercontent.com
+# URL in the docs must name one of these, or it returns 404.
+PUBLISHED_TAGS = ('v3.0.0', 'v3.3.0')
+
+RAW_URL_DOC_FILES = [
+    'README.md', 'docs/SERVER.md', 'docs/HOSTED.md', 'docs/PROTOCOL.md',
+    'deploy/systemd/README.md', 'deploy/aws/README.md',
+    'deploy/private-network/README.md', 'deploy/aws-self-hosted/README.md',
+]
+RAW_URL = re.compile(r'raw\.githubusercontent\.com/agenticML/agenticml-lite/([^/\s]+)/(\S*)')
+TAG_ASSIGNMENT = re.compile(r'^\s*TAG=([^\s]+)', re.MULTILINE)
+
+
+def test_raw_urls_use_published_tags():
+    """Protects readers from raw.githubusercontent.com/agenticML/agenticml-lite/<ref>/
+    URLs that return 404 because the tag does not exist, or that follow a branch
+    and drift from the installed version. Every ref must be in PUBLISHED_TAGS.
+    A `$TAG` ref is allowed when the same file sets `TAG=` to a published tag.
+    Images under docs/assets/ are exempt: the README needs them on `main` so
+    that PyPI shows them. Fails if no raw URL is found at all."""
+    paths = [p for p in sorted(DOCS.rglob('*')) if p.suffix in ('.md', '.mdx')]
+    for relative in RAW_URL_DOC_FILES:
+        path = ROOT / relative
+        assert path.is_file(), f'missing {relative}'
+        paths.append(path)
+    found = 0
+    bad = []
+    for path in paths:
+        text = path.read_text(encoding='utf-8')
+        where = path.relative_to(ROOT)
+        for ref, rest in RAW_URL.findall(text):
+            if rest.startswith('docs/assets/'):
+                continue
+            found += 1
+            if ref in ('$TAG', '${TAG}'):
+                if not TAG_ASSIGNMENT.search(text):
+                    bad.append(f'{where}: {ref} used but the file has no TAG= line')
+            elif ref not in PUBLISHED_TAGS:
+                bad.append(f'{where}: {ref}/{rest}')
+        bad.extend(
+            f'{where}: TAG={tag}' for tag in TAG_ASSIGNMENT.findall(text)
+            if tag not in PUBLISHED_TAGS
+        )
+    assert found, 'no raw.githubusercontent.com URL found in the docs'
+    assert not bad, bad
+
+
+def test_releases_page_names_the_package_version():
+    """Protects the Releases page from naming an older version than the package.
+    It fails after a version bump until the page is updated, on purpose: bump
+    the version in the release PR together with the "Which version should I
+    use?" table and the `## <version>` section."""
+    match = re.search(r'^version = "(.*)"', (ROOT / 'pyproject.toml').read_text(encoding='utf-8'), re.MULTILINE)
+    assert match, 'no version in pyproject.toml'
+    version = match.group(1)
+    text = _text('releases.md')
+    rows = re.findall(r'^\| (?:Local tracking only|Self-hosted server|Hosted service) \| (\S+) from PyPI \|',
+                      text, re.MULTILINE)
+    assert len(rows) == 3, rows
+    assert set(rows) == {version}, f'table names {rows}, package is {version}'
+    section = re.search(rf'^## {re.escape(version)}\n\n(\*\*Status:\*\*[^\n]*)', text, re.MULTILINE)
+    assert section, f'no "## {version}" section with a status line'
+    assert section.group(1).startswith('**Status:** Released'), section.group(1)
+
+
 # Pages that must install from PyPI, not from a git URL or the `dev` branch.
 INSTALL_DOC_FILES = [
     'README.md', 'docs/SERVER.md', 'docs/HOSTED.md',
