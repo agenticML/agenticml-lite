@@ -10,12 +10,22 @@ readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Gaurav Singh", email = "gaurav.singh@agenticml.xyz" }]
 requires-python = ">=3.10"
-keywords = ["mlops", "experiment-tracking", "machine-learning", "agentic"]
+keywords = [
+  "experiment-tracking",
+  "mlops",
+  "machine-learning",
+  "deep-learning",
+  "pytorch",
+  "tensorboard",
+  "wandb-alternative",
+  "self-hosted",
+  "local-first",
+]
 dependencies = [
   "requests>=2.31",
 ]
 classifiers = [
-  "Development Status :: 2 - Pre-Alpha",
+  "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",

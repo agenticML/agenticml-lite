@@ -20,6 +20,8 @@ Within each workspace, members hold one of four roles:
 | `member` | Sync runs (`/v2`), edit run notes, and create/revoke own sync keys. |
 | `viewer` | Read-only dashboard access. Cannot sync (sync keys can only call `GET /v2/whoami`). |
 
+Manage workspaces with `agenticml server workspaces` (`list`, `create`, `rename`, `suspend`, `resume`, `delete`, `usage`, `set-plan`, and more). The full command list is in the [server reference](https://github.com/agenticML/agenticml-lite/blob/main/docs/SERVER.md).
+
 Server administrators hold a global `server_admin` flag on their account. They manage workspaces and global accounts, but do not have access to customer runs unless explicitly added as workspace members.
 
 ## Workspace-bound API keys
@@ -39,7 +41,7 @@ When syncing over protocol v2, the server determines the target workspace direct
 
 ## First admin account and setup
 
-When starting a server with an empty data directory, the server logs a one-time setup URL:
+When starting a server with an empty data directory, the server logs a one-time setup URL. Read it from the server's terminal output, or from the journal under systemd (`sudo journalctl -u agenticml-server`):
 
 ```
 No admin key yet. Open <url>/setup?token=<token> to create one, or run: agenticml server keys create --name admin --scope admin
@@ -54,6 +56,8 @@ Alternatively, create an account and invite link directly using the CLI:
 ```bash
 agenticml server users add admin --role admin --workspace default
 ```
+
+Under systemd, run `agenticml server ...` commands with `--data /var/lib/agenticml-server` (or set `AGENTICML_SERVER_DATA`). The default data directory is `~/.agenticml-server`.
 
 ### Environment admin key
 
@@ -79,7 +83,7 @@ The environment key is named `env`, held in memory only, and bound to the `defau
 Manage keys across workspaces using `agenticml server keys`:
 
 ```bash
-# Create a sync key in a workspace
+# Create a sync key in a workspace (the plaintext key is printed once)
 agenticml server keys create --name worker-1 --workspace default [--scope sync|admin] [--user LOGIN]
 
 # List keys in a workspace

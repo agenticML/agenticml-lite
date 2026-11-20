@@ -1,0 +1,71 @@
+name: Bug report
+description: Something does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. For security problems, do not open an issue; see
+        [SECURITY.md](https://github.com/agenticML/agenticml-lite/blob/main/SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: agenticml-lite version
+      description: Output of `pip show agenticml-lite` or `agenticml --version`.
+      placeholder: "3.0.0"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "Ubuntu 24.04, macOS 15, Windows 11"
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.12.4"
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: How are you using agenticml-lite?
+      options:
+        - Local only (files on disk, local dashboard)
+        - Self-hosted server
+        - Hosted service (app.agenticml.xyz)
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The smallest script or commands that show the problem.
+      placeholder: |
+        1. Run ...
+        2. Open ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and output
+      description: Error messages or tracebacks. Remove secrets and API keys first.
+      render: shell
+    validations:
+      required: false
