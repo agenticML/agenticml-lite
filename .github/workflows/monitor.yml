@@ -7,7 +7,7 @@ name: Hosted service monitor
 # external links. It is not an uptime guarantee; the CloudWatch alarms are the
 # alerting path. A failure opens one issue labelled `hosted`, later failures
 # comment on it, and the next passing run closes it. Scheduled runs use the
-# default branch (dev), so the schedule starts once this file reaches it;
+# default branch (main), so the schedule starts once this file reaches it;
 # GitHub disables schedules after 60 days without repository activity.
 on:
   schedule:

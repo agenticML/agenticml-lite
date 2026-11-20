@@ -434,6 +434,11 @@ part can go to `main` early as a docs-only PR.
   44499848598 (Nov 19, 2026); the value moves to an environment secret and
   each address is masked; status: done (this PR; owner step in the
   Backlog).
+- `main` is now the working branch (owner decision, Nov 20, 2026: the GitHub
+  default branch is `main` and every PR targets it). The hosted deploy and
+  the Tests workflow still triggered on pushes to `dev`, so merges to `main`
+  would not have reached app.agenticml.xyz: [plan](packages/fix-main-branch-flow.md);
+  status: in review (PR to `main`).
 
 ### Later (unscheduled)
 
@@ -532,9 +537,12 @@ on Nov 17, 2026; none of the entries below blocked it.
     `ADMIN_EMAILS`, admin sign-in still works, and whether old logs were
     deleted is recorded here.
   - Progress: (1) and (2) done Nov 19, 2026 (secret set 14:13 UTC, variable
-    deleted). Until this PR is merged, do not approve a deploy from `dev`:
-    the old workflow would read the now-empty variable and drop the admin
-    list.
+    deleted). The fix is merged to `dev`
+    ([#92](https://github.com/agenticML/agenticml-lite/pull/92)). Until `dev`
+    is merged into `main`
+    ([#93](https://github.com/agenticML/agenticml-lite/pull/93)), do not
+    approve or dispatch a deploy from `main`: its old workflow would read the
+    now-empty variable and drop the admin list.
 - **Capacity dashboard and metrics** (package 32, Nov 18, 2026). Do after
   the 3.1 PR is merged to `dev` and deployed.
   - Where: `deploy/aws/README.md`, "Capacity dashboard and metrics"; the
@@ -565,7 +573,7 @@ on Nov 17, 2026; none of the entries below blocked it.
     `ConnectionBudget` and `ConnectionsAlarm` mappings in `hosted.yaml`
     first; (2) for more than 2 tasks, set `DbInstanceClass` to
     `db.t4g.small` at a quiet time (a few minutes of downtime) and repeat
-    (1); (3) `gh workflow run deploy.yml --ref dev -f max_task_count=2`
+    (1); (3) `gh workflow run deploy.yml --ref main -f max_task_count=2`
     (or 3–4 on small); (4) load test with several sync clients in parallel
     (for example `scripts/hosted_check.py make-run` from a few machines,
     or `bench_server.py` on Fargate as in the README) and watch the
@@ -576,8 +584,8 @@ on Nov 17, 2026; none of the entries below blocked it.
   - Done when: a load test scales out and back in with no failed syncs,
     the real `max_connections` is recorded here, and the mappings match
     it.
-- **3.2.0 release** (package 34.4, owner). Do after this PR is merged to
-  `dev` and `dev` is merged to `main`.
+- **3.2.0 release** (package 34.4, owner). Do after `dev` is merged to
+  `main` ([#93](https://github.com/agenticML/agenticml-lite/pull/93)).
   - Where: tags; repository Settings → Environments → `pypi`; the docs.
   - Problem: the code says 3.2.0, but PyPI serves 3.0.0, so the install lines
     that say what `pip install` gets (README, Releases page "Which version
@@ -683,8 +691,8 @@ on Nov 17, 2026; none of the entries below blocked it.
   needed for the launch.
   - Where: `deploy/aws/README.md`, Launch checks 5.1.
   - Problem: the service has only ever run one steady-state task.
-  - Fix: `gh workflow run deploy.yml --ref dev -f desired_count=2` (the
-    default branch is `dev`, so this works now; the `healthy_hosts` alarm then
+  - Fix: `gh workflow run deploy.yml --ref main -f desired_count=2` (the
+    default branch is `main`, so this works now; the `healthy_hosts` alarm then
     uses threshold 2); `aws ecs wait services-stable`; both targets healthy
     (`aws elbv2 describe-target-health`); sync several runs from two clients
     or workspaces (mind the 2 GB daily upload limit per free workspace),

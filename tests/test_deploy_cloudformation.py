@@ -1271,12 +1271,12 @@ def test_deploy_workflow_only_deploys_commits_on_the_dispatching_ref():
     assert steps[guard[0]]['env']['INPUT_REF'] == '${{ inputs.ref }}'
 
 
-def test_deploy_workflow_runs_on_dev_pushes_and_on_dispatch():
+def test_deploy_workflow_runs_on_main_pushes_and_on_dispatch():
     workflow = load_workflow('deploy.yml')
     # PyYAML reads the bare `on` key as True.
     triggers = workflow[True]
     assert set(triggers) == {'push', 'workflow_dispatch'}
-    assert triggers['push']['branches'] == ['dev']
+    assert triggers['push']['branches'] == ['main']
     # Docs and the bootstrap template (deployed by hand) do not queue a deploy.
     assert triggers['push']['paths'] == [
         'src/**', 'pyproject.toml', 'deploy/aws/**', '!deploy/aws/**/*.md',
