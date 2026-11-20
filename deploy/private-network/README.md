@@ -54,9 +54,9 @@ install from it:
 The files in this directory and in `deploy/systemd/` are not in the wheel.
 Fetch them from the tag that matches the installed version
 (`pip show agenticml-lite`), or clone the repository at that tag. For
-example, for version 3.2.0:
+example, for version 3.3.0:
 
-    TAG=v3.2.0
+    TAG=v3.3.0
     BASE=https://raw.githubusercontent.com/agenticML/agenticml-lite/$TAG/deploy
     curl -fsSLO $BASE/private-network/Caddyfile        # or nginx.conf
     curl -fsSLO $BASE/private-network/agenticml-server.env.example

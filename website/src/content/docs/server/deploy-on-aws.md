@@ -65,7 +65,7 @@ aws cloudformation deploy \
 
 ### Console
 
-1. Download `agenticml.yaml` from the GitHub release for your version.
+1. Download `agenticml.yaml` from the [latest GitHub release](https://github.com/agenticML/agenticml-lite/releases/latest/download/agenticml.yaml), or from the release for your version.
 2. Open the AWS CloudFormation console.
 3. Select **Create stack** > **With new resources (standard)**.
 4. Under **Prerequisite - Prepare template**, select **Choose an existing template**, choose **Upload a template file**, and select `agenticml.yaml`.
