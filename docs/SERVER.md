@@ -40,6 +40,9 @@ pip install "agenticml-lite[s3]"
 # Firebase ID token verification (PyJWT with cryptography)
 pip install "agenticml-lite[firebase]"
 
+# OIDC ID token verification (PyJWT with cryptography)
+pip install "agenticml-lite[oidc]"
+
 # Hosted bundle: postgres, s3, and firebase
 pip install "agenticml-lite[hosted]"
 ```
@@ -51,6 +54,8 @@ Start the server using `agenticml server serve`:
 ```bash
 agenticml server serve --data /var/lib/agenticml-server --host 127.0.0.1 --port 8080 --public-url https://aml.example.com
 ```
+
+To deploy in your own AWS account with a CloudFormation template (EC2, SQLite, ALB, Cognito), see [Deploy on AWS](https://agenticml.github.io/agenticml-lite/server/deploy-on-aws/).
 
 ### Quick start on a workstation: `server up`
 
@@ -143,6 +148,34 @@ A reverse proxy in front of the server must satisfy these requirements:
   3. oauth2-proxy must skip authentication for `/v2/` and `/healthz` routes; sync clients authenticate using Bearer API keys and cannot negotiate browser SSO flows.
   4. Map user accounts to emails using `sudo -u agenticml /opt/agenticml/bin/agenticml server users set-identity LOGIN email@example.com --data /var/lib/agenticml-server`.
 
+### Sign-in with an OIDC provider (Cognito, Okta, Entra ID)
+
+The server supports single sign-on with OpenID Connect (OIDC) identity providers such as Amazon Cognito, Okta, and Microsoft Entra ID.
+
+The integration uses the standard OpenID Connect authorization code flow with PKCE (RFC 7636, S256 code challenge) and a public client (no client secret is required or supported).
+
+Requirements and behavior:
+- **Dependency**: Install the `[oidc]` extra (`pip install 'agenticml-lite[oidc]'`). The server refuses to start without it when `--oidc-issuer` is set.
+- **Provider registration**: Register a public application client at the provider with:
+  - Callback URL (redirect URI): `<public-url>/auth/oidc/callback` (for example `https://aml.example.com/auth/oidc/callback`)
+  - Post-logout redirect URI: `<public-url>/login` (only used with `--oidc-logout-url`)
+  - Required scopes: `openid email profile`
+- **ID token requirements**: The ID token must be RS256-signed and carry `email` with `email_verified: true`. Without a verified email, nobody can be linked, signed up, listed as admin or invited. Cognito with email verification sets it. Okta and Entra ID have not been tested yet; only the Cognito path is the documented deployment. Entra ID needs a verified-email claim configured.
+- **Sign-out**:
+  - The post-logout redirect URI `<public-url>/login` is only used with `--oidc-logout-url`.
+  - That option is optional and sends `client_id` and `logout_uri` as query parameters, which is Cognito's form. Okta and Entra ID use `post_logout_redirect_uri`, so provider sign-out there works only if the provider accepts these parameters.
+  - Without the option, sign-out ends the AgenticML session only.
+- **HTTPS required**: `--public-url` must use the `https://` scheme (except `http://127.0.0.1` and `localhost` in local testing).
+- **One provider per server**: Configure at most one sign-in provider. Running OIDC together with Firebase (`--firebase-project`) or an identity proxy header (`--identity-header`) is refused at startup.
+- **Open sign-up and admin emails**: Both `--open-signup` and `--admin-emails` work with OIDC. A user completing a verified OIDC sign-in gets a personal workspace if open sign-up is enabled, and becomes server administrator if their email matches `--admin-emails`. `/setup` is off with OIDC; the first admin comes from `--admin-emails`.
+- **Domain restrictions (`--signup-email-domains`)**: Comma-separated list of allowed domains (e.g. `example.com,example.org`). Open sign-up provisions accounts only for email addresses whose domain matches exactly (case-insensitive, no subdomain wildcards). It also withholds the personal workspace from existing accounts whose email is outside the listed domains. Accounts on the `--admin-emails` list are exempt from domain restrictions.
+- **Invites accepted via POST**: When inviting users, invite links use the fragment format (`/invite#token=...`). The client accepts the invite by submitting `POST /auth/oidc/start` with the token in the form body. `GET /auth/oidc/start` explicitly rejects invite tokens, preventing tokens from appearing in query strings or load balancer logs.
+- **Account linking and relinking rules**:
+  - The stored identifier is `oidc:<issuer tag>:<sub>`, where the tag is 12 hex digits derived from the issuer URL.
+  - A verified email links an OIDC sign-in only to an account that has no password, identity or provider link yet. Accounts with a password or a proxy identity and no provider link are not linked.
+  - An account linked to a Firebase uid, or to an OIDC uid from a different issuer (for example a re-created Cognito user pool), is relinked at the next sign-in with the same verified email, audited as `account.relink`.
+  - The same issuer with a different subject is refused.
+
 ### Proxy bypass with NO_PROXY
 
 If training machines define `HTTPS_PROXY` in their environment, add the server hostname to `NO_PROXY`:
@@ -212,11 +245,11 @@ A global account can have the `server_admin` flag set. Server administrators:
 
 Server administrator privileges can be granted through three paths:
 
-- **Admin emails (`--admin-emails` / `AGENTICML_SERVER_ADMIN_EMAILS`)**: Comma-separated list of emails, matched case-insensitively. Requires Firebase authentication (`--firebase-project`). Without Firebase, the list is ignored with a startup warning. Invalid entries are dropped with a warning. When a user completes a verified Firebase sign-in (Google OAuth or email/password with verified email) matching the list, their account is created if none exists and granted server admin with source `list`. With `--open-signup` the account also gets the free personal workspace (once); without it, no workspace is created. If an email is removed from the list, list-granted server admin is revoked at that person's next sign-in.
-- **Web administration (`/admin`)**: The "Server admins" section lists all server administrators (login, source, and sign-in state). Administrators can add server admins by email or login. Adding an email without an existing account creates a credential-less account that links on its first verified Firebase sign-in (`source` is `manual`). Administrators can remove server admins immediately; an email still in `--admin-emails` will regain server admin at its next sign-in.
+- **Admin emails (`--admin-emails` / `AGENTICML_SERVER_ADMIN_EMAILS`)**: Comma-separated list of emails, matched case-insensitively. Requires Firebase or OIDC authentication (`--firebase-project` or `--oidc-issuer`). Without Firebase or OIDC, the list is ignored with a startup warning. Invalid entries are dropped with a warning. When a user completes a verified Firebase or OIDC sign-in (Google OAuth, OIDC, or email/password with verified email) matching the list, their account is created if none exists and granted server admin with source `list`. With `--open-signup` the account also gets the free personal workspace (once); without it, no workspace is created. If an email is removed from the list, list-granted server admin is revoked at that person's next sign-in.
+- **Web administration (`/admin`)**: The "Server admins" section lists all server administrators (login, source, and sign-in state). Administrators can add server admins by email or login. Adding an email without an existing account creates a credential-less account that links on its first verified Firebase or OIDC sign-in (`source` is `manual`). Administrators can remove server admins immediately; an email still in `--admin-emails` will regain server admin at its next sign-in.
 - **Server CLI (`agenticml server accounts set-server-admin`)**: `set-server-admin LOGIN on|off` and `accounts add LOGIN --server-admin` grant or revoke server admin with source `manual`. Manual grants survive removal of an email from `--admin-emails`.
 
-**Last server admin rule**: The last server administrator who can sign in (has a password, an identity, or a linked Firebase account) can never be removed through the list, the web interface, or the CLI; a pending admin that has never signed in does not count and can always be removed (`agenticml server accounts set-server-admin LOGIN off` fails with "cannot remove the last server admin").
+**Last server admin rule**: The last server administrator who can sign in (has a password, an identity, or a linked Firebase or OIDC account) can never be removed through the list, the web interface, or the CLI; a pending admin that has never signed in does not count and can always be removed (`agenticml server accounts set-server-admin LOGIN off` fails with "cannot remove the last server admin").
 
 **CLI source column**: `agenticml server accounts list` displays a `source` column (`list`, `manual`, or `-`). The JSON output (`--json`) includes `server_admin_source`.
 
@@ -315,7 +348,7 @@ agenticml server users set-identity LOGIN [IDENTITY] --workspace SLUG
 
 `--workspace` defaults to `default`.
 
-Invite and setup links on a self-hosted server carry their token in the query string (`/invite?token=...`, `/setup?token=...`), because the server reads it to choose the page. If such a server sits behind a proxy or load balancer that logs request URLs, those tokens (single use, 72 hours for invites) appear in its logs; exclude query strings from that log. With Firebase sign-in on (the hosted service), `users invite` and the Members page print `/invite#token=...` instead: the fragment is never sent to the server or to any proxy in front of it.
+Invite and setup links on a self-hosted server carry their token in the query string (`/invite?token=...`, `/setup?token=...`), because the server reads it to choose the page. If such a server sits behind a proxy or load balancer that logs request URLs, those tokens (single use, 72 hours for invites) appear in its logs; exclude query strings from that log. With Firebase or OIDC sign-in on, `users invite` and the Members page print `/invite#token=...` instead: the fragment is never sent to the server or to any proxy in front of it.
 
 ## API keys and sync authentication
 
@@ -681,11 +714,16 @@ Sync clients on version 2.2 continue to sync to a 3.0 server without modificatio
 | `--firebase-project ID` | `AGENTICML_SERVER_FIREBASE_PROJECT` | unset | Firebase project ID for token verification. |
 | `--firebase-api-key KEY` | `AGENTICML_SERVER_FIREBASE_API_KEY` | unset | Firebase web API key for dashboard sign-in. |
 | `--firebase-auth-domain HOST` | `AGENTICML_SERVER_FIREBASE_AUTH_DOMAIN` | unset | Firebase auth domain (defaults to `<project>.firebaseapp.com`). |
+| `--oidc-issuer URL` | `AGENTICML_SERVER_OIDC_ISSUER` | unset | Sign in with this OpenID Connect issuer (Cognito, Okta, Entra ID, etc.); needs `--public-url` and the `[oidc]` extra. |
+| `--oidc-client-id ID` | `AGENTICML_SERVER_OIDC_CLIENT_ID` | unset | OIDC public client ID; redirect URI to register is `<public-url>/auth/oidc/callback`. |
+| `--oidc-logout-url URL` | `AGENTICML_SERVER_OIDC_LOGOUT_URL` | unset | Provider sign-out URL; sign-out redirects there with `client_id` and `logout_uri=<public-url>/login`. Optional. |
+| `--oidc-label TEXT` | `AGENTICML_SERVER_OIDC_LABEL` | `Sign in` | Sign-in button text on the login page. |
+| `--signup-email-domains LIST` | `AGENTICML_SERVER_SIGNUP_EMAIL_DOMAINS` | unset | Comma-separated email domains (exact match, no subdomains) that open sign-up serves; others get no account. |
 | `--limits FILE` | `AGENTICML_SERVER_LIMITS` | unset | Path to JSON file defining workspace usage limits and plans. |
 | `--metrics MODE` | `AGENTICML_SERVER_METRICS` | `off` | Capacity metrics mode: `off` or `cloudwatch`. Flag wins over env; blank counts as unset. Any other value refuses to start. Only `server serve` has it. |
-| `--admin-emails LIST` | `AGENTICML_SERVER_ADMIN_EMAILS` | unset | Comma-separated emails granted server admin on verified Firebase sign-in. Ignored without Firebase. |
+| `--admin-emails LIST` | `AGENTICML_SERVER_ADMIN_EMAILS` | unset | Comma-separated emails granted server admin on verified Firebase or OIDC sign-in. Ignored without Firebase or OIDC. |
 | `--legal-base-url URL` | `AGENTICML_SERVER_LEGAL_BASE_URL` | unset | `https://` base URL of your Terms, Acceptable use and Privacy pages (`terms/`, `acceptable-use/`, `privacy/` under it). With Firebase on, the sign-in page (`/login` and `/invite`) then shows "By continuing you agree to the Terms and the Acceptable use policy. See the Privacy policy." with those links. A non-`https://` value stops the server at startup. Ignored without Firebase. Not set means no links. |
-| `--open-signup` | `AGENTICML_SERVER_OPEN_SIGNUP` | off | Allow verified Firebase sign-in to create an account and personal workspace. A verified account with no workspace gets one at sign-in (once; an admin-deleted sign-up workspace is not recreated). |
+| `--open-signup` | `AGENTICML_SERVER_OPEN_SIGNUP` | off | Allow verified Firebase or OIDC sign-in to create an account and personal workspace. A verified account with no workspace gets one at sign-in (once; an admin-deleted sign-up workspace is not recreated). |
 | `--min-client-version X.Y` | `AGENTICML_SERVER_MIN_CLIENT_VERSION` | `2.2` | Reject `agenticml-lite` clients older than `X.Y` on `/v2` requests with HTTP 426. Values below `2.2` are unsupported: 2.0 and 2.1 clients misreport their own runs as foreign. |
 
 Additional environment variables:

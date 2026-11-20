@@ -9,9 +9,11 @@ from __future__ import annotations
 import http.client
 import json
 import re
+import select
 import socket
 import ssl
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,7 +30,18 @@ LAB_NAME = "agenticml.lab.internal"
 
 
 class TlsProxy:
-    """Terminate TLS on a loopback port and copy bytes to a plain-http upstream."""
+    """Terminate TLS on a loopback port and copy bytes to a plain-http upstream.
+
+    Teardown is deterministic: every socket is tracked the moment it exists (the
+    TLS socket before its handshake), nothing new starts once `stop` has begun,
+    and `stop` shuts sockets down until no thread is left. Each connection is
+    served by ONE thread that owns both of its sockets: an SSL object must not
+    be read and written from two threads at once, which showed up as a spurious
+    EOF that truncated a response.
+    """
+
+    HANDSHAKE_TIMEOUT = 10
+    IDLE_TIMEOUT = 30  # only a backstop: `stop` wakes every blocked socket itself
 
     def __init__(self, certs):
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -53,13 +66,19 @@ class TlsProxy:
         self.acceptor.start()
 
     def _track(self, sock):
+        """Register `sock` for `stop`; once stopping, close it and refuse instead."""
         with self.lock:
-            self.sockets.append(sock)
-        return sock
+            if not self.stopping.is_set():
+                self.sockets.append(sock)
+                return sock
+        self._close(sock)
+        raise OSError("proxy is stopping")
 
     def _spawn(self, target, *args):
         thread = threading.Thread(target=target, args=args, daemon=True)
         with self.lock:
+            if self.stopping.is_set():
+                raise OSError("proxy is stopping")
             self.threads.append(thread)
         thread.start()
 
@@ -71,24 +90,39 @@ class TlsProxy:
                 continue
             except OSError:
                 return
-            self._track(raw)
-            self._spawn(self._serve, raw)
+            try:
+                self._track(raw)
+                self._spawn(self._serve, raw)
+            except OSError:
+                self._close(raw)
+                return
 
     def _serve(self, raw):
+        client = upstream = None
         try:
-            raw.settimeout(10)
-            client = self._track(self.context.wrap_socket(raw, server_side=True))
-            upstream = self._track(socket.create_connection(("127.0.0.1", self.upstream_port), timeout=10))
-        except (OSError, ssl.SSLError):
-            self._close(raw)
-            return
-        self._spawn(self._pump, upstream, client)
-        self._pump(client, upstream)
+            raw.settimeout(self.HANDSHAKE_TIMEOUT)
+            # wrap_socket detaches `raw`: its descriptor moves to the TLS socket, so
+            # that one must be tracked before the handshake or `stop` cannot reach it.
+            client = self._track(self.context.wrap_socket(raw, server_side=True, do_handshake_on_connect=False))
+            client.do_handshake()
+            upstream = self._track(socket.create_connection(("127.0.0.1", self.upstream_port),
+                                                            timeout=self.HANDSHAKE_TIMEOUT))
+            client.settimeout(self.IDLE_TIMEOUT)
+            upstream.settimeout(self.IDLE_TIMEOUT)
+            self._relay(client, upstream)
+        except (OSError, ssl.SSLError, ValueError):
+            pass
+        finally:
+            for sock in (client, upstream, raw):
+                if sock is not None:
+                    self._close(sock)
 
     @staticmethod
     def _close(sock):
         try:
-            sock.shutdown(socket.SHUT_RDWR)
+            # The plain socket method: SSLSocket.shutdown would also drop the TLS state
+            # under a thread that is still using it.
+            socket.socket.shutdown(sock, socket.SHUT_RDWR)
         except (OSError, ValueError):
             pass
         try:
@@ -96,30 +130,49 @@ class TlsProxy:
         except OSError:
             pass
 
-    def _pump(self, source, sink):
-        try:
-            while True:
-                data = source.recv(65536)
+    def _relay(self, client, upstream):
+        """Copy bytes both ways until either side closes. The response side is
+        served first, and a failed write towards the upstream (it may answer and
+        hang up before reading the whole request) does not cut the response short."""
+        forwarding = True
+        while not self.stopping.is_set():
+            ready = select.select([client, upstream], [], [], 0.2)[0]
+            if client.pending() and client not in ready:
+                ready.append(client)
+            if not ready:
+                continue
+            if upstream in ready:
+                data = upstream.recv(65536)
                 if not data:
-                    break
-                sink.sendall(data)
-        except (OSError, ssl.SSLError):
-            pass
-        finally:
-            self._close(source)
-            self._close(sink)
+                    return
+                client.sendall(data)
+            if client in ready:
+                data = client.recv(65536)
+                if not data:
+                    return
+                if forwarding:
+                    try:
+                        upstream.sendall(data)
+                    except OSError:
+                        forwarding = False
 
     def stop(self):
         self.stopping.set()
         self._close(self.listener)
         if self.acceptor is not None:
             self.acceptor.join(timeout=5)
-        with self.lock:
-            sockets, threads = list(self.sockets), list(self.threads)
-        for sock in sockets:
-            self._close(sock)
-        for thread in threads:
-            thread.join(timeout=5)
+        deadline = time.monotonic() + 10
+        while True:
+            with self.lock:
+                sockets, threads = list(self.sockets), list(self.threads)
+            for sock in sockets:
+                self._close(sock)
+            for thread in threads:
+                thread.join(timeout=0.2)
+            with self.lock:
+                settled = len(self.sockets) == len(sockets) and len(self.threads) == len(threads)
+            if (settled and not any(thread.is_alive() for thread in threads)) or time.monotonic() > deadline:
+                break
         assert self.acceptor is None or not self.acceptor.is_alive()
         assert not any(thread.is_alive() for thread in threads)
 

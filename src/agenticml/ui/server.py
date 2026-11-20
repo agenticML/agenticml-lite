@@ -1432,7 +1432,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         extra = {} if headers is None else dict(headers)
         self.send_header("Content-Security-Policy", extra.pop("Content-Security-Policy", _CSP))
         for name, value in extra.items():
-            self.send_header(name, value)
+            # A list sends the header once per item (two Set-Cookie lines).
+            for item in value if isinstance(value, (list, tuple)) else (value,):
+                self.send_header(name, item)
         self.end_headers()
 
     def _send(self, body, content_type, status=200, headers=None):

@@ -16,6 +16,8 @@ logger = logging.getLogger("agenticml.server.userspage")
 _SELF_INVITE = "you cannot re-invite yourself; change your password from the Account menu"
 _FIREBASE_REINVITE = ("members sign in with Google or email at /login; no invite link is needed "
                       "(send a new invite to someone who has not joined yet)")
+_OIDC_REINVITE = ("members sign in with your identity provider at /login; no invite link is needed "
+                  "(send a new invite to someone who has not joined yet)")
 
 
 def _user_name(name):
@@ -52,7 +54,7 @@ def _user_run_counts(handler):
 
 
 def _invite_url(webauth, handler, token):
-    return invite_link(command_host(webauth, handler)["host"], token, webauth.firebase is not None)
+    return invite_link(command_host(webauth, handler)["host"], token, webauth.external_signin)
 
 
 def _audit(handler, principal, action, target, detail=None):
@@ -158,10 +160,13 @@ def handle(webauth, handler, path, *, show_owner=False):
                 if name == principal.user:
                     handler._json({"error": _SELF_INVITE}, 409)
                     return
-                if webauth.firebase is not None:
-                    # A re-invite is a password-reset token, which the Firebase
-                    # invite page never accepts; Firebase members just sign in.
-                    handler._json({"error": _FIREBASE_REINVITE}, 409)
+                if webauth.external_signin:
+                    # A re-invite is a password-reset token, which the external
+                    # (Firebase or OIDC) invite page never accepts; members just
+                    # sign in with the provider.
+                    handler._json(
+                        {"error": _OIDC_REINVITE if webauth.oidc is not None else _FIREBASE_REINVITE},
+                        409)
                     return
                 try:
                     token = users.create_invite(name)

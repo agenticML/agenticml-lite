@@ -12,6 +12,7 @@ plans live next to it:
 - Release 2.2: [on-prem-teams-plan.md](on-prem-teams-plan.md)
 - Release 3.0: [on-prem-3.0-plan.md](on-prem-3.0-plan.md)
 - Release 3.1: sketched below, with package plans in `packages/`.
+- Release 3.3: [packages/36-aws-self-deploy.md](packages/36-aws-self-deploy.md).
 
 ## Product direction
 
@@ -40,6 +41,7 @@ plans live next to it:
 | **3.0** | Database storage, workspaces and hosted service | Server state in SQLite or Postgres, workspaces with accounts and memberships on one hostname, Firebase sign-in and self-serve sign-up with free limits, many server processes, S3 objects, metric summaries, AWS deployment, agenticml-server retired | Exit criteria 1–6 in the [3.0 plan](on-prem-3.0-plan.md); released Nov 17, 2026 as 3.0.0 (tag `v3.0.0`, [PyPI](https://pypi.org/project/agenticml-lite/3.0.0/), [GitHub release](https://github.com/agenticML/agenticml-lite/releases/tag/v3.0.0)) |
 | **3.1** | Scale and visibility | Usage history on `/admin` and `agenticml server stats`, capacity metrics with a CloudWatch dashboard and alarms, ECS autoscaling for the hosted service | A server admin sees accounts, active users, workspaces and stored data over time; the hosted service shows request, latency, task and database load on one dashboard; under a load test it scales between 1 and its maximum task count with no failed requests |
 | **3.2** | Private networks | Run the server and dashboard inside a lab VPC without Tailscale: CA bundle and per-host http trust on the client, a TLS proxy kit (Caddy, nginx), an end-to-end test through a TLS proxy, a private-network docs page | A lab follows the docs to sync from its training machines and sign in from its browsers over HTTPS with an internal certificate, with nothing reaching in from the internet |
+| **3.3** | Deploy in your own AWS account | One CloudFormation template (EC2 + SQLite from PyPI, ALB + ACM, Cognito sign-up and sign-in) and OIDC sign-in in the server | A deployer with an AWS account and a Route 53 domain launches the template, signs up with the admin email and syncs a run, with no other setup |
 | Later | Scale and lifecycle | Unscheduled; see below | – |
 
 Decision (Nov 5, 2026): the server ships only as the `agenticml-lite`
@@ -337,9 +339,9 @@ Backlog.
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 31 | Usage history: `accounts.last_active_at`, daily `stats_daily` snapshots refreshed hourly inside the server, `GET /api/admin/stats`, `agenticml server stats`, Usage section with growth charts on `/admin` | 3.0 | Sonnet | M | [plan](packages/31-usage-history.md) | in review |
-| 32 | Capacity metrics: per-minute requests, errors, latency percentiles, peak requests in progress and database connections, and the 31 totals, sent with `PutMetricData` (`--metrics cloudwatch`, off by default); alarms on database CPU credits, database connections and ECS memory in `hosted.yaml`; a CloudWatch dashboard in `bootstrap.yaml` | 31 | Sonnet | M | [plan](packages/32-capacity-metrics.md) | in review |
-| 33 | ECS autoscaling: target tracking on service CPU (60%) between `DesiredCount` (minimum) and a new `MaxTaskCount` (1–4, default 1 = off); a per-process Postgres connection budget (`AGENTICML_SERVER_DB_CONNECTIONS`) sized by `DbInstanceClass` (new parameter; micro allows at most 2 tasks) so every task fits the database even during deploys; deploys stop resetting the count; `max_task_count` deploy input | 32, owner's two-task check | Sonnet; owner runs it | M | [plan](packages/33-autoscaling.md) | in review |
+| 31 | Usage history: `accounts.last_active_at`, daily `stats_daily` snapshots refreshed hourly inside the server, `GET /api/admin/stats`, `agenticml server stats`, Usage section with growth charts on `/admin` | 3.0 | Sonnet | M | [plan](packages/31-usage-history.md) | done ([#84](https://github.com/agenticML/agenticml-lite/pull/84), merged Nov 19, 2026; owner steps in the Backlog) |
+| 32 | Capacity metrics: per-minute requests, errors, latency percentiles, peak requests in progress and database connections, and the 31 totals, sent with `PutMetricData` (`--metrics cloudwatch`, off by default); alarms on database CPU credits, database connections and ECS memory in `hosted.yaml`; a CloudWatch dashboard in `bootstrap.yaml` | 31 | Sonnet | M | [plan](packages/32-capacity-metrics.md) | done ([#84](https://github.com/agenticML/agenticml-lite/pull/84), merged Nov 19, 2026; owner steps in the Backlog) |
+| 33 | ECS autoscaling: target tracking on service CPU (60%) between `DesiredCount` (minimum) and a new `MaxTaskCount` (1–4, default 1 = off); a per-process Postgres connection budget (`AGENTICML_SERVER_DB_CONNECTIONS`) sized by `DbInstanceClass` (new parameter; micro allows at most 2 tasks) so every task fits the database even during deploys; deploys stop resetting the count; `max_task_count` deploy input | 32, owner's two-task check | Sonnet; owner runs it | M | [plan](packages/33-autoscaling.md) | done ([#84](https://github.com/agenticML/agenticml-lite/pull/84), merged Nov 19, 2026; owner steps in the Backlog) |
 
 - **31** answers "are we growing?" with no AWS change and no data sent
   anywhere: the server keeps one row of totals per UTC day (accounts,
@@ -372,12 +374,33 @@ example or docs). It does not depend on 3.1 (packages 31–33, merged in
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 34 † | Private-network deployment (no Tailscale) | 3.0 | Sonnet; prose Antigravity; owner releases | M | [plan](packages/34-private-network.md) | done (this PR; owner steps 34.4 publish and 34.5 left) |
-| 34.1 † | Client trust: `--ca-bundle`, saved bundle, `AGENTICML_CA_BUNDLE`, saved `insecure` per host, certificate errors without retries and with clear text, redirect text | 3.0 | Sonnet | M | [plan](packages/34-private-network.md) | done (this PR; Sonnet coded; supervisor reviewed with two adversarial review passes and did the † second review) |
-| 34.2 † | Deploy kit (`deploy/private-network/`: Caddy, nginx, env file, checklist incl. first admin, CA, SELinux, backups), sync unit lines, end-to-end test through a TLS proxy with a private CA | 34.1 | Sonnet | M | [plan](packages/34-private-network.md) | done (this PR; Sonnet coded; supervisor reviewed, checked the Caddyfile with `caddy validate` and did the † second review) |
-| 34.3 | Docs: SERVER.md section and troubleshooting, THREAT_MODEL.md, PROTOCOL.md, website page and facts test, README, systemd README | 34.1, 34.2 | Antigravity; supervisor checks | S–M | [plan](packages/34-private-network.md) | done (this PR; Antigravity drafted, Sonnet corrected the fact-check findings, supervisor checked against the code) |
-| 34.4 | Version 3.2.0; docs require `agenticml-lite>=3.2` and the kit from the matching tag | 34.3 | Sonnet; owner tags and publishes | S | [plan](packages/34-private-network.md) | done in code (this PR: version 3.2.0, Releases page); owner tags and publishes |
+| 34 † | Private-network deployment (no Tailscale) | 3.0 | Sonnet; prose Antigravity; owner releases | M | [plan](packages/34-private-network.md) | done ([#86](https://github.com/agenticML/agenticml-lite/pull/86), merged Nov 19, 2026; owner steps 34.4 publish and 34.5 left) |
+| 34.1 † | Client trust: `--ca-bundle`, saved bundle, `AGENTICML_CA_BUNDLE`, saved `insecure` per host, certificate errors without retries and with clear text, redirect text | 3.0 | Sonnet | M | [plan](packages/34-private-network.md) | done ([#86](https://github.com/agenticML/agenticml-lite/pull/86), merged Nov 19, 2026; Sonnet coded; supervisor reviewed with two adversarial review passes and did the † second review) |
+| 34.2 † | Deploy kit (`deploy/private-network/`: Caddy, nginx, env file, checklist incl. first admin, CA, SELinux, backups), sync unit lines, end-to-end test through a TLS proxy with a private CA | 34.1 | Sonnet | M | [plan](packages/34-private-network.md) | done ([#86](https://github.com/agenticML/agenticml-lite/pull/86), merged Nov 19, 2026; Sonnet coded; supervisor reviewed, checked the Caddyfile with `caddy validate` and did the † second review) |
+| 34.3 | Docs: SERVER.md section and troubleshooting, THREAT_MODEL.md, PROTOCOL.md, website page and facts test, README, systemd README | 34.1, 34.2 | Antigravity; supervisor checks | S–M | [plan](packages/34-private-network.md) | done ([#86](https://github.com/agenticML/agenticml-lite/pull/86), merged Nov 19, 2026; Antigravity drafted, Sonnet corrected the fact-check findings, supervisor checked against the code) |
+| 34.4 | Version 3.2.0; docs require `agenticml-lite>=3.2` and the kit from the matching tag | 34.3 | Sonnet; owner tags and publishes | S | [plan](packages/34-private-network.md) | done in code ([#86](https://github.com/agenticML/agenticml-lite/pull/86), merged Nov 19, 2026: version 3.2.0, Releases page); owner tags and publishes |
 | 34.5 | First lab install from the docs (Backlog owner step) | 34.4 | Owner | S | [plan](packages/34-private-network.md) | not started |
+
+### 3.3: deploy in your own AWS account
+
+Added Nov 19, 2026 at the owner's request ("make things a lot simpler for
+onboarding … a CloudFormation script for users who want to deploy; target
+users that have an AWS environment"). Today, self-serve sign-up needs a
+Firebase project, and our AWS templates are tied to our account. Decisions
+D36.1–D36.7 are in the plan: one EC2 instance with SQLite installed from
+PyPI (no image), ALB + ACM, Amazon Cognito through a generic OIDC client
+in the server (which also starts the Later "Enterprise SSO" entry), and
+about $45–55/month. It comes after 3.2 (package 34); 36.1 and 36.2 do not
+touch 34's files, and 36.3 and 36.4 build on 34 (merged into this branch from PR #86, which must merge first).
+
+| # | Package | Depends on | Coder | Size | Plan | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| 36 † | Deploy in your own AWS account | 3.2 | Sonnet; prose Antigravity; owner releases and deploys | L | [plan](packages/36-aws-self-deploy.md) | done in code (this PR; owner steps 36.4 publish and 36.5 first deploy left) |
+| 36.1 † | Server: OIDC sign-in (authorization code + PKCE), open sign-up, admin emails and invites on OIDC, `--signup-email-domains`, `[oidc]` extra | 3.0 | Sonnet | M–L | [plan](packages/36-aws-self-deploy.md) | done ([#88](https://github.com/agenticML/agenticml-lite/pull/88); Sonnet coded; supervisor reviewed in three rounds with adversarial review passes and did the † second review; checked on Postgres 16 locally) |
+| 36.2 † | Template `deploy/aws-self-hosted/agenticml.yaml` (VPC optional, ALB, ACM, Route 53, Cognito, EC2 Auto Scaling group of 1, data volume with daily snapshots), static tests, cfn-lint in CI | 36.1 options | Sonnet | M | [plan](packages/36-aws-self-deploy.md) | done ([#88](https://github.com/agenticML/agenticml-lite/pull/88); Sonnet coded; supervisor reviewed in three rounds with adversarial review passes and did the † second review; cfn-lint clean; AWS behaviour checked statically only until 36.5) |
+| 36.3 | Docs: "Deploy on AWS" page, SERVER.md OIDC section, threat model, README, facts test | 36.2, 34.3 | Antigravity; supervisor checks | S–M | [plan](packages/36-aws-self-deploy.md) | done ([#88](https://github.com/agenticML/agenticml-lite/pull/88); Antigravity drafted; two fact-check rounds against the code with adversarial verification; supervisor corrected two wordings) |
+| 36.4 | Version 3.3.0; template on the GitHub release; Launch Stack link (owner: public S3 bucket) | 36.3, 34.4 | Sonnet; owner tags and publishes | S | [plan](packages/36-aws-self-deploy.md) | done in code ([#88](https://github.com/agenticML/agenticml-lite/pull/88): version 3.3.0, `release-assets.yml` attaches the template to a published release, version tied to the template default by a test); owner tags, publishes and adds the Launch Stack bucket (Backlog) |
+| 36.5 | First real deploy in an AWS account (Backlog owner step) | 36.4 | Owner | S | [plan](packages/36-aws-self-deploy.md) | not started |
 
 ### Outreach
 
@@ -405,6 +428,12 @@ part can go to `main` early as a docs-only PR.
   e2e and metrics tests): [plan](packages/fix-flaky-postgres-timeouts.md),
   found in [#83](https://github.com/agenticML/agenticml-lite/pull/83);
   status: done ([#85](https://github.com/agenticML/agenticml-lite/pull/85)).
+- The hosted deploy log printed the admin email addresses
+  (`HOSTED_ADMIN_EMAILS` variable) in this public repository's Actions logs:
+  [plan](packages/fix-admin-emails-in-deploy-log.md), found in deploy run
+  44499848598 (Nov 19, 2026); the value moves to an environment secret and
+  each address is masked; status: done (this PR; owner step in the
+  Backlog).
 
 ### Later (unscheduled)
 
@@ -481,6 +510,31 @@ on Nov 17, 2026; none of the entries below blocked it.
 
 ### Owner steps
 
+- **Move the admin emails to a secret** (fix
+  [admin emails in the deploy log](packages/fix-admin-emails-in-deploy-log.md),
+  Nov 19, 2026). High priority: do it before the next hosted deploy; deploys
+  stop at "Check required variables" until it is done.
+  - Where: repository Settings → Environments → `hosted`; Actions run logs of
+    `deploy.yml`.
+  - Problem: the `HOSTED_ADMIN_EMAILS` variable was printed in every deploy
+    run log, and the repository is public. The fix reads it from an
+    environment secret instead, but the value can only be moved by the owner,
+    and the old run logs still contain the address.
+  - Fix: (1) `gh secret set HOSTED_ADMIN_EMAILS --env hosted` with the same
+    value (it prompts); (2) `gh variable delete HOSTED_ADMIN_EMAILS --env
+    hosted`; (3) approve the next deploy and check that its log shows
+    `ADMIN_EMAILS: ***` and that you still have server admin after signing in
+    again; (4) optional: delete the logs of earlier deploy runs
+    (`gh run list --workflow deploy.yml --limit 200`, then
+    `gh api -X DELETE repos/agenticML/agenticml-lite/actions/runs/<id>/logs`
+    for each, or delete the runs in the Actions tab).
+  - Done when: the variable is gone, a deploy log shows `***` for
+    `ADMIN_EMAILS`, admin sign-in still works, and whether old logs were
+    deleted is recorded here.
+  - Progress: (1) and (2) done Nov 19, 2026 (secret set 14:13 UTC, variable
+    deleted). Until this PR is merged, do not approve a deploy from `dev`:
+    the old workflow would read the now-empty variable and drop the admin
+    list.
 - **Capacity dashboard and metrics** (package 32, Nov 18, 2026). Do after
   the 3.1 PR is merged to `dev` and deployed.
   - Where: `deploy/aws/README.md`, "Capacity dashboard and metrics"; the
@@ -549,6 +603,68 @@ on Nov 17, 2026; none of the entries below blocked it.
     `agenticml server verify`; note every step that did not match the docs.
   - Done when: both machines' runs show in the dashboard, `server verify`
     reports 0 problems, and each mismatch is fixed or recorded here.
+- **3.3.0 release and Launch Stack link** (package 36.4, owner). Do after
+  the "3.2.0 release" step. PR #88 is stacked on #86 (3.2), so merge #86
+  first.
+  - Where: tags; `pypi` environment; a new public S3 bucket; the docs page
+    `server/deploy-on-aws.md`.
+  - Problem: the template's default `AgenticmlVersion` is 3.3.0, so a deploy
+    fails until 3.3.0 is on PyPI. The docs can only offer "upload the
+    template" until the template sits in a public S3 bucket, because a
+    CloudFormation quick-create link needs an S3 URL.
+  - Fix:
+    (1) Tag `v3.3.0` on `main` after `v3.2.0`, and approve the Publish run.
+    Then publish the GitHub release for the tag yourself (the UI or `gh
+    release create`, not with a workflow's `GITHUB_TOKEN`). The
+    `release-assets.yml` workflow then attaches `agenticml.yaml`, after
+    checking that the template's default version equals the tag.
+    (2) Create a bucket, for example `agenticml-templates`. Allow public
+    read only on `self-hosted/*`, keep Block Public Access off for that
+    prefix only, and do not allow listing.
+    (3) Upload `self-hosted/3.3.0/agenticml.yaml` and
+    `self-hosted/latest/agenticml.yaml`.
+    (4) Add the Launch Stack button to the docs page:
+    `https://console.aws.amazon.com/cloudformation/home#/stacks/quickcreate?templateURL=<bucket URL>/self-hosted/latest/agenticml.yaml&stackName=agenticml`.
+  - Done when: 3.3.0 is on PyPI, the release has `agenticml.yaml`, and the
+    Launch Stack link opens the quick-create page in a clean account.
+- **First real deploy of the AWS template** (package 36.5, owner; after the
+  step above). The template is checked only statically: cfn-lint, 73 tests
+  and stubbed bootstrap runs.
+  - Where: a clean AWS account or region, and a Route 53 zone.
+  - Problem: these behaviours have never run on AWS:
+    - the AL2023 packages (`python3.11`, `python3.11-pip`,
+      `aws-cfn-bootstrap`), and that uid/gid 5400 is free;
+    - `cfn-signal` and the ASG creation policy;
+    - the EBS attach and the NVMe by-id link;
+    - `xfs_growfs` as `ExecStartPre=+`;
+    - ACM DNS validation and the alias record;
+    - Cognito Lite with deletion protection, the pre-sign-up trigger, the
+      classic hosted UI, and sign-up with `WriteAttributes [email, name]`;
+    - the logout redirect;
+    - the rolling update and instance replacement;
+    - DLM;
+    - the existing-VPC path (`SubnetZone`);
+    - a restore with `DataSnapshotId`.
+  - Fix: follow `server/deploy-on-aws.md` exactly, and check each item in
+    turn:
+    (1) `SignUp=open` with `AllowedEmailDomains`: the admin email signs up
+    and owns `default`; a second in-domain email gets its own workspace; an
+    out-of-domain email is refused by Cognito.
+    (2) Create a key and `sync --follow` one run from a laptop.
+    (3) Stack update to a new `AgenticmlVersion` (or the same version with a
+    changed `BackupRetentionDays`, to check that nothing rolls): the data is
+    still there.
+    (4) Terminate the instance by hand: the ASG replaces it and the data is
+    intact.
+    (5) Raise `DataVolumeSize`, reboot, and `df` shows the new size.
+    (6) Restore drill: a new stack from a DLM snapshot with
+    `DataSnapshotId`; sign in again; `server verify` reports 0 problems.
+    (7) Repeat a short launch into an existing VPC with `Scheme=internal`.
+    (8) Delete both stacks: the final snapshot exists and the pool is
+    retained.
+    Record the cost after 7 days.
+  - Done when: every step passes, or each mismatch is fixed in the template
+    with a test, and the cost is recorded here.
 - **Release follow-ups (owner)** (3.0.0 released Nov 17, 2026). Low priority.
   - Where: repository Settings → Environments → `pypi`; tags.
   - Problem: the `pypi` environment has no required reviewer, so any pushed

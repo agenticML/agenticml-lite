@@ -138,18 +138,23 @@ jobs:
           if [[ "$EVENT_NAME" == pull_request ]]; then
             git diff --name-only "$BASE_SHA" "$HEAD_SHA" > /tmp/deploy-changed-files
           fi
+          # The image build (and the lint) run for the hosted service's files; the
+          # lint alone also runs for the self-hosted AWS template.
           if [[ "$EVENT_NAME" != pull_request ]] || grep -Eq '^(deploy/aws/|\.github/workflows/(deploy|test)\.yml$|pyproject\.toml$|\.dockerignore$)' /tmp/deploy-changed-files; then
             echo 'run=true' >> "$GITHUB_OUTPUT"
+            echo 'lint=true' >> "$GITHUB_OUTPUT"
+          elif grep -Eq '^deploy/aws-self-hosted/' /tmp/deploy-changed-files; then
+            echo 'lint=true' >> "$GITHUB_OUTPUT"
           fi
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
-        if: steps.changes.outputs.run == 'true'
+        if: steps.changes.outputs.lint == 'true'
         with:
           python-version: "3.12"
       - name: Lint CloudFormation templates
-        if: steps.changes.outputs.run == 'true'
+        if: steps.changes.outputs.lint == 'true'
         run: |
           python -m pip install cfn-lint==1.60.0
-          cfn-lint deploy/aws/cloudformation/*.yaml
+          cfn-lint deploy/aws/cloudformation/*.yaml deploy/aws-self-hosted/agenticml.yaml
       - name: Build and check hosted image
         if: steps.changes.outputs.run == 'true'
         run: |

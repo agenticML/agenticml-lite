@@ -19,6 +19,7 @@ sidebar:
 ## Topics
 
 - [Installation and deployment](/agenticml-lite/server/install/): Install via pip, optional extras (`[postgres]`, `[s3]`, `[firebase]`, `[hosted]`), run directly or under systemd, and configure a TLS proxy.
+- [Deploy on AWS](/agenticml-lite/server/deploy-on-aws/): One CloudFormation template in your own account.
 - [Authentication and keys](/agenticml-lite/server/keys/): Workspaces, roles (`owner`, `admin`, `member`, `viewer`), workspace-bound API keys, and dashboard sessions.
 - [Syncing runs](/agenticml-lite/server/sync/): Connect training machines with `agenticml login`, `sync --all`, continuous `sync --follow`, and storage limit handling.
 - [Backups and restore](/agenticml-lite/server/backups/): Online consistent backups via `agenticml server backup`, SQLite snapshots, PostgreSQL dumps, and restore.
