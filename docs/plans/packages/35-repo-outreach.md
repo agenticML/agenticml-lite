@@ -438,6 +438,82 @@ the lineage inspector for runs without snapshots). They were fixed in the
 same PR ([plan](fix-demo-gif-ui-defects.md)), and the three images were
 regenerated from the fixed dashboard.
 
+### Lineage draft (Nov 21, 2026)
+
+Owner, after seeing `demo.gif`: the lineage graph shows for about one
+frame; "i want to highlight the concept of lineage graph, create one more
+draft of the gif that we can use". A second GIF, `docs/assets/demo-lineage.gif`,
+made next to `demo.gif`. The README keeps `demo.gif` until the owner picks
+one.
+
+**Goal.** The GIF makes the lineage idea readable: every run records the run
+it came from, the tree shows how an experiment evolved over generations, and
+each step shows what changed (params and code) and what it did to the
+metric. Then the best path is compared.
+
+**Files.** `scripts/make_readme_images.py` (new `--only lineage` choice and
+the scenes), `docs/assets/demo-lineage.gif` (new, generated), this section
+and the roadmap row 35.3. No dashboard, server or README change.
+
+**Seeding (draft only, its own temporary store).**
+
+- The five runs of `demo.gif` plus two: `mixup-long` (child of `mixup`,
+  gen 3, 30 epochs, the new best) and `lr-1e-2` (child of `baseline`, last
+  step 59, status `crashed`). The tree then has 7 runs, 4 generations, 4
+  branches and one failed run.
+- One config seed (42) in this draft, so the config diffs show only the
+  changes that matter (the curves keep each run's own seed).
+- Real code snapshots: `lineage=True`. Before each run the script writes
+  `train.py` in the work directory with that run's change (schedule, mixup,
+  weight decay, epochs), so the inspector shows "1 file changed · train.py"
+  next to the param diff. `wd-5e-4` keeps its parent's code ("code
+  unchanged", a param-only change).
+- `demo.gif`, `dashboard.png` and `social-preview.png` keep the current
+  seeding and do not change.
+
+**Storyboard (about 18–22 s, loops).** A short caption pill at the bottom
+names each beat (the draft only; injected like the cursor).
+
+1. Live run, short: the same page as `demo.gif`'s scene 1 with fewer polls
+   (about 3 s). Caption: "A run is training".
+2. Run list, click "Lineage ⤢". The view is fitted ("Fit") so the root is in
+   view, and holds with the best path lit. Caption: "Every run records the
+   run it came from".
+3. Untick then tick "Highlight best path": the path from the root to the
+   best run lights up. Caption: "The best path: from the root run to the
+   best one".
+4. Walk the path: click `baseline` (root config, baseline snapshot),
+   `cosine-warmup`, `mixup`, `mixup-long`, holding about 1.2 s each so the
+   inspector's config diff, code row and Δ vs parent / Δ vs root can be
+   read. Caption: "What each step changed, and what it did to val_loss".
+5. Click the crashed `lr-1e-2`: a dead branch stays in the record. Caption:
+   "Dead ends stay in the record".
+6. "Best path" quick select, then "Compare 4 runs" from the tray: the
+   compare view overlays the path's curves. Caption: "Compare the best
+   path".
+
+As built (Nov 21, 2026): 78 frames, 21.9 s, 0.56 MB. The caption pill sits
+at the bottom right, over the lineage footnote, so it hides neither the
+legend nor the tray. Reviewed by Sonnet (read-only); its four findings
+(plan wording, a stricter inspector wait, the final cursor spot) are fixed.
+
+**Constraints.** Same recording rules as `demo.gif` (fake clock, one
+screenshot per frame, one palette, 960 wide). Under 3 MB. No change to
+`demo.gif` output for `--only all|gif|png`.
+
+**Edge cases.** The 4-lane tree must fit the 1280×800 viewport with the
+inspector open (check the frames; zoom out one step if it does not). The
+crashed run must not be picked as best. `train.py` must not land in the
+store's run code (`track_source=False` already).
+
+**Checks.** Run `--only lineage`. View the frames for each beat: the tree is
+fully in view, captions don't hide the controls, the inspector text is
+readable at 960 px, no "Loading" or empty chart. Run `--only gif` and confirm
+`demo.gif` still renders. `tests/test_website_facts.py` passes.
+
+**Done when.** `demo-lineage.gif` exists, the owner has seen it, and the
+choice between the two GIFs is the owner's.
+
 ## Branch and release
 
 One PR to `main` (the working branch) with the plan, script, GIF, README and

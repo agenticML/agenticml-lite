@@ -10,14 +10,18 @@ the dashboard, and writes:
 - docs/assets/demo.gif (the README's animated demo, 960 wide, about 20 s, loops:
   a live run's curves growing, the task's lineage graph, select and compare,
   then hover readouts and smoothing in the metrics workspace)
+- docs/assets/demo-lineage.gif (``--only lineage``, a draft that puts the
+  lineage graph first: a deeper tree with code snapshots, the best path,
+  what changed at each step, then the best path compared; captioned)
 
 Run from the repo root with the testbed venv (it has Playwright and Pillow):
 
-    testbed/.venv/bin/python scripts/make_readme_images.py [--only {all,gif,png}]
+    testbed/.venv/bin/python scripts/make_readme_images.py [--only {all,gif,png,lineage}]
 
 A full run takes about 15 seconds (the GIF is one screenshot per frame).
 ``--only png`` writes dashboard.png and social-preview.png, ``--only gif``
-writes demo.gif only.
+writes demo.gif only, ``--only lineage`` writes demo-lineage.gif only (from
+its own store, seeded with two more runs and real code snapshots).
 
 No network access: fonts and the logo come from files in this repo. Not part
 of the test suite.
@@ -62,6 +66,7 @@ LOGO = ROOT / "website" / "src" / "assets" / "logo-light.svg"
 DASHBOARD_PNG = ASSETS / "dashboard.png"
 SOCIAL_PNG = ASSETS / "social-preview.png"
 DEMO_GIF = ASSETS / "demo.gif"
+LINEAGE_GIF = ASSETS / "demo-lineage.gif"
 
 PROJECT = "cifar-resnet"
 TASK = "image-classification"
@@ -100,6 +105,22 @@ RUNS = [
         "name": "wd-5e-4", "parent": "cosine-warmup", "seed": 53, "lr": 7e-4, "schedule": "cosine", "augment": "flip",
         "mixup": 0.0, "weight_decay": 5e-4, "tau": 60, "floor": 0.40, "gap": 0.03,
         "tags": ["regularization"], "notes": "Cosine-warmup with stronger weight decay.",
+    },
+]
+
+# The lineage draft's two extra runs: a third generation (the new best) and a
+# branch that diverged and crashed at step ``crash_at``. Parents come first.
+LINEAGE_RUNS = RUNS + [
+    {
+        "name": "mixup-long", "parent": "mixup", "seed": 61, "lr": 1.5e-3, "schedule": "cosine",
+        "augment": "flip+mixup", "mixup": 0.2, "weight_decay": 1e-4, "epochs": 30, "tau": 58,
+        "floor": 0.30, "gap": -0.05, "tags": ["schedule", "augmentation"],
+        "notes": "Mixup, trained for 30 epochs instead of 20.",
+    },
+    {
+        "name": "lr-1e-2", "parent": "baseline", "seed": 71, "lr": 1e-2, "schedule": "constant",
+        "augment": "flip", "mixup": 0.0, "weight_decay": 0.0, "tau": 90, "floor": 0.9, "gap": 0.3,
+        "crash_at": 60, "tags": ["lr-sweep"], "notes": "Ten times the baseline learning rate: diverged.",
     },
 ]
 
@@ -146,7 +167,37 @@ def curves(spec):
         }
 
 
-def start_run(spec, root: Path, parent_id: str | None = None):
+def train_source(spec) -> str:
+    """The run's ``train.py`` for the lineage draft's code snapshots: the
+    schedule, mixup and epoch count are code changes; lr and weight decay are
+    params only, so a run that changes just those keeps its parent's code."""
+    schedule = (
+        "    return None  # constant learning rate"
+        if spec["schedule"] == "constant"
+        else "    return warmup_cosine(optimizer, warmup=0.05, total=steps)"
+    )
+    batches = (
+        f"    return mixup(loader, alpha={spec['mixup']})" if spec["mixup"] else "    return loader"
+    )
+    return "\n".join([
+        '"""ResNet-18 on CIFAR-10."""',
+        "from data import loaders, mixup",
+        "from model import resnet18, warmup_cosine",
+        "",
+        f"EPOCHS = {spec.get('epochs', 20)}",
+        "",
+        "",
+        "def schedule(optimizer, steps):",
+        schedule,
+        "",
+        "",
+        "def batches(loader):",
+        batches,
+        "",
+    ])
+
+
+def start_run(spec, root: Path, parent_id: str | None = None, snapshots: bool = False):
     return agenticml.Run(
         PROJECT,
         spec["name"],
@@ -161,8 +212,10 @@ def start_run(spec, root: Path, parent_id: str | None = None):
             "augment": spec["augment"],
             "mixup_alpha": spec["mixup"],
             "batch_size": 128,
-            "epochs": 20,
-            "seed": spec["seed"],
+            "epochs": spec.get("epochs", 20),
+            # The lineage draft keeps one seed, so the config diffs show only
+            # the changes that matter (the curves still use spec["seed"]).
+            "seed": 42 if snapshots else spec["seed"],
         },
         tags=spec["tags"],
         notes=spec["notes"],
@@ -171,7 +224,8 @@ def start_run(spec, root: Path, parent_id: str | None = None):
         auto_track=False,
         track_source=False,
         capture_env=False,
-        lineage=False,
+        # The lineage draft snapshots the work directory's train.py.
+        lineage=snapshots,
         # The background flusher is off the clock: frames flush by hand.
         flush_interval=3600,
     )
@@ -203,31 +257,37 @@ class LiveRun:
         self.finished = True
 
 
-def finish_run(run, val_loss) -> None:
+def finish_run(run, val_loss, status: str = "finished") -> None:
     # The dashboard ranks a task by the first loss or accuracy key of the run
     # summaries, so keep val_loss alone: the lowest val_loss is the "best" run.
     # It is the mean of the last 10 steps, not the (noisy) final step.
     run.summary["val_loss"] = round(sum(val_loss[-10:]) / len(val_loss[-10:]), 5)
-    run.finish()
+    run.finish(status=status)
 
 
-def seed_store(root: Path, live: str | None = None):
+def seed_store(root: Path, live: str | None = None, runs=RUNS, snapshots: bool = False):
     """Write the runs. The run named ``live`` is left open and unfinished,
     with no steps logged: the caller drives it through the returned
-    ``LiveRun`` (None when ``live`` is not given)."""
+    ``LiveRun`` (None when ``live`` is not given). With ``snapshots``, each
+    run snapshots a ``train.py`` written for it in the current directory."""
     ids = {}
     live_run = None
-    for spec in RUNS:
-        run = start_run(spec, root, ids.get(spec["parent"]))
+    for spec in runs:
+        if snapshots:
+            Path("train.py").write_text(train_source(spec))
+        run = start_run(spec, root, ids.get(spec["parent"]), snapshots=snapshots)
         ids[spec["name"]] = run.run_id
         if spec["name"] == live:
             live_run = LiveRun(run, spec)
             continue
+        crash_at = spec.get("crash_at")
         val_loss = []
         for step, metrics in curves(spec):
+            if step == crash_at:
+                break
             run.log(metrics, step=step)
             val_loss.append(metrics["val_loss"])
-        finish_run(run, val_loss)
+        finish_run(run, val_loss, "crashed" if crash_at else "finished")
     return ids, live_run
 
 
@@ -357,12 +417,18 @@ PAGE_INIT = """
     + 'filter:drop-shadow(0 1px 2px rgba(0,0,0,.35))}'
     + '#demo-cursor i{position:absolute;left:-15px;top:-15px;width:30px;height:30px;border-radius:50%;'
     + 'border:2px solid #2f6fed;background:rgba(47,111,237,.18);display:none}'
-    + '#demo-cursor.down i{display:block}';
+    + '#demo-cursor.down i{display:block}'
+    + '#demo-caption{position:fixed;right:40px;bottom:22px;'
+    + 'z-index:2147483646;pointer-events:none;display:none;white-space:nowrap;'
+    + 'background:#14213d;color:#fff;font:600 17px/1.2 "Instrument Sans",sans-serif;'
+    + 'padding:10px 20px;border-radius:999px;box-shadow:0 6px 20px rgba(20,33,61,.28)}';
   const cursor = document.createElement('div');
   cursor.id = 'demo-cursor';
   cursor.innerHTML = '<i></i><svg viewBox="0 0 22 22"><path d="M2 1.5v16l4.4-4 3 6.5 2.8-1.3-3-6.4 6-.4z" '
     + 'fill="#fff" stroke="#14213d" stroke-width="1.5" stroke-linejoin="round"/></svg>';
-  const mount = () => { document.head.append(css); document.body.append(cursor); };
+  const caption = document.createElement('div');
+  caption.id = 'demo-caption';
+  const mount = () => { document.head.append(css); document.body.append(cursor, caption); };
   document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', mount) : mount();
   const put = (e) => { cursor.style.display = 'block';
     cursor.style.transform = `translate(${e.clientX}px,${e.clientY}px)`; };
@@ -428,8 +494,17 @@ class Reel:
     def hold(self, ms: int, **kw) -> None:
         self.shot(ms, **kw)
 
+    def caption(self, text: str | None) -> None:
+        """Show ``text`` in the caption pill (None hides it) from the next frame."""
+        self.page.evaluate(
+            "text => { const c = document.getElementById('demo-caption');"
+            " c.textContent = text || ''; c.style.display = text ? 'block' : 'none'; }",
+            text,
+        )
 
-def scene_live(reel: Reel, url: str, ids, live: LiveRun) -> None:
+
+def scene_live(reel: Reel, url: str, ids, live: LiveRun, batch: int = LIVE_BATCH,
+               caption: str | None = None) -> None:
     """1. The live run's page: its curves grow while it is `running`."""
     page = reel.page
     live.advance(LIVE_FIRST)
@@ -441,9 +516,11 @@ def scene_live(reel: Reel, url: str, ids, live: LiveRun) -> None:
     # the Backlog) stays in view.
     page.evaluate("() => window.scrollTo(0, document.querySelector('.card.toolbar').getBoundingClientRect().top"
                   " + scrollY - 72)")
+    if caption:
+        reel.caption(caption)
     reel.shot(400, canvases=True)
-    while len(live.val_loss) + LIVE_BATCH < STEPS:
-        live.advance(LIVE_BATCH)
+    while len(live.val_loss) + batch < STEPS:
+        live.advance(batch)
         # One poll of the page's 5 s refresh timer, then put Date back to the
         # real time so the run's "wall time" stays honest.
         page.clock.run_for(5000)
@@ -541,6 +618,75 @@ def scene_explore(reel: Reel) -> None:
     reel.hold(800, canvases=True)
 
 
+def scene_lineage_story(reel: Reel, ids) -> None:
+    """Lineage draft, 2. The task's Lineage view: the tree, the best path
+    switched off and on, a walk down the path with the inspector showing what
+    changed at each generation, then the crashed branch."""
+    page = reel.page
+    node = lambda name: f'.lv-node[data-run-id="{ids[name]}"] .lv-box'  # noqa: E731
+    page.evaluate("() => { location.hash = '#/'; }")
+    page.wait_for_selector(".run-row")
+    page.wait_for_function(
+        "() => document.querySelector('.task-strip') && !document.body.innerText.includes('Loading')"
+    )
+    page.evaluate("() => scrollTo(0, 0)")
+    reel.caption("Every run records the run it came from")
+    reel.put(640, 300)
+    reel.shot(500)
+    reel.glide(*reel.point("text=Lineage ⤢", 0.92, 0.85), steps=7)
+    reel.click(160)
+    page.wait_for_selector(".lv-node")
+    # The view opens scrolled to the best run (gen 3): fit the whole tree,
+    # root included, in the canvas.
+    # A DOM click, so the real mouse (and the drawn cursor) stays put.
+    page.locator('.lv-zoom button:has-text("Fit")').dispatch_event("click")
+    page.evaluate("document.activeElement && document.activeElement.blur()")
+    reel.hold(1600)
+    # "Highlight best path" off, then on: the root-to-best chain lights up.
+    reel.caption("The best path: from the root run to the best one")
+    reel.glide(*reel.point("label.lv-best", 0.08, 0.5), steps=6)
+    reel.click(140)
+    reel.hold(700)
+    reel.click(140)
+    reel.hold(1300)
+    # Walk the path: the inspector shows the params and code each step changed
+    # and what that did to val_loss.
+    reel.caption("What each step changed, and what it did to val_loss")
+    for name in ("baseline", "cosine-warmup", "mixup", "mixup-long"):
+        reel.glide(*reel.point(node(name), 0.5, 0.6), steps=5)
+        reel.click(150)
+        # The inspector shows this run, and a changed tree's file list (it
+        # reads "code changed" until the fetch lands) is in.
+        page.wait_for_function(
+            "name => document.querySelector('.lv-insp-name')?.textContent === name"
+            " && !document.querySelector('.lv-inspector').innerText.includes('code changed')",
+            arg=name,
+        )
+        reel.hold(1500)
+    reel.caption("Dead ends stay in the record")
+    reel.glide(*reel.point(node("lr-1e-2"), 0.5, 0.6), steps=6)
+    reel.click(150)
+    reel.hold(1400)
+
+
+def scene_compare_path(reel: Reel) -> None:
+    """Lineage draft, 3. Quick-select the best path, compare it."""
+    page = reel.page
+    reel.caption("Compare the best path")
+    reel.glide(*reel.point('[data-focus="lv-pick-path"]', 0.5, 0.5), steps=7)
+    reel.click(150)
+    # The tray grows chips and a Compare button, so the buttons shift under
+    # the cursor: keep this hold short.
+    reel.hold(300)
+    reel.glide(*reel.point('[data-focus="lv-compare-tray"]', 0.4, 0.5), steps=6)
+    reel.click(150)
+    page.wait_for_selector('.chart-card[data-key="train_loss"]')
+    scroll_compare_to_charts(page)
+    page.evaluate("document.activeElement && document.activeElement.blur()")
+    reel.put(1240, 700)  # out of the way, and clear of the caption
+    reel.hold(2400, canvases=True)
+
+
 def encode_gif(frames, path: Path) -> None:
     from PIL import Image
 
@@ -569,7 +715,8 @@ def encode_gif(frames, path: Path) -> None:
     )
 
 
-def capture_demo(url: str, ids, live: LiveRun) -> None:
+def capture_demo(url: str, ids, live: LiveRun, story: str = "demo") -> None:
+    """Record ``demo.gif`` (story "demo") or ``demo-lineage.gif`` ("lineage")."""
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
@@ -583,15 +730,22 @@ def capture_demo(url: str, ids, live: LiveRun) -> None:
         # Polling runs on a fake clock: the page only refreshes when we say.
         page.clock.install(time=int(time.time() * 1000))
         reel = Reel(page)
-        scene_live(reel, url, ids, live)
-        scene_lineage(reel)
-        scene_compare(reel, ids)
-        scene_explore(reel)
+        if story == "lineage":
+            path = LINEAGE_GIF
+            scene_live(reel, url, ids, live, batch=44, caption="A run is training")
+            scene_lineage_story(reel, ids)
+            scene_compare_path(reel)
+        else:
+            path = DEMO_GIF
+            scene_live(reel, url, ids, live)
+            scene_lineage(reel)
+            scene_compare(reel, ids)
+            scene_explore(reel)
         browser.close()
-    encode_gif(reel.frames, DEMO_GIF)
+    encode_gif(reel.frames, path)
     total = sum(ms for _, ms in reel.frames)
-    print(f"demo.gif: {len(reel.frames)} frames, {total / 1000:.1f} s, "
-          f"{DEMO_GIF.stat().st_size / 1e6:.2f} MB", file=sys.stderr)
+    print(f"{path.name}: {len(reel.frames)} frames, {total / 1000:.1f} s, "
+          f"{path.stat().st_size / 1e6:.2f} MB", file=sys.stderr)
 
 
 @contextlib.contextmanager
@@ -610,13 +764,19 @@ def seeding_env(work: Path):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--only", choices=["all", "gif", "png"], default="all")
+    parser.add_argument("--only", choices=["all", "gif", "png", "lineage"], default="all")
     only = parser.parse_args().only
     ASSETS.mkdir(parents=True, exist_ok=True)
+    lineage = only == "lineage"
     with tempfile.TemporaryDirectory(prefix="agenticml-readme-") as tmp:
         root = Path(tmp) / "store"
         with seeding_env(Path(tmp) / "work"):
-            ids, live = seed_store(root, live="wd-5e-4" if only != "png" else None)
+            ids, live = seed_store(
+                root,
+                live="wd-5e-4" if only != "png" else None,
+                runs=LINEAGE_RUNS if lineage else RUNS,
+                snapshots=lineage,
+            )
         # A fixed port, so the header reads the same in every run. If it is
         # taken, any free port will do (the header then shows that one).
         try:
@@ -629,8 +789,8 @@ def main() -> None:
             url = f"http://127.0.0.1:{server.server_address[1]}"
             if live is not None:
                 # Leaves every run, the live one included, finished.
-                capture_demo(url, ids, live)
-            if only != "gif":
+                capture_demo(url, ids, live, story="lineage" if lineage else "demo")
+            if only in ("all", "png"):
                 capture_dashboard(url, [ids[spec["name"]] for spec in RUNS])
         finally:
             if live is not None and not live.finished:
@@ -640,12 +800,14 @@ def main() -> None:
                     live.finish()
             server.shutdown()
             server.server_close()
-    if only != "gif":
+    if only in ("all", "png"):
         capture_social()
         print(DASHBOARD_PNG)
         print(SOCIAL_PNG)
-    if only != "png":
+    if only in ("all", "gif"):
         print(DEMO_GIF)
+    if lineage:
+        print(LINEAGE_GIF)
 
 
 if __name__ == "__main__":

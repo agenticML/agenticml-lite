@@ -1,6 +1,6 @@
 # Fix: dashboard defects seen in the README demo GIF
 
-Nov 21, 2026 · in review (see Resume notes) · ships in the package 35.3 PR
+Nov 21, 2026 · in review, full test runs done (see Resume notes) · ships in the package 35.3 PR
 ([#96](https://github.com/agenticML/agenticml-lite/pull/96))
 
 ## Goal
@@ -166,3 +166,12 @@ Left to do before the PR is marked ready:
   CI cover their 375px overflow checks.
 - The README images don't show the run-page change note case, so they
   need no regeneration for it.
+
+Done Nov 21, 2026: the full runs on the PR head (`4263001`, nothing to merge
+from `main` or `dev`). `-m ui` (hosted dashboard files left out locally):
+300 passed, 2 failed. `pytest -q tests` (the 8 `boto3`/`jwt` files left out):
+3683 passed, 15 failed, 152 skipped. Every failure fails the same way on
+`main` and comes from macOS (an installed Tailscale, Linux service paths,
+`/private/var` temp paths, socket timing, the copy-key shortcut text), so
+none is tracked. CI on Linux passed every job on `4263001`, the hosted
+dashboard UI tests included (503 passed).
