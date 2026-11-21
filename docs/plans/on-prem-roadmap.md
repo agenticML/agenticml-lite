@@ -413,9 +413,10 @@ part can go to `main` early as a docs-only PR.
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 35 | Repo outreach: README, comparison table, images, community files, dashboard GitHub link | 3.1 | Sonnet; supervisor reviews | M | [plan](packages/35-repo-outreach.md) | done ([#90](https://github.com/agenticML/agenticml-lite/pull/90), merged Nov 20, 2026; released in 3.3.0) |
+| 35 | Repo outreach: README, comparison table, images, community files, dashboard GitHub link | 3.1 | Sonnet; supervisor reviews | M | [plan](packages/35-repo-outreach.md) | done ([#90](https://github.com/agenticML/agenticml-lite/pull/90), merged Nov 20, 2026; released in 3.3.0); 35.3 added Nov 20, 2026, see its row |
 | 35.1 | README rework with screenshot and comparison table, `scripts/make_readme_images.py` (dashboard screenshot, social preview), CONTRIBUTING, code of conduct, issue and PR templates, PyPI keywords and classifiers | – | Sonnet | S–M | [plan](packages/35-repo-outreach.md) | done ([#90](https://github.com/agenticML/agenticml-lite/pull/90), merged Nov 20, 2026; released in 3.3.0) |
 | 35.2 | GitHub link in the dashboard top bar; docs and GitHub line from `agenticml ui` | – | Sonnet | S | [plan](packages/35-repo-outreach.md) | done ([#90](https://github.com/agenticML/agenticml-lite/pull/90), merged Nov 20, 2026; released in 3.3.0) |
+| 35.3 | README demo GIF instead of the still screenshot (live run, lineage graph, select and compare, hover and smoothing), made by `scripts/make_readme_images.py` with Playwright frames and Pillow | 35.1 | Sonnet; supervisor reviews | S | [plan](packages/35-repo-outreach.md#353-readme-demo-gif) | in review |
 
 ### Maintenance fixes
 
@@ -516,6 +517,30 @@ follow-ups and the metric picker, a remainder moved to "Later
 (unscheduled)"), the permissions boundary moved to Later, and the entries
 below are the ones that need the owner's accounts or machines. 3.0.0 was released
 on Nov 17, 2026; none of the entries below blocked it.
+
+### Dashboard UI defects seen in the README demo GIF
+
+- **Toolbar label, run page header and inspector "code changed"** (found
+  in package 35.3, Nov 20, 2026). Low priority.
+  - Where: `src/agenticml/ui/static/app.js:2585` and `.toolbar label` in
+    `app.css:1576` (label text); `drawFacts` in `app.js` (about line 3644,
+    run page header); the lineage view inspector's "code" row.
+  - Problem: (1) the toolbar label "Clip outliers on y-axis" renders as
+    "Clipoutlierson y-axis" although the source has the spaces. (2)
+    `title.replaceChildren(...)` in `drawFacts` is the native DOM method and
+    gets `null` for the owner chip (local mode) and for the parent link (root
+    runs); native `replaceChildren` turns `null` into the text "null", so
+    run pages show "null" beside the status chip (the `el()` helper filters
+    nulls, `replaceChildren` does not). (3) The inspector shows "code
+    changed" for runs with no code snapshot ("snapshot –"); not re-checked.
+  - Fix: (1) find why the spaces collapse (the label is a flex container, so
+    the bare text node is an anonymous flex item) and wrap the text in a
+    `<span>`; (2) filter falsy children before `replaceChildren`; (3) show
+    "–" for code when neither run has a snapshot.
+  - Done when: UI tests assert the label text, no "null" in a local root
+    run's header, and the inspector's code row without snapshots; then
+    `scripts/make_readme_images.py` is rerun so `demo.gif` and
+    `dashboard.png` show the fixes.
 
 ### Owner steps
 
