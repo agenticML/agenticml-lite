@@ -7,12 +7,13 @@ the dashboard, and writes:
 - docs/assets/dashboard.png (1440 wide, light theme, runs overlaid in compare view,
   cropped below the chart cards)
 - docs/assets/social-preview.png (1280x640, for GitHub's social preview)
-- docs/assets/demo.gif (the README's animated demo, 960 wide, about 20 s, loops:
+- docs/assets/demo.gif (the first cut of the demo, 960 wide, about 20 s, loops:
   a live run's curves growing, the task's lineage graph, select and compare,
   then hover readouts and smoothing in the metrics workspace)
-- docs/assets/demo-lineage.gif (``--only lineage``, a draft that puts the
-  lineage graph first: a deeper tree with code snapshots, the best path,
-  what changed at each step, then the best path compared; captioned)
+- docs/assets/demo-lineage.gif (``--only lineage``, the README's animated
+  demo, which puts the lineage graph first: a deeper tree with code
+  snapshots, the best path, what changed at each step, then the best path
+  compared; captioned)
 
 Run from the repo root with the testbed venv (it has Playwright and Pillow):
 

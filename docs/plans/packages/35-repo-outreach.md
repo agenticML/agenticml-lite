@@ -514,6 +514,10 @@ readable at 960 px, no "Loading" or empty chart. Run `--only gif` and confirm
 **Done when.** `demo-lineage.gif` exists, the owner has seen it, and the
 choice between the two GIFs is the owner's.
 
+**Owner's pick (Nov 21, 2026): "Use lineage draft".** README line 7 now
+shows `demo-lineage.gif`, with alt text for the lineage story. `demo.gif`
+and its `--only gif` mode stay as the first cut; nothing links to it.
+
 ## Branch and release
 
 One PR to `main` (the working branch) with the plan, script, GIF, README and
