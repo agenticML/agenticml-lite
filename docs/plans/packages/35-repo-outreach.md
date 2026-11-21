@@ -412,7 +412,7 @@ looking at the frames:
   header, because the run list has no charts. The curves grow from step 23
   to 199 over eight polls on Playwright's fake clock (`page.clock`), then the
   run is finished by this process. The scroll stops at the sticky smoothing
-  toolbar, so its label stays in view (UI defect below). The "running" chip
+  toolbar, so its label stays in view. The "running" chip
   is scrolled out of view; only the growing curves and "@ step N" labels
   show that the run is live.
 - **Scene 2** (lineage) is as planned: the Lineage button, the dialog with
@@ -430,17 +430,13 @@ looking at the frames:
   generations differ in a few pixels of text. The server port is fixed
   (47321) unless it is taken. The polling and the steps in each frame are
   deterministic.
-- `--only {all,gif,png}` was added. `dashboard.png` and
-  `social-preview.png` came out byte-identical with the seeding changes, so
-  they are not part of the diff.
+- `--only {all,gif,png}` was added.
 
-UI defects seen in the frames (dashboard code is out of scope here; they are
-in the roadmap Backlog):
-
-- The label "Clip outliers on y-axis" renders as "Clipoutlierson y-axis"
-  (`app.js:2585`, `.toolbar label` in `app.css:1576`).
-- The run page header shows `null` for a run that is still running
-  (reported in review, not re-checked).
+The first GIF showed three dashboard defects (squeezed word gaps in small
+sans text, a literal "null" in the run page header, and "code changed" in
+the lineage inspector for runs without snapshots). They were fixed in the
+same PR ([plan](fix-demo-gif-ui-defects.md)), and the three images were
+regenerated from the fixed dashboard.
 
 ## Branch and release
 

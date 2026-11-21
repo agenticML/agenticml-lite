@@ -2025,8 +2025,19 @@ async function home(version) {
             .filter((name) => !IDENTITY_KEYS.has(name))
             .sort()
             .map((name) => [name, "—", fmt(run.config[name])]);
+      // A code diff needs a snapshot (tree) on both runs. When the server has
+      // no tree for the run, or for its parent, there is nothing to compare.
+      const parentNode = parent ? entry.byId.get(parent.run_id) : null;
+      const noSnapshot = !node.tree;
+      const parentNoSnapshot = Boolean(parentNode) && !parentNode.tree;
       // Changed files come from the per-run lineage diff, fetched once.
-      if (parent && !node.same_tree_as_parent && !details.has(runId)) {
+      if (
+        parent &&
+        !noSnapshot &&
+        !parentNoSnapshot &&
+        !node.same_tree_as_parent &&
+        !details.has(runId)
+      ) {
         details.set(runId, null);
         get(`${apiRun(runId)}/lineage`)
           .then((detail) => {
@@ -2041,15 +2052,19 @@ async function home(version) {
         serverMode && typeof detail?.error === "string" && detail.error
           ? detail.error
           : null;
-      const code = !parent
-        ? "baseline snapshot"
-        : node.same_tree_as_parent
-          ? "code unchanged"
-          : lineageError
-            ? lineageError
-            : files
-              ? `${files.length} file${files.length === 1 ? "" : "s"} changed${files[0] ? ` · ${files[0].path}` : ""}`
-              : "code changed";
+      const code = noSnapshot
+        ? "no snapshot"
+        : !parent
+          ? "baseline snapshot"
+          : parentNoSnapshot
+            ? "parent has no snapshot"
+            : node.same_tree_as_parent
+              ? "code unchanged"
+              : lineageError
+                ? lineageError
+                : files
+                  ? `${files.length} file${files.length === 1 ? "" : "s"} changed${files[0] ? ` · ${files[0].path}` : ""}`
+                  : "code changed";
       const stat = (name, text, tone = "") =>
         el("div", {}, el("dt", { text: name }), el("dd", { class: tone, text }));
       inspector.replaceChildren(
@@ -2063,10 +2078,13 @@ async function home(version) {
             el("span", { class: "lv-insp-name", text: run.name || runId, title: run.name || runId }),
             statusChip(run.status, run),
           ),
-          el("span", {
-            class: "lv-insp-sub",
-            text: `run ${shortRunId(runId)} · ${parent ? `child of ${parent.name || parent.run_id}` : `root of ${label}`} · gen ${item.depth}`,
-          }),
+          // "· gen N" stays together so the line never leaves "gen" and the number apart.
+          el(
+            "span",
+            { class: "lv-insp-sub" },
+            `run ${shortRunId(runId)} · ${parent ? `child of ${parent.name || parent.run_id}` : `root of ${label}`} `,
+            el("span", { class: "nowrap", text: `· gen ${item.depth}` }),
+          ),
           el(
             "label",
             { class: "lv-include" },
@@ -3641,32 +3659,35 @@ async function runPage(id, version) {
   }
   function drawFacts() {
     const parent = parentOf();
+    // Native replaceChildren turns null into the text "null", so drop empty slots.
     title.replaceChildren(
-      el("h1", { class: "mono", text: run.name || id }),
-      statusChip(run.status, run),
-      serverMode && run.owner
-        ? el("span", { class: "muted run-owner", text: run.owner, title: `Owner ${run.owner}` })
-        : null,
-      ...(run.tags || []).map((tag) => chip(tag)),
-      parent
-        ? el(
-            "span",
-            { class: "run-parent" },
-            "child of ",
-            el("a", { href: routeRun(parent.run_id), text: parent.name || parent.run_id }),
-          )
-        : null,
-      el(
-        "div",
-        { class: "run-actions" },
-        parent
-          ? el("a", {
-              class: "btn btn-secondary btn-sm",
-              href: `#/compare?${new URLSearchParams([["selection", "1"], ["runs", parent.run_id], ["runs", id]])}`,
-              text: "Compare with parent",
-            })
+      ...[
+        el("h1", { class: "mono", text: run.name || id }),
+        statusChip(run.status, run),
+        serverMode && run.owner
+          ? el("span", { class: "muted run-owner", text: run.owner, title: `Owner ${run.owner}` })
           : null,
-      ),
+        ...(run.tags || []).map((tag) => chip(tag)),
+        parent
+          ? el(
+              "span",
+              { class: "run-parent" },
+              "child of ",
+              el("a", { href: routeRun(parent.run_id), text: parent.name || parent.run_id }),
+            )
+          : null,
+        el(
+          "div",
+          { class: "run-actions" },
+          parent
+            ? el("a", {
+                class: "btn btn-secondary btn-sm",
+                href: `#/compare?${new URLSearchParams([["selection", "1"], ["runs", parent.run_id], ["runs", id]])}`,
+                text: "Compare with parent",
+              })
+            : null,
+        ),
+      ].filter((child) => child != null && child !== false),
     );
     const root = run.lineage && !parentId();
     changeLabel.textContent = parent ? "changed vs parent" : root ? "root run" : "params";
@@ -3682,9 +3703,11 @@ async function runPage(id, version) {
           changedKeys(run, parent).length ? "everything else inherited" : null,
           parentTree === undefined || !tree
             ? null
-            : parentTree === tree
-              ? "code unchanged"
-              : "code changed",
+            : parentTree === null
+              ? "parent has no snapshot"
+              : parentTree === tree
+                ? "code unchanged"
+                : "code changed",
         ]
           .filter(Boolean)
           .map((text) => `· ${text}`)

@@ -202,9 +202,23 @@ body {
   background: var(--bg);
   color: var(--text);
   font-family: var(--font-sans-stack);
+  /* Instrument Sans has a narrow space (0.2em). Chromium on Linux rounds glyph
+     positions and kerns against the space, so at 12px it draws about 1.3px
+     and words run together. A little extra space keeps small text readable.
+     It is inherited as a fixed length (about 1px at the body size), so every
+     monospace rule resets it to normal. */
+  word-spacing: 0.08em;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
+}
+
+/* Code-like elements always keep one-character spaces. */
+pre,
+code,
+kbd,
+samp {
+  word-spacing: normal;
 }
 
 p {
@@ -262,6 +276,7 @@ textarea::placeholder {
 .mono {
   font-family: var(--font-mono-stack);
   font-variant-numeric: tabular-nums;
+  word-spacing: normal;
 }
 
 /* Section label: small caps-height sans, quiet but always legible. */
@@ -457,6 +472,14 @@ button,
 input {
   font: inherit;
 }
+/* Browsers reset word-spacing on form controls; keep it like the page text.
+   Monospace controls set their own word-spacing: normal in their class rule. */
+button,
+input,
+select,
+textarea {
+  word-spacing: inherit;
+}
 button {
   color: inherit;
 }
@@ -484,6 +507,7 @@ pre {
   margin: 0;
   overflow: auto;
   font: var(--fs-sm) / 1.6 var(--font-mono-stack);
+  word-spacing: normal;
 }
 kbd {
   display: inline-block;
@@ -496,6 +520,7 @@ kbd {
   font: var(--fs-xs) var(--font-mono-stack);
   color: var(--text-3);
   text-align: center;
+  word-spacing: normal;
 }
 [hidden] {
   display: none !important;
@@ -521,6 +546,7 @@ kbd {
   font: 500 var(--fs-md) var(--font-mono-stack);
   color: var(--text-2);
   letter-spacing: -0.01em;
+  word-spacing: normal;
 }
 .breadcrumb::before {
   content: "";
@@ -542,6 +568,7 @@ kbd {
   white-space: nowrap;
   font: var(--fs-sm) var(--font-mono);
   color: var(--text-3);
+  word-spacing: normal;
 }
 #nav-github {
   display: inline-flex;
@@ -574,6 +601,7 @@ kbd {
   max-width: 28ch;
   font: var(--fs-sm) var(--font-mono);
   color: var(--text-3);
+  word-spacing: normal;
 }
 .login-page {
   min-height: 100vh;
@@ -672,6 +700,7 @@ kbd {
 .auth-brand-count {
   font: 11px var(--font-mono-stack);
   color: var(--text-3);
+  word-spacing: normal;
 }
 .auth-chart {
   display: block;
@@ -707,6 +736,7 @@ kbd {
 .auth-chart-label {
   font: 9.5px var(--font-mono-stack);
   fill: var(--s1);
+  word-spacing: normal;
 }
 .auth-runs {
   list-style: none;
@@ -739,11 +769,13 @@ kbd {
 .auth-run-name {
   font: 11px var(--font-mono-stack);
   color: var(--text-2);
+  word-spacing: normal;
 }
 .auth-run-status {
   margin-left: auto;
   font: 11px var(--font-mono-stack);
   color: var(--text-3);
+  word-spacing: normal;
 }
 .auth-brand-pitch {
   margin-top: auto;
@@ -797,6 +829,7 @@ kbd {
   flex: none;
   font-family: var(--font-mono-stack);
   font-size: var(--fs-xs);
+  word-spacing: normal;
 }
 @media (min-width: 961px) {
   :root[data-theme="dark"] .auth-form-side {
@@ -901,6 +934,7 @@ kbd {
   letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--text-3);
+  word-spacing: normal;
 }
 .auth-show-password {
   align-self: flex-start;
@@ -912,6 +946,7 @@ kbd {
   text-transform: uppercase;
   color: var(--text-2);
   cursor: pointer;
+  word-spacing: normal;
 }
 .auth-buttons {
   display: flex;
@@ -1000,6 +1035,7 @@ kbd {
   flex: none;
   font-family: var(--font-mono-stack);
   font-size: var(--fs-xs);
+  word-spacing: normal;
 }
 #app {
   padding: var(--s-5) var(--s-5) var(--s-7);
@@ -1048,6 +1084,7 @@ kbd {
   color: var(--text-3);
   font: var(--fs-xs) var(--font-mono-stack);
   font-variant-numeric: tabular-nums;
+  word-spacing: normal;
 }
 .poll-status {
   padding-top: var(--s-2);
@@ -1056,6 +1093,7 @@ kbd {
   color: var(--text-3);
   font: var(--fs-sm) / 1.6 var(--font-mono-stack);
   overflow-wrap: anywhere;
+  word-spacing: normal;
 }
 /* Project tabs read as one segmented control. */
 .tabs {
@@ -1089,6 +1127,7 @@ kbd {
   font: var(--fs-sm) var(--font-mono);
   color: var(--text-3);
   overflow-wrap: anywhere;
+  word-spacing: normal;
 }
 .runs-heading > .runs-controls {
   display: flex;
@@ -1134,6 +1173,7 @@ kbd {
   overflow-wrap: anywhere;
   font: var(--fs-xs) var(--font-mono-stack);
   font-variant-numeric: tabular-nums;
+  word-spacing: normal;
 }
 .field-label {
   font-size: var(--fs-sm);
@@ -1156,6 +1196,7 @@ kbd {
   margin-left: 8px;
   font: var(--fs-xs) var(--font-mono);
   color: var(--text-3);
+  word-spacing: normal;
 }
 .tabs .field {
   width: 260px;
@@ -1238,12 +1279,14 @@ kbd {
   font: var(--fs-sm) var(--font-mono);
   color: var(--text-3);
   overflow-wrap: anywhere;
+  word-spacing: normal;
 }
 .project-note {
   color: var(--warn-text);
   font: var(--fs-xs) var(--font-mono-stack);
   min-width: 0;
   overflow-wrap: anywhere;
+  word-spacing: normal;
 }
 .run-grid {
   display: grid;
@@ -1256,6 +1299,7 @@ kbd {
   font: var(--fs-xs) var(--font-mono);
   color: var(--text-3);
   white-space: nowrap;
+  word-spacing: normal;
 }
 .run-owner {
   font: var(--fs-xs) var(--font-mono);
@@ -1264,6 +1308,7 @@ kbd {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  word-spacing: normal;
 }
 .run-status {
   min-width: 0;
@@ -1323,12 +1368,14 @@ kbd {
   font: 500 var(--fs-md) var(--font-mono-stack);
   color: var(--text);
   overflow-wrap: anywhere;
+  word-spacing: normal;
 }
 .run-varied {
   font: var(--fs-xs) var(--font-mono-stack);
   color: var(--text-3);
   overflow: hidden;
   text-overflow: ellipsis;
+  word-spacing: normal;
 }
 .run-number {
   text-align: right;
@@ -1336,6 +1383,7 @@ kbd {
   font-variant-numeric: tabular-nums;
   color: var(--text-2);
   overflow-wrap: anywhere;
+  word-spacing: normal;
 }
 .check {
   accent-color: var(--accent);
@@ -1358,6 +1406,7 @@ kbd {
   border: 1px solid var(--border);
   color: var(--text-3);
   white-space: nowrap;
+  word-spacing: normal;
 }
 .chip.accent,
 .chip.ok,
@@ -1447,6 +1496,7 @@ kbd {
 }
 .kv-list.identity dd {
   font-family: var(--font-mono-stack);
+  word-spacing: normal;
 }
 /* Commit, branch and the dirty chip read as one line where width allows. */
 .kv-list.identity > div:has(.git-identity) {
@@ -1533,6 +1583,7 @@ figcaption {
   margin-top: 6px;
   color: var(--text-3);
   font: var(--fs-xs) var(--font-mono-stack);
+  word-spacing: normal;
 }
 dialog {
   max-width: 95vw;
@@ -1626,11 +1677,13 @@ button.chart-card:not(:disabled):hover,
 .chart-card h3 {
   font: 600 var(--fs-md) var(--font-mono-stack);
   color: var(--text);
+  word-spacing: normal;
 }
 .chart-key {
   color: var(--text-3);
   font: var(--fs-xs) var(--font-mono-stack);
   overflow-wrap: anywhere;
+  word-spacing: normal;
 }
 .chart-host {
   height: 168px;
@@ -1650,6 +1703,7 @@ canvas {
   color: var(--text-2);
   font: var(--fs-xs) var(--font-mono-stack);
   font-variant-numeric: tabular-nums;
+  word-spacing: normal;
 }
 .chart-values > *,
 .legend > * {
@@ -1702,6 +1756,7 @@ canvas {
   font: 600 var(--fs-xs) var(--font-mono-stack);
   text-transform: uppercase;
   letter-spacing: 0.06em;
+  word-spacing: normal;
 }
 .focus-body {
   overflow: auto;
@@ -1733,6 +1788,7 @@ td {
 }
 td {
   font-family: var(--font-mono-stack);
+  word-spacing: normal;
 }
 table:not(.code-diff-table) tbody tr:hover > td {
   background: var(--surface-3);
@@ -1802,6 +1858,7 @@ th {
   padding: 3px 12px;
   font: var(--fs-sm) var(--font-mono-stack);
   color: var(--text-2);
+  word-spacing: normal;
 }
 .code-file:hover,
 .outline-item:hover,
@@ -1836,6 +1893,7 @@ th {
   padding: 7px 12px;
   color: var(--text-3);
   font: 11px var(--font-mono-stack);
+  word-spacing: normal;
 }
 .code-editor {
   min-width: 0;
@@ -1870,6 +1928,7 @@ th {
   border: 0;
   font: var(--fs-sm) var(--font-mono-stack);
   padding: 5px 8px;
+  word-spacing: normal;
 }
 .code-tab button:hover {
   color: var(--text);
@@ -1887,11 +1946,13 @@ th {
   font: 11.5px var(--font-mono-stack);
   color: var(--text-3);
   overflow-wrap: anywhere;
+  word-spacing: normal;
 }
 .code-find {
   width: 150px;
   padding: 4px 8px;
   font: 11.5px var(--font-mono-stack);
+  word-spacing: normal;
 }
 .code-tools .btn {
   padding: 3px 8px;
@@ -1901,6 +1962,7 @@ th {
   min-width: 44px;
   font: 10.5px var(--font-mono-stack);
   color: var(--text-3);
+  word-spacing: normal;
 }
 .code-lines {
   flex: 1;
@@ -1909,6 +1971,7 @@ th {
   padding: 10px 0 24px;
   font: var(--fs-md) / 20px var(--font-mono-stack);
   background: var(--surface);
+  word-spacing: normal;
 }
 .code-line {
   display: flex;
@@ -1962,6 +2025,7 @@ th {
   background: var(--surface-2);
   font: 10.5px var(--font-mono-stack);
   color: var(--text-3);
+  word-spacing: normal;
 }
 /* Compare snapshot diffs keep long source lines inside their own scroller. */
 .code-diff-section,
@@ -2056,6 +2120,7 @@ th {
 .code-diff-path,
 .code-diff-counts {
   font: 11.5px var(--font-mono-stack);
+  word-spacing: normal;
 }
 .code-diff-status,
 .code-diff-badge {
@@ -2064,6 +2129,7 @@ th {
   border: 1px solid var(--border);
   border-radius: var(--r-xs);
   font: 500 var(--fs-xs) var(--font-mono-stack);
+  word-spacing: normal;
 }
 .code-diff-badge {
   margin-inline-start: 6px;
@@ -2106,6 +2172,7 @@ th {
   border-collapse: separate;
   border-spacing: 0;
   font: var(--fs-sm) / 20px var(--font-mono-stack);
+  word-spacing: normal;
 }
 .code-diff-table td {
   min-width: 0;
@@ -2473,6 +2540,7 @@ pre,
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  word-spacing: normal;
 }
 .task-summary,
 .task-metric {
@@ -2480,6 +2548,7 @@ pre,
   font: var(--fs-sm) var(--font-mono);
   color: var(--text-3);
   overflow-wrap: anywhere;
+  word-spacing: normal;
 }
 .task-best {
   color: var(--text);
@@ -2591,11 +2660,13 @@ pre,
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  word-spacing: normal;
 }
 .lv-meta {
   min-width: 0;
   font: var(--fs-sm) var(--font-mono);
   color: var(--text-3);
+  word-spacing: normal;
 }
 .lv-controls {
   display: flex;
@@ -2632,6 +2703,7 @@ pre,
   padding: 0 8px;
   font: 11.5px var(--font-mono);
   color: var(--text-2);
+  word-spacing: normal;
 }
 .lv-body {
   flex: 1;
@@ -2673,6 +2745,7 @@ pre,
   letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--text-3);
+  word-spacing: normal;
 }
 .lv-edge {
   position: absolute;
@@ -2775,6 +2848,7 @@ pre,
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  word-spacing: normal;
 }
 .lv-badge {
   flex: none;
@@ -2791,6 +2865,7 @@ pre,
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  word-spacing: normal;
 }
 .lv-change.is-root {
   background: var(--surface-3);
@@ -2803,6 +2878,7 @@ pre,
   width: 100%;
   min-width: 0;
   font-family: var(--font-mono);
+  word-spacing: normal;
 }
 .lv-metric-key,
 .lv-foot {
@@ -2870,6 +2946,7 @@ pre,
   color: var(--text);
   font: 12px var(--font-mono);
   cursor: pointer;
+  word-spacing: normal;
 }
 .lv-chip > [aria-hidden] {
   color: var(--text-3);
@@ -2950,11 +3027,16 @@ pre,
   min-width: 0;
   font: 500 15px var(--font-mono);
   overflow-wrap: anywhere;
+  word-spacing: normal;
+}
+.lv-insp-sub .nowrap {
+  white-space: nowrap;
 }
 .lv-insp-sub {
   font: 11.5px var(--font-mono);
   color: var(--text-3);
   overflow-wrap: anywhere;
+  word-spacing: normal;
 }
 .lv-stats {
   display: grid;
@@ -2968,17 +3050,20 @@ pre,
   text-transform: uppercase;
   color: var(--text-3);
   overflow-wrap: anywhere;
+  word-spacing: normal;
 }
 .lv-stats dd {
   margin: 2px 0 0;
   font: 500 16px var(--font-mono);
   overflow-wrap: anywhere;
+  word-spacing: normal;
 }
 .lv-diff {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 6px 8px;
   font: 12px var(--font-mono);
+  word-spacing: normal;
 }
 .lv-diff > span {
   min-width: 0;
@@ -3013,6 +3098,7 @@ pre,
   font: 12px var(--font-mono);
   text-align: left;
   cursor: pointer;
+  word-spacing: normal;
 }
 .lv-kid:hover {
   background: var(--surface-3);
@@ -3085,6 +3171,7 @@ pre,
   font: var(--fs-sm) var(--font-mono);
   color: var(--text-3);
   overflow-wrap: anywhere;
+  word-spacing: normal;
 }
 .ws-title {
   margin: 0;
@@ -3170,6 +3257,7 @@ pre,
 .ws-runs-scope {
   font: 11px var(--font-mono);
   color: var(--text-3);
+  word-spacing: normal;
 }
 .ws-runs {
   display: grid;
@@ -3208,6 +3296,7 @@ pre,
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  word-spacing: normal;
 }
 .ws-run-meta {
   font: 11px var(--font-mono);
@@ -3215,6 +3304,7 @@ pre,
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  word-spacing: normal;
 }
 .ws-main {
   flex: 1;
@@ -3245,10 +3335,12 @@ pre,
 }
 .ws-group-name {
   font: 500 13.5px var(--font-mono);
+  word-spacing: normal;
 }
 .ws-group-count {
   font: 11.5px var(--font-mono);
   color: var(--text-3);
+  word-spacing: normal;
 }
 .ws-grid {
   display: grid;
@@ -3275,6 +3367,7 @@ pre,
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  word-spacing: normal;
 }
 .ws-card-tools {
   display: flex;
@@ -3310,6 +3403,7 @@ pre,
   color: var(--text-2);
   pointer-events: none;
   white-space: nowrap;
+  word-spacing: normal;
 }
 .ws-tip[hidden] {
   display: none;
@@ -3400,6 +3494,7 @@ pre,
 .run-parent {
   font: var(--fs-sm) var(--font-mono);
   color: var(--text-3);
+  word-spacing: normal;
 }
 .run-actions {
   margin-left: auto;
@@ -3425,12 +3520,14 @@ pre,
   letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--text-3);
+  word-spacing: normal;
 }
 .change-strip .subline {
   min-width: 0;
   max-width: 100%;
   font: 500 var(--fs-md) var(--font-mono);
   color: var(--text);
+  word-spacing: normal;
 }
 .change-note {
   font-size: var(--fs-sm);
@@ -3458,6 +3555,7 @@ pre,
   text-transform: uppercase;
   color: var(--text-3);
   overflow-wrap: anywhere;
+  word-spacing: normal;
 }
 .stat dd {
   margin: 0;
@@ -3468,10 +3566,12 @@ pre,
   font-variant-numeric: tabular-nums;
   color: var(--text);
   overflow-wrap: anywhere;
+  word-spacing: normal;
 }
 .stat-delta {
   font: var(--fs-xs) var(--font-mono);
   color: var(--text-3);
+  word-spacing: normal;
 }
 .run-facts .kv-list.identity {
   border: 0;
@@ -3510,6 +3610,7 @@ pre,
   font: 500 var(--fs-md) var(--font-mono);
   color: var(--text);
   overflow-wrap: anywhere;
+  word-spacing: normal;
 }
 .chart-dir {
   font-size: var(--fs-xs);
@@ -3553,6 +3654,7 @@ pre,
   border-radius: var(--r-pill);
   background: var(--surface);
   font: 500 var(--fs-md) var(--font-mono);
+  word-spacing: normal;
 }
 .legend-swatch {
   flex: none;
@@ -3661,6 +3763,7 @@ pre,
   min-width: 0;
   white-space: pre-wrap;
   font: var(--fs-sm) / 1.6 var(--font-mono-stack);
+  word-spacing: normal;
 }
 .key-copy-status {
   position: absolute;
@@ -3779,6 +3882,7 @@ pre,
 .workspace-switcher-role {
   color: var(--text-3);
   font: var(--fs-sm) var(--font-mono-stack);
+  word-spacing: normal;
 }
 .workspace-list {
   list-style: none;
@@ -3988,6 +4092,7 @@ pre,
   font: 400 11.5px var(--font-mono-stack);
   color: var(--text-3);
   overflow-wrap: anywhere;
+  word-spacing: normal;
 }
 .settings-ws-name {
   font-size: var(--fs-md);
@@ -4041,6 +4146,7 @@ pre,
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   font: var(--fs-sm) / 1.6 var(--font-mono-stack);
+  word-spacing: normal;
 }
 .settings-result .btn {
   align-self: flex-start;
@@ -4121,6 +4227,7 @@ pre,
 .settings-row-role {
   font: 400 var(--fs-sm) var(--font-mono-stack);
   color: var(--text-3);
+  word-spacing: normal;
 }
 .settings-row-slot {
   display: inline-flex;
@@ -4165,6 +4272,7 @@ pre,
   font: 500 var(--fs-sm) var(--font-mono-stack);
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
+  word-spacing: normal;
 }
 .usage-tiles .usage-note {
   display: block;
