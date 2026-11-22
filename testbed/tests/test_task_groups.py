@@ -402,3 +402,33 @@ def test_lineage_view_follows_polls(page, ui_server):
     runs.clear()
     page.clock.fast_forward(5000)
     expect(page.get_by_role("dialog")).to_have_count(0)
+
+
+def _drop_lineage(root, ids):
+    for run_id in ids:
+        path = root / "runs" / run_id / "meta.json"
+        meta = json.loads(path.read_text())
+        meta.pop("lineage", None)
+        path.write_text(json.dumps(meta))
+
+
+def test_lineage_inspector_says_no_snapshot_instead_of_code_changed(page, tmp_path, ui_server_factory):
+    root = tmp_path / "lineage-no-snapshot"
+    ids = _scored(root, [0.5, 0.6, 0.9], parents=(None, 0, 1))
+    # Runs recorded with lineage=False keep an explicit parent but have no tree.
+    _drop_lineage(root, [ids[0], ids[2]])
+    fetched = []
+    page.on("request", lambda request: fetched.append(request.url) if "/lineage" in request.url else None)
+    with ui_server_factory(root) as server:
+        home(page, server)
+        dialog = _open_lineage(page)
+        inspector = dialog.get_by_role("complementary", name="Selected run")
+        code = inspector.locator(".kv-list > div").filter(has=page.locator("dt", has_text="code")).locator("dd")
+        for index, text in ((0, "no snapshot"),         # root without a snapshot
+                            (1, "parent has no snapshot"),  # snapshot, but the parent has none
+                            (2, "no snapshot")):        # child without a snapshot
+            page.locator(f'.lv-node[data-run-id="{ids[index]}"] .lv-box').click()
+            expect(page.locator(".lv-node.is-focused")).to_have_attribute("data-run-id", ids[index])
+            expect(code).to_have_text(text)
+        # Only runs whose snapshots can be compared ask the server for a code diff.
+        assert not [url for url in fetched if "/api/runs/" in url]
