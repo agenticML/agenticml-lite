@@ -3,10 +3,19 @@
 Nov 21, 2026 · Supervisor plan · Maintenance fix after 3.3.0 · Size: S ·
 Base branch: `main` (tag `v3.3.0` + release docs).
 
-Status: plan draft, waiting for the owner's review. Nothing is built yet.
+Status: built and in review in
+[#97](https://github.com/agenticML/agenticml-lite/pull/97) (Nov 22, 2026).
+The open questions are decided (see "Decisions" at the end). Sonnet coded;
+the supervisor reviewed, ran a four-lens review with adversarial
+verification (one confirmed defect: the `rev-parse` describe fallback, fixed
+by switching to `for-each-ref`), and did the † second review.
 Updated Nov 22, 2026: code claims re-checked against `main`, costs measured
 (see "Performance and limits"), timeout budget, helper reuse and dashboard
 label made precise.
+
+† Security-sensitive: run ids from metadata reach a Git argument list, so
+the change gets a second read-only review (by the supervisor when no other
+coder is available).
 
 ## Goal
 
@@ -84,8 +93,9 @@ Git parent after the fact.
 - `_git_numstat` (ui/server.py ~977) streams stdout through `Popen` in 64 KiB
   reads with a 5 s deadline (`_GIT_TIMEOUT`), stops at 500 rows
   (`_LINEAGE_FILES`) or 2 MiB (`_GIT_MAX_BYTES`) and terminates Git there.
-  `lineage._resolve_commit` (lineage.py ~245) runs the same `rev-parse` this
-  plan needs, but returns `None` for every non-zero exit (cannot tell "not
+  `lineage._resolve_commit` (lineage.py ~245) resolves `refs/runs/<id>`
+  with `rev-parse --verify` (which also reads `describe`-style names; see
+  step 2), returns `None` for every non-zero exit (cannot tell "not
   found" from "Git failed"), defaults to a 30 s timeout and raises
   `ValueError` on bad ids; `server/lineage.py` `_commit` is a third variant.
 - The dashboard server is a `ThreadingHTTPServer` (one thread per
@@ -104,7 +114,7 @@ Git parent after the fact.
 | Stored meta | Unchanged; `parent_commit` keeps meaning "resolved at snapshot time" | Cannot touch `meta.json` (client-owned, re-pushed); needs a server-owned sidecar or a DB column | Would store a commit whose objects are not in the local repo, breaking local `lineage diff` / `ui` | Unchanged |
 | Git-argument safety | Run id checked with `_as_run_id` and a ref-format check; output checked with `_COMMIT_RE` | Same checks, inside the receive lock | New download path to secure | Same as (a) |
 | Workspace / project isolation | Lookup only in the child's own workspace root and project repo | Same, plus the trigger must stay inside one workspace | Needs a cross-store fetch API | n/a |
-| Caching | None needed (one `rev-parse`, ~ms) | Stored, but must handle refs removed later | n/a | Same as (a) |
+| Caching | None needed (one `for-each-ref`, ~ms) | Stored, but must handle refs removed later | n/a | Same as (a) |
 | SQLite / Postgres | No database change | Migration on both dialects, or a sidecar file | No | No |
 | Hosted service | Same code path; read-only Git on EFS, safe across processes | Extra writes and a children lookup on every receive | n/a | n/a |
 | Older clients and stores | Fixed by upgrading the server alone, including runs already synced | Needs a backfill for runs already synced | Needs every worker upgraded; no fix for old runs | Fixed by upgrading the client |
@@ -189,26 +199,44 @@ succeeds:
    `_resolve_run_commit(repo, parent_run_id, timeout=_GIT_LOOKUP_TIMEOUT)`:
    - The id arrives already validated by `_stored_parent` → `_as_run_id`
      (`_RUN_ID_RE`); that is what keeps `^`, `~`, `:`, spaces and similar
-     out of `refs/runs/{id}^{commit}`. The helper keeps its own dot-pattern
-     check as defence in depth.
+     out of the ref pattern (`/`, `*`, `?`, `[` cannot occur). The helper
+     keeps its own dot-pattern check as defence in depth.
    - Refuse ids that can never be ref names before calling Git: contains
      `..`, ends with `.` or `.lock` (`_RUN_ID_RE` allows only
      `[A-Za-z0-9._-]` with an alphanumeric first character, so these dot
      patterns are the only ref-format hazards). Return "not found", the same
-     outcome Git gives for them (exit 1), so the pre-check only saves a
+     outcome Git gives for them (no match), so the pre-check only saves a
      process spawn.
-   - Run `["git", f"--git-dir={repo}", "rev-parse", "--verify", "-q",
-     f"refs/runs/{run_id}^{{commit}}"]` with `subprocess.run`, `stdin`/
-     `stderr` to DEVNULL, `stdout` captured, `env=_git_env()`,
-     `cwd=str(repo)`, `timeout=timeout`. The argument starts with `refs/`,
-     so it cannot be read as an option; `--verify` accepts one object only.
-   - Exit 0 and stdout (stripped) matching `_COMMIT_RE`: found. Exit 1:
-     not found (checked on Git 2.50 and 2.34: a missing ref and a `..` name
-     both exit 1 with `-q`). Any other exit or malformed output: "git diff
-     failed". `FileNotFoundError`: "git is not available". `TimeoutExpired`:
-     "git diff timed out". Any other `OSError` (permission denied, EMFILE):
-     "git diff failed", as in `_git_numstat`. Errors return the error
-     payload, never a misleading root diff.
+   - Run `["git", f"--git-dir={repo}", "for-each-ref",
+     "--format=%(objectname) %(objecttype)", f"refs/runs/{run_id}"]` with
+     `subprocess.run`, `stdin`/`stderr` to DEVNULL, `stdout` captured,
+     `env=_git_env()`, `cwd=str(repo)`, `timeout=timeout`. The argument
+     starts with `refs/`, so it cannot be read as an option.
+   - **Not `rev-parse` (changed in review, Nov 22, 2026).** `git rev-parse
+     --verify refs/runs/<id>^{commit}` falls back to reading a missing name
+     as `git describe` output, so an id like `exp-g67ef` (which `_RUN_ID_RE`
+     allows) resolves to any commit whose id starts with `67ef`, including
+     commits whose run was removed. That gives a wrong diff labelled
+     `parent_source: "ref"` and lets anyone who can push `meta.json` probe
+     the workspace's shadow repo by commit prefix. `for-each-ref` matches
+     ref names only: a pattern matches the exact ref or refs below it
+     (`refs/runs/<id>/...`, which cannot exist because run ids have no `/`),
+     never a prefix of a name (`refs/runs/ab` does not match
+     `refs/runs/abc`) and never an object id. Checked on Git 2.34 with loose
+     and packed refs.
+   - Exit 0 with exactly one line `<sha> commit` whose sha matches
+     `_COMMIT_RE`: found. Exit 0 with empty output: not found. Exit 0 with a
+     single line whose type is not `commit`: not found (the same outcome the
+     old `^{commit}` peel gave; on the server refs are always commits). Any
+     other exit (128 for a broken repo), more than one line, or malformed
+     output: "git diff failed". `FileNotFoundError`: "git is not
+     available". `TimeoutExpired`: "git diff timed out". Any other `OSError`
+     (permission denied, EMFILE): "git diff failed", as in `_git_numstat`.
+     Errors return the error payload, never a misleading root diff.
+   - The CLI's `lineage._resolve_commit` (used by `snapshot()` at snapshot
+     time and by `lineage.diff()`) has the same `describe` fallback. That
+     predates this fix and is out of scope here; it is a roadmap Backlog
+     entry.
    - Found: `parent_commit = <sha>`, `parent_source = "ref"`.
    - Not found: `parent_commit = None`, `parent_source = None`, root diff as
      today.
@@ -293,13 +321,13 @@ EFS was not measured; see the last row.
 
 | What | Today (parent in another store) | After the fix |
 | --- | --- | --- |
-| Parent lookup (`rev-parse`) | none | ~1 ms found or not found; 1.2-1.7 ms with 10,000 run refs (loose or packed) |
+| Parent lookup (measured with `rev-parse`; `for-each-ref` reads the same ref files) | none | ~1 ms found or not found; 1.2-1.7 ms with 10,000 run refs (loose or packed) |
 | Diff, 20,000 files, 1 file changed | 187 ms root diff (loose objects), 64 ms packed | 1.3 ms (~140x less) |
 | Diff, 20,000 files, 5% changed | 189 ms | 31 ms loose, 13 ms packed (~6x less) |
 | Diff, 2,000 files, 1 file changed | 22 ms | 1.2 ms |
 | Parent never synced | root diff | same root diff + ~1 ms |
 | Stored `parent_commit` set | unchanged | unchanged, no lookup |
-| Git child peak RSS, 20,000 files | 13 MB (root diff) | 4.6 MB (parent diff), 4.1 MB (`rev-parse`); the two never overlap |
+| Git child peak RSS, 20,000 files | 13 MB (root diff) | 4.6 MB (parent diff), 4.1 MB (lookup); the two never overlap |
 | Python-side memory per request | bounded by 500 rows / 2 MiB cap | same bound; no cache or stored state added |
 | JSON payload for a cross-host child | ~39 KB (500 "added" rows at the cap) | ~0.3 KB for one changed file |
 | Worst case on a stalled filesystem | 5 s read deadline | read deadline stays 5 s, shared by lookup and diff (step 2); without sharing it would be 5 s + 5 s. Not covered: the existing wait-and-kill in `_reap_git` (up to 5 s + 5 s after a timeout), unchanged |
@@ -388,10 +416,14 @@ Unit (`tests/test_ui.py`, local `agenticml ui` path):
    on the module is the intended seam; existing tests that patch
    `server.subprocess.Popen` would also reach the lookup when
    `parent_commit` is empty, so keep their fixtures' `parent_commit` set.
-7. `rev-parse` outcomes by monkeypatching `server.subprocess.run`:
+7. Lookup outcomes by monkeypatching `server.subprocess.run`:
    malformed stdout, exit 128 and a generic `OSError` give "git diff
    failed"; `FileNotFoundError` gives "git is not available";
    `TimeoutExpired` gives "git diff timed out"; `files` empty in each.
+   Also with real Git: a non-commit ref type and two output lines (stubbed)
+   give "not found" and "git diff failed"; a parent id shaped like
+   `git describe` output (`x-g<first 5 hex of an existing commit>`) with no
+   such ref gives a root diff with `parent_source: null`.
 8. Timeout budget: call `server._lineage_changes(root, run_id, meta)`
    directly with `_resolve_run_commit` and `_git_numstat` stubbed, and a
    mutable clock (`[100.0]`) patched into `server.time.monotonic`. The
@@ -419,7 +451,7 @@ pattern). Existing `test_lineage_inspector_code_changed_without_repo` keeps
 "code changed"; no horizontal overflow at 375 px.
 
 Optional owner check (hosted, not a CI step): on the hosted task, time one
-`rev-parse --verify -q refs/runs/<id>^{commit}` and one `diff-tree --root`
+`for-each-ref refs/runs/<id>` and one `diff-tree --root`
 on a real workspace repo on EFS, and record the numbers in this plan.
 
 Checks:
@@ -460,3 +492,22 @@ Checks:
    "code not synced yet" in the same PR?
 5. Release: ship as 3.3.1 on its own, or hold for the next minor release?
    agentlab only needs the server upgraded.
+
+## Decisions (Nov 22, 2026)
+
+The owner asked the supervisor to take the recommended option for open
+decisions and record it here.
+
+1. Label: `parent code not available`, in local and server mode. The API
+   keeps the root diff for an unresolved parent (no `files: []` shortcut),
+   so the API answer for those runs does not change.
+2. Parent id: the lookup uses the top-level `parent_run_id` (via
+   `_stored_parent`), the id the payload and graph show. The CLI
+   `lineage diff` is not changed in this PR; aligning it (or documenting the
+   difference) goes to the roadmap Backlog.
+3. Cross-project parents: root diff with the label; no project-specific
+   message (no extra `meta.json` read per request).
+4. Child bundle not yet received: keep "git diff failed" (pre-existing).
+5. Release: recommended as a 3.3.1 patch release, since agentlab only needs
+   the server upgraded. Tagging and publishing stay owner steps; this PR does
+   not change the version or the Releases page.

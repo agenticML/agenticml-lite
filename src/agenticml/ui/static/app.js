@@ -2047,9 +2047,11 @@ async function home(version) {
           ? "code unchanged"
           : lineageError
             ? lineageError
-            : files
-              ? `${files.length} file${files.length === 1 ? "" : "s"} changed${files[0] ? ` · ${files[0].path}` : ""}`
-              : "code changed";
+            : detail && !detail.error && detail.parent_run_id && !detail.parent_commit
+              ? "parent code not available"
+              : files
+                ? `${files.length} file${files.length === 1 ? "" : "s"} changed${files[0] ? ` · ${files[0].path}` : ""}`
+                : "code changed";
       const stat = (name, text, tone = "") =>
         el("div", {}, el("dt", { text: name }), el("dd", { class: tone, text }));
       inspector.replaceChildren(

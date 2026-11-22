@@ -276,6 +276,16 @@ keeps any live ref's objects available. Uploaded temporary files and quarantines
 are removed after both successful and failed requests. Startup also removes
 abandoned `lineage-*` quarantine directories from `server/tmp` after a crash.
 
+The server never rewrites `meta.json` or its `lineage.parent_commit`: the client
+owns that file and replaces any server edit on its next push. A child whose
+parent ran in another store (another machine syncing to the same server) has
+`parent_commit: null`, because the parent's ref did not exist where the child
+was snapshotted. Once the parent's bundle is on the server in the same workspace
+and project, the dashboard run diff resolves `refs/runs/<parent_run_id>` at read
+time and compares the child with it (`parent_source: "ref"`, see FORMAT.md).
+Sync order between machines does not matter, and a parent that never syncs
+leaves the child with a root diff.
+
 ### `POST /v2/objects/missing`
 
 Query which content-addressed objects are missing on the server.

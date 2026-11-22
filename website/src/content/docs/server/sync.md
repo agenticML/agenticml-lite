@@ -129,7 +129,7 @@ The server updates run status based on commits recorded in the server database:
 
 ## Full fidelity features
 
-- **Lineage code diffs**: When Git is installed on the server, `agenticml sync` replicates shadow Git bundles, allowing the web dashboard to render source code diffs and commit histories.
+- **Lineage code diffs**: When Git is installed on the server, `agenticml sync` replicates shadow Git bundles, allowing the web dashboard to render source code diffs and commit histories. Runs from several machines syncing to one server get correct diffs against a parent that ran on another machine, in either sync order, once both have synced (pass `--parent` with the parent's run id).
 - **By-reference artifacts**: Use `agenticml sync --artifacts` to upload files logged with `copy=False`.
 - **User ownership**: Runs are owned by the account holding the sync key. Any key belonging to that account can append to the run.
 
