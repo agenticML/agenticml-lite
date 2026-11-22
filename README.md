@@ -4,7 +4,7 @@ Experiment tracking for machine learning that runs from files on disk. A W&B-sty
 
 [![PyPI](https://img.shields.io/pypi/v/agenticml-lite)](https://pypi.org/project/agenticml-lite/) [![Python versions](https://img.shields.io/pypi/pyversions/agenticml-lite)](https://pypi.org/project/agenticml-lite/) [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/agenticML/agenticml-lite/blob/main/LICENSE) [![Tests](https://github.com/agenticML/agenticml-lite/actions/workflows/test.yml/badge.svg)](https://github.com/agenticML/agenticml-lite/actions/workflows/test.yml) [![Docs](https://img.shields.io/badge/docs-agenticml.github.io-blue)](https://agenticml.github.io/agenticml-lite/)
 
-![The agenticml dashboard comparing the loss and accuracy curves of several runs of one project](https://raw.githubusercontent.com/agenticML/agenticml-lite/main/docs/assets/dashboard.png)
+![Demo of the agenticml dashboard: a training run's curves growing live, then the lineage graph of a task's runs: the best path from the root run to the best one, what each step changed in params and code and what it did to val_loss, a crashed branch, and the best path compared](https://raw.githubusercontent.com/agenticML/agenticml-lite/main/docs/assets/demo-lineage.gif)
 
 Training writes metrics, config, code and media to files on disk, and `agenticml ui` shows them in a local dashboard. When you want to share runs with a team, sync them to your own `agenticml server` or to the hosted service (public preview).
 

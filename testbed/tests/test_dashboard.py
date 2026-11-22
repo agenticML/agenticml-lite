@@ -1181,6 +1181,63 @@ def test_metrics_chunk_keys_and_overview_points(page, tmp_path, ui_server_factor
         painted(dense.locator("canvas"))
 
 
+def test_sans_text_has_word_spacing_and_mono_text_keeps_none(page, ui_server):
+    """Small sans text gets slightly wider gaps; code and ids stay one character wide."""
+    compare(page, ui_server)
+    label = page.locator("label").filter(has_text="Clip outliers on y-axis")
+    spacing = lambda locator: locator.evaluate("el => parseFloat(getComputedStyle(el).wordSpacing) || 0")
+    assert spacing(label) > 0
+    # Form controls keep the page spacing too (browsers reset it on button/input).
+    assert spacing(page.locator("button.btn-secondary").first) > 0
+    page.goto(f"{ui_server.url}#/run/{ui_server.runs['explicit-baseline']}")
+    expect(page.get_by_role("heading", name="explicit-baseline", exact=True)).to_be_visible()
+    viewer = page.get_by_test_id("code-inline-view")
+    viewer.locator('.code-file[data-path$="model.py"]').click()
+    lines = viewer.locator(".code-lines")
+    expect(lines).to_contain_text("class LogisticRegression")
+    assert spacing(lines) == 0
+    assert spacing(page.get_by_role("heading", name="explicit-baseline", exact=True)) == 0
+    # Every element drawn in the mono family keeps normal spacing, wherever it sits.
+    offenders = page.evaluate("""() => [...document.querySelectorAll('body *')]
+      .filter((el) => /JetBrains|monospace/i.test(getComputedStyle(el).fontFamily))
+      .filter((el) => parseFloat(getComputedStyle(el).wordSpacing) > 0)
+      .map((el) => el.tagName + '.' + el.className)""")
+    assert offenders == []
+
+
+@pytest.mark.parametrize("child", [False, True])
+def test_run_header_never_prints_null(page, tmp_path, ui_server_factory, child):
+    root = tmp_path / "header"
+    ids = _lineage_project(root, ("root-run", "child-run"))
+    with ui_server_factory(root) as server:
+        page.goto(f"{server.url}#/run/{ids[1 if child else 0]}")
+        name = "child-run" if child else "root-run"
+        expect(page.get_by_role("heading", name=name, exact=True)).to_be_visible()
+        title = page.locator(".run-title")
+        if child:
+            expect(title.locator(".run-parent")).to_contain_text("child of root-run")
+        expect(title).to_contain_text(name)
+        assert "null" not in title.inner_text()
+        assert "undefined" not in title.inner_text()
+
+
+def test_run_page_change_note_says_parent_has_no_snapshot(page, tmp_path, ui_server_factory):
+    root = tmp_path / "parent-no-snapshot"
+    ids = _lineage_project(root, ("root-run", "child-run"))
+    # Seed the parent as recorded with lineage=False: no lineage block, hence no tree.
+    path = root / "runs" / ids[0] / "meta.json"
+    meta = json.loads(path.read_text())
+    meta.pop("lineage")
+    path.write_text(json.dumps(meta))
+    with ui_server_factory(root) as server:
+        page.goto(f"{server.url}#/run/{ids[1]}")
+        expect(page.get_by_role("heading", name="child-run", exact=True)).to_be_visible()
+        note = page.locator(".change-note")
+        expect(note).to_contain_text("parent has no snapshot")
+        expect(note).not_to_contain_text("code changed")
+        expect(note).not_to_contain_text("code unchanged")
+
+
 def test_canvas_resizes_for_device_pixels_and_viewport(page, context, ui_server):
     open_run(page, ui_server)
     canvas = loss(page).locator("canvas")

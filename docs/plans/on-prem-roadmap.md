@@ -413,9 +413,10 @@ part can go to `main` early as a docs-only PR.
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 35 | Repo outreach: README, comparison table, images, community files, dashboard GitHub link | 3.1 | Sonnet; supervisor reviews | M | [plan](packages/35-repo-outreach.md) | done ([#90](https://github.com/agenticML/agenticml-lite/pull/90), merged Nov 20, 2026; released in 3.3.0) |
+| 35 | Repo outreach: README, comparison table, images, community files, dashboard GitHub link | 3.1 | Sonnet; supervisor reviews | M | [plan](packages/35-repo-outreach.md) | done ([#90](https://github.com/agenticML/agenticml-lite/pull/90), merged Nov 20, 2026; released in 3.3.0); 35.3 added Nov 20, 2026, see its row |
 | 35.1 | README rework with screenshot and comparison table, `scripts/make_readme_images.py` (dashboard screenshot, social preview), CONTRIBUTING, code of conduct, issue and PR templates, PyPI keywords and classifiers | – | Sonnet | S–M | [plan](packages/35-repo-outreach.md) | done ([#90](https://github.com/agenticML/agenticml-lite/pull/90), merged Nov 20, 2026; released in 3.3.0) |
 | 35.2 | GitHub link in the dashboard top bar; docs and GitHub line from `agenticml ui` | – | Sonnet | S | [plan](packages/35-repo-outreach.md) | done ([#90](https://github.com/agenticML/agenticml-lite/pull/90), merged Nov 20, 2026; released in 3.3.0) |
+| 35.3 | README demo GIF instead of the still screenshot (live run, lineage graph, select and compare, hover and smoothing), made by `scripts/make_readme_images.py` with Playwright frames and Pillow | 35.1 | Sonnet; supervisor reviews | S | [plan](packages/35-repo-outreach.md#353-readme-demo-gif) | in review ([#96](https://github.com/agenticML/agenticml-lite/pull/96), draft); the README shows the lineage-focused `demo-lineage.gif` (owner's pick, Nov 21, 2026) |
 
 ### Maintenance fixes
 
@@ -428,6 +429,12 @@ part can go to `main` early as a docs-only PR.
   e2e and metrics tests): [plan](packages/fix-flaky-postgres-timeouts.md),
   found in [#83](https://github.com/agenticML/agenticml-lite/pull/83);
   status: done ([#85](https://github.com/agenticML/agenticml-lite/pull/85)).
+- Dashboard defects seen in the README demo GIF (squeezed word gaps in
+  small sans text, a literal "null" in the run page header, "code changed"
+  in the lineage inspector without snapshots):
+  [plan](packages/fix-demo-gif-ui-defects.md), found in package 35.3;
+  status: in review ([#96](https://github.com/agenticML/agenticml-lite/pull/96); full test
+  runs done Nov 21, 2026, see the plan's Resume notes).
 - The hosted deploy log printed the admin email addresses
   (`HOSTED_ADMIN_EMAILS` variable) in this public repository's Actions logs:
   [plan](packages/fix-admin-emails-in-deploy-log.md), found in deploy run
@@ -524,6 +531,11 @@ follow-ups and the metric picker, a remainder moved to "Later
 (unscheduled)"), the permissions boundary moved to Later, and the entries
 below are the ones that need the owner's accounts or machines. 3.0.0 was released
 on Nov 17, 2026; none of the entries below blocked it.
+
+### Dashboard UI defects seen in the README demo GIF
+
+- Fixed in [#96](https://github.com/agenticML/agenticml-lite/pull/96); see
+  the [plan](packages/fix-demo-gif-ui-defects.md).
 
 ### Owner steps
 
