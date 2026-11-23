@@ -416,7 +416,7 @@ part can go to `main` early as a docs-only PR.
 | 35 | Repo outreach: README, comparison table, images, community files, dashboard GitHub link | 3.1 | Sonnet; supervisor reviews | M | [plan](packages/35-repo-outreach.md) | done ([#90](https://github.com/agenticML/agenticml-lite/pull/90), merged Nov 20, 2026; released in 3.3.0); 35.3 added Nov 20, 2026, see its row |
 | 35.1 | README rework with screenshot and comparison table, `scripts/make_readme_images.py` (dashboard screenshot, social preview), CONTRIBUTING, code of conduct, issue and PR templates, PyPI keywords and classifiers | – | Sonnet | S–M | [plan](packages/35-repo-outreach.md) | done ([#90](https://github.com/agenticML/agenticml-lite/pull/90), merged Nov 20, 2026; released in 3.3.0) |
 | 35.2 | GitHub link in the dashboard top bar; docs and GitHub line from `agenticml ui` | – | Sonnet | S | [plan](packages/35-repo-outreach.md) | done ([#90](https://github.com/agenticML/agenticml-lite/pull/90), merged Nov 20, 2026; released in 3.3.0) |
-| 35.3 | README demo GIF instead of the still screenshot (live run, lineage graph, select and compare, hover and smoothing), made by `scripts/make_readme_images.py` with Playwright frames and Pillow | 35.1 | Sonnet; supervisor reviews | S | [plan](packages/35-repo-outreach.md#353-readme-demo-gif) | done ([#96](https://github.com/agenticML/agenticml-lite/pull/96), merged Nov 22, 2026; released in 3.3.1 (Nov 23, 2026)); the README shows the lineage-focused `demo-lineage.gif` (owner's pick, Nov 21, 2026) |
+| 35.3 | README demo GIF instead of the still screenshot (live run, lineage graph, select and compare, hover and smoothing), made by `scripts/make_readme_images.py` with Playwright frames and Pillow | 35.1 | Sonnet; supervisor reviews | S | [plan](packages/35-repo-outreach.md#353-readme-demo-gif) | done ([#96](https://github.com/agenticML/agenticml-lite/pull/96), merged Nov 22, 2026; released in 3.3.1 on Nov 23, 2026); the README shows the lineage-focused `demo-lineage.gif` (owner's pick, Nov 21, 2026) |
 
 ### Maintenance fixes
 
@@ -545,18 +545,14 @@ on Nov 17, 2026; none of the entries below blocked it.
 
 ### Owner steps
 
-- **Release 3.3.1** (owner). Tag `v3.3.1` and PyPI 3.3.1 done Nov 23, 2026.
-  - Where: the GitHub repository (releases, Actions); `release-assets.yml`,
-    `deploy.yml`.
-  - Problem: the GitHub release for `v3.3.1` does not exist yet, and the
-    hosted deploy of `4c060b3` (the merge of
-    [#97](https://github.com/agenticML/agenticml-lite/pull/97)) is waiting for
+- **Release 3.3.1** (owner). Tag `v3.3.1`, PyPI 3.3.1 and the GitHub release
+  (with `agenticml.yaml`) done Nov 23, 2026.
+  - Where: Actions, `deploy.yml`.
+  - Problem: the hosted deploy of `4c060b3` (the merge of
+    [#97](https://github.com/agenticML/agenticml-lite/pull/97)) waits for
     approval, so the hosted service does not run 3.3.1.
-  - Fix: (1) Publish the GitHub release for `v3.3.1`; `release-assets.yml`
-    attaches `agenticml.yaml`. (2) Approve the `deploy.yml` run that waits for
-    the `hosted` environment.
-  - Done when: the release has `agenticml.yaml` and the hosted service runs
-    `4c060b3`.
+  - Fix: approve the `deploy.yml` run waiting for the `hosted` environment.
+  - Done when: the hosted service runs `4c060b3`.
 - **Move the admin emails to a secret** (fix
   [admin emails in the deploy log](packages/fix-admin-emails-in-deploy-log.md),
   Nov 19, 2026). High priority: do it before the next hosted deploy; deploys

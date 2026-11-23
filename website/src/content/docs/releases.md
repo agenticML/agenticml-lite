@@ -51,6 +51,8 @@ pip install -U 'agenticml-lite[system]'
 - **Runs without a snapshot:** The lineage inspector and the run page say "no snapshot" or "parent has no snapshot" instead of "code changed".
 - **Lineage inspector:** "· gen N" stays on one line.
 
+**Template on the release:** The [GitHub release](https://github.com/agenticML/agenticml-lite/releases/tag/v3.3.1) has the template as `agenticml.yaml`.
+
 ---
 
 ## 3.3.0
