@@ -148,6 +148,7 @@ _CODE_DIFF_TOTAL_LINES = 20000
 _CODE_DIFF_FILES = 500
 _CODE_DIFF_CACHE_SIZE = 256
 _GIT_TIMEOUT = 5
+_GIT_LOOKUP_TIMEOUT = 2
 _GIT_MAX_BYTES = 2 * 1024 * 1024
 _GIT_READ = 64 * 1024
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
@@ -830,12 +831,13 @@ def _git_env():
     return env
 
 
-def _diff_payload(run_id, *, commit=None, parent_run_id=None, parent_commit=None, files=None, truncated=False, error=None):
+def _diff_payload(run_id, *, commit=None, parent_run_id=None, parent_commit=None, parent_source=None, files=None, truncated=False, error=None):
     return {
         "run_id": run_id,
         "commit": commit,
         "parent_run_id": parent_run_id,
         "parent_commit": parent_commit,
+        "parent_source": parent_source,
         "files": files or [],
         "truncated": truncated,
         "checkout": f"agenticml lineage checkout {run_id}",
@@ -974,7 +976,48 @@ def _reap_git(proc, *, terminate):
             pass
 
 
-def _git_numstat(args, cwd):
+def _resolve_run_commit(repo, run_id, timeout):
+    """``(commit, error)`` for ``refs/runs/<run_id>`` in a shadow repo.
+
+    Not ``lineage._resolve_commit``: the dashboard must tell "not found" from
+    "git failed", needs a short timeout and keeps this module's hardening.
+    Uses ``for-each-ref``, not ``rev-parse``: ``rev-parse`` reads a missing
+    name as ``git describe`` output, so ``x-g<hex>`` would match any commit
+    whose id starts with ``<hex>``.
+    """
+    if ".." in run_id or run_id.endswith((".", ".lock")):
+        return None, None
+    args = [
+        "git", f"--git-dir={repo}", "for-each-ref", "--format=%(objectname) %(objecttype)",
+        f"refs/runs/{run_id}",
+    ]
+    try:
+        done = subprocess.run(
+            args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            env=_git_env(), cwd=str(repo), timeout=timeout,
+        )
+    except FileNotFoundError:
+        return None, "git is not available"
+    except subprocess.TimeoutExpired:
+        return None, "git diff timed out"
+    except OSError:
+        return None, "git diff failed"
+    if done.returncode != 0:
+        return None, "git diff failed"
+    lines = done.stdout.decode("ascii", "replace").splitlines()
+    if not lines:
+        return None, None
+    if len(lines) != 1:
+        return None, "git diff failed"
+    sha, _, kind = lines[0].partition(" ")
+    if not _COMMIT_RE.fullmatch(sha) or not kind.isalpha():
+        return None, "git diff failed"
+    if kind != "commit":
+        return None, None
+    return sha, None
+
+
+def _git_numstat(args, cwd, timeout=_GIT_TIMEOUT):
     """``(blob, truncated, error)``. Stderr is discarded; stdout is capped."""
     try:
         proc = subprocess.Popen(
@@ -995,7 +1038,7 @@ def _git_numstat(args, cwd):
     timed_out = False
     try:
         blob, truncated = _cap_numstat(
-            _iter_stdout(proc, _GIT_TIMEOUT), _LINEAGE_FILES, _GIT_MAX_BYTES,
+            _iter_stdout(proc, timeout), _LINEAGE_FILES, _GIT_MAX_BYTES,
         )
     except subprocess.TimeoutExpired:
         timed_out = True
@@ -1026,22 +1069,24 @@ def _lineage_changes(root, run_id, meta, server_mode=False):
     raw_parent = lineage.get("parent_commit")
     if raw_parent in (None, ""):
         parent_commit = None
+        parent_source = None
     elif isinstance(raw_parent, str) and _COMMIT_RE.fullmatch(raw_parent):
         parent_commit = raw_parent
+        parent_source = "meta"
     else:
         return _diff_payload(run_id, commit=commit, parent_run_id=parent_run_id, error="invalid parent commit")
     key = lineage.get("project_key")
     if not isinstance(key, str) or not _PROJECT_KEY_RE.fullmatch(key):
         return _diff_payload(
             run_id, commit=commit, parent_run_id=parent_run_id, parent_commit=parent_commit,
-            error=stored_error or "invalid lineage project key",
+            parent_source=parent_source, error=stored_error or "invalid lineage project key",
         )
     try:
         repo = layout.contained(root, Path(root) / "lineage" / f"{key}.git")
     except ValueError:
         return _diff_payload(
             run_id, commit=commit, parent_run_id=parent_run_id, parent_commit=parent_commit,
-            error="invalid lineage repository",
+            parent_source=parent_source, error="invalid lineage repository",
         )
     try:
         if not repo.is_dir():
@@ -1050,18 +1095,27 @@ def _lineage_changes(root, run_id, meta, server_mode=False):
         missing = "code diff not available on this server" if server_mode else "lineage repository not found"
         return _diff_payload(
             run_id, commit=commit, parent_run_id=parent_run_id, parent_commit=parent_commit,
-            error=missing,
+            parent_source=parent_source, error=missing,
         )
+    deadline = None
+    if not parent_commit and parent_run_id and parent_run_id != run_id:
+        deadline = time.monotonic() + _GIT_TIMEOUT
+        parent_commit, error = _resolve_run_commit(repo, parent_run_id, _GIT_LOOKUP_TIMEOUT)
+        if error:
+            return _diff_payload(run_id, commit=commit, parent_run_id=parent_run_id, error=error)
+        if parent_commit:
+            parent_source = "ref"
     git_dir = f"--git-dir={repo}"
     if parent_commit:
         args = ["git", git_dir, "diff-tree", "-r", "--numstat", "-z", "--no-renames", parent_commit, commit]
     else:
         args = ["git", git_dir, "diff-tree", "--root", "-r", "--numstat", "-z", commit]
-    blob, truncated, error = _git_numstat(args, str(repo))
+    timeout = _GIT_TIMEOUT if deadline is None else max(0.5, deadline - time.monotonic())
+    blob, truncated, error = _git_numstat(args, str(repo), timeout=timeout)
     if error:
         return _diff_payload(
             run_id, commit=commit, parent_run_id=parent_run_id, parent_commit=parent_commit,
-            error=error,
+            parent_source=parent_source, error=error,
         )
     files = _parse_numstat(blob)
     if len(files) > _LINEAGE_FILES:
@@ -1069,7 +1123,7 @@ def _lineage_changes(root, run_id, meta, server_mode=False):
         truncated = True
     return _diff_payload(
         run_id, commit=commit, parent_run_id=parent_run_id, parent_commit=parent_commit,
-        files=files, truncated=truncated, error=None,
+        parent_source=parent_source, files=files, truncated=truncated, error=None,
     )
 
 

@@ -42,7 +42,7 @@ training machine with the `SyncCommand` output.
 | `SignUp` | `invite-only` | `invite-only`, or `open` (every verified email gets its own workspace). |
 | `AllowedEmailDomains` | empty | Comma-separated domains, no spaces. Only these domains (and the administrator) can sign up, in the server and in Cognito. Invitees must also be in these domains: Cognito refuses a sign-up from any other domain, invited or not. Empty means no restriction. |
 | `CognitoDomainPrefix` | empty | Cognito sign-in domain prefix; empty derives one from the stack ID. |
-| `AgenticmlVersion` | `3.3.0` | Version installed from PyPI. |
+| `AgenticmlVersion` | `3.3.1` | Version installed from PyPI. |
 | `InstanceType` | `t4g.small` | Graviton instance type. |
 | `DataVolumeSize` | `50` | Data volume in GiB (whole number from 10). A raised size applies to the volume at once and to the file system at the next instance restart or replacement. |
 | `BackupRetentionDays` | `14` | Daily snapshots to keep. |

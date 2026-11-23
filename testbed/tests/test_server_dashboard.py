@@ -6,6 +6,7 @@ import threading
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from conftest import seed_shadow_repo
 from agenticml.server.app import make_server
 from agenticml.server.db.repos import RunRepo
 from agenticml.server.db.workspaces import InviteRepo, WorkspaceRepo
@@ -213,6 +214,39 @@ def test_lineage_inspector_shows_server_code_diff_message(page, tmp_path, monkey
         expect(page.locator(".lv-node.is-focused")).to_have_attribute("data-run-id", ids[1])
         code = inspector.locator(".kv-list > div").filter(has=page.locator("dt", has_text="code")).locator("dd")
         expect(code).to_have_text("code diff not available on this server")
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()
+
+
+@pytest.mark.parametrize("parent_ref, text", [
+    (False, "parent code not available"),
+    (True, "1 file changed · train.py"),
+])
+def test_lineage_inspector_shows_parent_code_label(page, tmp_path, monkeypatch, parent_ref, text):
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    httpd = make_server(tmp_path / "data", port=0)
+    _, admin = httpd.keys.create("admin", "admin")
+    ids = _lineage_pair(httpd.root)
+    seed_shadow_repo(httpd.root, ids[1], ids[0], parent_ref=parent_ref, key="demo-0123abcd")
+    reconcile(httpd.root, httpd.run_index)
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
+    thread.start()
+    server = {"url": f"http://127.0.0.1:{httpd.server_address[1]}", "admin": admin}
+    try:
+        page.set_viewport_size({"width": 375, "height": 900})
+        sign_in(page, server, admin)
+        expect(page.get_by_role("heading", name="Runs", exact=True)).to_be_visible()
+        page.get_by_role("button", name="Open lineage of asr", exact=True).click()
+        dialog = page.get_by_role("dialog")
+        expect(dialog).to_be_visible()
+        page.locator(f'.lv-node[data-run-id="{ids[1]}"] .lv-box').click()
+        inspector = dialog.get_by_role("complementary", name="Selected run")
+        expect(page.locator(".lv-node.is-focused")).to_have_attribute("data-run-id", ids[1])
+        code = inspector.locator(".kv-list > div").filter(has=page.locator("dt", has_text="code")).locator("dd")
+        expect(code).to_have_text(text)
+        assert_no_overflow(page)
     finally:
         httpd.shutdown()
         thread.join(timeout=5)

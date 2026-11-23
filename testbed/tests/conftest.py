@@ -36,6 +36,41 @@ def clean_env(root, config):
     return env
 
 
+def seed_shadow_repo(root, child_id, parent_id, *, parent_ref, key="demo-0123abcd"):
+    """Give a seeded child a real shadow commit whose parent commit is null.
+
+    The parent's commit goes under ``refs/runs/<parent_id>`` only when
+    ``parent_ref`` is true (the parent run synced from another machine).
+    """
+    import json
+    repo = root / "lineage" / f"{key}.git"
+    repo.parent.mkdir(parents=True, exist_ok=True)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_AUTHOR_NAME="T", GIT_AUTHOR_EMAIL="t@example.com",
+               GIT_COMMITTER_NAME="T", GIT_COMMITTER_EMAIL="t@example.com")
+
+    def git(*args, input=None):
+        command = ["git", "--git-dir", str(repo), *args]
+        return subprocess.run(command, input=input, capture_output=True, check=True, env=env,
+                              timeout=30).stdout.decode().strip()
+
+    subprocess.run(["git", "init", "--bare", str(repo)], capture_output=True, check=True, env=env, timeout=30)
+
+    def commit(train):
+        rows = ""
+        for name, text in (("util.py", b"u = 1\n"), ("train.py", train)):
+            rows += f"100644 blob {git('hash-object', '-w', '--stdin', input=text)}\t{name}\n"
+        return git("commit-tree", git("mktree", input=rows.encode()), "-m", "x")
+
+    parent, child = commit(b"x = 1\n"), commit(b"x = 2\n")
+    if parent_ref:
+        git("update-ref", f"refs/runs/{parent_id}", parent)
+    path = root / "runs" / child_id / "meta.json"
+    meta = json.loads(path.read_text())
+    meta["lineage"].update(commit=child, parent_commit=None, project_key=key)
+    path.write_text(json.dumps(meta))
+
+
 @pytest.fixture(autouse=True)
 def isolated_environment(tmp_path, monkeypatch):
     for key in list(os.environ):

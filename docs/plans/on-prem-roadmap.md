@@ -416,7 +416,7 @@ part can go to `main` early as a docs-only PR.
 | 35 | Repo outreach: README, comparison table, images, community files, dashboard GitHub link | 3.1 | Sonnet; supervisor reviews | M | [plan](packages/35-repo-outreach.md) | done ([#90](https://github.com/agenticML/agenticml-lite/pull/90), merged Nov 20, 2026; released in 3.3.0); 35.3 added Nov 20, 2026, see its row |
 | 35.1 | README rework with screenshot and comparison table, `scripts/make_readme_images.py` (dashboard screenshot, social preview), CONTRIBUTING, code of conduct, issue and PR templates, PyPI keywords and classifiers | – | Sonnet | S–M | [plan](packages/35-repo-outreach.md) | done ([#90](https://github.com/agenticML/agenticml-lite/pull/90), merged Nov 20, 2026; released in 3.3.0) |
 | 35.2 | GitHub link in the dashboard top bar; docs and GitHub line from `agenticml ui` | – | Sonnet | S | [plan](packages/35-repo-outreach.md) | done ([#90](https://github.com/agenticML/agenticml-lite/pull/90), merged Nov 20, 2026; released in 3.3.0) |
-| 35.3 | README demo GIF instead of the still screenshot (live run, lineage graph, select and compare, hover and smoothing), made by `scripts/make_readme_images.py` with Playwright frames and Pillow | 35.1 | Sonnet; supervisor reviews | S | [plan](packages/35-repo-outreach.md#353-readme-demo-gif) | in review ([#96](https://github.com/agenticML/agenticml-lite/pull/96), draft); the README shows the lineage-focused `demo-lineage.gif` (owner's pick, Nov 21, 2026) |
+| 35.3 | README demo GIF instead of the still screenshot (live run, lineage graph, select and compare, hover and smoothing), made by `scripts/make_readme_images.py` with Playwright frames and Pillow | 35.1 | Sonnet; supervisor reviews | S | [plan](packages/35-repo-outreach.md#353-readme-demo-gif) | done ([#96](https://github.com/agenticML/agenticml-lite/pull/96), merged Nov 22, 2026; ships in 3.3.1); the README shows the lineage-focused `demo-lineage.gif` (owner's pick, Nov 21, 2026) |
 
 ### Maintenance fixes
 
@@ -433,8 +433,8 @@ part can go to `main` early as a docs-only PR.
   small sans text, a literal "null" in the run page header, "code changed"
   in the lineage inspector without snapshots):
   [plan](packages/fix-demo-gif-ui-defects.md), found in package 35.3;
-  status: in review ([#96](https://github.com/agenticML/agenticml-lite/pull/96); full test
-  runs done Nov 21, 2026, see the plan's Resume notes).
+  status: done ([#96](https://github.com/agenticML/agenticml-lite/pull/96),
+  merged Nov 22, 2026); ships in 3.3.1.
 - The hosted deploy log printed the admin email addresses
   (`HOSTED_ADMIN_EMAILS` variable) in this public repository's Actions logs:
   [plan](packages/fix-admin-emails-in-deploy-log.md), found in deploy run
@@ -450,6 +450,15 @@ part can go to `main` early as a docs-only PR.
   `v3.3.0`; install lines, raw URLs, Releases page) and test that raw URLs
   name published tags and the Releases page names the package version:
   [plan](packages/release-3-3-0-docs.md); status: in review.
+- † The dashboard run code diff showed every file as added when the parent
+  run was created in another store (another worker machine), even after both
+  runs synced to one server (`parent_commit` stays null; `_lineage_changes`
+  never resolved `parent_run_id` the way `agenticml lineage diff` does):
+  [plan](packages/fix-lineage-diff-cross-host-parent.md), found with
+  agentlab's multi-worker runs (Nov 21, 2026); status: in review
+  ([#97](https://github.com/agenticML/agenticml-lite/pull/97); Sonnet coded,
+  supervisor reviewed and did the † second review); ships as 3.3.1 (the
+  version bump is in the same PR).
 
 ### Later (unscheduled)
 
@@ -515,7 +524,9 @@ part can go to `main` early as a docs-only PR.
 
 Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
-priority. 3.3.0 (with 3.1 and 3.2) was released on Nov 20, 2026.
+priority. 3.3.0 (with 3.1 and 3.2) was released on Nov 20, 2026. 3.3.1 is
+ready in [#97](https://github.com/agenticML/agenticml-lite/pull/97) and waits
+for the owner's tag (see "Release 3.3.1" under Owner steps).
 
 Package 30 (Nov 17, 2026) cleared the Backlog before the 3.0 release: 21
 entries were fixed in parts 30.1–30.6 (for two of them, the many-process
@@ -531,6 +542,25 @@ on Nov 17, 2026; none of the entries below blocked it.
 
 ### Owner steps
 
+- **Release 3.3.1** (owner; version bump in
+  [#97](https://github.com/agenticML/agenticml-lite/pull/97)). 3.3.1 ships the
+  lineage diff fix for parents from another machine and the dashboard fixes
+  from [#96](https://github.com/agenticML/agenticml-lite/pull/96).
+  - Where: the GitHub repository (tags, releases, Actions); `publish.yml`,
+    `release-assets.yml`, `deploy.yml`.
+  - Problem: the Releases page says "Released" for 3.3.1 from the merge of #97,
+    but PyPI, the release and the hosted service only change when the owner
+    acts.
+  - Fix: (1) After #97 is merged, push tag `v3.3.1` on the merge commit;
+    `publish.yml` checks the tag against `pyproject.toml` and
+    `__init__.py` and uploads to PyPI. (2) Publish the GitHub release;
+    `release-assets.yml` attaches `agenticml.yaml`. (3) Approve the hosted
+    deploy that the merge starts (`deploy.yml` runs on `src/**` and
+    `pyproject.toml` pushes to `main`). (4) Optional: move the raw
+    `githubusercontent.com/.../v3.3.0/...` URLs to `v3.3.1` and add `v3.3.1` to
+    `PUBLISHED_TAGS` in `tests/test_website_facts.py`.
+  - Done when: PyPI shows 3.3.1, the release has `agenticml.yaml`, and the
+    hosted service runs the merge commit.
 - **Move the admin emails to a secret** (fix
   [admin emails in the deploy log](packages/fix-admin-emails-in-deploy-log.md),
   Nov 19, 2026). High priority: do it before the next hosted deploy; deploys
@@ -767,3 +797,77 @@ on Nov 17, 2026; none of the entries below blocked it.
   - Done when: `https://docs.agenticml.xyz` serves the site with HTTPS
     enforced, old github.io URLs redirect, and the link check passes.
 
+### Code and dashboard follow-ups
+
+Found with the cross-host lineage diff fix
+([plan](packages/fix-lineage-diff-cross-host-parent.md), Nov 22, 2026). None
+blocks a release; listed by priority.
+
+- **CLI parent lookup reads a missing ref as `git describe` output.**
+  - Where: `src/agenticml/lineage.py` `_resolve_commit` (~245), used by
+    `snapshot()` at snapshot time and by `lineage.diff()`.
+  - Problem: it uses `git rev-parse`, which falls back to `git describe`
+    parsing when `refs/runs/<id>` is missing. A run created with
+    `--parent exp-g<hex>` whose parent is not local can resolve to any
+    commit whose id starts with `<hex>`, so it stores a wrong
+    `parent_commit` permanently and gets a wrong Git parent.
+  - Fix: resolve with `for-each-ref refs/runs/<id>` like
+    `_resolve_run_commit` in `ui/server.py` (or a shared helper), which
+    matches ref names only.
+  - Done when: a test with a describe-shaped parent id and no such ref
+    stores `parent_commit: null`.
+- **Retry after a failed `/lineage` fetch in an open lineage dialog.**
+  - Where: `src/agenticml/ui/static/app.js`, lineage inspector (`details`
+    map, the `.catch` that stores `{ error: true }`).
+  - Problem: a failed per-run diff fetch is remembered for the whole dialog,
+    so the inspector keeps "code changed" until the dialog is closed and
+    reopened.
+  - Fix: clear the entry (or retry once, with a short delay) when the fetch
+    fails, so a later focus or a "Retry" action asks again.
+  - Done when: a test with a failed first `/lineage` answer shows the
+    placeholder, then the real answer after the retry, without reopening the
+    dialog.
+- **Loading state in the lineage inspector.**
+  - Where: `src/agenticml/ui/static/app.js`, the `code` row of the lineage
+    inspector.
+  - Problem: while the per-run diff is in flight the row reads "code
+    changed", which looks like a result.
+  - Fix: show "loading code diff…" while the `details` value is `null`.
+  - Done when: a delayed `/lineage` answer (`page.route`) shows the loading
+    text first and the final text after, with no overflow at 375px.
+- **Show the `truncated` flag of the lineage diff.**
+  - Where: `src/agenticml/ui/static/app.js` (the `N files changed` line);
+    `/api/runs/<id>/lineage` already returns `truncated`.
+  - Problem: a list cut at 500 rows reads "500 files changed".
+  - Fix: show "500+ files changed" when `truncated` is true.
+  - Done when: a test with a 501-file diff shows "500+ files changed".
+- **Align the CLI `agenticml lineage diff` parent id with the dashboard.**
+  - Where: `src/agenticml/lineage.py` `diff()` (uses `lineage.parent_run_id`);
+    `src/agenticml/ui/server.py` `_lineage_changes` (uses the top-level
+    `parent_run_id` via `_stored_parent`, which wins when they differ);
+    `docs/FORMAT.md`.
+  - Problem: the two differ only for hand-edited or legacy metadata, but a
+    run can then show different parents in the CLI and the dashboard.
+  - Fix: make the CLI use the same parent id as the dashboard (a shared
+    helper), or document the difference in `docs/FORMAT.md`.
+  - Done when: a test with differing ids gives the same parent in both, or
+    FORMAT.md says which one each uses.
+- **Pack refs on the server's shadow repos.**
+  - Where: `src/agenticml/server/lineage.py` (`receive()`), the repos at
+    `<workspace store>/lineage/<key>.git`.
+  - Problem: every run is a loose ref (`refs/runs/<id>`); in a repo with
+    thousands of runs, loose refs make the `for-each-ref refs/runs/<id>` lookup and `diff-tree` slower
+    (measured ~1.2-1.7 ms with 10,000 refs, so small today).
+  - Fix: run `git pack-refs --all` on a repo from time to time (for example
+    every N receives, inside the receive lock), without moving or deleting
+    any ref.
+  - Done when: a test with many received runs shows packed refs, and the
+    dashboard diff and `server verify` still pass.
+- **Time the lineage lookup on hosted EFS (optional owner check).**
+  - Where: the hosted task, a real workspace repo under the EFS mount.
+  - Problem: the costs in the plan were measured on local NVMe; EFS adds a
+    network round trip per file open.
+  - Fix: time one `git for-each-ref refs/runs/<id>` and one
+    `git diff-tree --root` on a real workspace repo, and record the numbers
+    in the plan's "Performance and limits".
+  - Done when: both timings are recorded there.

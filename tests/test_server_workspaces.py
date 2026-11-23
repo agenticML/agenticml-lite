@@ -169,6 +169,53 @@ def test_lineage_receive_and_state_are_scoped(two, tmp_path):
         assert lineage._repo_path(store_root(server.data_dir, ws['id']), info['project_key']).is_dir()
 
 
+def test_dashboard_lineage_parent_lookup_stays_in_the_workspace(two, tmp_path):
+    """A parent synced into alpha is invisible to a child (same parent id) in beta."""
+    if shutil.which('git') is None:
+        pytest.skip('requires git')
+    from agenticml import sync
+    server, _, _, keys_a, keys_b, ka, kb = two
+    admin = {'alpha': keys_a.create('dash', 'admin', user='alice')[1], 'beta': keys_b.create('dash', 'admin', user='bob')[1]}
+    def make(worker, run_id, text, parent=None):
+        source = tmp_path / f'source-{run_id}'
+        source.mkdir()
+        (source / 'util.py').write_text('u = 1\n')
+        (source / 'train.py').write_text(text)
+        root = tmp_path / worker
+        writer = RunWriter.create(root, run_id=run_id, meta={'project': 'demo', 'parent_run_id': parent})
+        block = lineage.snapshot(root, 'demo', source, run_id, parent)
+        assert block['error'] is None
+        writer._update_meta({'lineage': block})
+        writer.finish('finished')
+        writer.close()
+        return root, run_id
+    def push(item, key):
+        root, run_id = item
+        with Client(f'http://127.0.0.1:{server.server_address[1]}', key) as client:
+            result = sync.SyncResult(run_id)
+            sync.sync_run(RunReader(root, run_id), client.base_url, client, result)
+        assert result.complete
+    def detail(slug):
+        status, _, hdrs = login(server, key=admin[slug])
+        assert status == 200
+        status, _, body, _ = authed(server, f'/api/w/{slug}/runs/child/lineage', cookie=hdrs['Set-Cookie'])
+        assert status == 200
+        return json.loads(body)
+    parent = make('worker-a', 'parent', 'x = 1\n')
+    child = make('worker-b', 'child', 'x = 2\n', parent='parent')
+    push(parent, ka)
+    push(child, kb)
+    beta = detail('beta')
+    assert beta['error'] is None and beta['parent_run_id'] == 'parent'
+    assert beta['parent_commit'] is None and beta['parent_source'] is None
+    assert {row['path'] for row in beta['files']} == {'train.py', 'util.py'}
+    push(child, ka)
+    alpha = detail('alpha')
+    assert alpha['parent_source'] == 'ref' and alpha['parent_commit']
+    assert [row['path'] for row in alpha['files']] == ['train.py']
+    assert detail('beta')['parent_source'] is None
+
+
 def test_suspend_remove_member_rename_and_access(two):
     server, a, b, keys_a, _, ka, kb = two
     repo = WorkspaceRepo(server.db)

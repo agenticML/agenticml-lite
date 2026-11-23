@@ -1036,3 +1036,89 @@ def test_idle_lineage_does_not_resolve_local_ref(remote, snapshots, monkeypatch)
     identity = sync._identity(remote[1])
     assert "parent" not in sync._selected_ids(parent.root, remote[1].base_url, [], True,
                                              key=identity["key"], features=identity["features"], workspace=identity["workspace"])
+
+
+def _worker_run(tmp_path, worker, run_id, train, parent=None, project="demo"):
+    """A run created in its own store (a worker machine); ``util.py`` is shared."""
+    if shutil.which("git") is None:
+        pytest.skip("requires git")
+    source = tmp_path / f"source-{worker}-{run_id}"
+    source.mkdir()
+    (source / "util.py").write_text("def helper():\n    return 1\n")
+    (source / "train.py").write_text(train)
+    root = tmp_path / worker
+    meta_in = {"project": project, "name": run_id}
+    if parent:
+        meta_in["parent_run_id"] = parent
+    writer = RunWriter.create(root, run_id=run_id, meta=meta_in)
+    block = lineage.snapshot(root, project, source, run_id, parent)
+    assert block["error"] is None
+    writer._update_meta({"lineage": block})
+    writer.finish("finished")
+    return writer
+
+
+def _run_lineage(server, run_id, workspace="default"):
+    if not getattr(server, "admin_key", None):
+        server.admin_key = server.keys.create("admin", "admin")[1]
+    status, _, body, _ = authed(server, f"/api/w/{workspace}/runs/{run_id}/lineage")
+    assert status == 200
+    return json.loads(body)
+
+
+def _rows(files):
+    return [{key: row[key] for key in ("path", "added", "deleted")} for row in files]
+
+
+@pytest.mark.parametrize("order", ["parent_first", "child_first", "parent_never_synced"])
+def test_cross_host_parent_diff(remote, tmp_path, order):
+    server, _ = remote
+    parent = _worker_run(tmp_path, "worker-a", "parent", "x = 1\n")
+    child = _worker_run(tmp_path, "worker-b", "child", "x = 2\ny = 3\n", parent="parent")
+    assert info(child)["parent_commit"] is None
+    pushes = {"parent_first": [parent, child], "child_first": [child, parent],
+              "parent_never_synced": [child]}[order]
+    for writer in pushes:
+        assert push(remote, writer).complete
+    detail = _run_lineage(server, "child")
+    assert detail["parent_run_id"] == "parent"
+    assert detail["error"] is None
+    if order == "parent_never_synced":
+        assert detail["parent_commit"] is None
+        assert detail["parent_source"] is None
+        assert {row["path"] for row in detail["files"]} == {"train.py", "util.py"}
+    else:
+        assert detail["parent_commit"] == info(parent)["commit"]
+        assert detail["parent_source"] == "ref"
+        assert [row["path"] for row in detail["files"]] == ["train.py"]
+        assert (detail["files"][0]["added"], detail["files"][0]["deleted"]) == (2, 1)
+        expected = [{"path": row["path"], "added": row["added"], "deleted": row["deleted"]}
+                    for row in lineage.diff(server.root, "child")]
+        assert _rows(detail["files"]) == expected
+    sent = (child.run_dir / "meta.json").read_bytes()
+    assert (server.root / "runs" / "child" / "meta.json").read_bytes() == sent
+
+
+def test_cross_host_parent_in_other_project_is_not_used(remote, tmp_path):
+    server, _ = remote
+    parent = _worker_run(tmp_path, "worker-a", "parent", "x = 1\n", project="other")
+    child = _worker_run(tmp_path, "worker-b", "child", "x = 2\ny = 3\n", parent="parent")
+    assert push(remote, parent).complete and push(remote, child).complete
+    detail = _run_lineage(server, "child")
+    assert detail["error"] is None
+    assert detail["parent_run_id"] == "parent"
+    assert detail["parent_commit"] is None and detail["parent_source"] is None
+    assert {row["path"] for row in detail["files"]} == {"train.py", "util.py"}
+
+
+def test_cross_host_parent_cycle_answers_both(remote, tmp_path):
+    server, _ = remote
+    left = _worker_run(tmp_path, "worker-a", "run-a", "x = 1\n", parent="run-b")
+    right = _worker_run(tmp_path, "worker-b", "run-b", "x = 2\ny = 3\n", parent="run-a")
+    assert push(remote, left).complete and push(remote, right).complete
+    for run_id, other in (("run-a", "run-b"), ("run-b", "run-a")):
+        detail = _run_lineage(server, run_id)
+        assert detail["error"] is None
+        assert detail["parent_source"] == "ref"
+        assert detail["parent_run_id"] == other
+        assert [row["path"] for row in detail["files"]] == ["train.py"]

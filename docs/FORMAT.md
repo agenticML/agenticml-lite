@@ -189,7 +189,13 @@ not applied when larger than 1 MiB. The parent ref is resolved inside the
 repository lock immediately before `commit-tree` and `update-ref`. If the parent
 is still unpublished, the child has no Git parent and `parent_commit` is null;
 diff resolves `parent_run_id` live on later calls. Existing commits and metadata
-are not rewritten.
+are not rewritten. `parent_commit` keeps meaning "resolved at snapshot time":
+both `agenticml lineage diff` and the dashboard run diff (below) look up
+`refs/runs/<parent_run_id>` in the same project repository when it is null (the
+CLI uses `lineage.parent_run_id`, the dashboard the stored parent id below), so
+a child whose parent ran in another store (another machine syncing to one
+server) is compared with its parent once the parent's snapshot is in that
+repository, in either sync order.
 
 CLI: `agenticml lineage ls [--project P] [--task T]` groups output by project,
 then `[task]` (`[no task]` for none).
@@ -227,6 +233,28 @@ accept `Z`; readers that use it should rewrite the suffix to `+00:00`.
 
 `effective_status` is **not** stored. `list_runs` adds it on the returned
 dict (see below).
+
+### Dashboard `/api/runs/<id>/lineage`
+
+`GET /api/runs/<id>/lineage` (on the server, `/api/w/<workspace>/runs/<id>/lineage`)
+returns the changed files of one run's snapshot against its parent's:
+
+| Field | Meaning |
+| --- | --- |
+| `run_id`, `commit` | Run id and its shadow commit, or `null`. |
+| `parent_run_id` | Stored parent run id (the top-level `parent_run_id` wins over `lineage.parent_run_id`; a parent the graph infers at read time is not reported), or `null`. |
+| `parent_commit` | Parent commit the diff was made against, or `null` for a root diff. |
+| `parent_source` | `meta` when the stored `lineage.parent_commit` was used, `ref` when `refs/runs/<parent_run_id>` was resolved at read time, `null` when there is no parent commit (root diff, or an error). |
+| `files` | Up to 500 rows of `path`, `added`, `deleted` (`null` counts for binary files). |
+| `truncated` | True when the list was cut at 500 files or 2 MiB. |
+| `checkout` | The `agenticml lineage checkout` command for the run. |
+| `error` | Short diagnostic (`no lineage for this run`, `git diff timed out`, ...), or `null`. |
+
+When the parent commit is missing (`parent_run_id` set, `parent_commit` and
+`parent_source` null) the diff is against the empty tree and every file reads as
+added; the dashboard shows `parent code not available` instead. The lookup runs
+in the run's own project repository only (the server's repository is per
+workspace and project) and never rewrites `meta.json`.
 
 ## `events.jsonl`
 

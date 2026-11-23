@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -952,7 +953,7 @@ _NODE_KEYS = {
 }
 _EDGE_KEYS = {'from', 'to', 'inferred', 'cross_task'}
 _DIFF_KEYS = {
-    'run_id', 'commit', 'parent_run_id', 'parent_commit', 'files', 'truncated',
+    'run_id', 'commit', 'parent_run_id', 'parent_commit', 'parent_source', 'files', 'truncated',
     'checkout', 'error',
 }
 _TREE = 'ab' * 20
@@ -1437,6 +1438,250 @@ def test_lineage_diff_numstat_binary_and_truncated(tmp_path):
     assert len(wide_diff['files']) == 500
     assert {row['path'] for row in wide_diff['files']} <= {f'f{index:04d}.txt' for index in range(501)}
     assert all(row['added'] == 1 and row['deleted'] == 0 for row in wide_diff['files'])
+
+
+def _lookup_repo(root, key='demo-abcdef12'):
+    """A shadow repo with a parent commit, a child commit and a third commit."""
+    repo = root / 'lineage' / f'{key}.git'
+    repo.parent.mkdir(parents=True)
+    _git(None, 'init', '--bare', str(repo))
+
+    def commit(files, *parents):
+        entries = ''
+        for name, text in files.items():
+            sha = _git(repo, 'hash-object', '-w', '--stdin', input=text).decode().strip()
+            entries += f'100644 blob {sha}\t{name}\n'
+        tree = _git(repo, 'mktree', input=entries.encode()).decode().strip()
+        args = ['commit-tree', tree, '-m', 'x']
+        for parent in parents:
+            args += ['-p', parent]
+        return _git(repo, *args).decode().strip(), tree
+
+    common = b'same\n'
+    parent, parent_tree = commit({'util.py': common, 'train.py': b'a\n'})
+    child, child_tree = commit({'util.py': common, 'train.py': b'a\nb\n'})
+    other, _ = commit({'util.py': common, 'train.py': b'z\n', 'extra.py': b'e\n'})
+    return SimpleNamespace(
+        repo=repo, key=key, parent=parent, parent_tree=parent_tree, child=child,
+        child_tree=child_tree, other=other,
+    )
+
+
+def _seed_lookup_child(root, info, *, parent_run_id='par', parent_commit=None, lineage_parent=None, run_id='kid'):
+    _seed_run(
+        root, run_id, project='demo', name=run_id, second=2, parent_run_id=parent_run_id,
+        lineage=_lineage_meta(
+            commit=info.child, tree=info.child_tree, parent_commit=parent_commit,
+            parent_run_id=lineage_parent or parent_run_id, parent_inference='explicit',
+            project_key=info.key,
+        ),
+    )
+
+
+def test_lineage_diff_resolves_parent_ref_when_parent_commit_is_null(tmp_path):
+    if shutil.which('git') is None:
+        pytest.skip('git is not available')
+    info = _lookup_repo(tmp_path)
+    _git(info.repo, 'update-ref', 'refs/runs/par', info.parent)
+    _seed_lookup_child(tmp_path, info)
+    httpd, thread = _serve(tmp_path)
+    try:
+        payload = _body(httpd, '/api/runs/kid/lineage')
+    finally:
+        _stop(httpd, thread)
+    assert payload['error'] is None
+    assert payload['parent_run_id'] == 'par'
+    assert payload['parent_commit'] == info.parent
+    assert payload['parent_source'] == 'ref'
+    assert [(row['path'], row['added'], row['deleted']) for row in payload['files']] == [('train.py', 1, 0)]
+
+
+def test_lineage_diff_stored_parent_commit_wins_over_ref(tmp_path, monkeypatch):
+    if shutil.which('git') is None:
+        pytest.skip('git is not available')
+    info = _lookup_repo(tmp_path)
+    _git(info.repo, 'update-ref', 'refs/runs/par', info.other)
+    _seed_lookup_child(tmp_path, info, parent_commit=info.parent)
+    monkeypatch.setattr(server.subprocess, 'run', lambda *a, **k: pytest.fail('lookup ran'))
+    httpd, thread = _serve(tmp_path)
+    try:
+        payload = _body(httpd, '/api/runs/kid/lineage')
+    finally:
+        _stop(httpd, thread)
+    assert payload['parent_commit'] == info.parent
+    assert payload['parent_source'] == 'meta'
+    assert [row['path'] for row in payload['files']] == ['train.py']
+
+
+@pytest.mark.parametrize('parent_id', ['kid', 'a..b', 'x.lock', 'x.'])
+def test_lineage_diff_skips_lookup_for_self_and_bad_ref_names(tmp_path, monkeypatch, parent_id):
+    if shutil.which('git') is None:
+        pytest.skip('git is not available')
+    info = _lookup_repo(tmp_path)
+    _seed_lookup_child(tmp_path, info, parent_run_id=parent_id)
+    monkeypatch.setattr(server.subprocess, 'run', lambda *a, **k: pytest.fail('git lookup ran'))
+    httpd, thread = _serve(tmp_path)
+    try:
+        payload = _body(httpd, '/api/runs/kid/lineage')
+    finally:
+        _stop(httpd, thread)
+    assert payload['error'] is None
+    assert payload['parent_commit'] is None and payload['parent_source'] is None
+    assert {row['path'] for row in payload['files']} == {'train.py', 'util.py'}
+
+
+class _Done:
+    def __init__(self, returncode, stdout=b''):
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+@pytest.mark.parametrize('outcome, message', [
+    (_Done(0, b'not-a-sha commit\n'), 'git diff failed'),
+    (_Done(0, b'not-a-sha\n'), 'git diff failed'),
+    (_Done(0, (_COMMIT['a'] + ' commit\n' + _COMMIT['b'] + ' commit\n').encode()), 'git diff failed'),
+    (_Done(128), 'git diff failed'),
+    (OSError('denied'), 'git diff failed'),
+    (FileNotFoundError('git'), 'git is not available'),
+    (subprocess.TimeoutExpired('git', 2), 'git diff timed out'),
+])
+def test_lineage_diff_lookup_failures_answer_with_an_error(tmp_path, monkeypatch, outcome, message):
+    key = 'demo-abcdef12'
+    (tmp_path / 'lineage' / f'{key}.git').mkdir(parents=True)
+    _seed_run(
+        tmp_path, 'kid', project='demo', name='kid', second=1, parent_run_id='par',
+        lineage=_lineage_meta(commit=_COMMIT['a'], parent_run_id='par', project_key=key),
+    )
+
+    def run(args, **kwargs):
+        assert args[2:] == ['for-each-ref', '--format=%(objectname) %(objecttype)', 'refs/runs/par']
+        assert kwargs['stderr'] is subprocess.DEVNULL and kwargs['timeout'] == server._GIT_LOOKUP_TIMEOUT
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(server.subprocess, 'run', run)
+    monkeypatch.setattr(server.subprocess, 'Popen', lambda *a, **k: pytest.fail('diff ran after a failed lookup'))
+    payload = server._lineage_changes(tmp_path, 'kid', json.loads((tmp_path / 'runs' / 'kid' / 'meta.json').read_text()))
+    assert payload['error'] == message
+    assert payload['files'] == []
+    assert payload['parent_commit'] is None and payload['parent_source'] is None
+    assert payload['parent_run_id'] == 'par'
+
+
+@pytest.mark.parametrize('stdout', [b'', (_COMMIT['a'] + ' tag\n').encode()])
+def test_lineage_diff_lookup_without_a_commit_ref_is_a_root_diff(tmp_path, monkeypatch, stdout):
+    key = 'demo-abcdef12'
+    (tmp_path / 'lineage' / f'{key}.git').mkdir(parents=True)
+    _seed_run(
+        tmp_path, 'kid', project='demo', name='kid', second=1, parent_run_id='par',
+        lineage=_lineage_meta(commit=_COMMIT['a'], parent_run_id='par', project_key=key),
+    )
+    monkeypatch.setattr(server.subprocess, 'run', lambda args, **kwargs: _Done(0, stdout))
+    monkeypatch.setattr(server, '_git_numstat', lambda args, cwd, timeout=None: (b'', False, None))
+    payload = server._lineage_changes(tmp_path, 'kid', json.loads((tmp_path / 'runs' / 'kid' / 'meta.json').read_text()))
+    assert payload['error'] is None
+    assert payload['parent_commit'] is None and payload['parent_source'] is None
+
+
+def test_lineage_diff_describe_shaped_parent_id_does_not_match_a_commit(tmp_path):
+    if shutil.which('git') is None:
+        pytest.skip('git is not available')
+    info = _lookup_repo(tmp_path)
+    # Published under another name: only a describe-style prefix match could find it.
+    _git(info.repo, 'update-ref', 'refs/runs/parent', info.parent)
+    _seed_lookup_child(tmp_path, info, parent_run_id='x-g' + info.parent[:5])
+    httpd, thread = _serve(tmp_path)
+    try:
+        payload = _body(httpd, '/api/runs/kid/lineage')
+    finally:
+        _stop(httpd, thread)
+    assert payload['error'] is None
+    assert payload['parent_run_id'] == 'x-g' + info.parent[:5]
+    assert payload['parent_commit'] is None and payload['parent_source'] is None
+    assert {row['path'] for row in payload['files']} == {'train.py', 'util.py'}
+
+
+def test_lineage_diff_shares_one_read_deadline(tmp_path, monkeypatch):
+    key = 'demo-abcdef12'
+    (tmp_path / 'lineage' / f'{key}.git').mkdir(parents=True)
+    _seed_run(
+        tmp_path, 'kid', project='demo', name='kid', second=1, parent_run_id='par',
+        lineage=_lineage_meta(commit=_COMMIT['a'], parent_run_id='par', project_key=key),
+    )
+    _seed_run(
+        tmp_path, 'stored', project='demo', name='stored', second=2, parent_run_id='par',
+        lineage=_lineage_meta(commit=_COMMIT['a'], parent_commit=_COMMIT['b'], parent_run_id='par', project_key=key),
+    )
+    _seed_run(
+        tmp_path, 'plain', project='demo', name='plain', second=3,
+        lineage=_lineage_meta(commit=_COMMIT['a'], project_key=key),
+    )
+    clock = [100.0]
+    seen = {}
+    monkeypatch.setattr(server.time, 'monotonic', lambda: clock[0])
+
+    def lookup(repo, run_id, timeout):
+        seen['lookup'] = (run_id, timeout)
+        clock[0] += 1.5
+        return _COMMIT['c'], None
+
+    def numstat(args, cwd, timeout=None):
+        seen['numstat'] = (args[-2:], timeout)
+        return b'', False, None
+
+    monkeypatch.setattr(server, '_resolve_run_commit', lookup)
+    monkeypatch.setattr(server, '_git_numstat', numstat)
+
+    def changes(run_id):
+        return server._lineage_changes(
+            tmp_path, run_id, json.loads((tmp_path / 'runs' / run_id / 'meta.json').read_text()),
+        )
+
+    payload = changes('kid')
+    assert seen['lookup'] == ('par', server._GIT_LOOKUP_TIMEOUT)
+    assert seen['numstat'][0] == [_COMMIT['c'], _COMMIT['a']]
+    assert seen['numstat'][1] == pytest.approx(server._GIT_TIMEOUT - 1.5)
+    assert payload['parent_commit'] == _COMMIT['c'] and payload['parent_source'] == 'ref'
+    seen.clear()
+    assert changes('stored')['parent_source'] == 'meta'
+    assert 'lookup' not in seen and seen['numstat'][1] == server._GIT_TIMEOUT
+    seen.clear()
+    assert changes('plain')['parent_source'] is None
+    assert 'lookup' not in seen and seen['numstat'][1] == server._GIT_TIMEOUT
+
+
+def test_lineage_diff_lookup_uses_the_top_level_parent_id(tmp_path):
+    if shutil.which('git') is None:
+        pytest.skip('git is not available')
+    info = _lookup_repo(tmp_path)
+    _git(info.repo, 'update-ref', 'refs/runs/top', info.parent)
+    _git(info.repo, 'update-ref', 'refs/runs/inner', info.other)
+    _seed_lookup_child(tmp_path, info, parent_run_id='top', lineage_parent='inner')
+    httpd, thread = _serve(tmp_path)
+    try:
+        payload = _body(httpd, '/api/runs/kid/lineage')
+    finally:
+        _stop(httpd, thread)
+    assert payload['parent_run_id'] == 'top'
+    assert payload['parent_commit'] == info.parent
+    assert payload['parent_source'] == 'ref'
+
+
+def test_lineage_diff_unknown_parent_ref_is_a_root_diff(tmp_path):
+    if shutil.which('git') is None:
+        pytest.skip('git is not available')
+    info = _lookup_repo(tmp_path)
+    _seed_lookup_child(tmp_path, info, parent_run_id='nobody')
+    httpd, thread = _serve(tmp_path)
+    try:
+        payload = _body(httpd, '/api/runs/kid/lineage')
+    finally:
+        _stop(httpd, thread)
+    assert payload['error'] is None
+    assert payload['parent_run_id'] == 'nobody'
+    assert payload['parent_commit'] is None and payload['parent_source'] is None
+    assert {row['path'] for row in payload['files']} == {'train.py', 'util.py'}
 
 
 class _GitProc:

@@ -73,7 +73,7 @@ Parameters:
     Description: Prefix of the Cognito sign-in domain. Empty derives one from the stack ID. Must be unused in the region and must not contain aws, amazon or cognito.
   AgenticmlVersion:
     Type: String
-    Default: 3.3.0
+    Default: 3.3.1
     AllowedPattern: '^\d+\.\d+\.\d+$'
     Description: Version of agenticml-lite installed from PyPI. Changing it replaces the instance, with a few minutes of downtime. The data stays.
   InstanceType:

@@ -664,7 +664,7 @@ the command lists the workspaces).
 
 ### Installation
 
-Install `agenticml-lite` 3.3.0 from PyPI with system metrics support:
+Install `agenticml-lite` 3.3.1 from PyPI with system metrics support:
 
 ```sh
 pip install 'agenticml-lite[system]'

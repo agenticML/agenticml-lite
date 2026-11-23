@@ -4,6 +4,7 @@ import re
 
 import pytest
 
+from conftest import seed_shadow_repo
 from test_dashboard import (
     _lineage_project, browser, context, home, mock_dashboard, page, row,
 )
@@ -241,6 +242,26 @@ def test_lineage_inspector_code_changed_without_repo(page, tmp_path, ui_server_f
         expect(code).to_have_text("code changed")
         expect(inspector).not_to_contain_text("code diff not available on this server")
         expect(inspector).not_to_contain_text("lineage repository not found")
+
+
+@pytest.mark.parametrize("parent_ref, text", [
+    (False, "parent code not available"),
+    (True, "1 file changed · train.py"),
+])
+def test_lineage_inspector_parent_code_label(page, tmp_path, ui_server_factory, parent_ref, text):
+    root = tmp_path / "lineage-parent-code"
+    ids = _scored(root, [0.5, 0.9], parents=(None, 0))
+    seed_shadow_repo(root, ids[1], ids[0], parent_ref=parent_ref)
+    with ui_server_factory(root) as server:
+        page.set_viewport_size({"width": 375, "height": 900})
+        home(page, server)
+        dialog = _open_lineage(page)
+        page.locator(f'.lv-node[data-run-id="{ids[1]}"] .lv-box').click()
+        inspector = dialog.get_by_role("complementary", name="Selected run")
+        expect(page.locator(".lv-node.is-focused")).to_have_attribute("data-run-id", ids[1])
+        code = inspector.locator(".kv-list > div").filter(has=page.locator("dt", has_text="code")).locator("dd")
+        expect(code).to_have_text(text)
+        _no_overflow(page)
 
 
 def test_lineage_tray_shares_selection_with_table(page, tmp_path, ui_server_factory):

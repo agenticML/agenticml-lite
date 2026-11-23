@@ -71,7 +71,7 @@ Authorization: Bearer <key>
 
 ### Client support window
 
-Sync clients declare their package version in the `User-Agent` header (e.g. `User-Agent: agenticml-lite/3.3.0`).
+Sync clients declare their package version in the `User-Agent` header (e.g. `User-Agent: agenticml-lite/3.3.1`).
 
 The server enforces a minimum client support window via `--min-client-version X.Y` (environment variable `AGENTICML_SERVER_MIN_CLIENT_VERSION`, default `2.2`). Values below `2.2` are not supported: 2.0 and 2.1 clients compare `owner` with their key name and misreport their own runs as foreign.
 
@@ -275,6 +275,16 @@ may still be published and deletion did not succeed; retaining those packs
 keeps any live ref's objects available. Uploaded temporary files and quarantines
 are removed after both successful and failed requests. Startup also removes
 abandoned `lineage-*` quarantine directories from `server/tmp` after a crash.
+
+The server never rewrites `meta.json` or its `lineage.parent_commit`: the client
+owns that file and replaces any server edit on its next push. A child whose
+parent ran in another store (another machine syncing to the same server) has
+`parent_commit: null`, because the parent's ref did not exist where the child
+was snapshotted. Once the parent's bundle is on the server in the same workspace
+and project, the dashboard run diff resolves `refs/runs/<parent_run_id>` at read
+time and compares the child with it (`parent_source: "ref"`, see FORMAT.md).
+Sync order between machines does not matter, and a parent that never syncs
+leaves the child with a root diff.
 
 ### `POST /v2/objects/missing`
 

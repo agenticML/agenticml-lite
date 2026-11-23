@@ -11,11 +11,11 @@ Use this table to choose the version for your setup:
 
 | Path | Version | Install command |
 | --- | --- | --- |
-| Local tracking only | 3.3.0 from PyPI | `pip install agenticml-lite` |
-| Self-hosted server | 3.3.0 from PyPI | `pip install 'agenticml-lite[system]'` |
-| Hosted service | 3.3.0 from PyPI | `pip install 'agenticml-lite[system]'` |
+| Local tracking only | 3.3.1 from PyPI | `pip install agenticml-lite` |
+| Self-hosted server | 3.3.1 from PyPI | `pip install 'agenticml-lite[system]'` |
+| Hosted service | 3.3.1 from PyPI | `pip install 'agenticml-lite[system]'` |
 
-`pip install agenticml-lite` installs 3.3.0, which includes the server and hosted service support. To stay on 1.0.0, run `pip install agenticml-lite==1.0.0`. Version 1.0.0 supports local tracking only. It cannot sync to a 2.x or 3.0 server.
+`pip install agenticml-lite` installs 3.3.1, which includes the server and hosted service support. To stay on 1.0.0, run `pip install agenticml-lite==1.0.0`. Version 1.0.0 supports local tracking only. It cannot sync to a 2.x or 3.0 server.
 
 A 2.2 client has not been checked against the hosted service. Use 3.0 or newer.
 
@@ -28,6 +28,28 @@ pip show agenticml-lite
 ```
 
 This works on every version. The `agenticml --version` command works from 3.0. On 1.0.0 and 2.x, use `pip show`.
+
+---
+
+## 3.3.1
+
+**Status:** Released Nov 2026 (tag `v3.3.1`). On PyPI.
+
+This release changes the dashboard and its API only. Upgrade the machine that runs the server or `agenticml ui`. Training machines can stay on 3.3.0. Nothing in the store or the sync protocol changes.
+
+Install from PyPI:
+
+```bash
+pip install -U 'agenticml-lite[system]'
+```
+
+### Fixes
+
+- **Lineage diff against a parent from another machine:** When a run and its parent were created on different machines, the dashboard showed every file as added, because the parent commit was not stored with the run. The dashboard now looks up the parent run's snapshot in the run's own project repository. If the parent's snapshot is not there, the inspector says "parent code not available". `/api/runs/<id>/lineage` has a new `parent_source` field (`meta`, `ref` or `null`) that tells which one was used. See [FORMAT.md](https://github.com/agenticML/agenticml-lite/blob/main/docs/FORMAT.md).
+- **Word spacing in small sans text:** Labels such as "Clip outliers on y-axis" no longer run together.
+- **Run page header:** An empty owner or parent no longer shows the text "null".
+- **Runs without a snapshot:** The lineage inspector and the run page say "no snapshot" or "parent has no snapshot" instead of "code changed".
+- **Lineage inspector:** "· gen N" stays on one line.
 
 ---
 
