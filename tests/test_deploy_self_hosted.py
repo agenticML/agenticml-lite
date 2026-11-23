@@ -50,7 +50,7 @@ EXAMPLE = {
     'AdminEmail': 'admin@example.com',
     'SignUp': 'open',
     'AllowedEmailDomains': 'example.com,example.org',
-    'AgenticmlVersion': '3.3.0',
+    'AgenticmlVersion': '3.3.1',
     'WorkspaceStorageGB': '100',
     'PeoplePerWorkspace': '50',
     'DataVolume': 'vol-0123456789abcdef0',
@@ -156,7 +156,7 @@ def test_parameters_and_defaults(template):
     defaults = {name: p['Default'] for name, p in params.items() if 'Default' in p}
     assert defaults == {
         'HostedZoneId': '', 'CertificateArn': '', 'SignUp': 'invite-only',
-        'AllowedEmailDomains': '', 'CognitoDomainPrefix': '', 'AgenticmlVersion': '3.3.0',
+        'AllowedEmailDomains': '', 'CognitoDomainPrefix': '', 'AgenticmlVersion': '3.3.1',
         'InstanceType': 't4g.small', 'DataVolumeSize': '50', 'BackupRetentionDays': '14',
         'WorkspaceStorageGB': '20', 'PeoplePerWorkspace': '50', 'DataSnapshotId': '',
         'Scheme': 'internet-facing', 'AllowedCidr': '0.0.0.0/0', 'VpcId': '',
@@ -164,8 +164,8 @@ def test_parameters_and_defaults(template):
     assert params['SignUp']['AllowedValues'] == ['invite-only', 'open']
     assert params['Scheme']['AllowedValues'] == ['internet-facing', 'internal']
     assert all(t.startswith(('t4g.', 'm7g.', 'c7g.')) for t in params['InstanceType']['AllowedValues'])
-    assert re.fullmatch(params['AgenticmlVersion']['AllowedPattern'], '3.3.0')
-    assert not re.fullmatch(params['AgenticmlVersion']['AllowedPattern'], "3.3.0'; reboot")
+    assert re.fullmatch(params['AgenticmlVersion']['AllowedPattern'], '3.3.1')
+    assert not re.fullmatch(params['AgenticmlVersion']['AllowedPattern'], "3.3.1'; reboot")
     # Numbers are strings with a pattern: a decimal would break the limits file.
     for name in ('DataVolumeSize', 'BackupRetentionDays', 'WorkspaceStorageGB', 'PeoplePerWorkspace'):
         assert params[name]['Type'] == 'String' and 'MaxLength' in params[name]
@@ -740,7 +740,7 @@ def test_systemd_unit_keeps_the_kits_hardening(script):
 
 def test_installs_from_pypi_with_python_311(script):
     assert 'python3.11 -m venv /opt/agenticml' in script
-    assert "pip install --no-cache-dir 'agenticml-lite[oidc]==3.3.0'" in script
+    assert "pip install --no-cache-dir 'agenticml-lite[oidc]==3.3.1'" in script
     assert 'dnf install -y python3.11 python3.11-pip aws-cfn-bootstrap xfsprogs' in script
 
 

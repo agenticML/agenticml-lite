@@ -60,7 +60,7 @@ The sync client is running an older `agenticml-lite` version below `--min-client
 ```bash
 pip install -U agenticml-lite
 ```
-This installs 3.3.0, which can sync to a server. Version 1.0.0 cannot.
+This installs 3.3.1, which can sync to a server. Version 1.0.0 cannot.
 
 ### `agenticml sync` exits with status 3 (`401 Unauthorized`)
 

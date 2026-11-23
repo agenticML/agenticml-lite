@@ -86,7 +86,7 @@ If using an existing ACM certificate instead of a Route 53 hosted zone, add a CN
 | `SignUp` | `invite-only` | `invite-only`, or `open` (every verified email gets its own workspace). |
 | `AllowedEmailDomains` | empty | Comma-separated domains, no spaces. Only these domains, and the `AdminEmail`, can sign up through Cognito, in both modes. The server additionally applies it to personal workspaces when `SignUp=open`. Domains match exactly (no subdomains). Invitees must be in these domains, because Cognito refuses other domains. Empty means no restriction. |
 | `CognitoDomainPrefix` | empty | Cognito sign-in domain prefix; empty derives one from the stack ID. |
-| `AgenticmlVersion` | `3.3.0` | Version installed from PyPI. |
+| `AgenticmlVersion` | `3.3.1` | Version installed from PyPI. |
 | `InstanceType` | `t4g.small` | Graviton instance type. |
 | `DataVolumeSize` | `50` | Data volume in GiB (whole number from 10). A raised size applies to the volume at once and to the file system at the next instance restart or replacement. |
 | `BackupRetentionDays` | `14` | Daily snapshots to keep. |

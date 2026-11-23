@@ -4,7 +4,8 @@ Nov 21, 2026 · Supervisor plan · Maintenance fix after 3.3.0 · Size: S ·
 Base branch: `main` (tag `v3.3.0` + release docs).
 
 Status: built and in review in
-[#97](https://github.com/agenticML/agenticml-lite/pull/97) (Nov 22, 2026).
+[#97](https://github.com/agenticML/agenticml-lite/pull/97) (Nov 22, 2026);
+#97 also bumps the version to 3.3.1 (Nov 23, 2026, see "Version 3.3.1").
 The open questions are decided (see "Decisions" at the end). Sonnet coded;
 the supervisor reviewed, ran a four-lens review with adversarial
 verification (one confirmed defect: the `rev-parse` describe fallback, fixed
@@ -508,6 +509,97 @@ decisions and record it here.
 3. Cross-project parents: root diff with the label; no project-specific
    message (no extra `meta.json` read per request).
 4. Child bundle not yet received: keep "git diff failed" (pre-existing).
-5. Release: recommended as a 3.3.1 patch release, since agentlab only needs
-   the server upgraded. Tagging and publishing stay owner steps; this PR does
-   not change the version or the Releases page.
+5. Release: a 3.3.1 patch release, since agentlab only needs the server
+   upgraded. Changed Nov 23, 2026 (owner): the version bump goes in this PR
+   too, so #97 is the 3.3.1 release PR; see "Version 3.3.1" below. Tagging
+   and publishing stay owner steps.
+
+## Version 3.3.1 (added Nov 23, 2026)
+
+The owner asked for the 3.3.1 version bump in this PR. 3.3.1 ships
+everything on `main` since the `v3.3.0` tag: this fix and the dashboard
+defect fixes from [#96](https://github.com/agenticML/agenticml-lite/pull/96)
+(merged Nov 22, 2026; plan `fix-demo-gif-ui-defects.md`). No other source
+change is on `main` since `v3.3.0` (`git diff --stat v3.3.0 origin/main --
+src` shows only `app.css` and `app.js` from #96).
+
+### Files to touch
+
+- `pyproject.toml` (`version`) and `src/agenticml/__init__.py`
+  (`__version__`): `3.3.1`.
+- `deploy/aws-self-hosted/agenticml.yaml`: `AgenticmlVersion` `Default:
+  3.3.1`. `release-assets.yml` refuses to attach the template to a release
+  whose tag differs from this default, and
+  `tests/test_deploy_self_hosted.py` ties it to the package version.
+- `tests/test_deploy_self_hosted.py`: the `3.3.0` example parameter values
+  and the `pip install ... ==3.3.0` assertion become `3.3.1`. The two
+  `AllowedPattern` assertions only test the pattern; change them too so no
+  `3.3.0` is left there.
+- `website/src/content/docs/releases.md`:
+  - the "Which version should I use?" table (three rows) and the line under
+    it: `3.3.1`;
+  - a new `## 3.3.1` section above `## 3.3.0`, in the page's style, with
+    `**Status:** Released Nov 2026 (tag `v3.3.1`). On PyPI.` (the facts test
+    needs a status that starts with "Released"), who must upgrade (only the
+    machine that runs the server or `agenticml ui`; training machines can
+    stay on 3.3.0, and nothing in the store or the sync protocol changes),
+    the install command, and a short list of fixes: lineage diffs against a
+    parent from another machine (with the "parent code not available" label
+    and the new `parent_source` field), and the #96 dashboard fixes (word
+    spacing in small sans text, no literal "null" in the run page header,
+    "no snapshot" / "parent has no snapshot" instead of "code changed",
+    "· gen N" kept on one line);
+  - historical statements stay as they are (the 3.3.0 and 3.2.0 sections,
+    "included in 3.3.0").
+- Pages that say what `pip install` installs today: `index.mdx` (current
+  version), `getting-started/installation.md`, `hosted/quickstart.md`,
+  `server/upgrade.md`: `3.3.1`. `server/deploy-on-aws.md` parameter table:
+  `AgenticmlVersion` default `3.3.1`. `docs/PROTOCOL.md` `User-Agent`
+  example: `agenticml-lite/3.3.1`.
+- Not changed: raw `githubusercontent.com/.../v3.3.0/...` URLs (docs,
+  `deploy/*/README.md`) and `PUBLISHED_TAGS` in `tests/test_website_facts.py`.
+  The tag `v3.3.1` does not exist until the owner pushes it, and the facts
+  test rejects a URL to an unpublished tag. The files those URLs fetch
+  (`deploy/systemd/*`, `deploy/private-network/*` kit files) have not
+  changed since `v3.3.0`, so the `v3.3.0` copies are correct for 3.3.1.
+- `docs/plans/on-prem-roadmap.md`:
+  - the "Maintenance fixes" entry for this fix: ships as 3.3.1;
+  - the #96 entry ("Dashboard defects seen in the README demo GIF"): done
+    (merged Nov 22, 2026), ships in 3.3.1;
+  - the Backlog intro line: 3.3.1 is pending the owner's tag;
+  - a new Backlog owner entry **Release 3.3.1**, placed first among the owner
+    entries: after #97 is merged, push tag `v3.3.1` on the merge commit
+    (`publish.yml` checks the tag against `pyproject.toml` and
+    `__init__.py` and uploads to PyPI), publish the GitHub release
+    (`release-assets.yml` attaches `agenticml.yaml`), approve the hosted
+    deploy the merge starts (`deploy.yml` runs on `src/**` and
+    `pyproject.toml` pushes to `main`), then optionally move raw URLs to
+    `v3.3.1` and add it to `PUBLISHED_TAGS`. Done when PyPI shows 3.3.1, the
+    release has `agenticml.yaml`, and the hosted service runs the merge
+    commit.
+
+### Constraints
+
+- Merging #97 publishes the docs site (`docs.yml` runs on `website/**`
+  pushes to `main`), so the Releases page says "Released" from the merge
+  until the tag is pushed. The owner pushes the tag right after the merge;
+  the PR body says so. This is the order `test_releases_page_names_the_package_version`
+  asks for ("bump the version in the release PR together with the table and
+  the section").
+- Plain past-tense facts; no claims that are not in the code or git log.
+
+### Checks
+
+- `testbed/.venv/bin/python -m pytest -q tests/test_website_facts.py
+  tests/test_deploy_self_hosted.py`, then the full unit suite.
+- `git grep -n "3\.3\.0"` outside `docs/plans`, `website/package-lock.json`
+  and the historical Releases sections returns only the `v3.3.0` raw URLs
+  and `PUBLISHED_TAGS`.
+- `python -c "import agenticml; print(agenticml.__version__)"` prints
+  `3.3.1`.
+- The docs site build runs in CI (`docs.yml` on the PR).
+
+### Done when
+
+The checks pass, the Releases page has a released `## 3.3.1` section, and
+the roadmap has the owner's release entry.
