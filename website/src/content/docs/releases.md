@@ -33,7 +33,7 @@ This works on every version. The `agenticml --version` command works from 3.0. O
 
 ## 3.3.1
 
-**Status:** Released Nov 2026 (tag `v3.3.1`). On PyPI.
+**Status:** Released Nov 23, 2026 (tag `v3.3.1`). On PyPI.
 
 This release changes the dashboard and its API only. Upgrade the machine that runs the server or `agenticml ui`. Training machines can stay on 3.3.0. Nothing in the store or the sync protocol changes.
 

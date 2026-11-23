@@ -786,10 +786,10 @@ local run, `verify` compares local runs with the server (file sizes and
 sha256, referenced objects, status, fingerprint), and `isolation` probes
 another workspace with this workspace's key. It reads the key from
 `AGENTICML_API_KEY` (or asks for it) and never prints it. The script lives in
-the repository. On a training machine without a checkout, fetch it from the `v3.3.0` tag:
+the repository. On a training machine without a checkout, fetch it from the `v3.3.1` tag:
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/agenticML/agenticml-lite/v3.3.0/scripts/hosted_check.py
+curl -fsSLO https://raw.githubusercontent.com/agenticML/agenticml-lite/v3.3.1/scripts/hosted_check.py
 ```
 
 The commands below use the setup from "Environment configuration" above

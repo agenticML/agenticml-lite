@@ -3,9 +3,10 @@
 Nov 21, 2026 · Supervisor plan · Maintenance fix after 3.3.0 · Size: S ·
 Base branch: `main` (tag `v3.3.0` + release docs).
 
-Status: built and in review in
-[#97](https://github.com/agenticML/agenticml-lite/pull/97) (Nov 22, 2026);
-#97 also bumps the version to 3.3.1 (Nov 23, 2026, see "Version 3.3.1").
+Status: done: merged in
+[#97](https://github.com/agenticML/agenticml-lite/pull/97) on Nov 23, 2026 and
+released in 3.3.1 (tag `v3.3.1`); #97 also bumped the version to 3.3.1 (Nov 23,
+2026, see "Version 3.3.1").
 The open questions are decided (see "Decisions" at the end). Sonnet coded;
 the supervisor reviewed, ran a four-lens review with adversarial
 verification (one confirmed defect: the `rev-parse` describe fallback, fixed

@@ -81,10 +81,10 @@ For Linux production systems, run the server as a systemd system service. See [d
 sudo python3 -m venv /opt/agenticml
 sudo /opt/agenticml/bin/python -m pip install agenticml-lite
 sudo useradd --system --home /var/lib/agenticml-server --shell /usr/sbin/nologin agenticml
-sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v3.3.0/deploy/systemd/agenticml-server.service
+sudo curl -fsSL -o /etc/systemd/system/agenticml-server.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v3.3.1/deploy/systemd/agenticml-server.service
 ```
 
-The unit is fetched from the `v3.3.0` tag. Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`).
+The unit is fetched from the `v3.3.1` tag. Use the tag that matches the agenticml-lite version you installed (`pip show agenticml-lite`).
 
 Edit `/etc/systemd/system/agenticml-server.service` or use `sudo systemctl edit agenticml-server` to set `AGENTICML_SERVER_PUBLIC_URL`. Then enable and start the service:
 
