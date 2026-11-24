@@ -33,7 +33,7 @@ A training machine uploads with a sync key.
 4. Leave **Scope** as `sync`.
 5. Click **Create**.
 
-The key is shown once and cannot be recovered. Copy it now. The dialog also shows a login command without the key in it (`agenticml login --host <host>`). Run it, then paste the key when it asks for it. This keeps the key out of your shell history and the process list.
+The key is shown once and cannot be recovered. Copy it now. The dialog also shows a login command without the key in it (`agenticml login --host <host>`). Run it, then paste the key when it asks for it. This keeps the key out of your shell history and the process list. For details on scopes, user assignment and key lifecycles, see [Sign-in and sync keys](/agenticml-lite/hosted/keys/).
 
 ## 4. Install the client
 
@@ -69,7 +69,7 @@ user: jane.doe@example.com (owner)
 workspace: jane-doe
 ```
 
-To log in without a prompt, pipe the key in, for example `echo "$HOSTED_KEY" | agenticml login --host https://app.agenticml.xyz`. On a machine where you do not want to save a key, set `AGENTICML_HOST` and `AGENTICML_API_KEY` instead; `sync` and `whoami` read them. Do not put the key on the command line.
+To log in without a prompt, pipe the key in, for example `echo "$HOSTED_KEY" | agenticml login --host https://app.agenticml.xyz`. On a machine where you do not want to save a key, set `AGENTICML_HOST` and `AGENTICML_API_KEY` instead; `sync` and `whoami` read them. Do not put the key on the command line. For cluster setups, environment overrides, and logout, see [Sign-in and sync keys](/agenticml-lite/hosted/keys/).
 
 ## 6. Track and sync a run
 
@@ -116,6 +116,6 @@ The limits are listed in [Free plan and limits](/agenticml-lite/hosted/#free-pla
 
 **HTTP 429.** The workspace went over 600 requests a minute. Wait for the number of seconds in the `Retry-After` header. The client also waits and tries again.
 
-**"up to date", but the run is not in the dashboard.** Sync keeps its progress per server, not per workspace, so a run that was already synced to one workspace is not sent to another. See [Several workspaces from one machine](/agenticml-lite/hosted/workspaces/#several-workspaces-from-one-machine).
+**"up to date", but the run is not in the dashboard.** 3.0+ clients keep sync progress per workspace (`<host>/w/<slug>`). Older clients keep progress per server, so a run synced to one workspace is not sent to another. See [Several workspaces from one machine](/agenticml-lite/hosted/workspaces/#several-workspaces-from-one-machine).
 
 **A run shows as "stale".** A run is marked stale when it is still `running` but nothing has arrived for more than 600 seconds. Run `agenticml sync --follow` during training so heartbeats arrive.

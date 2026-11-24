@@ -463,6 +463,13 @@ part can go to `main` early as a docs-only PR.
   move to `v3.3.1`, the Releases page dates 3.3.1, and the roadmap lists only
   the open owner steps): [plan](packages/release-3-3-1-docs.md); status: in
   review.
+- The hosted docs had no page on sign-in and sync keys, although sync keys
+  are how training machines reach the service (owner's request, Nov 24,
+  2026); new "Sign-in and sync keys" page, links from the other hosted pages,
+  a wrong quickstart sentence on per-workspace sync progress, and a facts
+  test: [plan](packages/docs-hosted-keys.md); status: in review (PR to
+  `main`; Antigravity drafted, Sonnet wrote the test and fixes, supervisor
+  fact-checked).
 
 ### Later (unscheduled)
 
