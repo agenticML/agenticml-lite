@@ -32,6 +32,10 @@ Open sign-up is on as of Nov 13, 2026. By signing up you agree to the [terms of 
 
 Choose local tracking if you work alone on one machine. Choose the hosted service if you want a shared dashboard and sync from several machines without running a server. Choose self-hosting if your data must stay on your own hardware.
 
+### How machines connect
+
+Training machines connect to the hosted service using sync keys generated in the dashboard. Each key is bound to one workspace and one user, and authenticated requests use HTTPS. See [Sign-in and sync keys](/agenticml-lite/hosted/keys/).
+
 ## Free plan and limits
 
 Every hosted workspace is on the free plan. As of Nov 13, 2026, each workspace has these limits:
@@ -65,5 +69,6 @@ Use [GitHub Issues](https://github.com/agenticML/agenticml-lite/issues) and put 
 ## Next steps
 
 - [Hosted quickstart](/agenticml-lite/hosted/quickstart/): sign up, make a sync key, and sync your first run.
+- [Sign-in and sync keys](/agenticml-lite/hosted/keys/): authentication, machine setup, key rotation, and sessions.
 - [Workspaces and team](/agenticml-lite/hosted/workspaces/): roles, invites, and several workspaces from one machine.
 - [Service status](/agenticml-lite/hosted/status/): what is live, what is being checked, and what is still open.

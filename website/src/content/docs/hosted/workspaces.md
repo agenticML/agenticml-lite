@@ -2,7 +2,7 @@
 title: Workspaces and team
 description: Roles, invites, the people limit, and using several workspaces from one machine.
 sidebar:
-  order: 3
+  order: 4
   badge:
     text: '3.0'
     variant: tip
@@ -49,7 +49,7 @@ Open **Settings** in the top bar. What you see depends on your role.
 - **Account:** your user, role and sign-in method, the workspace switcher, and sign out. Servers without Firebase sign-in also show a password form.
 - **Workspace:** name, slug, plan and **Usage** (storage, daily uploads, requests per minute and people against the free plan limits). Owners and admins only.
 - **Members:** people, roles, invites and pending invites. Owners and admins only.
-- **API keys:** your sync keys, with a **New key** button. Owners and admins also see the keys of other people and can make one for a person with the **User** field. A key is shown once, when it is made.
+- **API keys:** your sync keys, with a **New key** button. Owners and admins also see the keys of other people and can make one for a person with the **User** field. A key is shown once, when it is made. See [Sign-in and sync keys](/agenticml-lite/hosted/keys/).
 - **Activity:** recent audit events. Owners and admins only.
 - **Usage banner:** a banner at the top of the dashboard appears when storage or daily uploads pass 80% of the limit, and again when the limit is reached.
 

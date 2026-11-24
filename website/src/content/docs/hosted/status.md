@@ -2,7 +2,7 @@
 title: Service status and roadmap
 description: What is live on the hosted service, what is being checked, and what is still open.
 sidebar:
-  order: 4
+  order: 5
   badge:
     text: '3.0'
     variant: tip
