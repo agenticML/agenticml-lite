@@ -7,6 +7,7 @@ import agenticml
 from agenticml import cli
 from agenticml.server.app import make_server
 from agenticml.server.webauth import DEFAULT_CONTACT_EMAIL, resolve_contact_email
+from server_db_helpers import isolate_server_dir
 from test_server_firebase import PROJECT, firebase_running
 from test_server_signin import running
 from test_server_web import authed, call
@@ -144,10 +145,14 @@ def _picker(httpd):
 
 def test_picker_has_a_mailto_link_only_in_operator_mode(tmp_path, monkeypatch):
     monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    isolate_server_dir(tmp_path / 'op', monkeypatch)
     with running(tmp_path / 'op', contact_email='lab@example.org') as httpd:
         page = _picker(httpd)
     assert ('<a class="btn btn-ghost btn-sm" '
             'href="mailto:lab@example.org?subject=agenticml%3A%20workspaces">Contact us</a>') in page
     for i, value in enumerate((None, '', 'off')):
+        # Each server needs its own database: on Postgres they would share one,
+        # and the fixed key name in _picker would collide.
+        isolate_server_dir(tmp_path / f'other-{i}', monkeypatch)
         with running(tmp_path / f'other-{i}', contact_email=value) as httpd:
             assert 'mailto:' not in _picker(httpd)
