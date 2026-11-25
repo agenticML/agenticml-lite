@@ -147,6 +147,8 @@ def test_external_links_keeps_only_real_deduplicated_urls(tmp_path):
             "Again https://github.com/agenticML/agenticml-lite/issues, and **https://other.dev/path**.\n"
             "Placeholders: https://<hostname>/x https://app.agenticml.xyz/w/<slug>/runs https://aml.example.com\n"
             "https://example.com/y http://127.0.0.1:6006 http://localhost:8080/ https://x.example/z\n"
+            "https://agenticml.lab.internal https://agenticml.lab.internal:8443/x "
+            "https://app.example.test/a https://foo.invalid https://my.localhost/\n"
             "`pip install git+https://github.com/agenticML/agenticml-lite`\n"
             "Ours: https://app.agenticml.xyz/login https://api.agenticml.xyz https://docs.agenticml.xyz/a "
             "https://agenticml.github.io/agenticml-lite/hosted/\n"
@@ -167,6 +169,21 @@ def test_external_links_keeps_only_real_deduplicated_urls(tmp_path):
     ]
 
 
+@pytest.mark.parametrize("host", [
+    "x.example", "example.com", "aml.example.org", "agenticml.lab.internal",
+    "app.example.test", "a.invalid", "b.localhost",
+])
+def test_is_example_true_for_reserved_names(host):
+    assert monitor._is_example(host)
+
+
+@pytest.mark.parametrize("host", [
+    "other.dev", "github.com", "internal.dev", "example-site.com", "test.org",
+])
+def test_is_example_false_for_real_names(host):
+    assert not monitor._is_example(host)
+
+
 def test_external_links_of_the_real_docs_site_are_not_placeholders():
     urls = monitor.external_links(monitor.DEFAULT_DOCS_DIR)
     assert urls
@@ -174,6 +191,7 @@ def test_external_links_of_the_real_docs_site_are_not_placeholders():
         host = monitor.urlsplit(url).hostname
         assert "." in host and host not in monitor.IGNORED_HOSTS, url
         assert not url.startswith(monitor.SKIPPED_PREFIXES), url
+        assert not monitor._is_example(host), url
 
 
 # ---------------------------------------------------------------- one link

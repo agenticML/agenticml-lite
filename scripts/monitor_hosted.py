@@ -48,6 +48,8 @@ IGNORED_HOSTS = frozenset({
     "localhost",
     "127.0.0.1",
 })
+# Names reserved by RFC 2606/6761 and ICANN (.internal) that never resolve on the public internet.
+RESERVED_TLDS = frozenset({"example", "test", "invalid", "localhost", "internal"})
 # URL prefixes the link check skips. Empty: raw files on `main` exist now that
 # 3.0 is merged there. Add a prefix here when a link cannot resolve yet.
 SKIPPED_PREFIXES = ()
@@ -111,9 +113,13 @@ def check_health(host, opener=_open, sleep=time.sleep):
 
 
 def _is_example(host):
-    """True for the reserved example names: x.example, example.com, aml.example.org."""
+    """True for reserved placeholder names.
+
+    Examples: x.example, example.com, aml.example.org, agenticml.lab.internal,
+    app.example.test.
+    """
     labels = host.split(".")
-    return labels[-1] == "example" or labels[-2:-1] == ["example"]
+    return labels[-1] in RESERVED_TLDS or labels[-2:-1] == ["example"]
 
 
 def external_links(docs_dir):
