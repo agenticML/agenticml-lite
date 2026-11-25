@@ -322,3 +322,37 @@ def test_contact_address_is_the_same_everywhere():
     assert DEFAULT_CONTACT_EMAIL == address
     assert constant.group(1) == address
     assert hosted['Parameters']['ContactEmail']['Default'] == address
+
+
+def test_hosted_keys_page_has_the_key_facts():
+    """Protects readers of the hosted sign-in and sync keys page: the
+    variables, the credentials file, the login and whoami commands, the web
+    session limits (from agenticml.server.webauth) and the key name length
+    limit (from agenticml.server.keys) must be on it and match the code, and
+    no key goes on a command line."""
+    from agenticml.server.keys import _NAME
+    from agenticml.server.webauth import SESSION_IDLE, SESSION_MAX_AGE
+
+    page = 'hosted/keys.md'
+    text = _text(page)
+    needles = [
+        'AGENTICML_API_KEY', 'AGENTICML_HOST', 'AGENTICML_CONFIG_DIR',
+        'credentials.json', 'agenticml login --host https://app.agenticml.xyz',
+        'agenticml whoami',
+    ]
+    missing = [needle for needle in needles if needle not in text]
+    assert not missing, f'{page} does not mention {missing}'
+
+    assert SESSION_IDLE % 3600 == 0, f'SESSION_IDLE={SESSION_IDLE} is not a whole number of hours; update this test'
+    assert SESSION_MAX_AGE % 86400 == 0, f'SESSION_MAX_AGE={SESSION_MAX_AGE} is not a whole number of days; update this test'
+    idle = f'{SESSION_IDLE // 3600} hours'
+    max_age = f'{SESSION_MAX_AGE // 86400} days'
+    assert idle in text, f'{page} does not state the web session idle limit "{idle}" (SESSION_IDLE)'
+    assert max_age in text, f'{page} does not state the web session maximum age "{max_age}" (SESSION_MAX_AGE)'
+
+    parsed = re.search(r'\{1,(\d+)\}', _NAME.pattern)
+    assert parsed, f'cannot read the maximum length from _NAME.pattern {_NAME.pattern!r}; update this test'
+    length = f'up to {int(parsed.group(1))} characters'
+    assert length in text, f'{page} does not state the key name length limit "{length}" (_NAME in server/keys.py)'
+
+    assert not _login_key_examples(text), _login_key_examples(text)
