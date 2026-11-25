@@ -58,5 +58,55 @@
       <button id="close-lightbox" class="btn btn-secondary btn-sm">Close</button>
       <img alt="Expanded run media" />
     </dialog>
+    <button
+      id="contact"
+      class="contact-fab"
+      type="button"
+      popovertarget="contact-panel"
+      aria-haspopup="dialog"
+      hidden
+    >
+      <svg
+        class="contact-fab-icon"
+        viewBox="0 0 24 24"
+        width="18"
+        height="18"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.8"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        aria-hidden="true"
+        focusable="false"
+      >
+        <rect x="3" y="5" width="18" height="14" rx="2" />
+        <path d="m3.5 6.5 8.5 6.5 8.5-6.5" />
+      </svg>
+      <span id="contact-label" class="contact-fab-label">Contact us</span>
+    </button>
+    <div
+      id="contact-panel"
+      class="contact-panel"
+      popover
+      role="dialog"
+      aria-labelledby="contact-title"
+    >
+      <h2 id="contact-title" class="contact-title">Contact us</h2>
+      <p id="contact-note" class="contact-note" hidden></p>
+      <div class="contact-actions">
+        <a id="contact-mail" class="btn btn-primary" href="mailto:">Write an email</a>
+        <button id="contact-copy" class="btn btn-secondary" type="button">Copy address</button>
+      </div>
+      <p id="contact-address" class="contact-address"></p>
+      <div id="contact-status" class="contact-status" role="status"></div>
+      <button
+        class="btn btn-ghost btn-sm contact-close"
+        type="button"
+        popovertarget="contact-panel"
+        popovertargetaction="hide"
+      >
+        Close
+      </button>
+    </div>
   </body>
 </html>

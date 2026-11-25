@@ -127,6 +127,7 @@ The unit's `StateDirectory=agenticml-server` automatically manages `/var/lib/age
 | `--metrics MODE` | `AGENTICML_SERVER_METRICS` | `off` | Capacity metrics mode: `off` or `cloudwatch`. |
 | `--open-signup` | `AGENTICML_SERVER_OPEN_SIGNUP` | off | Allow verified Firebase sign-in to create an account and workspace. |
 | `--admin-emails LIST` | `AGENTICML_SERVER_ADMIN_EMAILS` | unset | Comma-separated emails granted server admin at their next verified Firebase sign-in. Ignored without Firebase. |
+| `--contact-email ADDRESS\|off` | `AGENTICML_SERVER_CONTACT_EMAIL` | unset | Where the dashboard's contact button writes. Unset shows a **Feedback** button that writes to the agenticml-lite team. An address shows a **Contact us** button that writes to that address. `off` shows no button. The button only opens the user's email app; the server sends nothing. See [Contact and feedback button](https://github.com/agenticML/agenticml-lite/blob/main/docs/SERVER.md#contact-and-feedback-button). |
 | `--min-client-version X.Y` | `AGENTICML_SERVER_MIN_CLIENT_VERSION` | `2.2` | Reject `agenticml-lite` clients older than `X.Y` on `/v2` requests with HTTP 426. |
 
 Two more environment variables apply to S3 object storage:

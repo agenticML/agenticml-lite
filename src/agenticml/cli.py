@@ -601,6 +601,22 @@ def _legal_base_url_from_args(args):
     return normalize_legal_base_url(raw)
 
 
+def _contact_email_from_args(args):
+    """The ``--contact-email`` value (flag wins over the environment), checked early.
+
+    Returns None when unset or blank (the server then uses the project default),
+    else the stripped address or ``off``. A bad address raises ValueError.
+    """
+    from .server.webauth import resolve_contact_email
+
+    raw = getattr(args, "contact_email", None)
+    if raw is None:
+        raw = os.environ.get("AGENTICML_SERVER_CONTACT_EMAIL", "")
+    raw = raw.strip(" \t")
+    resolve_contact_email(raw)
+    return raw or None
+
+
 def _metrics_from_args(args):
     """``off`` or ``cloudwatch`` from ``--metrics`` or the environment (flag wins)."""
     raw = getattr(args, "metrics", None)
@@ -667,6 +683,9 @@ def cmd_server_serve(args):
         legal_base_url = _legal_base_url_from_args(args)
         if legal_base_url:
             extra["legal_base_url"] = legal_base_url
+        contact_email = _contact_email_from_args(args)
+        if contact_email is not None:
+            extra["contact_email"] = contact_email
         metrics = _metrics_from_args(args)
         if metrics != "off":
             extra["metrics"] = metrics
@@ -2077,6 +2096,10 @@ def main(argv=None):
                          help="https:// base URL of the Terms, Acceptable use and Privacy pages "
                               "linked from the Firebase sign-in page; unset shows no links "
                               "(default: AGENTICML_SERVER_LEGAL_BASE_URL)")
+    p_serve.add_argument("--contact-email", default=None, metavar="ADDRESS|off",
+                         help="Address the dashboard's Contact us button writes to; unset shows a "
+                              "Feedback button that writes to the agenticml-lite team, off shows "
+                              "no button (default: AGENTICML_SERVER_CONTACT_EMAIL)")
     p_serve.add_argument("--min-client-version", default=None, metavar="X.Y",
                          help="Reject agenticml-lite clients older than this on /v2 "
                               "(default: AGENTICML_SERVER_MIN_CLIENT_VERSION or 2.2)")

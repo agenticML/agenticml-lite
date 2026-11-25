@@ -418,6 +418,26 @@ part can go to `main` early as a docs-only PR.
 | 35.2 | GitHub link in the dashboard top bar; docs and GitHub line from `agenticml ui` | – | Sonnet | S | [plan](packages/35-repo-outreach.md) | done ([#90](https://github.com/agenticML/agenticml-lite/pull/90), merged Nov 20, 2026; released in 3.3.0) |
 | 35.3 | README demo GIF instead of the still screenshot (live run, lineage graph, select and compare, hover and smoothing), made by `scripts/make_readme_images.py` with Playwright frames and Pillow | 35.1 | Sonnet; supervisor reviews | S | [plan](packages/35-repo-outreach.md#353-readme-demo-gif) | done ([#96](https://github.com/agenticML/agenticml-lite/pull/96), merged Nov 22, 2026; released in 3.3.1 (Nov 23, 2026)); the README shows the lineage-focused `demo-lineage.gif` (owner's pick, Nov 21, 2026) |
 
+### Contact us
+
+Added Nov 24, 2026 (owner: "I wanna add a feedback or contact us on github
+pages, and also in hosted service"; then "instead of feedback chat window,
+we can have a contact-us button, to write up an email to us"). A Contact us
+button on the docs site and on the dashboard opens a panel that drafts an
+email to `contact@agenticml.xyz` (`mailto:`) or copies the address. Nothing
+is sent by the page, so no backend and no third-party code. Self-hosted
+servers show a Feedback button to the agenticml-lite team by default (owner,
+same day: "even for the self hosted service, i would want the email to be
+forwarded to mine"); `--contact-email` sets the operator's own address or
+`off`, and the hosted service sets ours. Ships with the next release.
+
+| # | Package | Depends on | Coder | Size | Plan | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| 37 | Contact us button on the docs site and the dashboard | – | Sonnet (code and docs); supervisor reviews | S–M | [plan](packages/37-contact-us.md) | in review |
+| 37.1 | Docs site: floating Contact us button on every page (email, copy address, GitHub Discussions, new issue); overflow check | – | Sonnet | S | [plan](packages/37-contact-us.md#371-docs-site-button) | in review |
+| 37.2 | Server `--contact-email` (default: Feedback to the agenticml-lite team; an address; or `off`), contact and version in the session payload, dashboard button, picker and Firebase sign-in links; UI tests | – | Sonnet | M | [plan](packages/37-contact-us.md#372-server-option-and-dashboard-button) | in review |
+| 37.3 | Hosted template sets the address; facts test; SERVER.md, threat model and deploy README | 37.2 | Sonnet | S | [plan](packages/37-contact-us.md#373-hosted-template-and-docs) | in review |
+
 ### Maintenance fixes
 
 - Empty object and lineage upload framing: [plan](packages/fix-empty-uploads.md),
@@ -476,6 +496,13 @@ part can go to `main` early as a docs-only PR.
 - (More than one server process and the S3 object backend moved to 3.0.)
 - Billing and paid plans; email delivery for invites (after 3.0).
 - Enterprise SSO per workspace (after 3.0).
+- Contact address for the self-deploy template and `server up` (from
+  package 37): a `ContactEmail` parameter in
+  `deploy/aws-self-hosted/agenticml.yaml` and a `--contact-email` flag on
+  `server up`, so operators need not set `AGENTICML_SERVER_CONTACT_EMAIL`
+  by hand. Today `server up` ignores `AGENTICML_SERVER_CONTACT_EMAIL` (only
+  `server serve` reads it), so a `server up` server always shows the Feedback
+  button and cannot turn it off.
 - Abuse controls if needed: Firebase App Check, disposable-email
   blocklist, removal of long-inactive free workspaces.
 - Run files on S3 instead of EFS, if the 3.0 EFS numbers call for it.

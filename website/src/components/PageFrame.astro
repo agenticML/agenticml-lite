@@ -1,0 +1,13 @@
+---
+// Wraps Starlight's page frame and adds the Contact us button to every page,
+// including the splash home page and the 404 page (package 37.1).
+import Default from '@astrojs/starlight/components/PageFrame.astro';
+import ContactButton from './ContactButton.astro';
+---
+
+<Default {...Astro.props}>
+	<slot name="header" slot="header" />
+	<slot name="sidebar" slot="sidebar" />
+	<slot />
+</Default>
+<ContactButton />
