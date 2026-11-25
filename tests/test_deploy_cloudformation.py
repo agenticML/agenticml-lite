@@ -117,6 +117,8 @@ def test_no_iam_wildcard_actions(name):
 @pytest.mark.parametrize('name', TEMPLATE_NAMES)
 def test_no_email_address_in_template(name):
     text = (TEMPLATE_DIR / name).read_text()
+    # The public project address (the ContactEmail default) is the one allowed address.
+    text = text.replace('contact@agenticml.xyz', '')
     assert not re.findall(r'[A-Za-z0-9._+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+', text)
 
 
@@ -498,7 +500,7 @@ def test_hosted_parameters(hosted):
     params = hosted['Parameters']
     assert set(params) == {'ImageTag', 'Hostname', 'DesiredCount', 'MaxTaskCount', 'DbInstanceClass', 'MultiAZ',
                            'FirebaseProject', 'FirebaseApiKey', 'OpenSignup', 'AdminEmails', 'LegalBaseUrl',
-                           'VpcCidr'}
+                           'ContactEmail', 'VpcCidr'}
     assert 'Default' not in params['ImageTag']
     assert params['Hostname']['Default'] == 'app.agenticml.xyz'
     # Lean default (package 24.5): one task; rolling deploys still start the new one first.
@@ -527,6 +529,15 @@ def test_hosted_parameters(hosted):
     for bad in ('http://a.io/', 'https://:443/', 'https://a.io:abc/', 'https://u@a.io/',
                 'https://a.io/?x=1', 'https://a.io/#f', 'https://a.io/a b'):
         assert not legal.match(bad), bad
+    # The hosted service names its own address (operator mode); the server default is the same one.
+    assert params['ContactEmail']['Default'] == 'contact@agenticml.xyz'
+    assert params['ContactEmail']['MaxLength'] == 254
+    contact = re.compile(params['ContactEmail']['AllowedPattern'])
+    for ok in ('', 'off', 'OFF', 'Off', 'contact@agenticml.xyz', 'a.b+c@sub.example.org'):
+        assert contact.fullmatch(ok), ok
+    for bad in ('a b@x.org', 'a@x.org?cc=b@y.org', 'a@x.org&bcc=b', 'a%40x@y.org', 'a,b@x.org', '"a"@x.org',
+                'a@@x.org', 'a@x', 'a@x.org\n', 'of', 'offf', 'mailto:a@x.org'):
+        assert not contact.fullmatch(bad), bad
     assert params['VpcCidr']['Default'] == '10.42.0.0/16'
     # No hosted zone, e-mail address or bucket name is a parameter.
     assert not {'HostedZoneId', 'AlarmEmail', 'ObjectsBucketName', 'LogsBucketName'} & set(params)
@@ -748,6 +759,7 @@ def test_hosted_trusted_proxy_is_the_alb_subnets_only(hosted):
     assert env['AGENTICML_SERVER_OPEN_SIGNUP'] == {'Ref': 'OpenSignup'}
     assert env['AGENTICML_SERVER_ADMIN_EMAILS'] == {'Ref': 'AdminEmails'}
     assert env['AGENTICML_SERVER_LEGAL_BASE_URL'] == {'Ref': 'LegalBaseUrl'}
+    assert env['AGENTICML_SERVER_CONTACT_EMAIL'] == {'Ref': 'ContactEmail'}
     assert env['AGENTICML_SERVER_PUBLIC_URL'] == {'Fn::Sub': 'https://${Hostname}'}
     assert env['AGENTICML_SERVER_OBJECTS'] == {'Fn::Sub': 's3://${ObjectsBucket}/hosted'}
     assert env['AGENTICML_SERVER_METRICS'] == 'cloudwatch'

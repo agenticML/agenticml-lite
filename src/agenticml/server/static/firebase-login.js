@@ -14,6 +14,7 @@
   const sub = document.querySelector("#auth-sub");
   const showPassword = document.querySelector("#show-password");
   const legal = document.querySelector("#legal");
+  const contact = document.querySelector("#contact");
 
   const NO_ACCOUNT =
     "Your account has no access to this server. Ask a workspace admin for an invite.";
@@ -373,6 +374,17 @@
     legal.hidden = false;
   }
 
+  // The server sends this only when the operator set a contact address.
+  function showContact(address) {
+    if (!contact || typeof address !== "string") return;
+    if (!/^[A-Za-z0-9._+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z0-9-]+$/.test(address)) return;
+    const link = document.createElement("a");
+    link.href = "mailto:" + address + "?subject=" + encodeURIComponent("agenticml: sign-in");
+    link.textContent = "Contact us";
+    contact.replaceChildren("Questions? ", link);
+    contact.hidden = false;
+  }
+
   async function start() {
     let response;
     try {
@@ -393,6 +405,7 @@
       return;
     }
     showLegal(config.legal);
+    showContact(config.contact_email);
     try {
       firebase.initializeApp({
         apiKey: config.apiKey,

@@ -1,0 +1,249 @@
+---
+// Floating "Contact us" button with a small panel (package 37.1). Nothing is
+// sent by the page: "Write an email" is a mailto: link that opens the
+// visitor's own email app, and "Copy address" is for people with webmail.
+// The panel uses the native HTML popover attribute, so only Copy needs script.
+const CONTACT_EMAIL = 'contact@agenticml.xyz';
+const DISCUSSIONS_URL = 'https://github.com/agenticML/agenticml-lite/discussions';
+const NEW_ISSUE_URL = 'https://github.com/agenticML/agenticml-lite/issues/new/choose';
+
+// Canonical page URL: the configured site origin plus the path (which already
+// includes the base). Astro.url alone would show the build host.
+const pageUrl = new URL(Astro.url.pathname, Astro.site ?? Astro.url).href;
+const title = Astro.locals.starlightRoute?.entry?.data?.title ?? '';
+const subject = title ? `agenticml docs: ${title}` : 'agenticml docs';
+// GitHub Pages serves 404.html for any missing address, so the build cannot know
+// the URL the visitor asked for. The draft leaves the Page line out there and
+// the script below adds it from location.
+const is404 = Astro.url.pathname.replace(/\/$/, '').endsWith('/404');
+const body = is404 ? '\n\n\n---' : `\n\n\n---\nPage: ${pageUrl}`;
+const mailto = `mailto:${CONTACT_EMAIL}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+---
+
+<button
+	type="button"
+	class="contact-fab"
+	id="contact-button"
+	popovertarget="contact-panel"
+	aria-label="Contact us"
+	data-contact-button
+>
+	<svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+		<rect x="3" y="5" width="18" height="14" rx="2"></rect>
+		<path d="m3 7 9 6 9-6"></path>
+	</svg>
+	<span class="contact-label">Contact us</span>
+</button>
+
+<div id="contact-panel" class="contact-panel" popover role="dialog" aria-labelledby="contact-title">
+	<h2 id="contact-title">Contact us</h2>
+	<div class="contact-actions">
+		<a class="contact-action contact-primary" href={mailto} data-contact-mailto data-contact-404={is404 ? '' : undefined}>Write an email</a>
+		<button type="button" class="contact-action" data-contact-copy>Copy address</button>
+		<a class="contact-action" href={DISCUSSIONS_URL} target="_blank" rel="noopener">Ask on GitHub</a>
+		<a class="contact-action" href={NEW_ISSUE_URL} target="_blank" rel="noopener">Report a bug</a>
+	</div>
+	<p class="contact-address" data-contact-address>{CONTACT_EMAIL}</p>
+	<p class="contact-status" data-contact-status role="status"></p>
+	<button type="button" class="contact-action contact-close" popovertarget="contact-panel" popovertargetaction="hide">Close</button>
+</div>
+
+<script>
+	const panel = document.getElementById('contact-panel');
+	const copy = panel?.querySelector<HTMLButtonElement>('[data-contact-copy]');
+	const address = panel?.querySelector<HTMLElement>('[data-contact-address]');
+	const status = panel?.querySelector<HTMLElement>('[data-contact-status]');
+	const mailto = panel?.querySelector<HTMLAnchorElement>('[data-contact-404]');
+	let timer: number | undefined;
+
+	// 404 page only: name the address the visitor actually asked for (no query).
+	if (mailto) {
+		const url = new URL(mailto.href);
+		const subject = new URLSearchParams(url.search).get('subject') ?? '';
+		const page = `${location.origin}${location.pathname}`;
+		const body = `\n\n\n---\nPage: ${page}`;
+		mailto.href = `${url.protocol}${url.pathname}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+	}
+
+	function setStatus(text: string, clearAfterMs = 0) {
+		if (!status) return;
+		window.clearTimeout(timer);
+		status.textContent = text;
+		if (clearAfterMs) timer = window.setTimeout(() => (status.textContent = ''), clearAfterMs);
+	}
+
+	function selectAddress() {
+		if (!address) return;
+		const range = document.createRange();
+		range.selectNodeContents(address);
+		const selection = window.getSelection();
+		selection?.removeAllRanges();
+		selection?.addRange(range);
+	}
+
+	copy?.addEventListener('click', async () => {
+		const text = address?.textContent?.trim() ?? '';
+		try {
+			if (!navigator.clipboard?.writeText) throw new Error('no clipboard');
+			await navigator.clipboard.writeText(text);
+			setStatus('Copied', 2000);
+		} catch {
+			selectAddress();
+			setStatus('Select the address above to copy it');
+		}
+	});
+
+	// Move focus into the panel on open. On close the browser returns it to the
+	// button for Escape and Close; after a click elsewhere it stays where the
+	// click put it.
+	panel?.addEventListener('toggle', (event) => {
+		if ((event as ToggleEvent).newState === 'open') {
+			panel.querySelector<HTMLElement>('.contact-primary')?.focus();
+		} else {
+			setStatus('');
+		}
+	});
+</script>
+
+<style is:global>
+	.contact-fab {
+		position: fixed;
+		z-index: 4; /* above page content, below Starlight's mobile menu (5) and navbar (10) */
+		right: calc(1rem + env(safe-area-inset-right, 0px));
+		bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		gap: 0.5rem;
+		min-width: 44px;
+		min-height: 44px;
+		padding: 0 1rem;
+		border: 1px solid var(--sl-color-accent);
+		border-radius: 999px;
+		background: var(--sl-color-accent);
+		color: #fff;
+		font: inherit;
+		font-size: var(--sl-text-sm);
+		font-weight: 600;
+		cursor: pointer;
+		box-shadow: var(--sl-shadow-md, 0 4px 14px rgb(0 0 0 / 0.25));
+	}
+	.contact-fab:hover {
+		filter: brightness(1.1);
+	}
+	.contact-fab:focus-visible,
+	.contact-action:focus-visible {
+		outline: 2px solid var(--sl-color-white);
+		outline-offset: 2px;
+	}
+
+	.contact-panel {
+		position: fixed;
+		inset: auto;
+		right: calc(1rem + env(safe-area-inset-right, 0px));
+		bottom: calc(1rem + 44px + 0.5rem + env(safe-area-inset-bottom, 0px));
+		margin: 0;
+		box-sizing: border-box;
+		width: min(20rem, calc(100vw - 2rem));
+		max-height: calc(100dvh - 6rem);
+		overflow-y: auto;
+		padding: 1rem;
+		border: 1px solid var(--sl-color-hairline);
+		border-radius: 0.75rem;
+		background: var(--sl-color-bg-nav);
+		color: var(--sl-color-text);
+		box-shadow: var(--sl-shadow-md, 0 8px 28px rgb(0 0 0 / 0.3));
+	}
+	.contact-panel h2 {
+		margin: 0 0 0.75rem;
+		font-size: var(--sl-text-lg);
+		color: var(--sl-color-white);
+	}
+	.contact-actions {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+	}
+	.contact-action {
+		display: block;
+		box-sizing: border-box;
+		width: 100%;
+		min-height: 2.5rem;
+		padding: 0.5rem 0.75rem;
+		border: 1px solid var(--sl-color-gray-4);
+		border-radius: 0.5rem;
+		background: transparent;
+		color: var(--sl-color-text);
+		font: inherit;
+		font-size: var(--sl-text-sm);
+		text-align: center;
+		text-decoration: none;
+		cursor: pointer;
+	}
+	.contact-action:hover {
+		border-color: var(--sl-color-accent);
+		color: var(--sl-color-white);
+	}
+	.contact-primary {
+		border-color: var(--sl-color-accent);
+		background: var(--sl-color-accent);
+		color: #fff;
+	}
+	.contact-primary:hover {
+		color: #fff;
+		filter: brightness(1.1);
+	}
+	.contact-address {
+		margin: 0.75rem 0 0;
+		font-size: var(--sl-text-sm);
+		overflow-wrap: anywhere;
+		user-select: all;
+		text-align: center;
+	}
+	.contact-status {
+		min-height: 1.25rem;
+		margin: 0.25rem 0 0.5rem;
+		font-size: var(--sl-text-xs);
+		color: var(--sl-color-gray-2);
+		text-align: center;
+	}
+	.contact-close {
+		min-height: 2.25rem;
+	}
+
+	/* Round icon on small screens; the aria-label carries the name. */
+	@media (max-width: 30rem) {
+		.contact-fab {
+			width: 44px;
+			padding: 0;
+		}
+		.contact-label {
+			position: absolute;
+			width: 1px;
+			height: 1px;
+			overflow: hidden;
+			clip-path: inset(50%);
+			white-space: nowrap;
+		}
+	}
+
+	/* Keep the last content row and the pagination clear of the button. */
+	.main-frame {
+		padding-bottom: calc(4.5rem + env(safe-area-inset-bottom, 0px));
+	}
+
+	@media print {
+		.contact-fab,
+		.contact-panel {
+			display: none !important;
+		}
+	}
+
+	/* No Popover API: the panel could not be closed, so leave the button out. */
+	@supports not selector(:popover-open) {
+		.contact-fab,
+		.contact-panel {
+			display: none !important;
+		}
+	}
+</style>

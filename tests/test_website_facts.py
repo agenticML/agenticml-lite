@@ -303,3 +303,22 @@ def test_deploy_on_aws_page_has_the_key_facts():
     missing = [needle for needle in needles if needle not in text]
     assert not missing, f'{page} does not mention {missing}'
     assert not _login_key_examples(text), _login_key_examples(text)
+
+
+def test_contact_address_is_the_same_everywhere():
+    """Protects the Contact us button: the address in the server default, the docs
+    site button, the hosted template and the Terms page must be one address."""
+    import yaml
+    from agenticml.server.webauth import DEFAULT_CONTACT_EMAIL
+    from test_deploy_cloudformation import CfnLoader
+
+    terms = re.search(r'\[(\S+@\S+?)\]\(mailto:', _text('legal/terms.md'))
+    assert terms, 'legal/terms.md has no mailto contact link'
+    address = terms.group(1)
+    button = (ROOT / 'website/src/components/ContactButton.astro').read_text(encoding='utf-8')
+    constant = re.search(r"CONTACT_EMAIL = '([^']+)'", button)
+    assert constant, 'ContactButton.astro has no CONTACT_EMAIL constant'
+    hosted = yaml.load((ROOT / 'deploy/aws/cloudformation/hosted.yaml').read_text(), Loader=CfnLoader)
+    assert DEFAULT_CONTACT_EMAIL == address
+    assert constant.group(1) == address
+    assert hosted['Parameters']['ContactEmail']['Default'] == address

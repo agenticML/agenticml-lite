@@ -1,6 +1,9 @@
 // Checks every built page for horizontal overflow at 375px, light and dark.
 // Also checks that the home page and the Python SDK guide carry the banner
 // text and a link to the hosted sign-in (package 29.8).
+// Also checks the Contact us button (package 37.1): every page has it, and on
+// the home page and the Python SDK guide the open panel causes no overflow in
+// either theme and its mailto: link carries the address and the page title.
 //
 // Run after `npm run build`: npm run check:overflow
 import { createServer } from 'node:http';
@@ -18,6 +21,8 @@ const THEMES = ['light', 'dark'];
 const BANNER_TEXT = 'Hosted service in public preview.';
 const SIGN_IN_URL = 'https://app.agenticml.xyz';
 const BANNER_PAGES = [`${BASE}/`, `${BASE}/guides/python-sdk/`];
+const CONTACT_EMAIL = 'contact@agenticml.xyz';
+const CONTACT_PAGES = [...BANNER_PAGES, `${BASE}/404.html`];
 
 const TYPES = {
 	'.html': 'text/html; charset=utf-8',
@@ -93,6 +98,55 @@ async function sitemapPaths() {
 	return [...paths].sort();
 }
 
+async function checkContactPanel(page, path, theme) {
+	const button = page.locator('button#contact-button');
+	const panel = page.locator('#contact-panel');
+	await button.click();
+	if (!(await panel.isVisible())) {
+		problems.push(`${path} (${theme}): contact panel did not open`);
+		return;
+	}
+	const open = await page.evaluate(() => {
+		const box = document.getElementById('contact-panel').getBoundingClientRect();
+		return { scrollWidth: document.documentElement.scrollWidth, left: box.left, right: box.right };
+	});
+	if (open.scrollWidth > WIDTH) {
+		problems.push(`${path} (${theme}): contact panel open, scrollWidth ${open.scrollWidth} > ${WIDTH}`);
+	}
+	if (open.left < 0 || open.right > WIDTH) {
+		problems.push(`${path} (${theme}): contact panel outside the viewport (${open.left}..${open.right})`);
+	}
+	if (theme === THEMES[0]) {
+		const href = await page.locator('#contact-panel a[href^="mailto:"]').getAttribute('href');
+		const url = new URL(href ?? 'mailto:');
+		const title = await page.evaluate(() => document.querySelector('h1')?.textContent?.trim() ?? '');
+		const subject = url.searchParams.get('subject') ?? '';
+		const body = url.searchParams.get('body') ?? '';
+		if (decodeURIComponent(url.pathname) !== CONTACT_EMAIL) {
+			problems.push(`${path}: mailto address is "${url.pathname}", expected ${CONTACT_EMAIL}`);
+		}
+		if (!subject.startsWith('agenticml docs: ') || (title && !subject.includes(title))) {
+			problems.push(`${path}: mailto subject "${subject}" lacks the page title "${title}"`);
+		}
+		// The 404 page fills in its Page line from location, so it names the local origin here.
+		const origin = path.endsWith('/404.html') ? await page.evaluate(() => location.origin) : SITE_ORIGIN;
+		if (!body.includes(`Page: ${origin}${path}`)) {
+			problems.push(`${path}: mailto body lacks the page URL: "${body}"`);
+		}
+		for (const label of ['Write an email', 'Copy address', 'Ask on GitHub', 'Report a bug']) {
+			if ((await panel.getByText(label, { exact: true }).count()) !== 1) {
+				problems.push(`${path}: contact panel action "${label}" missing`);
+			}
+		}
+	}
+	await page.keyboard.press('Escape');
+	if (await panel.isVisible()) problems.push(`${path} (${theme}): contact panel did not close on Escape`);
+	const focused = await page.evaluate(() => document.activeElement?.id);
+	if (focused !== 'contact-button') {
+		problems.push(`${path} (${theme}): focus did not return to the Contact us button (on "${focused}")`);
+	}
+}
+
 const server = await startServer();
 const origin = `http://127.0.0.1:${server.address().port}`;
 const browser = await chromium.launch();
@@ -130,6 +184,10 @@ try {
 			if (result.scrollWidth > WIDTH) {
 				problems.push(`${path} (${theme}): scrollWidth ${result.scrollWidth} > ${WIDTH}`);
 			}
+			if (theme === THEMES[0] && (await page.locator('button#contact-button').count()) !== 1) {
+				problems.push(`${path}: Contact us button missing`);
+			}
+			if (CONTACT_PAGES.includes(path)) await checkContactPanel(page, path, theme);
 			if (theme === THEMES[0] && BANNER_PAGES.includes(path)) {
 				const banner = await page.evaluate(
 					([text, url]) => ({

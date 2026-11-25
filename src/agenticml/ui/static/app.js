@@ -609,6 +609,94 @@ async function signOut() {
   }
   location.assign(target);
 }
+// The Contact us / Feedback button. Nothing is sent from here: the link only
+// opens the visitor's own email app with a draft they read before sending.
+function setupContact(contact, version) {
+  if (!contact || typeof contact !== "object" || typeof contact.email !== "string" || !contact.email)
+    return;
+  const address = contact.email;
+  const projectMode = contact.default === true;
+  const fab = document.querySelector("#contact");
+  const panel = document.querySelector("#contact-panel");
+  const mail = document.querySelector("#contact-mail");
+  const copy = document.querySelector("#contact-copy");
+  const status = document.querySelector("#contact-status");
+  const label = projectMode ? "Feedback" : "Contact us";
+  document.querySelector("#contact-label").textContent = label;
+  fab.setAttribute("aria-label", label);
+  document.querySelector("#contact-title").textContent = projectMode
+    ? "Feedback to the agenticml-lite team"
+    : "Contact us";
+  const note = document.querySelector("#contact-note");
+  note.textContent = projectMode
+    ? "This writes to the people who make agenticml-lite, not to your server admin. For access or account problems, ask your server admin."
+    : "";
+  note.hidden = !projectMode;
+  document.querySelector("#contact-address").textContent = address;
+  const versionLine =
+    typeof version === "string" && version ? `Server: agenticml-lite ${version}` : "";
+  const draft = () => {
+    const slug = isAdminPath() ? null : currentWorkspaceSlug();
+    const lines = ["", "", "---"];
+    let subject = "agenticml (self-hosted): feedback";
+    if (!projectMode) {
+      subject = `agenticml: ${isAdminPath() ? "admin" : slug || "dashboard"}`;
+      lines.push(`Page: ${location.pathname}${location.hash}`);
+      if (slug) lines.push(`Workspace: ${slug}`);
+    }
+    if (versionLine) lines.push(versionLine);
+    return `mailto:${address}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(lines.join("\n"))}`;
+  };
+  let statusTimer = 0;
+  const refresh = () => {
+    mail.href = draft();
+    clearTimeout(statusTimer);
+    status.textContent = "";
+  };
+  refresh();
+  panel.addEventListener("beforetoggle", (event) => {
+    if (event.newState === "open") refresh();
+  });
+  // Back/Forward changes the route without closing the open panel; keep the
+  // draft naming the page the user is on.
+  addEventListener("hashchange", () => {
+    if (panel.matches(":popover-open")) mail.href = draft();
+  });
+  panel.addEventListener("toggle", (event) => {
+    // On close the browser returns focus to the button for Escape and Close;
+    // after a click elsewhere on the page, focus stays where the click put it.
+    if (event.newState === "open") mail.focus();
+  });
+  const selectAddress = () => {
+    const range = document.createRange();
+    range.selectNodeContents(document.querySelector("#contact-address"));
+    const selection = getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  };
+  // The status region stays rendered. Clearing it first and setting the text on
+  // the next tick makes a screen reader announce a repeated "Copied" too.
+  const say = (text, ms) => {
+    clearTimeout(statusTimer);
+    status.textContent = "";
+    statusTimer = setTimeout(() => {
+      status.textContent = text;
+      if (ms) statusTimer = setTimeout(() => (status.textContent = ""), ms);
+    }, 50);
+  };
+  copy.onclick = async () => {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("no clipboard");
+      await navigator.clipboard.writeText(address);
+      say("Copied", 2000);
+    } catch {
+      selectAddress();
+      say("Select the address above to copy it");
+    }
+  };
+  document.body.classList.add("has-contact");
+  fab.hidden = false;
+}
 const sessionReady = fetch(api("/account/session"), { credentials: "same-origin" })
   .then(async (response) => {
     let data = null;
@@ -644,6 +732,7 @@ const sessionReady = fetch(api("/account/session"), { credentials: "same-origin"
     signOutButton.onclick = signOut;
     account.onclick = () => openAccountDialog();
     loadUsageBanner();
+    setupContact(data.contact, data.version);
   })
   .catch(() => {});
 document.querySelector("#close-lightbox").onclick = () =>

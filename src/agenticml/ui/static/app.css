@@ -4381,3 +4381,127 @@ pre,
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* Contact us / Feedback: a floating button that opens a native popover with a
+   mailto: link (nothing is sent from the page). */
+body.has-contact #app {
+  padding-bottom: calc(var(--s-7) + 44px + env(safe-area-inset-bottom, 0px));
+}
+.contact-fab {
+  position: fixed;
+  right: max(var(--s-4), env(safe-area-inset-right, 0px));
+  bottom: calc(var(--s-4) + env(safe-area-inset-bottom, 0px));
+  z-index: 30;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 var(--s-4);
+  font-family: inherit;
+  font-size: var(--fs-md);
+  font-weight: 500;
+  line-height: 1;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-pill);
+  box-shadow: var(--shadow-2);
+  cursor: pointer;
+  touch-action: manipulation;
+  transition:
+    background var(--dur) var(--ease),
+    border-color var(--dur) var(--ease);
+}
+.contact-fab:hover {
+  background: var(--surface-3);
+  border-color: var(--text-4);
+}
+.contact-fab-icon {
+  flex: none;
+}
+.contact-panel {
+  position: fixed;
+  inset: auto;
+  right: max(var(--s-4), env(safe-area-inset-right, 0px));
+  bottom: calc(var(--s-4) + 44px + var(--s-2) + env(safe-area-inset-bottom, 0px));
+  width: min(340px, calc(100vw - 2 * var(--s-4)));
+  max-height: calc(100vh - 2 * var(--s-4) - 44px - var(--s-2));
+  max-height: calc(100dvh - 2 * var(--s-4) - 44px - var(--s-2));
+  margin: 0;
+  padding: var(--s-4);
+  overflow: auto;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r);
+  box-shadow: var(--shadow-2);
+}
+.contact-panel:popover-open {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+}
+.contact-title {
+  margin: 0;
+  font-size: var(--fs-xl);
+  font-weight: 600;
+}
+.contact-note,
+.contact-status {
+  margin: 0;
+  font-size: var(--fs-md);
+  line-height: 1.5;
+  color: var(--text-3);
+}
+.contact-status:empty {
+  /* Stays in the accessibility tree so a screen reader announces new text. */
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+.contact-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+}
+.contact-actions .btn {
+  text-decoration: none;
+}
+.contact-address {
+  margin: 0;
+  font: var(--fs-sm) var(--font-mono-stack);
+  color: var(--text-2);
+  word-spacing: normal;
+  user-select: all;
+}
+.contact-close {
+  align-self: flex-end;
+}
+@media (max-width: 480px) {
+  .contact-fab {
+    padding: 0;
+    width: 44px;
+  }
+  .contact-fab-label {
+    display: none;
+  }
+}
+@media print {
+  .contact-fab,
+  .contact-panel {
+    display: none !important;
+  }
+}
+/* No Popover API (older Safari, Firefox before 125): the panel could not be
+   closed and would always show, so leave the button out. */
+@supports not selector(:popover-open) {
+  .contact-fab,
+  .contact-panel {
+    display: none !important;
+  }
+}

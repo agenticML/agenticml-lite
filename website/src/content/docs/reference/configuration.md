@@ -60,6 +60,7 @@ Read by `agenticml server serve` and `agenticml server up`. The full list, with 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `AGENTICML_SERVER_ADMIN_EMAILS` | unset | Comma-separated emails granted server admin at their next verified Firebase sign-in. Same as `--admin-emails`. Ignored without Firebase. |
+| `AGENTICML_SERVER_CONTACT_EMAIL` | unset | Where the dashboard's contact button writes: unset shows a Feedback button to the agenticml-lite team, an address shows Contact us for that address, `off` shows no button. Same as `--contact-email`. Read only by `agenticml server serve`; `agenticml server up` ignores it and always shows the Feedback button. |
 | `AGENTICML_SERVER_DB_CONNECTIONS` | unset (`89`) | Most Postgres connections one server process opens (8 to 1000). Same as `--db-connections` (only `agenticml server serve`). Ignored with SQLite. |
 | `AGENTICML_SERVER_METRICS` | `off` | Capacity metrics mode: `off` or `cloudwatch`. Same as `--metrics` (only `agenticml server serve`). |
 | `AGENTICML_SERVER_S3_ENDPOINT_URL` | unset | Custom S3 endpoint, for MinIO, LocalStack or a VPC endpoint. |

@@ -100,6 +100,27 @@ sudo systemctl status agenticml-server
 sudo journalctl -u agenticml-server -f
 ```
 
+## Contact and feedback button
+
+Every dashboard of `agenticml server` shows a floating button after sign-in. It opens a small panel with **Write an email** (opens your email app with the address, a subject and a short draft filled in) and **Copy address**. The page sends nothing: your email app sends the mail when you press Send, and no agenticml server handles it. The dashboard loads no third-party code for it. The local `agenticml ui` shows no button.
+
+What the button does depends on `--contact-email` (see the options table). Only `agenticml server serve` reads it (and the environment variable). `agenticml server up` ignores both and always shows the **Feedback** button below; it cannot set an address or turn the button off yet.
+
+- **Not set (the default).** The button is **Feedback** and writes to the agenticml-lite team at `contact@agenticml.xyz`. The panel says so: it does not reach your server admin. The draft holds only the server version. It never names your workspaces or pages.
+- **An address.** The button is **Contact us** and writes to that address, for example your lab's help desk. The draft also holds the page and workspace the user was on and the server version. The workspace picker gets a Contact us link, and so does the Firebase sign-in page.
+- **`off`.** No button and no links.
+
+```bash
+# Contact us goes to your own address
+agenticml server serve --contact-email help@lab.example.org ...
+# or: AGENTICML_SERVER_CONTACT_EMAIL=help@lab.example.org
+
+# No button at all
+agenticml server serve --contact-email off ...
+```
+
+The hosted service (`app.agenticml.xyz`) sets `contact@agenticml.xyz` through the `ContactEmail` stack parameter, so it runs with a **Contact us** button.
+
 ## Private network (no Tailscale)
 
 Run the server and dashboard inside a private VPC or lab network without Tailscale or internet connectivity. All traffic starts inside the network, terminated by a local TLS reverse proxy with an internal certificate.
@@ -723,6 +744,7 @@ Sync clients on version 2.2 continue to sync to a 3.0 server without modificatio
 | `--metrics MODE` | `AGENTICML_SERVER_METRICS` | `off` | Capacity metrics mode: `off` or `cloudwatch`. Flag wins over env; blank counts as unset. Any other value refuses to start. Only `server serve` has it. |
 | `--admin-emails LIST` | `AGENTICML_SERVER_ADMIN_EMAILS` | unset | Comma-separated emails granted server admin on verified Firebase or OIDC sign-in. Ignored without Firebase or OIDC. |
 | `--legal-base-url URL` | `AGENTICML_SERVER_LEGAL_BASE_URL` | unset | `https://` base URL of your Terms, Acceptable use and Privacy pages (`terms/`, `acceptable-use/`, `privacy/` under it). With Firebase on, the sign-in page (`/login` and `/invite`) then shows "By continuing you agree to the Terms and the Acceptable use policy. See the Privacy policy." with those links. A non-`https://` value stops the server at startup. Ignored without Firebase. Not set means no links. |
+| `--contact-email ADDRESS\|off` | `AGENTICML_SERVER_CONTACT_EMAIL` | unset | Where the dashboard's contact button writes. Unset or empty shows a **Feedback** button that writes to the agenticml-lite team (`contact@agenticml.xyz`). An address (a plain address such as `name@example.com`: the part before `@` uses letters, digits and `. _ + -`; the domain uses letters, digits, `.` and `-` and needs at least one dot) shows a **Contact us** button that writes to that address, adds a Contact us link to the workspace picker and, with Firebase on, a "Questions? Contact us" link to the sign-in page. `off` (any case) shows no button and no links. Flag wins over the environment. Any other value stops the server at startup. Only `server serve` has it; `server up` ignores it and always shows the Feedback button. |
 | `--open-signup` | `AGENTICML_SERVER_OPEN_SIGNUP` | off | Allow verified Firebase or OIDC sign-in to create an account and personal workspace. A verified account with no workspace gets one at sign-in (once; an admin-deleted sign-up workspace is not recreated). |
 | `--min-client-version X.Y` | `AGENTICML_SERVER_MIN_CLIENT_VERSION` | `2.2` | Reject `agenticml-lite` clients older than `X.Y` on `/v2` requests with HTTP 426. Values below `2.2` are unsupported: 2.0 and 2.1 clients misreport their own runs as foreign. |
 

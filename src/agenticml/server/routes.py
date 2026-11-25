@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
+from urllib.parse import quote
 
 from .access import WorkspaceNotFound, bind_dashboard
 from .users import allowed
@@ -420,6 +421,12 @@ def _workspaces_page(webauth, handler, route, match):
     admin_link = (
         '<a class="btn btn-ghost btn-sm" href="/admin/">Admin</a>'
         if getattr(handler.principal, "server_admin", False) else "")
+    contact = webauth.contact
+    contact_link = (
+        '<a class="btn btn-ghost btn-sm" href="mailto:{address}?subject={subject}">Contact us</a>'.format(
+            address=html_escape(contact[0], quote=True),
+            subject=quote("agenticml: workspaces", safe=""))
+        if contact is not None and not contact[1] else "")
     # An identity proxy owns the sign-in, so its sessions get the label only.
     can_sign_out = handler.principal.via != "proxy"
     session_box = (
@@ -442,7 +449,7 @@ def _workspaces_page(webauth, handler, route, match):
         "<body class=\"picker-page\">"
         "<header class=\"topbar\">"
         "<a href=\"/workspaces\" class=\"breadcrumb\">agenticml / workspaces</a>"
-        + admin_link + session_box +
+        + admin_link + contact_link + session_box +
         "</header>"
         "<main id=\"app\"><div class=\"workspace stack\">"
         "<div class=\"heading\"><h1>Workspaces</h1></div>"

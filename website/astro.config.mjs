@@ -22,7 +22,10 @@ export default defineConfig({
 				baseUrl: 'https://github.com/agenticML/agenticml-lite/edit/dev/website/',
 			},
 			routeMiddleware: './src/routeData.ts',
-			components: { SocialIcons: './src/components/SocialIcons.astro' },
+			components: {
+				SocialIcons: './src/components/SocialIcons.astro',
+				PageFrame: './src/components/PageFrame.astro',
+			},
 			lastUpdated: true,
 			customCss: ['./src/styles/custom.css'],
 			sidebar: [

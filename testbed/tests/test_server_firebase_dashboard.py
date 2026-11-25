@@ -1152,3 +1152,66 @@ def test_settings_account_card_has_no_password_form_with_firebase(page, firebase
     expect(identity.locator("div").filter(has_text="Sign-in").locator("dd")).to_have_text("firebase")
     expect(card.get_by_text("Change password")).to_have_count(0)
     expect(card.get_by_label("New password", exact=True)).to_have_count(0)
+
+
+CONTACT_EMAIL = "help@lab.example.org"
+
+
+@pytest.mark.parametrize("path", ["/login", "/invite?token=x"])
+def test_firebase_sign_in_shows_contact_link_in_operator_mode(page, tmp_path, monkeypatch, path):
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    stub_vendor(page)
+    for server in _serve_firebase(tmp_path, contact_email=CONTACT_EMAIL):
+        page.goto(f"{server['url']}{path}")
+        contact = page.locator("#contact")
+        expect(contact).to_be_visible()
+        expect(contact).to_have_text("Questions? Contact us")
+        link = contact.get_by_role("link", name="Contact us", exact=True)
+        expect(link).to_have_attribute(
+            "href", f"mailto:{CONTACT_EMAIL}?subject=agenticml%3A%20sign-in")
+        # Shown even though no legal links are set.
+        expect(page.locator("#legal")).to_be_hidden()
+
+
+def test_firebase_sign_in_contact_link_beside_policy_links(page, tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    stub_vendor(page)
+    for server in _serve_firebase(tmp_path, contact_email=CONTACT_EMAIL, legal_base_url=LEGAL_BASE):
+        page.goto(f"{server['url']}/login")
+        expect(page.locator("#legal")).to_have_text(LEGAL_TEXT)
+        expect(page.locator("#contact")).to_have_text("Questions? Contact us")
+
+
+@pytest.mark.parametrize("contact", [None, "", "off"])
+def test_firebase_sign_in_has_no_contact_link_otherwise(page, tmp_path, monkeypatch, contact):
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    stub_vendor(page)
+    for server in _serve_firebase(tmp_path, contact_email=contact):
+        page.goto(f"{server['url']}/login")
+        expect(page.get_by_role("button", name="Continue with Google", exact=True)).to_be_visible()
+        expect(page.locator("#contact")).to_be_hidden()
+        expect(page.locator("#contact a")).to_have_count(0)
+
+
+def test_firebase_contact_link_ignores_a_bad_address_from_the_config(page, firebase_ui):
+    stub_vendor(page)
+    page.route(
+        re.compile(r"/auth/firebase/config$"),
+        json_auth(200, {
+            "projectId": "demo-project", "apiKey": "k", "authDomain": "demo-project.firebaseapp.com",
+            "contact_email": "a@x.org?cc=b@y.org"}))
+    page.goto(f"{firebase_ui['url']}/login")
+    expect(page.get_by_role("button", name="Continue with Google", exact=True)).to_be_visible()
+    expect(page.locator("#contact")).to_be_hidden()
+
+
+@pytest.mark.parametrize("scheme", ["light", "dark"])
+def test_firebase_contact_link_no_overflow_at_375(page, tmp_path, monkeypatch, scheme):
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    stub_vendor(page)
+    page.emulate_media(color_scheme=scheme)
+    page.set_viewport_size({"width": 375, "height": 812})
+    for server in _serve_firebase(tmp_path, contact_email=CONTACT_EMAIL, legal_base_url=LEGAL_BASE):
+        page.goto(f"{server['url']}/login")
+        expect(page.locator("#contact")).to_be_visible()
+        assert_no_overflow(page)

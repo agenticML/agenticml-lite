@@ -190,6 +190,19 @@ The task count is no longer a variable: it comes from the deploy workflow's
 `desired_count` and `max_task_count` inputs (see First deploy and Operations and
 scaling). Delete `HOSTED_DESIRED_COUNT` if it is already set; nothing reads it.
 
+The dashboard's Contact us button writes to the stack parameter `ContactEmail`
+(server setting `AGENTICML_SERVER_CONTACT_EMAIL`), which defaults to
+`contact@agenticml.xyz`. It has no GitHub variable: the deploy workflow does
+not pass it, so the default applies when the stack first gets the parameter.
+After that the stack keeps its stored value: `aws cloudformation deploy`
+reuses the previous value of any parameter it is not given, so editing the
+default in `hosted.yaml` later changes nothing on an existing stack. The button
+only opens the visitor's email app; nothing is sent by the page. To change the
+address (or `off` for no button) on an existing stack, update the stack
+parameter itself: run `aws cloudformation deploy ... --parameter-overrides
+ContactEmail=ADDRESS` with the other parameters unchanged, or change
+`ContactEmail` in the CloudFormation console and keep the other values.
+
 | Secret | Value | Default |
 | --- | --- | --- |
 | `HOSTED_ADMIN_EMAILS` | Comma-separated admin emails (no spaces; empty = none) | (empty) |

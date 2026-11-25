@@ -27,6 +27,7 @@ from agenticml.ui.server import (
     _reject_nonfinite,
     _reset_request_workspace,
 )
+from agenticml import __version__
 from . import keyspage
 from .db import DatabaseError
 from .oidc import CALLBACK_PATH, START_PATH
@@ -446,6 +447,29 @@ def normalize_legal_base_url(value):
     return value if value.endswith("/") else value + "/"
 
 
+# The mailbox of the agenticml-lite team (the address the Terms and Privacy pages
+# publish). A server with no ``--contact-email`` offers it as a Feedback button.
+DEFAULT_CONTACT_EMAIL = "contact@agenticml.xyz"
+# One plain address: no ``?cc=`` or ``&bcc=`` can ride along in a mailto: link.
+_CONTACT_EMAIL = re.compile(r"[A-Za-z0-9._+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z0-9-]+")
+
+
+def resolve_contact_email(value):
+    """Return ``None`` (off) or ``(address, is_default)`` for ``--contact-email``.
+
+    Unset or blank means the project default; ``off`` (any case) turns the button
+    off; anything else must be a plain ``local@domain.tld`` address, else ValueError.
+    """
+    value = (value or "").strip(" \t")
+    if not value:
+        return (DEFAULT_CONTACT_EMAIL, True)
+    if value.lower() == "off":
+        return None
+    if len(value) > 254 or not _CONTACT_EMAIL.fullmatch(value):
+        raise ValueError("--contact-email must be a plain address like name@example.com, or off")
+    return (value, False)
+
+
 # Page text for the answers of ``_external_sign_in`` (keyed by reason or error).
 _OIDC_MESSAGES = {
     "sign_in_failed": "Sign-in failed. Try again.",
@@ -470,7 +494,7 @@ class WebAuth:
                  users=None, trusted_proxies=(), identity_header=None,
                  firebase=None, cert_source=None, plans=None, open_signup=False,
                  admin_emails=frozenset(), legal_base_url=None, oidc=None,
-                 signup_email_domains=frozenset(), oidc_provider=None):
+                 signup_email_domains=frozenset(), oidc_provider=None, contact_email=None):
         self.keys = keys
         self.users = users if users is not None else UserStore(keys.server_dir, db=keys.db, workspace_id=keys.workspace_id or '0' * 32)
         self.public_url = public_url
@@ -497,6 +521,7 @@ class WebAuth:
         if self.legal_base_url and self.firebase is None:
             logger.warning("--legal-base-url is ignored without --firebase-project")
             self.legal_base_url = None
+        self.contact = resolve_contact_email(contact_email)
         if self.firebase is not None:
             from .firebase import FIREBASE_EXTRA, FIREBASE_IDENTITY, firebase_available
             if self.identity_header is not None:
@@ -1224,6 +1249,8 @@ class WebAuth:
                 "acceptable_use": self.legal_base_url + "acceptable-use/",
                 "privacy": self.legal_base_url + "privacy/",
             }
+        if self.contact is not None and not self.contact[1]:
+            config["contact_email"] = self.contact[0]
         handler._json(config, headers=self._headers())
 
     def _firebase_auth(self, handler):
@@ -2113,6 +2140,9 @@ class WebAuth:
             "workspaces": self._account_workspaces(handler),
             "server_admin": bool(principal.server_admin),
             "open_signup": bool(self.open_signup),
+            "contact": (None if self.contact is None
+                        else {"email": self.contact[0], "default": self.contact[1]}),
+            "version": __version__,
         }
 
     def _session_info(self, handler):
