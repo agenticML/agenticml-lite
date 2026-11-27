@@ -1215,3 +1215,265 @@ def test_firebase_contact_link_no_overflow_at_375(page, tmp_path, monkeypatch, s
         page.goto(f"{server['url']}/login")
         expect(page.locator("#contact")).to_be_visible()
         assert_no_overflow(page)
+
+
+# --- Package 40: the blog on the sign-in page -----------------------------------------
+#
+# The page reads the blog's RSS feed in the visitor's browser. Every feed here is
+# served with page.route, so no test touches the network.
+
+BLOG_URL = "https://blog.example.test/blog/"
+BLOG_FEED = BLOG_URL + "rss.xml"
+FIRST_POST = BLOG_URL + "first-post/"
+
+
+def rss_item(title, link, date="Tue, 25 Nov 2026 09:30:00 GMT"):
+    date_tag = f"<pubDate>{date}</pubDate>" if date else ""
+    return f"<item><title>{title}</title><link>{link}</link>{date_tag}</item>"
+
+
+def rss_feed(*items):
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel>'
+        "<title>Blog</title>" + "".join(items) + "</channel></rss>")
+
+
+GOOD_FEED = rss_feed(
+    rss_item("Hello, agenticml", FIRST_POST),
+    rss_item("An older post", BLOG_URL + "older-post/", "Mon, 03 Nov 2026 09:30:00 GMT"))
+
+
+def stub_blog(page, body, status=200, content_type="application/rss+xml; charset=utf-8"):
+    """Serve the feed (with the CORS header the real host sends); returns the request log."""
+    hits = []
+
+    def on_feed(route):
+        hits.append(route.request.url)
+        route.fulfill(
+            status=status, content_type=content_type, body=body,
+            headers={"Access-Control-Allow-Origin": "*"})
+
+    page.route(BLOG_FEED, on_feed)
+    return hits
+
+
+def assert_blog_link_only(page):
+    """The feed gave nothing usable: no card, but the Blog link and sign-in still work."""
+    expect(page.locator("#blog")).to_be_visible()
+    expect(page.locator("#blog a")).to_have_attribute("href", BLOG_URL)
+    expect(page.locator("#blog-card")).to_be_hidden()
+    expect(page.get_by_role("button", name="Continue with Google", exact=True)).to_be_visible()
+    expect(page.locator("#submit")).to_be_enabled()
+    assert len(fake_calls(page)["initializeApp"]) == 1
+
+
+@pytest.mark.parametrize("path", ["/login", "/invite?token=x"])
+def test_blog_card_shows_the_newest_post(page, tmp_path, monkeypatch, path):
+    """The card shows the first item's title, date and link, and the Blog link shows too."""
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    stub_vendor(page)
+    hits = stub_blog(page, GOOD_FEED)
+    for server in _serve_firebase(tmp_path, blog_url=BLOG_URL):
+        page.goto(f"{server['url']}{path}")
+        card = page.locator("#blog-card")
+        expect(card).to_be_visible()
+        expect(card.locator(".auth-blog-heading")).to_have_text("From the blog")
+        title = card.get_by_role("link", name="Hello, agenticml", exact=True)
+        expect(title).to_have_attribute("href", FIRST_POST)
+        expect(card.locator(".auth-blog-date")).to_have_text("Nov 25, 2026")
+        expect(card.get_by_role("link", name="All posts", exact=True)).to_have_attribute(
+            "href", BLOG_URL)
+        expect(card.get_by_text("An older post")).to_have_count(0)
+        blog = page.locator("#blog")
+        expect(blog).to_be_visible()
+        expect(blog).to_have_text("Blog")
+        expect(blog.locator("a")).to_have_attribute("href", BLOG_URL)
+        # Both tabs keep them.
+        page.get_by_role("tab", name="Sign up", exact=True).click()
+        expect(card).to_be_visible()
+        expect(blog).to_be_visible()
+    assert hits == [BLOG_FEED]
+
+
+def test_blog_feed_is_fetched_without_credentials_or_referrer(page, tmp_path, monkeypatch):
+    """The feed request carries no cookie and no referrer."""
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    stub_vendor(page)
+    seen = []
+
+    def on_feed(route):
+        seen.append(route.request.headers)
+        route.fulfill(
+            status=200, content_type="application/rss+xml", body=GOOD_FEED,
+            headers={"Access-Control-Allow-Origin": "*"})
+
+    page.route(BLOG_FEED, on_feed)
+    for server in _serve_firebase(tmp_path, blog_url=BLOG_URL):
+        page.goto(f"{server['url']}/login")
+        expect(page.locator("#blog-card")).to_be_visible()
+    assert len(seen) == 1
+    assert "cookie" not in seen[0]
+    assert "referer" not in seen[0]
+
+
+def test_blog_card_is_hidden_without_the_option(page, firebase_ui):
+    """Without --blog-url there is no card, no Blog link and no feed request."""
+    stub_vendor(page)
+    hits = stub_blog(page, GOOD_FEED)
+    page.goto(f"{firebase_ui['url']}/login")
+    expect(page.get_by_role("button", name="Continue with Google", exact=True)).to_be_visible()
+    page.wait_for_timeout(200)
+    expect(page.locator("#blog-card")).to_be_hidden()
+    expect(page.locator("#blog")).to_be_hidden()
+    expect(page.locator("#blog a, #blog-card a")).to_have_count(0)
+    assert hits == []
+
+
+def test_blog_ignores_non_https_urls_from_the_config(page, firebase_ui):
+    """A config with a bad blog URL or feed shows nothing and requests nothing."""
+    stub_vendor(page)
+    hits = stub_blog(page, GOOD_FEED)
+    page.route(
+        re.compile(r"/auth/firebase/config$"),
+        json_auth(200, {
+            "projectId": "demo-project", "apiKey": "k", "authDomain": "demo-project.firebaseapp.com",
+            "blog": {"url": "javascript:alert(1)", "feed": BLOG_FEED}}))
+    page.goto(f"{firebase_ui['url']}/login")
+    expect(page.get_by_role("button", name="Continue with Google", exact=True)).to_be_visible()
+    page.wait_for_timeout(200)
+    expect(page.locator("#blog")).to_be_hidden()
+    expect(page.locator("#blog-card")).to_be_hidden()
+    assert hits == []
+
+
+FEED_FAILURES = {
+    "not-xml": dict(body="<html><body>not a feed", content_type="text/html"),
+    "broken-xml": dict(body="<rss><channel><item><title>x</title>", content_type="application/xml"),
+    "no-items": dict(body=rss_feed(), content_type="application/rss+xml"),
+    "other-origin": dict(
+        body=rss_feed(rss_item("Elsewhere", "https://evil.example.test/blog/p/")),
+        content_type="application/rss+xml"),
+    "http-link": dict(
+        body=rss_feed(rss_item("Plain", "http://blog.example.test/blog/p/")),
+        content_type="application/rss+xml"),
+    "script-link": dict(
+        body=rss_feed(rss_item("Script", "javascript:alert(1)")),
+        content_type="application/rss+xml"),
+    "empty-title": dict(
+        body=rss_feed(rss_item("   ", FIRST_POST)), content_type="application/rss+xml"),
+    "too-big": dict(
+        body=rss_feed(rss_item("Big", FIRST_POST), "<!--" + "x" * (257 * 1024) + "-->"),
+        content_type="application/rss+xml"),
+    # The browser logs a failed fetch as a console error only for HTTP errors, which the
+    # shared page fixture filters for 4xx and 503; 404 and 503 stand in for "the feed is down".
+    "not-found": dict(body="missing", status=404, content_type="text/plain"),
+    "unavailable": dict(body="down", status=503, content_type="text/plain"),
+}
+
+
+@pytest.mark.parametrize("failure", sorted(FEED_FAILURES))
+def test_blog_card_stays_hidden_when_the_feed_is_unusable(page, tmp_path, monkeypatch, failure):
+    """A bad feed leaves the Blog link, no card, no console error and a working sign-in."""
+    page.allow_http_errors = True
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    stub_vendor(page)
+    hits = stub_blog(page, **FEED_FAILURES[failure])
+    for server in _serve_firebase(tmp_path, blog_url=BLOG_URL):
+        page.goto(f"{server['url']}/login")
+        assert_blog_link_only(page)
+        assert hits == [BLOG_FEED]
+        page.wait_for_timeout(300)
+        expect(page.locator("#blog-card")).to_be_hidden()
+
+
+def test_blog_card_stays_hidden_when_the_feed_never_answers(page, tmp_path, monkeypatch):
+    """A feed that hangs is given up after 5 s, without blocking sign-in or showing an error."""
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    stub_vendor(page)
+    hits = []
+    page.route(BLOG_FEED, lambda route: hits.append(route.request.url))
+    for server in _serve_firebase(tmp_path, blog_url=BLOG_URL):
+        page.goto(f"{server['url']}/login")
+        # Sign-in is ready while the feed is still pending.
+        assert_blog_link_only(page)
+        assert hits == [BLOG_FEED]
+        page.wait_for_timeout(5600)
+        expect(page.locator("#blog-card")).to_be_hidden()
+        expect(page.locator("#blog")).to_be_visible()
+        expect(page.locator("#submit")).to_be_enabled()
+
+
+def test_blog_title_is_rendered_as_text(page, tmp_path, monkeypatch):
+    """A title with markup shows as text and creates no element."""
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    stub_vendor(page)
+    hostile = "&lt;img src=x onerror=window.__pwned=1&gt;"
+    stub_blog(page, rss_feed(rss_item(hostile, FIRST_POST)))
+    for server in _serve_firebase(tmp_path, blog_url=BLOG_URL):
+        page.goto(f"{server['url']}/login")
+        card = page.locator("#blog-card")
+        expect(card).to_be_visible()
+        expect(card.locator(".auth-blog-title")).to_have_text("<img src=x onerror=window.__pwned=1>")
+        expect(page.locator("#blog-card img, img[src='x']")).to_have_count(0)
+        page.wait_for_timeout(200)
+        assert page.evaluate("window.__pwned") is None
+    stub_cdata = rss_feed(rss_item("<![CDATA[<img src=x onerror=window.__pwned=1>]]>", FIRST_POST))
+    page.unroute(BLOG_FEED)
+    stub_blog(page, stub_cdata)
+    for server in _serve_firebase(tmp_path / "again", blog_url=BLOG_URL):
+        page.goto(f"{server['url']}/login")
+        expect(page.locator("#blog-card .auth-blog-title")).to_have_text(
+            "<img src=x onerror=window.__pwned=1>")
+        expect(page.locator("#blog-card img")).to_have_count(0)
+        assert page.evaluate("window.__pwned") is None
+
+
+def test_blog_title_is_cut_to_120_characters(page, tmp_path, monkeypatch):
+    """A long title is cut at 120 characters with an ellipsis."""
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    stub_vendor(page)
+    stub_blog(page, rss_feed(rss_item("w" * 200, FIRST_POST)))
+    for server in _serve_firebase(tmp_path, blog_url=BLOG_URL):
+        page.goto(f"{server['url']}/login")
+        title = page.locator("#blog-card .auth-blog-title")
+        expect(title).to_have_text("w" * 119 + "…")
+
+
+def test_blog_card_leaves_out_an_unparseable_date(page, tmp_path, monkeypatch):
+    """No date shows when pubDate is missing or not a date; the title still shows."""
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    stub_vendor(page)
+    stub_blog(page, rss_feed(rss_item("Undated", FIRST_POST, "last Tuesday")))
+    for server in _serve_firebase(tmp_path, blog_url=BLOG_URL):
+        page.goto(f"{server['url']}/login")
+        expect(page.locator("#blog-card .auth-blog-title")).to_have_text("Undated")
+        expect(page.locator("#blog-card .auth-blog-date")).to_have_count(0)
+
+
+@pytest.mark.parametrize("scheme", ["light", "dark"])
+@pytest.mark.parametrize("width", [375, 1280])
+def test_blog_no_overflow_with_a_long_title(page, tmp_path, monkeypatch, scheme, width):
+    """A 200-character title and the Blog link cause no horizontal overflow."""
+    monkeypatch.delenv("AGENTICML_SERVER_KEY", raising=False)
+    stub_vendor(page)
+    page.emulate_media(color_scheme=scheme)
+    page.set_viewport_size({"width": width, "height": 812})
+    # One long word is the worst case for wrapping.
+    stub_blog(page, rss_feed(rss_item("a" * 110 + " " + "b" * 89, FIRST_POST)))
+    for server in _serve_firebase(tmp_path, blog_url=BLOG_URL, legal_base_url=LEGAL_BASE,
+                                  contact_email=CONTACT_EMAIL):
+        page.goto(f"{server['url']}/login")
+        expect(page.locator("#blog")).to_be_visible()
+        if width > 960:
+            expect(page.locator("#blog-card")).to_be_visible()
+            box = page.locator("#blog-card").bounding_box()
+            panel = page.locator(".auth-brand").bounding_box()
+            assert box["x"] >= panel["x"]
+            assert box["x"] + box["width"] <= panel["x"] + panel["width"]
+        else:
+            # The brand panel, and the card in it, are hidden at 960px and narrower.
+            expect(page.locator("#blog-card")).to_be_hidden()
+        assert_no_overflow(page)
+        page.goto(f"{server['url']}/invite?token=x")
+        expect(page.locator("#blog")).to_be_visible()
+        assert_no_overflow(page)

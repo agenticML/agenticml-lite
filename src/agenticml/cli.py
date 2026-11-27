@@ -601,6 +601,19 @@ def _legal_base_url_from_args(args):
     return normalize_legal_base_url(raw)
 
 
+def _blog_url_from_args(args):
+    """Blog URL from ``--blog-url`` or the environment (flag wins).
+
+    Empty means unset. Anything but an https:// URL raises ValueError.
+    """
+    from .server.webauth import normalize_blog_url
+
+    raw = getattr(args, "blog_url", None)
+    if raw is None:
+        raw = os.environ.get("AGENTICML_SERVER_BLOG_URL", "")
+    return normalize_blog_url(raw)
+
+
 def _contact_email_from_args(args):
     """The ``--contact-email`` value (flag wins over the environment), checked early.
 
@@ -683,6 +696,9 @@ def cmd_server_serve(args):
         legal_base_url = _legal_base_url_from_args(args)
         if legal_base_url:
             extra["legal_base_url"] = legal_base_url
+        blog_url = _blog_url_from_args(args)
+        if blog_url:
+            extra["blog_url"] = blog_url
         contact_email = _contact_email_from_args(args)
         if contact_email is not None:
             extra["contact_email"] = contact_email
@@ -2096,6 +2112,10 @@ def main(argv=None):
                          help="https:// base URL of the Terms, Acceptable use and Privacy pages "
                               "linked from the Firebase sign-in page; unset shows no links "
                               "(default: AGENTICML_SERVER_LEGAL_BASE_URL)")
+    p_serve.add_argument("--blog-url", default=None, metavar="URL",
+                         help="https:// URL of the blog shown on the Firebase sign-in page (its "
+                              "newest post and a Blog link); unset shows nothing "
+                              "(default: AGENTICML_SERVER_BLOG_URL)")
     p_serve.add_argument("--contact-email", default=None, metavar="ADDRESS|off",
                          help="Address the dashboard's Contact us button writes to; unset shows a "
                               "Feedback button that writes to the agenticml-lite team, off shows "

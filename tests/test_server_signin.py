@@ -1051,7 +1051,8 @@ def test_sign_in_pages_share_the_auth_shell():
         brand = re.search(r'<aside class="auth-brand".*?</aside>', text, re.S)
         logo = re.search(r'<div class="auth-compact-logo">.*?</div>', text, re.S)
         assert brand and logo, name
-        brands.append(brand.group(0))
+        # Only the Firebase page has the (empty, hidden) "From the blog" card.
+        brands.append(re.sub(r'\s*<section id="blog-card"[^>]*></section>', "", brand.group(0)))
         logos.append(logo.group(0))
         assert 'class="auth-page"' in text and "auth-shell" in text, name
         if name in ("setup.html", "invite.html", "invite-existing.html"):

@@ -1,14 +1,39 @@
 ---
-// The default social icons (GitHub) plus a visible "Sign in" text link to the
-// hosted service. Starlight shows these in the header on wide screens and in
-// the mobile menu footer on narrow ones.
-import Default from '@astrojs/starlight/components/SocialIcons.astro';
+// The configured social icons (GitHub) plus a visible "Sign in" text link to
+// the hosted service. Starlight shows these in the header on wide screens and
+// in the mobile menu footer on narrow ones.
+//
+// The icons are rendered here, with the same markup as Starlight's default
+// SocialIcons, so the RSS icon that starlight-blog adds on its own can be left
+// out: it opens /blog/rss.xml, which browsers show as raw XML. The feed itself
+// and the <link rel="alternate"> in each page's <head> are unchanged.
+import config from 'virtual:starlight/user-config';
+import { Icon } from '@astrojs/starlight/components';
+
+const links = (config.social || []).filter(({ icon }) => icon !== 'rss');
 ---
 
-<Default><slot /></Default>
+{
+	links.map(({ label, href, icon }) => (
+		<a {href} rel="me" class="sl-flex social-link">
+			<span class="sr-only">{label}</span>
+			<Icon name={icon} />
+		</a>
+	))
+}
 <a href="https://app.agenticml.xyz" class="sign-in">Sign in</a>
 
 <style>
+	@layer starlight.core {
+		.social-link {
+			color: var(--sl-color-text-accent);
+			padding: 0.5em;
+			margin: -0.5em;
+		}
+		.social-link:hover {
+			color: var(--sl-color-white);
+		}
+	}
 	.sign-in {
 		color: var(--sl-color-text-accent);
 		font-size: var(--sl-text-sm);

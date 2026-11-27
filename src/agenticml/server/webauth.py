@@ -410,20 +410,27 @@ _ASSETS = {
 }
 
 
-def firebase_login_csp(auth_domain):
-    """Dashboard CSP plus the Google hosts the Firebase sign-in pages need."""
+def firebase_login_csp(auth_domain, blog_origin=None):
+    """Dashboard CSP plus the Google hosts the Firebase sign-in pages need.
+
+    ``blog_origin`` (``https://host[:port]``) is added to ``connect-src`` and
+    nowhere else: the page reads the blog's feed from the visitor's browser.
+    """
+    connect_extra = f" {blog_origin}" if blog_origin else ""
     return (
         _CSP.replace("script-src 'self'", "script-src 'self' https://apis.google.com")
         + "; connect-src 'self' https://identitytoolkit.googleapis.com"
         " https://securetoken.googleapis.com https://www.googleapis.com https://apis.google.com"
+        + connect_extra
         + f"; frame-src https://{auth_domain} https://apis.google.com"
     )
 
 
-def normalize_legal_base_url(value):
-    """Return an ``https://`` policy base URL ending in ``/``, or None when unset.
+def _normalize_https_base_url(value, flag):
+    """Return an ``https://`` URL ending in ``/``, or None when unset.
 
-    Raises ValueError for anything else: the sign-in page links to this URL.
+    Raises ValueError (naming ``flag``) for anything else: the sign-in page
+    links to this URL.
     """
     if value is None:
         return None
@@ -431,21 +438,41 @@ def normalize_legal_base_url(value):
     if not value:
         return None
     if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in value):
-        raise ValueError("--legal-base-url must not contain spaces or control characters")
+        raise ValueError(f"{flag} must not contain spaces or control characters")
     try:
         parts = urlsplit(value)
         host = parts.hostname
         parts.port  # raises ValueError for a non-numeric or out-of-range port
     except ValueError:
-        raise ValueError("--legal-base-url is not a valid URL") from None
+        raise ValueError(f"{flag} is not a valid URL") from None
     if parts.scheme != "https" or not host:
-        raise ValueError("--legal-base-url must be an https:// URL")
+        raise ValueError(f"{flag} must be an https:// URL")
     # An empty query or fragment ("...?" or "...#") parses as "", so check the
     # characters too: the page names are appended to this string.
     if (parts.username is not None or parts.password is not None
             or "?" in value or "#" in value):
-        raise ValueError("--legal-base-url must not have credentials, a query, or a fragment")
+        raise ValueError(f"{flag} must not have credentials, a query, or a fragment")
     return value if value.endswith("/") else value + "/"
+
+
+def normalize_legal_base_url(value):
+    """Return an ``https://`` policy base URL ending in ``/``, or None when unset."""
+    return _normalize_https_base_url(value, "--legal-base-url")
+
+
+def normalize_blog_url(value):
+    """Return an ``https://`` blog URL ending in ``/``, or None when unset."""
+    return _normalize_https_base_url(value, "--blog-url")
+
+
+def _origin(url):
+    """``https://host[:port]`` of a URL that ``normalize_blog_url`` accepted."""
+    parts = urlsplit(url)
+    host = parts.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    port = f":{parts.port}" if parts.port else ""
+    return f"https://{host}{port}"
 
 
 # The mailbox of the agenticml-lite team (the address the Terms and Privacy pages
@@ -495,7 +522,8 @@ class WebAuth:
                  users=None, trusted_proxies=(), identity_header=None,
                  firebase=None, cert_source=None, plans=None, open_signup=False,
                  admin_emails=frozenset(), legal_base_url=None, oidc=None,
-                 signup_email_domains=frozenset(), oidc_provider=None, contact_email=None):
+                 signup_email_domains=frozenset(), oidc_provider=None, contact_email=None,
+                 blog_url=None):
         self.keys = keys
         self.users = users if users is not None else UserStore(keys.server_dir, db=keys.db, workspace_id=keys.workspace_id or '0' * 32)
         self.public_url = public_url
@@ -522,6 +550,10 @@ class WebAuth:
         if self.legal_base_url and self.firebase is None:
             logger.warning("--legal-base-url is ignored without --firebase-project")
             self.legal_base_url = None
+        self.blog_url = normalize_blog_url(blog_url)
+        if self.blog_url and self.firebase is None:
+            logger.warning("--blog-url is ignored without --firebase-project")
+            self.blog_url = None
         self.contact = resolve_contact_email(contact_email)
         if self.firebase is not None:
             from .firebase import FIREBASE_EXTRA, FIREBASE_IDENTITY, firebase_available
@@ -1236,7 +1268,9 @@ class WebAuth:
             "text/html; charset=utf-8",
             headers=self._headers({
                 "Referrer-Policy": "no-referrer",
-                "Content-Security-Policy": firebase_login_csp(self.firebase.auth_domain),
+                "Content-Security-Policy": firebase_login_csp(
+                    self.firebase.auth_domain,
+                    _origin(self.blog_url) if self.blog_url else None),
             }),
         )
 
@@ -1252,6 +1286,8 @@ class WebAuth:
                 "acceptable_use": self.legal_base_url + "acceptable-use/",
                 "privacy": self.legal_base_url + "privacy/",
             }
+        if self.blog_url:
+            config["blog"] = {"url": self.blog_url, "feed": self.blog_url + "rss.xml"}
         if self.contact is not None and not self.contact[1]:
             config["contact_email"] = self.contact[0]
         handler._json(config, headers=self._headers())

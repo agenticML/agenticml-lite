@@ -449,13 +449,17 @@ Starlight site at `/blog/`. Replaces the Backlog entry "Docs custom domain".
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 38 | Docs site at `agenticml.xyz` | – | Sonnet; owner DNS and Pages | S–M | [plan](packages/38-site-domain.md) | in progress |
-| 38.1 | Root-path build: drop the `/agenticml-lite` base, rewrite links, new URL across the repo, guard test | – | Sonnet | S–M | [plan](packages/38-site-domain.md#part-381-root-path-build-sonnet) | in review |
-| 38.2 | Cutover: Namecheap `A`/`www` records, merge, Pages custom domain, Enforce HTTPS | 38.1 | Owner | S | [plan](packages/38-site-domain.md#part-382-cutover-owner) | not started |
-| 38.3 | `HOSTED_LEGAL_BASE_URL` to `https://agenticml.xyz/legal/` and hosted deploy | 38.2 | Owner | S | [plan](packages/38-site-domain.md#part-383-hosted-policy-links-owner) | not started |
-| 39 | Blog at `agenticml.xyz/blog/`: `starlight-blog` plugin, post list, tags, RSS, header link, first post | 38.1 (live after 38.2) | Sonnet; prose Antigravity | M | [plan](packages/39-blog.md) | in review |
-| 39.1 | Blog section: plugin pinned at 0.30.2, schema, header link, overflow and RSS checks, facts test | 38.1 | Sonnet | S–M | [plan](packages/39-blog.md#part-391-blog-section-sonnet) | in review |
-| 39.2 | First post: the docs and blog now live at agenticml.xyz | 39.1 | Antigravity; supervisor checks | S | [plan](packages/39-blog.md#part-392-first-post-antigravity-writes-it-the-supervisor-checks-it) | in review |
+| 38 | Docs site at `agenticml.xyz` | – | Sonnet; owner DNS and Pages | S–M | [plan](packages/38-site-domain.md) | in progress: 38.1 and 38.2 done ([#103](https://github.com/agenticML/agenticml-lite/pull/103), merged Nov 27, 2026); 38.3 left (owner) |
+| 38.1 | Root-path build: drop the `/agenticml-lite` base, rewrite links, new URL across the repo, guard test | – | Sonnet | S–M | [plan](packages/38-site-domain.md#part-381-root-path-build-sonnet) | done ([#103](https://github.com/agenticML/agenticml-lite/pull/103), merged Nov 27, 2026) |
+| 38.2 | Cutover: Namecheap `A`/`www` records, merge, Pages custom domain, Enforce HTTPS | 38.1 | Owner | S | [plan](packages/38-site-domain.md#part-382-cutover-owner) | done (Nov 27, 2026): DNS records added by the owner; Pages custom domain set and Enforce HTTPS turned on; `https://agenticml.xyz/`, `www`, plain HTTP and old github.io links checked |
+| 38.3 | `HOSTED_LEGAL_BASE_URL` to `https://agenticml.xyz/legal/` and hosted deploy | 38.2 | Owner | S | [plan](packages/38-site-domain.md#part-383-hosted-policy-links-owner) | not started (owner): set `HOSTED_LEGAL_BASE_URL`, approve the hosted deploy, and change the repo website link to `https://agenticml.xyz/` |
+| 39 | Blog at `agenticml.xyz/blog/`: `starlight-blog` plugin, post list, tags, RSS, header link, first post | 38.1 (live after 38.2) | Sonnet; prose Antigravity | M | [plan](packages/39-blog.md) | done ([#103](https://github.com/agenticML/agenticml-lite/pull/103), merged Nov 27, 2026); live at https://agenticml.xyz/blog/ |
+| 39.1 | Blog section: plugin pinned at 0.30.2, schema, header link, overflow and RSS checks, facts test | 38.1 | Sonnet | S–M | [plan](packages/39-blog.md#part-391-blog-section-sonnet) | done ([#103](https://github.com/agenticML/agenticml-lite/pull/103)) |
+| 39.2 | First post: the docs and blog now live at agenticml.xyz | 39.1 | Antigravity; supervisor checks | S | [plan](packages/39-blog.md#part-392-first-post-antigravity-writes-it-the-supervisor-checks-it) | done ([#103](https://github.com/agenticML/agenticml-lite/pull/103)) |
+| 40 † | Blog on the hosted sign-in page: "From the blog" card (newest post from the RSS feed) and a Blog link | 39 (live after 38.2) | Sonnet; supervisor reviews and does the † review | M | [plan](packages/40-signin-blog-card.md) | in review |
+| 40.1 † | Server `--blog-url` (`AGENTICML_SERVER_BLOG_URL`), config `blog`, CSP `connect-src` for the blog origin, hosted template `BlogUrl` | – | Sonnet | S | [plan](packages/40-signin-blog-card.md#part-401-server-option-sonnet) | in review |
+| 40.2 | Sign-in page: brand-panel card, Blog link, feed fetch and checks, CSS; UI tests | 40.1 | Sonnet | M | [plan](packages/40-signin-blog-card.md#part-402-sign-in-page-sonnet) | in review |
+| 40.3 | SERVER.md, HOSTED.md, threat model | 40.1 | Sonnet | S | [plan](packages/40-signin-blog-card.md#part-403-docs-sonnet) | in review |
 
 ### Maintenance fixes
 

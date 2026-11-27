@@ -799,6 +799,58 @@ kbd {
   color: var(--text-3);
 }
 
+/* "From the blog" card, after the pitch so the pitch keeps its margin-top:
+   auto and the pair stays at the bottom of the panel. The negative margin
+   tightens the panel's 40px gap. Shown by firebase-login.js only. */
+.auth-blog {
+  margin-top: -12px;
+  max-width: 480px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 16px;
+  border-top: 1px solid var(--hairline);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.auth-blog[hidden] {
+  display: none;
+}
+.auth-blog-heading {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.auth-blog-title {
+  min-width: 0;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 500;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+}
+.auth-blog-title:hover,
+.auth-blog-all:hover {
+  color: var(--accent);
+}
+.auth-blog-date {
+  margin: 0;
+  font: 11px var(--font-mono-stack);
+  color: var(--text-3);
+}
+.auth-blog-all {
+  align-self: flex-start;
+  color: var(--accent);
+}
+
 /* Logo: the mark takes --accent and the wordmark --text of whichever
    panel it sits in. */
 .auth-logo {
