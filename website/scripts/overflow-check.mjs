@@ -7,7 +7,9 @@
 //
 // Also checks the blog (package 39.1): /blog/, every post and a tag page are in
 // the built site (so they get the overflow and Contact us checks above) and
-// /blog/rss.xml has one <item> per post, with links on the site origin.
+// /blog/rss.xml has one <item> per post, with links on the site origin. The
+// header and the mobile menu show no RSS icon (a link to the raw XML), while
+// the page <head> keeps the RSS alternate link for feed readers.
 //
 // Run after `npm run build`: npm run check:overflow
 import { createServer } from 'node:http';
@@ -28,6 +30,7 @@ const THEMES = ['light', 'dark'];
 const BANNER_TEXT = 'Hosted service in public preview.';
 const SIGN_IN_URL = 'https://app.agenticml.xyz';
 const BANNER_PAGES = [`${BASE}/`, `${BASE}/guides/python-sdk/`];
+const RSS_PAGES = [`${BASE}/`, `${BASE}/blog/`];
 const CONTACT_EMAIL = 'contact@agenticml.xyz';
 const CONTACT_PAGES = [...BANNER_PAGES, `${BASE}/404.html`];
 
@@ -192,6 +195,27 @@ async function checkBlog(paths) {
 	}
 }
 
+// The RSS icon that starlight-blog adds opens raw XML, so SocialIcons.astro leaves
+// it out. The feed and the <link rel="alternate"> in <head> must stay.
+async function checkRssLinks(page, path) {
+	const result = await page.evaluate(() => {
+		const isRss = (el) => new URL(el.getAttribute('href') ?? '', location.href).pathname === '/blog/rss.xml';
+		// The social icons sit in the header and in the mobile menu footer. The
+		// blog sidebar's own "RSS" text link is a separate plugin feature.
+		const icons = [...document.querySelectorAll('header .social-icons a[href], .mobile-preferences .social-icons a[href]')];
+		return {
+			rss: icons.filter(isRss).map((a) => a.outerHTML.slice(0, 120)),
+			github: icons.filter((a) => a.href.startsWith('https://github.com/')).length,
+			alternate: [...document.head.querySelectorAll('link[rel="alternate"][type="application/rss+xml"]')].filter(isRss).length,
+		};
+	});
+	for (const html of result.rss) problems.push(`${path}: RSS icon link in the header or mobile menu: ${html}`);
+	if (result.github === 0) problems.push(`${path}: GitHub icon missing from the header`);
+	if (result.alternate !== 1) {
+		problems.push(`${path}: expected 1 RSS alternate <link> in <head> for /blog/rss.xml, found ${result.alternate}`);
+	}
+}
+
 const server = await startServer();
 const origin = `http://127.0.0.1:${server.address().port}`;
 const browser = await chromium.launch();
@@ -233,6 +257,7 @@ try {
 			if (theme === THEMES[0] && (await page.locator('button#contact-button').count()) !== 1) {
 				problems.push(`${path}: Contact us button missing`);
 			}
+			if (theme === THEMES[0] && RSS_PAGES.includes(path)) await checkRssLinks(page, path);
 			if (CONTACT_PAGES.includes(path)) await checkContactPanel(page, path, theme);
 			if (theme === THEMES[0] && BANNER_PAGES.includes(path)) {
 				const banner = await page.evaluate(
