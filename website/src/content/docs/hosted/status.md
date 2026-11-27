@@ -11,7 +11,7 @@ sidebar:
 This page says where the hosted service at `https://app.agenticml.xyz` stands. Updated by hand; last updated Nov 16, 2026. It changes when a check finishes, so it can be behind.
 
 :::note[Public preview]
-The hosted service is a public preview. It runs on a best-effort basis, with no SLA. See the [terms of service](/agenticml-lite/legal/terms/), [acceptable use policy](/agenticml-lite/legal/acceptable-use/) and [privacy policy](/agenticml-lite/legal/privacy/).
+The hosted service is a public preview. It runs on a best-effort basis, with no SLA. See the [terms of service](/legal/terms/), [acceptable use policy](/legal/acceptable-use/) and [privacy policy](/legal/privacy/).
 :::
 
 ## Right now
@@ -23,7 +23,7 @@ The service runs one server task and one database in a single availability zone.
 ## What is live
 
 - **Nov 12, 2026:** first deploy. The service answers at `https://app.agenticml.xyz` with a valid certificate, and the health check above works.
-- **Nov 13, 2026:** sign-in with Google, or email and password, is on. See [Sign-up](/agenticml-lite/hosted/#sign-up) for the current sign-up state.
+- **Nov 13, 2026:** sign-in with Google, or email and password, is on. See [Sign-up](/hosted/#sign-up) for the current sign-up state.
 - **Nov 14, 2026:** workspace admins manage members and API keys on a Settings page, and server admins can archive and restore workspaces.
 - **Nov 15, 2026:** the 3.0 client from `dev` keeps its sync state per workspace, so one local store can sync to several workspaces.
 - **Nov 16, 2026:** two customer workspaces, each with an admin, a member and a sync key, checked end to end: each person sees only their own workspaces, and a test run synced into each shows only in its own dashboard.

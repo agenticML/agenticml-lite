@@ -8,7 +8,7 @@ sidebar:
     variant: tip
 ---
 
-This page takes you from no account to a run you can see at `https://app.agenticml.xyz`. It needs Python 3.10 or newer on the training machine. The hosted service is a public preview; read the [overview](/agenticml-lite/hosted/) first if you have not.
+This page takes you from no account to a run you can see at `https://app.agenticml.xyz`. It needs Python 3.10 or newer on the training machine. The hosted service is a public preview; read the [overview](/hosted/) first if you have not.
 
 ## 1. Sign up
 
@@ -17,7 +17,7 @@ Open `https://app.agenticml.xyz/login`. The page has two tabs, **Sign in** and *
 - **Google:** click **Continue with Google**. Google has already verified your email.
 - **Email and password:** open the **Sign up** tab, enter your email and a password, and click **Sign up**. The page tells you to check your inbox to verify your email. Open the link in that email, come back, and sign in. Until the email is verified you cannot get a workspace or accept an invite.
 
-Whether anyone can sign up is stated in [Sign-up](/agenticml-lite/hosted/#sign-up). If it is off, the page says "Your account has no access to this server. Ask a workspace admin for an invite." Ask for an invite, then follow [Workspaces and team](/agenticml-lite/hosted/workspaces/#invite-someone).
+Whether anyone can sign up is stated in [Sign-up](/hosted/#sign-up). If it is off, the page says "Your account has no access to this server. Ask a workspace admin for an invite." Ask for an invite, then follow [Workspaces and team](/hosted/workspaces/#invite-someone).
 
 ## 2. Find your personal workspace
 
@@ -33,7 +33,7 @@ A training machine uploads with a sync key.
 4. Leave **Scope** as `sync`.
 5. Click **Create**.
 
-The key is shown once and cannot be recovered. Copy it now. The dialog also shows a login command without the key in it (`agenticml login --host <host>`). Run it, then paste the key when it asks for it. This keeps the key out of your shell history and the process list. For details on scopes, user assignment and key lifecycles, see [Sign-in and sync keys](/agenticml-lite/hosted/keys/).
+The key is shown once and cannot be recovered. Copy it now. The dialog also shows a login command without the key in it (`agenticml login --host <host>`). Run it, then paste the key when it asks for it. This keeps the key out of your shell history and the process list. For details on scopes, user assignment and key lifecycles, see [Sign-in and sync keys](/hosted/keys/).
 
 ## 4. Install the client
 
@@ -69,7 +69,7 @@ user: jane.doe@example.com (owner)
 workspace: jane-doe
 ```
 
-To log in without a prompt, pipe the key in, for example `echo "$HOSTED_KEY" | agenticml login --host https://app.agenticml.xyz`. On a machine where you do not want to save a key, set `AGENTICML_HOST` and `AGENTICML_API_KEY` instead; `sync` and `whoami` read them. Do not put the key on the command line. For cluster setups, environment overrides, and logout, see [Sign-in and sync keys](/agenticml-lite/hosted/keys/).
+To log in without a prompt, pipe the key in, for example `echo "$HOSTED_KEY" | agenticml login --host https://app.agenticml.xyz`. On a machine where you do not want to save a key, set `AGENTICML_HOST` and `AGENTICML_API_KEY` instead; `sync` and `whoami` read them. Do not put the key on the command line. For cluster setups, environment overrides, and logout, see [Sign-in and sync keys](/hosted/keys/).
 
 ## 6. Track and sync a run
 
@@ -95,7 +95,7 @@ agenticml sync --follow
 
 ## 7. Open the dashboard
 
-Open `https://app.agenticml.xyz/w/<slug>/` with your slug. Your runs are listed there. The charts, run pages and comparisons work as in the [local dashboard](/agenticml-lite/guides/dashboard/).
+Open `https://app.agenticml.xyz/w/<slug>/` with your slug. Your runs are listed there. The charts, run pages and comparisons work as in the [local dashboard](/guides/dashboard/).
 
 ## Troubleshooting
 
@@ -109,13 +109,13 @@ Open `https://app.agenticml.xyz/w/<slug>/` with your slug. Your runs are listed 
 
 - `storage limit reached: ... of 5.0 GB used; delete runs or ask for more`: the workspace is full. Existing runs stay readable. `sync --follow` tries again every 10 minutes.
 - `daily upload limit reached ... resets at 00:00 UTC`: the 2 GB daily upload limit is used up. Uploads work again at 00:00 UTC.
-- `people limit reached (5 of 5)`: seen when inviting, not when syncing. See [Workspaces and team](/agenticml-lite/hosted/workspaces/#people-limit).
+- `people limit reached (5 of 5)`: seen when inviting, not when syncing. See [Workspaces and team](/hosted/workspaces/#people-limit).
 - `forbidden`: the key belongs to a viewer. Viewers cannot sync. Ask a workspace admin to change your role, then make a new key.
 
-The limits are listed in [Free plan and limits](/agenticml-lite/hosted/#free-plan-and-limits).
+The limits are listed in [Free plan and limits](/hosted/#free-plan-and-limits).
 
 **HTTP 429.** The workspace went over 600 requests a minute. Wait for the number of seconds in the `Retry-After` header. The client also waits and tries again.
 
-**"up to date", but the run is not in the dashboard.** 3.0+ clients keep sync progress per workspace (`<host>/w/<slug>`). Older clients keep progress per server, so a run synced to one workspace is not sent to another. See [Several workspaces from one machine](/agenticml-lite/hosted/workspaces/#several-workspaces-from-one-machine).
+**"up to date", but the run is not in the dashboard.** 3.0+ clients keep sync progress per workspace (`<host>/w/<slug>`). Older clients keep progress per server, so a run synced to one workspace is not sent to another. See [Several workspaces from one machine](/hosted/workspaces/#several-workspaces-from-one-machine).
 
 **A run shows as "stale".** A run is marked stale when it is still `running` but nothing has arrived for more than 600 seconds. Run `agenticml sync --follow` during training so heartbeats arrive.

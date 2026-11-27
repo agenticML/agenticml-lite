@@ -67,7 +67,7 @@ pip install 'agenticml-lite[system]'
 
 ### Deploy in your own AWS account
 
-Deploy an AgenticML server in your own AWS account with a single CloudFormation template. See [Deploy on AWS](/agenticml-lite/server/deploy-on-aws/).
+Deploy an AgenticML server in your own AWS account with a single CloudFormation template. See [Deploy on AWS](/server/deploy-on-aws/).
 
 - **CloudFormation template:** One template (`deploy/aws-self-hosted/agenticml.yaml`) creates a Graviton EC2 instance running SQLite on an encrypted EBS data volume, an HTTPS Application Load Balancer with an ACM certificate, and Amazon Cognito for user management.
 - **OIDC sign-in:** The server supports OpenID Connect (Cognito, Okta, Entra ID) using authorization code flow with PKCE and public clients, via the `[oidc]` extra.
@@ -84,7 +84,7 @@ Version 3.1 was not released separately either. Install 3.3.0 to get this work.
 
 ### Private networks
 
-Run the server and dashboard inside a private network, with no Tailscale, behind a TLS proxy that uses an internal certificate. See [Private network](/agenticml-lite/server/private-network/).
+Run the server and dashboard inside a private network, with no Tailscale, behind a TLS proxy that uses an internal certificate. See [Private network](/server/private-network/).
 
 - **CA bundle:** `agenticml login`, `sync` and `whoami` take `--ca-bundle PATH`. `login --ca-bundle` saves the bundle for that host. `AGENTICML_CA_BUNDLE` sets one for every https host that has no saved bundle.
 - **Plain http per host:** `agenticml login --insecure` to a non-local `http://` host remembers that consent for that exact host only. Other hosts are still refused.
@@ -114,9 +114,9 @@ pip install 'agenticml-lite[system]'
 - **Database storage:** Server state lives in a SQL database. SQLite is used for single-process self-hosted deployments. PostgreSQL is used for multi-process or hosted deployments.
 - **Workspaces:** All runs, API keys, and memberships belong to isolated workspaces on a single hostname. People have a role in each workspace. Dashboard views run at `/w/<slug>/`.
 - **Workspace switcher:** Switch between workspaces from the dashboard.
-- **Hosted service:** A service on AWS at `https://app.agenticml.xyz`. It is a public preview, run on a best-effort basis with no SLA. See the [hosted quickstart](/agenticml-lite/hosted/quickstart/).
+- **Hosted service:** A service on AWS at `https://app.agenticml.xyz`. It is a public preview, run on a best-effort basis with no SLA. See the [hosted quickstart](/hosted/quickstart/).
 - **Firebase sign-in:** Sign in to the hosted service with Google or email and password.
-- **Self-serve sign-up:** See [Sign-up](/agenticml-lite/hosted/#sign-up) for whether open sign-up is on.
+- **Self-serve sign-up:** See [Sign-up](/hosted/#sign-up) for whether open sign-up is on.
 - **Free plan limits (as of Nov 13, 2026):** 5 GB storage, 2 GB uploads per UTC day, 600 requests per minute per workspace, 5 people (members plus pending invites), and 1 free workspace per account. Over the storage, daily upload or people limit the server answers 403. Over the request rate it answers 429 with `Retry-After`.
 - **Several server processes and S3 objects:** PostgreSQL deployments can run more than one server process. Content-addressed objects (code snapshots, media, copied artifacts) can be stored in Amazon S3. The hosted service uses both.
 - **Metric summaries:** The server keeps a summary of each metric series in the database, so the runs list can sort and filter by metric.
@@ -125,13 +125,13 @@ pip install 'agenticml-lite[system]'
 
 ### Documentation
 
-- [Server overview](/agenticml-lite/server/)
-- [Installation and deployment](/agenticml-lite/server/install/)
-- [Authentication and keys](/agenticml-lite/server/keys/)
-- [Syncing runs](/agenticml-lite/server/sync/)
-- [Backups and restore](/agenticml-lite/server/backups/)
-- [Upgrades and troubleshooting](/agenticml-lite/server/upgrade/)
-- [Hosted service](/agenticml-lite/hosted/), [Hosted quickstart](/agenticml-lite/hosted/quickstart/), [Workspaces and team](/agenticml-lite/hosted/workspaces/), [Service status](/agenticml-lite/hosted/status/)
+- [Server overview](/server/)
+- [Installation and deployment](/server/install/)
+- [Authentication and keys](/server/keys/)
+- [Syncing runs](/server/sync/)
+- [Backups and restore](/server/backups/)
+- [Upgrades and troubleshooting](/server/upgrade/)
+- [Hosted service](/hosted/), [Hosted quickstart](/hosted/quickstart/), [Workspaces and team](/hosted/workspaces/), [Service status](/hosted/status/)
 
 ---
 
@@ -216,10 +216,10 @@ Version 1.0.0 was the first release on PyPI. Version 3.0.0 replaces it.
 
 ### Documentation
 
-- [Installation](/agenticml-lite/getting-started/installation/)
-- [Quickstart](/agenticml-lite/getting-started/quickstart/)
-- [Python SDK](/agenticml-lite/guides/python-sdk/)
-- [Zero-code tracking](/agenticml-lite/guides/zero-code/)
-- [Local dashboard](/agenticml-lite/guides/dashboard/)
-- [Storage reference](/agenticml-lite/reference/storage/)
-- [Configuration reference](/agenticml-lite/reference/configuration/)
+- [Installation](/getting-started/installation/)
+- [Quickstart](/getting-started/quickstart/)
+- [Python SDK](/guides/python-sdk/)
+- [Zero-code tracking](/guides/zero-code/)
+- [Local dashboard](/guides/dashboard/)
+- [Storage reference](/reference/storage/)
+- [Configuration reference](/reference/configuration/)

@@ -7,7 +7,7 @@ Last updated: Nov 15, 2026
 
 This Acceptable Use Policy ("AUP") defines acceptable and prohibited behavior on the agenticml-lite hosted service (`https://app.agenticml.xyz`), operated by the agenticML project ("agenticML", "we", "us", or "our").
 
-This policy applies to all users, accounts, API keys, and machine sync traffic. By using the service, you agree to comply with this policy and our [Terms of Service](/agenticml-lite/legal/terms/).
+This policy applies to all users, accounts, API keys, and machine sync traffic. By using the service, you agree to comply with this policy and our [Terms of Service](/legal/terms/).
 
 ## 1. Intended Use
 

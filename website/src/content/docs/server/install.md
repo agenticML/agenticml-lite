@@ -78,7 +78,7 @@ To share the server securely across your Tailscale network:
 
 Use Caddy, Nginx, or an AWS Application Load Balancer to terminate TLS and forward requests to `127.0.0.1:8080`. Always configure `--public-url` (or `AGENTICML_SERVER_PUBLIC_URL`) to match the public HTTPS endpoint for Host and Origin validation.
 
-For isolated VPCs or internal lab networks without Tailscale or internet access, see [Private networks](/agenticml-lite/server/private-network/).
+For isolated VPCs or internal lab networks without Tailscale or internet access, see [Private networks](/server/private-network/).
 
 ## Systemd service
 
@@ -137,4 +137,4 @@ Two more environment variables apply to S3 object storage:
 
 ## Next
 
-Continue to [Authentication and keys](/agenticml-lite/server/keys/) to configure access and workspaces.
+Continue to [Authentication and keys](/server/keys/) to configure access and workspaces.

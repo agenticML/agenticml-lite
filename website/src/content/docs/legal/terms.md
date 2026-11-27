@@ -7,7 +7,7 @@ Last updated: Nov 15, 2026
 
 Welcome to the agenticml-lite hosted service (`https://app.agenticml.xyz`), operated by the agenticML project ("agenticML", "we", "us", or "our").
 
-These Terms of Service ("Terms") govern your access to and use of our hosted service. By signing up, accessing, or using the service, you agree to be bound by these Terms, our [Acceptable Use Policy](/agenticml-lite/legal/acceptable-use/), and our [Privacy Policy](/agenticml-lite/legal/privacy/). If you do not agree to these Terms, do not use the service.
+These Terms of Service ("Terms") govern your access to and use of our hosted service. By signing up, accessing, or using the service, you agree to be bound by these Terms, our [Acceptable Use Policy](/legal/acceptable-use/), and our [Privacy Policy](/legal/privacy/). If you do not agree to these Terms, do not use the service.
 
 ## 1. The Service and Public Preview
 
@@ -25,7 +25,7 @@ The service provides cloud-hosted machine learning experiment tracking, metric v
 
 - **Workspaces:** Data on the service is organized into isolated workspaces. Each workspace has assigned roles: `owner`, `admin`, `member`, and `viewer`.
 - **Role responsibilities:** Workspace owners and administrators manage memberships and invitations, can issue and revoke API keys for any member, and can see the workspace Activity log. Members can create and revoke their own sync keys. Actions are attributed to the individual account or API key that performed them.
-- **Staff support access:** Server administrators cannot open your workspace's runs, files, code or artifacts through the service unless they are a member of your workspace. If you ask for technical support, you add our support account as a member or admin in Settings › Members, and remove it when we are done. Adding the account and any change to its role are recorded in the workspace Activity log; what a member views is not logged. People who operate the underlying AWS infrastructure can technically reach stored data outside the service; see the [Privacy Policy](/agenticml-lite/legal/privacy/).
+- **Staff support access:** Server administrators cannot open your workspace's runs, files, code or artifacts through the service unless they are a member of your workspace. If you ask for technical support, you add our support account as a member or admin in Settings › Members, and remove it when we are done. Adding the account and any change to its role are recorded in the workspace Activity log; what a member views is not logged. People who operate the underlying AWS infrastructure can technically reach stored data outside the service; see the [Privacy Policy](/legal/privacy/).
 
 ## 4. Plans and Free Limits
 
@@ -49,7 +49,7 @@ When a workspace reaches its storage, daily upload, or people limit, further upl
 
 ## 6. Acceptable Use
 
-You agree to comply with our [Acceptable Use Policy](/agenticml-lite/legal/acceptable-use/). You must not:
+You agree to comply with our [Acceptable Use Policy](/legal/acceptable-use/). You must not:
 
 - Upload malware, corrupted Git bundles, or hostile payloads.
 - Probe, scan, or attempt to bypass workspace isolation boundaries or security controls.

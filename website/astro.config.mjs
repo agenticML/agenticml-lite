@@ -3,11 +3,10 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import starlightLinksValidator from 'starlight-links-validator';
 
-// Served from GitHub Pages at https://agenticml.github.io/agenticml-lite/.
-// Links inside pages must include the /agenticml-lite base.
+// Served from GitHub Pages at https://agenticml.xyz/ (custom domain, root path).
+// There is no base: links inside pages start with / and carry no prefix.
 export default defineConfig({
-	site: 'https://agenticml.github.io',
-	base: '/agenticml-lite',
+	site: 'https://agenticml.xyz',
 	integrations: [
 		starlight({
 			plugins: [starlightLinksValidator({ errorOnLocalLinks: false })],
@@ -19,7 +18,7 @@ export default defineConfig({
 				{ icon: 'github', label: 'GitHub', href: 'https://github.com/agenticML/agenticml-lite' },
 			],
 			editLink: {
-				baseUrl: 'https://github.com/agenticML/agenticml-lite/edit/dev/website/',
+				baseUrl: 'https://github.com/agenticML/agenticml-lite/edit/main/website/',
 			},
 			routeMiddleware: './src/routeData.ts',
 			components: {

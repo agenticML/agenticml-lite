@@ -10,7 +10,7 @@ sidebar:
 
 Every run, sync key and membership on `https://app.agenticml.xyz` belongs to one workspace. A workspace has its own address, `https://app.agenticml.xyz/w/<slug>/`. If you belong to more than one, the workspace switcher is under **Settings > Account**. Every page's top bar has a **Workspaces** link back to your workspace list and **Sign out**.
 
-The server treats a workspace you do not belong to as if it did not exist: it answers "not found" to a key, a session or an address from another workspace. A live check of this on the hosted service is still on the [open list](/agenticml-lite/hosted/status/).
+The server treats a workspace you do not belong to as if it did not exist: it answers "not found" to a key, a session or an address from another workspace. A live check of this on the hosted service is still on the [open list](/hosted/status/).
 
 ## Roles
 
@@ -49,13 +49,13 @@ Open **Settings** in the top bar. What you see depends on your role.
 - **Account:** your user, role and sign-in method, the workspace switcher, and sign out. Servers without Firebase sign-in also show a password form.
 - **Workspace:** name, slug, plan and **Usage** (storage, daily uploads, requests per minute and people against the free plan limits). Owners and admins only.
 - **Members:** people, roles, invites and pending invites. Owners and admins only.
-- **API keys:** your sync keys, with a **New key** button. Owners and admins also see the keys of other people and can make one for a person with the **User** field. A key is shown once, when it is made. See [Sign-in and sync keys](/agenticml-lite/hosted/keys/).
+- **API keys:** your sync keys, with a **New key** button. Owners and admins also see the keys of other people and can make one for a person with the **User** field. A key is shown once, when it is made. See [Sign-in and sync keys](/hosted/keys/).
 - **Activity:** recent audit events. Owners and admins only.
 - **Usage banner:** a banner at the top of the dashboard appears when storage or daily uploads pass 80% of the limit, and again when the limit is reached.
 
 Viewers see only Account. Members see Account and API keys. The switcher appears only if you belong to more than one workspace, open sign-up is on, or you are a server admin.
 
-Only the operator can delete a workspace. Send deletion requests to [contact@agenticml.xyz](mailto:contact@agenticml.xyz), as the [Privacy policy](/agenticml-lite/legal/privacy/) describes. The operator confirms privately which workspace is yours before deleting anything. Do not post your workspace slug, email or run data in a public GitHub issue.
+Only the operator can delete a workspace. Send deletion requests to [contact@agenticml.xyz](mailto:contact@agenticml.xyz), as the [Privacy policy](/legal/privacy/) describes. The operator confirms privately which workspace is yours before deleting anything. Do not post your workspace slug, email or run data in a public GitHub issue.
 
 ## Several workspaces from one machine
 

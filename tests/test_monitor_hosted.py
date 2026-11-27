@@ -151,7 +151,7 @@ def test_external_links_keeps_only_real_deduplicated_urls(tmp_path):
             "https://app.example.test/a https://foo.invalid https://my.localhost/\n"
             "`pip install git+https://github.com/agenticML/agenticml-lite`\n"
             "Ours: https://app.agenticml.xyz/login https://api.agenticml.xyz https://docs.agenticml.xyz/a "
-            "https://agenticml.github.io/agenticml-lite/hosted/\n"
+            "https://agenticml.github.io/agenticml-lite/hosted/ https://agenticml.xyz/hosted/ https://www.agenticml.xyz/\n"
             "Elided https://... and https://<machine>\n"
             "Raw: https://raw.githubusercontent.com/agenticML/agenticml-lite/main/deploy/systemd/a.service "
             "https://raw.githubusercontent.com/agenticML/agenticml-lite/v3.0.0/deploy/systemd/a.service\n"

@@ -49,7 +49,7 @@ No admin key yet. Open <url>/setup?token=<token> to create one, or run: agenticm
 
 Open `/setup?token=<token>` in a browser to create the initial admin key and sign in to the default workspace.
 
-When Firebase sign-in is on, `/setup` returns 404. Use `--admin-emails` (see [Installation and deployment](/agenticml-lite/server/install/#configuration-options)) or the CLI instead.
+When Firebase sign-in is on, `/setup` returns 404. Use `--admin-emails` (see [Installation and deployment](/server/install/#configuration-options)) or the CLI instead.
 
 Alternatively, create an account and invite link directly using the CLI:
 
@@ -144,4 +144,4 @@ Sessions are persisted in the database (`sessions` table) with a 12-hour idle ti
 
 ## Next
 
-Continue to [Syncing runs](/agenticml-lite/server/sync/) to connect training machines.
+Continue to [Syncing runs](/server/sync/) to connect training machines.

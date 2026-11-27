@@ -2052,7 +2052,7 @@ def make_server(root, host="127.0.0.1", port=6006, read_only=False) -> Threading
     return cls(root, host, port, read_only)
 
 
-_DOCS_URL = "https://agenticml.github.io/agenticml-lite/"
+_DOCS_URL = "https://agenticml.xyz/"
 _REPO_URL = "https://github.com/agenticML/agenticml-lite"
 
 

@@ -433,10 +433,29 @@ forwarded to mine"); `--contact-email` sets the operator's own address or
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 37 | Contact us button on the docs site and the dashboard | – | Sonnet (code and docs); supervisor reviews | S–M | [plan](packages/37-contact-us.md) | in review |
-| 37.1 | Docs site: floating Contact us button on every page (email, copy address, GitHub Discussions, new issue); overflow check | – | Sonnet | S | [plan](packages/37-contact-us.md#371-docs-site-button) | in review |
-| 37.2 | Server `--contact-email` (default: Feedback to the agenticml-lite team; an address; or `off`), contact and version in the session payload, dashboard button, picker and Firebase sign-in links; UI tests | – | Sonnet | M | [plan](packages/37-contact-us.md#372-server-option-and-dashboard-button) | in review |
-| 37.3 | Hosted template sets the address; facts test; SERVER.md, threat model and deploy README | 37.2 | Sonnet | S | [plan](packages/37-contact-us.md#373-hosted-template-and-docs) | in review |
+| 37 | Contact us button on the docs site and the dashboard | – | Sonnet (code and docs); supervisor reviews | S–M | [plan](packages/37-contact-us.md) | done ([#101](https://github.com/agenticML/agenticml-lite/pull/101), merged Nov 25, 2026) |
+| 37.1 | Docs site: floating Contact us button on every page (email, copy address, GitHub Discussions, new issue); overflow check | – | Sonnet | S | [plan](packages/37-contact-us.md#371-docs-site-button) | done ([#101](https://github.com/agenticML/agenticml-lite/pull/101)) |
+| 37.2 | Server `--contact-email` (default: Feedback to the agenticml-lite team; an address; or `off`), contact and version in the session payload, dashboard button, picker and Firebase sign-in links; UI tests | – | Sonnet | M | [plan](packages/37-contact-us.md#372-server-option-and-dashboard-button) | done ([#101](https://github.com/agenticML/agenticml-lite/pull/101)) |
+| 37.3 | Hosted template sets the address; facts test; SERVER.md, threat model and deploy README | 37.2 | Sonnet | S | [plan](packages/37-contact-us.md#373-hosted-template-and-docs) | done ([#101](https://github.com/agenticML/agenticml-lite/pull/101)) |
+
+### Docs site at agenticml.xyz and blog
+
+Added Nov 27, 2026 (owner: "now i want to add a blog on the agenticml-lite").
+Before the first post, the docs site moves from
+`agenticml.github.io/agenticml-lite/` to `https://agenticml.xyz/`, so post
+links never move. The owner chose `agenticml.xyz` over `docs.agenticml.xyz`
+and over `app.agenticml.xyz/docs` (same day). The blog goes in the same
+Starlight site at `/blog/`. Replaces the Backlog entry "Docs custom domain".
+
+| # | Package | Depends on | Coder | Size | Plan | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| 38 | Docs site at `agenticml.xyz` | – | Sonnet; owner DNS and Pages | S–M | [plan](packages/38-site-domain.md) | in progress |
+| 38.1 | Root-path build: drop the `/agenticml-lite` base, rewrite links, new URL across the repo, guard test | – | Sonnet | S–M | [plan](packages/38-site-domain.md#part-381-root-path-build-sonnet) | in review |
+| 38.2 | Cutover: Namecheap `A`/`www` records, merge, Pages custom domain, Enforce HTTPS | 38.1 | Owner | S | [plan](packages/38-site-domain.md#part-382-cutover-owner) | not started |
+| 38.3 | `HOSTED_LEGAL_BASE_URL` to `https://agenticml.xyz/legal/` and hosted deploy | 38.2 | Owner | S | [plan](packages/38-site-domain.md#part-383-hosted-policy-links-owner) | not started |
+| 39 | Blog at `agenticml.xyz/blog/`: `starlight-blog` plugin, post list, tags, RSS, header link, first post | 38.1 (live after 38.2) | Sonnet; prose Antigravity | M | [plan](packages/39-blog.md) | plan ready |
+| 39.1 | Blog section: plugin pinned at 0.30.2, schema, header link, overflow and RSS checks, facts test | 38.1 | Sonnet | S–M | [plan](packages/39-blog.md#part-391-blog-section-sonnet) | plan ready |
+| 39.2 | First post: the docs and blog now live at agenticml.xyz | 39.1 | Antigravity; supervisor checks | S | [plan](packages/39-blog.md#part-392-first-post-antigravity-writes-it-the-supervisor-checks-it) | plan ready |
 
 ### Maintenance fixes
 
@@ -804,28 +823,7 @@ on Nov 17, 2026; none of the entries below blocked it.
     --install` once on Linux and remove it.
   - Done when: those steps pass, or each mismatch is fixed with a test built
     from the captured JSON in `tests/test_server_up.py`.
-- **Docs custom domain** (package 29, decision D8, Nov 13, 2026). Not needed
-  for 3.0.0: PyPI's Documentation URL may stay on github.io, which GitHub
-  redirects to the custom domain once it is set.
-  - Where: `website/astro.config.mjs` (`site`, `base`), `website/public/CNAME`,
-    internal `/agenticml-lite/` links in `website/src/content/docs` (also
-    `href="..."` and frontmatter `link:` forms), `website/scripts/overflow-check.mjs`,
-    `pyproject.toml` `Documentation`, `HOSTED_LEGAL_BASE_URL`; Namecheap; Pages
-    settings.
-  - Problem: the docs live at `agenticml.github.io/agenticml-lite/`, and
-    `agenticml.xyz` has no `docs` record. Enforce HTTPS cannot be turned on for
-    the github.io project URL ("The certificate does not exist yet").
-  - Fix, in this order (Astro's `base` changes asset URLs, so the domain and
-    the root-path build must go live together): (1) Sonnet prepares the
-    root-path build (drop `base`, rewrite internal links, redirects from
-    `/agenticml-lite/*`, CNAME file, overflow check, `pyproject.toml`) on a
-    branch; (2) owner adds the Namecheap CNAME `docs` → `agenticml.github.io.`
-    (never touch `app`); (3) owner sets the Pages custom domain and, at once,
-    the build is deployed (merge to `main` or dispatch `docs.yml`); (4) tick
-    Enforce HTTPS once the certificate exists; (5) set `HOSTED_LEGAL_BASE_URL`
-    to `https://docs.agenticml.xyz/legal/` and run the deploy.
-  - Done when: `https://docs.agenticml.xyz` serves the site with HTTPS
-    enforced, old github.io URLs redirect, and the link check passes.
+- **Docs custom domain**: moved to package 38 ([plan](packages/38-site-domain.md)), Nov 27, 2026.
 
 ### Code and dashboard follow-ups
 

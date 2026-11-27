@@ -12,7 +12,7 @@ pip install agenticml-lite
 ```
 
 :::note[Which version you get]
-`pip install agenticml-lite` installs 3.3.1, which adds the self-hosted server and the hosted service. To stay on the 1.0.0 local tracker, which cannot sync to a server, run `pip install agenticml-lite==1.0.0`. See [Releases](/agenticml-lite/releases/) for what each version includes.
+`pip install agenticml-lite` installs 3.3.1, which adds the self-hosted server and the hosted service. To stay on the 1.0.0 local tracker, which cannot sync to a server, run `pip install agenticml-lite==1.0.0`. See [Releases](/releases/) for what each version includes.
 :::
 
 ## Optional extras
@@ -38,4 +38,4 @@ These extras are for the server. They need version 3.0 (see above).
 
 ## Next
 
-Continue to the [quickstart](/agenticml-lite/getting-started/quickstart/).
+Continue to the [quickstart](/getting-started/quickstart/).

@@ -31,9 +31,9 @@ agenticml.init(project="demo", name="exp1", id=run_id, resume="allow")
 | `"allow"` | Opens the run, or creates it if missing. |
 | `"must"` | Errors if the run is missing. |
 
-A pruned run (see [Storage](/agenticml-lite/reference/storage/)) cannot be resumed (its overview is present, but the raw series file is gone).
+A pruned run (see [Storage](/reference/storage/)) cannot be resumed (its overview is present, but the raw series file is gone).
 
-Under `agenticml run`, use `--id` and `--resume` instead. They are described in [Resuming a run](/agenticml-lite/guides/zero-code/#resuming-a-run).
+Under `agenticml run`, use `--id` and `--resume` instead. They are described in [Resuming a run](/guides/zero-code/#resuming-a-run).
 
 ```bash
 agenticml run --id 20261101T130355-1cded4a7 --resume must -- python train.py

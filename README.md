@@ -2,7 +2,7 @@
 
 Experiment tracking for machine learning that runs from files on disk. A W&B-style Python API, a local dashboard, and no server to run.
 
-[![PyPI](https://img.shields.io/pypi/v/agenticml-lite)](https://pypi.org/project/agenticml-lite/) [![Python versions](https://img.shields.io/pypi/pyversions/agenticml-lite)](https://pypi.org/project/agenticml-lite/) [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/agenticML/agenticml-lite/blob/main/LICENSE) [![Tests](https://github.com/agenticML/agenticml-lite/actions/workflows/test.yml/badge.svg)](https://github.com/agenticML/agenticml-lite/actions/workflows/test.yml) [![Docs](https://img.shields.io/badge/docs-agenticml.github.io-blue)](https://agenticml.github.io/agenticml-lite/)
+[![PyPI](https://img.shields.io/pypi/v/agenticml-lite)](https://pypi.org/project/agenticml-lite/) [![Python versions](https://img.shields.io/pypi/pyversions/agenticml-lite)](https://pypi.org/project/agenticml-lite/) [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/agenticML/agenticml-lite/blob/main/LICENSE) [![Tests](https://github.com/agenticML/agenticml-lite/actions/workflows/test.yml/badge.svg)](https://github.com/agenticML/agenticml-lite/actions/workflows/test.yml) [![Docs](https://img.shields.io/badge/docs-agenticml.xyz-blue)](https://agenticml.xyz/)
 
 ![Demo of the agenticml dashboard: a training run's curves growing live, then the lineage graph of a task's runs: the best path from the root run to the best one, what each step changed in params and code and what it did to val_loss, a crashed branch, and the best path compared](https://raw.githubusercontent.com/agenticML/agenticml-lite/main/docs/assets/demo-lineage.gif)
 
@@ -66,19 +66,19 @@ Checked November 2026. If something here is wrong or out of date, please open an
 
 ## Share runs with a team
 
-- Run your own server with `agenticml server serve`. See [Installation and deployment](https://agenticml.github.io/agenticml-lite/server/install/) and [Authentication and keys](https://agenticml.github.io/agenticml-lite/server/keys/). Inside a private network or lab VPC, see [Private networks](https://agenticml.github.io/agenticml-lite/server/private-network/). To deploy in your own AWS account with CloudFormation, see [Deploy on AWS](https://agenticml.github.io/agenticml-lite/server/deploy-on-aws/).
-- On each training machine, run `agenticml login --host https://your-server` and then `agenticml sync --all`, or `agenticml sync --follow` to keep syncing. See [Syncing runs](https://agenticml.github.io/agenticml-lite/server/sync/).
-- Or use the hosted service in public preview at app.agenticml.xyz. See the [hosted quickstart](https://agenticml.github.io/agenticml-lite/hosted/quickstart/).
+- Run your own server with `agenticml server serve`. See [Installation and deployment](https://agenticml.xyz/server/install/) and [Authentication and keys](https://agenticml.xyz/server/keys/). Inside a private network or lab VPC, see [Private networks](https://agenticml.xyz/server/private-network/). To deploy in your own AWS account with CloudFormation, see [Deploy on AWS](https://agenticml.xyz/server/deploy-on-aws/).
+- On each training machine, run `agenticml login --host https://your-server` and then `agenticml sync --all`, or `agenticml sync --follow` to keep syncing. See [Syncing runs](https://agenticml.xyz/server/sync/).
+- Or use the hosted service in public preview at app.agenticml.xyz. See the [hosted quickstart](https://agenticml.xyz/hosted/quickstart/).
 
 ## Documentation
 
-Docs site: <https://agenticml.github.io/agenticml-lite/>
+Docs site: <https://agenticml.xyz/>
 
-- Getting started: [Installation](https://agenticml.github.io/agenticml-lite/getting-started/installation/), [Quickstart](https://agenticml.github.io/agenticml-lite/getting-started/quickstart/)
-- Guides: [Zero-code runs](https://agenticml.github.io/agenticml-lite/guides/zero-code/), [Python SDK](https://agenticml.github.io/agenticml-lite/guides/python-sdk/), [Dashboard](https://agenticml.github.io/agenticml-lite/guides/dashboard/), [Distributed, resume, disabled](https://agenticml.github.io/agenticml-lite/guides/distributed/)
-- Reference: [Storage and disk](https://agenticml.github.io/agenticml-lite/reference/storage/), [Configuration](https://agenticml.github.io/agenticml-lite/reference/configuration/)
-- Server: [Install](https://agenticml.github.io/agenticml-lite/server/install/), [Keys](https://agenticml.github.io/agenticml-lite/server/keys/), [Sync](https://agenticml.github.io/agenticml-lite/server/sync/), [Backups](https://agenticml.github.io/agenticml-lite/server/backups/), [Upgrade](https://agenticml.github.io/agenticml-lite/server/upgrade/), [Private networks](https://agenticml.github.io/agenticml-lite/server/private-network/), [Deploy on AWS](https://agenticml.github.io/agenticml-lite/server/deploy-on-aws/)
-- [Hosted service](https://agenticml.github.io/agenticml-lite/hosted/) and [Releases](https://agenticml.github.io/agenticml-lite/releases/)
+- Getting started: [Installation](https://agenticml.xyz/getting-started/installation/), [Quickstart](https://agenticml.xyz/getting-started/quickstart/)
+- Guides: [Zero-code runs](https://agenticml.xyz/guides/zero-code/), [Python SDK](https://agenticml.xyz/guides/python-sdk/), [Dashboard](https://agenticml.xyz/guides/dashboard/), [Distributed, resume, disabled](https://agenticml.xyz/guides/distributed/)
+- Reference: [Storage and disk](https://agenticml.xyz/reference/storage/), [Configuration](https://agenticml.xyz/reference/configuration/)
+- Server: [Install](https://agenticml.xyz/server/install/), [Keys](https://agenticml.xyz/server/keys/), [Sync](https://agenticml.xyz/server/sync/), [Backups](https://agenticml.xyz/server/backups/), [Upgrade](https://agenticml.xyz/server/upgrade/), [Private networks](https://agenticml.xyz/server/private-network/), [Deploy on AWS](https://agenticml.xyz/server/deploy-on-aws/)
+- [Hosted service](https://agenticml.xyz/hosted/) and [Releases](https://agenticml.xyz/releases/)
 - In the repository: [docs/SDK.md](https://github.com/agenticML/agenticml-lite/blob/main/docs/SDK.md), [docs/FORMAT.md](https://github.com/agenticML/agenticml-lite/blob/main/docs/FORMAT.md), [docs/PROTOCOL.md](https://github.com/agenticML/agenticml-lite/blob/main/docs/PROTOCOL.md), [docs/SERVER.md](https://github.com/agenticML/agenticml-lite/blob/main/docs/SERVER.md), [docs/HOSTED.md](https://github.com/agenticML/agenticml-lite/blob/main/docs/HOSTED.md), [docs/THREAT_MODEL.md](https://github.com/agenticML/agenticml-lite/blob/main/docs/THREAT_MODEL.md)
 
 ## Contributing

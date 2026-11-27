@@ -13,8 +13,9 @@ import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
 
 const DIST = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'dist');
-const BASE = '/agenticml-lite';
-const SITE_ORIGIN = 'https://agenticml.github.io';
+// The site is served at the root, so there is no base path.
+const BASE = '';
+const SITE_ORIGIN = 'https://agenticml.xyz';
 const WIDTH = 375;
 const HEIGHT = 812;
 const THEMES = ['light', 'dark'];

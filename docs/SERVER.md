@@ -55,7 +55,7 @@ Start the server using `agenticml server serve`:
 agenticml server serve --data /var/lib/agenticml-server --host 127.0.0.1 --port 8080 --public-url https://aml.example.com
 ```
 
-To deploy in your own AWS account with a CloudFormation template (EC2, SQLite, ALB, Cognito), see [Deploy on AWS](https://agenticml.github.io/agenticml-lite/server/deploy-on-aws/).
+To deploy in your own AWS account with a CloudFormation template (EC2, SQLite, ALB, Cognito), see [Deploy on AWS](https://agenticml.xyz/server/deploy-on-aws/).
 
 ### Quick start on a workstation: `server up`
 

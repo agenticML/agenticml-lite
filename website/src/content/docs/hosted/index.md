@@ -10,15 +10,15 @@ sidebar:
 
 The hosted service is the agenticml server, run for you at `https://app.agenticml.xyz`. You sign in, sync runs from your training machines, and share a dashboard with your team. There is nothing to install or run on the server side.
 
-It runs the same open-source server code as the [self-hosted server](/agenticml-lite/server/).
+It runs the same open-source server code as the [self-hosted server](/server/).
 
 :::note[Public preview]
-The hosted service is a public preview. It runs on a best-effort basis, with no SLA. It runs one server task and a database in one availability zone, so an outage is possible. See the [service status](/agenticml-lite/hosted/status/) page for what has been checked and what has not.
+The hosted service is a public preview. It runs on a best-effort basis, with no SLA. It runs one server task and a database in one availability zone, so an outage is possible. See the [service status](/hosted/status/) page for what has been checked and what has not.
 :::
 
 ## Sign-up
 
-Open sign-up is on as of Nov 13, 2026. By signing up you agree to the [terms of service](/agenticml-lite/legal/terms/), [acceptable use policy](/agenticml-lite/legal/acceptable-use/) and [privacy policy](/agenticml-lite/legal/privacy/). Sign in with a verified Google or email account, and if you have no account yet you get one free personal workspace. If sign-up is turned off, you need an invite from a workspace admin.
+Open sign-up is on as of Nov 13, 2026. By signing up you agree to the [terms of service](/legal/terms/), [acceptable use policy](/legal/acceptable-use/) and [privacy policy](/legal/privacy/). Sign in with a verified Google or email account, and if you have no account yet you get one free personal workspace. If sign-up is turned off, you need an invite from a workspace admin.
 
 ## Local, self-hosted or hosted
 
@@ -28,13 +28,13 @@ Open sign-up is on as of Nov 13, 2026. By signing up you agree to the [terms of 
 | Cost | Free | Free; you pay for your own hardware | Free plan only; no paid plan yet |
 | Sign-in | None | Passwords and invite links, a trusted identity proxy, or Firebase | Google, or email and password |
 | Teams | One person | Workspaces with roles | Workspaces with roles, up to 5 people on the free plan |
-| Setup | `pip install agenticml-lite` | [Install 3.0 and run the server](/agenticml-lite/server/install/) | [Sign up and install the 3.0 client](/agenticml-lite/hosted/quickstart/) |
+| Setup | `pip install agenticml-lite` | [Install 3.0 and run the server](/server/install/) | [Sign up and install the 3.0 client](/hosted/quickstart/) |
 
 Choose local tracking if you work alone on one machine. Choose the hosted service if you want a shared dashboard and sync from several machines without running a server. Choose self-hosting if your data must stay on your own hardware.
 
 ### How machines connect
 
-Training machines connect to the hosted service using sync keys generated in the dashboard. Each key is bound to one workspace and one user, and authenticated requests use HTTPS. See [Sign-in and sync keys](/agenticml-lite/hosted/keys/).
+Training machines connect to the hosted service using sync keys generated in the dashboard. Each key is bound to one workspace and one user, and authenticated requests use HTTPS. See [Sign-in and sync keys](/hosted/keys/).
 
 ## Free plan and limits
 
@@ -56,9 +56,9 @@ The dashboard warns you when storage or daily uploads pass 80% of the limit. `ag
 
 **Workspace data.** Everything a sync uploads: run metadata and config, metric series and summaries, event logs, media, copied artifacts, and code snapshots with their lineage history. A run's local note (`notes.md`) is not uploaded. By-reference artifacts are uploaded only with `sync --artifacts`.
 
-**Where.** All of it runs in AWS region `us-east-2` (Ohio): run metadata in a PostgreSQL database, run files on network file storage, and objects (code, media, copied artifacts) in S3. All three are set up to encrypt data at rest. On Nov 16, 2026 the stored objects were checked: they are encrypted and match the bytes that were uploaded (see [service status](/agenticml-lite/hosted/status/)).
+**Where.** All of it runs in AWS region `us-east-2` (Ohio): run metadata in a PostgreSQL database, run files on network file storage, and objects (code, media, copied artifacts) in S3. All three are set up to encrypt data at rest. On Nov 16, 2026 the stored objects were checked: they are encrypted and match the bytes that were uploaded (see [service status](/hosted/status/)).
 
-**Backups.** The database and file storage have daily backups kept for up to 35 days, and the database also allows point-in-time recovery for 7 days. S3 keeps old object versions for 30 days. On Nov 16, 2026 a restore of the database, files and objects into a separate test service passed (see [service status](/agenticml-lite/hosted/status/)). Deleted data can stay in backups for up to 35 days.
+**Backups.** The database and file storage have daily backups kept for up to 35 days, and the database also allows point-in-time recovery for 7 days. S3 keeps old object versions for 30 days. On Nov 16, 2026 a restore of the database, files and objects into a separate test service passed (see [service status](/hosted/status/)). Deleted data can stay in backups for up to 35 days.
 
 **Staff access.** A server administrator gets "not found" for a workspace they are not a member of. Support staff see a workspace only if a workspace admin invites a support account, and that is recorded in the workspace audit log.
 
@@ -68,7 +68,7 @@ Use [GitHub Issues](https://github.com/agenticML/agenticml-lite/issues) and put 
 
 ## Next steps
 
-- [Hosted quickstart](/agenticml-lite/hosted/quickstart/): sign up, make a sync key, and sync your first run.
-- [Sign-in and sync keys](/agenticml-lite/hosted/keys/): authentication, machine setup, key rotation, and sessions.
-- [Workspaces and team](/agenticml-lite/hosted/workspaces/): roles, invites, and several workspaces from one machine.
-- [Service status](/agenticml-lite/hosted/status/): what is live, what is being checked, and what is still open.
+- [Hosted quickstart](/hosted/quickstart/): sign up, make a sync key, and sync your first run.
+- [Sign-in and sync keys](/hosted/keys/): authentication, machine setup, key rotation, and sessions.
+- [Workspaces and team](/hosted/workspaces/): roles, invites, and several workspaces from one machine.
+- [Service status](/hosted/status/): what is live, what is being checked, and what is still open.

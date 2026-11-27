@@ -1,6 +1,6 @@
 # agenticml SDK: quick test guide
 
-A short guide for trying the SDK by hand. Install as `agenticml-lite`, import as `agenticml`. Runs are written to local files. No server or API key is needed until you choose to sync. The full reference is on the [docs site](https://agenticml.github.io/agenticml-lite/).
+A short guide for trying the SDK by hand. Install as `agenticml-lite`, import as `agenticml`. Runs are written to local files. No server or API key is needed until you choose to sync. The full reference is on the [docs site](https://agenticml.xyz/).
 
 ## 1. Set up
 
