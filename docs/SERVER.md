@@ -753,6 +753,7 @@ Additional environment variables:
 - `AGENTICML_SERVER_KEY`: Static admin API key named `env` kept in memory. Bound to the `default` workspace.
 - `AGENTICML_SERVER_S3_ENDPOINT_URL`: Custom S3 endpoint URL for MinIO, LocalStack, or VPC endpoints.
 - `AGENTICML_SERVER_S3_KMS_KEY_ID`: AWS KMS Key ID or ARN for S3 server-side encryption (`aws:kms`).
+- `AGENTICML_SERVER_DATABASE_PASSWORD_SECRET`: Optional, Postgres only. The ARN or name of an AWS Secrets Manager secret whose JSON value has a `password` key (the format of an RDS-managed master password secret). When Postgres refuses a new connection with `password authentication failed`, for example after RDS rotated the password, the server reads the secret, retries once with the password in it, and keeps using it; no restart is needed. It reads the secret at most once every 30 seconds and logs `database password refreshed from the secret` on success. The task or instance role needs `secretsmanager:GetSecretValue` on the secret, and `boto3` (included in `[hosted]`) must be installed; the region comes from `AWS_REGION` or `AWS_DEFAULT_REGION`. Unset (the default): the server never contacts Secrets Manager and uses the password in the database URL or `PGPASSWORD`.
 - `AGENTICML_REMOTE_STALE_SECONDS`: Inactivity threshold before an active run is marked `stale` (default `600`).
 
 ### Client options

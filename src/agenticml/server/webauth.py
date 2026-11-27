@@ -30,6 +30,7 @@ from agenticml.ui.server import (
 from agenticml import __version__
 from . import keyspage
 from .db import DatabaseError
+from .ratelog import log_unavailable
 from .oidc import CALLBACK_PATH, START_PATH
 from .keys import ClientError, KeyStoreUnavailable, validate_name
 from .users import (
@@ -834,7 +835,9 @@ class WebAuth:
                 except OSError:
                     handler.close_connection = True
             return True
-        except (KeyStoreUnavailable, DatabaseError):
+        except (KeyStoreUnavailable, DatabaseError) as exc:
+            log_unavailable(logger, "dashboard request failed: database unavailable",
+                            exc, handler.command, handler.path)
             if not getattr(handler, "_started", False):
                 handler._error({"error": "key store unavailable"}, 503)
             return True

@@ -442,11 +442,23 @@ Resources:
       Parameters:
         rds.force_ssl: "1"
 
+  # RDS creates and fills this group when the log export is on; naming it here
+  # gives it the 30-day retention (RDS would create it without any).
+  RdsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/rds/instance/agenticml-hosted/postgresql
+      RetentionInDays: 30
+
   # The master password lives in an RDS-managed secret (MasterUserSecret).
+  # RDS rotates it every 7 days; the task reads the current value from the
+  # secret (AGENTICML_SERVER_DATABASE_PASSWORD_SECRET) when a connection is refused.
   # Deletion protection stays on, so deleting this stack needs it switched
   # off first; a final snapshot is taken either way.
   DbInstance:
     Type: AWS::RDS::DBInstance
+    # The log group first, so RDS does not create it without retention.
+    DependsOn: RdsLogGroup
     DeletionPolicy: Snapshot
     UpdateReplacePolicy: Snapshot
     Metadata:
@@ -477,6 +489,9 @@ Resources:
       EnablePerformanceInsights: false
       CopyTagsToSnapshot: true
       AutoMinorVersionUpgrade: true
+      # Without this the FATAL lines (for example a refused password) exist only
+      # in the RDS console log files. Switching it on does not restart the instance.
+      EnableCloudwatchLogsExports: [postgresql]
 
   # ---- File system ------------------------------------------------------
   # The policy is a property of the file system, which the access point
@@ -664,6 +679,12 @@ Resources:
             Condition:
               StringEquals:
                 cloudwatch:namespace: AgenticML/Server
+          # The running server re-reads the RDS-managed password after a rotation
+          # (the execution role's grant only covers the start of a task). The secret
+          # uses the AWS managed key (aws/secretsmanager), so no kms:Decrypt statement.
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !GetAtt DbInstance.MasterUserSecret.SecretArn
 
   # ---- Load balancer ----------------------------------------------------
   LoadBalancer:
@@ -816,6 +837,8 @@ Resources:
               - !Ref AWS::NoValue
             - Name: AWS_REGION
               Value: !Ref AWS::Region
+            - Name: AGENTICML_SERVER_DATABASE_PASSWORD_SECRET
+              Value: !GetAtt DbInstance.MasterUserSecret.SecretArn
           Secrets:
             - Name: PGPASSWORD
               ValueFrom: !Sub "${DbInstance.MasterUserSecret.SecretArn}:password::"
