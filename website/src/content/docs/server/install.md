@@ -130,10 +130,11 @@ The unit's `StateDirectory=agenticml-server` automatically manages `/var/lib/age
 | `--contact-email ADDRESS\|off` | `AGENTICML_SERVER_CONTACT_EMAIL` | unset | Where the dashboard's contact button writes. Unset shows a **Feedback** button that writes to the agenticml-lite team. An address shows a **Contact us** button that writes to that address. `off` shows no button. The button only opens the user's email app; the server sends nothing. See [Contact and feedback button](https://github.com/agenticML/agenticml-lite/blob/main/docs/SERVER.md#contact-and-feedback-button). |
 | `--min-client-version X.Y` | `AGENTICML_SERVER_MIN_CLIENT_VERSION` | `2.2` | Reject `agenticml-lite` clients older than `X.Y` on `/v2` requests with HTTP 426. |
 
-Two more environment variables apply to S3 object storage:
+Three more environment variables apply to S3 object storage and Postgres:
 
 - `AGENTICML_SERVER_S3_ENDPOINT_URL`: custom S3 endpoint, for MinIO, LocalStack or a VPC endpoint.
 - `AGENTICML_SERVER_S3_KMS_KEY_ID`: AWS KMS key ID or ARN. Uploads then use `aws:kms` encryption instead of `AES256`.
+- `AGENTICML_SERVER_DATABASE_PASSWORD_SECRET`: optional ARN or name of an AWS Secrets Manager secret whose JSON has a `password` key (an RDS-managed master password secret). If Postgres refuses a new connection because the password was rotated, the server re-reads the secret and retries once, so no restart is needed. Needs `secretsmanager:GetSecretValue` and `boto3` (in `[hosted]`). Unset: the server never calls Secrets Manager.
 
 ## Next
 

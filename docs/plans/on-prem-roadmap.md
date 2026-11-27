@@ -509,6 +509,16 @@ Starlight site at `/blog/`. Replaces the Backlog entry "Docs custom domain".
   test: [plan](packages/docs-hosted-keys.md); status: in review (PR to
   `main`; Antigravity drafted, Sonnet wrote the test and fixes, supervisor
   fact-checked).
+- † The hosted dashboard stopped loading after RDS rotated its managed
+  database password (rotation is automatic every 7 days): the running task
+  kept the old `PGPASSWORD`, so every new Postgres connection failed, one of
+  the three dashboard scripts answered 503 on each load, and the server logged
+  nothing. The server now re-reads the password from Secrets Manager when a new
+  connection is refused, logs database failures, and RDS Postgres logs go to
+  CloudWatch: [plan](packages/fix-db-password-rotation.md), found Nov 27, 2026
+  (owner report of a slow dashboard; mitigated the same day by restarting the
+  service); status: in review (PR to `main`; Sonnet coded, supervisor
+  reviewed and did the † second review).
 
 ### Later (unscheduled)
 
@@ -836,6 +846,42 @@ on Nov 17, 2026; none of the entries below blocked it.
 - **Docs custom domain**: moved to package 38 ([plan](packages/38-site-domain.md)), Nov 27, 2026.
 
 ### Code and dashboard follow-ups
+
+Found with the database password rotation fix
+([plan](packages/fix-db-password-rotation.md), Nov 27, 2026), by priority:
+
+- **Owner: re-apply the bootstrap stack, then deploy the rotation fix.**
+  - Where: `deploy/aws/cloudformation/bootstrap.yaml` (CloudFormation role may
+    now manage `/aws/rds/instance/agenticml-hosted/*` log groups), then the
+    hosted deploy of the fix.
+  - Problem: the hosted template now creates the RDS log group; the deploy
+    fails if the bootstrap stack has not granted that first. Until the fix is
+    deployed, the next rotation (Dec 3, 2026) breaks the dashboard again.
+  - Fix: re-apply bootstrap, merge, approve the hosted deploy before Dec 3.
+  - Done when: the RDS log group exists with 30-day retention and the Dec 3
+    rotation causes no 503s (ALB 5xx stays 0; the server log shows
+    `database password refreshed` on the first new connection after it).
+- **Dashboard: one failed script blanks the whole page.**
+  - Where: `src/agenticml/ui/static/app.js` (static `import` of `charts.js`,
+    `code.js`, `codediff.js`).
+  - Problem: if any of the three fails to load, the `app.js` module never
+    runs; the page never makes an API call and looks like it is still loading.
+  - Fix: catch module-load failure (for example a small loader that imports
+    `app.js` dynamically) and show an error with a Retry button.
+  - Done when: a UI test that answers 503 for `charts.js` once shows the error,
+    and Retry loads the dashboard.
+- **Static assets: no compression and no long-lived caching.**
+  - Where: `ui/server.py` static branch (`Cache-Control: no-cache` /
+    `private, no-cache`), the public assets in `server/webauth.py`
+    (`no-store`), the hosted ALB.
+  - Problem: every dashboard load fetches or revalidates about 450 KB of
+    uncompressed JS, CSS and fonts at one round trip each (about 0.25 s per round
+    trip from a distant region).
+  - Fix: gzip text assets when the client accepts it, and serve versioned
+    URLs (`app.js?v=<hash>`) with `immutable, max-age=31536000`.
+  - Done when: a test checks `Content-Encoding: gzip` and the immutable
+    header on versioned URLs, and a repeat dashboard load fetches no static
+    file.
 
 Found with the cross-host lineage diff fix
 ([plan](packages/fix-lineage-diff-cross-host-parent.md), Nov 22, 2026). None

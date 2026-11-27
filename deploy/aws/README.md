@@ -1017,12 +1017,39 @@ emergency or for the temporary task count described under Operations and
 scaling, and put any lasting change into the workflow or the GitHub
 environment.
 
-Rotating the RDS-managed database password in Secrets Manager requires forcing
-a new ECS task deployment so tasks fetch the new secret:
+RDS rotates the managed database password in Secrets Manager every 7 days.
+ECS injects `PGPASSWORD` only when a task starts, so a long-running task holds
+the old value. The task definition therefore also sets
+`AGENTICML_SERVER_DATABASE_PASSWORD_SECRET` to the secret's ARN, and the task
+role may read that one secret (`secretsmanager:GetSecretValue`). When Postgres
+refuses a new connection with `password authentication failed`, the server
+reads the current password from the secret, retries once, and logs
+`database password refreshed from the secret`. It reads the secret at most once
+every 30 seconds. No restart is needed after a rotation. On an older stack that
+does not set the variable yet, force a new deployment after each rotation so
+tasks start with the new secret:
 
 ```sh
 aws ecs update-service --cluster agenticml-hosted --service agenticml-hosted --force-new-deployment
 ```
+
+The stack also exports the RDS Postgres log to CloudWatch Logs, in the log group
+`/aws/rds/instance/agenticml-hosted/postgresql` (30-day retention). Look there
+for `FATAL` lines such as a refused password:
+
+```sh
+aws logs filter-log-events --log-group-name /aws/rds/instance/agenticml-hosted/postgresql \
+  --filter-pattern FATAL --start-time "$(($(date +%s) - 3600))000"
+```
+
+Re-apply the bootstrap stack from your laptop **before** the hosted deploy that
+adds this log group: the CloudFormation role needs the new
+`/aws/rds/instance/agenticml-hosted/*` log group permission to create it, and
+without it the deploy fails with `AccessDenied` and CloudFormation rolls back.
+Enabling the export does not restart the database. The server also logs a
+WARNING (at most once every 10 seconds) for every failed Postgres connection
+and for each 503 that answers "key store unavailable" or "object store
+unavailable", so these failures show up in `/ecs/agenticml-hosted` as well.
 
 Trusted proxies are configured via `AGENTICML_SERVER_TRUSTED_PROXY` using the
 ALB subnet CIDRs only. Task security group ingress accepts traffic only from

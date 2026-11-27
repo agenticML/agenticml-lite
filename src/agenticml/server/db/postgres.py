@@ -1,10 +1,13 @@
 """Postgres transactions and a bounded idle connection pool."""
 from contextlib import contextmanager
 import hashlib
+import json
 import logging
+import os
 import threading
 import time
 
+from ..ratelog import RateLimitedLog
 from .dialect import PostgresDialect
 from .errors import DatabaseBusy, DatabaseError
 from .sqlite import Tx
@@ -28,6 +31,11 @@ DEFAULT_LIMITS = (TRANSACTION_CONNECTION_LIMIT, OUTER_LOCK_LIMIT, INNER_LOCK_LIM
 MIN_BUDGET = 8
 MAX_BUDGET = 1000
 _budget_lock = threading.Lock()
+PASSWORD_SECRET_ENV = 'AGENTICML_SERVER_DATABASE_PASSWORD_SECRET'
+# Fetch the secret at most this often per instance, so a wrong secret or a real
+# outage cannot hammer Secrets Manager.
+_SECRET_REFETCH_SECONDS = 30.0
+INVALID_PASSWORD = '28P01'
 
 
 def connection_limits(budget):
@@ -146,6 +154,7 @@ class PostgresDatabase:
         self._peak = 0
         self.closed = False
         self._url = url
+        self._init_password_refresh()
         try:
             import psycopg
         except ImportError:
@@ -176,16 +185,114 @@ class PostgresDatabase:
             self.close()
             raise
 
+    def _init_password_refresh(self):
+        # Empty means unset: libpq keeps using the URL / PGPASSWORD as before.
+        self._password_secret = os.environ.get(PASSWORD_SECRET_ENV, '').strip()
+        self._password = None
+        self._password_lock = threading.Lock()
+        self._secret_fetched_at = None
+        self._connect_log = RateLimitedLog()
+
     def _new_connection(self, *, lock=False):
+        try:
+            return self._connect_refreshing(lock)
+        except self._psycopg.Error as exc:
+            self._log_connect_failure(exc)
+        _raise_plain(DatabaseError('could not connect to Postgres'))
+
+    def _connect_refreshing(self, lock):
+        """Connect; if the password was rotated, re-read it from the secret and retry once."""
+        password = self._password
+        try:
+            return self._connect_once(lock, password)
+        except self._psycopg.Error as exc:
+            if not (self._password_secret and self._password_failure(exc)):
+                raise
+            failed = exc
+        fresh = self._refresh_password(password)
+        if fresh is None:
+            raise failed
+        connection = self._connect_once(lock, fresh)
+        logger.info('database password refreshed from the secret')
+        return connection
+
+    @staticmethod
+    def _password_failure(exc):
+        if exc.sqlstate == INVALID_PASSWORD:
+            return True
+        # A failed connect carries no SQLSTATE from libpq, only the server message.
+        return 'password authentication failed' in str(exc)
+
+    def _refresh_password(self, tried):
+        """The password to retry with, or None when there is nothing new to try.
+
+        ``tried`` is the password the failed attempt used (None: libpq's own
+        source, the URL or PGPASSWORD).
+        """
+        with self._password_lock:
+            if self._password is not None and self._password != tried:
+                return self._password  # another thread already refreshed it
+            now = time.monotonic()
+            if (self._secret_fetched_at is not None
+                    and now - self._secret_fetched_at < _SECRET_REFETCH_SECONDS):
+                return None
+            self._secret_fetched_at = now
+            try:
+                fresh = self._fetch_secret_password()
+            except Exception as exc:
+                # Only the exception class: messages can name the secret or the account.
+                logger.warning('could not read the database password secret: %s',
+                               type(exc).__name__)
+                return None
+            if fresh == (tried if tried is not None else os.environ.get('PGPASSWORD')):
+                return None  # not a rotation: wrong user or a real outage
+            self._password = fresh
+            return fresh
+
+    def _fetch_secret_password(self):
+        """The ``password`` of the RDS-managed secret (JSON), from Secrets Manager."""
+        import boto3
+        from botocore.config import Config
+        # botocore reads AWS_DEFAULT_REGION, not AWS_REGION, so pass the region on.
+        region = os.environ.get('AWS_REGION') or os.environ.get('AWS_DEFAULT_REGION') or None
+        # Short timeouts: this runs under _password_lock, which every thread needing
+        # a new connection waits on.
+        config = Config(connect_timeout=3, read_timeout=5, retries={'max_attempts': 2})
+        client = boto3.client('secretsmanager', region_name=region, config=config)
+        value = client.get_secret_value(SecretId=self._password_secret)['SecretString']
+        password = json.loads(value)['password']
+        if not isinstance(password, str) or not password:
+            raise ValueError('secret has no password')
+        return password
+
+    def _log_connect_failure(self, exc):
+        # Never the URL, conninfo or password: only the SQLSTATE and the server's message.
+        detail = None
+        diag = getattr(exc, 'diag', None)
+        if diag is not None:
+            detail = getattr(diag, 'message_primary', None)
+        if not detail:
+            # A failed connect has no diagnostics; the server's own text follows "FATAL:".
+            text = str(exc)
+            if 'FATAL:' in text:
+                lines = text.rsplit('FATAL:', 1)[1].strip().splitlines()
+                detail = lines[0][:200] if lines else None
+        self._connect_log.warning(
+            logger, 'could not connect to Postgres: %s: %s',
+            exc.sqlstate or type(exc).__name__, detail or type(exc).__name__)
+
+    def _connect_once(self, lock, password):
         connection = None
         try:
             conninfo = _conninfo_with_timeout(self._url)
             if lock:
                 from psycopg.conninfo import make_conninfo
                 conninfo = make_conninfo(conninfo, keepalives=1, keepalives_idle=30)
+            # The refreshed password goes in as a keyword, never into the conninfo string.
+            extra = {} if password is None else {'password': password}
             connection = self._psycopg.connect(
                 conninfo, autocommit=True,
-                row_factory=_row_factory)
+                row_factory=_row_factory, **extra)
             for setting in ("lock_timeout = '5s'", "statement_timeout = '60s'",
                             "idle_in_transaction_session_timeout = '60s'",
                             "TIME ZONE 'UTC'", "application_name = 'agenticml-server'"):
@@ -205,16 +312,11 @@ class PostgresDatabase:
                     except (self._psycopg.errors.UndefinedObject,
                             self._psycopg.errors.FeatureNotSupported):
                         logger.warning('Postgres SET %s is unsupported', setting)
-        except self._psycopg.Error:
-            if connection is not None:
-                self._close_connection(connection)
         except BaseException:
             if connection is not None:
                 self._close_connection(connection)
             raise
-        else:
-            return connection
-        _raise_plain(DatabaseError('could not connect to Postgres'))
+        return connection
 
     @staticmethod
     def _connection_error(exc):

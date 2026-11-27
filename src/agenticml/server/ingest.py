@@ -21,6 +21,7 @@ from .db.errors import DatabaseBusy
 from . import lineage
 from .clientwindow import too_old, upgrade_message
 from .db import DatabaseError
+from .ratelog import log_unavailable
 from .db.usage import UsageRepo
 from .access import WorkspaceNotFound
 from .limits import LimitReached
@@ -341,14 +342,20 @@ class IngestHandler(DashboardHandler):
             self._error({"error": "request body timeout"}, 408)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             self.close_connection = True
-        except ObjectStoreUnavailable:
+        except ObjectStoreUnavailable as exc:
+            log_unavailable(logger, "sync request failed: object store unavailable",
+                            exc, self.command, self.path)
             self.close_connection = True
             if not getattr(self, "_started", False):
                 self._json({"error": "object store unavailable"}, 503, {"Retry-After": "5"})
-        except DatabaseBusy:
+        except DatabaseBusy as exc:
+            log_unavailable(logger, "sync request failed: database busy",
+                            exc, self.command, self.path)
             self.close_connection = True
             self._json({"error": "key store unavailable"}, 503, {"Retry-After": "5"})
-        except (DatabaseError, KeyStoreUnavailable):
+        except (DatabaseError, KeyStoreUnavailable) as exc:
+            log_unavailable(logger, "sync request failed: key store unavailable",
+                            exc, self.command, self.path)
             self.close_connection = True
             self._error({"error": "key store unavailable"}, 503)
         except Exception as exc:
