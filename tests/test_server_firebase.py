@@ -16,7 +16,7 @@ from cryptography.x509.oid import NameOID
 
 from agenticml import cli
 from agenticml.server.app import make_server, prepare_data_dir
-from agenticml.server.webauth import firebase_login_csp
+from agenticml.server.webauth import firebase_login_csp, normalize_blog_url
 from agenticml.ui.server import _CSP
 from agenticml.server.db import connect, for_server_dir
 from agenticml.server.db.errors import DatabaseError
@@ -980,6 +980,103 @@ def test_firebase_login_csp_and_assets(tmp_path, monkeypatch):
             got = call(httpd, path)
             assert (got[0], got[2]) == (unknown[0], unknown[2])
             assert got[1].get('Location') == unknown[1].get('Location')
+
+
+BLOG_URL = 'https://blog.example.org/blog/'
+
+
+@pytest.mark.parametrize('value', ['https://blog.example.org/blog', BLOG_URL])
+def test_firebase_config_has_blog_only_when_set(tmp_path, monkeypatch, value):
+    """The sign-in page gets the blog URL and feed only from the operator's option."""
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    with firebase_running(tmp_path / 'on', blog_url=value) as httpd:
+        status, _, body = call(httpd, '/auth/firebase/config')
+        assert status == 200
+        assert json.loads(body) == {
+            'projectId': PROJECT, 'apiKey': 'test-api-key-1',
+            'authDomain': f'{PROJECT}.firebaseapp.com',
+            'blog': {'url': BLOG_URL, 'feed': BLOG_URL + 'rss.xml'}}
+    for unset in (None, ''):
+        with firebase_running(tmp_path / f'off-{unset!r}', blog_url=unset) as httpd:
+            assert 'blog' not in json.loads(call(httpd, '/auth/firebase/config')[2])
+
+
+@pytest.mark.parametrize('value', [
+    'http://blog.example.org/blog/', 'ftp://blog.example.org/', 'blog.example.org/blog/',
+    'javascript:alert(1)', '//blog.example.org/blog/', 'https://', 'https:///blog/',
+    'https://blog.example.org/blog/?x=1', 'https://blog.example.org/blog/#a',
+    'https://blog.example.org/blog?', 'https://blog.example.org/blog#',
+    'https://user:pw@blog.example.org/blog/', 'https://blog.example.org/bl og/',
+    'https://:443/', 'https://blog.example.org:abc/blog/'])
+def test_blog_url_must_be_https(tmp_path, monkeypatch, capsys, value):
+    """A blog URL that is not plain https:// stops the server and names the flag."""
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    with pytest.raises(ValueError, match='--blog-url'):
+        normalize_blog_url(value)
+    with pytest.raises(ValueError, match='--blog-url'):
+        make_server(tmp_path / 'data', port=0, firebase=FIREBASE_CFG, cert_source=_source(),
+                    blog_url=value)
+    assert cli.main(['server', 'serve', '--data', str(tmp_path / 'cli'), '--port', '0',
+                     '--firebase-project', PROJECT, '--firebase-api-key', 'k',
+                     '--blog-url', value]) == 1
+    assert '--blog-url' in capsys.readouterr().err
+
+
+def test_cli_blog_url_flag_env_and_default(tmp_path, monkeypatch):
+    """The flag beats AGENTICML_SERVER_BLOG_URL, and an empty value means unset."""
+    seen = {}
+    monkeypatch.setattr('agenticml.server.serve', lambda *a, **kw: seen.update(kw))
+    monkeypatch.delenv('AGENTICML_SERVER_BLOG_URL', raising=False)
+    argv = ['server', 'serve', '--data', str(tmp_path), '--port', '0']
+    assert cli.main(argv) == 0
+    assert 'blog_url' not in seen
+    monkeypatch.setenv('AGENTICML_SERVER_BLOG_URL', '')
+    assert cli.main(argv) == 0
+    assert 'blog_url' not in seen
+    monkeypatch.setenv('AGENTICML_SERVER_BLOG_URL', 'https://env.example.org/blog')
+    assert cli.main(argv) == 0
+    assert seen['blog_url'] == 'https://env.example.org/blog/'
+    assert cli.main(argv + ['--blog-url', 'https://flag.example.org/p/']) == 0
+    assert seen['blog_url'] == 'https://flag.example.org/p/'
+    seen.clear()
+    assert cli.main(argv + ['--blog-url', '']) == 0
+    assert 'blog_url' not in seen
+
+
+def test_blog_url_is_ignored_without_firebase(tmp_path, monkeypatch, caplog):
+    """Only the Firebase sign-in page shows the blog, so the option warns and drops without it."""
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    with running(tmp_path / 'nofb', blog_url=BLOG_URL) as httpd:
+        assert httpd.web.blog_url is None
+    assert '--blog-url is ignored without --firebase-project' in caplog.text
+
+
+def test_blog_origin_is_only_in_the_firebase_login_connect_src(tmp_path, monkeypatch):
+    """The blog origin widens connect-src of the sign-in page and nothing else."""
+    monkeypatch.delenv('AGENTICML_SERVER_KEY', raising=False)
+    origin = 'https://blog.example.org'
+    with_blog = firebase_login_csp(FIREBASE_CFG.auth_domain, origin)
+    assert with_blog == _FIREBASE_LOGIN_CSP.replace(
+        'https://apis.google.com; frame-src', f'https://apis.google.com {origin}; frame-src')
+    assert firebase_login_csp(FIREBASE_CFG.auth_domain) == _FIREBASE_LOGIN_CSP
+    directives = dict(part.split(' ', 1) for part in with_blog.split('; '))
+    expected = dict(part.split(' ', 1) for part in _FIREBASE_LOGIN_CSP.split('; '))
+    assert [name for name in directives if directives[name] != expected[name]] == ['connect-src']
+    assert directives['script-src'] == "'self' https://apis.google.com"
+    with firebase_running(tmp_path / 'on', blog_url='https://blog.example.org:8443/blog/') as httpd:
+        for path in ('/login', '/invite'):
+            csp = call(httpd, path)[1].get('Content-Security-Policy')
+            assert ' https://blog.example.org:8443;' in csp
+            assert '8443/' not in csp
+            assert csp.count('blog.example.org') == 1
+        status, hdrs, _ = call(httpd, '/static/app.css')
+        assert hdrs.get('Content-Security-Policy') == _CSP
+        status, hdrs, _ = call(httpd, '/auth/firebase/config')
+        assert 'blog.example.org' not in hdrs.get('Content-Security-Policy', '')
+    with firebase_running(tmp_path / 'plain') as httpd:
+        assert call(httpd, '/login')[1].get('Content-Security-Policy') == _FIREBASE_LOGIN_CSP
+    with running(tmp_path / 'off', blog_url=BLOG_URL) as httpd:
+        assert call(httpd, '/login')[1].get('Content-Security-Policy') == _CSP
 
 
 def test_session_payload_auth_field(tmp_path, monkeypatch):

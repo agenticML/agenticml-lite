@@ -15,6 +15,8 @@
   const showPassword = document.querySelector("#show-password");
   const legal = document.querySelector("#legal");
   const contact = document.querySelector("#contact");
+  const blog = document.querySelector("#blog");
+  const blogCard = document.querySelector("#blog-card");
 
   const NO_ACCOUNT =
     "Your account has no access to this server. Ask a workspace admin for an invite.";
@@ -385,6 +387,106 @@
     contact.hidden = false;
   }
 
+  // The feed is the operator's own blog, read by the visitor's browser. It is
+  // untrusted text: cap its size and time, never let it redirect, and render it
+  // with textContent only.
+  const BLOG_FEED_MAX_BYTES = 256 * 1024;
+  const BLOG_FEED_TIMEOUT_MS = 5000;
+  const BLOG_TITLE_MAX = 120;
+
+  async function fetchBlogFeed(feed) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), BLOG_FEED_TIMEOUT_MS);
+    try {
+      const response = await fetch(feed, {
+        credentials: "omit",
+        mode: "cors",
+        redirect: "error",
+        referrerPolicy: "no-referrer",
+        signal: controller.signal,
+      });
+      if (!response.ok) return null;
+      const length = Number(response.headers.get("content-length"));
+      if (length > BLOG_FEED_MAX_BYTES) return null;
+      const text = await response.text();
+      return text.length > BLOG_FEED_MAX_BYTES ? null : text;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function newestPost(text, origin) {
+    const doc = new DOMParser().parseFromString(text, "application/xml");
+    if (doc.getElementsByTagName("parsererror").length) return null;
+    const item = doc.getElementsByTagName("item")[0];
+    if (!item) return null;
+    const field = (name) => {
+      const node = item.getElementsByTagName(name)[0];
+      return node ? (node.textContent || "").trim() : "";
+    };
+    let postTitle = field("title");
+    const link = httpsUrl(field("link"));
+    if (!postTitle || !link) return null;
+    // Only links on the blog's own origin: a changed feed cannot send the
+    // visitor to another site from this card.
+    if (new URL(link).origin !== origin) return null;
+    if (postTitle.length > BLOG_TITLE_MAX) {
+      postTitle = postTitle.slice(0, BLOG_TITLE_MAX - 1).trimEnd() + "\u2026";
+    }
+    const published = new Date(field("pubDate"));
+    return {
+      title: postTitle,
+      link,
+      date: Number.isNaN(published.getTime())
+        ? null
+        : published.toLocaleDateString("en", {
+            year: "numeric",
+            month: "short",
+            day: "numeric",
+            timeZone: "UTC",
+          }),
+    };
+  }
+
+  function renderBlogCard(post, url) {
+    const heading = document.createElement("p");
+    heading.className = "auth-blog-heading";
+    heading.textContent = "From the blog";
+    const postLink = legalLink(post.link, post.title);
+    postLink.className = "auth-blog-title";
+    const parts = [heading, postLink];
+    if (post.date) {
+      const date = document.createElement("p");
+      date.className = "auth-blog-date";
+      date.textContent = post.date;
+      parts.push(date);
+    }
+    const all = legalLink(url, "All posts");
+    all.className = "auth-blog-all";
+    parts.push(all);
+    blogCard.replaceChildren(...parts);
+    blogCard.hidden = false;
+  }
+
+  // The server sends this only when the operator set a blog URL. The Blog link
+  // shows at once; the newest-post card appears only if the feed loads, and any
+  // failure leaves it hidden without an error.
+  function showBlog(config) {
+    if (!blog || !blogCard || !config || typeof config !== "object") return;
+    const url = httpsUrl(config.url);
+    const feed = httpsUrl(config.feed);
+    if (!url || !feed) return;
+    blog.replaceChildren(legalLink(url, "Blog"));
+    blog.hidden = false;
+    // Not awaited: sign-in setup never waits for the feed.
+    fetchBlogFeed(feed)
+      .then((text) => {
+        const post = text ? newestPost(text, new URL(url).origin) : null;
+        if (post) renderBlogCard(post, url);
+      })
+      .catch((err) => console.debug("blog feed unavailable", err));
+  }
+
   async function start() {
     let response;
     try {
@@ -406,6 +508,7 @@
     }
     showLegal(config.legal);
     showContact(config.contact_email);
+    showBlog(config.blog);
     try {
       firebase.initializeApp({
         apiKey: config.apiKey,

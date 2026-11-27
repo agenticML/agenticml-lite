@@ -500,7 +500,7 @@ def test_hosted_parameters(hosted):
     params = hosted['Parameters']
     assert set(params) == {'ImageTag', 'Hostname', 'DesiredCount', 'MaxTaskCount', 'DbInstanceClass', 'MultiAZ',
                            'FirebaseProject', 'FirebaseApiKey', 'OpenSignup', 'AdminEmails', 'LegalBaseUrl',
-                           'ContactEmail', 'VpcCidr'}
+                           'BlogUrl', 'ContactEmail', 'VpcCidr'}
     assert 'Default' not in params['ImageTag']
     assert params['Hostname']['Default'] == 'app.agenticml.xyz'
     # Lean default (package 24.5): one task; rolling deploys still start the new one first.
@@ -529,6 +529,11 @@ def test_hosted_parameters(hosted):
     for bad in ('http://a.io/', 'https://:443/', 'https://a.io:abc/', 'https://u@a.io/',
                 'https://a.io/?x=1', 'https://a.io/#f', 'https://a.io/a b'):
         assert not legal.match(bad), bad
+    # The hosted sign-in page shows the blog by default; the pattern is the policy URL's.
+    assert params['BlogUrl']['Default'] == 'https://agenticml.xyz/blog/'
+    assert params['BlogUrl']['MaxLength'] == params['LegalBaseUrl']['MaxLength']
+    assert params['BlogUrl']['AllowedPattern'] == params['LegalBaseUrl']['AllowedPattern']
+    assert re.compile(params['BlogUrl']['AllowedPattern']).match(params['BlogUrl']['Default'])
     # The hosted service names its own address (operator mode); the server default is the same one.
     assert params['ContactEmail']['Default'] == 'contact@agenticml.xyz'
     assert params['ContactEmail']['MaxLength'] == 254
@@ -759,6 +764,7 @@ def test_hosted_trusted_proxy_is_the_alb_subnets_only(hosted):
     assert env['AGENTICML_SERVER_OPEN_SIGNUP'] == {'Ref': 'OpenSignup'}
     assert env['AGENTICML_SERVER_ADMIN_EMAILS'] == {'Ref': 'AdminEmails'}
     assert env['AGENTICML_SERVER_LEGAL_BASE_URL'] == {'Ref': 'LegalBaseUrl'}
+    assert env['AGENTICML_SERVER_BLOG_URL'] == {'Ref': 'BlogUrl'}
     assert env['AGENTICML_SERVER_CONTACT_EMAIL'] == {'Ref': 'ContactEmail'}
     assert env['AGENTICML_SERVER_PUBLIC_URL'] == {'Fn::Sub': 'https://${Hostname}'}
     assert env['AGENTICML_SERVER_OBJECTS'] == {'Fn::Sub': 's3://${ObjectsBucket}/hosted'}

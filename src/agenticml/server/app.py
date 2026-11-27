@@ -270,7 +270,8 @@ class IngestServer(DashboardServer):
                  trusted_proxies=(), identity_header=None, db=None,
                  firebase=None, cert_source=None, plans=None, open_signup=False,
                  min_client_version=None, admin_emails=frozenset(), legal_base_url=None,
-                 oidc=None, signup_email_domains=frozenset(), contact_email=None):
+                 oidc=None, signup_email_domains=frozenset(), contact_email=None,
+                 blog_url=None):
         from .clientwindow import parse_min_client
         from .firebase import require_open_signup
         from .ingest import IngestHandler
@@ -301,7 +302,8 @@ class IngestServer(DashboardServer):
             firebase=firebase, cert_source=cert_source, plans=plans,
             open_signup=open_signup, admin_emails=admin_emails,
             legal_base_url=legal_base_url, oidc=oidc,
-            signup_email_domains=signup_email_domains, contact_email=contact_email)
+            signup_email_domains=signup_email_domains, contact_email=contact_email,
+            blog_url=blog_url)
         self.store_file_mode = 0o666 & ~_read_umask()
         self.limits = Limits()
         self.lineage_enabled = shutil.which("git") is not None
@@ -516,7 +518,7 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
                 firebase=None, cert_source=None, plans=None, open_signup=False, objects=None,
                 min_client_version=None, admin_emails=frozenset(), legal_base_url=None,
                 db_connections=None, oidc=None, signup_email_domains=frozenset(),
-                contact_email=None):
+                contact_email=None, blog_url=None):
     """Prepare and lock the data directory; port=0 chooses a free port."""
     from .firebase import require_open_signup
     from .limits import Plans
@@ -580,7 +582,7 @@ def make_server(data, host="127.0.0.1", port=8080, public_url=None, env_key=None
                      open_signup=open_signup, min_client_version=min_client_version,
                      admin_emails=admin_emails, legal_base_url=legal_base_url,
                      oidc=oidc, signup_email_domains=signup_email_domains,
-                     contact_email=contact_email)
+                     contact_email=contact_email, blog_url=blog_url)
         server.objects = backend
         server._server_lock = handle
         for workspace in server.workspaces.list():
@@ -602,7 +604,8 @@ def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None
           firebase=None, cert_source=None, plans=None, open_signup=False, objects=None,
           min_client_version=None, admin_emails=frozenset(), legal_base_url=None,
           stats_interval=STATS_REFRESH, metrics=None, db_connections=None,
-          oidc=None, signup_email_domains=frozenset(), contact_email=None):
+          oidc=None, signup_email_domains=frozenset(), contact_email=None,
+          blog_url=None):
     """Run until interrupted, with an optional environment admin key."""
     if metrics not in (None, "off", "cloudwatch"):
         raise ValueError(MODE_MESSAGE)
@@ -632,6 +635,8 @@ def serve(data=None, host="127.0.0.1", port=8080, public_url=None, on_ready=None
         extra["legal_base_url"] = legal_base_url
     if contact_email is not None:
         extra["contact_email"] = contact_email
+    if blog_url is not None:
+        extra["blog_url"] = blog_url
     if db_connections is not None:
         extra["db_connections"] = db_connections
     if oidc is not None:

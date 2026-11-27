@@ -1,6 +1,6 @@
 # Package 39: Blog at agenticml.xyz/blog
 
-Status: plan ready (Nov 27, 2026).
+Status: done (#103, merged Nov 27, 2026).
 
 ## Goal
 

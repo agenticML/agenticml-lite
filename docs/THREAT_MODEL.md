@@ -84,6 +84,7 @@ Trust boundaries define the isolation model across single-tenant and multi-tenan
   - **Cryptographic verification**: Tokens are verified locally using RS256 signature validation against Google's public keys. Expiry, issuer (`https://securetoken.google.com/<project>`), audience, and `auth_time` are validated.
   - **UID linkage**: The first link of a credential-less account (created by an admin, an invite, or the list) is by verified email; after that by Firebase uid.
   - **No token pass-through**: The client sends the Firebase token once to exchange it for an AgenticML session cookie. Subsequent requests rely on the server's own session management.
+  - **Blog card on the sign-in page**: When the operator sets `--blog-url`, the sign-in page reads one feed URL (`rss.xml` under it) from the visitor's browser. The page's CSP allows only that origin for `connect-src`, and no other page's CSP changes. The request sends no cookies and no referrer, does not follow redirects, and is limited in size and time. The page renders the post as plain text and accepts a post link only on the blog's own origin. A compromised blog host could change the card's text and link, but it cannot run script on the app origin.
 
 ### 7. S3 object security
 
