@@ -453,9 +453,9 @@ Starlight site at `/blog/`. Replaces the Backlog entry "Docs custom domain".
 | 38.1 | Root-path build: drop the `/agenticml-lite` base, rewrite links, new URL across the repo, guard test | – | Sonnet | S–M | [plan](packages/38-site-domain.md#part-381-root-path-build-sonnet) | in review |
 | 38.2 | Cutover: Namecheap `A`/`www` records, merge, Pages custom domain, Enforce HTTPS | 38.1 | Owner | S | [plan](packages/38-site-domain.md#part-382-cutover-owner) | not started |
 | 38.3 | `HOSTED_LEGAL_BASE_URL` to `https://agenticml.xyz/legal/` and hosted deploy | 38.2 | Owner | S | [plan](packages/38-site-domain.md#part-383-hosted-policy-links-owner) | not started |
-| 39 | Blog at `agenticml.xyz/blog/`: `starlight-blog` plugin, post list, tags, RSS, header link, first post | 38.1 (live after 38.2) | Sonnet; prose Antigravity | M | [plan](packages/39-blog.md) | plan ready |
-| 39.1 | Blog section: plugin pinned at 0.30.2, schema, header link, overflow and RSS checks, facts test | 38.1 | Sonnet | S–M | [plan](packages/39-blog.md#part-391-blog-section-sonnet) | plan ready |
-| 39.2 | First post: the docs and blog now live at agenticml.xyz | 39.1 | Antigravity; supervisor checks | S | [plan](packages/39-blog.md#part-392-first-post-antigravity-writes-it-the-supervisor-checks-it) | plan ready |
+| 39 | Blog at `agenticml.xyz/blog/`: `starlight-blog` plugin, post list, tags, RSS, header link, first post | 38.1 (live after 38.2) | Sonnet; prose Antigravity | M | [plan](packages/39-blog.md) | in review |
+| 39.1 | Blog section: plugin pinned at 0.30.2, schema, header link, overflow and RSS checks, facts test | 38.1 | Sonnet | S–M | [plan](packages/39-blog.md#part-391-blog-section-sonnet) | in review |
+| 39.2 | First post: the docs and blog now live at agenticml.xyz | 39.1 | Antigravity; supervisor checks | S | [plan](packages/39-blog.md#part-392-first-post-antigravity-writes-it-the-supervisor-checks-it) | in review |
 
 ### Maintenance fixes
 
@@ -823,6 +823,16 @@ on Nov 17, 2026; none of the entries below blocked it.
     --install` once on Linux and remove it.
   - Done when: those steps pass, or each mismatch is fixed with a test built
     from the captured JSON in `tests/test_server_up.py`.
+- **Astro advisory in the docs site build** (found Nov 27, 2026 with package 39;
+  already on `main` before it). `npm audit` in `website/` reports a moderate
+  advisory for `astro` 7.4.0 (XSS through attribute injection in dynamic tag
+  names; an `@astrojs/node` image endpoint issue). The site is static and
+  uses neither feature with untrusted input, so it is low risk.
+  - Where: `website/package.json`, `website/package-lock.json`.
+  - Fix: move `astro` to the first patched release that is at least two weeks
+    old, and check that Starlight 0.42.x and `starlight-blog` still accept it.
+  - Done when: `npm audit` is clean for `astro`, and the build, the link check
+    and `npm run check:overflow` pass.
 - **Docs custom domain**: moved to package 38 ([plan](packages/38-site-domain.md)), Nov 27, 2026.
 
 ### Code and dashboard follow-ups

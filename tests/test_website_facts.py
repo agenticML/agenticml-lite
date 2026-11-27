@@ -359,10 +359,11 @@ def test_hosted_keys_page_has_the_key_facts():
 
 
 # The docs site moved to https://agenticml.xyz/ (root path, package 38). The old
-# github.io URL may stay only where it is history (docs/plans), the hosted
-# monitor's ignored hosts, and tests.
+# github.io URL may stay only where it is history (docs/plans, blog posts such
+# as the one announcing the move), the hosted monitor's ignored hosts, and tests.
 OLD_DOCS_URL = 'agenticml.github.io/agenticml-lite'
-OLD_DOCS_URL_ALLOWED = ('docs/plans/', 'scripts/monitor_hosted.py', 'tests/')
+OLD_DOCS_URL_ALLOWED = ('docs/plans/', 'website/src/content/docs/blog/',
+                        'scripts/monitor_hosted.py', 'tests/')
 SKIPPED_DIRS = {'node_modules', 'dist', '.venv', '.git', '__pycache__', '.pytest_cache',
                 '.mypy_cache', '.ruff_cache', '.astro'}
 
@@ -383,7 +384,8 @@ def _repo_text_files():
 
 def test_no_old_github_pages_docs_url():
     """Protects readers from the old docs address: no file outside
-    docs/plans/, scripts/monitor_hosted.py and tests/ may link to
+    docs/plans/, the blog posts (dated history, e.g. the one announcing the
+    move), scripts/monitor_hosted.py and tests/ may link to
     agenticml.github.io/agenticml-lite; the docs are at https://agenticml.xyz/."""
     bad = [
         str(path.relative_to(ROOT))
@@ -406,3 +408,33 @@ def test_no_agenticml_lite_base_prefix_in_site_links():
         for match in pattern.finditer(text)
     ]
     assert not bad, bad
+
+
+def test_blog_posts_have_required_frontmatter():
+    """Protects the blog (website/src/content/docs/blog) from posts the site
+    cannot list properly: every post needs a title, a valid date that is not in
+    the future, authors and an excerpt in its frontmatter."""
+    import datetime
+
+    import yaml
+
+    posts = sorted(
+        p for p in (DOCS / 'blog').iterdir() if p.is_file() and p.suffix in ('.md', '.mdx')
+    )
+    assert posts, 'no blog posts found in website/src/content/docs/blog'
+    today = datetime.date.today()
+    for post in posts:
+        match = re.match(r'---\r?\n(.*?)\r?\n---\r?\n', post.read_text(encoding='utf-8'), re.S)
+        assert match, f'{post.name}: no frontmatter'
+        meta = yaml.safe_load(match.group(1))
+        assert isinstance(meta, dict), f'{post.name}: frontmatter is not a mapping'
+        for key in ('title', 'authors', 'excerpt'):
+            assert meta.get(key), f'{post.name}: frontmatter has no {key}'
+        date = meta.get('date')
+        if isinstance(date, str):
+            assert re.fullmatch(r'\d{4}-\d{2}-\d{2}', date), f'{post.name}: date {date!r} is not YYYY-MM-DD'
+            date = datetime.date.fromisoformat(date)
+        assert isinstance(date, datetime.date), f'{post.name}: date {date!r} is not a valid date'
+        if isinstance(date, datetime.datetime):
+            date = date.date()
+        assert date <= today, f'{post.name}: date {date} is in the future'

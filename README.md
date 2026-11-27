@@ -79,6 +79,7 @@ Docs site: <https://agenticml.xyz/>
 - Reference: [Storage and disk](https://agenticml.xyz/reference/storage/), [Configuration](https://agenticml.xyz/reference/configuration/)
 - Server: [Install](https://agenticml.xyz/server/install/), [Keys](https://agenticml.xyz/server/keys/), [Sync](https://agenticml.xyz/server/sync/), [Backups](https://agenticml.xyz/server/backups/), [Upgrade](https://agenticml.xyz/server/upgrade/), [Private networks](https://agenticml.xyz/server/private-network/), [Deploy on AWS](https://agenticml.xyz/server/deploy-on-aws/)
 - [Hosted service](https://agenticml.xyz/hosted/) and [Releases](https://agenticml.xyz/releases/)
+- Blog: <https://agenticml.xyz/blog/>
 - In the repository: [docs/SDK.md](https://github.com/agenticML/agenticml-lite/blob/main/docs/SDK.md), [docs/FORMAT.md](https://github.com/agenticML/agenticml-lite/blob/main/docs/FORMAT.md), [docs/PROTOCOL.md](https://github.com/agenticML/agenticml-lite/blob/main/docs/PROTOCOL.md), [docs/SERVER.md](https://github.com/agenticML/agenticml-lite/blob/main/docs/SERVER.md), [docs/HOSTED.md](https://github.com/agenticML/agenticml-lite/blob/main/docs/HOSTED.md), [docs/THREAT_MODEL.md](https://github.com/agenticML/agenticml-lite/blob/main/docs/THREAT_MODEL.md)
 
 ## Contributing

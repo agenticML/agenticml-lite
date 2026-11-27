@@ -5,6 +5,10 @@
 // the home page and the Python SDK guide the open panel causes no overflow in
 // either theme and its mailto: link carries the address and the page title.
 //
+// Also checks the blog (package 39.1): /blog/, every post and a tag page are in
+// the built site (so they get the overflow and Contact us checks above) and
+// /blog/rss.xml has one <item> per post, with links on the site origin.
+//
 // Run after `npm run build`: npm run check:overflow
 import { createServer } from 'node:http';
 import { readFile, readdir, stat } from 'node:fs/promises';
@@ -12,7 +16,9 @@ import { dirname, extname, join, normalize, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
 
-const DIST = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'dist');
+const WEBSITE = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const DIST = join(WEBSITE, 'dist');
+const BLOG_SRC = join(WEBSITE, 'src', 'content', 'docs', 'blog');
 // The site is served at the root, so there is no base path.
 const BASE = '';
 const SITE_ORIGIN = 'https://agenticml.xyz';
@@ -148,6 +154,44 @@ async function checkContactPanel(page, path, theme) {
 	}
 }
 
+// One post per .md/.mdx file in src/content/docs/blog/ (slug = file name).
+async function postSlugs() {
+	const names = await readdir(BLOG_SRC);
+	return names.filter((n) => /\.mdx?$/.test(n)).map((n) => n.replace(/\.mdx?$/, '')).sort();
+}
+
+async function checkBlog(paths) {
+	const slugs = await postSlugs();
+	if (slugs.length === 0) {
+		problems.push(`no posts in ${BLOG_SRC}`);
+		return;
+	}
+	const required = [`${BASE}/blog/`, ...slugs.map((slug) => `${BASE}/blog/${slug}/`)];
+	for (const path of required) {
+		if (!paths.includes(path)) problems.push(`${path}: blog page missing from the sitemap`);
+	}
+	if (!paths.some((path) => path.startsWith(`${BASE}/blog/tags/`))) {
+		problems.push('no blog tag page in the sitemap');
+	}
+	let rss;
+	try {
+		rss = await readFile(join(DIST, 'blog', 'rss.xml'), 'utf8');
+	} catch {
+		problems.push('blog/rss.xml missing from dist/');
+		return;
+	}
+	const items = rss.match(/<item>/g)?.length ?? 0;
+	if (items !== slugs.length) problems.push(`blog/rss.xml has ${items} <item> element(s), expected ${slugs.length} (one per post)`);
+	for (const slug of slugs) {
+		if (!rss.includes(`<link>${SITE_ORIGIN}${BASE}/blog/${slug}/</link>`)) {
+			problems.push(`blog/rss.xml has no item linking to ${SITE_ORIGIN}${BASE}/blog/${slug}/`);
+		}
+	}
+	for (const [, link] of rss.matchAll(/<link>([^<]*)<\/link>/g)) {
+		if (!link.startsWith(SITE_ORIGIN)) problems.push(`blog/rss.xml: link ${link} is not on ${SITE_ORIGIN}`);
+	}
+}
+
 const server = await startServer();
 const origin = `http://127.0.0.1:${server.address().port}`;
 const browser = await chromium.launch();
@@ -159,6 +203,7 @@ try {
 	const paths = await sitemapPaths();
 	if (paths.length <= 1) fail('no pages found in dist/sitemap-*.xml');
 	pageCount = paths.length;
+	await checkBlog(paths);
 
 	for (const theme of THEMES) {
 		const context = await browser.newContext({
