@@ -772,7 +772,28 @@ def test_hosted_trusted_proxy_is_the_alb_subnets_only(hosted):
     (container,) = taskdef['Properties']['ContainerDefinitions']
     assert container['Secrets'] == [{'Name': 'PGPASSWORD', 'ValueFrom': {
         'Fn::Sub': '${DbInstance.MasterUserSecret.SecretArn}:password::'}}]
-    assert not [e for e in env_of(hosted) if 'Name' in e and 'PASSWORD' in e['Name']]
+    # The server re-reads that same secret when RDS rotates it: the ARN, never the value.
+    assert env['AGENTICML_SERVER_DATABASE_PASSWORD_SECRET'] == {
+        'Fn::GetAtt': 'DbInstance.MasterUserSecret.SecretArn'}
+    assert not [e for e in env_of(hosted) if 'Name' in e and 'PASSWORD' in e['Name']
+                and e['Name'] != 'AGENTICML_SERVER_DATABASE_PASSWORD_SECRET']
+
+
+def test_hosted_rds_postgres_log_is_exported_to_a_30_day_log_group(hosted, bootstrap):
+    db = only(hosted, 'AWS::RDS::DBInstance')
+    assert db['Properties']['EnableCloudwatchLogsExports'] == ['postgresql']
+    assert db['DependsOn'] == 'RdsLogGroup'
+    assert hosted['Resources']['RdsLogGroup']['Type'] == 'AWS::Logs::LogGroup'
+    assert hosted['Resources']['RdsLogGroup']['Properties'] == {
+        'LogGroupName': '/aws/rds/instance/agenticml-hosted/postgresql', 'RetentionInDays': 30}
+    assert db['Properties']['DBInstanceIdentifier'] == 'agenticml-hosted'
+    # The CloudFormation role manages that group, and already modifies the instance.
+    stmts = {s['Sid']: s for s in role_statements(bootstrap['Resources']['CloudFormationRole']) if 'Sid' in s}
+    resources = [fn_sub_text(r) for r in as_list(stmts['LogGroups']['Resource'])]
+    assert any(r.endswith(':log-group:/aws/rds/instance/agenticml-hosted/*') for r in resources)
+    assert any(r.endswith(':log-group:/ecs/agenticml-hosted*') for r in resources)
+    assert 'rds:ModifyDBInstance' in {a for s in role_statements(bootstrap['Resources']['CloudFormationRole'])
+                                       for a in actions_of(s)}
 
 
 def test_hosted_firebase_is_conditional_and_open_signup_needs_it(hosted):
@@ -860,8 +881,14 @@ def test_hosted_task_policy_is_scoped(hosted):
     assert actions_of(metrics) == ['cloudwatch:PutMetricData'] and metrics['Effect'] == 'Allow'
     assert metrics['Resource'] == '*'
     assert metrics['Condition'] == {'StringEquals': {'cloudwatch:namespace': capacity.NAMESPACE}}
-    # Nothing outside S3, EFS, the SSM message channel and CloudWatch metrics.
-    assert {a.split(':')[0] for a in by_action} == {'s3', 'elasticfilesystem', 'ssmmessages', 'cloudwatch'}
+    # The running server re-reads the RDS-managed password: that one secret, read only.
+    (secret,) = by_action['secretsmanager:GetSecretValue']
+    assert actions_of(secret) == ['secretsmanager:GetSecretValue'] and secret['Effect'] == 'Allow'
+    assert secret['Resource'] == {'Fn::GetAtt': 'DbInstance.MasterUserSecret.SecretArn'}
+    assert 'Condition' not in secret
+    # Nothing outside S3, EFS, the SSM message channel, CloudWatch metrics and that secret.
+    assert {a.split(':')[0] for a in by_action} == {
+        's3', 'elasticfilesystem', 'ssmmessages', 'cloudwatch', 'secretsmanager'}
 
 
 def test_hosted_roles_are_named_inside_the_cloudformation_roles_scope(hosted, bootstrap):
@@ -891,8 +918,10 @@ def test_hosted_roles_are_named_inside_the_cloudformation_roles_scope(hosted, bo
 def test_hosted_resource_names_match_the_cloudformation_role_scope(hosted, bootstrap):
     stmts = {s['Sid']: s for s in role_statements(bootstrap['Resources']['CloudFormationRole']) if 'Sid' in s}
 
-    log_group = hosted['Resources']['LogGroup']['Properties']['LogGroupName']
-    assert fnmatch.fnmatch(log_group, fn_sub_text(stmts['LogGroups']['Resource']).split('log-group:')[1])
+    patterns = [fn_sub_text(r).split('log-group:')[1] for r in as_list(stmts['LogGroups']['Resource'])]
+    for key in ('LogGroup', 'RdsLogGroup'):
+        log_group = hosted['Resources'][key]['Properties']['LogGroupName']
+        assert any(fnmatch.fnmatch(log_group, pattern) for pattern in patterns), key
     alarm_pattern = fn_sub_text(stmts['Alarms']['Resource']).split('alarm:')[1]
     names = alarms_of(hosted)
     assert len(names) == 9

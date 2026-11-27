@@ -338,7 +338,9 @@ Resources:
                   - logs:TagResource
                   - logs:UntagLogGroup
                   - logs:UntagResource
-                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/agenticml-hosted*
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/agenticml-hosted*
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/rds/instance/agenticml-hosted/*
               - Sid: LogGroupsDescribe
                 Effect: Allow
                 Action: logs:DescribeLogGroups
