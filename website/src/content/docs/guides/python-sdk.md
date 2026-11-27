@@ -5,7 +5,7 @@ sidebar:
   order: 2
 ---
 
-Use the Python SDK when you want to choose exactly what is logged. If you only need to track an existing script, [`agenticml run`](/agenticml-lite/guides/zero-code/) needs no code changes.
+Use the Python SDK when you want to choose exactly what is logged. If you only need to track an existing script, [`agenticml run`](/guides/zero-code/) needs no code changes.
 
 Install the package as `agenticml-lite` and import it as `agenticml`. Runs are written to local files, so no server or API key is needed.
 
@@ -159,7 +159,7 @@ A run belongs to a task, such as `"asr"` or `"imagegen"`. Lineage graphs and par
 agenticml.init(project="demo", task="asr")
 ```
 
-Without `task=`, the task comes from `AGENTICML_TASK`, then the explicit parent's task, then an `agenticml.toml` `task` key, then the entry script's folder. See the [zero-code guide](/agenticml-lite/guides/zero-code/#lineage-parent-and-task) for the full order and the cross-task warning.
+Without `task=`, the task comes from `AGENTICML_TASK`, then the explicit parent's task, then an `agenticml.toml` `task` key, then the entry script's folder. See the [zero-code guide](/guides/zero-code/#lineage-parent-and-task) for the full order and the cross-task warning.
 
 `lineage=True` (the default) snapshots your project code in a shadow Git repository under the store root. The project itself is never written to. Disable it with `lineage=False` or `AGENTICML_LINEAGE=0`.
 
@@ -190,4 +190,4 @@ If your script raises after `init()`, the run finishes as `crashed` with `_excep
 - **A run shows `running` after a crash:** it is marked `crashed` once its lock is released. `agenticml sync` finalizes it.
 - **Multi-GPU:** only rank 0 logs. Launch as `torchrun ... -m agenticml run -- train.py`.
 
-For the on-disk layout, see the [storage reference](/agenticml-lite/reference/storage/). To try the SDK end to end, run `python examples/train_toy.py --explicit`.
+For the on-disk layout, see the [storage reference](/reference/storage/). To try the SDK end to end, run `python examples/train_toy.py --explicit`.

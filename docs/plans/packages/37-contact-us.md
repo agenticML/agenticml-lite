@@ -1,6 +1,6 @@
 # Package 37: Contact us button (docs site and dashboard)
 
-Status: in review (plan ready Nov 24, 2026; self-hosted default changed the
+Status: done (#101, merged Nov 25, 2026; plan ready Nov 24, 2026; self-hosted default changed the
 same day, see D37.2).
 
 ## Goal

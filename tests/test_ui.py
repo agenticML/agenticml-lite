@@ -592,7 +592,7 @@ def test_serve_prints_docs_and_github_line_after_the_url(tmp_path, monkeypatch, 
     server.serve(tmp_path)
     lines = capsys.readouterr().out.splitlines()
     assert lines[0] == 'AgenticML UI: http://127.0.0.1:6006'
-    assert lines[1].startswith('Docs: https://agenticml.github.io/agenticml-lite/ ')
+    assert lines[1].startswith('Docs: https://agenticml.xyz/ ')
     assert lines[1].endswith('Star us on GitHub: https://github.com/agenticML/agenticml-lite')
     assert len(lines) == 2
 
@@ -604,7 +604,7 @@ def test_serve_promo_line_falls_back_to_ascii(monkeypatch):
     monkeypatch.setattr(server.sys, 'stdout', Ascii())
     line = server._promo_line()
     assert line.isascii()
-    assert 'Docs: https://agenticml.github.io/agenticml-lite/ | Star us on GitHub:' in line
+    assert 'Docs: https://agenticml.xyz/ | Star us on GitHub:' in line
 
 
 def test_summary_keeps_scalar_string_keys_in_order():

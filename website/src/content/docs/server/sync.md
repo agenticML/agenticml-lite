@@ -17,7 +17,7 @@ pip install agenticml-lite
 
 Syncing to a server needs version 2.2 or newer. 1.0.0 cannot sync.
 
-Using the hosted service at `app.agenticml.xyz`? Follow the [hosted quickstart](/agenticml-lite/hosted/quickstart/) instead. Syncing to a server on a private network with an internal CA? See [Private networks](/agenticml-lite/server/private-network/).
+Using the hosted service at `app.agenticml.xyz`? Follow the [hosted quickstart](/hosted/quickstart/) instead. Syncing to a server on a private network with an internal CA? See [Private networks](/server/private-network/).
 
 Log in with your server URL:
 
@@ -104,7 +104,7 @@ mkdir -p ~/.config/systemd/user
 curl -fsSL -o ~/.config/systemd/user/agenticml-sync.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v3.3.1/deploy/systemd/agenticml-sync.service
 ```
 
-The unit file works with 2.2 and newer clients. Since 3.2 it also has commented settings for a private network with an internal CA; see [Private network](/agenticml-lite/server/private-network/).
+The unit file works with 2.2 and newer clients. Since 3.2 it also has commented settings for a private network with an internal CA; see [Private network](/server/private-network/).
 
 ```bash
 systemctl --user daemon-reload
@@ -135,4 +135,4 @@ The server updates run status based on commits recorded in the server database:
 
 ## Next
 
-Continue to [Backups and restore](/agenticml-lite/server/backups/) to safeguard server data.
+Continue to [Backups and restore](/server/backups/) to safeguard server data.

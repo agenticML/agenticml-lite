@@ -5,7 +5,7 @@ sidebar:
   order: 1
 ---
 
-`agenticml server` provides a central synchronization target and shared web dashboard for AgenticML experiments. It runs self-hosted on your own infrastructure or as our managed multi-workspace service on AWS. To use the hosted service instead of running your own server, start with the [Hosted service](/agenticml-lite/hosted/) section.
+`agenticml server` provides a central synchronization target and shared web dashboard for AgenticML experiments. It runs self-hosted on your own infrastructure or as our managed multi-workspace service on AWS. To use the hosted service instead of running your own server, start with the [Hosted service](/hosted/) section.
 
 ## Architecture
 
@@ -18,9 +18,9 @@ sidebar:
 
 ## Topics
 
-- [Installation and deployment](/agenticml-lite/server/install/): Install via pip, optional extras (`[postgres]`, `[s3]`, `[firebase]`, `[hosted]`), run directly or under systemd, and configure a TLS proxy.
-- [Deploy on AWS](/agenticml-lite/server/deploy-on-aws/): One CloudFormation template in your own account.
-- [Authentication and keys](/agenticml-lite/server/keys/): Workspaces, roles (`owner`, `admin`, `member`, `viewer`), workspace-bound API keys, and dashboard sessions.
-- [Syncing runs](/agenticml-lite/server/sync/): Connect training machines with `agenticml login`, `sync --all`, continuous `sync --follow`, and storage limit handling.
-- [Backups and restore](/agenticml-lite/server/backups/): Online consistent backups via `agenticml server backup`, SQLite snapshots, PostgreSQL dumps, and restore.
-- [Upgrades and troubleshooting](/agenticml-lite/server/upgrade/): Upgrading to 3.0, automatic 2.x data migration into `default`, and troubleshooting common operational issues.
+- [Installation and deployment](/server/install/): Install via pip, optional extras (`[postgres]`, `[s3]`, `[firebase]`, `[hosted]`), run directly or under systemd, and configure a TLS proxy.
+- [Deploy on AWS](/server/deploy-on-aws/): One CloudFormation template in your own account.
+- [Authentication and keys](/server/keys/): Workspaces, roles (`owner`, `admin`, `member`, `viewer`), workspace-bound API keys, and dashboard sessions.
+- [Syncing runs](/server/sync/): Connect training machines with `agenticml login`, `sync --all`, continuous `sync --follow`, and storage limit handling.
+- [Backups and restore](/server/backups/): Online consistent backups via `agenticml server backup`, SQLite snapshots, PostgreSQL dumps, and restore.
+- [Upgrades and troubleshooting](/server/upgrade/): Upgrading to 3.0, automatic 2.x data migration into `default`, and troubleshooting common operational issues.

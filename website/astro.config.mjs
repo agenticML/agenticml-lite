@@ -1,16 +1,22 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
+import starlightBlog from 'starlight-blog';
 import starlightLinksValidator from 'starlight-links-validator';
 
-// Served from GitHub Pages at https://agenticml.github.io/agenticml-lite/.
-// Links inside pages must include the /agenticml-lite base.
+// Served from GitHub Pages at https://agenticml.xyz/ (custom domain, root path).
+// There is no base: links inside pages start with / and carry no prefix.
 export default defineConfig({
-	site: 'https://agenticml.github.io',
-	base: '/agenticml-lite',
+	site: 'https://agenticml.xyz',
 	integrations: [
 		starlight({
-			plugins: [starlightLinksValidator({ errorOnLocalLinks: false })],
+			plugins: [
+				starlightBlog({
+					title: 'Blog',
+					authors: { team: { name: 'agenticML team', url: 'https://github.com/agenticML' } },
+				}),
+				starlightLinksValidator({ errorOnLocalLinks: false }),
+			],
 			title: 'agenticml-lite',
 			description: 'Experiment tracking for machine learning: local files, a self-hosted server and a hosted service preview.',
 			logo: { light: './src/assets/logo-light.svg', dark: './src/assets/logo-dark.svg', alt: 'agenticML', replacesTitle: true },
@@ -19,7 +25,7 @@ export default defineConfig({
 				{ icon: 'github', label: 'GitHub', href: 'https://github.com/agenticML/agenticml-lite' },
 			],
 			editLink: {
-				baseUrl: 'https://github.com/agenticML/agenticml-lite/edit/dev/website/',
+				baseUrl: 'https://github.com/agenticML/agenticml-lite/edit/main/website/',
 			},
 			routeMiddleware: './src/routeData.ts',
 			components: {

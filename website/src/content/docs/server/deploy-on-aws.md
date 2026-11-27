@@ -168,7 +168,7 @@ To expand disk capacity, increase `DataVolumeSize` in a stack update. CloudForma
 
 ## Private-only (Scheme=internal)
 
-To run the server on an internal network without public exposure, set `Scheme=internal` and configure `AllowedCidr` to your private network range. Deploy into an existing VPC with `VpcId` and `PublicSubnetIds`. `Scheme=internal` still needs the instance to reach PyPI and Cognito (public endpoints, NAT or VPC endpoints), and Cognito's sign-in page is on a public hosted domain, so this is not an air-gapped setup. See [Private networks](/agenticml-lite/server/private-network/) for proxy and client network requirements.
+To run the server on an internal network without public exposure, set `Scheme=internal` and configure `AllowedCidr` to your private network range. Deploy into an existing VPC with `VpcId` and `PublicSubnetIds`. `Scheme=internal` still needs the instance to reach PyPI and Cognito (public endpoints, NAT or VPC endpoints), and Cognito's sign-in page is on a public hosted domain, so this is not an air-gapped setup. See [Private networks](/server/private-network/) for proxy and client network requirements.
 
 ## Operating it
 

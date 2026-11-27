@@ -49,7 +49,7 @@ Configuration templates for private networks are available in the repository und
 
 ## Server configuration
 
-Create the service user and install the systemd service as described in [Installation and deployment](/agenticml-lite/server/install/#systemd-service).
+Create the service user and install the systemd service as described in [Installation and deployment](/server/install/#systemd-service).
 
 Copy the environment template [`agenticml-server.env.example`](https://github.com/agenticML/agenticml-lite/blob/main/deploy/private-network/agenticml-server.env.example) to `/etc/agenticml-server.env` with restricted permissions:
 
@@ -169,7 +169,7 @@ Synchronize runs:
 agenticml sync --all
 ```
 
-For background synchronization on Linux, install the user systemd unit `agenticml-sync.service` as described in [Syncing runs](/agenticml-lite/server/sync/#background-service-with-systemd). Because `login --ca-bundle` records the bundle path per host, no additional service environment variables are needed.
+For background synchronization on Linux, install the user systemd unit `agenticml-sync.service` as described in [Syncing runs](/server/sync/#background-service-with-systemd). Because `login --ca-bundle` records the bundle path per host, no additional service environment variables are needed.
 
 ### Trust order and CA bundles
 
@@ -282,5 +282,5 @@ chmod go-w /etc/ssl/certs/lab-ca.pem
 
 ## Next
 
-- [Authentication and keys](/agenticml-lite/server/keys/): manage workspace users, roles, and machine API keys.
-- [Backups and restore](/agenticml-lite/server/backups/): configure automated backups for server data.
+- [Authentication and keys](/server/keys/): manage workspace users, roles, and machine API keys.
+- [Backups and restore](/server/backups/): configure automated backups for server data.

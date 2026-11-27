@@ -55,7 +55,7 @@ Read by `agenticml run`. `agenticml.init()` also reads `AGENTICML_PROJECT`, `AGE
 
 ## Server options
 
-Read by `agenticml server serve` and `agenticml server up`. The full list, with defaults, is in [Installation and deployment](/agenticml-lite/server/install/#configuration-options).
+Read by `agenticml server serve` and `agenticml server up`. The full list, with defaults, is in [Installation and deployment](/server/install/#configuration-options).
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -73,4 +73,4 @@ Read by `agenticml server serve` and `agenticml server up`. The full list, with 
 - Boolean switches treat `0`, `false`, `no`, and `off` as off.
 - `agenticml.init()` defaults `auto_metrics` and `sync_tensorboard` to off; `agenticml run` turns them on.
 - There is no positive override flag: once a feature is disabled via its environment variable (such as `AGENTICML_SYSTEM_METRICS=0` or `AGENTICML_ALL_RANKS=1`), the CLI cannot re-enable it; unset the variable instead.
-- See [Zero-code runs](/agenticml-lite/guides/zero-code/#options-and-environment-variables) for details on CLI option syntax.
+- See [Zero-code runs](/guides/zero-code/#options-and-environment-variables) for details on CLI option syntax.

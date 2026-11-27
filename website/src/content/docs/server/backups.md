@@ -83,4 +83,4 @@ agenticml server backup --to /backups/20261109-0000
 
 ## Next
 
-Continue to [Upgrades and troubleshooting](/agenticml-lite/server/upgrade/) for maintenance and version migration procedures.
+Continue to [Upgrades and troubleshooting](/server/upgrade/) for maintenance and version migration procedures.

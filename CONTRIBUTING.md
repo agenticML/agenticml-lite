@@ -14,7 +14,7 @@ pytest
 python scripts/bench.py --quick
 ```
 
-`pytest` runs the unit tests in `tests/`. `scripts/bench.py --quick` is a quick performance check; its output is described under "Performance" on the [storage page](https://agenticml.github.io/agenticml-lite/reference/storage/#performance).
+`pytest` runs the unit tests in `tests/`. `scripts/bench.py --quick` is a quick performance check; its output is described under "Performance" on the [storage page](https://agenticml.xyz/reference/storage/#performance).
 
 The `testbed/` directory is a small user project that consumes `agenticml-lite`, with CLI and dashboard tests. Set up its virtual environment once (see [testbed/README.md](testbed/README.md) for the full guide):
 

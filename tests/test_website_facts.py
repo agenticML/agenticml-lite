@@ -356,3 +356,85 @@ def test_hosted_keys_page_has_the_key_facts():
     assert length in text, f'{page} does not state the key name length limit "{length}" (_NAME in server/keys.py)'
 
     assert not _login_key_examples(text), _login_key_examples(text)
+
+
+# The docs site moved to https://agenticml.xyz/ (root path, package 38). The old
+# github.io URL may stay only where it is history (docs/plans, blog posts such
+# as the one announcing the move), the hosted monitor's ignored hosts, and tests.
+OLD_DOCS_URL = 'agenticml.github.io/agenticml-lite'
+OLD_DOCS_URL_ALLOWED = ('docs/plans/', 'website/src/content/docs/blog/',
+                        'scripts/monitor_hosted.py', 'tests/')
+SKIPPED_DIRS = {'node_modules', 'dist', '.venv', '.git', '__pycache__', '.pytest_cache',
+                '.mypy_cache', '.ruff_cache', '.astro'}
+
+
+def _repo_text_files():
+    stack = [ROOT]
+    while stack:
+        for path in sorted(stack.pop().iterdir()):
+            if path.is_dir():
+                if path.name not in SKIPPED_DIRS and not path.name.endswith('.egg-info'):
+                    stack.append(path)
+            elif path.is_file():
+                try:
+                    yield path, path.read_text(encoding='utf-8')
+                except (UnicodeDecodeError, OSError):
+                    continue
+
+
+def test_no_old_github_pages_docs_url():
+    """Protects readers from the old docs address: no file outside
+    docs/plans/, the blog posts (dated history, e.g. the one announcing the
+    move), scripts/monitor_hosted.py and tests/ may link to
+    agenticml.github.io/agenticml-lite; the docs are at https://agenticml.xyz/."""
+    bad = [
+        str(path.relative_to(ROOT))
+        for path, text in _repo_text_files()
+        if OLD_DOCS_URL in text
+        and not path.relative_to(ROOT).as_posix().startswith(OLD_DOCS_URL_ALLOWED)
+    ]
+    assert not bad, f'{OLD_DOCS_URL} is still linked in {bad}; use https://agenticml.xyz/'
+
+
+def test_no_agenticml_lite_base_prefix_in_site_links():
+    """Protects the docs site (served at the root, no base path) from links
+    that still start with /agenticml-lite/ in a Markdown link, href= or a
+    frontmatter link:, which would 404."""
+    pattern = re.compile(r'''(?:\]\(|href=["']|link:\s*["']?)/agenticml-lite(?:/|["')\s]|$)''', re.M)
+    bad = [
+        f'{path.relative_to(ROOT)}: {match.group(0)}'
+        for path, text in _repo_text_files()
+        if path.relative_to(ROOT).as_posix().startswith('website/src/')
+        for match in pattern.finditer(text)
+    ]
+    assert not bad, bad
+
+
+def test_blog_posts_have_required_frontmatter():
+    """Protects the blog (website/src/content/docs/blog) from posts the site
+    cannot list properly: every post needs a title, a valid date that is not in
+    the future, authors and an excerpt in its frontmatter."""
+    import datetime
+
+    import yaml
+
+    posts = sorted(
+        p for p in (DOCS / 'blog').iterdir() if p.is_file() and p.suffix in ('.md', '.mdx')
+    )
+    assert posts, 'no blog posts found in website/src/content/docs/blog'
+    today = datetime.date.today()
+    for post in posts:
+        match = re.match(r'---\r?\n(.*?)\r?\n---\r?\n', post.read_text(encoding='utf-8'), re.S)
+        assert match, f'{post.name}: no frontmatter'
+        meta = yaml.safe_load(match.group(1))
+        assert isinstance(meta, dict), f'{post.name}: frontmatter is not a mapping'
+        for key in ('title', 'authors', 'excerpt'):
+            assert meta.get(key), f'{post.name}: frontmatter has no {key}'
+        date = meta.get('date')
+        if isinstance(date, str):
+            assert re.fullmatch(r'\d{4}-\d{2}-\d{2}', date), f'{post.name}: date {date!r} is not YYYY-MM-DD'
+            date = datetime.date.fromisoformat(date)
+        assert isinstance(date, datetime.date), f'{post.name}: date {date!r} is not a valid date'
+        if isinstance(date, datetime.datetime):
+            date = date.date()
+        assert date <= today, f'{post.name}: date {date} is in the future'

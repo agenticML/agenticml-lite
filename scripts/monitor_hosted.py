@@ -45,6 +45,8 @@ IGNORED_HOSTS = frozenset({
     "api.agenticml.xyz",
     "docs.agenticml.xyz",
     "agenticml.github.io",
+    "agenticml.xyz",
+    "www.agenticml.xyz",
     "localhost",
     "127.0.0.1",
 })

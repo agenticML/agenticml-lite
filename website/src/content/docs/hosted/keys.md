@@ -54,7 +54,7 @@ Workspace owners, admins, and members can create sync keys. Viewers cannot creat
 
 Workspace owners and admins also see a **User** field to create a key for another person in the workspace. If the selected user has the viewer role, the key is created as **inactive**.
 
-The key secret is shown once upon creation and cannot be recovered. Copy it immediately. For a walkthrough, see [Hosted quickstart](/agenticml-lite/hosted/quickstart/#3-make-a-sync-key).
+The key secret is shown once upon creation and cannot be recovered. Copy it immediately. For a walkthrough, see [Hosted quickstart](/hosted/quickstart/#3-make-a-sync-key).
 
 ## Set up a training machine
 
@@ -112,7 +112,7 @@ export AGENTICML_API_KEY="$HOSTED_KEY"
 
 Never bake an API key into a container image or put the raw key value on a command line.
 
-In multi-GPU jobs, training scripts track metrics on rank 0 only by default (see [Distributed training](/agenticml-lite/guides/distributed/)). One key on the machine that runs rank 0 is enough. Run `agenticml sync --follow` alongside training (see [quickstart step 6](/agenticml-lite/hosted/quickstart/#6-track-and-sync-a-run)).
+In multi-GPU jobs, training scripts track metrics on rank 0 only by default (see [Distributed training](/guides/distributed/)). One key on the machine that runs rank 0 is enough. Run `agenticml sync --follow` alongside training (see [quickstart step 6](/hosted/quickstart/#6-track-and-sync-a-run)).
 
 ## One key per machine
 
@@ -152,7 +152,7 @@ A one-shot `agenticml sync` exits with status 1. A long-running `agenticml sync 
 
 `credentials.json` stores one default host and one key per host URL. Because all hosted workspaces share `https://app.agenticml.xyz`, running `agenticml login` for a second workspace overwrites the saved key.
 
-To sync to several workspaces from one machine, provide `AGENTICML_API_KEY` per command or per shell environment. For details on per-workspace progress tracking and cursor resets, see [Several workspaces from one machine](/agenticml-lite/hosted/workspaces/#several-workspaces-from-one-machine).
+To sync to several workspaces from one machine, provide `AGENTICML_API_KEY` per command or per shell environment. For details on per-workspace progress tracking and cursor resets, see [Several workspaces from one machine](/hosted/workspaces/#several-workspaces-from-one-machine).
 
 ## Keep keys safe
 
@@ -169,7 +169,7 @@ To log out of the dashboard manually, click **Sign out** in the top navigation b
 
 ## Troubleshooting
 
-For storage, daily upload, request rate, and member limit errors (HTTP 403 and HTTP 429), see [Hosted quickstart troubleshooting](/agenticml-lite/hosted/quickstart/#troubleshooting).
+For storage, daily upload, request rate, and member limit errors (HTTP 403 and HTTP 429), see [Hosted quickstart troubleshooting](/hosted/quickstart/#troubleshooting).
 
 **"invalid API key" on login.** The key was mistyped, was revoked, or was created for a different server. Create a new key in **Settings > API keys**.
 

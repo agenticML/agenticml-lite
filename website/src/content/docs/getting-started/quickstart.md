@@ -19,7 +19,7 @@ No arguments are needed. If `train.py` uses `argparse`, its parsed values (defau
 agenticml run train.py --lr 1e-3 --epochs 20
 ```
 
-Hyperparameters, a code snapshot, model/optimizer/loss tracking and system metrics are captured automatically. See [what gets captured](/agenticml-lite/guides/zero-code/#what-gets-captured).
+Hyperparameters, a code snapshot, model/optimizer/loss tracking and system metrics are captured automatically. See [what gets captured](/guides/zero-code/#what-gets-captured).
 
 More examples, all zero-code:
 
@@ -50,11 +50,11 @@ agenticml run -- python examples/train_toy.py
 agenticml run -- python examples/train_toy.py --lr 0.05 --epochs 5
 ```
 
-Options such as `--project` and `--name` go before the script. Everything after the script is passed to it untouched. Use `--no-auto-track`, `--no-capture-args`, or `--no-tensorboard` to switch parts off. All command forms are in the [zero-code guide](/agenticml-lite/guides/zero-code/).
+Options such as `--project` and `--name` go before the script. Everything after the script is passed to it untouched. Use `--no-auto-track`, `--no-capture-args`, or `--no-tensorboard` to switch parts off. All command forms are in the [zero-code guide](/guides/zero-code/).
 
 ## Or log from Python
 
-Use the SDK when you want to choose exactly which metrics, config, and summary values are logged. The [Python SDK guide](/agenticml-lite/guides/python-sdk/) covers every call and option.
+Use the SDK when you want to choose exactly which metrics, config, and summary values are logged. The [Python SDK guide](/guides/python-sdk/) covers every call and option.
 
 ```python title="train.py"
 import agenticml
