@@ -8,7 +8,7 @@ sidebar:
 `agenticml import` reads another tracker's logs and writes each run into the local store. After that you can browse the runs with `agenticml ui` and upload them with `agenticml sync`.
 
 :::note[New in 3.4]
-`agenticml import` and the `wandb` extra are new in 3.4. Until 3.4 is released, `pip install agenticml-lite` (3.3.1) has no `import` command. Install from source to use it.
+`agenticml import` and the `wandb` extra are new in 3.4. Older versions have no `import` command.
 :::
 
 ```bash

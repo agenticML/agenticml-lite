@@ -101,7 +101,7 @@ On Linux machines, run `sync --follow` as a user-level systemd service:
 
 ```bash
 mkdir -p ~/.config/systemd/user
-curl -fsSL -o ~/.config/systemd/user/agenticml-sync.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v3.3.1/deploy/systemd/agenticml-sync.service
+curl -fsSL -o ~/.config/systemd/user/agenticml-sync.service https://raw.githubusercontent.com/agenticML/agenticml-lite/v3.4.0/deploy/systemd/agenticml-sync.service
 ```
 
 The unit file works with 2.2 and newer clients. Since 3.2 it also has commented settings for a private network with an internal CA; see [Private network](/server/private-network/).

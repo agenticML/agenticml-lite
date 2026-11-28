@@ -99,7 +99,7 @@ Open `https://app.agenticml.xyz/w/<slug>/` with your slug. Your runs are listed 
 
 ## Troubleshooting
 
-**HTTP 426, "this server needs agenticml-lite >= 2.2".** The client is too old. Run `pip install -U agenticml-lite` to install 3.3.1 (step 4).
+**HTTP 426, "this server needs agenticml-lite >= 2.2".** The client is too old. Run `pip install -U agenticml-lite` to install 3.4.0 (step 4).
 
 **"invalid API key" on login.** The key was copied wrongly, was revoked, or belongs to another server. Make a new key under **Settings > API keys**.
 
