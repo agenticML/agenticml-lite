@@ -1,6 +1,6 @@
 # Package 40: Blog on the hosted sign-in page
 
-Status: in review (plan ready Nov 27, 2026).
+Status: done (#105, merged Nov 27, 2026; live after hosted deploy run 46012459165).
 
 ## Goal
 
