@@ -449,17 +449,17 @@ Starlight site at `/blog/`. Replaces the Backlog entry "Docs custom domain".
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 38 | Docs site at `agenticml.xyz` | – | Sonnet; owner DNS and Pages | S–M | [plan](packages/38-site-domain.md) | in progress: 38.1 and 38.2 done ([#103](https://github.com/agenticML/agenticml-lite/pull/103), merged Nov 27, 2026); 38.3 left (owner) |
+| 38 | Docs site at `agenticml.xyz` | – | Sonnet; owner DNS and Pages | S–M | [plan](packages/38-site-domain.md) | done (Nov 28, 2026): 38.1 and 38.2 done ([#103](https://github.com/agenticML/agenticml-lite/pull/103), merged Nov 27, 2026); 38.3 done |
 | 38.1 | Root-path build: drop the `/agenticml-lite` base, rewrite links, new URL across the repo, guard test | – | Sonnet | S–M | [plan](packages/38-site-domain.md#part-381-root-path-build-sonnet) | done ([#103](https://github.com/agenticML/agenticml-lite/pull/103), merged Nov 27, 2026) |
 | 38.2 | Cutover: Namecheap `A`/`www` records, merge, Pages custom domain, Enforce HTTPS | 38.1 | Owner | S | [plan](packages/38-site-domain.md#part-382-cutover-owner) | done (Nov 27, 2026): DNS records added by the owner; Pages custom domain set and Enforce HTTPS turned on; `https://agenticml.xyz/`, `www`, plain HTTP and old github.io links checked |
-| 38.3 | `HOSTED_LEGAL_BASE_URL` to `https://agenticml.xyz/legal/` and hosted deploy | 38.2 | Owner | S | [plan](packages/38-site-domain.md#part-383-hosted-policy-links-owner) | not started (owner): set `HOSTED_LEGAL_BASE_URL`, approve the hosted deploy, and change the repo website link to `https://agenticml.xyz/` |
+| 38.3 | `HOSTED_LEGAL_BASE_URL` to `https://agenticml.xyz/legal/` and hosted deploy | 38.2 | Owner | S | [plan](packages/38-site-domain.md#part-383-hosted-policy-links-owner) | done (Nov 28, 2026): `HOSTED_LEGAL_BASE_URL` (a variable of the `hosted` environment) set to `https://agenticml.xyz/legal/` with the owner's go; hosted deploy run 46012459165 approved and succeeded; `/login` links Terms, Acceptable use and Privacy straight to `https://agenticml.xyz/legal/`. Repo website link changed to `https://agenticml.xyz/` on Nov 28 with the owner's go |
 | 39 | Blog at `agenticml.xyz/blog/`: `starlight-blog` plugin, post list, tags, RSS, header link, first post | 38.1 (live after 38.2) | Sonnet; prose Antigravity | M | [plan](packages/39-blog.md) | done ([#103](https://github.com/agenticML/agenticml-lite/pull/103), merged Nov 27, 2026); live at https://agenticml.xyz/blog/ |
 | 39.1 | Blog section: plugin pinned at 0.30.2, schema, header link, overflow and RSS checks, facts test | 38.1 | Sonnet | S–M | [plan](packages/39-blog.md#part-391-blog-section-sonnet) | done ([#103](https://github.com/agenticML/agenticml-lite/pull/103)) |
 | 39.2 | First post: the docs and blog now live at agenticml.xyz | 39.1 | Antigravity; supervisor checks | S | [plan](packages/39-blog.md#part-392-first-post-antigravity-writes-it-the-supervisor-checks-it) | done ([#103](https://github.com/agenticML/agenticml-lite/pull/103)) |
-| 40 † | Blog on the hosted sign-in page: "From the blog" card (newest post from the RSS feed) and a Blog link | 39 (live after 38.2) | Sonnet; supervisor reviews and does the † review | M | [plan](packages/40-signin-blog-card.md) | in review |
-| 40.1 † | Server `--blog-url` (`AGENTICML_SERVER_BLOG_URL`), config `blog`, CSP `connect-src` for the blog origin, hosted template `BlogUrl` | – | Sonnet | S | [plan](packages/40-signin-blog-card.md#part-401-server-option-sonnet) | in review |
-| 40.2 | Sign-in page: brand-panel card, Blog link, feed fetch and checks, CSS; UI tests | 40.1 | Sonnet | M | [plan](packages/40-signin-blog-card.md#part-402-sign-in-page-sonnet) | in review |
-| 40.3 | SERVER.md, HOSTED.md, threat model | 40.1 | Sonnet | S | [plan](packages/40-signin-blog-card.md#part-403-docs-sonnet) | in review |
+| 40 † | Blog on the hosted sign-in page: "From the blog" card (newest post from the RSS feed) and a Blog link | 39 (live after 38.2) | Sonnet; supervisor reviews and does the † review | M | [plan](packages/40-signin-blog-card.md) | done (Nov 27, 2026): merged ([#105](https://github.com/agenticML/agenticml-lite/pull/105)); † second review by the supervisor (Codex and Cursor off); live after hosted deploy run 46012459165: `/login` shows the newest post and the Blog link, CSP `connect-src` adds only `https://agenticml.xyz`, no horizontal overflow |
+| 40.1 † | Server `--blog-url` (`AGENTICML_SERVER_BLOG_URL`), config `blog`, CSP `connect-src` for the blog origin, hosted template `BlogUrl` | – | Sonnet | S | [plan](packages/40-signin-blog-card.md#part-401-server-option-sonnet) | done ([#105](https://github.com/agenticML/agenticml-lite/pull/105)) |
+| 40.2 | Sign-in page: brand-panel card, Blog link, feed fetch and checks, CSS; UI tests | 40.1 | Sonnet | M | [plan](packages/40-signin-blog-card.md#part-402-sign-in-page-sonnet) | done ([#105](https://github.com/agenticML/agenticml-lite/pull/105)) |
+| 40.3 | SERVER.md, HOSTED.md, threat model | 40.1 | Sonnet | S | [plan](packages/40-signin-blog-card.md#part-403-docs-sonnet) | done ([#105](https://github.com/agenticML/agenticml-lite/pull/105)) |
 
 ### Maintenance fixes
 
@@ -521,8 +521,12 @@ Starlight site at `/blog/`. Replaces the Backlog entry "Docs custom domain".
   connection is refused, logs database failures, and RDS Postgres logs go to
   CloudWatch: [plan](packages/fix-db-password-rotation.md), found Nov 27, 2026
   (owner report of a slow dashboard; mitigated the same day by restarting the
-  service); status: in review (PR to `main`; Sonnet coded, supervisor
-  reviewed and did the † second review).
+  service); status: done (Nov 27, 2026): merged
+  ([#104](https://github.com/agenticML/agenticml-lite/pull/104); Sonnet coded,
+  supervisor reviewed and did the † second review). The first deploy (run
+  45992145003) rolled back because the bootstrap stack had not been re-applied;
+  after the re-apply, deploy run 46012459165 succeeded. Still to confirm on the
+  Dec 3 rotation (see the Backlog entry).
 
 ### Later (unscheduled)
 
@@ -854,7 +858,9 @@ on Nov 17, 2026; none of the entries below blocked it.
 Found with the database password rotation fix
 ([plan](packages/fix-db-password-rotation.md), Nov 27, 2026), by priority:
 
-- **Owner: re-apply the bootstrap stack, then deploy the rotation fix.**
+- **Confirm the rotation fix on the Dec 3 rotation.** (Bootstrap re-applied
+  and the fix deployed on Nov 27, 2026, run 46012459165; the RDS log group
+  exists. Only the Dec 3 check is left.)
   - Where: `deploy/aws/cloudformation/bootstrap.yaml` (CloudFormation role may
     now manage `/aws/rds/instance/agenticml-hosted/*` log groups), then the
     hosted deploy of the fix.
