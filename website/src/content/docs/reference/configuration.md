@@ -53,6 +53,25 @@ Read by `agenticml run`. `agenticml.init()` also reads `AGENTICML_PROJECT`, `AGE
 | `AGENTICML_FLUSH_INTERVAL` | `2.0` | Background metric flush interval in seconds. |
 | `AGENTICML_ALL_RANKS` | `0` | Set to `1` to track all distributed ranks (not only rank 0). |
 
+## `agenticml import` options
+
+`agenticml import SOURCE PATH [options]` copies runs from another tracker into the local store. `SOURCE` is `tensorboard`, `mlflow`, `wandb` or `csv`. `PATH` is a log directory or file; for `wandb` it can also be `ENTITY/PROJECT[/RUN_ID]`. `agenticml import` and the `wandb` extra are new in 3.4; until it is released, install from source. See [Import runs from other trackers](/guides/import/).
+
+| Option | Environment variable | Default | Description |
+| --- | --- | --- | --- |
+| `--dir DIR` | `AGENTICML_DIR` | `~/.agenticml` | Local store root |
+| `--project PROJECT` | none | the source's own project | Project for every imported run |
+| `--tag T` | none | none | Add a tag to every imported run (repeatable). Every run also gets `imported:<source>` |
+| `--run GLOB` | none | all runs | Import only runs whose name or source id matches the glob (repeatable) |
+| `--replace` | none | off | Replace runs that were imported before. Runs that were synced are refused |
+| `--include-running` | none | off | Import source runs that look unfinished, as finished. They are skipped without it |
+| `--step-column COL` | none | `step`, then `global_step`, then `epoch` | `csv` only: column that holds the step. Ignored for `trainer_state.json` (a warning is printed) |
+| `--time-column COL` | none | `timestamp`, then `time`, then `wall_time` | `csv` only: column that holds the time. Ignored for `trainer_state.json` (a warning is printed) |
+| `--dry-run` | none | off | Read the source and report, write nothing |
+| `--json` | none | off | Print the report as one JSON object |
+
+Exit code `0` means nothing failed, `1` means at least one run failed, and `2` means the command could not start (bad path, unknown source, or an option that does not fit the source).
+
 ## Server options
 
 Read by `agenticml server serve` and `agenticml server up`. The full list, with defaults, is in [Installation and deployment](/server/install/#configuration-options).

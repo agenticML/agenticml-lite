@@ -417,14 +417,14 @@ or lineage on imported runs.
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 41 | Import runs from TensorBoard, MLflow, W&B and CSV | – | Sonnet; supervisor reviews | L | [plan](packages/41-import-trackers.md) | in progress |
+| 41 | Import runs from TensorBoard, MLflow, W&B and CSV | – | Sonnet; supervisor reviews | L | [plan](packages/41-import-trackers.md) | done ([#107](https://github.com/agenticML/agenticml-lite/pull/107)); ships in 3.4 (release and its docs follow-ups in the Backlog) |
 | 41.1 | Import core: writer time options, `importers` package, `agenticml import` CLI, dedupe, `--replace`, dry run, report | – | Sonnet | M | [plan](packages/41-import-trackers.md#411-import-core) | done (Sonnet coded; two review rounds by three Sonnet reviewers with skeptic checks; supervisor reviewed) |
 | 41.2 | TensorBoard event files: TFRecord and protobuf decoding, scalars (TF1 and TF2), images, hparams | 41.1 | Sonnet | M | [plan](packages/41-import-trackers.md#412-tensorboard) | done (Sonnet coded; reviewed by two Sonnet lenses with skeptic checks, 9 findings fixed, clean recheck; supervisor reviewed and ran it end to end; 1M points in 22.7 s) |
 | 41.3 | MLflow file store (`mlruns/`) and SQLite (`mlflow.db`) | 41.1 | Sonnet | M | [plan](packages/41-import-trackers.md#413-mlflow) | done (Sonnet coded; two review rounds, 7 findings fixed; supervisor checked both backends end to end) |
 | 41.4 | W&B local run directories (`.wandb` files), media images | 41.1 | Sonnet | M | [plan](packages/41-import-trackers.md#414-wb-local) | done (Sonnet coded; 7 review findings fixed; fixtures regenerated without host or path data after the supervisor's scan; supervisor ran it end to end) |
 | 41.5 | CSV / JSONL, Lightning `CSVLogger`, Hugging Face `trainer_state.json` | 41.1 | Sonnet | S | [plan](packages/41-import-trackers.md#415-csv--jsonl-and-common-local-loggers) | done (Sonnet coded; two review rounds, 12 findings fixed; dedupe no longer depends on file mtime after the supervisor's end-to-end check) |
 | 41.6 | W&B cloud import through `wandb.Api` (`[wandb]` extra) | 41.4 | Sonnet | S | [plan](packages/41-import-trackers.md#416-wb-cloud) | done (Sonnet coded against a mocked `wandb.Api`; 3 review findings fixed; no live W&B account check) |
-| 41.7 | Docs: import guide, CLI reference, FORMAT.md, README, facts test | 41.2–41.6 | Sonnet; supervisor fact-checks | S | [plan](packages/41-import-trackers.md#417-docs) | plan ready |
+| 41.7 | Docs: import guide, CLI reference, FORMAT.md, README, facts test | 41.2–41.6 | Sonnet; supervisor fact-checks | S | [plan](packages/41-import-trackers.md#417-docs) | done (Sonnet wrote; two Sonnet fact-checkers, 12 findings fixed; supervisor read the guide, built the site and ran the 375px overflow check) |
 
 ### Outreach
 
@@ -876,6 +876,40 @@ on Nov 17, 2026; none of the entries below blocked it.
   - Done when: `npm audit` is clean for `astro`, and the build, the link check
     and `npm run check:overflow` pass.
 - **Docs custom domain**: moved to package 38 ([plan](packages/38-site-domain.md)), Nov 27, 2026.
+
+### Import follow-ups (package 41)
+
+Found while building package 41 ([plan](packages/41-import-trackers.md),
+Nov 28, 2026), by priority:
+
+- **Release 3.4 with `agenticml import`** (owner).
+  - Where: `pyproject.toml` version, `website/src/content/docs/releases.md`,
+    the tag and PyPI.
+  - Problem: `agenticml import` is merged but unreleased; the guide,
+    `reference/configuration.md` and the README say "New in 3.4" and tell
+    readers to install from source until then.
+  - Fix: bump to 3.4.0, add the Releases entry, tag `v3.4.0`, publish to PyPI;
+    then drop the "until 3.4 is released" sentences and add the `wandb` extra
+    to the extras table in `getting-started/installation.md`.
+  - Done when: `pip install agenticml-lite==3.4.0` has `agenticml import`, and
+    the docs no longer mention installing from source for it.
+- **`agenticml ls` LAST STEP for imported runs.**
+  - Where: `src/agenticml/cli.py` `cmd_ls` and the reader's last-step lookup
+    (it uses the last `_time.bin` record).
+  - Problem: an import writes points in source time order, so the last record
+    can have a smaller step than the run's largest (an MLflow `mlflow.db`
+    fixture run shows 0 instead of 4). The data is correct; only the column is
+    misleading.
+  - Fix: for runs with `imported_from`, show the largest step of any series
+    (or use it for every finished run).
+  - Done when: a test with an imported run whose last point has a lower step
+    shows the largest step in `agenticml ls`.
+- **Check W&B cloud import against a real account** (owner, optional).
+  - Where: `src/agenticml/importers/wandb_cloud.py`.
+  - Problem: it is tested only against a mocked `wandb.Api`.
+  - Fix: run `agenticml import wandb ENTITY/PROJECT` on a small real project.
+  - Done when: the runs show in `agenticml ui` with metrics, images, config
+    and times matching the W&B page.
 
 ### Code and dashboard follow-ups
 
