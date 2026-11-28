@@ -11,11 +11,11 @@ Use this table to choose the version for your setup:
 
 | Path | Version | Install command |
 | --- | --- | --- |
-| Local tracking only | 3.3.1 from PyPI | `pip install agenticml-lite` |
-| Self-hosted server | 3.3.1 from PyPI | `pip install 'agenticml-lite[system]'` |
-| Hosted service | 3.3.1 from PyPI | `pip install 'agenticml-lite[system]'` |
+| Local tracking only | 3.4.0 from PyPI | `pip install agenticml-lite` |
+| Self-hosted server | 3.4.0 from PyPI | `pip install 'agenticml-lite[system]'` |
+| Hosted service | 3.4.0 from PyPI | `pip install 'agenticml-lite[system]'` |
 
-`pip install agenticml-lite` installs 3.3.1, which includes the server and hosted service support. To stay on 1.0.0, run `pip install agenticml-lite==1.0.0`. Version 1.0.0 supports local tracking only. It cannot sync to a 2.x or 3.0 server.
+`pip install agenticml-lite` installs 3.4.0, which includes the server and hosted service support. To stay on 1.0.0, run `pip install agenticml-lite==1.0.0`. Version 1.0.0 supports local tracking only. It cannot sync to a 2.x or 3.0 server.
 
 A 2.2 client has not been checked against the hosted service. Use 3.0 or newer.
 
@@ -28,6 +28,35 @@ pip show agenticml-lite
 ```
 
 This works on every version. The `agenticml --version` command works from 3.0. On 1.0.0 and 2.x, use `pip show`.
+
+---
+
+## 3.4.0
+
+**Status:** Released Nov 28, 2026 (tag `v3.4.0`). On PyPI.
+
+Training machines need 3.4.0 only to use `agenticml import`. The server needs it for the server options below. Nothing in the existing files of the store format or in the sync protocol changes. Imported runs carry a new `imported_from` key in `meta.json`.
+
+Install from PyPI:
+
+```bash
+pip install -U 'agenticml-lite[system]'
+```
+
+### Import from other trackers
+
+`agenticml import` copies runs from other trackers into the local store, so you can browse them with `agenticml ui` and upload them with `agenticml sync`. See [Import runs from other trackers](/guides/import/).
+
+- **Sources:** TensorBoard event files (scalars, images and hparams), MLflow `mlruns/` directories and `mlflow.db`, W&B local runs, W&B cloud runs (with the `[wandb]` extra), CSV and JSONL files, Lightning `CSVLogger` output, and Hugging Face `trainer_state.json`.
+- **Source times:** Each run keeps the start and end times from its source, and each point keeps its own time where the source records one.
+- **Re-import:** Importing the same run again skips it. `--replace` imports it again and replaces the earlier copy.
+- **Options:** `--dry-run` shows what would be imported and writes nothing. `--json` prints the report as one JSON object.
+
+### Server
+
+- **Contact button:** `--contact-email` (or `AGENTICML_SERVER_CONTACT_EMAIL`) sets where the dashboard's Feedback or Contact us button writes. `off` hides the button.
+- **Blog card:** `--blog-url` (or `AGENTICML_SERVER_BLOG_URL`) shows a link and the newest post from your blog on the Firebase sign-in page.
+- **Rotated database password:** With `AGENTICML_SERVER_DATABASE_PASSWORD_SECRET` set, the Postgres backend re-reads a rotated password from AWS Secrets Manager and retries, so no restart is needed. It also logs failed database connects.
 
 ---
 

@@ -43,7 +43,7 @@ plans live next to it:
 | **3.1** | Scale and visibility | Usage history on `/admin` and `agenticml server stats`, capacity metrics with a CloudWatch dashboard and alarms, ECS autoscaling for the hosted service | A server admin sees accounts, active users, workspaces and stored data over time; the hosted service shows request, latency, task and database load on one dashboard; under a load test it scales between 1 and its maximum task count with no failed requests; released in 3.3.0 (Nov 20, 2026), not published on its own |
 | **3.2** | Private networks | Run the server and dashboard inside a lab VPC without Tailscale: CA bundle and per-host http trust on the client, a TLS proxy kit (Caddy, nginx), an end-to-end test through a TLS proxy, a private-network docs page | A lab follows the docs to sync from its training machines and sign in from its browsers over HTTPS with an internal certificate, with nothing reaching in from the internet; released in 3.3.0 (Nov 20, 2026), not published on its own |
 | **3.3** | Deploy in your own AWS account | One CloudFormation template (EC2 + SQLite from PyPI, ALB + ACM, Cognito sign-up and sign-in) and OIDC sign-in in the server | A deployer with an AWS account and a Route 53 domain launches the template, signs up with the admin email and syncs a run, with no other setup; released Nov 20, 2026 as 3.3.0 (tag `v3.3.0`, [PyPI](https://pypi.org/project/agenticml-lite/3.3.0/), [GitHub release](https://github.com/agenticML/agenticml-lite/releases/tag/v3.3.0)) |
-| **3.4** | Import from other trackers | `agenticml import` for TensorBoard event files, MLflow (`mlruns/` and `mlflow.db`), W&B local runs and W&B cloud, CSV/JSONL with Lightning and Hugging Face logs; imported runs are normal finished runs in the local store | Each source's fixtures import into a fresh store and show in `agenticml ui` with metrics, images, config and original times; a repeat import skips every run |
+| **3.4** | Import from other trackers | `agenticml import` for TensorBoard event files, MLflow (`mlruns/` and `mlflow.db`), W&B local runs and W&B cloud, CSV/JSONL with Lightning and Hugging Face logs; imported runs are normal finished runs in the local store | Each source's fixtures import into a fresh store and show in `agenticml ui` with metrics, images, config and original times; a repeat import skips every run; released Nov 28, 2026 as 3.4.0 (tag `v3.4.0`, [plan](packages/release-3-4-0.md)) |
 | Later | Scale and lifecycle | Unscheduled; see below | – |
 
 Decision (Nov 5, 2026): the server ships only as the `agenticml-lite`
@@ -417,7 +417,7 @@ or lineage on imported runs.
 
 | # | Package | Depends on | Coder | Size | Plan | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| 41 | Import runs from TensorBoard, MLflow, W&B and CSV | – | Sonnet; supervisor reviews | L | [plan](packages/41-import-trackers.md) | done ([#107](https://github.com/agenticML/agenticml-lite/pull/107)); ships in 3.4 (release and its docs follow-ups in the Backlog) |
+| 41 | Import runs from TensorBoard, MLflow, W&B and CSV | – | Sonnet; supervisor reviews | L | [plan](packages/41-import-trackers.md) | done ([#107](https://github.com/agenticML/agenticml-lite/pull/107)); released in 3.4.0 (Nov 28, 2026) |
 | 41.1 | Import core: writer time options, `importers` package, `agenticml import` CLI, dedupe, `--replace`, dry run, report | – | Sonnet | M | [plan](packages/41-import-trackers.md#411-import-core) | done (Sonnet coded; two review rounds by three Sonnet reviewers with skeptic checks; supervisor reviewed) |
 | 41.2 | TensorBoard event files: TFRecord and protobuf decoding, scalars (TF1 and TF2), images, hparams | 41.1 | Sonnet | M | [plan](packages/41-import-trackers.md#412-tensorboard) | done (Sonnet coded; reviewed by two Sonnet lenses with skeptic checks, 9 findings fixed, clean recheck; supervisor reviewed and ran it end to end; 1M points in 22.7 s) |
 | 41.3 | MLflow file store (`mlruns/`) and SQLite (`mlflow.db`) | 41.1 | Sonnet | M | [plan](packages/41-import-trackers.md#413-mlflow) | done (Sonnet coded; two review rounds, 7 findings fixed; supervisor checked both backends end to end) |
@@ -624,7 +624,7 @@ Starlight site at `/blog/`. Replaces the Backlog entry "Docs custom domain".
 Unfinished work found along the way that is not part of a package above. Each
 entry says where, the problem, the fix, and when it is done. Place entries by
 priority. 3.3.0 (with 3.1 and 3.2) was released on Nov 20, 2026. 3.3.1 was
-released on Nov 23, 2026.
+released on Nov 23, 2026. 3.4.0 was released on Nov 28, 2026.
 
 Package 30 (Nov 17, 2026) cleared the Backlog before the 3.0 release: 21
 entries were fixed in parts 30.1–30.6 (for two of them, the many-process
@@ -640,6 +640,18 @@ on Nov 17, 2026; none of the entries below blocked it.
 
 ### Owner steps
 
+- **Release 3.4.0** (owner). Tag `v3.4.0` and PyPI 3.4.0 follow the merge of the
+  release PR ([plan](packages/release-3-4-0.md)).
+  - Where: the GitHub repository (releases, Actions); `release-assets.yml`,
+    `deploy.yml`.
+  - Problem: the GitHub release for `v3.4.0` does not exist yet, and the
+    hosted deploy of the merge commit waits for approval, so the hosted
+    service does not run 3.4.0.
+  - Fix: (1) Publish the GitHub release for `v3.4.0`; `release-assets.yml`
+    attaches `agenticml.yaml`. (2) Approve the `deploy.yml` run that waits for
+    the `hosted` environment.
+  - Done when: the release has `agenticml.yaml` and the hosted service runs
+    the merge commit.
 - **Release 3.3.1** (owner). Tag `v3.3.1` and PyPI 3.3.1 done Nov 23, 2026.
   - Where: the GitHub repository (releases, Actions); `release-assets.yml`,
     `deploy.yml`.
@@ -882,17 +894,6 @@ on Nov 17, 2026; none of the entries below blocked it.
 Found while building package 41 ([plan](packages/41-import-trackers.md),
 Nov 28, 2026), by priority:
 
-- **Release 3.4 with `agenticml import`** (owner).
-  - Where: `pyproject.toml` version, `website/src/content/docs/releases.md`,
-    the tag and PyPI.
-  - Problem: `agenticml import` is merged but unreleased; the guide,
-    `reference/configuration.md` and the README say "New in 3.4" and tell
-    readers to install from source until then.
-  - Fix: bump to 3.4.0, add the Releases entry, tag `v3.4.0`, publish to PyPI;
-    then drop the "until 3.4 is released" sentences and add the `wandb` extra
-    to the extras table in `getting-started/installation.md`.
-  - Done when: `pip install agenticml-lite==3.4.0` has `agenticml import`, and
-    the docs no longer mention installing from source for it.
 - **`agenticml ls` LAST STEP for imported runs.**
   - Where: `src/agenticml/cli.py` `cmd_ls` and the reader's last-step lookup
     (it uses the last `_time.bin` record).

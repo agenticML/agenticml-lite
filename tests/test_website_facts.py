@@ -135,7 +135,7 @@ def test_no_v3_0_0_raw_url_until_published():
 
 # The published release tags. Update it after each release: a raw.githubusercontent.com
 # URL in the docs must name one of these, or it returns 404.
-PUBLISHED_TAGS = ('v3.0.0', 'v3.3.0', 'v3.3.1')
+PUBLISHED_TAGS = ('v3.0.0', 'v3.3.0', 'v3.3.1', 'v3.4.0')
 
 RAW_URL_DOC_FILES = [
     'README.md', 'docs/SERVER.md', 'docs/HOSTED.md', 'docs/PROTOCOL.md',

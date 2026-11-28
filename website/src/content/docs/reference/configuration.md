@@ -55,7 +55,7 @@ Read by `agenticml run`. `agenticml.init()` also reads `AGENTICML_PROJECT`, `AGE
 
 ## `agenticml import` options
 
-`agenticml import SOURCE PATH [options]` copies runs from another tracker into the local store. `SOURCE` is `tensorboard`, `mlflow`, `wandb` or `csv`. `PATH` is a log directory or file; for `wandb` it can also be `ENTITY/PROJECT[/RUN_ID]`. `agenticml import` and the `wandb` extra are new in 3.4; until it is released, install from source. See [Import runs from other trackers](/guides/import/).
+`agenticml import SOURCE PATH [options]` copies runs from another tracker into the local store. `SOURCE` is `tensorboard`, `mlflow`, `wandb` or `csv`. `PATH` is a log directory or file; for `wandb` it can also be `ENTITY/PROJECT[/RUN_ID]`. `agenticml import` and the `wandb` extra are new in 3.4. See [Import runs from other trackers](/guides/import/).
 
 | Option | Environment variable | Default | Description |
 | --- | --- | --- | --- |

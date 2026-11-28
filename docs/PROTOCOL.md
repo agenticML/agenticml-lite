@@ -71,7 +71,7 @@ Authorization: Bearer <key>
 
 ### Client support window
 
-Sync clients declare their package version in the `User-Agent` header (e.g. `User-Agent: agenticml-lite/3.3.1`).
+Sync clients declare their package version in the `User-Agent` header (e.g. `User-Agent: agenticml-lite/3.4.0`).
 
 The server enforces a minimum client support window via `--min-client-version X.Y` (environment variable `AGENTICML_SERVER_MIN_CLIENT_VERSION`, default `2.2`). Values below `2.2` are not supported: 2.0 and 2.1 clients compare `owner` with their key name and misreport their own runs as foreign.
 
