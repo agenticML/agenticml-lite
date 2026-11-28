@@ -1,0 +1,9 @@
+batch_size: 32
+hidden_dim: 128
+lr: 0.001
+optimizer: adam
+use_bn: true
+dropout: null
+layers:
+- 64
+- 32

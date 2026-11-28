@@ -1,0 +1,4 @@
+epoch,step,train_loss,val_loss
+0,9,2.50,
+0,19,2.00,
+0,24,,2.20
