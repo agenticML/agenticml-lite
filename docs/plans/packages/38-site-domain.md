@@ -1,6 +1,6 @@
 # Package 38: Docs site at agenticml.xyz
 
-Status: done except the repo website link (owner). 38.1 and 38.2 done (#103, merged Nov 27, 2026); 38.3 policy links done Nov 27 (hosted deploy run 46012459165).
+Status: done (Nov 28, 2026). 38.1 and 38.2 done (#103, merged Nov 27, 2026); 38.3 done: policy links live after hosted deploy run 46012459165 (Nov 27), repo website link changed Nov 28.
 
 ## Goal
 
