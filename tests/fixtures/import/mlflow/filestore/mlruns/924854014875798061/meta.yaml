@@ -1,0 +1,9 @@
+artifact_location: file:///mlruns/924854014875798061
+creation_time: 1795859906411
+effective_trace_archival_retention: null
+experiment_id: '924854014875798061'
+last_update_time: 1795859906411
+lifecycle_stage: active
+name: resnet
+trace_location: null
+workspace: default
