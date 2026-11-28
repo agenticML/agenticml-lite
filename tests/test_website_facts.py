@@ -8,6 +8,8 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 from agenticml.server.clientwindow import DEFAULT_MIN_CLIENT
 
 ROOT = Path(__file__).parents[1]
@@ -438,3 +440,41 @@ def test_blog_posts_have_required_frontmatter():
         if isinstance(date, datetime.datetime):
             date = date.date()
         assert date <= today, f'{post.name}: date {date} is in the future'
+
+
+def _import_long_options(capsys):
+    """The long options of `agenticml import`, read from its --help output."""
+    from agenticml import cli
+
+    with pytest.raises(SystemExit) as stop:
+        cli.main(['import', '--help'])
+    assert stop.value.code == 0
+    help_text = capsys.readouterr().out
+    options = set(re.findall(r'^\s+(?:-\w, )?(--[a-z][a-z-]*)', help_text, re.MULTILINE))
+    options.discard('--help')
+    return options
+
+
+def test_import_guide_names_every_source_and_option(capsys):
+    """Protects the import guide and the configuration reference from dropping a
+    source in agenticml.importers.SOURCES or a long option of `agenticml import`."""
+    from agenticml.importers import SOURCES
+
+    options = _import_long_options(capsys)
+    # Guard the check itself: a rename of the help layout must not empty the set.
+    assert {'--dir', '--project', '--tag', '--run', '--replace', '--dry-run', '--json'} <= options, options
+    assert SOURCES, 'no import sources registered'
+
+    guide = _text('guides/import.md')
+    for source in SOURCES:
+        assert f'agenticml import {source} ' in guide, f'guides/import.md: no command for source {source!r}'
+    for option in sorted(options):
+        assert re.search(rf'{re.escape(option)}(?![\w-])', guide), f'guides/import.md: no {option}'
+
+    reference = _text('reference/configuration.md')
+    for option in sorted(options):
+        assert re.search(rf'^\| `{re.escape(option)}[ `]', reference, re.MULTILINE), (
+            f'reference/configuration.md: no table row for {option}'
+        )
+    for source in SOURCES:
+        assert f'`{source}`' in reference, f'reference/configuration.md: source {source!r} not named'

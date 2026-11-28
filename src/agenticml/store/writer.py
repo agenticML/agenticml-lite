@@ -25,7 +25,9 @@ import struct
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from .layout import (
     EVENTS_NAME,
@@ -119,6 +121,9 @@ class _Series:
     monotonic: bool
     last_step: int | None
     max_step: int | None
+
+
+_UNSET: Any = object()  # "argument not given", as opposed to an explicit None
 
 
 def _hostname() -> str | None:
@@ -369,13 +374,28 @@ class RunWriter:
         return path
 
     @classmethod
-    def create(cls, root, *, run_id: str | None = None, meta: dict | None = None) -> RunWriter:
+    def create(
+        cls,
+        root,
+        *,
+        run_id: str | None = None,
+        meta: dict | None = None,
+        created_at: datetime | None = None,
+        hostname: str | None = _UNSET,  # type: ignore[assignment]
+    ) -> RunWriter:
         """Create a run directory and write ``meta.json`` with status ``running``.
 
         ``run_id`` defaults to :func:`new_run_id`. System fields (format
         version, id, status, timestamps, pid, hostname) are set here even if
         ``meta`` contains them. Raises ``FileExistsError`` when that id
         already has a ``meta.json``.
+
+        ``created_at`` (importers only) replaces the clock for ``created_at``
+        and the ``_time.bin`` origin; a naive value is read as UTC.
+
+        ``hostname`` (importers only) replaces this machine's name in the
+        ``hostname`` field; pass ``None`` to record no host. When it is left
+        out the field is this machine's hostname, as before.
         """
         if run_id is None:
             run_id = new_run_id()
@@ -388,9 +408,10 @@ class RunWriter:
         writer = cls(root, run_id)
         if writer._meta_path.is_file():
             raise FileExistsError(writer._meta_path)
-        created_at = format_timestamp()
-        writer._created_at_unix = parse_timestamp(created_at).timestamp()
-        built = _initial_meta(user, run_id, created_at, os.getpid(), _hostname())
+        created_text = format_timestamp(created_at)
+        writer._created_at_unix = parse_timestamp(created_text).timestamp()
+        host = _hostname() if hostname is _UNSET else hostname
+        built = _initial_meta(user, run_id, created_text, os.getpid(), host)
         writer.run_dir.mkdir(parents=True, exist_ok=True)
         try:
             writer._acquire_run_lock()
@@ -550,7 +571,7 @@ class RunWriter:
                     best = series.max_step
             return best
 
-    def write_scalars(self, items) -> None:
+    def write_scalars(self, items, *, wall_time: float | None = None) -> None:
         """Append ``(step, metrics)`` points.
 
         A bad step or a value ``float()`` cannot convert is dropped. The
@@ -558,6 +579,10 @@ class RunWriter:
         not. One ``_time.bin`` record is appended per call that stored at
         least one point: the max accepted step, and seconds since
         ``created_at`` as float32.
+
+        ``wall_time`` (importers only) is a Unix time that replaces the clock
+        for that ``_time.bin`` record; a value before ``created_at`` is
+        stored as 0.0.
         """
         normalized = _normalize_items(items)
         with self._lock:
@@ -657,7 +682,10 @@ class RunWriter:
                 time_initial_size = self._time_bin_size()
                 for series_id, buf in buffers.items():
                     self._append_series_bytes(series_id, bytes(buf))
-                seconds = time.time() - self._created_at_unix
+                if wall_time is None:
+                    seconds = time.time() - self._created_at_unix
+                else:
+                    seconds = max(0.0, wall_time - self._created_at_unix)
                 payload, _overflowed = _pack_record(max_step, seconds)
                 self._append_time(payload)
             except Exception:
@@ -877,11 +905,20 @@ class RunWriter:
             self._artifact_versions[name] = version
             return dict(record)
 
-    def finish(self, status: str, summary: dict | None = None) -> None:
+    def finish(
+        self,
+        status: str,
+        summary: dict | None = None,
+        *,
+        finished_at: datetime | None = None,
+    ) -> None:
         """Flush, write ``.ovw`` files, fsync, set status, append ``finish``.
 
         Idempotent in this process: a second call does nothing, and the first
         status and summary stay. ``status`` is ``finished`` or ``crashed``.
+
+        ``finished_at`` (importers only) replaces the clock for ``finished_at``
+        and the ``finish`` event's ``t``.
         """
         if status not in _FINISHED:
             raise ValueError("status must be 'finished' or 'crashed'")
@@ -896,17 +933,22 @@ class RunWriter:
             self._close_handles()
             self._write_overviews()
             self._fsync_outputs()
+            finished_text = format_timestamp(finished_at)
+            if finished_at is None:
+                finished_unix = time.time()
+            else:
+                finished_unix = parse_timestamp(finished_text).timestamp()
             self._update_meta(
                 {
                     "status": status,
                     "summary": summary,
-                    "finished_at": format_timestamp(),
+                    "finished_at": finished_text,
                 },
                 fsync=True,
             )
             self._append_event(
                 {
-                    "t": time.time(),
+                    "t": finished_unix,
                     "kind": "finish",
                     "status": status,
                     "summary": summary,

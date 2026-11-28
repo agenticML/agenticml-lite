@@ -1,0 +1,5 @@
+{"global_step": 0, "time": 1700000000000, "train": {"loss": 1.0}, "lr": 0.1, "note": "ok"}
+{"global_step": 1, "time": 1700000010000, "train": {"loss": 0.5}, "lr": 0.05, "note": "ok"}
+{"global_step": 2, "time": 1700000020000, "train": {"loss": 0.3333333333333333}, "lr": 0.03333333333333333, "note": "ok"}
+{"global_step": 3, "time": 1700000030000, "train": {"loss": 0.25}, "lr": 0.025, "note": "ok"}
+{"global_step": 4, "time": 1700000040000, "train": {"loss": 0.2}, "lr": 0.02, "note": "ok"}

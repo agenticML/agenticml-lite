@@ -64,6 +64,10 @@ s3 = [
 cloudwatch = [
   "boto3>=1.34",
 ]
+# W&B cloud import (agenticml import wandb ENTITY/PROJECT)
+wandb = [
+  "wandb>=0.17",
+]
 hosted = [
   "agenticml-lite[cloudwatch,firebase,postgres,s3]",
 ]

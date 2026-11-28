@@ -99,6 +99,7 @@ atomically (see below). Fields:
 | `group`, `job_type`, `parent_run_id` | String or `null`. |
 | `env`, `git` | JSON objects. Default `{}`. |
 | `arch` | Optional architecture object; fields below. |
+| `imported_from` | Optional object, present only on runs written by `agenticml import`; fields below. |
 | `lineage` | Optional startup shadow snapshot; fields below. |
 | `status` | `running`, `finished`, or `crashed`. |
 | `summary` | JSON object. Default `{}`. |
@@ -109,7 +110,36 @@ atomically (see below). Fields:
 
 Extra keys from the caller are preserved. Create always forces
 `format_version`, `run_id`, `status=running`, `created_at`, `finished_at=null`,
-`pid`, and `hostname`, even if the caller passed them.
+`pid`, and `hostname`, even if the caller passed them. The only exceptions are
+the importer-only arguments `created_at=` and `hostname=` of `RunWriter.create`
+(see [Importer-only writer arguments](#importer-only-writer-arguments)).
+
+### `imported_from`
+
+Written once at create by `agenticml import`; every other writer leaves it out.
+Its presence marks a run as imported. `import --replace` only replaces a run
+that has this key and no `sync.json`. Sync copies `meta.json` byte for byte,
+so the key reaches the server unchanged.
+
+| Field | Meaning |
+| --- | --- |
+| `source` | `tensorboard`, `mlflow`, `wandb` or `csv`. |
+| `location` | Absolute path of the source store as read (the resolved `mlruns` directory, `mlflow.db` file, log directory, or table file; for local W&B, the `wandb/` directory that holds the run directory), or `wandb://<host>/<entity>/<project>` for W&B cloud. |
+| `source_run_id` | The run's id inside the source (TensorBoard: the run directory relative to the log directory; MLflow: the run id; W&B: the run id, or `<run id>@<directory name>` for a resumed segment; csv: the file name). |
+| `source_status` | The source's own status text (`FINISHED`, `failed (exit code 1)`, `finished`, ...), or `null` when the source has none. |
+| `imported_at` | UTC timestamp of the import. |
+| `agenticml_version` | Version of agenticml that wrote the run. |
+| `renumbered_steps` | Optional, sorted array of metric keys whose steps were replaced by `0..n-1` in time order, because every point of the series had the same step (MLflow `log_metric` without `step`, a CSV column on one step). Present only when at least one key was renumbered. |
+
+Imported runs also have the tag `imported:<source>`. Their `env` and `git` are
+`{}`, they have no `lineage`, and `hostname` is the host the source recorded
+(W&B) or `null`; it is never the importing machine's name.
+
+The run id is `<start as YYYYmmddTHHMMSS>-<8 hex>`, where the digits are the
+first 8 hex digits of `sha256(source NUL location NUL source_run_id)`. An
+import looks for an existing run whose id ends in the same digits and whose
+`imported_from` has the same `source`, `location` and `source_run_id`, so the
+run keeps its id when the start time changes between imports.
 
 ### Task resolution
 
@@ -439,7 +469,9 @@ on the same writer instance do not. The set is not persisted across resume.
 point. `step` is the maximum accepted step in that call. `value` is seconds
 since `created_at`, as float32. Calls that are empty or whose points were
 all dropped do not append a time record. This is one sample per flush, not
-per point.
+per point. With the importer-only `wall_time=` argument, `value` is
+`wall_time - created_at` instead, with a negative result stored as `0.0`
+(see [Importer-only writer arguments](#importer-only-writer-arguments)).
 
 Writers do not fsync these files on the append path. Durability of a crash
 is the torn-tail rule, not `fsync`. Handles are unbuffered so a reader in
@@ -705,6 +737,21 @@ first request and reads only those prefixes. New keys and appended records
 wait for the next invocation (or `--watch` pass), so continuous training cannot
 keep a pass running forever. Each scalar round loads at most 200,000 records
 total across all keys.
+
+## Importer-only writer arguments
+
+`agenticml import` writes finished runs from another tracker. It uses
+the normal writer, with four extra keyword arguments: three replace the clock
+and one replaces the machine's name, so the stored times and host are the
+source's own. No other caller uses them; without them every behavior above is
+unchanged.
+
+| Call | Argument | Effect |
+| --- | --- | --- |
+| `RunWriter.create` | `created_at=<datetime>` | Replaces the clock for `created_at` and for the zero point of `_time.bin`. A naive value is read as UTC. |
+| `RunWriter.create` | `hostname=<str or None>` | Replaces this machine's name in `hostname`. `None` records no host. Left out, `hostname` is this machine's name. |
+| `RunWriter.write_scalars` | `wall_time=<Unix seconds>` | Replaces the clock for that call's `_time.bin` record: `value = wall_time - created_at`, negative stored as `0.0`. |
+| `RunWriter.finish` | `finished_at=<datetime>` | Replaces the clock for `finished_at` and for the `t` of the `finish` event. |
 
 ## Who may write
 

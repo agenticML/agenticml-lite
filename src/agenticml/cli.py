@@ -10,6 +10,7 @@ agenticml code in the script:
 
 `agenticml show` inspects a local run; `agenticml export` dumps its metric series.
 `agenticml sync` incrementally uploads local runs to a server.
+`agenticml import` copies runs from TensorBoard, MLflow, W&B or CSV logs into the local store.
 `agenticml edit`, `artifact`, `finish`, and `note` update a finished run.
 """
 
@@ -219,6 +220,53 @@ def cmd_ls(args):
         print("  ".join(value.ljust(width) for value, width in zip(row, widths)).rstrip())
     print(f"{len(runs)} run{'s' if len(runs) != 1 else ''}")
     return 0
+
+
+def _import_line(row, dry_run):
+    name = row.name or "-"
+    if row.status == "failed":
+        return f"failed {name}: {row.reason}"
+    if row.status == "skipped":
+        return f"skipped {row.run_id or '-'}  {name}  ({row.reason})"
+    dropped = f", {row.dropped_points + row.dropped_media} dropped" if row.dropped_points or row.dropped_media else ""
+    verb = "would import" if dry_run else "imported"
+    note = f"  ({row.reason})" if row.reason else ""
+    return f"{verb} {row.run_id or '-'}  {name}  {row.points} points, {row.media} images{dropped}{note}"
+
+
+def cmd_import(args):
+    from .importers import ImportOptions, ImportSourceError, run_import
+    from .store.layout import resolve_root
+
+    options = ImportOptions(
+        project=args.project,
+        tags=list(args.tag or []),
+        run_globs=list(args.run or []),
+        include_running=args.include_running,
+        step_column=args.step_column,
+        time_column=args.time_column,
+    )
+    root = resolve_root(args.dir)
+    on_row = None if args.json else (lambda row: print(_import_line(row, args.dry_run), flush=True))
+    try:
+        report = run_import(
+            root, args.source, args.path, options,
+            replace=args.replace, dry_run=args.dry_run, on_row=on_row,
+        )
+    except ImportSourceError as exc:
+        print(f"agenticml import: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"agenticml import: {exc}", file=sys.stderr)
+        return 2
+    for message in report.warnings:
+        print(f"warning: {message}", file=sys.stderr)
+    if args.json:
+        print(json.dumps(report.to_dict()))
+    else:
+        verb = "would import" if args.dry_run else "imported"
+        print(f"{report.imported} {verb}, {report.skipped} skipped, {report.failed} failed")
+    return 1 if report.failed else 0
 
 
 def cmd_show(args):
@@ -2000,6 +2048,32 @@ def main(argv=None):
     p_ls.add_argument("--project", default=None, help="Filter by project")
     p_ls.add_argument("--json", action="store_true", help="Print run metadata as JSON")
     p_ls.set_defaults(func=cmd_ls)
+
+    from .importers import SOURCES as import_sources
+
+    p_import = sub.add_parser(
+        "import",
+        help="Import runs from TensorBoard, MLflow, W&B or CSV logs",
+        description="Read another tracker's logs on disk and write each run to the local store. "
+                    "The source is not changed; importing the same run again skips it.",
+    )
+    p_import.add_argument("source", choices=import_sources, help="Kind of logs to read")
+    p_import.add_argument("path", help="Log directory or file (W&B also accepts ENTITY/PROJECT)")
+    p_import.add_argument("--dir", default=None, help="Local root (default: AGENTICML_DIR or ~/.agenticml)")
+    p_import.add_argument("--project", default=None, help="Project for every imported run (default: the source's own)")
+    p_import.add_argument("--tag", action="append", default=None, metavar="T",
+                          help="Add a tag to every imported run; repeatable")
+    p_import.add_argument("--run", action="append", default=None, metavar="GLOB",
+                          help="Only runs whose name or id matches GLOB; repeatable")
+    p_import.add_argument("--replace", action="store_true",
+                          help="Re-import runs that were imported before (never synced runs only)")
+    p_import.add_argument("--include-running", action="store_true",
+                          help="Import source runs that look unfinished, as finished")
+    p_import.add_argument("--step-column", default=None, metavar="COL", help="csv only: column holding the step")
+    p_import.add_argument("--time-column", default=None, metavar="COL", help="csv only: column holding the time")
+    p_import.add_argument("--dry-run", action="store_true", help="Read the source and report, write nothing")
+    p_import.add_argument("--json", action="store_true", help="Print the report as JSON")
+    p_import.set_defaults(func=cmd_import)
 
     p_show = sub.add_parser("show", help="Show one local run")
     p_show.add_argument("run_id")

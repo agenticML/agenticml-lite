@@ -13,6 +13,7 @@ plans live next to it:
 - Release 3.0: [on-prem-3.0-plan.md](on-prem-3.0-plan.md)
 - Release 3.1: sketched below, with package plans in `packages/`.
 - Release 3.3: [packages/36-aws-self-deploy.md](packages/36-aws-self-deploy.md).
+- Release 3.4: [packages/41-import-trackers.md](packages/41-import-trackers.md).
 
 ## Product direction
 
@@ -42,6 +43,7 @@ plans live next to it:
 | **3.1** | Scale and visibility | Usage history on `/admin` and `agenticml server stats`, capacity metrics with a CloudWatch dashboard and alarms, ECS autoscaling for the hosted service | A server admin sees accounts, active users, workspaces and stored data over time; the hosted service shows request, latency, task and database load on one dashboard; under a load test it scales between 1 and its maximum task count with no failed requests; released in 3.3.0 (Nov 20, 2026), not published on its own |
 | **3.2** | Private networks | Run the server and dashboard inside a lab VPC without Tailscale: CA bundle and per-host http trust on the client, a TLS proxy kit (Caddy, nginx), an end-to-end test through a TLS proxy, a private-network docs page | A lab follows the docs to sync from its training machines and sign in from its browsers over HTTPS with an internal certificate, with nothing reaching in from the internet; released in 3.3.0 (Nov 20, 2026), not published on its own |
 | **3.3** | Deploy in your own AWS account | One CloudFormation template (EC2 + SQLite from PyPI, ALB + ACM, Cognito sign-up and sign-in) and OIDC sign-in in the server | A deployer with an AWS account and a Route 53 domain launches the template, signs up with the admin email and syncs a run, with no other setup; released Nov 20, 2026 as 3.3.0 (tag `v3.3.0`, [PyPI](https://pypi.org/project/agenticml-lite/3.3.0/), [GitHub release](https://github.com/agenticML/agenticml-lite/releases/tag/v3.3.0)) |
+| **3.4** | Import from other trackers | `agenticml import` for TensorBoard event files, MLflow (`mlruns/` and `mlflow.db`), W&B local runs and W&B cloud, CSV/JSONL with Lightning and Hugging Face logs; imported runs are normal finished runs in the local store | Each source's fixtures import into a fresh store and show in `agenticml ui` with metrics, images, config and original times; a repeat import skips every run |
 | Later | Scale and lifecycle | Unscheduled; see below | – |
 
 Decision (Nov 5, 2026): the server ships only as the `agenticml-lite`
@@ -279,7 +281,7 @@ dry run 44138465918, tag `v3.0.0`, Publish run 44139009661, 3.0.0 on PyPI
 | 30.3 † | Admin plan edits merge atomically and prefill free limits; Keys copy command without `--key`; metric picker refresh; workspace rename by its owner | 30.1, 30.2 | Sonnet | M | [plan](packages/30-backlog-cleanup.md) | done ([#79](https://github.com/agenticML/agenticml-lite/pull/79), merged Nov 17, 2026; Sonnet coded; supervisor reviewed and did the † second review of the rename) |
 | 30.4 † | Sign-in pages: setup and invite in the new shell, theme toggle, Firebase page tests, invite token in the URL fragment on hosted | 30.1, 30.2 | Sonnet | M | [plan](packages/30-backlog-cleanup.md) | done ([#79](https://github.com/agenticML/agenticml-lite/pull/79), merged Nov 17, 2026; Sonnet coded; supervisor reviewed with an adversarial review pass, no findings; † second review by the supervisor) |
 | 30.5 | Database: transaction connection cap, committed sizes per reader call, usage views on the database clock, 19.1 notes | 30.1, 30.2 | Sonnet | S–M | [plan](packages/30-backlog-cleanup.md) | done ([#79](https://github.com/agenticML/agenticml-lite/pull/79), merged Nov 17, 2026; Sonnet coded, supervisor reviewed; session-lock pooling moved to Later) |
-| 30.6 | AWS template and CI: ECS init process, healthy-hosts alarm from DesiredCount, actions pinned to SHAs, weekly hosted monitor | – | Sonnet | S–M | [plan](packages/30-backlog-cleanup.md) | done ([#79](https://github.com/agenticML/agenticml-lite/pull/79), merged Nov 17, 2026; Sonnet coded, supervisor reviewed) |
+| 30.6 | AWS template and CI: ECS init process, healthy-hosts alarm from DesiredCount, actions pinned to SHAs, weekly hosted monitor | – | Sonnet | S–M | [plan](packages/30-backlog-cleanup.md) | done ([#79](https://github.com/agenticML/agenticml-lite/pull/79), merged Nov 17, 2026; Sonnet coded, supervisor reviewed; [#107](https://github.com/agenticML/agenticml-lite/pull/107)) |
 | 30.7 | Roadmap and Backlog: owner checklists, deferred entries to Later, stale rows | 30.1–30.6 | Supervisor | S | [plan](packages/30-backlog-cleanup.md) | done ([#79](https://github.com/agenticML/agenticml-lite/pull/79), merged Nov 17, 2026; Backlog rewritten: owner checklists, three entries moved to Later) |
 
 Getting the hosted service live on AWS, step by step: [AWS deployment roadmap](aws-deployment-roadmap.md).
@@ -401,6 +403,28 @@ touch 34's files, and 36.3 and 36.4 build on 34 (merged from PR #86).
 | 36.3 | Docs: "Deploy on AWS" page, SERVER.md OIDC section, threat model, README, facts test | 36.2, 34.3 | Antigravity; supervisor checks | S–M | [plan](packages/36-aws-self-deploy.md) | done ([#88](https://github.com/agenticML/agenticml-lite/pull/88); Antigravity drafted; two fact-check rounds against the code with adversarial verification; supervisor corrected two wordings) |
 | 36.4 | Version 3.3.0; template on the GitHub release; Launch Stack link (owner: public S3 bucket) | 36.3, 34.4 | Sonnet; owner tags and publishes | S | [plan](packages/36-aws-self-deploy.md) | done ([#88](https://github.com/agenticML/agenticml-lite/pull/88), released Nov 20, 2026: tag `v3.3.0`, PyPI 3.3.0, `agenticml.yaml` on the release; `release-assets.yml` attaches the template to a published release, version tied to the template default by a test); owner: Launch Stack bucket (Backlog) |
 | 36.5 | First real deploy in an AWS account (Backlog owner step) | 36.4 | Owner | S | [plan](packages/36-aws-self-deploy.md) | not started |
+
+### 3.4: import from other trackers
+
+Added Nov 28, 2026 (owner: "give path to tensorboard logs, and experiment
+directory, and we port the metrics into the agenticml dashboard", then "we
+basically want it to be exported, and save it under agenticml directory" and
+"i also want to support multiple exports from mlflow, wandb, and other
+stuff"). Decisions D1–D9 are in the plan: one `agenticml import <source>
+<path>` command, standard-library readers (only W&B cloud needs an extra),
+deterministic run ids so re-imports skip, original timestamps kept, no code
+or lineage on imported runs.
+
+| # | Package | Depends on | Coder | Size | Plan | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| 41 | Import runs from TensorBoard, MLflow, W&B and CSV | – | Sonnet; supervisor reviews | L | [plan](packages/41-import-trackers.md) | done ([#107](https://github.com/agenticML/agenticml-lite/pull/107)); ships in 3.4 (release and its docs follow-ups in the Backlog) |
+| 41.1 | Import core: writer time options, `importers` package, `agenticml import` CLI, dedupe, `--replace`, dry run, report | – | Sonnet | M | [plan](packages/41-import-trackers.md#411-import-core) | done (Sonnet coded; two review rounds by three Sonnet reviewers with skeptic checks; supervisor reviewed) |
+| 41.2 | TensorBoard event files: TFRecord and protobuf decoding, scalars (TF1 and TF2), images, hparams | 41.1 | Sonnet | M | [plan](packages/41-import-trackers.md#412-tensorboard) | done (Sonnet coded; reviewed by two Sonnet lenses with skeptic checks, 9 findings fixed, clean recheck; supervisor reviewed and ran it end to end; 1M points in 22.7 s) |
+| 41.3 | MLflow file store (`mlruns/`) and SQLite (`mlflow.db`) | 41.1 | Sonnet | M | [plan](packages/41-import-trackers.md#413-mlflow) | done (Sonnet coded; two review rounds, 7 findings fixed; supervisor checked both backends end to end) |
+| 41.4 | W&B local run directories (`.wandb` files), media images | 41.1 | Sonnet | M | [plan](packages/41-import-trackers.md#414-wb-local) | done (Sonnet coded; 7 review findings fixed; fixtures regenerated without host or path data after the supervisor's scan; supervisor ran it end to end) |
+| 41.5 | CSV / JSONL, Lightning `CSVLogger`, Hugging Face `trainer_state.json` | 41.1 | Sonnet | S | [plan](packages/41-import-trackers.md#415-csv--jsonl-and-common-local-loggers) | done (Sonnet coded; two review rounds, 12 findings fixed; dedupe no longer depends on file mtime after the supervisor's end-to-end check) |
+| 41.6 | W&B cloud import through `wandb.Api` (`[wandb]` extra) | 41.4 | Sonnet | S | [plan](packages/41-import-trackers.md#416-wb-cloud) | done (Sonnet coded against a mocked `wandb.Api`; 3 review findings fixed; no live W&B account check) |
+| 41.7 | Docs: import guide, CLI reference, FORMAT.md, README, facts test | 41.2–41.6 | Sonnet; supervisor fact-checks | S | [plan](packages/41-import-trackers.md#417-docs) | done (Sonnet wrote; two Sonnet fact-checkers, 12 findings fixed; supervisor read the guide, built the site and ran the 375px overflow check) |
 
 ### Outreach
 
@@ -852,6 +876,40 @@ on Nov 17, 2026; none of the entries below blocked it.
   - Done when: `npm audit` is clean for `astro`, and the build, the link check
     and `npm run check:overflow` pass.
 - **Docs custom domain**: moved to package 38 ([plan](packages/38-site-domain.md)), Nov 27, 2026.
+
+### Import follow-ups (package 41)
+
+Found while building package 41 ([plan](packages/41-import-trackers.md),
+Nov 28, 2026), by priority:
+
+- **Release 3.4 with `agenticml import`** (owner).
+  - Where: `pyproject.toml` version, `website/src/content/docs/releases.md`,
+    the tag and PyPI.
+  - Problem: `agenticml import` is merged but unreleased; the guide,
+    `reference/configuration.md` and the README say "New in 3.4" and tell
+    readers to install from source until then.
+  - Fix: bump to 3.4.0, add the Releases entry, tag `v3.4.0`, publish to PyPI;
+    then drop the "until 3.4 is released" sentences and add the `wandb` extra
+    to the extras table in `getting-started/installation.md`.
+  - Done when: `pip install agenticml-lite==3.4.0` has `agenticml import`, and
+    the docs no longer mention installing from source for it.
+- **`agenticml ls` LAST STEP for imported runs.**
+  - Where: `src/agenticml/cli.py` `cmd_ls` and the reader's last-step lookup
+    (it uses the last `_time.bin` record).
+  - Problem: an import writes points in source time order, so the last record
+    can have a smaller step than the run's largest (an MLflow `mlflow.db`
+    fixture run shows 0 instead of 4). The data is correct; only the column is
+    misleading.
+  - Fix: for runs with `imported_from`, show the largest step of any series
+    (or use it for every finished run).
+  - Done when: a test with an imported run whose last point has a lower step
+    shows the largest step in `agenticml ls`.
+- **Check W&B cloud import against a real account** (owner, optional).
+  - Where: `src/agenticml/importers/wandb_cloud.py`.
+  - Problem: it is tested only against a mocked `wandb.Api`.
+  - Fix: run `agenticml import wandb ENTITY/PROJECT` on a small real project.
+  - Done when: the runs show in `agenticml ui` with metrics, images, config
+    and times matching the W&B page.
 
 ### Code and dashboard follow-ups
 

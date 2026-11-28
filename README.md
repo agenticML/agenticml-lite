@@ -46,6 +46,7 @@ Install the package as `agenticml-lite` and import it as `agenticml`. It needs P
 - **Code snapshots and diffs.** Runtime code snapshots are stored with each run, and the dashboard and `agenticml lineage diff` show what changed between runs.
 - **PyTorch component detection.** The model, optimizer, loss and dataloader are recorded automatically.
 - **TensorBoard mirroring.** Scalars, images, figures and hparams written through `SummaryWriter` or `tensorboardX` are mirrored into the run under `agenticml run`, or with `init(sync_tensorboard=True)`.
+- **Import from other trackers.** `agenticml import` copies TensorBoard, MLflow, Weights & Biases (local or cloud), CSV, Lightning and Hugging Face runs into the local store, with the source's own times where it records them, so you can browse and sync them. New in 3.4.
 - **System and GPU metrics.** CPU, memory and disk through `psutil`, and NVIDIA GPU metrics through `pynvml` (install the `system` and `gpu` extras).
 - **Media and artifacts.** Log images and files, by reference or as a snapshot of the bytes. Images need the `media` extra.
 - **Self-hosted server.** `agenticml server serve` gives a team a shared dashboard and sync endpoint, with workspaces, roles and an audit log. It is open source (MIT).
@@ -75,7 +76,7 @@ Checked November 2026. If something here is wrong or out of date, please open an
 Docs site: <https://agenticml.xyz/>
 
 - Getting started: [Installation](https://agenticml.xyz/getting-started/installation/), [Quickstart](https://agenticml.xyz/getting-started/quickstart/)
-- Guides: [Zero-code runs](https://agenticml.xyz/guides/zero-code/), [Python SDK](https://agenticml.xyz/guides/python-sdk/), [Dashboard](https://agenticml.xyz/guides/dashboard/), [Distributed, resume, disabled](https://agenticml.xyz/guides/distributed/)
+- Guides: [Zero-code runs](https://agenticml.xyz/guides/zero-code/), [Python SDK](https://agenticml.xyz/guides/python-sdk/), [Dashboard](https://agenticml.xyz/guides/dashboard/), [Distributed, resume, disabled](https://agenticml.xyz/guides/distributed/), [Import runs](https://agenticml.xyz/guides/import/)
 - Reference: [Storage and disk](https://agenticml.xyz/reference/storage/), [Configuration](https://agenticml.xyz/reference/configuration/)
 - Server: [Install](https://agenticml.xyz/server/install/), [Keys](https://agenticml.xyz/server/keys/), [Sync](https://agenticml.xyz/server/sync/), [Backups](https://agenticml.xyz/server/backups/), [Upgrade](https://agenticml.xyz/server/upgrade/), [Private networks](https://agenticml.xyz/server/private-network/), [Deploy on AWS](https://agenticml.xyz/server/deploy-on-aws/)
 - [Hosted service](https://agenticml.xyz/hosted/) and [Releases](https://agenticml.xyz/releases/)

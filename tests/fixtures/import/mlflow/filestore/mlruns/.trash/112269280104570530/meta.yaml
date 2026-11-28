@@ -1,0 +1,10 @@
+artifact_location: file:///mlruns/112269280104570530
+creation_time: 1795859906560
+effective_trace_archival_retention: null
+experiment_id: '112269280104570530'
+last_update_time: 1795859906561
+lifecycle_stage: deleted
+name: old
+tags: {}
+trace_location: null
+workspace: default
