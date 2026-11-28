@@ -726,6 +726,17 @@ def test_bad_values_inside_good_records_are_ignored(tmp_path):
     assert RunReader(store, report.rows[0].run_id).keys() == ["loss"]
 
 
+def test_json_guard_drops_deep_values_on_every_python():
+    # Python 3.12's decoder parses this without raising; the depth guard must still reject it.
+    nested = '{"a":' * 5000 + "1" + "}" * 5000
+    assert wandb_importer._json(nested) is wandb_importer._MISSING
+    assert wandb_importer._json("[" * 5000 + "]" * 5000) is wandb_importer._MISSING
+    assert wandb_importer._json('{"a": {"b": [1, 2, {"c": 3}]}}') == {"a": {"b": [1, 2, {"c": 3}]}}
+    limit = wandb_importer._MAX_JSON_DEPTH
+    assert wandb_importer._json("[" * limit + "]" * limit) is not wandb_importer._MISSING
+    assert wandb_importer._json("[" * (limit + 1) + "]" * (limit + 1)) is wandb_importer._MISSING
+
+
 def test_unparseable_start_time_fails_the_run(tmp_path):
     records = [ld(17, st(1, "abc12345") + ld(17, vi(1, 2**62))), exit_record()]
     report, store = do_import(tmp_path, write_run(tmp_path / "w", records))

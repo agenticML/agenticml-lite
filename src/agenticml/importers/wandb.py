@@ -64,6 +64,7 @@ MAX_MEDIA_BYTES = 64 * 1024 * 1024
 _MAX_PATH_DEPTH = 32
 _MAX_CONFIG_BYTES = 16 * 1024 * 1024  # one value_json bigger than this is not parsed
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_MAX_JSON_DEPTH = 64  # a config / history value nested deeper than this is dropped
 _MISSING = object()
 
 
@@ -244,9 +245,28 @@ def _json(text: str, lists: bool = True):
     if len(text) > _MAX_CONFIG_BYTES:
         return _MISSING
     try:
-        return json.loads(text)
+        value = json.loads(text)
     except (ValueError, RecursionError):
         return _MISSING
+    # Python 3.12's decoder accepts nesting that earlier versions refuse, so cap it here.
+    return _MISSING if _too_deep(value) else value
+
+
+def _too_deep(value, limit: int = _MAX_JSON_DEPTH) -> bool:
+    """Whether lists / dicts in ``value`` nest deeper than ``limit`` (checked without recursion)."""
+    stack = [(value, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if isinstance(node, dict):
+            children = node.values()
+        elif isinstance(node, list):
+            children = node
+        else:
+            continue
+        if depth > limit:
+            return True
+        stack.extend((child, depth + 1) for child in children)
+    return False
 
 
 def _item_path(item: pb.Message) -> list[str]:
