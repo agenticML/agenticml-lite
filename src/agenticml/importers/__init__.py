@@ -6,10 +6,14 @@ another tracker's logs on disk and yields :class:`ImportedRun` objects from
 :class:`~agenticml.store.RunWriter` as a normal, finished run. Nothing in the
 source is changed.
 
-The run id is derived from the source run, so importing the same run twice
-gives the same id and the second import skips it. A reader must therefore
-derive ``started_at`` from the source data (never from the clock or from a
-file it may have touched) and ``location`` from the resolved source path.
+The run id is ``<start stamp>-<digest>``. The digest comes from the source
+run (source, location, source id), and the stamp comes from ``started_at``.
+Importing the same run twice is detected by the digest: an existing imported
+run with the same digest and the same source, location and source id is the
+same run, and keeps its id even when ``started_at`` differs (a reader may only
+have a file's modification time for it). A reader should still derive
+``started_at`` from the source data where it can (never from the clock), and
+``location`` from the resolved source path.
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ from typing import Protocol
 from ..store.layout import (
     META_NAME,
     RunLockedError,
+    contained,
     format_timestamp,
     read_file_nofollow,
     run_dir,
@@ -94,6 +99,9 @@ class ImportedRun:
     # Source id of the parent run (MLflow nested runs). Linked after the import
     # when the parent was in the same import.
     parent_source_run_id: str | None = None
+    # Host the source recorded for the run; None when it does not say. The
+    # importing machine's name is never used.
+    hostname: str | None = None
 
 
 @dataclass
@@ -110,7 +118,8 @@ class ImportOptions:
 
     def warn(self, message: str) -> None:
         """Record a reader warning for the report."""
-        logger.warning("%s", message)
+        # DEBUG: the CLI prints the collected warnings once, at the end.
+        logger.debug("%s", message)
         if message not in self.warnings:
             self.warnings.append(message)
 
@@ -182,6 +191,11 @@ def _utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _source_digest(run: ImportedRun) -> str:
+    key = f"{run.source}\0{run.location}\0{run.source_run_id}".encode("utf-8", "surrogatepass")
+    return hashlib.sha256(key).hexdigest()[:8]
+
+
 def import_run_id(run: ImportedRun) -> str:
     """``<start as YYYYmmddTHHMMSS>-<8 hex of sha256(source, location, source_run_id)>``."""
     start = _utc(run.started_at)
@@ -191,8 +205,7 @@ def import_run_id(run: ImportedRun) -> str:
         f"{start.year:04d}{start.month:02d}{start.day:02d}"
         f"T{start.hour:02d}{start.minute:02d}{start.second:02d}"
     )
-    key = f"{run.source}\0{run.location}\0{run.source_run_id}".encode("utf-8", "surrogatepass")
-    digest = hashlib.sha256(key).hexdigest()[:8]
+    digest = _source_digest(run)
     run_id = f"{stamp}-{digest}"
     if not valid_run_id(run_id):
         raise ValueError(f"cannot build a run id from {run_id!r}")
@@ -341,6 +354,14 @@ def json_plain(value, _depth: int = 0, _seen: frozenset = frozenset()):
         return "<unserializable>"
 
 
+def _clean_host(value) -> str | None:
+    """The reader's host as clean text, or None when it gave none."""
+    if not isinstance(value, str):
+        return None
+    text = json_plain(value).strip()
+    return text or None
+
+
 def _plain_dict(value) -> dict:
     plain = json_plain(value) if value else {}
     return plain if isinstance(plain, dict) else {}
@@ -389,7 +410,65 @@ def _restore_aside(directory: Path, aside: Path | None, row: ImportRow) -> None:
         row.reason = (row.reason or "failed") + suffix
 
 
-def write_imported_run(root, run: ImportedRun, *, replace: bool = False, dry_run: bool = False) -> ImportRow:
+def _find_same_source_run(
+    root, run: ImportedRun, run_id: str, warn: Callable[[str], None] | None = None
+) -> str:
+    """The id of the run already imported from this source run, else ``run_id``.
+
+    The id stamp comes from ``started_at``, which a reader may only know from a
+    file's modification time, so the same source run can ask for a different id
+    on a later import. Look for a run directory ``*-<digest>`` whose
+    ``imported_from`` names the same source, location and source run id.
+    """
+    suffix = "-" + _source_digest(run)
+    try:
+        runs_root = run_dir(root, run_id).parent
+        if (runs_root / run_id / META_NAME).is_file():
+            return run_id  # exact id: the usual case
+        entries = list(os.scandir(runs_root))
+    except (OSError, ValueError):
+        return run_id
+    found: list[tuple[str, str]] = []  # (created_at, run id)
+    for entry in entries:
+        name = entry.name
+        if name.startswith(".") or not name.endswith(suffix) or not valid_run_id(name):
+            continue
+        try:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            contained(root, runs_root / name)
+        except (OSError, ValueError):
+            continue
+        meta = _read_meta(runs_root / name / META_NAME)
+        origin = meta.get("imported_from") if meta else None
+        if not isinstance(origin, dict):
+            continue
+        if (
+            origin.get("source") == json_plain(run.source)
+            and origin.get("location") == json_plain(run.location)
+            and origin.get("source_run_id") == json_plain(run.source_run_id)
+        ):
+            created = meta.get("created_at")
+            found.append((created if isinstance(created, str) else "", name))
+    if not found:
+        return run_id
+    found.sort()
+    if len(found) > 1 and warn is not None:
+        warn(
+            f"{run.name or run.source_run_id}: {len(found)} runs were already imported from "
+            f"this source run; using the newest ({found[-1][1]})"
+        )
+    return found[-1][1]
+
+
+def write_imported_run(
+    root,
+    run: ImportedRun,
+    *,
+    replace: bool = False,
+    dry_run: bool = False,
+    warn: Callable[[str], None] | None = None,
+) -> ImportRow:
     """Write one source run as a finished run. Never raises for a bad run.
 
     The returned row says ``imported``, ``skipped`` (already there, or being
@@ -404,6 +483,7 @@ def write_imported_run(root, run: ImportedRun, *, replace: bool = False, dry_run
         run_id = import_run_id(run)
     except Exception as exc:
         return ImportRow("failed", name, source_run_id=run.source_run_id, reason=str(exc))
+    run_id = _find_same_source_run(root, run, run_id, warn)
     row = ImportRow("imported", name, run_id, run.source_run_id)
 
     try:
@@ -511,7 +591,13 @@ def _write_new(root, run, row, directory, meta_path, aside, dry_run):
     writer = None
     try:
         try:
-            writer = RunWriter.create(root, run_id=run_id, meta=meta, created_at=started)
+            writer = RunWriter.create(
+                root,
+                run_id=run_id,
+                meta=meta,
+                created_at=started,
+                hostname=_clean_host(run.hostname),
+            )
         except FileExistsError:
             row.status, row.reason = "skipped", "already imported"
             _restore_aside(directory, aside, row)
@@ -729,7 +815,7 @@ def run_import(
                 )
             )
             continue
-        row = write_imported_run(root, run, replace=replace, dry_run=dry_run)
+        row = write_imported_run(root, run, replace=replace, dry_run=dry_run, warn=options.warn)
         if row.run_id is not None and row.status != "failed":
             imported_ids[run.source_run_id] = row.run_id
             if row.status == "imported" and run.parent_source_run_id:

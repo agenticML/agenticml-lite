@@ -27,6 +27,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from .layout import (
     EVENTS_NAME,
@@ -120,6 +121,9 @@ class _Series:
     monotonic: bool
     last_step: int | None
     max_step: int | None
+
+
+_UNSET: Any = object()  # "argument not given", as opposed to an explicit None
 
 
 def _hostname() -> str | None:
@@ -377,6 +381,7 @@ class RunWriter:
         run_id: str | None = None,
         meta: dict | None = None,
         created_at: datetime | None = None,
+        hostname: str | None = _UNSET,  # type: ignore[assignment]
     ) -> RunWriter:
         """Create a run directory and write ``meta.json`` with status ``running``.
 
@@ -387,6 +392,10 @@ class RunWriter:
 
         ``created_at`` (importers only) replaces the clock for ``created_at``
         and the ``_time.bin`` origin; a naive value is read as UTC.
+
+        ``hostname`` (importers only) replaces this machine's name in the
+        ``hostname`` field; pass ``None`` to record no host. When it is left
+        out the field is this machine's hostname, as before.
         """
         if run_id is None:
             run_id = new_run_id()
@@ -401,7 +410,8 @@ class RunWriter:
             raise FileExistsError(writer._meta_path)
         created_text = format_timestamp(created_at)
         writer._created_at_unix = parse_timestamp(created_text).timestamp()
-        built = _initial_meta(user, run_id, created_text, os.getpid(), _hostname())
+        host = _hostname() if hostname is _UNSET else hostname
+        built = _initial_meta(user, run_id, created_text, os.getpid(), host)
         writer.run_dir.mkdir(parents=True, exist_ok=True)
         try:
             writer._acquire_run_lock()

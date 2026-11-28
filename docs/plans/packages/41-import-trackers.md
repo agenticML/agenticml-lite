@@ -277,6 +277,22 @@ where it differs from the steps above, the code wins:
   values) with `.child(raw)` (depth-capped), `.first()`, `.last()`, and
   `as_*` / `repeated_*` helpers; `sniff_image_type` returns MIME strings.
 - Dry-run lines say `would import`.
+- `ImportOptions.warn` logs at DEBUG and collects into `options.warnings`;
+  the CLI prints each collected warning once, as a `warning:` line.
+- Dedupe does not depend on `started_at`. The id is `<start stamp>-<digest>`,
+  but before deciding a run is new, `write_imported_run` looks under
+  `<root>/runs/` for an imported run named `*-<digest>` whose `imported_from`
+  has the same source, location and source run id, and uses that run's id for
+  every later rule (skip, stale replace, `--replace`, sync.json, lock). A
+  csv run whose start time is only the file's modification time therefore
+  stays one run after a clone, copy or `touch`. With several matches the
+  newest by `created_at` wins and a reader warning is added.
+- Imported runs do not record the importing machine's hostname.
+  `RunWriter.create(..., hostname=)` (importers only) overrides it, and
+  `ImportedRun.hostname` (default None) carries what the source recorded:
+  W&B local reads the run record's `host` (field 13), W&B cloud reads a
+  `run.host` attribute when present; all other readers leave it None, so
+  `meta["hostname"]` is null (the dashboard shows a dash).
 - 41.7 documents `imported_from` and the writer options in FORMAT.md.
 
 ## 41.2 TensorBoard
@@ -501,6 +517,8 @@ Coder `sonnet`; the supervisor fact-checks against the code.
 - Performance (measured, not asserted in CI): 1,000,000 TensorBoard scalar
   points import in under 60 s on the dev machine; record the number in this
   plan.
+  Measured Nov 28, 2026 (part 41.2): 1,000,000 points through `run_import`
+  in 22.7 s.
 - `agenticml sync --dry-run` on an imported run reports it as a normal
   finished run.
 

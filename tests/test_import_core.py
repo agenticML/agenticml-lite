@@ -1,6 +1,9 @@
 """Import core: writer time options, run writing, dedupe, CLI, and the byte helpers."""
 
 import json
+import logging
+import shutil
+import socket
 import struct
 import sys
 import types
@@ -117,6 +120,27 @@ def test_writer_time_options_override_the_clock(tmp_path):
     assert seconds(reader) == {3: 7.5, 4: 0.0}
     finish_event = [e for e in reader.events() if e["kind"] == "finish"][0]
     assert finish_event["t"] == ended.timestamp()
+
+
+def test_writer_hostname_default_is_this_machine_and_override_is_stored(tmp_path):
+    default = RunWriter.create(tmp_path, run_id="default")
+    default.finish("finished")
+    assert RunReader(tmp_path, "default").meta()["hostname"] == socket.gethostname()
+    named = RunWriter.create(tmp_path, run_id="named", hostname="gpu-1")
+    named.finish("finished")
+    assert RunReader(tmp_path, "named").meta()["hostname"] == "gpu-1"
+    none = RunWriter.create(tmp_path, run_id="none", hostname=None)
+    none.finish("finished")
+    assert RunReader(tmp_path, "none").meta()["hostname"] is None
+
+
+def test_imported_run_hostname_is_the_sources_or_null(tmp_path):
+    plain = write_imported_run(tmp_path, make_run("plain"))
+    assert RunReader(tmp_path, plain.run_id).meta()["hostname"] is None
+    named = write_imported_run(tmp_path, make_run("named", hostname="h1"))
+    assert RunReader(tmp_path, named.run_id).meta()["hostname"] == "h1"
+    blank = write_imported_run(tmp_path, make_run("blank", hostname="  "))
+    assert RunReader(tmp_path, blank.run_id).meta()["hostname"] is None
 
 
 def test_writer_naive_created_at_is_utc(tmp_path):
@@ -276,6 +300,74 @@ def test_run_id_is_stable_and_depends_on_source_location_and_id():
     assert import_run_id(base) not in other_ids and len(other_ids) == 3
     stamp, digest = import_run_id(base).split("-")
     assert stamp == "20240305T123015" and len(digest) == 8
+
+
+def test_same_source_run_with_a_new_start_time_is_the_same_run(tmp_path):
+    later = START + timedelta(days=3)
+    first = write_imported_run(tmp_path, make_run())
+    again = write_imported_run(tmp_path, make_run(started_at=later, summary={"best": 99}))
+    assert first.status == "imported"
+    assert again.status == "skipped" and again.reason == "already imported"
+    assert again.run_id == first.run_id
+    assert len(list_runs(tmp_path)) == 1
+    assert RunReader(tmp_path, first.run_id).meta()["summary"] == {"best": 0.25}
+
+
+def test_replace_with_a_new_start_time_keeps_the_old_id(tmp_path):
+    later = START + timedelta(days=3)
+    first = write_imported_run(tmp_path, make_run())
+    assert import_run_id(make_run(started_at=later)) != first.run_id
+    replaced = write_imported_run(tmp_path, make_run(started_at=later, summary={"best": 99}), replace=True)
+    assert replaced.status == "imported" and replaced.run_id == first.run_id
+    assert RunReader(tmp_path, first.run_id).meta()["summary"] == {"best": 99}
+    assert [r["run_id"] for r in list_runs(tmp_path)] == [first.run_id]
+
+
+def test_stale_running_import_is_replaced_under_its_old_id(tmp_path):
+    later = START + timedelta(days=3)
+    first = write_imported_run(tmp_path, make_run())
+    meta_path = tmp_path / "runs" / first.run_id / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta["status"] = "running"
+    meta_path.write_text(json.dumps(meta))
+    row = write_imported_run(tmp_path, make_run(started_at=later))
+    assert row.status == "imported" and row.run_id == first.run_id
+    assert [r["run_id"] for r in list_runs(tmp_path)] == [first.run_id]
+
+
+def test_a_run_that_only_ends_in_the_digest_is_not_matched(tmp_path):
+    later = START + timedelta(days=3)
+    digest = import_run_id(make_run()).split("-")[1]
+    lookalike = f"mine-{digest}"
+    native = RunWriter.create(tmp_path, run_id=lookalike, meta={"project": "p", "name": "mine"})
+    native.finish("finished", {})
+    # an imported run of ANOTHER source run with the same digest suffix
+    other = tmp_path / "runs" / f"20200101T000000-{digest}"
+    other.mkdir()
+    (other / "meta.json").write_text(json.dumps({"imported_from": {"source": "tensorboard", "location": "/x", "source_run_id": "y"}}))
+    row = write_imported_run(tmp_path, make_run(started_at=later))
+    assert row.status == "imported"
+    assert row.run_id == import_run_id(make_run(started_at=later))
+    assert row.run_id not in (lookalike, other.name)
+
+
+def test_several_matching_runs_use_the_newest_and_warn(tmp_path):
+    first = write_imported_run(tmp_path, make_run())
+    older_id = import_run_id(make_run(started_at=START - timedelta(days=1)))
+    older = write_imported_run(tmp_path, make_run(started_at=START - timedelta(days=1)), replace=False)
+    # the older start time asked for its own id only when the first is not found by digest
+    assert older.status == "skipped" and older.run_id == first.run_id
+    shutil.copytree(tmp_path / "runs" / first.run_id, tmp_path / "runs" / older_id)
+    meta_path = tmp_path / "runs" / older_id / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta["created_at"] = "2020-01-01T00:00:00.000Z"
+    meta_path.write_text(json.dumps(meta))
+    warnings = []
+    row = write_imported_run(
+        tmp_path, make_run(started_at=START + timedelta(days=1)), warn=warnings.append
+    )
+    assert row.status == "skipped" and row.run_id == first.run_id
+    assert len(warnings) == 1 and "newest" in warnings[0]
 
 
 def test_reimport_skips_and_replace_rewrites(tmp_path):
@@ -657,6 +749,22 @@ def test_reader_warnings_reach_the_report(tmp_path, monkeypatch):
     fake_source(monkeypatch, runs)
     report = run_import(tmp_path / "store", "tensorboard", str(tmp_path))
     assert report.warnings == ["may still be writing"]
+
+
+def test_cli_prints_each_reader_warning_once(tmp_path, monkeypatch, capsys):
+    def runs(path, options):
+        options.warn("reader says hello")
+        yield make_run("a")
+
+    fake_source(monkeypatch, runs)
+    # pytest installs root handlers, which would turn cli.main's basicConfig into a no-op.
+    root = logging.getLogger()
+    monkeypatch.setattr(root, "handlers", [])
+    monkeypatch.setattr(root, "level", logging.WARNING)
+    assert cli.main(["import", "tensorboard", str(tmp_path), "--dir", str(tmp_path / "s")]) == 0
+    captured = capsys.readouterr()
+    assert (captured.out + captured.err).count("reader says hello") == 1
+    assert "warning: reader says hello" in captured.err
 
 
 def test_reader_failing_before_the_first_run_is_a_source_error(tmp_path, monkeypatch):
